@@ -4,6 +4,7 @@
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
+    num::NonZeroU32,
     path::{Path, PathBuf},
     process::{Output, Stdio},
     sync::Arc,
@@ -819,6 +820,64 @@ async fn connections_that_never_handshake_are_taken_a_few_at_a_time_and_a_server
         .expect("reach the Relay over HTTPS");
     let (_, relay_named) = server.challenged(&KeyPair::generate().unwrap()).await;
     assert_eq!(relay_named, PUBLIC_ADDRESS);
+    relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_relay_serving_https_holding_as_many_connections_as_it_may_lets_more_go_before_their_handshake()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let minted = Minted::new("Relay test authority");
+    let provider = Arc::new(ScriptedProvider::new());
+    let relay = suru_relay::start(
+        RelayConfig::new(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            directory.path().join("relay.db"),
+            PUBLIC_ADDRESS,
+        )
+        .with_tls(minted.write(directory.path()))
+        .with_connections_at_once(NonZeroU32::MIN)
+        .with_connection_log(std::io::sink())
+        .with_admission(admitting(&provider)),
+        provider.clone(),
+    )
+    .await
+    .expect("start the Relay serving HTTPS");
+    let address = relay.address();
+    let trusted = minted.trusted_by();
+    let key = KeyPair::generate().unwrap();
+
+    let mut held = connect_over_https(address, &trusted)
+        .await
+        .expect("reach the Relay over HTTPS");
+    for _ in 0..3 {
+        assert!(
+            connect_over_https(address, &trusted).await.is_err(),
+            "a connection past the cap is let go as it comes"
+        );
+    }
+    assert_eq!(
+        held.prove(&key, PUBLIC_ADDRESS).await,
+        RelayMessage::Proven { login: None },
+        "the connection the Relay holds goes on"
+    );
+
+    // Once it has gone, the Relay takes another.
+    drop(held);
+    let mut next = timeout(DEADLINE, async {
+        loop {
+            if let Ok(next) = connect_over_https(address, &trusted).await {
+                return next;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the Relay takes another connection once the one it held has gone");
+    assert_eq!(
+        next.prove(&key, PUBLIC_ADDRESS).await,
+        RelayMessage::Proven { login: None }
+    );
     relay.shutdown().await.unwrap();
 }
 

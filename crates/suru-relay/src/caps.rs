@@ -1,21 +1,35 @@
-//! The caps a Relay's operator sets on each Account, so that no one Account
-//! can exhaust the Relay: on how many Logins stand under it, and on how many
-//! connections the Relay joins for it at once. They are also the whole of
-//! what a phished login costs: a stranger's Server put under a user's Account
-//! holds nothing there but a place against its cap of Logins (ADR-0048).
+//! The caps a Relay's operator sets so that no one can exhaust the Relay.
 //!
-//! Each cap is decided under the standing lock at the moment what it counts
-//! comes to count — a Login as it is formed, a join as it is asked — so no
-//! two decisions can each find the last place free. A Login holds its place
-//! for as long as it is kept, its Account lapsed or not, and gives it back
-//! the moment it is forgotten or removed; a join holds its place from just
-//! before it is asked until it ends, however it ends.
+//! On each Account: how many Logins stand under it, and how many connections
+//! the Relay joins for it at once. They are also the whole of what a phished
+//! login costs: a stranger's Server put under a user's Account holds nothing
+//! there but a place against its cap of Logins (ADR-0048). Each is decided
+//! under the standing lock at the moment what it counts comes to count — a
+//! Login as it is formed, a join as it is asked — so no two decisions can each
+//! find the last place free. A Login holds its place for as long as it is
+//! kept, its Account lapsed or not, and gives it back the moment it is
+//! forgotten or removed; a join holds its place from just before it is asked
+//! until it ends, however it ends.
+//!
+//! On connections, which anyone may open, Login or none: how many the Relay
+//! holds at once, from everyone together ([`crate::listener`]); how many idle
+//! connections each Server holds — those on which it does nothing, neither
+//! waiting to be reached, nor joined or asking to be, nor logging in — a few
+//! where it holds no Login that stands, and more where it does; and how many
+//! logins are under way at once, each Server logging in on one connection at
+//! a time. A Server's waiting connections are held to
+//! [`crate::WAITING_CONNECTIONS_PER_SERVER`], the joins asked of it to
+//! [`crate::JOINS_ASKED_PER_SERVER`], and those it asks for and carries to its
+//! Account's cap of joined connections, so whatever a connection does, it is
+//! held to a cap.
 
 use std::{
     collections::HashMap,
     num::NonZeroU32,
     sync::{Arc, Mutex},
 };
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::admission::Verdicts;
 
@@ -37,6 +51,39 @@ pub const LOGINS_PER_ACCOUNT: NonZeroU32 = NonZeroU32::new(64).unwrap();
 /// made again while the one before it winds down, while bounding what one
 /// Account holds of the Relay to 512 of its connections.
 pub const JOINED_CONNECTIONS_PER_ACCOUNT: NonZeroU32 = NonZeroU32::new(256).unwrap();
+
+/// How many connections a Relay holds at once, from every Server together,
+/// unless its configuration says otherwise. Each costs the Relay a socket and
+/// the buffers its WebSocket reads and writes through — idle, a little over a
+/// hundred kibibytes; carrying a join, up to twice that — so 8,192 bounds what
+/// they hold of it to a gibibyte or two, while leaving room for dozens of
+/// Accounts each with every Server keeping every other in view: an Account at
+/// its cap of joined connections holds 512.
+pub const CONNECTIONS_AT_ONCE: NonZeroU32 = NonZeroU32::new(8192).unwrap();
+
+/// How many logins may be under way at a Relay at once, from every Server
+/// together, unless its configuration says otherwise. A login waits up to a
+/// quarter of an hour for its user to finish it at the identity provider,
+/// asking the provider how it stands every few seconds meanwhile, and GitHub
+/// takes no more than fifty device logins an hour for each app; 128 is room
+/// for a team logging in all at once, many times over.
+pub const LOGINS_AT_ONCE: NonZeroU32 = NonZeroU32::new(128).unwrap();
+
+/// How many idle connections a Server whose Login stands may hold at a Relay
+/// at once, unless its configuration says otherwise. A Server holds one —
+/// the connection it hears at once on that its Login stops standing, unless
+/// it waits on that one to be reached — and one more for each join it asks
+/// for or takes up, for the moment between proving its key and asking.
+/// 32 leaves room for a Server reaching dozens of Remotes through the Relay
+/// all at once, while bounding what an Account's Servers hold idle, at its
+/// cap of Logins, to 2,048.
+pub const IDLE_CONNECTIONS_PER_SERVER: NonZeroU32 = NonZeroU32::new(32).unwrap();
+
+/// How many idle connections a Server holding no Login that stands may hold
+/// at a Relay at once, unless its configuration says otherwise. Such a Server
+/// connects to log in, to be forgotten, or to learn its Login needs renewing,
+/// and asks what it came for at once, so it has one or two at a time.
+pub const IDLE_CONNECTIONS_PER_SERVER_WITHOUT_LOGIN: NonZeroU32 = NonZeroU32::new(4).unwrap();
 
 /// The connections joined for each Account, held to a cap.
 pub(crate) struct Joined {
@@ -94,9 +141,170 @@ impl Drop for Place {
     }
 }
 
-/// The places held, as they stand. Each step taken under its lock is a
-/// lookup and a count, which leave it whole however they fail.
-fn lock(held: &Mutex<HashMap<i64, u32>>) -> std::sync::MutexGuard<'_, HashMap<i64, u32>> {
+/// The idle connections each Server holds, held to one cap where its Login
+/// stands and another where it holds none.
+pub(crate) struct Idle {
+    standing: NonZeroU32,
+    without_login: NonZeroU32,
+    /// How many places each Server holds, by its identity key, where it holds
+    /// any.
+    held: Arc<Mutex<HashMap<Vec<u8>, u32>>>,
+}
+
+/// A place for one idle connection of a Server's, given back as this drops.
+pub(crate) struct IdlePlace {
+    held: Arc<Mutex<HashMap<Vec<u8>, u32>>>,
+    key: Vec<u8>,
+}
+
+impl Idle {
+    pub(crate) fn new(standing: NonZeroU32, without_login: NonZeroU32) -> Self {
+        Self {
+            standing,
+            without_login,
+            held: Arc::default(),
+        }
+    }
+
+    /// A place for one more idle connection of the Server whose identity key
+    /// is `key`, where it holds fewer than its cap — the cap of a Server
+    /// whose Login stands, where the connection stands on it, and of one
+    /// holding none otherwise.
+    pub(crate) fn take(&self, key: &[u8], stands: bool) -> Option<IdlePlace> {
+        let limit = if stands {
+            self.standing
+        } else {
+            self.without_login
+        };
+        let mut held = lock(&self.held);
+        let places = held.entry(key.to_vec()).or_default();
+        if *places >= limit.get() {
+            return None;
+        }
+        *places += 1;
+        Some(IdlePlace {
+            held: self.held.clone(),
+            key: key.to_vec(),
+        })
+    }
+
+    /// The most idle connections a Server may hold at once, where its Login
+    /// stands, as `stands` says, and where it holds none.
+    pub(crate) fn limit(&self, stands: bool) -> NonZeroU32 {
+        if stands {
+            self.standing
+        } else {
+            self.without_login
+        }
+    }
+}
+
+impl Drop for IdlePlace {
+    fn drop(&mut self) {
+        let mut held = lock(&self.held);
+        if let Some(places) = held.get_mut(&self.key) {
+            *places -= 1;
+            if *places == 0 {
+                held.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// The logins under way at the Relay, held to a cap, each Server's on one
+/// connection at a time.
+pub(crate) struct Logins {
+    places: Arc<Semaphore>,
+    state: Arc<Mutex<LoginsUnderWay>>,
+}
+
+#[derive(Default)]
+struct LoginsUnderWay {
+    next: u64,
+    /// The login each Server has under way, by its identity key.
+    by_server: HashMap<Vec<u8>, UnderWay>,
+}
+
+/// A Server's login under way: its number, its place against the cap, and
+/// what tells it that it has been given up for a later one.
+struct UnderWay {
+    number: u64,
+    place: OwnedSemaphorePermit,
+    give_up: oneshot::Sender<()>,
+}
+
+/// A login under way, holding its place against the cap until it drops.
+pub(crate) struct LoginPlace {
+    state: Arc<Mutex<LoginsUnderWay>>,
+    key: Vec<u8>,
+    number: u64,
+    given_up: oneshot::Receiver<()>,
+}
+
+impl Logins {
+    pub(crate) fn new(cap: NonZeroU32) -> Self {
+        Self {
+            places: Arc::new(Semaphore::new(cap.get() as usize)),
+            state: Arc::default(),
+        }
+    }
+
+    /// A place for a login the Server whose identity key is `key` begins:
+    /// the place of the login it already has under way, where it has one,
+    /// which is given up — the Server gave it up as it began this one — and
+    /// otherwise one of those free against the cap, where one is.
+    pub(crate) fn begin(&self, key: &[u8]) -> Option<LoginPlace> {
+        let mut state = lock(&self.state);
+        let place = match state.by_server.remove(key) {
+            Some(earlier) => {
+                let _ = earlier.give_up.send(());
+                earlier.place
+            }
+            None => self.places.clone().try_acquire_owned().ok()?,
+        };
+        let number = state.next;
+        state.next += 1;
+        let (give_up, given_up) = oneshot::channel();
+        state.by_server.insert(
+            key.to_vec(),
+            UnderWay {
+                number,
+                place,
+                give_up,
+            },
+        );
+        Some(LoginPlace {
+            state: self.state.clone(),
+            key: key.to_vec(),
+            number,
+            given_up,
+        })
+    }
+}
+
+impl LoginPlace {
+    /// Returns once the login is given up for a later one its Server began.
+    pub(crate) async fn given_up(&mut self) {
+        let _ = (&mut self.given_up).await;
+    }
+}
+
+impl Drop for LoginPlace {
+    fn drop(&mut self) {
+        let mut state = lock(&self.state);
+        if state
+            .by_server
+            .get(&self.key)
+            .is_some_and(|under_way| under_way.number == self.number)
+        {
+            state.by_server.remove(&self.key);
+        }
+    }
+}
+
+/// What a cap holds, as it stands. Each step taken under its lock is a lookup
+/// and a count, which leave it whole however they fail.
+fn lock<T>(held: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     held.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -120,5 +328,51 @@ mod tests {
         let again = joined.take(&standing, 1).expect("a place given back");
         drop((second, again, elsewhere));
         assert!(lock(&joined.held).is_empty(), "nothing is kept of no place");
+    }
+
+    #[test]
+    fn a_server_holds_no_more_idle_connections_than_its_cap_and_fewer_without_a_login() {
+        let idle = Idle::new(NonZeroU32::new(3).unwrap(), NonZeroU32::new(1).unwrap());
+        let first = idle.take(b"laptop", false).expect("a place");
+        assert!(
+            idle.take(b"laptop", false).is_none(),
+            "the cap without a Login"
+        );
+        let second = idle
+            .take(b"laptop", true)
+            .expect("a connection standing on a Login is held to the larger cap");
+        let third = idle.take(b"laptop", true).expect("a place");
+        assert!(idle.take(b"laptop", true).is_none(), "the cap with a Login");
+        let elsewhere = idle
+            .take(b"tablet", false)
+            .expect("another Server's places are its own");
+        assert!(idle.take(b"tablet", false).is_none());
+        drop((first, second, third, elsewhere));
+        assert!(lock(&idle.held).is_empty(), "nothing is kept of no place");
+    }
+
+    #[tokio::test]
+    async fn a_server_logs_in_once_at_a_time_its_later_login_taking_the_place_of_the_earlier() {
+        let logins = Logins::new(NonZeroU32::new(2).unwrap());
+        let mut earlier = logins.begin(b"laptop").expect("a place");
+        let tablet = logins.begin(b"tablet").expect("a place");
+        assert!(logins.begin(b"phone").is_none(), "the cap is reached");
+
+        let mut later = logins.begin(b"laptop").expect("the earlier login's place");
+        earlier.given_up().await;
+        drop(earlier);
+        assert!(
+            logins.begin(b"phone").is_none(),
+            "an earlier login given up and gone leaves its place with the later"
+        );
+        assert!(
+            futures_util::FutureExt::now_or_never(later.given_up()).is_none(),
+            "the later login is under way still"
+        );
+        drop(later);
+        let phone = logins.begin(b"phone").expect("a place given back");
+        drop((tablet, phone));
+        assert!(lock(&logins.state).by_server.is_empty());
+        assert_eq!(logins.places.available_permits(), 2);
     }
 }

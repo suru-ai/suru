@@ -31,8 +31,10 @@ use serde::Deserialize;
 use suru_relay_protocol::canonical_address;
 
 use crate::{
-    Admission, GitHub, GitHubApp, GitHubAppKey, IdentityProvider, JOINED_CONNECTIONS_PER_ACCOUNT,
-    KEEPALIVE, LOGINS_PER_ACCOUNT, NoIdentityProvider, RelayConfig, TlsFiles, TrustedProxy,
+    Admission, CONNECTIONS_AT_ONCE, GitHub, GitHubApp, GitHubAppKey, IDLE_CONNECTIONS_PER_SERVER,
+    IDLE_CONNECTIONS_PER_SERVER_WITHOUT_LOGIN, IdentityProvider, JOINED_CONNECTIONS_PER_ACCOUNT,
+    KEEPALIVE, LOGINS_AT_ONCE, LOGINS_PER_ACCOUNT, NoIdentityProvider, RelayConfig, TlsFiles,
+    TrustedProxy,
 };
 
 /// Where the Relay keeps its records unless told otherwise: in the working
@@ -165,6 +167,35 @@ pub struct RunArguments {
     /// unless given.
     #[arg(long, value_name = "CONNECTIONS")]
     pub joined_connections_per_account: Option<NonZeroU32>,
+    /// How many connections this Relay holds at once, from every Server
+    /// together, each from the moment it is taken until it ends, however far
+    /// it got. One past it is let go as it comes, before its TLS handshake
+    /// where the Relay serves HTTPS, and nothing the Relay holds is
+    /// disturbed. Keep it below the number of files the Relay's user may
+    /// have open. 8192 unless given.
+    #[arg(long, value_name = "CONNECTIONS")]
+    pub connections_at_once: Option<NonZeroU32>,
+    /// How many logins may be under way at this Relay at once, from every
+    /// Server together, each for as long as its user takes to finish it at
+    /// GitHub. A login past it is refused until one ends; each Server logs
+    /// in on one connection at a time, a later login taking the place of the
+    /// one it has under way. 128 unless given.
+    #[arg(long, value_name = "LOGINS")]
+    pub logins_at_once: Option<NonZeroU32>,
+    /// How many idle connections each Server whose Login stands may hold at
+    /// once: those on which it is doing nothing — not waiting to be reached,
+    /// not joined nor asking to be, not logging in. A Server holds one, to
+    /// hear at once that its Login stops standing, and one more for a moment
+    /// for each join it asks for or takes up. One past it is refused. 32
+    /// unless given.
+    #[arg(long, value_name = "CONNECTIONS")]
+    pub idle_connections_per_server: Option<NonZeroU32>,
+    /// How many idle connections each Server holding no Login that stands
+    /// may hold at once, before it logs in or as it learns its Login needs
+    /// renewing. One past it is refused, and each is let go once it has
+    /// asked nothing for 30 seconds. 4 unless given.
+    #[arg(long, value_name = "CONNECTIONS")]
+    pub idle_connections_per_server_without_login: Option<NonZeroU32>,
     /// How many seconds the Relay lets a connection go with nothing sent on
     /// it before it pings — a Server's waiting to be reached, or either side
     /// of a join carrying nothing — so a reverse proxy, load balancer or
@@ -194,6 +225,10 @@ struct ConfigFile {
     fresh_login_days: Option<NonZeroU32>,
     logins_per_account: Option<NonZeroU32>,
     joined_connections_per_account: Option<NonZeroU32>,
+    connections_at_once: Option<NonZeroU32>,
+    logins_at_once: Option<NonZeroU32>,
+    idle_connections_per_server: Option<NonZeroU32>,
+    idle_connections_per_server_without_login: Option<NonZeroU32>,
     keepalive_seconds: Option<NonZeroU32>,
 }
 
@@ -394,6 +429,10 @@ pub struct Settings {
     pub fresh_login_every: Option<Duration>,
     pub logins_per_account: NonZeroU32,
     pub joined_connections_per_account: NonZeroU32,
+    pub connections_at_once: NonZeroU32,
+    pub logins_at_once: NonZeroU32,
+    pub idle_connections_per_server: NonZeroU32,
+    pub idle_connections_per_server_without_login: NonZeroU32,
     pub keepalive: Duration,
     /// How the GitHub App's client ID and private key file were given, so a
     /// refusal of either says where to look.
@@ -541,6 +580,21 @@ pub fn settle(
             file.joined_connections_per_account
         })
         .unwrap_or(JOINED_CONNECTIONS_PER_ACCOUNT),
+        connections_at_once: number(arguments.connections_at_once, |file| {
+            file.connections_at_once
+        })
+        .unwrap_or(CONNECTIONS_AT_ONCE),
+        logins_at_once: number(arguments.logins_at_once, |file| file.logins_at_once)
+            .unwrap_or(LOGINS_AT_ONCE),
+        idle_connections_per_server: number(arguments.idle_connections_per_server, |file| {
+            file.idle_connections_per_server
+        })
+        .unwrap_or(IDLE_CONNECTIONS_PER_SERVER),
+        idle_connections_per_server_without_login: number(
+            arguments.idle_connections_per_server_without_login,
+            |file| file.idle_connections_per_server_without_login,
+        )
+        .unwrap_or(IDLE_CONNECTIONS_PER_SERVER_WITHOUT_LOGIN),
         keepalive: number(arguments.keepalive_seconds, |file| file.keepalive_seconds)
             .map_or(KEEPALIVE, |seconds| {
                 Duration::from_secs(u64::from(seconds.get()))
@@ -625,6 +679,12 @@ impl Settings {
             .with_trusted_proxies(self.trusted_proxies.clone())
             .with_logins_per_account(self.logins_per_account)
             .with_joined_connections_per_account(self.joined_connections_per_account)
+            .with_connections_at_once(self.connections_at_once)
+            .with_logins_at_once(self.logins_at_once)
+            .with_idle_connections_per_server(self.idle_connections_per_server)
+            .with_idle_connections_per_server_without_login(
+                self.idle_connections_per_server_without_login,
+            )
             .with_keepalive(self.keepalive)
             .with_admission(
                 Admission::nobody()
@@ -714,6 +774,10 @@ mod tests {
             fresh_login_days,
             logins_per_account,
             joined_connections_per_account,
+            connections_at_once,
+            logins_at_once,
+            idle_connections_per_server,
+            idle_connections_per_server_without_login,
             keepalive_seconds,
         )
         .to_vec()
@@ -783,7 +847,8 @@ mod tests {
     fn a_flag_overrides_its_key_and_a_list_flag_replaces_the_list() {
         let file = format!(
             "{MINIMAL}admit_users = [\"octocat\", \"mona\"]\ngithub_client_id = \"Iv23liFile\"\n\
-             logins_per_account = 8\nkeepalive_seconds = 5\n"
+             logins_per_account = 8\nkeepalive_seconds = 5\nconnections_at_once = 100\n\
+             idle_connections_per_server = 3\n"
         );
         let settings = settled(
             &file,
@@ -791,6 +856,7 @@ mod tests {
                 public_address: Some("https://relay.example.org".to_owned()),
                 admit_users: vec!["hubot".to_owned()],
                 logins_per_account: NonZeroU32::new(9),
+                idle_connections_per_server: NonZeroU32::new(5),
                 ..RunArguments::default()
             },
         )
@@ -803,6 +869,13 @@ mod tests {
         assert_eq!(
             settings.joined_connections_per_account,
             JOINED_CONNECTIONS_PER_ACCOUNT
+        );
+        assert_eq!(settings.connections_at_once.get(), 100);
+        assert_eq!(settings.idle_connections_per_server.get(), 5);
+        assert_eq!(settings.logins_at_once, LOGINS_AT_ONCE);
+        assert_eq!(
+            settings.idle_connections_per_server_without_login,
+            IDLE_CONNECTIONS_PER_SERVER_WITHOUT_LOGIN
         );
     }
 

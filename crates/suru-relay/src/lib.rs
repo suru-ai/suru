@@ -59,6 +59,7 @@ mod forwarded;
 mod github;
 mod identity;
 mod joiner;
+mod listener;
 mod operator;
 mod private_file;
 mod running;
@@ -67,7 +68,10 @@ mod store;
 mod tls;
 
 pub use admission::{Admission, AdmissionRule, Undecided};
-pub use caps::{JOINED_CONNECTIONS_PER_ACCOUNT, LOGINS_PER_ACCOUNT};
+pub use caps::{
+    CONNECTIONS_AT_ONCE, IDLE_CONNECTIONS_PER_SERVER, IDLE_CONNECTIONS_PER_SERVER_WITHOUT_LOGIN,
+    JOINED_CONNECTIONS_PER_ACCOUNT, LOGINS_AT_ONCE, LOGINS_PER_ACCOUNT,
+};
 pub use clock::Clock;
 pub use forwarded::{TrustedProxy, UnrecognizedProxy};
 pub use github::{GitHub, GitHubApp, GitHubAppKey};
@@ -116,6 +120,13 @@ pub const HANDSHAKES_AT_ONCE: usize = 256;
 /// configuration says otherwise: one for each joined connection the Relay
 /// carries, and one for each ended whose line its reader has yet to take in.
 const CONNECTION_LOG_CAPACITY: usize = 65_536;
+
+/// How long a Server holding no Login may leave a connection idle — asking
+/// nothing of the Relay, and with no login under way on it — before the Relay
+/// lets the connection go, unless its configuration says otherwise: as long
+/// as it may take over each step of proving itself, since a Server holding no
+/// Login asks what it came for the moment it has.
+const IDLE_TIMEOUT_WITHOUT_LOGIN: Duration = GREETING_TIMEOUT;
 
 /// How long a stopping Relay waits for its connection log to write the lines
 /// it owes, and then for its diagnostic log to say how many it gave up,
@@ -198,6 +209,11 @@ pub struct RelayConfig {
     fresh_login_every: Option<Duration>,
     logins_per_account: NonZeroU32,
     joined_connections_per_account: NonZeroU32,
+    connections_at_once: NonZeroU32,
+    logins_at_once: NonZeroU32,
+    idle_connections_per_server: NonZeroU32,
+    idle_connections_per_server_without_login: NonZeroU32,
+    idle_timeout_without_login: Duration,
 }
 
 impl RelayConfig {
@@ -236,6 +252,11 @@ impl RelayConfig {
             fresh_login_every: None,
             logins_per_account: LOGINS_PER_ACCOUNT,
             joined_connections_per_account: JOINED_CONNECTIONS_PER_ACCOUNT,
+            connections_at_once: CONNECTIONS_AT_ONCE,
+            logins_at_once: LOGINS_AT_ONCE,
+            idle_connections_per_server: IDLE_CONNECTIONS_PER_SERVER,
+            idle_connections_per_server_without_login: IDLE_CONNECTIONS_PER_SERVER_WITHOUT_LOGIN,
+            idle_timeout_without_login: IDLE_TIMEOUT_WITHOUT_LOGIN,
         }
     }
 
@@ -318,6 +339,55 @@ impl RelayConfig {
     /// `cap` rather than [`JOINED_CONNECTIONS_PER_ACCOUNT`].
     pub fn with_joined_connections_per_account(mut self, cap: NonZeroU32) -> Self {
         self.joined_connections_per_account = cap;
+        self
+    }
+
+    /// Caps how many connections the Relay holds at once, from every Server
+    /// together, at `cap` rather than [`CONNECTIONS_AT_ONCE`]: each from the
+    /// moment it is taken until it ends, however far it got — making its TLS
+    /// handshake, proving its Server's key, or carrying a join. A connection
+    /// past it is let go as it comes, before anything else is done with it,
+    /// and nothing the Relay holds is disturbed.
+    pub fn with_connections_at_once(mut self, cap: NonZeroU32) -> Self {
+        self.connections_at_once = cap;
+        self
+    }
+
+    /// Caps how many logins may be under way at the Relay at once, from every
+    /// Server together, at `cap` rather than [`LOGINS_AT_ONCE`]. A login past
+    /// it is refused until one ends; a Server's own later login takes the
+    /// place of the one it already has under way, since each Server logs in
+    /// on one connection at a time.
+    pub fn with_logins_at_once(mut self, cap: NonZeroU32) -> Self {
+        self.logins_at_once = cap;
+        self
+    }
+
+    /// Caps how many idle connections each Server whose Login stands may hold
+    /// at once at `cap` rather than [`IDLE_CONNECTIONS_PER_SERVER`]: those on
+    /// which it is doing nothing — not waiting to be reached, not joined nor
+    /// asking to be, not logging in — such as the one a Server keeps to hear
+    /// at once that its Login stops standing, and each it opens for a moment
+    /// before asking for a join on it. One past it is refused.
+    pub fn with_idle_connections_per_server(mut self, cap: NonZeroU32) -> Self {
+        self.idle_connections_per_server = cap;
+        self
+    }
+
+    /// Caps how many idle connections each Server holding no Login that
+    /// stands may hold at once at `cap` rather than
+    /// [`IDLE_CONNECTIONS_PER_SERVER_WITHOUT_LOGIN`]. One past it is refused.
+    pub fn with_idle_connections_per_server_without_login(mut self, cap: NonZeroU32) -> Self {
+        self.idle_connections_per_server_without_login = cap;
+        self
+    }
+
+    /// Has the Relay let go of a connection whose Server holds no Login that
+    /// stands once it has been idle for `timeout` — asking nothing, and with
+    /// no login under way on it — rather than for as long as the greeting
+    /// timeout allows each step of proving itself.
+    pub fn with_idle_timeout_without_login(mut self, timeout: Duration) -> Self {
+        self.idle_timeout_without_login = timeout;
         self
     }
 
@@ -496,19 +566,30 @@ async fn told_to_stop() -> Result<()> {
 }
 
 /// The address a connection to the Relay comes from, however the Relay
-/// listens.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Peer(pub(crate) SocketAddr);
+/// listens, and what says the connection has begun its conversation.
+#[derive(Clone, Debug)]
+pub(crate) struct Peer {
+    pub(crate) address: SocketAddr,
+    pub(crate) begun: listener::Begun,
+}
 
-impl Connected<IncomingStream<'_, TcpListener>> for Peer {
-    fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
-        Self(*stream.remote_addr())
+impl Connected<IncomingStream<'_, listener::Capped<TcpListener>>> for Peer {
+    fn connect_info(stream: IncomingStream<'_, listener::Capped<TcpListener>>) -> Self {
+        Self {
+            address: *stream.remote_addr(),
+            begun: stream.io().begun().clone(),
+        }
     }
 }
 
-impl Connected<IncomingStream<'_, tls::TlsListener>> for Peer {
-    fn connect_info(stream: IncomingStream<'_, tls::TlsListener>) -> Self {
-        Self(*stream.remote_addr())
+impl Connected<IncomingStream<'_, tls::TlsListener<listener::Capped<TcpListener>>>> for Peer {
+    fn connect_info(
+        stream: IncomingStream<'_, tls::TlsListener<listener::Capped<TcpListener>>>,
+    ) -> Self {
+        Self {
+            address: *stream.remote_addr(),
+            begun: stream.io().get_ref().0.begun().clone(),
+        }
     }
 }
 
@@ -579,6 +660,14 @@ pub async fn start(
         .await
         .with_context(|| format!("listen at {}", config.listen))?;
     let address = listener.local_addr().context("read the Relay's address")?;
+    // Every connection the Relay takes counts against its cap from the moment
+    // it is taken — before its TLS handshake, where it serves HTTPS — until
+    // it ends, and must begin its conversation within the greeting timeout.
+    let listener = listener::Capped::new(
+        listener,
+        config.connections_at_once,
+        config.greeting_timeout,
+    );
     let store = Store::open(&config.database)?;
     let admission = config
         .admission
@@ -598,6 +687,12 @@ pub async fn start(
         send_timeout: config.send_timeout,
         join_timeout: config.join_timeout,
         keepalive: config.keepalive,
+        idle_timeout_without_login: config.idle_timeout_without_login,
+        idle: caps::Idle::new(
+            config.idle_connections_per_server,
+            config.idle_connections_per_server_without_login,
+        ),
+        logins: caps::Logins::new(config.logins_at_once),
         joiner: joiner::Joiner::new(),
         standing: tokio::sync::Mutex::new(checks.verdicts()),
         holdings: standing::Holdings::new(),

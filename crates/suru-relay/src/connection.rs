@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::{
     Clock, Peer,
     admission::{self, Admission, Checks, Verdict, Verdicts},
-    caps::{Joined, Place},
+    caps::{Idle, IdlePlace, Joined, LoginPlace, Logins, Place},
     connection_log::{ConnectionLog, Entry, Party, Room},
     forwarded::{self, TrustedProxy},
     identity::{IdentityProvider, LoginRefusal},
@@ -62,6 +62,15 @@ pub(crate) struct Relay {
     /// it before it pings, so a reverse proxy that closes idle connections
     /// keeps it.
     pub(crate) keepalive: Duration,
+    /// How long a Server holding no Login that stands may leave a connection
+    /// idle — asking nothing, with no login under way on it — before the
+    /// Relay lets it go.
+    pub(crate) idle_timeout_without_login: Duration,
+    /// The idle connections each Server holds, held to their caps.
+    pub(crate) idle: Idle,
+    /// The logins under way, held to their cap, each Server's on one
+    /// connection at a time.
+    pub(crate) logins: Logins,
     /// The Servers waiting to be reached, and the joins asked of them, each
     /// handing on the connection it is taken up on.
     pub(crate) joiner: Joiner<Accepted>,
@@ -165,11 +174,11 @@ impl Relay {
 
 pub(crate) async fn connect(
     State(relay): State<Arc<Relay>>,
-    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
+    ConnectInfo(Peer { address, begun }): ConnectInfo<Peer>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let address = forwarded::network_address(peer.ip(), &headers, &relay.trusted_proxies);
+    let address = forwarded::network_address(address.ip(), &headers, &relay.trusted_proxies);
     // What a Server sends and what it has yet to take in are both held to a
     // bound, so one that pings without reading, or sends without end, costs
     // the Relay no more than that.
@@ -178,7 +187,12 @@ pub(crate) async fn connect(
         .max_write_buffer_size(2 * MAX_MESSAGE_LEN)
         .max_message_size(MAX_MESSAGE_LEN)
         .max_frame_size(MAX_MESSAGE_LEN)
-        .on_upgrade(move |socket| converse(socket, relay, address))
+        .on_upgrade(move |socket| {
+            // Its conversation begun, the connection is held to what the
+            // conversation allows from here.
+            begun.begin();
+            converse(socket, relay, address)
+        })
 }
 
 /// Converses with the Server whose connection comes from `address`.
@@ -311,12 +325,22 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Handover>,
             }
         }
     };
+    // Proven, the connection is idle until its Server asks something of it,
+    // and is idle again each time what it asked is done with, held to the
+    // Server's cap on idle connections throughout.
+    let mut idle = Some(idle_place(channel, relay, &key, held.is_some()).await?);
     channel.send(&RelayMessage::Proven { login }).await?;
     loop {
+        let idle = match idle.take() {
+            Some(idle) => idle,
+            None => idle_place(channel, relay, &key, held.is_some()).await?,
+        };
+        let stands = held.is_some();
         let asked = tokio::select! {
-            asked = channel.receive() => asked?,
+            asked = asked_while_idle(channel, relay, stands) => asked?,
             why = cut(&mut held) => return cut_off(channel, why).await,
         };
+        drop(idle);
         match asked {
             ServerMessage::BeginLogin { hostname } => {
                 log_in(channel, relay, &key, label(&hostname), &mut held).await?;
@@ -391,6 +415,54 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Handover>,
             }
         }
     }
+}
+
+/// A place for the connection of the Server whose key is `key` among its
+/// idle connections, where its Login stands on it, as `stands` says, or where
+/// it does not: refusing it, and ending the connection, where the Server
+/// holds as many as it may.
+async fn idle_place(
+    channel: &mut Channel,
+    relay: &Relay,
+    key: &[u8],
+    stands: bool,
+) -> Result<IdlePlace, Ended> {
+    match relay.idle.take(key, stands) {
+        Some(place) => Ok(place),
+        None => {
+            let limit = relay.idle.limit(stands);
+            let message = if stands {
+                format!(
+                    "this Server holds {limit} idle connections at this Relay, as many as it may; \
+                     it is let have another once one ends or is put to use"
+                )
+            } else {
+                format!(
+                    "this Server holds {limit} idle connections at this Relay, as many as a \
+                     Server holding no Login there may; it is let have another once one ends or \
+                     is put to use"
+                )
+            };
+            channel.refuse(Refusal::Unavailable, message).await
+        }
+    }
+}
+
+/// The next thing the Server asks on a connection idle until it does, where
+/// its Login stands on the connection, as `stands` says; where it does not,
+/// the connection is let go once it has asked nothing for the Relay's idle
+/// timeout for connections holding no Login.
+async fn asked_while_idle(
+    channel: &mut Channel,
+    relay: &Relay,
+    stands: bool,
+) -> Result<ServerMessage, Ended> {
+    if stands {
+        return channel.receive().await;
+    }
+    tokio::time::timeout(relay.idle_timeout_without_login, channel.receive())
+        .await
+        .unwrap_or(Err(Ended))
 }
 
 /// Has a Server wait on this connection to be reached, as `waiting`, telling
@@ -732,9 +804,21 @@ async fn log_in(
     hostname: String,
     held: &mut Option<Held>,
 ) -> Result<(), Ended> {
-    let login = match attending(channel, relay.provider.begin_login()).await? {
+    let Some(mut place) = relay.logins.begin(key) else {
+        return channel
+            .send(&refused(
+                Refusal::LoginUnavailable,
+                "this Relay has as many logins under way at once as it takes; log in again in a \
+                 minute",
+            ))
+            .await;
+    };
+    let login = match attending(channel, &mut place, relay.provider.begin_login()).await? {
         Ok(login) => login,
-        Err(refusal) => return channel.send(&login_refused(refusal)).await,
+        Err(refusal) => {
+            drop(place);
+            return channel.send(&login_refused(refusal)).await;
+        }
     };
     channel
         .send(&RelayMessage::LoginStarted {
@@ -746,27 +830,35 @@ async fn log_in(
         .await?;
     let outcome = attending(
         channel,
+        &mut place,
         tokio::time::timeout(login.expires_in, relay.provider.finish_login(&login)),
     )
     .await?
     .unwrap_or(Err(LoginRefusal::Expired));
     let identity = match outcome {
         Ok(identity) => identity,
-        Err(refusal) => return channel.send(&login_refused(refusal)).await,
+        Err(refusal) => {
+            drop(place);
+            return channel.send(&login_refused(refusal)).await;
+        }
     };
     let provider = relay.provider.name();
     // The rules are asked with nothing held, and what they find takes effect
     // under the standing lock only where no asking begun later has found
     // otherwise since.
     let check = relay.checks.begin(provider, &identity.subject);
-    match attending(
+    let verdict = attending(
         channel,
+        &mut place,
         relay
             .admission
             .decide(provider, &identity, relay.admission_timeout),
     )
-    .await?
-    {
+    .await?;
+    // The login has ended, however it is told: its place is free for
+    // another from here.
+    drop(place);
+    match verdict {
         Verdict::Admitted => {}
         // A refusal is news of the identity's Account as well: it lapses at
         // once, as it would at the Relay's next check.
@@ -847,14 +939,28 @@ async fn log_in(
 /// otherwise: pinged each keepalive interval it is quiet, so a reverse proxy
 /// that closes idle connections keeps it however slowly the provider
 /// answers. A Server that goes, or speaks, before it is done abandons the
-/// login.
-async fn attending<T>(channel: &mut Channel, work: impl Future<Output = T>) -> Result<T, Ended> {
+/// login, and one that begins another login, as `place` says, gives this one
+/// up.
+async fn attending<T>(
+    channel: &mut Channel,
+    place: &mut LoginPlace,
+    work: impl Future<Output = T>,
+) -> Result<T, Ended> {
     tokio::select! {
         done = work => Ok(done),
         spoken = channel.receive() => {
             spoken?;
             channel
                 .refuse(Refusal::Unexpected, "a Server waits for its login to end")
+                .await
+        }
+        () = place.given_up() => {
+            channel
+                .refuse(
+                    Refusal::LoginUnavailable,
+                    "this login was given up for a later login this Server began, since a \
+                     Server logs in on one connection at a time",
+                )
                 .await
         }
     }

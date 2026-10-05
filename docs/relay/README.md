@@ -502,6 +502,23 @@ Each Account may have at most 64 Servers logged in (`logins_per_account`) and 25
 through the Relay holds one joined connection. Past a cap, a login or a join is refused, and Suru tells its user
 which cap was reached, to ask you to raise it or to remove a Login. Raise either in the configuration.
 
+Anyone who can reach the Relay can open a connection to it and prove a key made up on the spot, admitted or not, so
+connections are capped as well, whoever opens them:
+
+- the Relay holds at most 8,192 connections at once, from everyone together (`connections_at_once`), letting any
+  past that go as it comes — before its TLS handshake, where it serves HTTPS — without disturbing what it holds,
+  and saying so once on standard error. Keep it below the number of files the Relay's user may have open;
+- at most 128 logins are under way at once (`logins_at_once`), and each Server logs in on one connection at a time;
+- each Server may hold at most 32 idle connections — neither waiting to be reached, nor joined, nor logging in —
+  where its Login stands (`idle_connections_per_server`), and 4 where it holds none
+  (`idle_connections_per_server_without_login`), each of the latter let go once it has asked nothing for 30
+  seconds.
+
+A Server holds one idle connection of its own, and one more for a moment for each join it asks for or takes up, so
+only a Server reaching dozens of Remotes through the Relay at the same moment comes near them; one refused is
+tried again. [The configuration reference](configuration.md#connections_at_once-logins_at_once-idle_connections_per_server-idle_connections_per_server_without_login)
+says what each counts.
+
 ## Requiring a fresh login
 
 A Login stands until it is removed, so an unattended machine stays reachable for months. To require each Account to

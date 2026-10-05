@@ -70,6 +70,18 @@ admit_organizations = ["example-org"]
 # logins_per_account = 64
 # joined_connections_per_account = 256
 
+# How many connections the Relay holds at once, from every Server together —
+# keep it below the number of files the Relay's user may have open — and how
+# many logins may be under way at once.
+# connections_at_once = 8192
+# logins_at_once = 128
+
+# How many idle connections each Server may hold at once — those on which it
+# is neither waiting to be reached, nor joined, nor logging in — where its
+# Login stands, and where it holds none.
+# idle_connections_per_server = 32
+# idle_connections_per_server_without_login = 4
+
 # How many seconds the Relay lets a connection go with nothing sent on it
 # before it pings — a Server waiting to be reached, one logging in however
 # slowly GitHub answers, and either side of a join carrying nothing — so a

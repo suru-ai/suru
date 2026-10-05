@@ -49,6 +49,10 @@ Relay does not know.
 | `fresh_login_days` | `--fresh-login-days` | whole number above 0 | off |
 | `logins_per_account` | `--logins-per-account` | whole number above 0 | `64` |
 | `joined_connections_per_account` | `--joined-connections-per-account` | whole number above 0 | `256` |
+| `connections_at_once` | `--connections-at-once` | whole number above 0 | `8192` |
+| `logins_at_once` | `--logins-at-once` | whole number above 0 | `128` |
+| `idle_connections_per_server` | `--idle-connections-per-server` | whole number above 0 | `32` |
+| `idle_connections_per_server_without_login` | `--idle-connections-per-server-without-login` | whole number above 0 | `4` |
 | `keepalive_seconds` | `--keepalive-seconds` | whole number above 0 | `20` |
 
 ### `database`
@@ -168,6 +172,43 @@ until a Server forgets its Login or the operator removes one. `joined_connection
 many connections the Relay joins for one Account at once: a Server keeping a Remote in view through the
 Relay holds one, so an Account whose Servers each keep the others in view holds one for each ordered
 pair. A join past it is refused until one ends. Suru tells its user which cap was reached.
+
+### `connections_at_once`, `logins_at_once`, `idle_connections_per_server`, `idle_connections_per_server_without_login`
+
+Caps on connections, which anyone who can reach the Relay may open, logged in or not, so nobody — and no
+number of identity keys made up on the spot — can exhaust it. Together with the caps on each Account and
+those the Relay holds every Server to — four connections waiting to be reached, the oldest giving way to
+a fifth, and sixteen joins asked of it and not yet taken up — whatever a connection is doing, it is held
+to a cap.
+
+- `connections_at_once` caps how many connections the Relay holds at once, from everyone together, each
+  from the moment it is taken until it ends, however far it got: sending its request, making its TLS
+  handshake, proving its Server's key, waiting to be reached, or carrying a join. A connection past it is
+  let go as it comes — where the Relay serves HTTPS, before any TLS handshake — and nothing the Relay
+  holds is disturbed; a Server let go connects again with backoff, and Suru reads the Relay as
+  Unreachable meanwhile. The Relay says once on standard error that it has reached the cap, and once that
+  it takes connections again. Each connection costs the Relay a socket and its buffers — a little over a
+  hundred kibibytes idle, up to twice that carrying a join — so the default bounds them to a gibibyte or
+  two. Keep it below the number of files the Relay's user may have open (`ulimit -n`; `LimitNOFILE=` for
+  a systemd service), or connections past that are refused by the operating system instead, each costing
+  the Relay a second's pause.
+- `logins_at_once` caps how many logins may be under way at once, from every Server together, each for
+  as long as its user takes to finish it at GitHub — up to a quarter of an hour. A login past it is
+  refused, saying the Relay has as many logins under way as it takes, and the Server may begin one again
+  later on the same connection. Each Server logs in on one connection at a time: a login it begins takes
+  the place of the one it already has under way, which is given up, as Suru gives it up as it begins
+  another.
+- `idle_connections_per_server` caps how many idle connections each Server whose Login stands may hold at
+  once: connections on which it is doing nothing — not waiting to be reached, not joined nor asking to
+  be, not logging in. A Server holds one, to hear at once that its Login stops standing, unless it waits
+  on that one to be reached, and one more for each join it asks for or takes up, for the moment between
+  proving its key and asking. A connection past it is refused as it proves the Server's key, and one
+  that becomes idle past it — its join refused, say — is let go.
+- `idle_connections_per_server_without_login` caps the same for a Server holding no Login that stands:
+  one that has yet to log in, or whose Login needs renewing. Such a Server asks what it came for — to
+  log in, to be forgotten, or only to learn its Login needs renewing — the moment it has proven its key,
+  so a connection of one that asks nothing for 30 seconds is let go as well. A login under way is not
+  idle, however long it takes.
 
 ### `keepalive_seconds`
 

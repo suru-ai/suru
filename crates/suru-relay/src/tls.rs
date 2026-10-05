@@ -19,7 +19,6 @@
 
 use std::{
     fmt,
-    io::ErrorKind,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
@@ -27,16 +26,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use axum::serve::Listener;
 use rustls::{
     crypto::CryptoProvider,
     pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
-use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::{Semaphore, mpsc},
-};
+use tokio::sync::{Semaphore, mpsc};
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
 /// How many connections whose TLS handshake has completed may wait for the
@@ -286,24 +283,24 @@ pub(crate) fn server_config(certificate: Arc<Certificate>) -> Arc<rustls::Server
     Arc::new(config)
 }
 
-/// A listener serving HTTPS: it hands on each connection made to it once its
-/// TLS handshake has completed, each handshake made on its own and given up
-/// past a timeout, so none slow to make one holds up the rest — and no more
-/// of them under way at once than it is allowed, taking no connection on past
-/// that until one has ended or been handed on, so connections that never
-/// make one hold no more of the Relay than that, the rest waiting their turn
-/// in the operating system's queue.
-pub(crate) struct TlsListener {
+/// A listener serving HTTPS: it hands on each connection the listener it
+/// serves on takes, once its TLS handshake has completed, each handshake made
+/// on its own and given up past a timeout, so none slow to make one holds up
+/// the rest — and no more of them under way at once than it is allowed,
+/// taking no connection on past that until one has ended or been handed on,
+/// so connections that never make one hold no more of the Relay than that,
+/// the rest waiting their turn in the operating system's queue.
+pub(crate) struct TlsListener<L: Listener> {
     address: SocketAddr,
-    handshaken: mpsc::Receiver<(TlsStream<TcpStream>, SocketAddr)>,
+    handshaken: mpsc::Receiver<(TlsStream<L::Io>, SocketAddr)>,
 }
 
-impl TlsListener {
-    /// Serves HTTPS as `config` says on the connections `listener` accepts,
-    /// at most `at_once` handshakes under way at a time, each given
+impl<L: Listener<Addr = SocketAddr>> TlsListener<L> {
+    /// Serves HTTPS as `config` says on the connections `listener` takes, at
+    /// most `at_once` handshakes under way at a time, each given
     /// `handshake_timeout`, until the listener returned is dropped.
     pub(crate) fn new(
-        listener: TcpListener,
+        mut listener: L,
         config: Arc<rustls::ServerConfig>,
         handshake_timeout: Duration,
         at_once: usize,
@@ -322,16 +319,9 @@ impl TlsListener {
                     }
                     () = hand_on.closed() => return,
                 };
-                let accepted = tokio::select! {
+                let (stream, peer) = tokio::select! {
                     accepted = listener.accept() => accepted,
                     () = hand_on.closed() => return,
-                };
-                let (stream, peer) = match accepted {
-                    Ok(accepted) => accepted,
-                    Err(error) => {
-                        pause_after(&error).await;
-                        continue;
-                    }
                 };
                 let acceptor = acceptor.clone();
                 let hand_on = hand_on.clone();
@@ -352,8 +342,8 @@ impl TlsListener {
     }
 }
 
-impl axum::serve::Listener for TlsListener {
-    type Io = TlsStream<TcpStream>;
+impl<L: Listener<Addr = SocketAddr>> Listener for TlsListener<L> {
+    type Io = TlsStream<L::Io>;
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
@@ -368,18 +358,4 @@ impl axum::serve::Listener for TlsListener {
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
         Ok(self.address)
     }
-}
-
-/// Waits, after a failure to accept a connection, before trying again: not
-/// at all where that one connection failed, and a second where the listener
-/// itself did — out of file descriptors, say — as axum's own listener does.
-async fn pause_after(error: &std::io::Error) {
-    if matches!(
-        error.kind(),
-        ErrorKind::ConnectionRefused | ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset
-    ) {
-        return;
-    }
-    tracing::error!("could not accept a connection: {error}");
-    tokio::time::sleep(Duration::from_secs(1)).await;
 }

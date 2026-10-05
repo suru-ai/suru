@@ -4188,6 +4188,411 @@ async fn a_join_not_taken_up_in_time_gives_its_place_back_before_it_is_refused()
     relay.running.shutdown().await.unwrap();
 }
 
+impl Client {
+    /// Opens a WebSocket to the Relay, where it takes the connection: none
+    /// where it lets the connection go as it comes.
+    async fn try_connect(relay: &Relay) -> Option<Self> {
+        let address = format!("ws://{}/connect", relay.running.address());
+        match timeout(DEADLINE, tokio_tungstenite::connect_async(address))
+            .await
+            .expect("the Relay answers in time, or lets the connection go")
+        {
+            Ok((socket, _)) => Some(Self {
+                socket,
+                known_as: relay.public_address.clone(),
+            }),
+            Err(_) => None,
+        }
+    }
+
+    /// Connects once the Relay has room for another connection, trying again
+    /// for as long as it lets each go.
+    async fn connect_once_there_is_room(relay: &Relay) -> Self {
+        timeout(DEADLINE, async {
+            loop {
+                if let Some(client) = Self::try_connect(relay).await {
+                    return client;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the Relay comes to have room for another connection")
+    }
+
+    /// Proves `key` once the Relay takes another idle connection of its
+    /// Server's, trying again for as long as it refuses one: the connection,
+    /// and what the Relay says of its Login.
+    async fn kept_once_there_is_room(relay: &Relay, key: &KeyPair) -> (Self, Option<Account>) {
+        timeout(DEADLINE, async {
+            loop {
+                let mut client = Self::connect(relay).await;
+                match client.prove(key).await {
+                    RelayMessage::Proven { login } => return (client, login),
+                    refused => assert_eq!(refusal(&refused), Some(&Refusal::Unavailable)),
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the Relay comes to take another of the Server's idle connections")
+    }
+
+    /// Proves `key` and begins a login on this connection: the code its user
+    /// would enter.
+    async fn begin_login(&mut self, key: &KeyPair) -> String {
+        assert!(matches!(self.prove(key).await, RelayMessage::Proven { .. }));
+        self.begun_login().await
+    }
+
+    /// Begins a login on this proven connection: the code its user would
+    /// enter.
+    async fn begun_login(&mut self) -> String {
+        self.say(&ServerMessage::BeginLogin {
+            hostname: "workstation".to_owned(),
+        })
+        .await;
+        match self.hear().await {
+            RelayMessage::LoginStarted { user_code, .. } => user_code,
+            other => panic!("the Relay begins a login, not {other:?}"),
+        }
+    }
+}
+
+/// The identity `subject`, named `username`.
+fn who(subject: &str, username: &str) -> Identity {
+    Identity {
+        subject: subject.to_owned(),
+        username: username.to_owned(),
+    }
+}
+
+/// What a Server logging in as `username` at the scripted provider is told
+/// as its login is done.
+fn login_done(username: &str) -> RelayMessage {
+    RelayMessage::LoginDone {
+        account: Account {
+            provider: "scripted".to_owned(),
+            username: username.to_owned(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn a_relay_holding_as_many_connections_as_it_may_lets_more_go_and_leaves_what_it_holds_alone()
+{
+    let relay = relay().await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    // Started afresh, holding no connection, the Relay takes three at once:
+    // a Server waiting, one asking to be joined to it, and the connection
+    // taking the join up.
+    let relay = relay
+        .restarted(|config| config.with_connections_at_once(cap(3)))
+        .await;
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+    let (mut asking, mut taken_up) = joined_on(&relay, &mut waiting, &workstation, &laptop).await;
+
+    for _ in 0..3 {
+        assert!(
+            Client::try_connect(&relay).await.is_none(),
+            "a connection past the cap is let go as it comes"
+        );
+    }
+    asking.carry(b"carried throughout").await;
+    assert_eq!(taken_up.carried().await, b"carried throughout");
+    taken_up.carry(b"both ways").await;
+    assert_eq!(asking.carried().await, b"both ways");
+
+    // A connection ending makes room for another.
+    asking.socket.close(None).await.unwrap();
+    assert!(taken_up.ended().await);
+    let mut next = Client::connect_once_there_is_room(&relay).await;
+    assert!(matches!(
+        next.prove(&laptop).await,
+        RelayMessage::Proven { login: Some(_) }
+    ));
+    waiting.say(&ServerMessage::Wait).await;
+    assert_eq!(
+        refusal(&waiting.hear().await),
+        Some(&Refusal::Unexpected),
+        "the waiting Server still waits"
+    );
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_connection_that_never_begins_its_conversation_is_let_go_in_time_making_room_for_another()
+{
+    const GREETING: Duration = Duration::from_millis(200);
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config
+            .with_connections_at_once(cap(1))
+            .with_greeting_timeout(GREETING)
+    })
+    .await;
+    let key = key();
+    // One connection says nothing at all, and another asks for something
+    // other than a WebSocket, which HTTP would keep open for its next
+    // request; each holds the one place until the Relay lets it go.
+    let mut silent = TcpStream::connect(relay.running.address()).await.unwrap();
+    let mut asking_otherwise = Client::connect_once_there_is_room_raw(&relay).await;
+    for stream in [&mut silent, &mut asking_otherwise] {
+        let mut byte = [0_u8; 1024];
+        loop {
+            match timeout(DEADLINE, stream.read(&mut byte))
+                .await
+                .expect("the Relay lets the connection go in time")
+            {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+    let mut server = Client::connect_once_there_is_room(&relay).await;
+    assert_eq!(
+        server.prove(&key).await,
+        RelayMessage::Proven { login: None }
+    );
+    relay.running.shutdown().await.unwrap();
+}
+
+impl Client {
+    /// Connects once the Relay has room, asking over plain HTTP for its
+    /// endpoint without asking for a WebSocket: the connection, which HTTP
+    /// keeps open for a next request once it is answered.
+    async fn connect_once_there_is_room_raw(relay: &Relay) -> TcpStream {
+        timeout(DEADLINE, async {
+            loop {
+                let mut stream = TcpStream::connect(relay.running.address()).await.unwrap();
+                stream
+                    .write_all(b"GET /connect HTTP/1.1\r\nHost: relay.example.com\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut answer = [0_u8; 12];
+                if stream.read_exact(&mut answer).await.is_ok() {
+                    assert!(answer.starts_with(b"HTTP/1.1 "), "{answer:?}");
+                    return stream;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the Relay comes to have room for another connection")
+    }
+}
+
+#[tokio::test]
+async fn a_server_holding_as_many_idle_connections_as_it_may_is_refused_another_and_what_it_does_goes_on()
+ {
+    let relay = relay().await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    // Started afresh, so no connection a login was made on is held still.
+    let relay = relay
+        .restarted(|config| config.with_idle_connections_per_server(cap(2)))
+        .await;
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+    let (mut asking, mut taken_up) = joined_on(&relay, &mut waiting, &workstation, &laptop).await;
+    let (mut first, _) = Client::kept(&relay, &workstation).await;
+    let (_second, _) = Client::kept(&relay, &workstation).await;
+
+    let mut one_too_many = Client::connect(&relay).await;
+    let refused = one_too_many.prove(&workstation).await;
+    let RelayMessage::Refused {
+        refusal: Refusal::Unavailable,
+        message,
+    } = &refused
+    else {
+        panic!("an idle connection past the cap is refused, not {refused:?}");
+    };
+    assert!(message.contains("idle connections"), "{message}");
+    assert!(one_too_many.ended().await);
+
+    // What the Server waits on, and what it has joined, go on, and another
+    // Server's connections are its own.
+    asking.carry(b"carried throughout").await;
+    assert_eq!(taken_up.carried().await, b"carried throughout");
+    let _another = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    waiting.reached().await;
+    assert!(Client::kept(&relay, &laptop).await.1.is_some());
+    first.say(&ServerMessage::Wait).await;
+    assert_eq!(first.hear().await, RelayMessage::Waiting);
+
+    // An idle connection put to use makes room for another.
+    let (_third, login) = Client::kept_once_there_is_room(&relay, &workstation).await;
+    assert!(login.is_some());
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_server_holding_no_login_is_held_to_a_few_idle_connections_and_its_login_goes_on() {
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config
+            .with_idle_connections_per_server_without_login(cap(2))
+            .with_idle_connections_per_server(cap(8))
+    })
+    .await;
+    let (newcomer, stranger) = (key(), key());
+    let mut logging_in = Client::connect(&relay).await;
+    let code = logging_in.begin_login(&newcomer).await;
+    let mut idle = Vec::new();
+    for _ in 0..2 {
+        let (kept, login) = Client::kept(&relay, &newcomer).await;
+        assert_eq!(login, None);
+        idle.push(kept);
+    }
+
+    let mut one_too_many = Client::connect(&relay).await;
+    assert_eq!(
+        refusal(&one_too_many.prove(&newcomer).await),
+        Some(&Refusal::Unavailable),
+        "an idle connection past the cap of a Server holding no Login is refused"
+    );
+    assert!(one_too_many.ended().await);
+    assert_eq!(
+        Client::kept(&relay, &stranger).await.1,
+        None,
+        "another Server's connections are its own"
+    );
+
+    // The login under way goes on, and once its Login stands the Server is
+    // held to the cap of a Server holding one.
+    assert!(relay.provider.approve(&code, who("17", "octo")));
+    assert_eq!(logging_in.hear().await, login_done("octo"));
+    let (_kept, login) = Client::kept(&relay, &newcomer).await;
+    assert!(login.is_some());
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_connection_of_a_server_holding_no_login_that_asks_nothing_is_let_go_soon() {
+    const IDLE: Duration = Duration::from_millis(200);
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_idle_timeout_without_login(IDLE)
+    })
+    .await;
+    let (workstation, newcomer, stranger) = (key(), key(), key());
+    Client::logged_in(&relay, &workstation, "17", "octo").await;
+    let begun = tokio::time::Instant::now();
+    let (mut standing, login) = Client::kept(&relay, &workstation).await;
+    assert!(login.is_some());
+    let mut logging_in = Client::connect(&relay).await;
+    let code = logging_in.begin_login(&newcomer).await;
+    let (mut idle, login) = Client::kept(&relay, &stranger).await;
+    assert_eq!(login, None);
+
+    // Bounded as a whole, since the Relay's pings keep each wait for a frame
+    // short.
+    assert!(
+        timeout(DEADLINE, idle.ended())
+            .await
+            .expect("the idle connection is let go in time"),
+        "a connection that holds no Login and asks nothing is let go"
+    );
+    // Neither a connection standing on a Login nor a login under way is.
+    tokio::time::sleep_until(begun + IDLE * 3).await;
+    assert!(relay.provider.approve(&code, who("99", "newcomer")));
+    assert_eq!(logging_in.hear().await, login_done("newcomer"));
+    standing.say(&ServerMessage::Wait).await;
+    assert_eq!(standing.hear().await, RelayMessage::Waiting);
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_relay_with_as_many_logins_under_way_as_it_takes_refuses_another_until_one_ends() {
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_logins_at_once(cap(1))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    let mut first = Client::connect(&relay).await;
+    let code = first.begin_login(&workstation).await;
+
+    let mut second = Client::connect(&relay).await;
+    assert!(matches!(
+        second.prove(&laptop).await,
+        RelayMessage::Proven { login: None }
+    ));
+    second
+        .say(&ServerMessage::BeginLogin {
+            hostname: "laptop".to_owned(),
+        })
+        .await;
+    let refused = second.hear().await;
+    let RelayMessage::Refused {
+        refusal: Refusal::LoginUnavailable,
+        message,
+    } = &refused
+    else {
+        panic!("a login past the cap is refused, not {refused:?}");
+    };
+    assert!(message.contains("logins under way"), "{message}");
+
+    // The login under way goes on, and once it has ended there is room for
+    // another, which the refused Server may ask for on the same connection.
+    assert!(relay.provider.approve(&code, who("17", "octo")));
+    assert_eq!(first.hear().await, login_done("octo"));
+    let code = second.begun_login().await;
+    assert!(relay.provider.approve(&code, who("17", "octo")));
+    assert_eq!(second.hear().await, login_done("octo"));
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_server_logs_in_on_one_connection_at_a_time_the_later_login_taking_the_earlier_ones_place()
+ {
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_logins_at_once(cap(1))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    let mut earlier = Client::connect(&relay).await;
+    earlier.begin_login(&workstation).await;
+
+    // The same Server's later login takes the place of its earlier one, which
+    // is given up, as a Server gives it up as it begins another.
+    let mut later = Client::connect(&relay).await;
+    let code = later.begin_login(&workstation).await;
+    // Bounded as a whole, since the Relay's pings keep each wait for a frame
+    // short.
+    let given_up = timeout(DEADLINE, earlier.hear())
+        .await
+        .expect("the earlier login is given up in time");
+    let RelayMessage::Refused {
+        refusal: Refusal::LoginUnavailable,
+        message,
+    } = &given_up
+    else {
+        panic!("the earlier login is given up, not {given_up:?}");
+    };
+    assert!(message.contains("later login"), "{message}");
+    assert!(earlier.ended().await);
+
+    // Another Server finds the one place taken still.
+    let mut another = Client::connect(&relay).await;
+    assert!(matches!(
+        another.prove(&laptop).await,
+        RelayMessage::Proven { login: None }
+    ));
+    another
+        .say(&ServerMessage::BeginLogin {
+            hostname: "laptop".to_owned(),
+        })
+        .await;
+    assert_eq!(
+        refusal(&another.hear().await),
+        Some(&Refusal::LoginUnavailable)
+    );
+    assert!(relay.provider.approve(&code, who("17", "octo")));
+    assert_eq!(later.hear().await, login_done("octo"));
+    relay.running.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn the_relay_binary_caps_each_account_as_its_operator_says_and_refuses_a_cap_of_nothing() {
     let directory = tempfile::tempdir().unwrap();
@@ -4212,6 +4617,10 @@ async fn the_relay_binary_caps_each_account_as_its_operator_says_and_refuses_a_c
         ("--joined-connections-per-account", "0"),
         ("--logins-per-account", "4294967296"),
         ("--joined-connections-per-account", "lots"),
+        ("--connections-at-once", "0"),
+        ("--logins-at-once", "0"),
+        ("--idle-connections-per-server", "0"),
+        ("--idle-connections-per-server-without-login", "none"),
     ] {
         let refused = binary().args([flag, value]).output().await.unwrap();
         let said = String::from_utf8_lossy(&refused.stderr);
@@ -4233,6 +4642,13 @@ async fn the_relay_binary_caps_each_account_as_its_operator_says_and_refuses_a_c
             suru_relay::JOINED_CONNECTIONS_PER_ACCOUNT
         ),
         format!("{} unless given", suru_relay::KEEPALIVE.as_secs()),
+        format!("{} unless given", suru_relay::CONNECTIONS_AT_ONCE),
+        format!("{} unless given", suru_relay::LOGINS_AT_ONCE),
+        format!("{} unless given", suru_relay::IDLE_CONNECTIONS_PER_SERVER),
+        format!(
+            "{} unless given",
+            suru_relay::IDLE_CONNECTIONS_PER_SERVER_WITHOUT_LOGIN
+        ),
     ] {
         assert!(
             help.split_whitespace()
