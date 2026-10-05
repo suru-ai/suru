@@ -56,10 +56,10 @@ pub(crate) struct SecretServiceStore {
 
 /// The D-Bus bus the Secret Service is asked on.
 enum Bus {
-    /// The user's session bus: where `DBUS_SESSION_BUS_ADDRESS` says, or
-    /// else `$XDG_RUNTIME_DIR/bus`.
+    /// The user's session bus: at the addresses `DBUS_SESSION_BUS_ADDRESS`
+    /// lists, or else `$XDG_RUNTIME_DIR/bus`.
     Session,
-    /// The bus at an address, in tests.
+    /// The bus at the addresses listed, in tests.
     #[cfg(test)]
     At(String),
     /// A peer that answers as the Secret Service itself, with no bus
@@ -150,14 +150,18 @@ impl IdentityStore for SecretServiceStore {
     }
 }
 
-/// A connection to the D-Bus bus `bus` names.
+/// A connection to the D-Bus bus `bus` names, at the first of its addresses
+/// a connection is made at.
 async fn connect(bus: &Bus) -> Result<Connection, StoreUnavailable> {
-    let address = match bus {
-        Bus::Session => zbus::Address::session()
-            .context("could not tell where the D-Bus session bus is")?
-            .to_string(),
+    let addresses = match bus {
+        Bus::Session => match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+            Ok(addresses) => addresses,
+            Err(_) => zbus::Address::session()
+                .context("could not tell where the D-Bus session bus is")?
+                .to_string(),
+        },
         #[cfg(test)]
-        Bus::At(address) => address.clone(),
+        Bus::At(addresses) => addresses.clone(),
         #[cfg(test)]
         Bus::Peer(socket) => {
             let socket = tokio::net::UnixStream::connect(socket)
@@ -170,13 +174,30 @@ async fn connect(bus: &Bus) -> Result<Connection, StoreUnavailable> {
                 .context("could not connect to the Secret Service")?);
         }
     };
-    connect_at(&address).await.map_err(|error| {
-        anyhow!("{error:#}")
-            .context(format!(
-                "could not connect to the D-Bus session bus at {address}"
-            ))
-            .into()
-    })
+    let mut unconnected = Vec::new();
+    for address in addresses.split(';').filter(|address| !address.is_empty()) {
+        match connect_at(address).await {
+            Ok(bus) => return Ok(bus),
+            Err(error) => unconnected.push((address, error)),
+        }
+    }
+    let why = match unconnected.as_slice() {
+        [] => anyhow!("it names no address"),
+        [(_, error)] => anyhow!("{error:#}"),
+        _ => anyhow!(
+            "{}",
+            unconnected
+                .iter()
+                .map(|(address, error)| format!("at {address}, {error:#}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    };
+    Err(why
+        .context(format!(
+            "could not connect to the D-Bus session bus at {addresses}"
+        ))
+        .into())
 }
 
 /// A connection to the D-Bus bus at `address`. Its socket is connected
@@ -778,6 +799,42 @@ mod tests {
             format!("could not connect to the D-Bus session bus at {address}")
         );
         assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    /// Each of the addresses a session bus is listed at is tried in turn,
+    /// until a connection is made at one; where none is, each says why.
+    #[test]
+    fn each_address_of_the_bus_is_tried_in_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = format!("unix:path={}", directory.path().join("missing").display());
+        let path = directory.path().join("bus");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listening = format!("unix:path={}", path.display());
+
+        let store = SecretServiceStore::on(Bus::At(format!("{missing};{listening}")))
+            .with_give_up_after(Duration::from_millis(50));
+        let error = store.get(&ItemId::random()).unwrap_err();
+        assert_eq!(error.to_string(), "it did not answer within 50ms");
+        assert!(
+            listener.accept().is_ok(),
+            "the second address is connected to"
+        );
+
+        let addresses = format!("{missing};{missing}");
+        let store = SecretServiceStore::on(Bus::At(addresses.clone()));
+        let error = store.get(&ItemId::random()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("could not connect to the D-Bus session bus at {addresses}")
+        );
+        assert_eq!(
+            format!("{error:#}")
+                .matches(&format!("at {missing}, "))
+                .count(),
+            2,
+            "{error:#}"
+        );
     }
 
     /// A call to a bus whose backlog is full, whose socket a blocking
