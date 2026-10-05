@@ -108,6 +108,9 @@ pub(crate) struct Relay {
     /// How often the Relay tries again to record a lapse it found and could
     /// not record.
     pub(crate) lapse_retry_interval: Duration,
+    /// How often the Relay asks again about each Account its rules could not
+    /// tell about as it started.
+    pub(crate) undecided_recheck_interval: Duration,
     /// Told each time the Relay finds a lapse it cannot record, so it tries
     /// again until it can.
     pub(crate) lapses_unrecorded: tokio::sync::Notify,
@@ -330,6 +333,17 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Handover>,
     let (login, mut held) = {
         let standing = relay.standing.lock().await;
         match relay.store.standing(&key, relay.fresh_since()).await {
+            Ok(Some((account, _))) if standing.undecided(account) => {
+                drop(standing);
+                return channel
+                    .refuse(
+                        Refusal::Unavailable,
+                        "this Relay could not tell, as it started, whether its rules still admit \
+                         the Account this Server is logged in under, and refuses it until it can; \
+                         try again shortly",
+                    )
+                    .await;
+            }
             Ok(login) => {
                 let login = login.filter(|(account, _)| !standing.has_lapsed(*account));
                 let held = login.as_ref().map(|(account, _)| {
@@ -385,7 +399,7 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Handover>,
                         .await
                         .map(|account| {
                             account
-                                .filter(|account| !standing.has_lapsed(*account))
+                                .filter(|account| standing.stands(*account))
                                 .map(|account| {
                                     (
                                         relay.joiner.wait(key.clone()),
@@ -666,7 +680,7 @@ async fn one_account(
     server: &[u8],
 ) -> anyhow::Result<Result<i64, RelayMessage>> {
     let fresh_since = relay.fresh_since();
-    let stands = |account: &i64| !standing.has_lapsed(*account);
+    let stands = |account: &i64| standing.stands(*account);
     let Some(joining) = relay
         .store
         .account_of(key, fresh_since)
@@ -706,7 +720,7 @@ async fn take_up(relay: &Relay, name: &[u8], key: &[u8]) -> anyhow::Result<Optio
     let Some(taken_up) = relay.joiner.take_up(name, key) else {
         return Ok(None);
     };
-    if standing.has_lapsed(taken_up.account) {
+    if !standing.stands(taken_up.account) {
         return Ok(None);
     }
     let parties = relay

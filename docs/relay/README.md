@@ -163,7 +163,14 @@ admit_organizations = ["example-corp"]
   hour, more for a large organization; a Relay with thousands of Accounts should raise `recheck_minutes`. The Relay
   checks every organization as it starts and refuses to start with one it cannot check, saying which and why —
   GitHub not answering included — so a mistake fails loudly rather than admitting the wrong people, or nobody.
-  Once running, it keeps its Accounts while GitHub does not answer, and refuses new logins it cannot check.
+  Once running, it keeps its Accounts while GitHub does not answer, and refuses new logins it cannot check. As it
+  starts, though, an Account it cannot check — GitHub answering for the app's installation on the organization but
+  not for that user's membership, say — stands on nothing until a check decides it, since a member removed just
+  before the Relay stopped might otherwise be served again: it is not lapsed, and nothing of it is written, but its
+  Servers are refused as the Relay being unavailable for now, and the Relay asks GitHub about it again every 30
+  seconds — no sooner than GitHub's limits allow — until it can tell, saying on standard error how many Accounts it
+  is waiting on. Users `admit_users` names are admitted without asking GitHub anything, so an outage holds up only
+  the Accounts it leaves undecided.
 - **Taking a name out of the rules** lapses, as the Relay next starts, the Accounts it alone admitted: their Logins
   are refused. Putting the name back does not restore them by itself: once the rules admit the user again, one
   fresh login from any of the Account's Servers restores every Login under it. The rules are the whole truth of who
@@ -580,8 +587,11 @@ It then tries again to record it every 10 seconds, saying so each time it still 
 has. Until then `accounts list` shows the Account as standing, though the Relay refuses it. One fresh login from any
 of the Account's Servers, once the rules admit it, restores it either way.
 
-A Relay that cannot record a lapse its rules call for as it starts refuses to start, saying why, rather than serve
-an Account its records would still say stands.
+A Relay that is stopped tries once more to record each lapse it has yet to. One it still cannot is lost with it, so as
+it next starts it checks the Account again, and while the rules cannot tell about it, refuses its Servers as
+unavailable for now until they can, as [Writing the admission rules](#writing-the-admission-rules) says. A Relay
+that cannot record a lapse its rules call for as it starts refuses to start, saying why, rather than serve an
+Account its records would still say stands.
 
 ## Versions and upgrades
 
@@ -664,6 +674,11 @@ at* the Relay's address, pointing to `/relay` to log in, and the Relay reads **L
 in again. A Remote that nothing but that Relay reaches reads Unreachable, offering *Log in to try again*, which leads
 to the same login. Where the Account lapsed, one fresh login from any of its Servers restores every Login under it. A
 Relay that has merely stopped answering reads Unreachable instead, and Suru keeps trying it on its own.
+
+A Relay that has just started and cannot yet tell whether its rules still admit an Account — GitHub not answering
+for its membership — reads Unreachable as well to that Account's Servers, saying it could not tell as it started,
+and raises no Notice and asks for no login: Suru tries it again on its own, and it stands again, or reads **Login
+needed**, once GitHub says.
 
 ### Serving with no port open
 

@@ -128,6 +128,13 @@ const CONNECTION_LOG_CAPACITY: usize = 65_536;
 /// Login asks what it came for the moment it has.
 const IDLE_TIMEOUT_WITHOUT_LOGIN: Duration = GREETING_TIMEOUT;
 
+/// How often a Relay asks again about each Account its admission rules could
+/// not tell about as it started — which stands on nothing until they can —
+/// unless its configuration says otherwise: soon, rather than at its next
+/// check of every Account, and no more often than its identity provider
+/// lets it be asked.
+const UNDECIDED_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
+
 /// How often a Relay tries again to record that an Account lapsed, where it
 /// could not as the Account was found to lapse, unless its configuration says
 /// otherwise. The Account is refused, and everything that stood on it cut,
@@ -221,6 +228,7 @@ pub struct RelayConfig {
     idle_connections_per_server_without_login: NonZeroU32,
     idle_timeout_without_login: Duration,
     lapse_retry_interval: Duration,
+    undecided_recheck_interval: Duration,
 }
 
 impl RelayConfig {
@@ -265,6 +273,7 @@ impl RelayConfig {
             idle_connections_per_server_without_login: IDLE_CONNECTIONS_PER_SERVER_WITHOUT_LOGIN,
             idle_timeout_without_login: IDLE_TIMEOUT_WITHOUT_LOGIN,
             lapse_retry_interval: LAPSE_RETRY_INTERVAL,
+            undecided_recheck_interval: UNDECIDED_RECHECK_INTERVAL,
         }
     }
 
@@ -396,6 +405,16 @@ impl RelayConfig {
     /// timeout allows each step of proving itself.
     pub fn with_idle_timeout_without_login(mut self, timeout: Duration) -> Self {
         self.idle_timeout_without_login = timeout;
+        self
+    }
+
+    /// Has the Relay ask again every `interval`, rather than every thirty
+    /// seconds, about each Account its admission rules could not tell about
+    /// as it started, until they can. Such an Account is not lapsed, but its
+    /// Servers are refused as the Relay being unavailable for now until the
+    /// rules decide it.
+    pub fn with_undecided_recheck_interval(mut self, interval: Duration) -> Self {
+        self.undecided_recheck_interval = interval;
         self
     }
 
@@ -543,11 +562,19 @@ impl RunningRelay {
     }
 
     /// Stops the Relay, ending every Server's connection to it, and returns
-    /// once the last of them has gone and the connection log has written
-    /// the lines they were owed — or has taken longer than the Relay waits.
+    /// once it has tried once more to record each lapse it found and could
+    /// not record, the last connection has gone, and the connection log has
+    /// written the lines they were owed — or has taken longer than the Relay
+    /// waits.
     pub async fn shutdown(mut self) -> Result<()> {
+        // Held until the Relay has tried once more to record each lapse it
+        // has yet to, which would otherwise be lost with it.
+        let relay = self.relay.upgrade();
         self.stopping.send_replace(true);
         let served = self.task.await.context("the Relay's task panicked")?;
+        if let Some(relay) = relay {
+            admission::record_lapses_as_it_stops(&relay).await;
+        }
         while self.released.recv().await.is_some() {}
         self.writing.finish(self.drain_timeout).await;
         served
@@ -723,6 +750,7 @@ pub async fn start(
         resume_at: std::sync::atomic::AtomicI64::new(0),
         admission_timeout: config.admission_timeout,
         lapse_retry_interval: config.lapse_retry_interval,
+        undecided_recheck_interval: config.undecided_recheck_interval,
         lapses_unrecorded: tokio::sync::Notify::new(),
         fresh_login_every: config.fresh_login_every,
         logins_per_account: config.logins_per_account,
@@ -737,8 +765,10 @@ pub async fn start(
     // to every Account, so none they no longer admit — a name removed from
     // them, say — is served even once; and refuses to start where it cannot
     // record what they call for. Each Account is asked about for no longer
-    // than the admission timeout, and one the rules cannot tell about stands.
-    admission::check_every_account(&relay)
+    // than the admission timeout, and one the rules cannot tell about stands
+    // on nothing until they can, which a lapse it found and could not record
+    // before it stopped might otherwise be served past.
+    admission::check_every_account(&relay, true)
         .await
         .context("check every Account against the admission rules before serving")?;
     // Logins its operator removed while it was not running are gone from its
@@ -766,6 +796,18 @@ pub async fn start(
             tokio::select! {
                 _ = stopping.wait_for(|stopping| *stopping) => {}
                 () = admission::keep_recording_lapses(&relay) => {}
+            }
+        }
+    });
+    // And it asks again about each Account its rules could not tell about as
+    // it started, until they decide every one.
+    tokio::spawn({
+        let relay = relay.clone();
+        let mut stopping = stopping_rx.clone();
+        async move {
+            tokio::select! {
+                _ = stopping.wait_for(|stopping| *stopping) => {}
+                () = admission::keep_deciding(&relay) => {}
             }
         }
     });

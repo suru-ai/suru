@@ -3754,8 +3754,28 @@ impl AdmissionRule for Silent {
     }
 }
 
+/// What the Relay says of the Login tied to `key` as it proves itself on a
+/// connection of its own: the Account it stands under, or none, where it
+/// takes the proof, and why it refuses it otherwise.
+async fn proved(relay: &Relay, key: &KeyPair) -> Result<Option<Account>, Refusal> {
+    match Client::connect(relay).await.prove(key).await {
+        RelayMessage::Proven { login } => Ok(login),
+        RelayMessage::Refused { refusal, .. } => Err(refusal),
+        other => panic!("the Relay answers a proof with {other:?}"),
+    }
+}
+
+/// Whether the Relay refuses `key` as it proves itself on a connection of its
+/// own as unavailable for now — not as needing a login — ending the
+/// connection.
+async fn refused_as_unavailable(relay: &Relay, key: &KeyPair) -> bool {
+    let mut client = Client::connect(relay).await;
+    refusal(&client.prove(key).await) == Some(&Refusal::Unavailable) && client.ended().await
+}
+
 /// Rules that cannot tell about an Account as the Relay starts hold the
-/// start up no longer than the Relay gives them, and lapse nobody.
+/// start up no longer than the Relay gives them, and lapse nobody — though
+/// nothing stands on an Account they could not tell about until they can.
 #[tokio::test]
 async fn a_relay_whose_rules_do_not_answer_as_it_starts_starts_lapsing_nobody() {
     let relay = relay().await;
@@ -3773,8 +3793,19 @@ async fn a_relay_whose_rules_do_not_answer_as_it_starts_starts_lapsing_nobody() 
     .await
     .expect("the Relay starts though its rules do not answer");
     for key in [&workstation, &laptop] {
-        assert!(standing(&relay, key).await.is_some());
+        assert!(refused_as_unavailable(&relay, key).await);
     }
+    assert!(
+        relay
+            .running
+            .store()
+            .accounts()
+            .await
+            .unwrap()
+            .iter()
+            .all(|account| !account.lapsed),
+        "nothing is lapsed"
+    );
     relay.running.shutdown().await.unwrap();
 }
 
@@ -3990,6 +4021,128 @@ async fn an_account_coming_due_a_fresh_login_whose_lapse_cannot_be_recorded_is_c
         standing(&relay, &workstation).await.is_some(),
         "one fresh login restores the Account"
     );
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_relay_stopping_tries_once_more_to_record_a_lapse_it_could_not() {
+    // The Relay's own tries to record the lapse fall far outside the test.
+    let relay =
+        checking_relay(|config| config.with_lapse_retry_interval(Duration::from_secs(600))).await;
+    let workstation = key();
+    Client::logged_in(&relay, &workstation, "17", "octo").await;
+    let (mut idle, _) = Client::kept(&relay, &workstation).await;
+    refuse_lapses(&relay);
+    relay.provider.set_admitted("17", false);
+    assert!(
+        timeout(DEADLINE, idle.cut_for_login_needed())
+            .await
+            .expect("the Account is cut in time")
+    );
+    allow_lapses(&relay);
+    asked_more(&relay, 3).await;
+    let store = relay.running.store().clone();
+    assert!(
+        !store.accounts().await.unwrap()[0].lapsed,
+        "nothing has recorded the lapse yet"
+    );
+
+    relay.running.shutdown().await.unwrap();
+    assert!(
+        store.accounts().await.unwrap()[0].lapsed,
+        "the stopping Relay recorded it"
+    );
+}
+
+#[tokio::test]
+async fn an_account_whose_refusal_went_unrecorded_across_a_restart_is_refused_until_a_check_decides_it()
+ {
+    let relay =
+        checking_relay(|config| config.with_lapse_retry_interval(Duration::from_secs(600))).await;
+    let (workstation, laptop, stranger) = (key(), key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    Client::logged_in(&relay, &stranger, "99", "someone-else").await;
+    let (mut idle, _) = Client::kept(&relay, &workstation).await;
+
+    // GitHub says the member has left, and the lapse cannot be recorded: the
+    // Account is refused in memory alone, even as the Relay stops.
+    refuse_lapses(&relay);
+    relay.provider.set_admitted("17", false);
+    assert!(
+        timeout(DEADLINE, idle.cut_for_login_needed())
+            .await
+            .expect("the Account is cut in time")
+    );
+    // As the Relay starts again its rules cannot tell about the Account —
+    // GitHub not answering for its membership — while a user the rules name,
+    // which asks GitHub nothing, is admitted as ever.
+    relay.provider.set_admission_undecided(true);
+    relay.provider.set_name("someone-else", Some("99"));
+    let provider = relay.provider.clone();
+    let relay = relay
+        .restarted(move |config| {
+            config
+                .with_admission(
+                    Admission::by([provider as Arc<dyn AdmissionRule>])
+                        .with_named_users(["someone-else"]),
+                )
+                .with_admission_interval(Duration::from_secs(600))
+                .with_undecided_recheck_interval(Duration::from_millis(10))
+        })
+        .await;
+    allow_lapses(&relay);
+
+    // The Account stands on nothing the rules have not decided: each of its
+    // Servers is refused as unavailable for now, not told to log in, and
+    // nothing of it is written.
+    for key in [&workstation, &laptop] {
+        assert!(refused_as_unavailable(&relay, key).await);
+    }
+    assert!(
+        standing(&relay, &stranger).await.is_some(),
+        "an Account the rules decided stands"
+    );
+    // The Relay asks again about the Account it could not decide, soon
+    // rather than at its next check of every Account.
+    asked_more(&relay, 2).await;
+    assert!(refused_as_unavailable(&relay, &workstation).await);
+    assert!(!relay.running.store().accounts().await.unwrap()[0].lapsed);
+
+    // Once the rules can tell, the Account lapses as they say.
+    relay.provider.set_admission_undecided(false);
+    recorded_as_lapsed(&relay, "17").await;
+    for key in [&workstation, &laptop] {
+        assert_eq!(standing(&relay, key).await, None);
+    }
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_account_the_rules_cannot_tell_about_as_the_relay_starts_stands_once_they_admit_it() {
+    let relay = relay().await;
+    let workstation = key();
+    Client::logged_in(&relay, &workstation, "17", "octo").await;
+    relay.provider.set_admission_undecided(true);
+    let relay = relay
+        .restarted(|config| {
+            config
+                .with_admission_interval(Duration::from_secs(600))
+                .with_undecided_recheck_interval(Duration::from_millis(10))
+        })
+        .await;
+    assert!(refused_as_unavailable(&relay, &workstation).await);
+
+    relay.provider.set_admission_undecided(false);
+    timeout(DEADLINE, async {
+        while !matches!(proved(&relay, &workstation).await, Ok(Some(_))) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the Account stands once the rules admit it");
+    assert!(!relay.running.store().accounts().await.unwrap()[0].lapsed);
     relay.running.shutdown().await.unwrap();
 }
 

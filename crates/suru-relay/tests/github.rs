@@ -1369,6 +1369,16 @@ impl Server {
     /// Connects to `relay` and proves `key` there: the connection, and the
     /// Account the Relay says its Login stands under, where it stands.
     async fn proven(relay: &RunningRelay, key: &KeyPair) -> (Self, Option<Account>) {
+        let (server, answer) = Self::proving(relay, key).await;
+        let RelayMessage::Proven { login } = answer else {
+            panic!("the Relay takes the proof, not {answer:?}");
+        };
+        (server, login)
+    }
+
+    /// Proves `key` to `relay` on a connection of its own: the connection,
+    /// and what the Relay answers the proof with.
+    async fn proving(relay: &RunningRelay, key: &KeyPair) -> (Self, RelayMessage) {
         let (socket, _) = timeout(
             DEADLINE,
             tokio_tungstenite::connect_async(format!("ws://{}/connect", relay.address())),
@@ -1393,10 +1403,8 @@ impl Server {
                 signature: Bytes(key.sign(&proof).unwrap()),
             })
             .await;
-        let RelayMessage::Proven { login } = server.hear().await else {
-            panic!("the Relay takes the proof");
-        };
-        (server, login)
+        let answer = server.hear().await;
+        (server, answer)
     }
 
     async fn say(&mut self, message: &ServerMessage) {
@@ -2570,6 +2578,98 @@ async fn a_running_relay_keeps_its_accounts_while_github_cannot_be_asked_about_m
     assert_eq!(
         logging_in_as(&stub, &relay, &key(), MONA, "mona").await,
         done_as("mona")
+    );
+    relay.shutdown().await.unwrap();
+}
+
+/// Has the records in `directory` refuse to record any Account lapsing — or
+/// being restored — as a full disk would, while `refusing`.
+fn refuse_lapses(directory: &tempfile::TempDir, refusing: bool) {
+    use diesel::{Connection as _, connection::SimpleConnection as _};
+
+    let path = directory.path().join("relay.db");
+    diesel::SqliteConnection::establish(path.to_str().unwrap())
+        .unwrap()
+        .batch_execute(if refusing {
+            "CREATE TRIGGER no_lapses BEFORE UPDATE OF lapsed_at ON accounts
+             BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;"
+        } else {
+            "DROP TRIGGER no_lapses;"
+        })
+        .unwrap();
+}
+
+/// A member removed from the organization whose lapse the Relay could not
+/// record before it stopped is found again as it starts: while GitHub
+/// answers for the app's installation but not for the membership, the
+/// Account stands on nothing — refused as the Relay being unavailable, not
+/// lapsed — and it lapses once GitHub says.
+#[tokio::test]
+async fn a_member_whose_removal_went_unrecorded_across_a_restart_is_refused_until_github_says_and_then_lapses()
+ {
+    let stub = acme().await;
+    stub.membership("acme", MONA, Some("active"));
+    let directory = tempfile::tempdir().unwrap();
+    let relay = start_relay_admitting(&directory, stub.app_with_key(), &[], &["acme"], |config| {
+        config
+            .with_admission_interval(RECHECK)
+            .with_lapse_retry_interval(Duration::from_secs(600))
+    })
+    .await
+    .unwrap();
+    let (workstation, desktop) = (key(), key());
+    assert_eq!(
+        logging_in_as(&stub, &relay, &workstation, OCTOCAT, "octocat").await,
+        done_as("octocat")
+    );
+    assert_eq!(
+        logging_in_as(&stub, &relay, &desktop, MONA, "mona").await,
+        done_as("mona")
+    );
+    refuse_lapses(&directory, true);
+    stub.membership("acme", OCTOCAT, None);
+    timeout(DEADLINE, async {
+        while Server::proven(&relay, &workstation).await.1.is_some() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the Account is refused in memory");
+    relay.shutdown().await.unwrap();
+    refuse_lapses(&directory, false);
+
+    stub.script().memberships_down = true;
+    let relay = start_relay_admitting(&directory, stub.app_with_key(), &[], &["acme"], |config| {
+        config
+            .with_admission_interval(Duration::from_secs(600))
+            .with_undecided_recheck_interval(RECHECK)
+    })
+    .await
+    .expect("the Relay starts, GitHub answering for its installation");
+    for key in [&workstation, &desktop] {
+        let (mut server, answer) = Server::proving(&relay, key).await;
+        assert_eq!(refusal(&answer), Some(&Refusal::Unavailable), "{answer:?}");
+        assert!(server.ended().await);
+    }
+    asked_about_memberships(&stub, 4).await;
+    assert!(
+        relay
+            .store()
+            .accounts()
+            .await
+            .unwrap()
+            .iter()
+            .all(|account| !account.lapsed),
+        "nothing is lapsed while GitHub cannot say"
+    );
+
+    stub.script().memberships_down = false;
+    until_lapsed(&relay, OCTOCAT, true).await;
+    assert_eq!(Server::proven(&relay, &workstation).await.1, None);
+    assert_eq!(
+        Server::proven(&relay, &desktop).await.1,
+        Some(github_account("mona")),
+        "the member GitHub says is one stands"
     );
     relay.shutdown().await.unwrap();
 }

@@ -61,7 +61,19 @@
 //! on its Logins, and tries again to record the lapse every so often until it
 //! can, or until one of its Servers logs in afresh and restores it. A Relay
 //! that cannot record a lapse its rules call for as it starts refuses to
-//! start, so its records never say less than it served by.
+//! start, so its records never say less than it served by, and one stopping
+//! tries once more to record any lapse it has yet to.
+//!
+//! A lapse a Relay found and could not record before it stopped is lost to
+//! it, so the check it makes as it starts must find the Account again: an
+//! Account it starts unable to tell about stands on nothing until its rules
+//! decide it. It is not lapsed — nothing of it is written, and none of its
+//! Servers is told its Login needs renewing — but each is refused as the
+//! Relay being unavailable for now, and tries again on its own, while the
+//! Relay asks the rules again about each such Account soon, rather than at
+//! its next check of every Account, until they decide it. Once running, the
+//! Relay keeps an Account its rules cannot tell about, as above: only a start
+//! leaves Accounts undecided.
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -407,6 +419,7 @@ impl Checks {
         Verdicts {
             ledger: self.0.clone(),
             unrecorded: HashMap::new(),
+            undecided: HashMap::new(),
         }
     }
 
@@ -482,16 +495,28 @@ fn lock(ledger: &Mutex<Ledger>) -> std::sync::MutexGuard<'_, Ledger> {
 /// Account, so a refusal counts as much for an identity that has no Account
 /// yet, and only while an asking about that identity is under way. And the
 /// Accounts found to lapse whose lapse the Relay has yet to record, each
-/// refused as though its records said it had lapsed. What the standing lock
-/// guards: each verdict is weighed, and takes effect, under it, and every
-/// decision taken on the strength of a Login asks it whether the Login's
-/// Account has lapsed unrecorded.
+/// refused as though its records said it had lapsed; and those its rules
+/// could not tell about as it started, on which nothing stands until they
+/// decide them. What the standing lock guards: each verdict is weighed, and
+/// takes effect, under it, and every decision taken on the strength of a
+/// Login asks it whether the Login's Account stands.
 #[derive(Default)]
 pub(crate) struct Verdicts {
     ledger: Arc<Mutex<Ledger>>,
     /// The Accounts found to lapse whose lapse the Relay could not record,
     /// by id, with how to record it.
     unrecorded: HashMap<i64, Unrecorded>,
+    /// The Accounts the rules could not tell about as the Relay started, by
+    /// id, with the identity that logs in as each, to ask about again.
+    undecided: HashMap<i64, AskAgain>,
+}
+
+/// An Account to ask the rules about again: the identity provider of the
+/// identity that logs in as it, and that identity.
+#[derive(Clone, Debug)]
+struct AskAgain {
+    provider: String,
+    identity: Identity,
 }
 
 /// A lapse found and not yet recorded: why the Account lapsed, and when.
@@ -509,11 +534,31 @@ impl Verdicts {
         self.unrecorded.contains_key(&account)
     }
 
+    /// Whether the Account `account` is one the rules could not tell about
+    /// as the Relay started, and have yet to decide: its Servers refused as
+    /// the Relay being unavailable for now until they do.
+    pub(crate) fn undecided(&self, account: i64) -> bool {
+        self.undecided.contains_key(&account)
+    }
+
+    /// Whether the Logins under the Account `account`, which its records say
+    /// stand, stand: it has neither lapsed unrecorded nor been left undecided.
+    pub(crate) fn stands(&self, account: i64) -> bool {
+        !self.has_lapsed(account) && !self.undecided(account)
+    }
+
     /// The Account `account` has been logged in as afresh, which restores it
-    /// whether or not its lapse was recorded: no lapse found before is
-    /// recorded from then on.
+    /// whether or not its lapse was recorded — no lapse found before is
+    /// recorded from then on — and decides it, the rules having admitted the
+    /// login.
     pub(crate) fn restored(&mut self, account: i64) {
         self.unrecorded.remove(&account);
+        self.undecided.remove(&account);
+    }
+
+    /// The rules have decided the Account `account`, one way or the other.
+    fn decided(&mut self, account: i64) {
+        self.undecided.remove(&account);
     }
 
     /// Whether `check` admitting its identity as it logs in may take effect.
@@ -604,7 +649,7 @@ impl Lapse {
 pub(crate) async fn keep_checking(relay: &Relay) {
     loop {
         tokio::time::sleep(relay.admission_interval).await;
-        if let Err(error) = check_every_account(relay).await {
+        if let Err(error) = check_every_account(relay, false).await {
             tracing::error!(
                 "the Relay could not use its records as it checked its Accounts against its \
                  admission rules: {error:#}"
@@ -627,6 +672,72 @@ pub(crate) async fn keep_recording_lapses(relay: &Relay) {
             }
         }
     }
+}
+
+/// Asks the rules again about each Account they could not tell about as the
+/// Relay started, every `relay`'s interval for Accounts left undecided, until
+/// they have decided every one, or what awaits this is dropped. Asked through
+/// an identity provider that limits how often it is asked, the rules cannot
+/// tell, asking nothing of it, until the limit lifts.
+pub(crate) async fn keep_deciding(relay: &Relay) {
+    loop {
+        let undecided = relay
+            .standing
+            .lock()
+            .await
+            .undecided
+            .iter()
+            .map(|(account, asked)| (*account, asked.clone()))
+            .collect::<Vec<_>>();
+        if undecided.is_empty() {
+            return;
+        }
+        tokio::time::sleep(relay.undecided_recheck_interval).await;
+        for (account, AskAgain { provider, identity }) in undecided {
+            if !relay.standing.lock().await.undecided(account) {
+                continue;
+            }
+            let check = relay.checks.begin(&provider, &identity.subject);
+            match relay
+                .admission
+                .decide(&provider, &identity, relay.admission_timeout)
+                .await
+            {
+                Verdict::Admitted => {
+                    relay.standing.lock().await.decided(account);
+                    tracing::info!(
+                        account,
+                        "the admission rules admit an Account they could not tell about as the \
+                         Relay started, which stands from now on"
+                    );
+                }
+                Verdict::NotAdmitted => {
+                    if let Err(error) = refuse(relay, &check).await {
+                        tracing::error!(
+                            "the Relay could not use its records as it lapsed an Account its \
+                             admission rules decided: {error:#}"
+                        );
+                    }
+                }
+                Verdict::Undecided(_) => {}
+            }
+        }
+    }
+}
+
+/// Tries once more, as the Relay stops, to record each lapse it found and has
+/// yet to record, saying how many it stops with still unrecorded: each to be
+/// found again by the check it makes as it next starts.
+pub(crate) async fn record_lapses_as_it_stops(relay: &Relay) {
+    if record_lapses(relay).await {
+        return;
+    }
+    let left = relay.standing.lock().await.unrecorded.len();
+    tracing::error!(
+        "the Relay stops with {left} lapses of Accounts it found and could not record; as it \
+         next starts it checks every Account again, and refuses as unavailable for now each its \
+         rules cannot tell about until they can"
+    );
 }
 
 /// Tries once more to record each lapse found and not yet recorded, each
@@ -679,7 +790,11 @@ async fn record_lapses(relay: &Relay) -> bool {
 /// An Account whose lapse cannot be recorded lapses all the same, and the
 /// check goes on to the rest, answering the first failure to use the records
 /// once it has been through them all.
-pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
+///
+/// The check the Relay makes as it starts, `starting`, leaves each Account
+/// the rules cannot tell about undecided, standing on nothing until they
+/// decide it; any other stands while they cannot tell.
+pub(crate) async fn check_every_account(relay: &Relay, starting: bool) -> anyhow::Result<()> {
     let fresh_since = relay.fresh_since();
     let mut undecided = 0_usize;
     let mut why_undecided = None;
@@ -711,7 +826,7 @@ pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
             )
             .await
         {
-            Verdict::Admitted => {}
+            Verdict::Admitted => relay.standing.lock().await.decided(account.id),
             Verdict::NotAdmitted => {
                 if let Err(error) = refuse(relay, &check).await {
                     failed.get_or_insert(error);
@@ -721,6 +836,15 @@ pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
                 undecided += 1;
                 why_undecided.get_or_insert(why);
                 first_undecided.get_or_insert(account.id);
+                if starting {
+                    relay.standing.lock().await.undecided.insert(
+                        account.id,
+                        AskAgain {
+                            provider: account.provider,
+                            identity: account.identity,
+                        },
+                    );
+                }
             }
         }
     }
@@ -728,10 +852,19 @@ pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
         .resume_at
         .store(first_undecided.unwrap_or(0), Ordering::Relaxed);
     if let Some(why) = why_undecided {
-        tracing::warn!(
-            "the admission rules could not tell whether they still admit {undecided} Accounts, \
-             which stand until they can: {why}"
-        );
+        if starting {
+            tracing::warn!(
+                "as the Relay starts, the admission rules cannot tell whether they still admit \
+                 {undecided} Accounts, whose Servers it refuses as unavailable for now until \
+                 they can, asking again every {:?}: {why}",
+                relay.undecided_recheck_interval
+            );
+        } else {
+            tracing::warn!(
+                "the admission rules could not tell whether they still admit {undecided} \
+                 Accounts, which stand until they can: {why}"
+            );
+        }
     }
     failed.map_or(Ok(()), Err)
 }
@@ -775,6 +908,8 @@ async fn lapse(
     account: i64,
     why: Lapse,
 ) -> anyhow::Result<()> {
+    // Lapsed, the Account is decided, its lapse governing it from here.
+    standing.decided(account);
     if standing.has_lapsed(account) {
         return Ok(());
     }
