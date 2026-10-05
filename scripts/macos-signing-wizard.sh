@@ -210,18 +210,59 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || die "gh can't tell which repository this is."
 export GH_REPO="$REPO"
 
-# keep_existing NAME... asks whether to keep secrets the repository already has. Succeeds when every one is set
-# and the human keeps them, so a re-run can skip what an earlier run finished.
+# keep_existing NAME... asks before replacing any of a group of secrets that only work together. Succeeds, so the
+# stage is skipped, when the human keeps what the repository already has; fails, so the stage goes ahead, when
+# none of them is set yet or the human agrees to replace them. A group set only in part, as by a run that
+# stopped partway, is offered for replacement too, since only setting it whole completes it.
 keep_existing() {
-  local existing name
-  existing=$(gh secret list --json name --jq '.[].name')
+  local existing name present=() missing=()
+  existing=$(gh secret list --json name --jq '.[].name') || die "gh couldn't list $REPO's secrets."
   for name in "$@"; do
-    grep -qx "$name" <<< "$existing" || return 1
+    if grep -qx "$name" <<< "$existing"; then present+=("$name"); else missing+=("$name"); fi
   done
-  note "$REPO already has $*."
-  if confirm "Replace them?"; then return 1; fi
-  printf '  %s✓ kept%s %s\n' "$GREEN" "$RESET" "$*"
-  pause "Press Enter to continue"
+  (( ${#present[@]} )) || return 1
+  if (( ${#missing[@]} )); then
+    warn "$REPO has ${present[*]} but not ${missing[*]}, as if a setup stopped partway."
+    if confirm "Replace ${present[*]}, so the group is set together?"; then return 1; fi
+    SKIPPED+=("${missing[*]} (re-run and replace ${present[*]})")
+  else
+    note "$REPO already has ${present[*]}."
+    if confirm "Replace them?"; then return 1; fi
+  fi
+  printf '  %s✓ kept%s %s\n' "$GREEN" "$RESET" "${present[*]}"
+}
+
+# upload_group NAME VALUE [NAME VALUE]... sets a group of secrets that only work together, all or none. If one
+# can't be set, or the wizard is stopped partway, those it already set are deleted again, so the repository never
+# holds a mismatched group that a re-run would offer to keep. A failure stops the wizard before it deletes any
+# file or reports success.
+GROUP_SET=()
+upload_group() {
+  local count
+  GROUP_SET=()
+  trap 'undo_group; exit 130' INT
+  while (( $# )); do
+    count=${#WRITTEN_SECRET[@]}
+    set_secret "$1" "$2"
+    if (( ${#WRITTEN_SECRET[@]} == count )); then
+      undo_group
+      die "Couldn't set $1 on $REPO, so this stage kept nothing. Check that gh can set its secrets, then re-run."
+    fi
+    GROUP_SET+=("$1")
+    shift 2
+  done
+  trap - INT
+  GROUP_SET=()
+}
+
+# undo_group deletes the secrets upload_group has set so far.
+undo_group() {
+  local name
+  (( ${#GROUP_SET[@]} )) || return 0
+  for name in "${GROUP_SET[@]}"; do
+    gh secret delete "$name" >/dev/null 2>&1 || warn "couldn't delete $name; replace its group on a re-run"
+  done
+  GROUP_SET=()
 }
 
 # ask_path KEY "Prompt" [DEFAULT] reads the path of an existing file into $KEY. Takes a path dragged in from
@@ -253,28 +294,35 @@ developer_id_identities() {
     sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | sort -u
 }
 
-# p12_identity PATH PASSWORD prints the Developer ID Application identity a p12 holds, by importing it into a
-# throwaway keychain as the release workflow does. Fails when the password is wrong or the p12 holds no such
-# identity.
+# p12_identity PATH PASSWORD prints the Developer ID Application identity a p12 holds, importing it into a
+# throwaway keychain and asking for valid identities only, as the release workflow does. Fails with 1 when the
+# password doesn't open it, and with 2 when it holds no valid such identity, after showing on stderr what it
+# holds instead and why each is refused (expired, revoked, untrusted).
 p12_identity() (
-  local dir keychain identity=""
+  local dir keychain identity
   dir=$(mktemp -d)
   keychain="$dir/check.keychain-db"
   trap 'security delete-keychain "$keychain" >/dev/null 2>&1; rm -rf "$dir"' EXIT
   security create-keychain -p check "$keychain" >/dev/null 2>&1
   security import "$1" -k "$keychain" -f pkcs12 -P "$2" >/dev/null 2>&1 || return 1
-  identity=$(security find-identity -p codesigning "$keychain" |
+  identity=$(security find-identity -v -p codesigning "$keychain" |
     sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -n1)
-  [[ -n "$identity" ]] && printf '%s\n' "$identity"
+  if [[ -z "$identity" ]]; then
+    security find-identity -p codesigning "$keychain" | grep ') [0-9A-F]* "' | sed 's/^ */    /' >&2 || true
+    return 2
+  fi
+  printf '%s\n' "$identity"
 )
 
 banner "Suru macOS release signing for $REPO"
 
 TEAM_ID=""
+CERT_KEPT=false
 
 stage "Developer ID Application certificate"
-# Keeping the certificate already set skips its export as well.
-if ! keep_existing "${P12_SECRETS[@]}"; then
+if keep_existing "${P12_SECRETS[@]}"; then
+  CERT_KEPT=true
+else
   say "Releases are signed with your team's Developer ID Application certificate."
   identities=$(developer_id_identities)
   if [[ -z "$identities" ]]; then
@@ -297,54 +345,69 @@ if ! keep_existing "${P12_SECRETS[@]}"; then
     warn "Apple's 'Developer ID - G2' intermediate from https://www.apple.com/certificateauthority/."
   fi
   pause "Press Enter to export it"
+fi
 
-  stage "Export the certificate as a .p12"
+stage "Export the certificate as a .p12"
+if [[ "$CERT_KEPT" == true ]]; then
+  say "The certificate's secrets stay as they are, so there's nothing to export."
+else
   open -a "Keychain Access" || warn "couldn't open Keychain Access; open it from Spotlight"
   step "In the login keychain's My Certificates, select 'Developer ID Application: … (your Team ID)'."
   step "Expand it: its private key must be beneath it, or the export can't sign anything."
   step "File → Export Items…, format Personal Information Exchange (.p12)."
   step "Save it to your Desktop as suru-developer-id.p12, and give it a strong password."
-  ask_path P12_PATH "Path to the .p12:" "$HOME/Desktop/suru-developer-id.p12"
+  P12_PATH="$HOME/Desktop/suru-developer-id.p12"
   while :; do
+    ask_path P12_PATH "Path to the .p12:" "$P12_PATH"
     ask_secret P12_PASSWORD "The password you exported it with:"
     if [[ -z "$P12_PASSWORD" ]]; then
       warn "The release needs a password on the p12; export it again with one."
       continue
     fi
-    if identity=$(p12_identity "$P12_PATH" "$P12_PASSWORD"); then break; fi
-    warn "That password doesn't open it, or it holds no Developer ID Application identity with its key."
+    status=0
+    identity=$(p12_identity "$P12_PATH" "$P12_PASSWORD") || status=$?
+    (( status == 0 )) && break
+    if (( status == 1 )); then
+      warn "That password doesn't open $P12_PATH."
+    else
+      warn "It holds no valid Developer ID Application identity with its key; above is what it holds, and why"
+      warn "the release would refuse it. Export a current one. One refused only as untrusted may need Apple's"
+      warn "'Developer ID - G2' intermediate from https://www.apple.com/certificateauthority/."
+    fi
   done
   printf '  %s✓ holds%s %s\n' "$GREEN" "$RESET" "$identity"
   TEAM_ID=${identity##*(}
   TEAM_ID=${TEAM_ID%)}
-  set_secret APPLE_DEVELOPER_ID_P12_BASE64 "$(base64 < "$P12_PATH" | tr -d '\n')"
-  set_secret APPLE_DEVELOPER_ID_P12_PASSWORD "$P12_PASSWORD"
+  upload_group APPLE_DEVELOPER_ID_P12_BASE64 "$(base64 < "$P12_PATH" | tr -d '\n')" \
+    APPLE_DEVELOPER_ID_P12_PASSWORD "$P12_PASSWORD"
   if confirm "Delete $P12_PATH now? The certificate stays in your login keychain."; then
     rm -f "$P12_PATH"
     printf '  %s✓ deleted%s %s\n' "$GREEN" "$RESET" "$P12_PATH"
   fi
-  pause "Press Enter to continue"
 fi
+pause "Press Enter to continue"
 
 stage "Team ID"
 warn "Every Suru release must come from one team, signed as ai.suru.cli: the keychain trusts that pair."
 warn "Another team brings 'suru wants to use your confidential information' back for every user."
 note "A renewed certificate from the same team is fine."
 if [[ -n "$TEAM_ID" ]]; then
-  say "The certificate you exported belongs to team $TEAM_ID."
-  set_secret APPLE_TEAM_ID "$TEAM_ID"
-  pause "Press Enter to continue"
-elif ! keep_existing APPLE_TEAM_ID; then
-  open_url "https://developer.apple.com/account"
-  step "Under Membership details, copy the Team ID: ten letters and digits."
-  while :; do
-    ask TEAM_ID "Team ID:"
-    [[ "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] && break
-    warn "A Team ID is ten capital letters and digits, like A1B2C3D4E5."
-  done
-  set_secret APPLE_TEAM_ID "$TEAM_ID"
-  pause "Press Enter to continue"
+  say "The certificate you exported belongs to team $TEAM_ID. APPLE_TEAM_ID must name it, or the release"
+  say "refuses the certificate."
 fi
+if ! keep_existing APPLE_TEAM_ID; then
+  if [[ -z "$TEAM_ID" ]]; then
+    open_url "https://developer.apple.com/account"
+    step "Under Membership details, copy the Team ID: ten letters and digits."
+    while :; do
+      ask TEAM_ID "Team ID:"
+      [[ "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] && break
+      warn "A Team ID is ten capital letters and digits, like A1B2C3D4E5."
+    done
+  fi
+  upload_group APPLE_TEAM_ID "$TEAM_ID"
+fi
+pause "Press Enter to continue"
 
 stage "App Store Connect API key, for notarization"
 if ! keep_existing "${API_KEY_SECRETS[@]}"; then
@@ -353,14 +416,15 @@ if ! keep_existing "${API_KEY_SECRETS[@]}"; then
   step "Name it 'Suru notarization', give it Developer access, then Generate."
   step "Download API Key on its row. Apple offers the download only once."
   step "Copy the Issuer ID shown above the list of keys."
-  latest_key=""
+  # Offers the newest key in Downloads.
+  P8_PATH=""
   for downloaded in "$HOME"/Downloads/AuthKey_*.p8; do
-    if [[ -f "$downloaded" && ( -z "$latest_key" || "$downloaded" -nt "$latest_key" ) ]]; then
-      latest_key=$downloaded
+    if [[ -f "$downloaded" && ( -z "$P8_PATH" || "$downloaded" -nt "$P8_PATH" ) ]]; then
+      P8_PATH=$downloaded
     fi
   done
   while :; do
-    ask_path P8_PATH "Path to the AuthKey_….p8:" "$latest_key"
+    ask_path P8_PATH "Path to the AuthKey_….p8:" "$P8_PATH"
     API_KEY_ID=""
     if [[ "$(basename "$P8_PATH")" =~ ^AuthKey_([A-Z0-9]+)\.p8$ ]]; then
       API_KEY_ID=${BASH_REMATCH[1]}
@@ -385,19 +449,20 @@ if ! keep_existing "${API_KEY_SECRETS[@]}"; then
     printf '%s\n' "$output" | sed 's/^/    /'
     confirm "The notary service turned it down. Enter the key again? (No uploads it as it is.)" || break
   done
-  set_secret APPLE_API_KEY "$(cat "$P8_PATH")"
-  set_secret APPLE_API_KEY_ID "$API_KEY_ID"
-  set_secret APPLE_API_ISSUER_ID "$API_ISSUER_ID"
+  upload_group APPLE_API_KEY "$(cat "$P8_PATH")" APPLE_API_KEY_ID "$API_KEY_ID" \
+    APPLE_API_ISSUER_ID "$API_ISSUER_ID"
   note "Keep $(basename "$P8_PATH") in a password manager, or delete it and generate another key when you need one."
   if confirm "Delete $P8_PATH now?"; then
     rm -f "$P8_PATH"
     printf '  %s✓ deleted%s %s\n' "$GREEN" "$RESET" "$P8_PATH"
   fi
-  pause "Press Enter to finish"
 fi
+pause "Press Enter to finish"
 
 finish
-say "The next release signs and notarizes its macOS binary. To check a released binary:"
-note "  codesign --verify --strict suru && codesign -d -r- suru"
-note "Its designated requirement names identifier \"ai.suru.cli\" and your Team ID."
-printf '\n'
+if (( ${#SKIPPED[@]} == 0 )); then
+  say "The next release signs and notarizes its macOS binary. To check a released binary:"
+  note "  codesign --verify --strict suru && codesign -d -r- suru"
+  note "Its designated requirement names identifier \"ai.suru.cli\" and your Team ID."
+  printf '\n'
+fi
