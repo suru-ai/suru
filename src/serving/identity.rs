@@ -628,6 +628,20 @@ const UNANSWERED_HINT: &str = "Unlock the keyring, as logging in at this machine
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const UNANSWERED_HINT: &str = "Try again once it answers.";
 
+/// What a platform credential store that answers it keeps no item a marker
+/// names has told, and what a user can do before giving the key up for
+/// lost. The Secret Service cannot tell an item it keeps nowhere from one
+/// a keyring database it has closed keeps, which it shows nobody.
+#[cfg(target_os = "linux")]
+const ITEM_GONE: &str = "which it does not find";
+#[cfg(target_os = "linux")]
+const ITEM_GONE_HINT: &str = "A keyring database or collection holding it may be closed or \
+                              locked: open or unlock it, and try again. Otherwise restore the item";
+#[cfg(not(target_os = "linux"))]
+const ITEM_GONE: &str = "which it no longer keeps";
+#[cfg(not(target_os = "linux"))]
+const ITEM_GONE_HINT: &str = "Restore the item";
+
 impl IdentityKeyUnavailable {
     /// The platform credential store did not answer, as `unanswered` says.
     fn unanswered(unanswered: &StoreUnavailable) -> Self {
@@ -643,9 +657,9 @@ impl IdentityKeyUnavailable {
     fn item_gone(item: ItemId, marker: &Path) -> Self {
         Self(format!(
             "this Server's identity key is kept in the platform credential store, \
-             {PLATFORM_STORE}, as the item {item}, which it no longer keeps; no new key was made \
-             in its place. Restore the item, or remove {} to give this Server a new identity, \
-             ending its Pairings and Relay Logins.",
+             {PLATFORM_STORE}, as the item {item}, {ITEM_GONE}; no new key was made in its place. \
+             {ITEM_GONE_HINT}, or remove {} to give this Server a new identity, ending its \
+             Pairings and Relay Logins.",
             marker.display()
         ))
     }
@@ -1333,7 +1347,7 @@ mod tests {
             let told = told(&identity.public_key().await.unwrap_err());
             assert!(
                 told.contains(&item.to_string())
-                    && told.contains("no longer keeps")
+                    && told.contains(ITEM_GONE)
                     && told.contains("no new key was made"),
                 "{told}"
             );
