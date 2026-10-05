@@ -2218,6 +2218,11 @@ mod tests {
     use super::*;
 
     fn controller(directory: &Path) -> RelayController {
+        controller_answering_within(directory, Duration::from_secs(1))
+    }
+
+    /// The same, waiting `answer_timeout` for each answer a Relay owes.
+    fn controller_answering_within(directory: &Path, answer_timeout: Duration) -> RelayController {
         let serving = ServingController::new(
             directory,
             Duration::from_secs(60),
@@ -2230,7 +2235,7 @@ mod tests {
             directory,
             serving,
             RelayTimings {
-                answer_timeout: Duration::from_secs(1),
+                answer_timeout,
                 retry_initial: Duration::from_millis(5),
                 retry_max: Duration::from_millis(25),
                 heartbeat_interval: Duration::from_secs(30),
@@ -2402,22 +2407,33 @@ mod tests {
     }
 
     /// A stand-in Relay that proves every Server it is reached by, under an
-    /// Account, without looking at its proof, and tells the test the first
-    /// thing each says once proven — `None` where it says nothing more: its
-    /// address, and what it hears.
-    async fn proving_relay() -> (
-        String,
-        tokio::sync::mpsc::UnboundedReceiver<Option<ServerMessage>>,
-    ) {
+    /// Account, without looking at its proof — saying it has the proof, and
+    /// holding its answer until it is released — and tells the test the
+    /// first thing each Server says once proven, `None` where it says nothing
+    /// more.
+    struct ProvingRelay {
+        address: String,
+        heard: tokio::sync::mpsc::UnboundedReceiver<Option<ServerMessage>>,
+        /// Says the stand-in has a Server's proof, and holds its answer.
+        proving: Arc<tokio::sync::Notify>,
+        /// Releases the answer held.
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    async fn proving_relay() -> ProvingRelay {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
         let (heard, hearing) = tokio::sync::mpsc::unbounded_channel();
+        let proving = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
         let relay = address.clone();
+        let (proved, released) = (proving.clone(), release.clone());
         tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
                 let (heard, relay) = (heard.clone(), relay.clone());
+                let (proved, released) = (proved.clone(), released.clone());
                 tokio::spawn(async move {
                     let Ok(mut socket) = tokio_tungstenite::accept_async(socket).await else {
                         return;
@@ -2439,6 +2455,8 @@ mod tests {
                     let Some(ServerMessage::Proof { .. }) = next_said(&mut socket).await else {
                         return;
                     };
+                    proved.notify_one();
+                    released.notified().await;
                     let proven = said(RelayMessage::Proven {
                         login: Some(relay_protocol::Account {
                             provider: "scripted".to_owned(),
@@ -2452,7 +2470,12 @@ mod tests {
                 });
             }
         });
-        (address, hearing)
+        ProvingRelay {
+            address,
+            heard: hearing,
+            proving,
+            release,
+        }
     }
 
     /// The next thing a Server says to the stand-in Relay on `socket`, or
@@ -2469,19 +2492,24 @@ mod tests {
         }
     }
 
-    /// A connection let go of while the Relay took the Server's proof asks no
-    /// join there, however soon the Relay answers: whether it is still wanted
-    /// is asked again just before the join would be.
+    /// A connection let go of while the Relay takes the Server's proof asks
+    /// no join there, however soon the Relay answers: whether it is still
+    /// wanted is asked again just before the join would be. The Relay holds
+    /// its answer until the connection has been let go, and the Server waits
+    /// for it far longer than the test could take, so nothing but the letting
+    /// go decides what comes of the join.
     #[tokio::test]
     async fn no_join_is_asked_for_a_connection_no_longer_wanted_once_proven() {
+        // Waited on only where the Server or the stand-in fails.
+        const STALLED: Duration = Duration::from_secs(60);
         let directory = tempfile::tempdir().unwrap();
-        let relays = controller(directory.path());
-        let (address, mut heard) = proving_relay().await;
-        relays.add(&address).unwrap();
+        let relays = controller_answering_within(directory.path(), Duration::from_secs(600));
+        let mut relay = proving_relay().await;
+        relays.add(&relay.address).unwrap();
         relays
             .lock()
             .iter_mut()
-            .find(|held| held.stored.address == address)
+            .find(|held| held.stored.address == relay.address)
             .unwrap()
             .stored
             .logged_in = true;
@@ -2492,13 +2520,28 @@ mod tests {
             timings: relays.timings,
             carrying: relays.carrying.clone(),
         };
+        let interest = tokio::sync::watch::Sender::new(());
+        let wanted = Wanted::while_held(&interest);
+        let address = relay.address.clone();
+        let joined =
+            tokio::spawn(async move { joining.join(&address, vec![7; 32], &wanted).await });
 
-        let joined = joining.join(&address, vec![7; 32], &Wanted::gone()).await;
+        tokio::time::timeout(STALLED, relay.proving.notified())
+            .await
+            .expect("the Server proves itself to the stand-in");
+        drop(interest);
+        relay.release.notify_one();
+        let joined = tokio::time::timeout(STALLED, joined)
+            .await
+            .expect("the join ends once the Relay answers")
+            .expect("the join runs to its end");
         assert_eq!(
-            joined.err().map(|error| error.kind()),
-            Some(std::io::ErrorKind::Interrupted)
+            joined.as_ref().err().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::Interrupted),
+            "the join ends as no longer wanted, not as {:?}",
+            joined.as_ref().err()
         );
-        let after_proof = tokio::time::timeout(Duration::from_secs(5), heard.recv())
+        let after_proof = tokio::time::timeout(STALLED, relay.heard.recv())
             .await
             .expect("the stand-in proved the Server")
             .expect("the stand-in is still listening");

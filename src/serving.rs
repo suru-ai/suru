@@ -395,10 +395,10 @@ impl Wanted {
         self.0.has_changed().is_ok()
     }
 
-    /// A connection wanted by nothing any longer.
+    /// A connection wanted for as long as `interest` stands.
     #[cfg(test)]
-    pub(crate) fn gone() -> Self {
-        Self(watch::Sender::new(()).subscribe())
+    pub(crate) fn while_held(interest: &watch::Sender<()>) -> Self {
+        Self(interest.subscribe())
     }
 }
 
