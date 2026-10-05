@@ -43,3 +43,9 @@ cool things Suru does:
   See [Running a Relay](docs/relay/README.md).
 - `/sidekick` - an agent with a view over all your sessions across all of your machines. Use it to answer meta questions,
   or to orchestrate work across workspaces and remotes.
+
+## Releasing
+
+Releases are cut by running the Release workflow from GitHub Actions. It signs and notarizes the macOS binary with
+secrets a maintainer sets up on a Mac by running `scripts/macos-signing-wizard.sh`, which walks through creating
+each one and uploads them; run it again to renew the certificate or rotate the notarization key.
