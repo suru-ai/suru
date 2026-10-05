@@ -2651,11 +2651,47 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
     let pair = paired_servers("remote-admin").await;
 
     let descriptor = pair.connecting.descriptor();
-    let remote_api = format!("{}/v1/remotes/workstation", descriptor.base_url);
+    let peer_id = &pair.serving_client.list_peers().await.unwrap()[0].id;
+    refuses_server_administration_to_peers(
+        &format!("{}/v1/remotes/workstation", descriptor.base_url),
+        &descriptor.token,
+        pair.serving.descriptor().instance_id,
+        peer_id,
+    )
+    .await;
+    assert_eq!(
+        pair.serving_client
+            .probe_remote("missing")
+            .await
+            .expect_err("the Serving Server has no Remotes")
+            .downcast_ref::<SessionError>()
+            .expect("the local API error remains typed")
+            .code,
+        SessionErrorCode::RemoteNotFound,
+        "the refused stop must leave the Serving Server running"
+    );
+
+    pair.shutdown().await;
+}
+
+/// Asks the Remote that `remote_api` reaches — as the Client holding `token`
+/// — to be administered every way a Server is, asserting each is refused as
+/// no Peer's to ask: changing its Settings, stopping it, though asked by its
+/// run's own `instance_id`, managing its Pairings, removing its Peer
+/// `peer_id` among them, and managing its Relays, or reading the event
+/// stream telling its Clients of them, each also by a path that only
+/// normalizes to one of them. Every way a Remote is reached asks this one
+/// matrix, so none can drift from another.
+async fn refuses_server_administration_to_peers(
+    remote_api: &str,
+    token: &str,
+    instance_id: uuid::Uuid,
+    peer_id: &str,
+) {
     let http = reqwest::Client::new();
     let settings = http
         .post(format!("{remote_api}/v1/settings"))
-        .bearer_auth(&descriptor.token)
+        .bearer_auth(token)
         .json(&SettingMutation::ServingEnabled { value: Some(false) })
         .send()
         .await
@@ -2664,9 +2700,9 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
 
     let stop = http
         .post(format!("{remote_api}/v1/server/stop"))
-        .bearer_auth(&descriptor.token)
+        .bearer_auth(token)
         .json(&ServerShutdown {
-            instance_id: pair.serving.descriptor().instance_id,
+            instance_id,
             reason: ShutdownReason::Manual,
         })
         .send()
@@ -2676,14 +2712,14 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
 
     let peers = http
         .get(format!("{remote_api}/v1/pairing/peers"))
-        .bearer_auth(&descriptor.token)
+        .bearer_auth(token)
         .send()
         .await
         .expect("attempt Remote Peer listing");
     assert_eq!(peers.status(), reqwest::StatusCode::FORBIDDEN);
     let invites = http
         .post(format!("{remote_api}/v1/pairing/invites"))
-        .bearer_auth(&descriptor.token)
+        .bearer_auth(token)
         .json(&IssueInviteRequest { ways: Vec::new() })
         .send()
         .await
@@ -2691,23 +2727,22 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
     assert_eq!(invites.status(), reqwest::StatusCode::FORBIDDEN);
     let remotes = http
         .get(format!("{remote_api}/v1/pairing/remotes"))
-        .bearer_auth(&descriptor.token)
+        .bearer_auth(token)
         .send()
         .await
         .expect("attempt Remote Pairing management");
     assert_eq!(remotes.status(), reqwest::StatusCode::FORBIDDEN);
     let normalized_settings = http
         .post(format!("{remote_api}/ordinary/%2e%2e/v1/settings"))
-        .bearer_auth(&descriptor.token)
+        .bearer_auth(token)
         .json(&SettingMutation::ServingEnabled { value: Some(false) })
         .send()
         .await
         .expect("attempt encoded Remote Settings mutation");
     assert_eq!(normalized_settings.status(), reqwest::StatusCode::FORBIDDEN);
-    let peer_id = &pair.serving_client.list_peers().await.unwrap()[0].id;
     let removal = http
         .delete(format!("{remote_api}/v1/pairing/peers/{peer_id}"))
-        .bearer_auth(&descriptor.token)
+        .bearer_auth(token)
         .send()
         .await
         .expect("attempt Remote Peer removal");
@@ -2749,7 +2784,7 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
     ] {
         let mut request = http
             .request(method.clone(), format!("{remote_api}{path}"))
-            .bearer_auth(&descriptor.token);
+            .bearer_auth(token);
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -2763,19 +2798,6 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
             "{method} {path} administers the Remote's Relays"
         );
     }
-    assert_eq!(
-        pair.serving_client
-            .probe_remote("missing")
-            .await
-            .expect_err("the Serving Server has no Remotes")
-            .downcast_ref::<SessionError>()
-            .expect("the local API error remains typed")
-            .code,
-        SessionErrorCode::RemoteNotFound,
-        "the refused stop must leave the Serving Server running"
-    );
-
-    pair.shutdown().await;
 }
 
 /// The Broker's tokens name this machine's own Provider Sessions, so Serving

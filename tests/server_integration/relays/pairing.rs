@@ -2995,6 +2995,61 @@ async fn the_relays_are_told_beside_as_much_as_a_joined_stream_carries_at_once()
     paired.shutdown().await;
 }
 
+/// Nothing that administers a Server is carried to it through a Relay, any
+/// more than directly: a Remote paired through a Relay alone refuses its
+/// Peer the whole matrix of routes a directly paired one does, asked over
+/// the join the Relay makes, and goes on running.
+#[tokio::test]
+async fn a_remote_reached_through_a_relay_alone_refuses_its_peers_server_administration() {
+    let PairedThrough {
+        mut relay,
+        workstation,
+        laptop,
+    } = PairedThrough::start("relay-pairing-remote-admin").await;
+    let descriptor = laptop.server.as_ref().unwrap().descriptor().clone();
+    let peer_id = workstation.client.list_peers().await.unwrap()[0].id.clone();
+    relay.route.wait_for_connections(2).await;
+    let opened = relay.route.opened_connections();
+    let logged = relay.joined_connections_logged();
+    // The Remote kept in view, so all that is asked of it is asked over one
+    // join.
+    let mut catalog = laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+
+    crate::refuses_server_administration_to_peers(
+        &format!("{}/v1/remotes/{REMOTE}", descriptor.base_url),
+        &descriptor.token,
+        workstation
+            .server
+            .as_ref()
+            .unwrap()
+            .descriptor()
+            .instance_id,
+        &peer_id,
+    )
+    .await;
+    timeout(PROGRESS_DEADLINE, RemoteApi::of(&laptop).health())
+        .await
+        .expect("the Remote answers in time")
+        .expect("the refused stop leaves the Remote running");
+    assert_eq!(
+        relay.route.opened_connections() - opened,
+        2,
+        "everything was asked over one join at the Relay"
+    );
+
+    drop(catalog);
+    laptop.shutdown().await;
+    relay.wait_for_joined_connections_logged(logged + 1).await;
+    workstation.shutdown().await;
+}
+
 /// Requests waiting their turn on a joined stream that drops fail at once,
 /// with everything it carried, and the Remote answers again over a join made
 /// afresh.
