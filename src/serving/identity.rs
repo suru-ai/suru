@@ -10,7 +10,10 @@
 //! marker, which holds nothing secret: where the key is kept — the store's
 //! item, or the file — and the key's fingerprint. A key the marker says is
 //! kept somewhere is never made anew, whatever stands in the way of getting
-//! it: a new key would end every Pairing and Relay Login the Server has.
+//! it: a new key would end every Pairing and Relay Login the Server has. Nor
+//! is a key used before what the next load needs to get it again is on the
+//! disk — the marker, and the file where it keeps the key — as a crash could
+//! take what is not, and with it every Pairing and Relay Login made since.
 
 use std::{
     fs, io,
@@ -272,8 +275,17 @@ impl KeptKey {
         }
         match marker {
             Marker::SystemStore { .. } => {
+                // The marker may be in place but not on the disk — writing it
+                // can fail having put it there — and a crash taking it would
+                // leave nothing to say the store keeps a key, so the next
+                // load would make one anew. So it is written again, for good,
+                // before the key is used, and the use fails where it cannot
+                // be. A marker saying the file keeps the key needs no such
+                // writing: it is written only once the file is on the disk,
+                // so a crash taking it leaves the file, which keeps the key.
+                self.mark(&marker)?;
                 tracing::info!("Server identity key is kept in {place}, as its marker records");
-                self.delete_file_left(&key, &marker);
+                self.delete_file_left(&key);
             }
             Marker::File { fingerprint } => self.move_from_file(&key, fingerprint),
         }
@@ -288,6 +300,10 @@ impl KeptKey {
             return self.make();
         };
         let fingerprint = fingerprint_of(&key)?;
+        // The file may be in place but not on the disk, as making a key in it
+        // can leave it, so it is written again, for good, before a marker
+        // says it keeps the key.
+        self.keep_in_file(&key)?;
         self.mark(&Marker::File {
             fingerprint: fingerprint.clone(),
         })?;
@@ -350,17 +366,15 @@ impl KeptKey {
     }
 
     /// Deletes the key file where it keeps `key`, which the platform
-    /// credential store keeps as the item `marker` names: the file a move
-    /// into the store stopped before deleting. A file keeping another key
-    /// is no file a move left, and is left as it is. The key is got all the
-    /// same, so what stands in the way is Logged, and the next load tries
-    /// again.
-    fn delete_file_left(&self, key: &[u8], marker: &Marker) {
+    /// credential store keeps as the item the marker, on the disk, names:
+    /// the file a move into the store stopped before deleting. A file
+    /// keeping another key is no file a move left, and is left as it is.
+    /// The key is got all the same, so what stands in the way is Logged, and
+    /// the next load tries again.
+    fn delete_file_left(&self, key: &[u8]) {
         let deleted = match self.file.read() {
             Ok(None) => return,
-            // A move can stop with the marker in place but not yet on the
-            // disk, so it is written again, for good, before the file goes.
-            Ok(Some(left)) if left == key => self.mark(marker).and_then(|()| self.file.delete()),
+            Ok(Some(left)) if left == key => self.file.delete(),
             Ok(Some(_)) => {
                 tracing::warn!(
                     "{} keeps a key other than this Server's identity key, and is left as it is",
@@ -381,7 +395,9 @@ impl KeptKey {
 
     /// A new key, kept in the store the selection says — in the file where
     /// that is the platform credential store and it cannot take the key —
-    /// and marked as kept there.
+    /// and marked as kept there. No use gets it until the marker is on the
+    /// disk, and, where the file keeps it, the file before the marker; a use
+    /// for which either cannot be fails, leaving whatever a marker may name.
     fn make(&self) -> Result<Vec<u8>> {
         let key = KeyPair::generate()
             .context("generate Server identity")?
@@ -391,7 +407,13 @@ impl KeptKey {
         let refused = match self.selection.store() {
             IdentityStoreChoice::System => match self.keep_in_store(&key) {
                 Ok(item) => {
-                    self.mark_kept_in_store(item, fingerprint)?;
+                    if self.mark_kept_in_store(item, fingerprint.clone())? == Marked::InPlace {
+                        // Written again, for good, before the key is used;
+                        // where it cannot be, the use fails, and the next
+                        // gets the key from the item the marker in place
+                        // names.
+                        self.mark(&Marker::SystemStore { item, fingerprint })?;
+                    }
                     tracing::info!(
                         "Server identity key is made and kept in {PLATFORM_STORE}, as the item \
                          {item}: {why}"
@@ -1753,6 +1775,82 @@ mod tests {
             MarkingLeft::after(Err(anyhow!("unreadable")), item),
             MarkingLeft::Unknown
         );
+    }
+
+    /// A first key the platform credential store keeps is never used before
+    /// the marker naming its item is on the disk, as a crash could take a
+    /// marker that is not, and the next load would make another key in its
+    /// place. Where writing the marker fails having put it in place, it is
+    /// written again; a use for which it cannot be fails, leaving the item,
+    /// and the next use gets the key from it. A crash after any use that got
+    /// the key leaves it to the next load.
+    #[tokio::test]
+    async fn a_first_key_in_the_store_is_never_used_before_its_marker_is_on_the_disk() {
+        for unflushed in [1, 2, 3] {
+            let directory = tempfile::tempdir().unwrap();
+            let marker_path = directory.path().join("server-identity.json");
+            let store = Arc::new(FakeIdentityStore::default());
+            let disk = Arc::new(FakeDisk::default());
+            let identity =
+                || IdentityKey::written_with(directory.path(), kept_in(&store), disk.writing());
+
+            disk.fail_flushing(&marker_path, unflushed);
+            let mut got = None;
+            for _ in 0..=unflushed {
+                match identity().public_key().await {
+                    Ok(public_key) => {
+                        got = Some(public_key);
+                        break;
+                    }
+                    Err(error) => {
+                        assert!(
+                            format!("{error:#}").starts_with("write Server identity marker"),
+                            "{error:#}"
+                        );
+                        let kept = store.contents();
+                        assert_eq!(kept.len(), 1, "no key is made beside the first");
+                        assert!(
+                            kept.contains_key(&marked_item(directory.path())),
+                            "the item the marker names is left"
+                        );
+                    }
+                }
+            }
+            let public_key = got.expect("a use gets the key once its marker is on the disk");
+            disk.crash();
+            assert_eq!(
+                identity().public_key().await.unwrap(),
+                public_key,
+                "a crash takes no key a use got, unflushed {unflushed} times"
+            );
+            assert_eq!(store.contents().len(), 1);
+        }
+    }
+
+    /// A first key kept in the file is never used before the file, and the
+    /// marker saying the file keeps it, are on the disk, the file first: a
+    /// use for which either cannot be flushed fails, and a crash after any
+    /// use that got the key leaves it to the next load.
+    #[tokio::test]
+    async fn a_first_key_in_the_file_is_never_used_before_the_file_is_on_the_disk() {
+        for unflushed in ["server-identity.pk8", "server-identity.json"] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Arc::new(FakeIdentityStore::default());
+            store.set_available(false);
+            let disk = Arc::new(FakeDisk::default());
+            let identity =
+                || IdentityKey::written_with(directory.path(), kept_in(&store), disk.writing());
+
+            disk.fail_flushing(&directory.path().join(unflushed), 1);
+            identity().public_key().await.unwrap_err();
+            let public_key = identity().public_key().await.unwrap();
+            disk.crash();
+            assert_eq!(
+                identity().public_key().await.unwrap(),
+                public_key,
+                "a crash takes no key a use got, {unflushed} unflushed"
+            );
+        }
     }
 
     /// Two data directories with one platform credential store between them
