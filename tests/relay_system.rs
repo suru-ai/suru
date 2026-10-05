@@ -1,10 +1,10 @@
 //! A Server reaching its Relays the way its machine reaches the web — through
 //! the system's HTTP proxy, and over HTTPS trusting what the machine's trust
 //! store trusts — and writing nothing of its Relays to its Log, however
-//! verbose the Log is asked to be, whether it logs in at them or Serves
-//! through them. The proxy and the trust store are named in
-//! the environment, and the Log is set up once for the whole process, so this
-//! binary holds this one test alone.
+//! verbose the Log is asked to be, whether it logs in at them, Serves
+//! through them, or refuses one whose certificate it cannot accept. The proxy
+//! and the trust store are named in the environment, and the Log is set up
+//! once for the whole process, so this binary holds this one test alone.
 
 use std::{
     sync::{Arc, Mutex},
@@ -42,6 +42,11 @@ use support::{
 const PROXIED_HOST: &str = "relay-behind-the-proxy.invalid";
 const PROXIED_ADDRESS: &str = "http://relay-behind-the-proxy.invalid:8443";
 
+/// A name nothing resolves, by which the Server knows a Relay serving HTTPS
+/// under a certificate for another name: the proxy tunnels to it.
+const MISNAMED_HOST: &str = "private-relay.company.example";
+const MISNAMED_ADDRESS: &str = "https://private-relay.company.example:8443";
+
 #[test]
 fn a_server_reaches_its_relays_through_the_system_proxy_and_trust_and_logs_nothing_of_them() {
     let proxy = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -52,16 +57,14 @@ fn a_server_reaches_its_relays_through_the_system_proxy_and_trust_and_logs_nothi
     // while it changes: the binary holds this one test, and no runtime has
     // started yet.
     unsafe {
-        std::env::set_var(
-            "HTTP_PROXY",
-            format!("http://{}", proxy.local_addr().unwrap()),
-        );
+        for name in ["HTTP_PROXY", "HTTPS_PROXY"] {
+            std::env::set_var(name, format!("http://{}", proxy.local_addr().unwrap()));
+        }
         // On Linux the operating system's trust store is the certificate
         // bundle this names, which a machine's own CA would be added to.
         std::env::set_var("SSL_CERT_FILE", &trust.bundle);
         for name in [
             "http_proxy",
-            "HTTPS_PROXY",
             "https_proxy",
             "ALL_PROXY",
             "all_proxy",
@@ -171,9 +174,11 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
     .expect("start the Relay");
     let relay_address = relay.address();
     let carried = Arc::new(Mutex::new(Vec::<String>::new()));
+    let tunnelled = Arc::new(Mutex::new(None));
     let proxying = tokio::spawn(forward_proxy(
         TcpListener::from_std(proxy).unwrap(),
         relay_address,
+        tunnelled.clone(),
         carried.clone(),
     ));
 
@@ -365,6 +370,45 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
         https_relay.shutdown().await.unwrap();
     }
 
+    // A Relay known by a name its certificate is not for — or, where the
+    // machine's trust store cannot be added to, whose certificate it does
+    // not trust — is refused, its certificate checked against the name the
+    // Server knows it by, through the proxy, which tunnels to it. However
+    // the check fails, nothing of that name reaches the Log.
+    let misnamed_relay_directory = tempfile::tempdir().unwrap();
+    let misnamed_relay = suru_relay::start(
+        RelayConfig::new(
+            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            misnamed_relay_directory.path().join("relay.db"),
+            MISNAMED_ADDRESS,
+        )
+        .with_tls(trust.write(misnamed_relay_directory.path()))
+        .with_admission(admitting(&provider)),
+        provider.clone(),
+    )
+    .await
+    .expect("start the Relay serving HTTPS under another name");
+    *tunnelled.lock().unwrap() = Some(misnamed_relay.address());
+    client.add_relay(MISNAMED_ADDRESS.to_owned()).await.unwrap();
+    let refused = client
+        .begin_relay_login(MISNAMED_ADDRESS)
+        .await
+        .expect_err("a certificate not for the Relay's name is refused");
+    assert!(
+        refused.to_string().contains("certificate"),
+        "the refusal says the certificate is not accepted: {refused:#}"
+    );
+    assert!(
+        carried
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|target| target.starts_with(MISNAMED_HOST)),
+        "the proxy tunnelled the Server to the Relay, whose certificate it checked"
+    );
+    other_material.push(MISNAMED_HOST.to_owned());
+    misnamed_relay.shutdown().await.unwrap();
+
     drop(client);
     server.shutdown().await.unwrap();
     relay.shutdown().await.unwrap();
@@ -383,22 +427,31 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
     .into_iter()
     .chain(other_material.iter().map(String::as_str))
     {
+        let holding = logs
+            .lines()
+            .filter(|line| line.contains(material))
+            .collect::<Vec<_>>();
         assert!(
-            !logs.contains(material),
-            "the Server's Log holds nothing of its Relays, yet it holds {material:?}"
+            holding.is_empty(),
+            "the Server's Log holds nothing of its Relays, yet it holds {material:?}: \
+             {holding:#?}"
         );
     }
 }
 
 /// A forward HTTP proxy carrying every request for [`PROXIED_HOST`] to the
-/// Relay at `relay`, noting the target each request named.
+/// Relay at `relay`, and tunnelling every connection asked for to
+/// [`MISNAMED_HOST`] to wherever `tunnelled` says, noting the target each
+/// request named.
 async fn forward_proxy(
     listener: TcpListener,
     relay: std::net::SocketAddr,
+    tunnelled: Arc<Mutex<Option<std::net::SocketAddr>>>,
     carried: Arc<Mutex<Vec<String>>>,
 ) {
     while let Ok((mut inbound, _)) = listener.accept().await {
         let carried = carried.clone();
+        let tunnelled = tunnelled.clone();
         tokio::spawn(async move {
             let mut head = Vec::new();
             while !head.ends_with(b"\r\n\r\n") {
@@ -419,6 +472,28 @@ async fn forward_proxy(
                 return;
             };
             carried.lock().unwrap().push(target.to_owned());
+            if method == "CONNECT" {
+                let to = target
+                    .strip_prefix(MISNAMED_HOST)
+                    .and_then(|_| *tunnelled.lock().unwrap());
+                let Some(to) = to else {
+                    let _ = inbound
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                    return;
+                };
+                let Ok(mut outbound) = TcpStream::connect(to).await else {
+                    return;
+                };
+                if inbound
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .is_ok()
+                {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+                return;
+            }
             let Some(path) = target
                 .strip_prefix("http://")
                 .and_then(|target| target.strip_prefix(PROXIED_HOST))

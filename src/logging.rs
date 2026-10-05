@@ -14,7 +14,9 @@
 //! included — before Suru has read it, so no directive may let those lines
 //! through. Neither may the lines in which the WebSocket and HTTP clients a
 //! Server reaches its Relays with name the Relay or carry what it said — a
-//! login's code among them — since nothing of a Relay reaches a Log.
+//! login's code among them — nor those in which the TLS beneath them names
+//! the Relay it checks a certificate for, since nothing of a Relay reaches a
+//! Log.
 
 use std::{
     fs::{self, OpenOptions},
@@ -42,15 +44,22 @@ const RETAINED_LOG_FILES: usize = 20;
 /// the most verbose level each is let log at whatever `SURU_LOG` asks: rmcp
 /// logs each Broker call whole, Answers included, at debug and trace and its
 /// notifications at info; tungstenite logs every frame and message a Relay
-/// sends whole at trace; and reqwest and hyper-util name the address of every
-/// host they connect to — a Relay's among them — at debug and trace. Their
-/// warnings and errors say what went wrong without either.
-const PAYLOAD_BEARING_TARGETS: [(&str, LevelFilter); 5] = [
+/// sends whole at trace; reqwest and hyper-util name the address of every
+/// host they connect to — a Relay's among them — at debug and trace; and
+/// rustls, wherever a dependency builds it with its logging, names the host
+/// whose certificate it is to check — a Relay's among them — at debug and
+/// trace. Their warnings and errors say what went wrong without any of that.
+/// The platform verifier rustls checks a Relay's certificate with logs
+/// nothing at all: its errors name the host the certificate was checked for,
+/// and the names the certificate holds.
+const PAYLOAD_BEARING_TARGETS: [(&str, LevelFilter); 7] = [
     ("rmcp", LevelFilter::WARN),
     ("tungstenite", LevelFilter::WARN),
     ("tokio_tungstenite", LevelFilter::WARN),
     ("reqwest", LevelFilter::WARN),
     ("hyper_util", LevelFilter::WARN),
+    ("rustls", LevelFilter::WARN),
+    ("rustls_platform_verifier", LevelFilter::OFF),
 ];
 
 /// The process's role, naming its Log file and stamped into its opening line.
@@ -252,8 +261,8 @@ mod tests {
 
     /// However verbose `SURU_LOG` asks the Log to be — at any level, and naming
     /// the dependency outright — a dependency that logs the payloads it carries
-    /// is held to its warnings and errors, while Suru's own lines are written
-    /// as verbosely as asked.
+    /// is held to its warnings and errors, or to nothing where even its errors
+    /// carry them, while Suru's own lines are written as verbosely as asked.
     #[test]
     fn a_dependency_logging_payloads_is_held_to_warnings_whatever_the_filter_asks() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -263,7 +272,7 @@ mod tests {
             Role::Server,
             Some(
                 "trace,rmcp=trace,rmcp::service=trace,tungstenite=trace,reqwest::connect=trace,\
-                 hyper_util=trace"
+                 hyper_util=trace,rustls=trace,rustls_platform_verifier=trace"
                     .to_owned(),
             ),
         )
@@ -276,6 +285,11 @@ mod tests {
         tracing::trace!(target: "tokio_tungstenite", "frame tok-relay-frame");
         tracing::debug!(target: "reqwest::connect", "starting new connection: tok-relay-host");
         tracing::debug!(target: "hyper_util::client", "connecting to tok-relay-address");
+        tracing::debug!(target: "rustls::client::hs", "No cached session for tok-relay-name");
+        tracing::error!(
+            target: "rustls_platform_verifier::verification::others",
+            "failed to verify TLS certificate: not valid for name tok-relay-certificate"
+        );
         tracing::trace!(marker = "suru-trace", "Suru's own trace line");
         drop(guard);
         let log_dir = config.state_dir().join(LOG_DIR);
@@ -292,6 +306,8 @@ mod tests {
             "tok-relay-frame",
             "tok-relay-host",
             "tok-relay-address",
+            "tok-relay-name",
+            "tok-relay-certificate",
         ] {
             assert!(!contents.contains(payload), "{payload} reached the Log");
         }
