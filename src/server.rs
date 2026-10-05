@@ -1421,7 +1421,10 @@ async fn start(
         interval: timings.joined_stream_keepalive_interval,
         timeout: timings.joined_stream_keepalive_timeout,
     })
-    .with_direct_proxies(timings.direct_proxies.clone());
+    .with_direct_proxies(timings.direct_proxies.clone())
+    .with_identity_store(Arc::new(crate::serving::FileIdentityStore::in_data_dir(
+        config.data_dir(),
+    )));
     let relays = crate::relays::RelayController::new(
         config.data_dir(),
         serving.clone(),
