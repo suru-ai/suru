@@ -1493,7 +1493,8 @@ pub enum ListenerState {
     /// Listening at `address`.
     Open { address: std::net::SocketAddr },
     /// Asked to listen, and listening nowhere, for `reason`: it could not
-    /// open where the Serving Settings ask, or it stopped on its own.
+    /// open where the Serving Settings ask, it stopped on its own, or
+    /// Serving itself could not start.
     Failed { reason: String },
 }
 

@@ -302,6 +302,11 @@ pub(crate) struct ServingController {
     data_dir: PathBuf,
     local_api: LocalApi,
     active: Arc<Mutex<Option<ActiveServing>>>,
+    /// The Serving Settings last adopted, where they ask for Serving and it
+    /// could not start — its identity key's store not answering, say: what
+    /// the next use of Serving starts it under. Changed only while `active`
+    /// is held.
+    unstarted: Arc<StdMutex<Option<ServingSettings>>>,
     /// How the listener stands, as the Server tells its Clients.
     listening: watch::Sender<ListenerState>,
     /// Whether the Server is Serving — accepting paired Servers at all, by
@@ -927,6 +932,7 @@ impl ServingController {
                 http: crate::runtime::loopback_http_client(),
             },
             active: Arc::new(Mutex::new(None)),
+            unstarted: Arc::default(),
             listening: watch::Sender::new(ListenerState::Off),
             serving: watch::channel(ServingStretch::default()).0,
             carried: Arc::default(),
@@ -1053,11 +1059,23 @@ impl ServingController {
         &self,
         request: IssueInviteRequest,
     ) -> std::result::Result<IssuedInvite, PairingFailure> {
-        if self.active.lock().await.is_none() {
-            return Err(PairingFailure::new(
-                SessionErrorCode::ServingListenerFailed,
-                "Serving is disabled",
-            ));
+        {
+            let mut active = self.active.lock().await;
+            if active.is_none() {
+                // Serving its Settings ask for that could not start as they
+                // were adopted is started at this use of it instead.
+                let Some(settings) = *self.unstarted() else {
+                    return Err(PairingFailure::new(
+                        SessionErrorCode::ServingListenerFailed,
+                        "Serving is disabled",
+                    ));
+                };
+                if let Err(error) = self.adopt_held(&mut active, settings).await
+                    && active.is_none()
+                {
+                    return Err(identity_failure(error));
+                }
+            }
         }
         let listening = self.listening.borrow().clone();
         let ways = request
@@ -1547,20 +1565,57 @@ impl ServingController {
     /// fails the adoption, leaving the one already listening, if any, where
     /// it is, and Serving going on through the Relays either way. An
     /// unchanged configuration is left alone.
+    ///
+    /// Serving that cannot start fails the adoption, and the listener reads
+    /// as failed for why, where the Server's user sees it; the next adoption
+    /// asking for Serving, or the next Invite asked for, tries again.
     pub(crate) async fn adopt(&self, settings: ServingSettings) -> Result<()> {
         let mut active = self.active.lock().await;
+        self.adopt_held(&mut active, settings).await
+    }
+
+    /// Adopts `settings`, as [`Self::adopt`] does, with `active` held.
+    async fn adopt_held(
+        &self,
+        active: &mut Option<ActiveServing>,
+        settings: ServingSettings,
+    ) -> Result<()> {
         if !settings.enabled {
+            *self.unstarted() = None;
             self.stop_carrying();
             self.discard_invites();
-            stop_active(&mut active, &self.listening).await;
+            stop_active(active, &self.listening).await;
             return Ok(());
         }
         if active.is_none() {
-            *active = Some(self.start_serving(settings).await?);
+            match self.start_serving(settings).await {
+                Ok(started) => {
+                    *self.unstarted() = None;
+                    *active = Some(started);
+                }
+                Err(error) => {
+                    *self.unstarted() = Some(settings);
+                    tell(
+                        &self.listening,
+                        ListenerState::Failed {
+                            reason: error.to_string(),
+                        },
+                    );
+                    return Err(error);
+                }
+            }
         }
         let running = active.as_mut().expect("Serving was started above");
         running.settings = settings;
         self.adopt_listener(running).await
+    }
+
+    /// The Serving Settings Serving could not start under, where it could
+    /// not; see `unstarted`.
+    fn unstarted(&self) -> std::sync::MutexGuard<'_, Option<ServingSettings>> {
+        self.unstarted
+            .lock()
+            .expect("unstarted Serving lock is not poisoned")
     }
 
     /// Starts Serving, with no listener yet: the acceptor, taking the
@@ -1677,6 +1732,7 @@ impl ServingController {
 
     pub(crate) async fn shutdown(&self) {
         let mut active = self.active.lock().await;
+        *self.unstarted() = None;
         self.stop_carrying();
         stop_active(&mut active, &self.listening).await;
         // What Remotes told that has yet to be stored is stored as the
@@ -7343,6 +7399,78 @@ mod tests {
             SessionErrorCode::PairingOutcomeUnknown,
             "the Remote answered, so what it was asked may have been done"
         );
+    }
+
+    /// Serving its Settings ask for that cannot start for want of its
+    /// identity key says why where the listener's state is told, and an
+    /// Invite asked for meanwhile is refused saying the same. Once the store
+    /// answers, the next Invite asked for starts Serving and is issued.
+    #[tokio::test]
+    async fn serving_that_cannot_start_for_want_of_its_identity_key_says_why_and_starts_later() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Arc::new(FakeIdentityStore::default());
+        let controller = || {
+            ServingController::new(
+                data.path(),
+                tokio::time::Duration::from_secs(60),
+                crate::protocol::PROTOCOL_VERSION,
+                "http://127.0.0.1:9".to_owned(),
+                "token".to_owned(),
+            )
+            .unwrap()
+            .with_identity_keeping(IdentityKeeping {
+                store: store.clone(),
+                selection: Selection::ReleaseBuild,
+                channel: "test".to_owned(),
+                store_timeout: tokio::time::Duration::from_secs(10),
+            })
+        };
+        controller().identity_key().public_key().await.unwrap();
+        let settings = ServingSettings {
+            enabled: true,
+            listener: true,
+            port: 0,
+            bind_address: std::net::Ipv4Addr::LOCALHOST.into(),
+        };
+
+        store.set_available(false);
+        let serving = controller();
+        let not_serving = serving
+            .adopt(settings)
+            .await
+            .expect_err("nothing Serves without the identity key");
+        let told = serving.listener().borrow().clone();
+        let ListenerState::Failed { reason } = told else {
+            panic!("the listener reads {told:?}");
+        };
+        assert_eq!(reason, not_serving.to_string());
+        assert!(reason.contains("platform credential store"), "{reason}");
+        let ask = || {
+            serving.issue_invite(IssueInviteRequest {
+                ways: vec![Way::Direct("127.0.0.1:1".parse().unwrap())],
+            })
+        };
+        let Err(refused) = ask().await else {
+            panic!("no Invite is issued without Serving");
+        };
+        assert_eq!(refused.code, SessionErrorCode::IdentityKeyUnavailable);
+        assert_eq!(refused.message, reason);
+
+        store.set_available(true);
+        ask()
+            .await
+            .unwrap_or_else(|failure| panic!("{}", failure.message));
+        assert!(serving.address().is_some(), "Serving starts");
+
+        serving
+            .adopt(ServingSettings {
+                enabled: false,
+                ..settings
+            })
+            .await
+            .unwrap();
+        assert_eq!(*serving.listener().borrow(), ListenerState::Off);
+        serving.shutdown().await;
     }
 
     /// Redeeming an Invite while the platform credential store this
