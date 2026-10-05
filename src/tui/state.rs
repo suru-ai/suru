@@ -5161,7 +5161,9 @@ pub enum ApplicationTransition {
     /// One Setting's typed edit, on its way to the server that owns the file.
     MutateSetting(SettingMutation),
     /// Prepare the `/serve` surface, enabling the durable Setting first when
-    /// it was off before discovering the ways an Invite may offer.
+    /// it was off — or asking for it on again where the Serving listener has
+    /// failed, so the Server tries once more to Serve — before discovering
+    /// the ways an Invite may offer.
     BeginServing {
         request: ServeRequest,
         enable: bool,
@@ -9652,7 +9654,15 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::ServeOpen => {
-                let enable = !self.state.settings.serving.enabled;
+                // Serving whose listener failed — Serving itself could not
+                // start, say, its identity key's store not answering — is
+                // asked for again, as one off is turned on: the Server tries
+                // once more, and says why where it still cannot.
+                let enable = !self.state.settings.serving.enabled
+                    || matches!(
+                        self.state.serving_listener,
+                        crate::protocol::ListenerState::Failed { .. }
+                    );
                 let port = self.state.settings.serving.port;
                 let request = self.state.serve_overlay.open();
                 self.state.command_mode = CommandMode::Composer;

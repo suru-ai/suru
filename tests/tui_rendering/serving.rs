@@ -8,7 +8,10 @@ use crate::support::{
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
-    protocol::{EffectiveSettings, IssueInviteRequest, IssuedInvite, Peer, SettingsSnapshot, Way},
+    protocol::{
+        EffectiveSettings, IssueInviteRequest, IssuedInvite, ListenerState, Peer, SettingsSnapshot,
+        Way,
+    },
     tui::{Application, ApplicationEvent, ApplicationTransition, SemanticCommandId},
 };
 
@@ -135,6 +138,48 @@ fn serving_shows_a_fresh_copyable_invite_and_removes_enrolled_peers() {
         !rendered_application_rows(&application)
             .join("\n")
             .contains("laptop-fingerprint")
+    );
+}
+
+/// Where Serving is on and its listener has failed — Serving could not
+/// start, its identity key's store not answering, say — `/serve` asks the
+/// Server for Serving again, so it tries once more, and the picker says why
+/// where it still cannot.
+#[test]
+fn serve_asks_for_serving_again_where_its_listener_has_failed() {
+    let mut application = Application::default();
+    let mut settings = EffectiveSettings::default();
+    settings.serving.enabled = true;
+    settings.serving.port = 7777;
+    deliver_settings(&mut application, settings);
+    deliver_listener(
+        &mut application,
+        ListenerState::Failed {
+            reason: "the platform credential store did not answer".to_owned(),
+        },
+    );
+
+    type_terminal_text(&mut application, "/serve");
+    let ApplicationTransition::BeginServing {
+        request,
+        enable: true,
+        port: 7777,
+    } = press(&mut application, KeyCode::Enter)
+    else {
+        panic!("/serve asks for Serving again where its listener has failed");
+    };
+    let still = "this Server's identity key is kept in the platform credential store, which did \
+                 not answer";
+    application
+        .handle_event(ApplicationEvent::ServingPreparationFailed {
+            request,
+            error: still.to_owned(),
+        })
+        .expect("say why Serving still cannot start");
+    let picker = rendered_application_rows(&application).join(" ");
+    assert!(
+        picker.contains("platform credential store"),
+        "the picker says why: {picker}"
     );
 }
 
