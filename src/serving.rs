@@ -1072,7 +1072,7 @@ impl ServingController {
             ));
         }
 
-        let identity = self.identity().map_err(identity_failure)?;
+        let identity = self.identity().await.map_err(identity_failure)?;
         let token = new_token();
         let payload = InvitePayload {
             ways: ways.clone(),
@@ -1172,7 +1172,7 @@ impl ServingController {
             validate_remote_name(name)?;
             self.ensure_remote_name_available(name)?;
         }
-        let identity = self.identity().map_err(identity_failure)?;
+        let identity = self.identity().await.map_err(identity_failure)?;
         let prepare = EnrollmentRequest {
             token: URL_SAFE_NO_PAD.encode(invite.token),
             protocol_version: self.protocol_version,
@@ -1373,7 +1373,7 @@ impl ServingController {
                 ));
             }
         };
-        let client = self.pairing_client(&remote)?;
+        let client = self.pairing_client(&remote).await?;
         // A request that may have reached the Remote is never asked again by
         // another way unless asking twice changes nothing: only one that was
         // never delivered is.
@@ -1479,7 +1479,7 @@ impl ServingController {
     /// authentication, protocol, and timeout failure alike simply leaves the
     /// removal unacknowledged.
     async fn ask_remote_to_withdraw(&self, remote: &StoredRemote) -> bool {
-        let Ok(client) = self.pairing_client(remote) else {
+        let Ok(client) = self.pairing_client(remote).await else {
             return false;
         };
         let asking = || {
@@ -1556,7 +1556,7 @@ impl ServingController {
             return Ok(());
         }
         if active.is_none() {
-            *active = Some(self.start_serving(settings)?);
+            *active = Some(self.start_serving(settings).await?);
         }
         let running = active.as_mut().expect("Serving was started above");
         running.settings = settings;
@@ -1566,8 +1566,8 @@ impl ServingController {
     /// Starts Serving, with no listener yet: the acceptor, taking the
     /// connections the listener and the Relays hand it, and another stretch
     /// of Serving for the Relays to wait in.
-    fn start_serving(&self, settings: ServingSettings) -> Result<ActiveServing> {
-        let tls = self.serving_tls()?;
+    async fn start_serving(&self, settings: ServingSettings) -> Result<ActiveServing> {
+        let tls = self.serving_tls(self.identity().await?)?;
         let connections = Arc::new(RevocableConnections::default());
         let (dialled, dialled_arrivals) = mpsc::channel(DIALLED_ARRIVALS_QUEUED);
         let (carried, carried_arrivals) = mpsc::channel(CARRIED_ARRIVALS_QUEUED);
@@ -1731,9 +1731,13 @@ impl ServingController {
     }
 
     /// This Server's own key fingerprint: what a Remote it is paired with
-    /// knows it by as a Peer, and names its Sidekicks' acts by.
+    /// knows it by as a Peer, and names its Sidekicks' acts by. It is known
+    /// without asking the store the key is kept in, so while that store does
+    /// not answer, and fails where the Server has yet to make its key.
     pub(crate) fn own_fingerprint(&self) -> Result<String> {
-        self.identity.fingerprint()
+        self.identity
+            .fingerprint()?
+            .context("this Server has yet to make its identity key")
     }
 
     /// This Server's identity key, by which it also proves itself to a
@@ -1764,8 +1768,8 @@ impl ServingController {
         });
     }
 
-    fn identity(&self) -> Result<IdentityMaterial> {
-        self.identity.material()
+    async fn identity(&self) -> Result<IdentityMaterial> {
+        self.identity.material().await
     }
 
     /// What dials the ways of the Serving Server whose identity key is
@@ -1784,9 +1788,8 @@ impl ServingController {
     }
 
     /// The pinned-key TLS the Serving side runs over each connection it
-    /// accepts, by where the connection came from.
-    fn serving_tls(&self) -> Result<ServingTls> {
-        let identity = self.identity()?;
+    /// accepts, by where the connection came from, proving `identity`.
+    fn serving_tls(&self, identity: IdentityMaterial) -> Result<ServingTls> {
         let certified = Arc::new(
             CertifiedKey::from_der(
                 vec![CertificateDer::from(identity.certificate)],
@@ -2198,7 +2201,7 @@ impl ServingController {
         &self,
         remote: &StoredRemote,
     ) -> std::result::Result<RemoteHealth, PairingFailure> {
-        let client = self.pairing_client(remote)?;
+        let client = self.pairing_client(remote).await?;
         let asking = || {
             Request::get("/health")
                 .body(Body::empty())
@@ -2245,10 +2248,12 @@ impl ServingController {
     /// nothing is asked of it, nor of the Pairing in its place, as it was
     /// asked: it is not found. Judged as the client is chosen, so no client
     /// is made for a Pairing that has ended.
-    fn pairing_client(
+    async fn pairing_client(
         &self,
         remote: &StoredRemote,
     ) -> std::result::Result<Arc<PairingHttpClient>, PairingFailure> {
+        // Got before anything is held, since getting it may take a while.
+        let identity = self.identity().await.map_err(identity_failure)?;
         let mut clients = self
             .remote_clients
             .lock()
@@ -2272,7 +2277,6 @@ impl ServingController {
         {
             return Ok(client);
         }
-        let identity = self.identity().map_err(identity_failure)?;
         let client = Arc::new(PairingHttpClient {
             generation: remote.generation,
             ..paired_http_client(
@@ -5811,7 +5815,7 @@ mod tests {
     #[tokio::test]
     async fn no_join_is_asked_for_interest_let_go_though_the_relay_would_join_at_once() {
         let directory = tempfile::tempdir().unwrap();
-        let identity = IdentityKey::new(directory.path()).material().unwrap();
+        let identity = IdentityKey::new(directory.path()).material().await.unwrap();
         let relays = Arc::new(CountingRelays::default());
         let given = GivenRelays::default();
         let _ = given.set(relays.clone());
@@ -5932,7 +5936,7 @@ mod tests {
     #[tokio::test]
     async fn a_joined_stream_whose_serving_server_never_begins_http2_is_given_up_in_time() {
         let directory = tempfile::tempdir().unwrap();
-        let identity = IdentityKey::new(directory.path()).material().unwrap();
+        let identity = IdentityKey::new(directory.path()).material().await.unwrap();
         let relays = Arc::new(SilentServing {
             tls: standing_in(&identity),
         });
@@ -6161,7 +6165,7 @@ mod tests {
     #[tokio::test]
     async fn a_joined_stream_the_redeeming_side_cannot_flush_is_let_go_once_judged_gone() {
         let directory = tempfile::tempdir().unwrap();
-        let identity = IdentityKey::new(directory.path()).material().unwrap();
+        let identity = IdentityKey::new(directory.path()).material().await.unwrap();
         let shut = Arc::new(AtomicBool::new(false));
         let (let_go, transport_let_go) = tokio::sync::oneshot::channel();
         let relays = Arc::new(ValvedServing {
@@ -6332,7 +6336,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_on_a_kept_connection_since_gone_is_asked_again_over_a_fresh_one() {
         let directory = tempfile::tempdir().unwrap();
-        let identity = IdentityKey::new(directory.path()).material().unwrap();
+        let identity = IdentityKey::new(directory.path()).material().await.unwrap();
         let stand_in = DirectStandIn::start(&identity, Treating::Answering).await;
         let client = asking_directly(&identity);
         let way = [Way::Direct(stand_in.address)];
@@ -6382,7 +6386,7 @@ mod tests {
     async fn a_request_that_may_have_been_delivered_is_asked_again_only_where_that_changes_nothing()
     {
         let directory = tempfile::tempdir().unwrap();
-        let identity = IdentityKey::new(directory.path()).material().unwrap();
+        let identity = IdentityKey::new(directory.path()).material().await.unwrap();
         let first = DirectStandIn::start(&identity, Treating::Swallowing).await;
         let second = DirectStandIn::start(&identity, Treating::Swallowing).await;
         let client = asking_directly(&identity);
@@ -7312,7 +7316,7 @@ mod tests {
         let client = Arc::new(
             paired_http_client(
                 &remote.public_key,
-                &controller.identity().expect("make an identity"),
+                &controller.identity().await.expect("make an identity"),
                 None,
                 controller.way_dialer(&remote.public_key),
             )
@@ -7390,7 +7394,7 @@ mod tests {
                 store_timeout: tokio::time::Duration::from_secs(10),
             })
         };
-        let own = redeeming().own_fingerprint().unwrap();
+        let own = fingerprint(&redeeming().identity_key().public_key().await.unwrap());
 
         store.set_available(false);
         let redeeming = redeeming();

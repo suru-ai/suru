@@ -6,7 +6,7 @@
 #[cfg(test)]
 use std::{
     collections::HashMap,
-    sync::{Mutex, MutexGuard},
+    sync::{Condvar, Mutex, MutexGuard, atomic::AtomicUsize},
 };
 use std::{
     sync::{
@@ -314,8 +314,23 @@ type FakeItems = HashMap<ItemId, (String, Vec<u8>)>;
 pub(crate) struct FakeIdentityStore {
     items: Mutex<FakeItems>,
     unavailable: AtomicBool,
-    /// Held while the store answers nothing.
-    held: Mutex<()>,
+    /// Whether the store answers nothing, and what is told as that ends.
+    held: (Mutex<bool>, Condvar),
+    /// How many calls the store has been asked, answered or not.
+    calls: AtomicUsize,
+}
+
+/// A [`FakeIdentityStore`] answering nothing, until this is dropped.
+#[cfg(test)]
+pub(crate) struct Held<'store>(&'store FakeIdentityStore);
+
+#[cfg(test)]
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let (held, ended) = &self.0.held;
+        *held.lock().expect("identity store hold is not poisoned") = false;
+        ended.notify_all();
+    }
 }
 
 #[cfg(test)]
@@ -328,10 +343,18 @@ impl FakeIdentityStore {
     /// Holds every call to the store, answering none, until what this
     /// answers is dropped: as a keyring waiting on an unlock nobody answers
     /// does.
-    pub(crate) fn hold(&self) -> MutexGuard<'_, ()> {
-        self.held
+    pub(crate) fn hold(&self) -> Held<'_> {
+        *self
+            .held
+            .0
             .lock()
-            .expect("identity store hold is not poisoned")
+            .expect("identity store hold is not poisoned") = true;
+        Held(self)
+    }
+
+    /// How many calls the store has been asked, answered or not.
+    pub(crate) fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 
     /// Every item the store keeps, available or not.
@@ -355,7 +378,16 @@ impl FakeIdentityStore {
 
     /// The items the store keeps, once it answers, while it is available.
     fn answering(&self) -> Result<MutexGuard<'_, FakeItems>, StoreUnavailable> {
-        drop(self.hold());
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let (held, ended) = &self.held;
+        drop(
+            ended
+                .wait_while(
+                    held.lock().expect("identity store hold is not poisoned"),
+                    |held| *held,
+                )
+                .expect("identity store hold is not poisoned"),
+        );
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(anyhow!("the identity store is unavailable").into());
         }

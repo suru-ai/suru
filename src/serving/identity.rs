@@ -77,7 +77,10 @@ impl IdentityKeeping {
 /// itself to a Relay by. It is got from where its marker says it is kept —
 /// or made and kept as its [`IdentityKeeping`] says, the first time — at its
 /// first use, and held from then on; a use that cannot get it fails, and
-/// the next tries again. Its private key never leaves the Serving module.
+/// the next tries again. It is got off the async workers, so a store slow
+/// to answer holds up only what needs the key, and one use at a time gets
+/// it, the rest waiting for what that use gets. Its private key never
+/// leaves the Serving module.
 #[derive(Clone)]
 pub(crate) struct IdentityKey(Arc<KeptKey>);
 
@@ -91,7 +94,11 @@ struct KeptKey {
     /// Where the marker is.
     marker: PathBuf,
     /// The key, once got.
-    material: StdMutex<Option<IdentityMaterial>>,
+    material: tokio::sync::OnceCell<IdentityMaterial>,
+    /// Held while the key is got or made, off the async workers: a get
+    /// begun while one for a use since given up on is still under way waits
+    /// for it, and gets what it kept, rather than making a key beside it.
+    getting: StdMutex<()>,
     /// The key's fingerprint, once known.
     fingerprint: OnceLock<String>,
 }
@@ -118,47 +125,80 @@ impl IdentityKey {
                 path: data_dir.join(KEY_FILE),
             },
             marker: data_dir.join(MARKER_FILE),
-            material: StdMutex::default(),
+            material: tokio::sync::OnceCell::new(),
+            getting: StdMutex::default(),
             fingerprint: OnceLock::new(),
         }))
     }
 
     /// The key, as the DER SubjectPublicKeyInfo its Pairings pin.
-    pub(crate) fn public_key(&self) -> Result<Vec<u8>> {
-        Ok(self.material()?.public_key)
+    pub(crate) async fn public_key(&self) -> Result<Vec<u8>> {
+        Ok(self.material().await?.public_key)
     }
 
     /// Signs `message` with the key, as the Server proves it to a Relay.
-    pub(crate) fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
-        let identity = self.material()?;
+    pub(crate) async fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
+        let identity = self.material().await?;
         let signing_key = KeyPair::try_from(identity.private_key.as_slice())
             .context("read Server identity key")?;
         rcgen::SigningKey::sign(&signing_key, message).context("sign with Server identity key")
     }
 
-    /// The key's fingerprint, as a Peer's name uses it. Where the key has
-    /// not been got, it is what the marker records, so it is known without
-    /// the key: while the store the key is kept in does not answer, say.
-    pub(super) fn fingerprint(&self) -> Result<String> {
-        if let Some(known) = self.0.fingerprint.get() {
-            return Ok(known.clone());
+    /// The key's fingerprint, as a Peer's name uses it, where this Server
+    /// has a key. It is known without asking the store the key is kept in —
+    /// from the key once got, from what the marker records, or from the key
+    /// file — so it is known while that store does not answer. A Server
+    /// that has yet to make its key has none.
+    pub(super) fn fingerprint(&self) -> Result<Option<String>> {
+        let kept = &self.0;
+        if let Some(known) = kept.fingerprint.get() {
+            return Ok(Some(known.clone()));
         }
-        let known = match Marker::read(&self.0.marker)? {
-            Some(marker) => marker.fingerprint().to_owned(),
-            None => fingerprint(&self.material()?.public_key),
+        let got = kept
+            .material
+            .get()
+            .map(|material| fingerprint(&material.public_key));
+        let known = match got {
+            Some(known) => known,
+            None => match Marker::read(&kept.marker)? {
+                Some(marker) => marker.fingerprint().to_owned(),
+                None => match kept.file.read()? {
+                    Some(key) => fingerprint_of(&key)?,
+                    None => return Ok(None),
+                },
+            },
         };
-        Ok(self.0.fingerprint.get_or_init(|| known).clone())
+        Ok(Some(kept.fingerprint.get_or_init(|| known).clone()))
     }
 
-    pub(super) fn material(&self) -> Result<IdentityMaterial> {
-        let mut identity = self
+    pub(super) async fn material(&self) -> Result<IdentityMaterial> {
+        let got = self
             .0
             .material
+            .get_or_try_init(|| async {
+                let kept = Arc::clone(&self.0);
+                // What it Logs goes where the use getting it Logs.
+                let log = tracing::dispatcher::get_default(Clone::clone);
+                tokio::task::spawn_blocking(move || {
+                    tracing::dispatcher::with_default(&log, || kept.get())
+                })
+                .await
+                .context("get Server identity key")?
+            })
+            .await?;
+        Ok(got.clone())
+    }
+}
+
+impl KeptKey {
+    /// The key, from where it is kept, or made: work that waits on files and
+    /// on the store, each call to which is bounded, so it is done off the
+    /// async workers.
+    fn get(&self) -> Result<IdentityMaterial> {
+        let _getting = self
+            .getting
             .lock()
             .expect("Server identity lock is not poisoned");
-        if let Some(identity) = identity.as_ref() {
-            return Ok(identity.clone());
-        }
         let private_key = self.private_key()?;
         let signing_key =
             KeyPair::try_from(private_key.as_slice()).context("read Server identity key")?;
@@ -166,13 +206,11 @@ impl IdentityKey {
             .context("describe Server identity certificate")?
             .self_signed(&signing_key)
             .context("mint Server identity certificate")?;
-        let material = IdentityMaterial {
+        Ok(IdentityMaterial {
             public_key: signing_key.subject_public_key_info(),
             private_key,
             certificate: certificate.der().as_ref().to_vec(),
-        };
-        *identity = Some(material.clone());
-        Ok(material)
+        })
     }
 
     /// The PKCS#8 private key, got from where the marker says it is kept,
@@ -180,13 +218,12 @@ impl IdentityKey {
     /// key file the data directory already keeps is the key, and is marked
     /// as kept there; with neither, a key is made.
     fn private_key(&self) -> Result<Vec<u8>> {
-        let kept = &self.0;
-        match Marker::read(&kept.marker)? {
+        match Marker::read(&self.marker)? {
             Some(Marker::SystemStore { item, fingerprint }) => {
-                let key = match kept.store.get(&item) {
+                let key = match self.store.get(&item) {
                     Ok(Stored::Found(key)) => key,
                     Ok(Stored::NoSuchItem) => {
-                        return Err(IdentityKeyUnavailable::item_gone(item, &kept.marker).into());
+                        return Err(IdentityKeyUnavailable::item_gone(item, &self.marker).into());
                     }
                     Err(unavailable) => {
                         return Err(IdentityKeyUnavailable::unanswered(&unavailable).into());
@@ -196,7 +233,7 @@ impl IdentityKey {
                     return Err(IdentityKeyUnavailable::not_its_key(
                         &format!("the item {item} {PLATFORM_STORE} keeps"),
                         &fingerprint,
-                        &kept.marker,
+                        &self.marker,
                     )
                     .into());
                 }
@@ -207,16 +244,16 @@ impl IdentityKey {
                 Ok(key)
             }
             Some(Marker::File { fingerprint }) => {
-                let Some(key) = kept.file.read()? else {
+                let Some(key) = self.file.read()? else {
                     return Err(
-                        IdentityKeyUnavailable::file_gone(&kept.file.path, &kept.marker).into(),
+                        IdentityKeyUnavailable::file_gone(&self.file.path, &self.marker).into(),
                     );
                 };
                 if fingerprint_of(&key)? != fingerprint {
                     return Err(IdentityKeyUnavailable::not_its_key(
-                        &kept.file.path.display().to_string(),
+                        &self.file.path.display().to_string(),
                         &fingerprint,
-                        &kept.marker,
+                        &self.marker,
                     )
                     .into());
                 }
@@ -226,12 +263,12 @@ impl IdentityKey {
                 );
                 Ok(key)
             }
-            None => match kept.file.read()? {
+            None => match self.file.read()? {
                 Some(key) => {
                     Marker::File {
                         fingerprint: fingerprint_of(&key)?,
                     }
-                    .write(&kept.marker)?;
+                    .write(&self.marker)?;
                     tracing::info!(
                         "Server identity key is kept in the owner-only file in the data \
                          directory it was found in"
@@ -247,16 +284,15 @@ impl IdentityKey {
     /// that is the platform credential store and it cannot take the key —
     /// and marked as kept there.
     fn make(&self) -> Result<Vec<u8>> {
-        let kept = &self.0;
         let key = KeyPair::generate()
             .context("generate Server identity")?
             .serialize_der();
         let fingerprint = fingerprint_of(&key)?;
-        let why = kept.selection.why();
-        let refused = match kept.selection.store() {
+        let why = self.selection.why();
+        let refused = match self.selection.store() {
             IdentityStoreChoice::System => match self.keep_in_store(&key) {
                 Ok(item) => {
-                    Marker::SystemStore { item, fingerprint }.write(&kept.marker)?;
+                    Marker::SystemStore { item, fingerprint }.write(&self.marker)?;
                     tracing::info!(
                         "Server identity key is made and kept in {PLATFORM_STORE}, as the item \
                          {item}: {why}"
@@ -267,8 +303,8 @@ impl IdentityKey {
             },
             IdentityStoreChoice::File => None,
         };
-        kept.file.write(&key)?;
-        Marker::File { fingerprint }.write(&kept.marker)?;
+        self.file.write(&key)?;
+        Marker::File { fingerprint }.write(&self.marker)?;
         match refused {
             Some(refused) => tracing::warn!(
                 "Server identity key is made and kept in an owner-only file in the data \
@@ -287,8 +323,8 @@ impl IdentityKey {
     /// is no place for the key.
     fn keep_in_store(&self, key: &[u8]) -> Result<ItemId, StoreUnavailable> {
         let item = ItemId::random();
-        self.0.store.put(&item, &self.0.label, key)?;
-        match self.0.store.get(&item)? {
+        self.store.put(&item, &self.label, key)?;
+        match self.store.get(&item)? {
             Stored::Found(kept) if kept == key => Ok(item),
             Stored::Found(_) => Err(anyhow!("it gave back another key than it was given").into()),
             Stored::NoSuchItem => Err(anyhow!("it kept nothing of what it was given").into()),
@@ -491,7 +527,7 @@ mod tests {
     }
 
     /// What `action` answers, and what it Logs.
-    fn record_log<T>(action: impl FnOnce() -> T) -> (T, String) {
+    async fn record_log<T>(action: impl Future<Output = T>) -> (T, String) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("identity.log");
         let subscriber = tracing_subscriber::fmt()
@@ -500,7 +536,10 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .with_writer(Arc::new(fs::File::create(&path).unwrap()))
             .finish();
-        let answered = tracing::subscriber::with_default(subscriber, action);
+        let answered = {
+            let _log = tracing::subscriber::set_default(subscriber);
+            action.await
+        };
         (answered, fs::read_to_string(path).unwrap())
     }
 
@@ -517,15 +556,15 @@ mod tests {
     /// The key an existing data directory keeps in its identity file is the
     /// Server's identity key, and what the Server signs to prove itself to a
     /// Relay verifies under it.
-    #[test]
-    fn a_data_directorys_key_file_is_its_identity_key_and_signs_as_it() {
+    #[tokio::test]
+    async fn a_data_directorys_key_file_is_its_identity_key_and_signs_as_it() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("server-identity.pk8");
         let kept = KeyPair::generate().unwrap().serialize_der();
         fs::write(&path, &kept).unwrap();
 
         let identity = IdentityKey::new(directory.path());
-        let public_key = identity.public_key().unwrap();
+        let public_key = identity.public_key().await.unwrap();
         assert_eq!(public_key, public_key_of(&kept));
         let nonce = [7; suru_relay_protocol::NONCE_LEN];
         let proof = identity
@@ -534,6 +573,7 @@ mod tests {
                 &nonce,
                 &public_key,
             ))
+            .await
             .unwrap();
         assert_eq!(
             suru_relay_protocol::verify_proof("wss://relay.example", &public_key, &nonce, &proof),
@@ -545,8 +585,8 @@ mod tests {
     /// A key file a data directory kept before it had a marker stays its
     /// identity key, kept where it is and marked as kept there, whatever
     /// store a new key would go into.
-    #[test]
-    fn a_key_file_with_no_marker_is_kept_where_it_is_and_marked_so() {
+    #[tokio::test]
+    async fn a_key_file_with_no_marker_is_kept_where_it_is_and_marked_so() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("server-identity.pk8");
         let kept = KeyPair::generate().unwrap().serialize_der();
@@ -555,6 +595,7 @@ mod tests {
 
         let public_key = IdentityKey::kept_in(directory.path(), kept_in(&store))
             .public_key()
+            .await
             .unwrap();
         assert_eq!(public_key, public_key_of(&kept));
         assert_eq!(
@@ -565,6 +606,7 @@ mod tests {
         assert_eq!(
             IdentityKey::kept_in(directory.path(), kept_in(&store))
                 .public_key()
+                .await
                 .unwrap(),
             public_key
         );
@@ -573,31 +615,40 @@ mod tests {
     /// With no platform credential store to ask, a data directory with no
     /// identity yet has one made at its first use, in its owner-only key
     /// file and marked as kept there, and the same one at every use after.
-    #[test]
-    fn a_first_identity_key_is_made_in_the_owner_only_identity_file() {
+    #[tokio::test]
+    async fn a_first_identity_key_is_made_in_the_owner_only_identity_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("server-identity.pk8");
 
-        let public_key = IdentityKey::new(directory.path()).public_key().unwrap();
+        let public_key = IdentityKey::new(directory.path())
+            .public_key()
+            .await
+            .unwrap();
         assert_eq!(public_key_of(&fs::read(&path).unwrap()), public_key);
         assert_eq!(marker(directory.path())["kept_in"], "file");
         #[cfg(unix)]
         assert_owner_only(&path);
         assert_eq!(
-            IdentityKey::new(directory.path()).public_key().unwrap(),
+            IdentityKey::new(directory.path())
+                .public_key()
+                .await
+                .unwrap(),
             public_key
         );
     }
 
     /// A key file that cannot be read fails each use of the identity key,
     /// saying so, and no key is made over it.
-    #[test]
-    fn an_unreadable_key_file_fails_the_identity_key_and_is_never_made_over() {
+    #[tokio::test]
+    async fn an_unreadable_key_file_fails_the_identity_key_and_is_never_made_over() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("server-identity.pk8");
         fs::create_dir(&path).unwrap();
 
-        let error = IdentityKey::new(directory.path()).public_key().unwrap_err();
+        let error = IdentityKey::new(directory.path())
+            .public_key()
+            .await
+            .unwrap_err();
         assert!(
             format!("{error:#}").starts_with("read Server identity"),
             "{error:#}"
@@ -612,17 +663,18 @@ mod tests {
     /// the same key. The item is labelled with the Server's channel and data
     /// directory, and one Log line says where the key is kept and why, and
     /// nothing of the key itself.
-    #[test]
-    fn a_first_identity_key_is_made_into_the_store_and_marked_as_kept_there() {
+    #[tokio::test]
+    async fn a_first_identity_key_is_made_into_the_store_and_marked_as_kept_there() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(FakeIdentityStore::default());
         let identity = IdentityKey::kept_in(directory.path(), kept_in(&store));
 
-        let (public_key, log) = record_log(|| {
-            let public_key = identity.public_key().unwrap();
-            identity.sign(b"message").unwrap();
+        let (public_key, log) = record_log(async {
+            let public_key = identity.public_key().await.unwrap();
+            identity.sign(b"message").await.unwrap();
             public_key
-        });
+        })
+        .await;
         assert!(
             !directory.path().join("server-identity.pk8").exists(),
             "no key is kept in the data directory"
@@ -662,6 +714,7 @@ mod tests {
         assert_eq!(
             IdentityKey::kept_in(directory.path(), kept_in(&store))
                 .public_key()
+                .await
                 .unwrap(),
             public_key
         );
@@ -671,20 +724,21 @@ mod tests {
     /// key, the key is kept in the owner-only file instead and marked as
     /// kept there, and one Log line says so and why, however often the key
     /// is used.
-    #[test]
-    fn a_first_identity_key_is_kept_in_the_file_where_the_store_does_not_answer() {
+    #[tokio::test]
+    async fn a_first_identity_key_is_kept_in_the_file_where_the_store_does_not_answer() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("server-identity.pk8");
         let store = Arc::new(FakeIdentityStore::default());
         store.set_available(false);
         let identity = IdentityKey::kept_in(directory.path(), kept_in(&store));
 
-        let (public_key, log) = record_log(|| {
-            let public_key = identity.public_key().unwrap();
-            identity.sign(b"message").unwrap();
-            identity.public_key().unwrap();
+        let (public_key, log) = record_log(async {
+            let public_key = identity.public_key().await.unwrap();
+            identity.sign(b"message").await.unwrap();
+            identity.public_key().await.unwrap();
             public_key
-        });
+        })
+        .await;
         assert_eq!(public_key_of(&fs::read(&path).unwrap()), public_key);
         #[cfg(unix)]
         assert_owner_only(&path);
@@ -707,6 +761,7 @@ mod tests {
         assert_eq!(
             IdentityKey::kept_in(directory.path(), kept_in(&store))
                 .public_key()
+                .await
                 .unwrap(),
             public_key
         );
@@ -715,8 +770,8 @@ mod tests {
     /// A debug build keeps a first identity key in the owner-only file
     /// though the platform credential store would take it, and its Log line
     /// says why.
-    #[test]
-    fn a_debug_build_keeps_a_first_identity_key_in_the_file() {
+    #[tokio::test]
+    async fn a_debug_build_keeps_a_first_identity_key_in_the_file() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(FakeIdentityStore::default());
         let identity = IdentityKey::kept_in(
@@ -727,7 +782,7 @@ mod tests {
             },
         );
 
-        let (public_key, log) = record_log(|| identity.public_key().unwrap());
+        let (public_key, log) = record_log(async { identity.public_key().await.unwrap() }).await;
         assert_eq!(
             public_key_of(&fs::read(directory.path().join("server-identity.pk8")).unwrap()),
             public_key
@@ -743,19 +798,20 @@ mod tests {
     /// marker says the store keeps cannot be used, its user is told why,
     /// and nothing is made or written in its place; once the store answers,
     /// the next use gets the key it kept all along.
-    #[test]
-    fn a_key_the_store_keeps_is_never_made_anew_while_the_store_does_not_answer() {
+    #[tokio::test]
+    async fn a_key_the_store_keeps_is_never_made_anew_while_the_store_does_not_answer() {
         let directory = tempfile::tempdir().unwrap();
         let marker_path = directory.path().join("server-identity.json");
         let store = Arc::new(FakeIdentityStore::default());
         let public_key = IdentityKey::kept_in(directory.path(), kept_in(&store))
             .public_key()
+            .await
             .unwrap();
         let marked = fs::read(&marker_path).unwrap();
 
         store.set_available(false);
         let identity = IdentityKey::kept_in(directory.path(), kept_in(&store));
-        let told = told(&identity.public_key().unwrap_err());
+        let told = told(&identity.public_key().await.unwrap_err());
         assert!(
             told.contains("platform credential store")
                 && told.contains(PLATFORM_STORE)
@@ -765,7 +821,7 @@ mod tests {
         );
         #[cfg(target_os = "macos")]
         assert!(told.contains("security unlock-keychain"), "{told}");
-        assert!(identity.sign(b"message").is_err());
+        assert!(identity.sign(b"message").await.is_err());
         assert!(
             !directory.path().join("server-identity.pk8").exists(),
             "no key is written to the file"
@@ -774,19 +830,20 @@ mod tests {
         assert_eq!(fs::read(&marker_path).unwrap(), marked);
 
         store.set_available(true);
-        assert_eq!(identity.public_key().unwrap(), public_key);
+        assert_eq!(identity.public_key().await.unwrap(), public_key);
     }
 
     /// A key whose item the platform credential store no longer keeps
     /// cannot be used, and nothing is made in its place, at that use or any
     /// after.
-    #[test]
-    fn a_key_the_store_has_lost_is_never_made_anew() {
+    #[tokio::test]
+    async fn a_key_the_store_has_lost_is_never_made_anew() {
         let directory = tempfile::tempdir().unwrap();
         let marker_path = directory.path().join("server-identity.json");
         let store = Arc::new(FakeIdentityStore::default());
         IdentityKey::kept_in(directory.path(), kept_in(&store))
             .public_key()
+            .await
             .unwrap();
         let marked = fs::read(&marker_path).unwrap();
         let item = marked_item(directory.path());
@@ -794,7 +851,7 @@ mod tests {
 
         let identity = IdentityKey::kept_in(directory.path(), kept_in(&store));
         for _ in 0..2 {
-            let told = told(&identity.public_key().unwrap_err());
+            let told = told(&identity.public_key().await.unwrap_err());
             assert!(
                 told.contains(&item.to_string())
                     && told.contains("no longer keeps")
@@ -809,12 +866,13 @@ mod tests {
 
     /// A key its store keeps that is not the one its marker records is
     /// never used, and none is made in its place.
-    #[test]
-    fn a_key_other_than_the_one_marked_is_never_used() {
+    #[tokio::test]
+    async fn a_key_other_than_the_one_marked_is_never_used() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(FakeIdentityStore::default());
         IdentityKey::kept_in(directory.path(), kept_in(&store))
             .public_key()
+            .await
             .unwrap();
         let item = marked_item(directory.path());
         let other = KeyPair::generate().unwrap().serialize_der();
@@ -823,6 +881,7 @@ mod tests {
         let told = told(
             &IdentityKey::kept_in(directory.path(), kept_in(&store))
                 .public_key()
+                .await
                 .unwrap_err(),
         );
         assert!(
@@ -835,8 +894,8 @@ mod tests {
 
     /// A marker that cannot be read stands for a key kept somewhere all the
     /// same, so none is made in its place.
-    #[test]
-    fn an_unreadable_marker_fails_the_identity_key_and_is_never_made_over() {
+    #[tokio::test]
+    async fn an_unreadable_marker_fails_the_identity_key_and_is_never_made_over() {
         let directory = tempfile::tempdir().unwrap();
         let marker_path = directory.path().join("server-identity.json");
         fs::write(&marker_path, b"not a marker").unwrap();
@@ -844,6 +903,7 @@ mod tests {
 
         let error = IdentityKey::kept_in(directory.path(), kept_in(&store))
             .public_key()
+            .await
             .unwrap_err();
         assert!(
             format!("{error:#}").starts_with("read Server identity marker"),
@@ -854,18 +914,88 @@ mod tests {
         assert!(store.contents().is_empty());
     }
 
+    /// While the platform credential store holds up a call to get the key,
+    /// whatever else the Server runs goes on, though it runs on one thread;
+    /// the key comes once the store answers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_store_holding_up_the_key_holds_up_nothing_else() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(FakeIdentityStore::default());
+        let public_key = IdentityKey::kept_in(directory.path(), kept_in(&store))
+            .public_key()
+            .await
+            .unwrap();
+        let identity = IdentityKey::kept_in(
+            directory.path(),
+            IdentityKeeping {
+                store_timeout: Duration::from_secs(2),
+                ..kept_in(&store)
+            },
+        );
+
+        let held = store.hold();
+        let getting = tokio::spawn({
+            let identity = identity.clone();
+            async move { identity.public_key().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!getting.is_finished(), "the store holds the key up still");
+        drop(held);
+        assert_eq!(getting.await.unwrap().unwrap(), public_key);
+    }
+
+    /// A key being made for a use given up on is the key the next use gets:
+    /// none is made beside it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_key_made_for_a_use_given_up_on_is_the_key_the_next_use_gets() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(FakeIdentityStore::default());
+        let identity = IdentityKey::kept_in(directory.path(), kept_in(&store));
+        let getting = || {
+            let identity = identity.clone();
+            tokio::spawn(async move { identity.public_key().await })
+        };
+
+        let held = store.hold();
+        let given_up = getting();
+        while store.calls() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        given_up.abort();
+        assert!(given_up.await.unwrap_err().is_cancelled());
+        let next = getting();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+
+        let public_key = next.await.unwrap().unwrap();
+        // Time for what was being got for the use given up on to be done,
+        // were it still under way.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(store.contents().len(), 1, "one key is made");
+        assert_eq!(
+            IdentityKey::kept_in(directory.path(), kept_in(&store))
+                .public_key()
+                .await
+                .unwrap(),
+            public_key,
+            "the key kept is the key the use got"
+        );
+    }
+
     /// Two data directories with one platform credential store between them
     /// have identities of their own, each kept as an item of its own.
-    #[test]
-    fn data_directories_sharing_a_store_have_identities_of_their_own() {
+    #[tokio::test]
+    async fn data_directories_sharing_a_store_have_identities_of_their_own() {
         let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let store = Arc::new(FakeIdentityStore::default());
 
         let first_key = IdentityKey::kept_in(first.path(), kept_in(&store))
             .public_key()
+            .await
             .unwrap();
         let second_key = IdentityKey::kept_in(second.path(), kept_in(&store))
             .public_key()
+            .await
             .unwrap();
         assert_ne!(first_key, second_key);
         assert_ne!(marked_item(first.path()), marked_item(second.path()));
@@ -873,6 +1003,7 @@ mod tests {
         assert_eq!(
             IdentityKey::kept_in(first.path(), kept_in(&store))
                 .public_key()
+                .await
                 .unwrap(),
             first_key
         );
@@ -881,8 +1012,8 @@ mod tests {
     /// A platform credential store that never answers is given up on once
     /// the store timeout has passed, and counts as unavailable: a key it
     /// keeps cannot be used, and a first key is kept in the file instead.
-    #[test]
-    fn a_store_that_never_answers_counts_as_unavailable() {
+    #[tokio::test]
+    async fn a_store_that_never_answers_counts_as_unavailable() {
         let (kept, first) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let store = Arc::new(FakeIdentityStore::default());
         let impatient = IdentityKeeping {
@@ -891,17 +1022,20 @@ mod tests {
         };
         let kept_key = IdentityKey::kept_in(kept.path(), kept_in(&store))
             .public_key()
+            .await
             .unwrap();
 
         let held = store.hold();
         let told = told(
             &IdentityKey::kept_in(kept.path(), impatient.clone())
                 .public_key()
+                .await
                 .unwrap_err(),
         );
         assert!(told.contains("did not answer within 20ms"), "{told}");
         let public_key = IdentityKey::kept_in(first.path(), impatient)
             .public_key()
+            .await
             .unwrap();
         assert_eq!(
             public_key_of(&fs::read(first.path().join("server-identity.pk8")).unwrap()),
@@ -913,6 +1047,7 @@ mod tests {
         assert_eq!(
             IdentityKey::kept_in(kept.path(), kept_in(&store))
                 .public_key()
+                .await
                 .unwrap(),
             kept_key
         );
