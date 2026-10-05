@@ -29,7 +29,6 @@ use super::{
         BoundedStore, IdentityStore, IdentityStoreChoice, ItemId, NoIdentityStore, PLATFORM_STORE,
         Selection, StoreUnavailable, Stored,
     },
-    write_private_json,
 };
 use crate::runtime::{protect_current_user_file, replace_private_file};
 
@@ -44,6 +43,11 @@ const MARKER_FILE: &str = "server-identity.json";
 /// store that answers at all, and short enough that nothing waits long on an
 /// unlock nobody answers.
 pub(crate) const IDENTITY_STORE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Writes `contents` as the owner-only file at a path, whole or not at all,
+/// and for good, as [`replace_private_file`] does: how the key file and the
+/// marker are written, which a test swaps for a disk of its own.
+type WriteFile = Arc<dyn Fn(&Path, &[u8]) -> Result<()> + Send + Sync>;
 
 /// How a Server keeps its identity key: the platform credential store it
 /// asks, which store the key is kept in, and how long it waits on the
@@ -96,6 +100,8 @@ struct KeptKey {
     file: KeyFile,
     /// Where the marker is.
     marker: PathBuf,
+    /// How the key file and the marker are written.
+    write_file: WriteFile,
     /// The key, once got.
     material: tokio::sync::OnceCell<IdentityMaterial>,
     /// The key as got off the async workers, held while it is got or made:
@@ -117,6 +123,13 @@ impl IdentityKey {
     /// The identity key of the Server whose data directory is `data_dir`,
     /// kept as `keeping` says.
     pub(super) fn kept_in(data_dir: &Path, keeping: IdentityKeeping) -> Self {
+        Self::written_with(data_dir, keeping, Arc::new(replace_private_file))
+    }
+
+    /// The identity key of the Server whose data directory is `data_dir`,
+    /// kept as `keeping` says, its key file and marker written by
+    /// `write_file`.
+    fn written_with(data_dir: &Path, keeping: IdentityKeeping, write_file: WriteFile) -> Self {
         Self(Arc::new(KeptKey {
             store: BoundedStore::new(keeping.store, keeping.store_timeout),
             selection: keeping.selection,
@@ -129,6 +142,7 @@ impl IdentityKey {
                 path: data_dir.join(KEY_FILE),
             },
             marker: data_dir.join(MARKER_FILE),
+            write_file,
             material: tokio::sync::OnceCell::new(),
             got: StdMutex::default(),
             fingerprint: OnceLock::new(),
@@ -274,10 +288,9 @@ impl KeptKey {
             return self.make();
         };
         let fingerprint = fingerprint_of(&key)?;
-        Marker::File {
+        self.mark(&Marker::File {
             fingerprint: fingerprint.clone(),
-        }
-        .write(&self.marker)?;
+        })?;
         self.move_from_file(&key, fingerprint);
         Ok(key)
     }
@@ -347,9 +360,7 @@ impl KeptKey {
             Ok(None) => return,
             // A move can stop with the marker in place but not yet on the
             // disk, so it is written again, for good, before the file goes.
-            Ok(Some(left)) if left == key => {
-                marker.write(&self.marker).and_then(|()| self.file.delete())
-            }
+            Ok(Some(left)) if left == key => self.mark(marker).and_then(|()| self.file.delete()),
             Ok(Some(_)) => {
                 tracing::warn!(
                     "{} keeps a key other than this Server's identity key, and is left as it is",
@@ -391,8 +402,8 @@ impl KeptKey {
             },
             IdentityStoreChoice::File => None,
         };
-        self.file.write(&key)?;
-        Marker::File { fingerprint }.write(&self.marker)?;
+        self.keep_in_file(&key)?;
+        self.mark(&Marker::File { fingerprint })?;
         match refused {
             Some(refused) => tracing::warn!(
                 "Server identity key is made and kept in an owner-only file in the data \
@@ -415,7 +426,7 @@ impl KeptKey {
     /// outlive the item it names. A Server stopping before the marker is
     /// written leaves the one item, which no marker names.
     fn mark_kept_in_store(&self, item: ItemId, fingerprint: String) -> Result<Marked> {
-        let Err(error) = (Marker::SystemStore { item, fingerprint }).write(&self.marker) else {
+        let Err(error) = self.mark(&Marker::SystemStore { item, fingerprint }) else {
             return Ok(Marked::ForGood);
         };
         match MarkingLeft::after(Marker::read(&self.marker), item) {
@@ -437,6 +448,22 @@ impl KeptKey {
             }
             MarkingLeft::Unknown => Err(error),
         }
+    }
+
+    /// Keeps `key` in the key file, replacing what was there whole or not at
+    /// all, and for good.
+    fn keep_in_file(&self, key: &[u8]) -> Result<()> {
+        (self.write_file)(&self.file.path, key)
+            .with_context(|| format!("publish Server identity {:?}", self.file.path))
+    }
+
+    /// Stores `marker`, replacing what was there whole or not at all,
+    /// owner-only, and for good.
+    fn mark(&self, marker: &Marker) -> Result<()> {
+        let mut encoded = serde_json::to_vec(marker).context("encode Server identity marker")?;
+        encoded.push(b'\n');
+        (self.write_file)(&self.marker, &encoded)
+            .with_context(|| format!("write Server identity marker {:?}", self.marker))
     }
 
     /// Keeps `key` in the platform credential store as a new item, and reads
@@ -518,13 +545,6 @@ impl Marker {
             }
         }
     }
-
-    /// Stores the marker at `path`, replacing what was there whole or not at
-    /// all, owner-only.
-    fn write(&self, path: &Path) -> Result<()> {
-        write_private_json(path, self)
-            .with_context(|| format!("write Server identity marker {path:?}"))
-    }
 }
 
 /// How the marker naming a new item stands, once marking it is done.
@@ -590,12 +610,6 @@ impl KeyFile {
                 Err(error).with_context(|| format!("read Server identity {:?}", self.path))
             }
         }
-    }
-
-    /// Keeps `key` in the file, replacing what was there whole or not at all.
-    fn write(&self, key: &[u8]) -> Result<()> {
-        replace_private_file(&self.path, key)
-            .with_context(|| format!("publish Server identity {:?}", self.path))
     }
 
     /// Deletes the file, where there is one.
@@ -701,6 +715,8 @@ impl std::error::Error for IdentityKeyUnavailable {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use serde_json::json;
 
     use super::*;
@@ -756,6 +772,94 @@ mod tests {
             action.await
         };
         (answered, fs::read_to_string(path).unwrap())
+    }
+
+    /// A disk for a test's key file and marker, which can fail to flush what
+    /// it writes having put it in place, as a disk can, and lose what it has
+    /// not flushed, as a crash does.
+    #[derive(Default)]
+    struct FakeDisk {
+        /// How many more writes of each file it fails to flush.
+        failing: StdMutex<HashMap<PathBuf, usize>>,
+        /// What each file it has written but not flushed held when last on
+        /// the disk: nothing, where it was not there.
+        unflushed: StdMutex<HashMap<PathBuf, Option<Vec<u8>>>>,
+    }
+
+    impl FakeDisk {
+        /// Fails to flush the next `writes` writes of the file at `path`,
+        /// having put each in place.
+        fn fail_flushing(&self, path: &Path, writes: usize) {
+            self.failing.lock().unwrap().insert(path.to_owned(), writes);
+        }
+
+        /// Loses what the disk has not flushed, as a crash does.
+        fn crash(&self) {
+            for (path, held) in self.unflushed.lock().unwrap().drain() {
+                match held {
+                    Some(held) => fs::write(&path, held).unwrap(),
+                    None => match fs::remove_file(&path) {
+                        Err(error) if error.kind() != io::ErrorKind::NotFound => panic!("{error}"),
+                        _ => {}
+                    },
+                }
+            }
+        }
+
+        /// How an identity key writes its files to this disk.
+        fn writing(self: &Arc<Self>) -> WriteFile {
+            let disk = Arc::clone(self);
+            Arc::new(move |path, contents| disk.write(path, contents))
+        }
+
+        /// Writes `contents` as the file at `path`, as the real disk does,
+        /// and has it flushed unless it is to fail to.
+        fn write(&self, path: &Path, contents: &[u8]) -> Result<()> {
+            let held = fs::read(path).ok();
+            replace_private_file(path, contents)?;
+            let failing = match self.failing.lock().unwrap().get_mut(path) {
+                Some(left) if *left > 0 => {
+                    *left -= 1;
+                    true
+                }
+                _ => false,
+            };
+            let mut unflushed = self.unflushed.lock().unwrap();
+            if failing {
+                unflushed.entry(path.to_owned()).or_insert(held);
+                return Err(anyhow!("flush the replacement of {path:?} to the disk"));
+            }
+            unflushed.remove(path);
+            Ok(())
+        }
+    }
+
+    /// The fake disk loses, at a crash, what it failed to flush, back to
+    /// what the disk held before, and nothing it flushed.
+    #[test]
+    fn the_fake_disk_loses_at_a_crash_what_it_failed_to_flush() {
+        let directory = tempfile::tempdir().unwrap();
+        let (kept, made, lost) = (
+            directory.path().join("kept"),
+            directory.path().join("made"),
+            directory.path().join("lost"),
+        );
+        let disk = Arc::new(FakeDisk::default());
+        let write = disk.writing();
+        write(&kept, b"flushed").unwrap();
+        disk.fail_flushing(&kept, 2);
+        disk.fail_flushing(&lost, 1);
+        write(&kept, b"unflushed").unwrap_err();
+        write(&kept, b"unflushed again").unwrap_err();
+        write(&made, b"flushed").unwrap();
+        write(&lost, b"unflushed").unwrap_err();
+        assert_eq!(fs::read(&kept).unwrap(), b"unflushed again");
+        assert_eq!(fs::read(&lost).unwrap(), b"unflushed");
+
+        disk.crash();
+        assert_eq!(fs::read(&kept).unwrap(), b"flushed");
+        assert_eq!(fs::read(&made).unwrap(), b"flushed");
+        assert!(!lost.exists());
     }
 
     #[cfg(unix)]
