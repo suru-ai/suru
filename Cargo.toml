@@ -103,17 +103,11 @@ libc = "0.2"
 signal-hook = "0.3.18"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# The Secret Service the Server identity key is kept in (ADR-0050) is spoken to over zbus, a D-Bus client written in
-# Rust, so the release binaries link no libdbus; it runs on the tokio Suru already builds. Suru speaks the Secret
-# Service's API itself, rather than through a crate that brings up the prompts it answers with, and does its sessions'
-# Diffie-Hellman exchange and encryption in Rust, with the crates below.
+# Keeps the Server identity key in the Secret Service (ADR-0050), over zbus, a D-Bus client written in Rust, so the
+# release binaries link no libdbus, with the session's encryption done in Rust rather than OpenSSL. zbus runs on the
+# tokio Suru already builds, and Suru connects it to the bus itself, so a connection given up on never blocks.
+secret-service = { version = "5.2.0", features = ["rt-tokio-crypto-rust"] }
 zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
-aes = "0.8.4"
-cbc = { version = "0.1.2", features = ["alloc"] }
-getrandom = "0.3.4"
-hkdf = "0.12.4"
-num-bigint = "0.4.8"
-sha2 = "0.10.9"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
