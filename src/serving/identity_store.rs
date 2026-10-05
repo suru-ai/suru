@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+#[cfg(any(windows, test))]
+mod credential_manager_store;
 #[cfg(target_os = "linux")]
 mod secret_service_store;
 
@@ -70,9 +72,10 @@ impl std::fmt::Display for ItemId {
 }
 
 /// What an [`IdentityStore`] keeps as an item, as it answers.
-// Only the Secret Service keeps anything a Server asks for yet: elsewhere
-// the platform's store is unavailable until Suru keeps keys there.
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+// Only the Secret Service and Credential Manager keep anything a Server
+// asks for yet: elsewhere the platform's store is unavailable until Suru
+// keeps keys there.
+#[cfg_attr(not(any(test, target_os = "linux", windows)), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Stored {
     Found(Vec<u8>),
@@ -103,13 +106,15 @@ impl std::error::Error for StoreUnavailable {
 }
 
 /// The platform credential store of the platform this Server runs on: the
-/// Secret Service on Linux. Suru keeps nothing in any other platform's
-/// store yet, so there it counts as unavailable, and a Server keeps a new
-/// key in its file instead.
+/// Secret Service on Linux, Credential Manager on Windows. Suru keeps
+/// nothing in any other platform's store yet, so there it counts as
+/// unavailable, and a Server keeps a new key in its file instead.
 pub(crate) fn platform_identity_store() -> Arc<dyn IdentityStore> {
     #[cfg(target_os = "linux")]
     return Arc::new(secret_service_store::SecretServiceStore::new());
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    return Arc::new(credential_manager_store::CredentialManagerStore);
+    #[cfg(not(any(target_os = "linux", windows)))]
     Arc::new(NoIdentityStore)
 }
 
