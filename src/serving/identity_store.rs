@@ -269,7 +269,9 @@ impl std::fmt::Display for IdentityStoreChoice {
     }
 }
 
-/// Which store a Server keeps a new identity key in, by what chose it.
+/// Which store a Server keeps its identity key in, by what chose it: the
+/// store a new key is made into, and whether a key kept in the file is moved
+/// into the platform credential store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Selection {
     /// A release build, which keeps it in the platform credential store.
@@ -302,7 +304,7 @@ impl Selection {
         }
     }
 
-    /// Why a new key is kept in the store it selects, as the Log says.
+    /// Why a key is kept in the store it selects, as the Log says.
     pub(crate) fn why(self) -> String {
         match self {
             Self::ReleaseBuild => "release builds keep it there".to_owned(),

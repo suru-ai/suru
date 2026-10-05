@@ -2,9 +2,11 @@
 //! Relay by: where it is kept, and how it is got from there.
 //!
 //! The key is kept in the platform credential store where a release build,
-//! or `SURU_IDENTITY_STORE`, selects that store and it answers as the Server
-//! first needs a key, and otherwise in an owner-only file in the Server's
-//! data directory (ADR-0050). Either way the data directory keeps a
+//! or `SURU_IDENTITY_STORE`, selects that store and it answers, and otherwise
+//! in an owner-only file in the Server's data directory (ADR-0050). A key
+//! kept in the file — from before Suru kept keys in the store, or from a
+//! time the store did not answer — is moved into the store, as it is, at the
+//! first load the store takes it. Either way the data directory keeps a
 //! marker, which holds nothing secret: where the key is kept — the store's
 //! item, or the file — and the key's fingerprint. A key the marker says is
 //! kept somewhere is never made anew, whatever stands in the way of getting
@@ -44,13 +46,13 @@ const MARKER_FILE: &str = "server-identity.json";
 pub(crate) const IDENTITY_STORE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How a Server keeps its identity key: the platform credential store it
-/// asks, which store a new key is kept in, and how long it waits on the
+/// asks, which store the key is kept in, and how long it waits on the
 /// platform credential store.
 #[derive(Clone)]
 pub(crate) struct IdentityKeeping {
     /// The platform credential store.
     pub(crate) store: Arc<dyn IdentityStore>,
-    /// Which store a new key is kept in, and what chose it.
+    /// Which store the key is kept in, and what chose it.
     pub(crate) selection: Selection,
     /// The Server's channel, which the store's item is labelled with beside
     /// the Server's data directory, so its user can tell whose item it is.
@@ -76,11 +78,12 @@ impl IdentityKeeping {
 /// This Server's identity key: what its Pairings pin, and what it proves
 /// itself to a Relay by. It is got from where its marker says it is kept —
 /// or made and kept as its [`IdentityKeeping`] says, the first time — at its
-/// first use, and held from then on; a use that cannot get it fails, and
-/// the next tries again. It is got off the async workers, so a store slow
-/// to answer holds up only what needs the key, and one use at a time gets
-/// it, the rest waiting for what that use gets. Its private key never
-/// leaves the Serving module.
+/// first use, moved from the file into the store its keeping selects where
+/// it is not kept there yet, and held from then on; a use that cannot get
+/// it fails, and the next tries again. It is got off the async workers, so
+/// a store slow to answer holds up only what needs the key, and one use at
+/// a time gets it, the rest waiting for what that use gets. Its private key
+/// never leaves the Serving module.
 #[derive(Clone)]
 pub(crate) struct IdentityKey(Arc<KeptKey>);
 
@@ -220,9 +223,11 @@ impl KeptKey {
     }
 
     /// The PKCS#8 private key, got from where the marker says it is kept,
-    /// and checked against the fingerprint it records. With no marker, a
-    /// key file the data directory already keeps is the key, and is marked
-    /// as kept there; with neither, a key is made.
+    /// and checked against the fingerprint it records; one the key file
+    /// keeps is moved into the platform credential store where the
+    /// selection says. With no marker, a key file the data directory
+    /// already keeps is the key, and is marked as kept there; with neither,
+    /// a key is made.
     fn private_key(&self) -> Result<Vec<u8>> {
         let Some(marker) = Marker::read(&self.marker)? else {
             return self.unmarked();
@@ -251,25 +256,111 @@ impl KeptKey {
             )
             .into());
         }
-        tracing::info!("Server identity key is kept in {place}, as its marker records");
+        match marker {
+            Marker::SystemStore { .. } => {
+                tracing::info!("Server identity key is kept in {place}, as its marker records");
+                self.delete_file_left(&key);
+            }
+            Marker::File { fingerprint } => self.move_from_file(&key, fingerprint),
+        }
         Ok(key)
     }
 
     /// The key where no marker says where it is kept: a key file the data
-    /// directory already keeps, marked as kept there, or else a key made.
+    /// directory already keeps, marked as kept there, and moved on from
+    /// there as any key the file keeps is; or else a key made.
     fn unmarked(&self) -> Result<Vec<u8>> {
         let Some(key) = self.file.read()? else {
             return self.make();
         };
+        let fingerprint = fingerprint_of(&key)?;
         Marker::File {
-            fingerprint: fingerprint_of(&key)?,
+            fingerprint: fingerprint.clone(),
         }
         .write(&self.marker)?;
-        tracing::info!(
-            "Server identity key is kept in the owner-only file in the data directory it was \
-             found in"
-        );
+        self.move_from_file(&key, fingerprint);
         Ok(key)
+    }
+
+    /// Moves `key`, whose fingerprint is `fingerprint`, which the key file
+    /// keeps and the marker says so, into the platform credential store,
+    /// where the selection says a key is kept there and the store takes it.
+    /// Where it is not moved, it stays in the file and is got from there,
+    /// and the Log says why.
+    fn move_from_file(&self, key: &[u8], fingerprint: String) {
+        match self.selection.store() {
+            IdentityStoreChoice::System => {
+                if let Err(refused) = self.move_into_store(key, fingerprint) {
+                    tracing::warn!(
+                        "Server identity key is kept in an owner-only file in the data \
+                         directory, as it could not be moved into {PLATFORM_STORE}: {refused:#}"
+                    );
+                }
+            }
+            IdentityStoreChoice::File => tracing::info!(
+                "Server identity key is kept in an owner-only file in the data directory: {}",
+                self.selection.why()
+            ),
+        }
+    }
+
+    /// Moves `key`, whose fingerprint is `fingerprint`, out of the key file
+    /// into the platform credential store, as it is: kept there as a new
+    /// item and read back, the marker made to name that item, and only then
+    /// the file deleted. However far a move gets before it stops, the key
+    /// still loads. Until the marker names the item, the file keeps the key
+    /// and the marker says so, and the next move keeps the key as a new
+    /// item again: one a move stopped before its marker leaves holds the
+    /// key, labelled as this Server's, but no marker names it, as only a new
+    /// item can be sure of being no item a marker names, in this data
+    /// directory or a copy of it. Once the marker names the item, the key is
+    /// got from there, and a file still left is deleted then.
+    fn move_into_store(&self, key: &[u8], fingerprint: String) -> Result<()> {
+        let item = self.keep_in_store(key)?;
+        self.mark_kept_in_store(item, fingerprint)?;
+        tracing::info!(
+            "Server identity key is moved from an owner-only file in the data directory into \
+             {PLATFORM_STORE}, as the item {item}: {}",
+            self.selection.why()
+        );
+        if let Err(left) = self.file.delete() {
+            tracing::warn!(
+                "the owner-only file in the data directory the Server identity key was moved \
+                 out of is left, and is deleted at its next load: {left:#}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Deletes the key file where it keeps `key`, which the platform
+    /// credential store keeps as the item the marker names: the file a move
+    /// into the store stopped before deleting. A file keeping another key
+    /// is no file a move left, and is left as it is. The key is got all the
+    /// same, so what stands in the way is Logged, and the next load tries
+    /// again.
+    fn delete_file_left(&self, key: &[u8]) {
+        let deleted = match self.file.read() {
+            Ok(None) => return,
+            Ok(Some(left)) if left == key => self.file.delete(),
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    "{} keeps a key other than this Server's identity key, and is left as it is",
+                    self.file.path.display()
+                );
+                return;
+            }
+            Err(unread) => Err(unread),
+        };
+        match deleted {
+            Ok(()) => tracing::info!(
+                "the owner-only file in the data directory the Server identity key was moved out \
+                 of is deleted"
+            ),
+            Err(left) => tracing::warn!(
+                "the owner-only file in the data directory the Server identity key was moved out \
+                 of is left, and is deleted at its next load: {left:#}"
+            ),
+        }
     }
 
     /// A new key, kept in the store the selection says — in the file where
@@ -310,14 +401,14 @@ impl KeptKey {
         Ok(key)
     }
 
-    /// Marks a new key the platform credential store keeps as the item
-    /// `item` as kept there. Where the marker cannot be written, the key was
-    /// never used, so it is taken out of the store again rather than left
-    /// behind at each failure — unless a marker names it all the same, or
-    /// may: the writing can fail after it put the marker in place, and a
-    /// marker must never outlive the item it names. A Server stopping
-    /// before the marker is written leaves the one item, holding a key
-    /// nothing ever used.
+    /// Marks a key the platform credential store has just taken as the item
+    /// `item` as kept there. Where the marker cannot be written, nothing
+    /// gets the key from the item, so it is taken out of the store again
+    /// rather than left behind at each failure — unless a marker names it
+    /// all the same, or may: the writing can fail after it put the marker
+    /// in place, and a marker must never outlive the item it names. A
+    /// Server stopping before the marker is written leaves the one item,
+    /// which no marker names.
     fn mark_kept_in_store(&self, item: ItemId, fingerprint: String) -> Result<()> {
         let Err(error) = (Marker::SystemStore { item, fingerprint }).write(&self.marker) else {
             return Ok(());
@@ -345,15 +436,24 @@ impl KeptKey {
 
     /// Keeps `key` in the platform credential store as a new item, and reads
     /// it back to be sure the store gives it up: the item, or why the store
-    /// is no place for the key.
+    /// is no place for the key. An item that does not read back as the key
+    /// is taken out again, as no marker names it.
     fn keep_in_store(&self, key: &[u8]) -> Result<ItemId, StoreUnavailable> {
         let item = ItemId::random();
         self.store.put(&item, &self.label, key)?;
-        match self.store.get(&item)? {
-            Stored::Found(kept) if kept == key => Ok(item),
-            Stored::Found(_) => Err(anyhow!("it gave back another key than it was given").into()),
-            Stored::NoSuchItem => Err(anyhow!("it kept nothing of what it was given").into()),
+        let refused = match self.store.get(&item) {
+            Ok(Stored::Found(kept)) if kept == key => return Ok(item),
+            Ok(Stored::Found(_)) => anyhow!("it gave back another key than it was given").into(),
+            Ok(Stored::NoSuchItem) => anyhow!("it kept nothing of what it was given").into(),
+            Err(unanswered) => unanswered,
+        };
+        if let Err(left) = self.store.delete(&item) {
+            tracing::warn!(
+                "an item the Server identity key was put in, which no marker names, is left in \
+                 {PLATFORM_STORE}, as the item {item}: {left:#}"
+            );
         }
+        Err(refused)
     }
 }
 
@@ -472,6 +572,17 @@ impl KeyFile {
     fn write(&self, key: &[u8]) -> Result<()> {
         replace_private_file(&self.path, key)
             .with_context(|| format!("publish Server identity {:?}", self.path))
+    }
+
+    /// Deletes the file, where there is one.
+    fn delete(&self) -> Result<()> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("delete Server identity {:?}", self.path))
+            }
+        }
     }
 }
 
@@ -640,27 +751,119 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), kept, "the file is left as it was");
     }
 
-    /// A key file a data directory kept before it had a marker stays its
-    /// identity key, kept where it is and marked as kept there, whatever
-    /// store a new key would go into.
-    #[tokio::test]
-    async fn a_key_file_with_no_marker_is_kept_where_it_is_and_marked_so() {
+    /// A data directory with the key `key` in its key file, and no marker,
+    /// as one kept before markers were.
+    fn key_file_with_no_marker(key: &[u8]) -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("server-identity.pk8");
-        let kept = KeyPair::generate().unwrap().serialize_der();
-        fs::write(&path, &kept).unwrap();
-        let store = Arc::new(FakeIdentityStore::default());
+        fs::write(directory.path().join("server-identity.pk8"), key).unwrap();
+        directory
+    }
 
+    /// Asserts that `key` has been moved out of the key file in `directory`
+    /// into `store`, as it is: the file is gone, the store keeps the key as
+    /// the item the marker names, labelled as a new key's item is, and the
+    /// marker records the key's fingerprint. The item.
+    fn assert_moved_into(store: &FakeIdentityStore, directory: &Path, key: &[u8]) -> ItemId {
+        assert!(
+            !directory.join("server-identity.pk8").exists(),
+            "no key is kept in the data directory"
+        );
+        let item = marked_item(directory);
+        assert_eq!(
+            marker(directory),
+            json!({
+                "kept_in": "system_store",
+                "item": item.to_string(),
+                "fingerprint": fingerprint(&public_key_of(key)),
+            })
+        );
+        #[cfg(unix)]
+        assert_owner_only(&directory.join("server-identity.json"));
+        assert_eq!(store.contents()[&item], key, "the key is moved as it is");
+        assert_eq!(
+            store.label(&item).unwrap(),
+            format!(
+                "Suru Server identity key (test channel, {})",
+                directory.display()
+            )
+        );
+        item
+    }
+
+    /// Asserts that `key` is kept in the key file in `directory` still,
+    /// as it was, and marked as kept there.
+    fn assert_kept_in_file(directory: &Path, key: &[u8]) {
+        assert_eq!(
+            fs::read(directory.join("server-identity.pk8")).unwrap(),
+            key,
+            "the file is left as it was"
+        );
+        assert_eq!(
+            marker(directory),
+            json!({ "kept_in": "file", "fingerprint": fingerprint(&public_key_of(key)) })
+        );
+    }
+
+    /// `key` written out as hex, as a Log might carry it.
+    fn hex(key: &[u8]) -> String {
+        key.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// A key file a data directory kept before it had a marker is moved
+    /// into the platform credential store where it answers, as it is: the
+    /// same key comes out, the store keeps it as the item the marker names,
+    /// and the file is gone. One Log line says the key was moved, where to
+    /// and why, and nothing of the key itself; a fresh identity key over
+    /// the directory gets the same key from the store.
+    #[tokio::test]
+    async fn a_key_file_with_no_marker_is_moved_into_the_store() {
+        let kept = KeyPair::generate().unwrap().serialize_der();
+        let directory = key_file_with_no_marker(&kept);
+        let store = Arc::new(FakeIdentityStore::default());
+        let identity = IdentityKey::kept_in(directory.path(), kept_in(&store));
+
+        let (public_key, log) = record_log(identity.public_key()).await;
+        assert_eq!(public_key.unwrap(), public_key_of(&kept));
+        let item = assert_moved_into(&store, directory.path(), &kept);
+        assert_eq!(store.contents().len(), 1);
+
+        let lines = log.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "{log}");
+        assert!(
+            lines[0].contains("moved")
+                && lines[0].contains("owner-only file")
+                && lines[0].contains(PLATFORM_STORE)
+                && lines[0].contains(&item.to_string())
+                && lines[0].contains("release builds keep it there"),
+            "{log}"
+        );
+        assert!(!log.contains(&hex(&kept)), "{log}");
+
+        assert_eq!(
+            IdentityKey::kept_in(directory.path(), kept_in(&store))
+                .public_key()
+                .await
+                .unwrap(),
+            public_key_of(&kept)
+        );
+    }
+
+    /// A key kept in the file while the platform credential store did not
+    /// answer is moved into the store, as it is, at the first load once the
+    /// store answers.
+    #[tokio::test]
+    async fn a_key_kept_in_the_file_is_moved_into_the_store_once_it_answers() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(FakeIdentityStore::default());
+        store.set_available(false);
         let public_key = IdentityKey::kept_in(directory.path(), kept_in(&store))
             .public_key()
             .await
             .unwrap();
-        assert_eq!(public_key, public_key_of(&kept));
-        assert_eq!(
-            marker(directory.path()),
-            json!({ "kept_in": "file", "fingerprint": fingerprint(&public_key) })
-        );
-        assert_eq!(fs::read(&path).unwrap(), kept, "the file is left as it was");
+        let kept = fs::read(directory.path().join("server-identity.pk8")).unwrap();
+        assert_kept_in_file(directory.path(), &kept);
+
+        store.set_available(true);
         assert_eq!(
             IdentityKey::kept_in(directory.path(), kept_in(&store))
                 .public_key()
@@ -668,6 +871,201 @@ mod tests {
                 .unwrap(),
             public_key
         );
+        assert_moved_into(&store, directory.path(), &kept);
+    }
+
+    /// While the platform credential store does not answer, a key file
+    /// keeps the key, whether a marker says so yet or not: it is used, and
+    /// nothing is deleted. Each load Logs one line saying the key is kept
+    /// in the file, and why it was not moved.
+    #[tokio::test]
+    async fn a_key_file_is_kept_and_nothing_deleted_while_the_store_does_not_answer() {
+        let kept = KeyPair::generate().unwrap().serialize_der();
+        let directory = key_file_with_no_marker(&kept);
+        let store = Arc::new(FakeIdentityStore::default());
+        store.set_available(false);
+
+        for _ in 0..2 {
+            let identity = IdentityKey::kept_in(directory.path(), kept_in(&store));
+            let (public_key, log) = record_log(identity.public_key()).await;
+            assert_eq!(public_key.unwrap(), public_key_of(&kept));
+            assert_kept_in_file(directory.path(), &kept);
+            assert!(store.contents().is_empty());
+            let lines = log.lines().collect::<Vec<_>>();
+            assert_eq!(lines.len(), 1, "{log}");
+            assert!(
+                lines[0].contains("owner-only file")
+                    && lines[0].contains(PLATFORM_STORE)
+                    && lines[0].contains("the identity store is unavailable"),
+                "{log}"
+            );
+        }
+    }
+
+    /// A move the platform credential store stops answering partway
+    /// through — after it took the key, before it gave it back — leaves the
+    /// key in the file, from which that load gets it, and the next load
+    /// the store answers finishes the move with the same key.
+    #[tokio::test]
+    async fn a_move_interrupted_after_the_store_took_the_key_is_finished_at_the_next_load() {
+        let kept = KeyPair::generate().unwrap().serialize_der();
+        let directory = key_file_with_no_marker(&kept);
+        let store = Arc::new(FakeIdentityStore::default());
+
+        store.lock_after(1);
+        assert_eq!(
+            IdentityKey::kept_in(directory.path(), kept_in(&store))
+                .public_key()
+                .await
+                .unwrap(),
+            public_key_of(&kept)
+        );
+        assert_eq!(
+            store.contents().into_values().collect::<Vec<_>>(),
+            std::slice::from_ref(&kept),
+            "the store took the key before it locked"
+        );
+        assert_kept_in_file(directory.path(), &kept);
+
+        store.set_available(true);
+        assert_eq!(
+            IdentityKey::kept_in(directory.path(), kept_in(&store))
+                .public_key()
+                .await
+                .unwrap(),
+            public_key_of(&kept)
+        );
+        assert_moved_into(&store, directory.path(), &kept);
+    }
+
+    /// A key file left beside a marker naming the item its key was moved
+    /// into — as a move stopped before its last step leaves it — is deleted
+    /// at the next load that gets the key from the store, and the Log says
+    /// so.
+    #[tokio::test]
+    async fn a_key_file_a_finished_move_left_is_deleted_at_the_next_load() {
+        let kept = KeyPair::generate().unwrap().serialize_der();
+        let directory = key_file_with_no_marker(&kept);
+        let store = Arc::new(FakeIdentityStore::default());
+        IdentityKey::kept_in(directory.path(), kept_in(&store))
+            .public_key()
+            .await
+            .unwrap();
+        let marked = fs::read(directory.path().join("server-identity.json")).unwrap();
+        let path = directory.path().join("server-identity.pk8");
+        fs::write(&path, &kept).unwrap();
+
+        store.set_available(false);
+        IdentityKey::kept_in(directory.path(), kept_in(&store))
+            .public_key()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            kept,
+            "nothing is deleted while the store does not answer"
+        );
+
+        store.set_available(true);
+        let identity = IdentityKey::kept_in(directory.path(), kept_in(&store));
+        let (public_key, log) = record_log(identity.public_key()).await;
+        assert_eq!(public_key.unwrap(), public_key_of(&kept));
+        assert!(!path.exists(), "the file left is deleted");
+        assert_eq!(
+            fs::read(directory.path().join("server-identity.json")).unwrap(),
+            marked
+        );
+        assert_eq!(store.contents().len(), 1);
+        assert!(
+            log.lines()
+                .any(|line| line.contains("owner-only file") && line.contains("is deleted")),
+            "{log}"
+        );
+        assert!(!log.contains(&hex(&kept)), "{log}");
+    }
+
+    /// A key file beside a marker naming an item that keeps another key is
+    /// no file a move left, and is left as it is.
+    #[tokio::test]
+    async fn a_key_file_keeping_another_key_than_the_stores_is_left_as_it_is() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(FakeIdentityStore::default());
+        let public_key = IdentityKey::kept_in(directory.path(), kept_in(&store))
+            .public_key()
+            .await
+            .unwrap();
+        let path = directory.path().join("server-identity.pk8");
+        let other = KeyPair::generate().unwrap().serialize_der();
+        fs::write(&path, &other).unwrap();
+
+        assert_eq!(
+            IdentityKey::kept_in(directory.path(), kept_in(&store))
+                .public_key()
+                .await
+                .unwrap(),
+            public_key
+        );
+        assert_eq!(fs::read(&path).unwrap(), other);
+    }
+
+    /// A key the platform credential store gives back other than it was
+    /// put is not moved: the key file is left as it is and the key is got
+    /// from it, the store keeps nothing of it, and the Log says why.
+    #[tokio::test]
+    async fn a_key_the_store_gives_back_otherwise_is_left_in_its_file() {
+        let kept = KeyPair::generate().unwrap().serialize_der();
+        let directory = key_file_with_no_marker(&kept);
+        let store = Arc::new(FakeIdentityStore::default());
+        store.mangle();
+
+        for _ in 0..2 {
+            let identity = IdentityKey::kept_in(directory.path(), kept_in(&store));
+            let (public_key, log) = record_log(identity.public_key()).await;
+            assert_eq!(public_key.unwrap(), public_key_of(&kept));
+            assert_kept_in_file(directory.path(), &kept);
+            assert!(store.contents().is_empty(), "nothing is left in the store");
+            assert!(
+                log.lines().any(|line| line.contains("owner-only file")
+                    && line.contains("gave back another key")),
+                "{log}"
+            );
+        }
+    }
+
+    /// A debug build, and `SURU_IDENTITY_STORE=file`, leave a key file
+    /// where it is, marked as kept there, though the platform credential
+    /// store would take it, and the Log says why.
+    #[tokio::test]
+    async fn a_key_file_is_not_moved_where_the_file_is_selected() {
+        for (selection, why) in [
+            (Selection::DebugBuild, "debug builds keep it there"),
+            (
+                Selection::Chosen(IdentityStoreChoice::File),
+                "SURU_IDENTITY_STORE=file keeps it there",
+            ),
+        ] {
+            let kept = KeyPair::generate().unwrap().serialize_der();
+            let directory = key_file_with_no_marker(&kept);
+            let store = Arc::new(FakeIdentityStore::default());
+            let keeping = IdentityKeeping {
+                selection,
+                ..kept_in(&store)
+            };
+
+            for _ in 0..2 {
+                let identity = IdentityKey::kept_in(directory.path(), keeping.clone());
+                let (public_key, log) = record_log(identity.public_key()).await;
+                assert_eq!(public_key.unwrap(), public_key_of(&kept));
+                assert_kept_in_file(directory.path(), &kept);
+                assert!(store.contents().is_empty());
+                let lines = log.lines().collect::<Vec<_>>();
+                assert_eq!(lines.len(), 1, "{log}");
+                assert!(
+                    lines[0].contains("owner-only file") && lines[0].contains(why),
+                    "{log}"
+                );
+            }
+        }
     }
 
     /// With no platform credential store to ask, a data directory with no
@@ -763,11 +1161,7 @@ mod tests {
         assert_eq!(lines.len(), 1, "{log}");
         assert!(lines[0].contains(PLATFORM_STORE), "{log}");
         assert!(lines[0].contains("release builds keep it there"), "{log}");
-        let hex = kept[&item]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert!(!log.contains(&hex), "{log}");
+        assert!(!log.contains(&hex(&kept[&item])), "{log}");
 
         assert_eq!(
             IdentityKey::kept_in(directory.path(), kept_in(&store))
