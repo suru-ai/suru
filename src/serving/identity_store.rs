@@ -295,17 +295,40 @@ pub(crate) enum Selection {
     /// the platform credential store has never seen, and would ask its user
     /// about.
     DebugBuild,
+    /// A release build Cargo runs — by `cargo run`, `cargo test` or `cargo
+    /// nextest run` — which keeps it in the file as a debug build does: it
+    /// too is a program the platform credential store has never seen, and a
+    /// test's Server keeps nothing in the store of the machine it runs on.
+    CargoRun,
     /// `SURU_IDENTITY_STORE`, naming the store whatever the build.
     Chosen(IdentityStoreChoice),
 }
 
 impl Selection {
-    /// The selection of a debug build, or a release one, where `chosen`, as
-    /// `SURU_IDENTITY_STORE` names a store, does not override it.
-    pub(crate) fn for_build(debug_build: bool, chosen: Option<IdentityStoreChoice>) -> Self {
+    /// The selection of this build as it runs, where `chosen`, as
+    /// `SURU_IDENTITY_STORE` names a store, does not override it. Cargo sets
+    /// `CARGO_MANIFEST_DIR` for whatever it runs, which those programs pass
+    /// on to theirs, and a Suru installed and run as it ships never has it.
+    pub(crate) fn for_this_build(chosen: Option<IdentityStoreChoice>) -> Self {
+        Self::for_build(
+            cfg!(debug_assertions),
+            std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+            chosen,
+        )
+    }
+
+    /// The selection of a debug build, or a release one, run by Cargo or
+    /// not, where `chosen`, as `SURU_IDENTITY_STORE` names a store, does not
+    /// override it.
+    pub(crate) fn for_build(
+        debug_build: bool,
+        run_by_cargo: bool,
+        chosen: Option<IdentityStoreChoice>,
+    ) -> Self {
         match chosen {
             Some(chosen) => Self::Chosen(chosen),
             None if debug_build => Self::DebugBuild,
+            None if run_by_cargo => Self::CargoRun,
             None => Self::ReleaseBuild,
         }
     }
@@ -314,7 +337,7 @@ impl Selection {
     pub(crate) fn store(self) -> IdentityStoreChoice {
         match self {
             Self::ReleaseBuild => IdentityStoreChoice::System,
-            Self::DebugBuild => IdentityStoreChoice::File,
+            Self::DebugBuild | Self::CargoRun => IdentityStoreChoice::File,
             Self::Chosen(chosen) => chosen,
         }
     }
@@ -325,6 +348,9 @@ impl Selection {
             Self::ReleaseBuild => "release builds keep it there".to_owned(),
             Self::DebugBuild => {
                 "debug builds keep it there unless SURU_IDENTITY_STORE=system".to_owned()
+            }
+            Self::CargoRun => {
+                "builds Cargo runs keep it there unless SURU_IDENTITY_STORE=system".to_owned()
             }
             Self::Chosen(chosen) => format!("SURU_IDENTITY_STORE={chosen} keeps it there"),
         }
@@ -642,21 +668,29 @@ mod tests {
         assert_eq!(answered, Stored::Found(b"kept".to_vec()));
     }
 
-    /// Release builds keep a new key in the platform credential store and
-    /// debug builds in the file, and `SURU_IDENTITY_STORE` overrides
-    /// either.
+    /// Release builds keep a new key in the platform credential store, and
+    /// debug builds and builds Cargo runs, whatever their profile, in the
+    /// file; `SURU_IDENTITY_STORE` overrides any of them.
     #[test]
     fn the_build_selects_the_store_and_suru_identity_store_overrides_it() {
         use IdentityStoreChoice::{File, System};
 
-        assert_eq!(Selection::for_build(false, None).store(), System);
-        assert_eq!(Selection::for_build(true, None).store(), File);
+        assert_eq!(Selection::for_build(false, false, None).store(), System);
+        assert_eq!(Selection::for_build(true, false, None).store(), File);
+        assert_eq!(Selection::for_build(false, true, None).store(), File);
+        assert_eq!(Selection::for_build(true, true, None).store(), File);
+        assert_eq!(
+            Selection::for_build(false, true, None).why(),
+            "builds Cargo runs keep it there unless SURU_IDENTITY_STORE=system"
+        );
         for debug_build in [false, true] {
-            for chosen in [System, File] {
-                assert_eq!(
-                    Selection::for_build(debug_build, Some(chosen)).store(),
-                    chosen
-                );
+            for run_by_cargo in [false, true] {
+                for chosen in [System, File] {
+                    assert_eq!(
+                        Selection::for_build(debug_build, run_by_cargo, Some(chosen)).store(),
+                        chosen
+                    );
+                }
             }
         }
 
@@ -673,5 +707,21 @@ mod tests {
             error.to_string(),
             "the identity store is `system` or `file`, not \"keychain\""
         );
+    }
+
+    /// This build, run by Cargo as every test is, keeps a new key in the
+    /// file whatever its profile — a debug build, or a release one Cargo
+    /// runs — so no test's Server keeps one in the store of the machine it
+    /// runs on unless `SURU_IDENTITY_STORE` chooses it.
+    #[test]
+    fn a_build_cargo_runs_selects_the_file_whatever_its_profile() {
+        let selected = Selection::for_this_build(None);
+        let expected = if cfg!(debug_assertions) {
+            Selection::DebugBuild
+        } else {
+            Selection::CargoRun
+        };
+        assert_eq!(selected, expected);
+        assert_eq!(selected.store(), IdentityStoreChoice::File);
     }
 }

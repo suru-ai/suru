@@ -146,7 +146,8 @@ impl RuntimeConfig {
     /// Configures a Server to keep a new identity key in `store`, as
     /// `SURU_IDENTITY_STORE` names one, whatever the build. Without this, a
     /// release build keeps it in the platform credential store, and a debug
-    /// build in an owner-only file in the data directory.
+    /// build, or any build Cargo runs, in an owner-only file in the data
+    /// directory.
     pub fn with_identity_store(mut self, store: IdentityStoreChoice) -> Self {
         self.identity_store = Some(store);
         self

@@ -1429,10 +1429,7 @@ async fn start(
     .with_direct_proxies(timings.direct_proxies.clone())
     .with_identity_keeping(crate::serving::IdentityKeeping {
         store: crate::serving::platform_identity_store(),
-        selection: crate::serving::Selection::for_build(
-            cfg!(debug_assertions),
-            config.identity_store(),
-        ),
+        selection: crate::serving::Selection::for_this_build(config.identity_store()),
         channel: config.channel().to_owned(),
         store_timeout: timings.identity_store_timeout,
     });

@@ -1287,6 +1287,42 @@ mod tests {
         assert!(lines[0].contains("debug builds keep it there"), "{log}");
     }
 
+    /// A release build Cargo runs, as every test's Server is, never puts a
+    /// key in the platform credential store, though the store would take
+    /// it: neither a first key, nor one a key file keeps, with or without a
+    /// marker. The store is never asked anything, and the Log says why.
+    #[tokio::test]
+    async fn a_build_cargo_runs_never_puts_or_moves_a_key_into_the_store() {
+        let store = Arc::new(FakeIdentityStore::default());
+        let keeping = IdentityKeeping {
+            selection: Selection::CargoRun,
+            ..kept_in(&store)
+        };
+        let why = "builds Cargo runs keep it there unless SURU_IDENTITY_STORE=system";
+
+        let first = tempfile::tempdir().unwrap();
+        let (public_key, log) =
+            record_log(IdentityKey::kept_in(first.path(), keeping.clone()).public_key()).await;
+        let made = fs::read(first.path().join("server-identity.pk8")).unwrap();
+        assert_eq!(public_key.unwrap(), public_key_of(&made));
+        assert_kept_in_file(first.path(), &made);
+        assert!(log.contains(why), "{log}");
+
+        let kept = KeyPair::generate().unwrap().serialize_der();
+        let unmarked = key_file_with_no_marker(&kept);
+        // Unmarked, and then marked as kept in the file.
+        for _ in 0..2 {
+            let identity = IdentityKey::kept_in(unmarked.path(), keeping.clone());
+            let (public_key, log) = record_log(identity.public_key()).await;
+            assert_eq!(public_key.unwrap(), public_key_of(&kept));
+            assert_kept_in_file(unmarked.path(), &kept);
+            assert!(log.contains(why), "{log}");
+        }
+
+        assert_eq!(store.calls(), 0, "the store is never asked");
+        assert!(store.contents().is_empty());
+    }
+
     /// While the platform credential store does not answer, a key its
     /// marker says the store keeps cannot be used, its user is told why,
     /// and nothing is made or written in its place; once the store answers,
