@@ -307,19 +307,34 @@ impl KeptKey {
     /// Marks a new key the platform credential store keeps as the item
     /// `item` as kept there. Where the marker cannot be written, the key was
     /// never used, so it is taken out of the store again rather than left
-    /// behind at each failure. A Server stopping before the marker is
-    /// written leaves the one item, holding a key nothing ever used.
+    /// behind at each failure — unless a marker names it all the same, or
+    /// may: the writing can fail after it put the marker in place, and a
+    /// marker must never outlive the item it names. A Server stopping
+    /// before the marker is written leaves the one item, holding a key
+    /// nothing ever used.
     fn mark_kept_in_store(&self, item: ItemId, fingerprint: String) -> Result<()> {
-        let marked = Marker::SystemStore { item, fingerprint }.write(&self.marker);
-        if marked.is_err()
-            && let Err(left) = self.store.delete(&item)
-        {
-            tracing::warn!(
-                "a Server identity key never used is left in {PLATFORM_STORE}, as the item \
-                 {item}: {left:#}"
-            );
+        let Err(error) = (Marker::SystemStore { item, fingerprint }).write(&self.marker) else {
+            return Ok(());
+        };
+        match MarkingLeft::after(Marker::read(&self.marker), item) {
+            MarkingLeft::Marked => {
+                tracing::warn!(
+                    "Server identity marker naming the item {item} is in place, though writing \
+                     it failed: {error:#}"
+                );
+                Ok(())
+            }
+            MarkingLeft::Unmarked => {
+                if let Err(left) = self.store.delete(&item) {
+                    tracing::warn!(
+                        "a Server identity key never used is left in {PLATFORM_STORE}, as the \
+                         item {item}: {left:#}"
+                    );
+                }
+                Err(error)
+            }
+            MarkingLeft::Unknown => Err(error),
         }
-        marked
     }
 
     /// Keeps `key` in the platform credential store as a new item, and reads
@@ -398,6 +413,31 @@ impl Marker {
     fn write(&self, path: &Path) -> Result<()> {
         write_private_json(path, self)
             .with_context(|| format!("write Server identity marker {path:?}"))
+    }
+}
+
+/// What writing the marker naming a new key's item left in place, where the
+/// writing failed: it puts the marker in place whole or not at all, but can
+/// fail after it has.
+#[derive(Debug, PartialEq, Eq)]
+enum MarkingLeft {
+    /// A marker naming the item.
+    Marked,
+    /// No marker naming the item.
+    Unmarked,
+    /// A marker that cannot be read, which may name it.
+    Unknown,
+}
+
+impl MarkingLeft {
+    /// What is in place, as the marker reads afterwards — `read` — for the
+    /// item `item`.
+    fn after(read: Result<Option<Marker>>, item: ItemId) -> Self {
+        match read {
+            Ok(Some(Marker::SystemStore { item: named, .. })) if named == item => Self::Marked,
+            Ok(_) => Self::Unmarked,
+            Err(_) => Self::Unknown,
+        }
     }
 }
 
@@ -1084,6 +1124,42 @@ mod tests {
         let kept = store.contents();
         assert_eq!(kept.len(), 1);
         assert_eq!(public_key_of(&kept[&marked_item(&data_dir)]), public_key);
+    }
+
+    /// After writing the marker naming a new key's item fails, the item is
+    /// taken out of the store only where no marker names it: a marker put
+    /// in place before the writing failed — its last step, making it
+    /// owner-only, failing, say — names it still, and one that cannot be
+    /// read may.
+    #[test]
+    fn a_new_item_is_taken_out_only_where_no_marker_names_it() {
+        let item = ItemId::random();
+        let marking = |kept_in| MarkingLeft::after(Ok(Some(kept_in)), item);
+        assert_eq!(
+            marking(Marker::SystemStore {
+                item,
+                fingerprint: "fingerprint".to_owned(),
+            }),
+            MarkingLeft::Marked
+        );
+        assert_eq!(
+            marking(Marker::SystemStore {
+                item: ItemId::random(),
+                fingerprint: "fingerprint".to_owned(),
+            }),
+            MarkingLeft::Unmarked
+        );
+        assert_eq!(
+            marking(Marker::File {
+                fingerprint: "fingerprint".to_owned(),
+            }),
+            MarkingLeft::Unmarked
+        );
+        assert_eq!(MarkingLeft::after(Ok(None), item), MarkingLeft::Unmarked);
+        assert_eq!(
+            MarkingLeft::after(Err(anyhow!("unreadable")), item),
+            MarkingLeft::Unknown
+        );
     }
 
     /// Two data directories with one platform credential store between them
