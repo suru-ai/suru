@@ -152,12 +152,14 @@ const JOINED_STREAMS_AT_ONCE: u32 = 100;
 /// How many a joined stream carries at once in all: those, and the one the
 /// Relays are told over, which so never waits behind what is asked.
 const JOINED_STREAMS: u32 = JOINED_STREAMS_AT_ONCE + 1;
-/// How many requests this Server asks of one Remote at once, awaiting its
-/// answer — carried there, or waiting their turn on a joined stream: as many
-/// as a joined stream carries at once, and as many again. One asked past
-/// them is refused at once, as the Remote being too busy to ask just now,
-/// rather than waiting.
-const AWAITED_AT_ONCE: usize = 2 * JOINED_STREAMS_AT_ONCE as usize;
+/// How many requests this Server asks of one Remote at once, by default,
+/// awaiting its answer — carried there, or waiting their turn on a joined
+/// stream, a probe of its health among them: as many as a joined stream
+/// carries at once, and as many again. One asked past them is refused at
+/// once, as the Remote being too busy to ask just now, rather than waiting.
+/// What the Server asks of a Remote on its own — which Relays it Serves
+/// through, over the place kept for that — is not among them.
+pub(crate) const AWAITED_AT_ONCE: usize = 2 * JOINED_STREAMS_AT_ONCE as usize;
 /// How many bytes the bodies of the requests awaiting one Remote's answer
 /// hold between them: as many of the largest the Session API reads as one
 /// Prompt binds Attachments. A request holds room for its body before it is
@@ -336,6 +338,8 @@ pub(crate) struct ServingController {
     /// What awaits each Remote's answer, by the Remote's name, for as long as
     /// anything does.
     awaiting: Arc<StdMutex<HashMap<String, Weak<Awaiting>>>>,
+    /// How many requests may await one Remote's answer at once.
+    awaited_at_once: usize,
     revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
     awaiting_revocation: AwaitingRevocation,
     /// What the Serving listener proves it named an act's author with; see
@@ -1001,6 +1005,7 @@ impl ServingController {
             remotes: Arc::new(RwLock::new(read_records(&data_dir.join(REMOTES_FILE))?)),
             remote_clients: Arc::new(StdMutex::new(HashMap::new())),
             awaiting: Arc::new(StdMutex::new(HashMap::new())),
+            awaited_at_once: AWAITED_AT_ONCE,
             revocations: Arc::new(RwLock::new(revocations)),
             awaiting_revocation: Arc::default(),
             forwarded_author_proof: URL_SAFE_NO_PAD.encode(new_token()).into(),
@@ -1031,6 +1036,12 @@ impl ServingController {
     /// handshake before it is dropped.
     pub(crate) fn with_handshake_timeout(mut self, timeout: tokio::time::Duration) -> Self {
         self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Sets how many requests may await one Remote's answer at once.
+    pub(crate) fn with_awaited_at_once(mut self, awaited_at_once: usize) -> Self {
+        self.awaited_at_once = awaited_at_once;
         self
     }
 
@@ -1301,11 +1312,15 @@ impl ServingController {
         self.pairings_made.load(Ordering::Acquire)
     }
 
+    /// Asks the Remote `name` whether it answers, and as what: a request
+    /// awaiting its answer as any carried to it does, refused at once where
+    /// as many await it as may.
     pub(crate) async fn probe_remote(
         &self,
         name: &str,
     ) -> std::result::Result<RemoteHealth, PairingFailure> {
         let remote = self.stored_remote(name)?;
+        let _awaiting = self.await_answer(name, 0)?;
         let health = match self.probe_remote_connection(&remote).await {
             Ok(health) => return Ok(health),
             Err(error) if error.code == SessionErrorCode::PairingAuthenticationFailed => {
@@ -1879,8 +1894,8 @@ impl ServingController {
 
     /// Takes room among what awaits the Remote `name`'s answer for a request
     /// whose body holds as much as `body` bytes, held until it is answered or
-    /// fails — refused at once where there is none, past
-    /// [`AWAITED_AT_ONCE`] or [`AWAITED_BODY_BYTES`].
+    /// fails — refused at once where there is none, past as many requests as
+    /// may await it at once or [`AWAITED_BODY_BYTES`].
     fn await_answer(
         &self,
         name: &str,
@@ -1895,7 +1910,7 @@ impl ServingController {
             if let Some(held) = awaiting.get(name).and_then(Weak::upgrade) {
                 held
             } else {
-                let held = Arc::new(Awaiting::default());
+                let held = Arc::new(Awaiting::new(self.awaited_at_once));
                 awaiting.insert(name.to_owned(), Arc::downgrade(&held));
                 held
             }
@@ -4730,10 +4745,12 @@ struct Awaiting {
     bytes: Arc<tokio::sync::Semaphore>,
 }
 
-impl Default for Awaiting {
-    fn default() -> Self {
+impl Awaiting {
+    /// Room for `requests` at once, and [`AWAITED_BODY_BYTES`] of their
+    /// bodies.
+    fn new(requests: usize) -> Self {
         Self {
-            requests: Arc::new(tokio::sync::Semaphore::new(AWAITED_AT_ONCE)),
+            requests: Arc::new(tokio::sync::Semaphore::new(requests)),
             bytes: Arc::new(tokio::sync::Semaphore::new(AWAITED_BODY_BYTES)),
         }
     }

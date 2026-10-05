@@ -3217,19 +3217,35 @@ async fn the_relays_are_told_beside_as_much_as_a_joined_stream_carries_at_once()
     paired.shutdown().await;
 }
 
-/// Past as many requests awaiting a Remote's answer as a joined stream
-/// carries at once and as many again, one more is refused at once — as the
-/// Remote being too busy to ask just now, so it is asked again later — rather
-/// than waiting with the rest, which are answered as the streams ahead end.
-#[tokio::test]
-async fn a_request_past_as_many_again_waiting_as_a_joined_stream_carries_is_refused_at_once() {
-    let paired = PairedThrough::start("relay-pairing-awaiting-bound").await;
-    let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
-    let api = RemoteApi::of(&paired.laptop);
-    let session = api.begin_session(workspace.path()).await;
+/// How many requests the laptop asks of its Remote at once in the tests that
+/// reach that bound: few, so reaching it holds few connections open.
+const ASKED_AT_ONCE: usize = 8;
 
-    let streams = filled(&api, &session).await;
-    let mut asked = (0..201)
+/// A workstation and a laptop paired through a Relay, the laptop asking its
+/// Remote no more than [`ASKED_AT_ONCE`] at once, with the join the laptop
+/// makes there held back at the Relay, so everything it asks of the Remote
+/// waits on that join until the Relay's route stops delaying it.
+async fn awaiting_a_held_join(channel: &str) -> PairedThrough {
+    let mut paired = PairedThrough::with_timings(
+        channel,
+        relay_timings().with_remote_requests_at_once(ASKED_AT_ONCE),
+    )
+    .await;
+    paired.relay.route.wait_for_connections(2).await;
+    paired.relay.route.delay(true);
+    paired
+}
+
+/// Past as many requests awaiting a Remote's answer as the Server asks of it
+/// at once — carried, or waiting their turn — one more is refused at once, as
+/// the Remote being too busy to ask just now, so it is asked again later,
+/// rather than waiting with the rest, which are answered once they can be.
+#[tokio::test]
+async fn a_request_past_as_many_as_await_a_remotes_answer_at_once_is_refused_at_once() {
+    let paired = awaiting_a_held_join("relay-pairing-awaiting-bound").await;
+    let api = RemoteApi::of(&paired.laptop);
+
+    let mut asked = (0..=ASKED_AT_ONCE)
         .map(|_| api.get("/health").send())
         .collect::<futures_util::stream::FuturesUnordered<_>>();
     let refused = timeout(PROGRESS_DEADLINE, asked.next())
@@ -3249,17 +3265,72 @@ async fn a_request_past_as_many_again_waiting_as_a_joined_stream_carries_is_refu
         "the rest wait their turn"
     );
 
-    drop(streams);
+    paired.relay.route.delay(false);
     let answered = timeout(PROGRESS_DEADLINE, asked.collect::<Vec<_>>())
         .await
-        .expect("the requests waiting are answered as the streams ahead end");
-    assert_eq!(answered.len(), 200);
+        .expect("the requests waiting are answered once the join is made");
+    assert_eq!(answered.len(), ASKED_AT_ONCE);
     assert!(
         answered.iter().all(|answer| answer
             .as_ref()
             .is_ok_and(|answer| answer.status().is_success())),
         "every request that waited is answered"
     );
+
+    paired.shutdown().await;
+}
+
+/// A probe of a Remote awaits its answer as a request carried to it does,
+/// within the one bound: past as many awaiting it at once, one more probe
+/// is refused at once, as the Remote being too busy to ask just now, rather
+/// than waiting with the rest.
+#[tokio::test]
+async fn a_probe_past_as_many_as_await_a_remotes_answer_at_once_is_refused_at_once() {
+    let paired = awaiting_a_held_join("relay-pairing-awaiting-probes").await;
+    let descriptor = paired.laptop.server.as_ref().unwrap().descriptor().clone();
+    let http = reqwest::Client::new();
+    let probing = || {
+        http.post(format!(
+            "{}/v1/pairing/remotes/{REMOTE}/health",
+            descriptor.base_url
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+    };
+
+    let mut probes = (0..=ASKED_AT_ONCE)
+        .map(|_| probing())
+        .collect::<futures_util::stream::FuturesUnordered<_>>();
+    let refused = timeout(PROGRESS_DEADLINE, probes.next())
+        .await
+        .expect("one probe is answered at once")
+        .expect("one probe is asked")
+        .expect("the local Server answers");
+    assert_eq!(refused.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        refused.json::<SessionError>().await.unwrap().code,
+        SessionErrorCode::RemoteBusy
+    );
+    assert!(
+        timeout(Duration::from_millis(200), probes.next())
+            .await
+            .is_err(),
+        "the rest wait their turn"
+    );
+
+    paired.relay.route.delay(false);
+    let answered = timeout(PROGRESS_DEADLINE, probes.collect::<Vec<_>>())
+        .await
+        .expect("the probes waiting are answered once the join is made");
+    assert_eq!(answered.len(), ASKED_AT_ONCE);
+    for answer in answered {
+        let health = answer
+            .expect("the local Server answers")
+            .json::<RemoteHealth>()
+            .await
+            .expect("a probe answers the Remote's health");
+        assert_eq!(health.status, RemoteStatus::Available);
+    }
 
     paired.shutdown().await;
 }

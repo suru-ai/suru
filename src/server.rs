@@ -222,6 +222,10 @@ pub struct ServerTimings {
     pub remote_silence_limit: Duration,
     /// How much keeping Remotes in view for Sidekicks' trees takes on.
     pub remote_watch_limits: RemoteWatchLimits,
+    /// How many requests may await one Remote's answer at once — carried to
+    /// it, probing it, or waiting their turn on its joined stream — past
+    /// which another is refused at once rather than waiting.
+    pub remote_requests_at_once: usize,
     /// How long one connection of a Pairing may take to finish its TLS
     /// handshake before it is dropped — one to the Serving listener, or one
     /// this Server opens to a Remote, through a Relay among them — so a
@@ -348,6 +352,7 @@ impl Default for ServerTimings {
             remote_retry_interval: Duration::from_secs(5),
             remote_silence_limit: Duration::from_secs(30),
             remote_watch_limits: RemoteWatchLimits::default(),
+            remote_requests_at_once: crate::serving::AWAITED_AT_ONCE,
             serving_handshake_timeout: Duration::from_secs(10),
             direct_head_start: Duration::from_millis(250),
             direct_idle_timeout: Duration::from_secs(90),
@@ -422,6 +427,14 @@ impl ServerTimings {
     /// much.
     pub fn with_remote_watch_limits(mut self, limits: RemoteWatchLimits) -> Self {
         self.remote_watch_limits = limits;
+        self
+    }
+
+    /// Bounds how many requests may await one Remote's answer at once;
+    /// injectable so tests see the bound reached without holding that many
+    /// open.
+    pub fn with_remote_requests_at_once(mut self, requests: usize) -> Self {
+        self.remote_requests_at_once = requests;
         self
     }
     /// Paces the reading of a Remote's trees a Sidekick is owed Reports of:
@@ -1400,6 +1413,7 @@ async fn start(
     .with_withdrawal_timeout(timings.remote_withdrawal_timeout)
     .with_handshake_timeout(timings.serving_handshake_timeout)
     .with_direct_head_start(timings.direct_head_start)
+    .with_awaited_at_once(timings.remote_requests_at_once)
     .with_direct_idle_timeout(timings.direct_idle_timeout)
     .with_direct_retry_interval(timings.direct_retry_interval)
     .with_told_relays_store_interval(timings.told_relays_store_interval)
