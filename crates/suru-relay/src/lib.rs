@@ -128,6 +128,12 @@ const CONNECTION_LOG_CAPACITY: usize = 65_536;
 /// Login asks what it came for the moment it has.
 const IDLE_TIMEOUT_WITHOUT_LOGIN: Duration = GREETING_TIMEOUT;
 
+/// How often a Relay tries again to record that an Account lapsed, where it
+/// could not as the Account was found to lapse, unless its configuration says
+/// otherwise. The Account is refused, and everything that stood on it cut,
+/// meanwhile.
+const LAPSE_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
 /// How long a stopping Relay waits for its connection log to write the lines
 /// it owes, and then for its diagnostic log to say how many it gave up,
 /// unless its configuration says otherwise.
@@ -214,6 +220,7 @@ pub struct RelayConfig {
     idle_connections_per_server: NonZeroU32,
     idle_connections_per_server_without_login: NonZeroU32,
     idle_timeout_without_login: Duration,
+    lapse_retry_interval: Duration,
 }
 
 impl RelayConfig {
@@ -257,6 +264,7 @@ impl RelayConfig {
             idle_connections_per_server: IDLE_CONNECTIONS_PER_SERVER,
             idle_connections_per_server_without_login: IDLE_CONNECTIONS_PER_SERVER_WITHOUT_LOGIN,
             idle_timeout_without_login: IDLE_TIMEOUT_WITHOUT_LOGIN,
+            lapse_retry_interval: LAPSE_RETRY_INTERVAL,
         }
     }
 
@@ -388,6 +396,16 @@ impl RelayConfig {
     /// timeout allows each step of proving itself.
     pub fn with_idle_timeout_without_login(mut self, timeout: Duration) -> Self {
         self.idle_timeout_without_login = timeout;
+        self
+    }
+
+    /// Has the Relay try again every `interval`, rather than every ten
+    /// seconds, to record that an Account lapsed where it could not as the
+    /// Account was found to lapse. The Account is refused, and everything
+    /// standing on it cut, from the moment it is found to lapse, however long
+    /// until its lapse is recorded.
+    pub fn with_lapse_retry_interval(mut self, interval: Duration) -> Self {
+        self.lapse_retry_interval = interval;
         self
     }
 
@@ -704,6 +722,8 @@ pub async fn start(
         admission_interval: config.admission_interval,
         resume_at: std::sync::atomic::AtomicI64::new(0),
         admission_timeout: config.admission_timeout,
+        lapse_retry_interval: config.lapse_retry_interval,
+        lapses_unrecorded: tokio::sync::Notify::new(),
         fresh_login_every: config.fresh_login_every,
         logins_per_account: config.logins_per_account,
         joined: caps::Joined::new(config.joined_connections_per_account),
@@ -727,7 +747,8 @@ pub async fn start(
         .await
         .context("look for Logins the operator removed before serving")?;
     // From then on it checks them on its own until it stops, letting go of
-    // any asking of the rules under way.
+    // any asking of the rules under way, and tries again to record each lapse
+    // it finds and cannot record, until it can.
     tokio::spawn({
         let relay = relay.clone();
         let mut stopping = stopping_rx.clone();
@@ -735,6 +756,16 @@ pub async fn start(
             tokio::select! {
                 _ = stopping.wait_for(|stopping| *stopping) => {}
                 () = admission::keep_checking(&relay) => {}
+            }
+        }
+    });
+    tokio::spawn({
+        let relay = relay.clone();
+        let mut stopping = stopping_rx.clone();
+        async move {
+            tokio::select! {
+                _ = stopping.wait_for(|stopping| *stopping) => {}
+                () = admission::keep_recording_lapses(&relay) => {}
             }
         }
     });

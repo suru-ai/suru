@@ -105,6 +105,12 @@ pub(crate) struct Relay {
     pub(crate) resume_at: AtomicI64,
     /// How long the rules may take to answer each asking.
     pub(crate) admission_timeout: Duration,
+    /// How often the Relay tries again to record a lapse it found and could
+    /// not record.
+    pub(crate) lapse_retry_interval: Duration,
+    /// Told each time the Relay finds a lapse it cannot record, so it tries
+    /// again until it can.
+    pub(crate) lapses_unrecorded: tokio::sync::Notify,
     /// How recently an Account must have been logged in as, where its
     /// operator requires a fresh login every so often.
     pub(crate) fresh_login_every: Option<Duration>,
@@ -169,6 +175,17 @@ impl Relay {
             self.joiner.give_up_joins_of(key);
         }
         self.holdings.cut(standing, keys, why)
+    }
+
+    /// Cuts, for `why`, everything standing on the Logins under the Account
+    /// `account`, while the standing lock is held, as `standing` shows: the
+    /// joins asked under it, the joins carried, and the connections its
+    /// Servers hold on the strength of them — whether or not the Relay can
+    /// read which Logins those are. Answers what it cut, to be waited on to
+    /// let go.
+    pub(crate) fn cut_account(&self, standing: &Verdicts, account: i64, why: Cut) -> Released {
+        self.joiner.give_up_joins_under(account);
+        self.holdings.cut_account(standing, account, why)
     }
 }
 
@@ -314,10 +331,11 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Handover>,
         let standing = relay.standing.lock().await;
         match relay.store.standing(&key, relay.fresh_since()).await {
             Ok(login) => {
-                let held = login
-                    .is_some()
-                    .then(|| relay.holdings.hold(&standing, vec![key.clone()]));
-                (login, held)
+                let login = login.filter(|(account, _)| !standing.has_lapsed(*account));
+                let held = login.as_ref().map(|(account, _)| {
+                    relay.holdings.hold(&standing, vec![key.clone()], *account)
+                });
+                (login.map(|(_, login)| login), held)
             }
             Err(error) => {
                 drop(standing);
@@ -366,12 +384,14 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Handover>,
                         .account_of(&key, relay.fresh_since())
                         .await
                         .map(|account| {
-                            account.map(|_| {
-                                (
-                                    relay.joiner.wait(key.clone()),
-                                    relay.holdings.hold(&standing, vec![key.clone()]),
-                                )
-                            })
+                            account
+                                .filter(|account| !standing.has_lapsed(*account))
+                                .map(|account| {
+                                    (
+                                        relay.joiner.wait(key.clone()),
+                                        relay.holdings.hold(&standing, vec![key.clone()], account),
+                                    )
+                                })
                         })
                 };
                 match waiting {
@@ -516,7 +536,7 @@ async fn join(
     // leaves unread holds them.
     let asked = {
         let standing = relay.standing.lock().await;
-        match one_account(relay, key, server).await {
+        match one_account(relay, &standing, key, server).await {
             Ok(Ok(account)) => Ok(ask(relay, &standing, key, server, account)),
             Ok(Err(refusal)) => Ok(Err(refusal)),
             Err(error) => Err(error),
@@ -548,7 +568,11 @@ async fn join(
         // its Account as the Server named took it up.
         Ok(Err(_)) => {
             drop(reserved);
-            let refusal = match one_account(relay, key, server).await {
+            let refusal = {
+                let standing = relay.standing.lock().await;
+                one_account(relay, &standing, key, server).await
+            };
+            let refusal = match refusal {
                 Ok(Err(refusal)) => refusal,
                 Ok(Ok(_)) => not_waiting("the Server named did not take the join up"),
                 Err(error) => return unreadable(channel, error).await,
@@ -634,28 +658,42 @@ fn ask(
 
 /// The Account the Logins of the Server whose key is `key` and the one whose
 /// key is `server` both stand under, or why the Relay would join them under
-/// none.
+/// none, while the standing lock is held, as `standing` shows.
 async fn one_account(
     relay: &Relay,
+    standing: &Verdicts,
     key: &[u8],
     server: &[u8],
 ) -> anyhow::Result<Result<i64, RelayMessage>> {
     let fresh_since = relay.fresh_since();
-    let Some(joining) = relay.store.account_of(key, fresh_since).await? else {
+    let stands = |account: &i64| !standing.has_lapsed(*account);
+    let Some(joining) = relay
+        .store
+        .account_of(key, fresh_since)
+        .await?
+        .filter(stands)
+    else {
         return Ok(Err(login_needed()));
     };
-    Ok(match relay.store.account_of(server, fresh_since).await? {
-        None => Err(refused(
-            Refusal::UnknownServer,
-            "this Relay knows no Server by the identity key named",
-        )),
-        Some(serving) if serving != joining => Err(refused(
-            Refusal::DifferentAccounts,
-            "the Server named is logged in under another Account, and this Relay joins only \
+    Ok(
+        match relay
+            .store
+            .account_of(server, fresh_since)
+            .await?
+            .filter(stands)
+        {
+            None => Err(refused(
+                Refusal::UnknownServer,
+                "this Relay knows no Server by the identity key named",
+            )),
+            Some(serving) if serving != joining => Err(refused(
+                Refusal::DifferentAccounts,
+                "the Server named is logged in under another Account, and this Relay joins only \
              Servers logged in under the same one",
-        )),
-        Some(account) => Ok(account),
-    })
+            )),
+            Some(account) => Ok(account),
+        },
+    )
 }
 
 /// Takes up the join named `name` for the Server whose key is `key`, where it
@@ -668,6 +706,9 @@ async fn take_up(relay: &Relay, name: &[u8], key: &[u8]) -> anyhow::Result<Optio
     let Some(taken_up) = relay.joiner.take_up(name, key) else {
         return Ok(None);
     };
+    if standing.has_lapsed(taken_up.account) {
+        return Ok(None);
+    }
     let parties = relay
         .store
         .parties(
@@ -680,9 +721,11 @@ async fn take_up(relay: &Relay, name: &[u8], key: &[u8]) -> anyhow::Result<Optio
     Ok(parties.map(|parties| Handover {
         taker: taken_up.taker,
         parties,
-        held: relay
-            .holdings
-            .hold(&standing, vec![taken_up.asker_key, key.to_vec()]),
+        held: relay.holdings.hold(
+            &standing,
+            vec![taken_up.asker_key, key.to_vec()],
+            taken_up.account,
+        ),
     }))
 }
 
@@ -899,13 +942,20 @@ async fn log_in(
                 .await;
             if let Ok(Some(recorded)) = &recorded {
                 standing.admitted(&check);
+                // Logged in as afresh, the Account is restored, whatever
+                // lapse of it the Relay has yet to record.
+                standing.restored(recorded.id);
                 relay.joiner.give_up_joins_of(key);
                 // A Login moved to another Account carries nothing that stood
                 // on it under the one before.
                 if recorded.moved() {
                     relay.cut(&standing, &[key.to_vec()], Cut::Moved);
                 }
-                *held = Some(relay.holdings.hold(&standing, vec![key.to_vec()]));
+                *held = Some(
+                    relay
+                        .holdings
+                        .hold(&standing, vec![key.to_vec()], recorded.id),
+                );
             }
             recorded.map(|recorded| recorded.map_or(Formed::AtCap, Formed::Recorded))
         } else {

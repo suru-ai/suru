@@ -225,14 +225,15 @@ impl Store {
         }
     }
 
-    /// The Account the Login tied to `server_key` stands under, by its
-    /// provider and username, where there is such a Login and it stands,
-    /// fresh enough where a login is required since `fresh_since`.
+    /// The Account the Login tied to `server_key` stands under — by its id,
+    /// and as the Server is told of it, by its provider and username — where
+    /// there is such a Login and it stands, fresh enough where a login is
+    /// required since `fresh_since`.
     pub(crate) async fn standing(
         &self,
         server_key: &[u8],
         fresh_since: Option<SystemTime>,
-    ) -> Result<Option<suru_relay_protocol::Account>> {
+    ) -> Result<Option<(i64, suru_relay_protocol::Account)>> {
         let server_key = server_key.to_vec();
         self.run(move |connection| {
             logins::table
@@ -240,13 +241,16 @@ impl Store {
                 .inner_join(identities::table.on(identities::account_id.eq(logins::account_id)))
                 .filter(logins::server_key.eq(server_key))
                 .filter(stands(since(fresh_since)))
-                .select((identities::provider, identities::username))
-                .first::<(String, String)>(connection)
+                .select((
+                    logins::account_id,
+                    identities::provider,
+                    identities::username,
+                ))
+                .first::<(i64, String, String)>(connection)
                 .optional()
                 .map(|found| {
-                    found.map(|(provider, username)| suru_relay_protocol::Account {
-                        provider,
-                        username,
+                    found.map(|(account, provider, username)| {
+                        (account, suru_relay_protocol::Account { provider, username })
                     })
                 })
                 .context("read a Server's Login")
@@ -1192,10 +1196,13 @@ mod tests {
         assert_eq!(laptop.hostname, "laptop again");
         assert_eq!(
             store.standing(b"laptop", None).await.unwrap(),
-            Some(suru_relay_protocol::Account {
-                provider: "github".to_owned(),
-                username: "octo".to_owned(),
-            })
+            Some((
+                laptop.account,
+                suru_relay_protocol::Account {
+                    provider: "github".to_owned(),
+                    username: "octo".to_owned(),
+                }
+            ))
         );
 
         assert!(store.forget(b"laptop").await.unwrap());

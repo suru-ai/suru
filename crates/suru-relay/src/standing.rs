@@ -1,10 +1,12 @@
 //! What stands on a Login at the Relay: each connection a Server holds there
 //! on the strength of its Login — waiting to be reached, or kept open idle —
 //! and each join the Relay carries between two. Each is held while it lasts,
-//! so a Login that stops standing — its Account lapsing, its Server
-//! forgetting it, or its operator removing it — or that comes to stand under
-//! another Account has everything standing on it cut at once, whatever the
-//! Server is doing.
+//! with the Account its Logins stood under as it was held, so a Login that
+//! stops standing — its Account lapsing, its Server forgetting it, or its
+//! operator removing it — or that comes to stand under another Account has
+//! everything standing on it cut at once, whatever the Server is doing; and an
+//! Account that lapses has everything standing on its Logins cut, whether or
+//! not the Relay could read which Logins those are.
 //!
 //! Everything is held, and cut, under the standing lock, after the Login it
 //! stands on is read and as that Login changes, so nothing comes to stand on
@@ -33,6 +35,8 @@ struct State {
 struct Holding {
     /// The identity keys of the Servers whose Logins it stands on.
     keys: Vec<Vec<u8>>,
+    /// The Account those Logins stood under as it was held, by its id.
+    account: i64,
     cut: watch::Sender<Option<Cut>>,
 }
 
@@ -73,14 +77,15 @@ impl Holdings {
         }
     }
 
-    /// Holds something that stands on the Logins tied to `keys`, while the
-    /// standing lock is held, as `_standing` shows.
-    pub(crate) fn hold(&self, _standing: &Verdicts, keys: Vec<Vec<u8>>) -> Held {
+    /// Holds something that stands on the Logins tied to `keys`, which stand
+    /// under the Account `account`, while the standing lock is held, as
+    /// `_standing` shows.
+    pub(crate) fn hold(&self, _standing: &Verdicts, keys: Vec<Vec<u8>>, account: i64) -> Held {
         let (cut, cut_off) = watch::channel(None);
         let mut state = lock(&self.state);
         let id = state.next;
         state.next += 1;
-        state.held.insert(id, Holding { keys, cut });
+        state.held.insert(id, Holding { keys, account, cut });
         Held {
             state: self.state.clone(),
             id,
@@ -92,10 +97,25 @@ impl Holdings {
     /// while the standing lock is held, as `_standing` shows: answers what it
     /// cut, to be waited on to let go.
     pub(crate) fn cut(&self, _standing: &Verdicts, keys: &[Vec<u8>], why: Cut) -> Released {
+        self.cut_where(
+            |holding| holding.keys.iter().any(|key| keys.contains(key)),
+            why,
+        )
+    }
+
+    /// Cuts, for `why`, everything standing on Logins that stood under the
+    /// Account `account` as it was held, while the standing lock is held, as
+    /// `_standing` shows: answers what it cut, to be waited on to let go.
+    pub(crate) fn cut_account(&self, _standing: &Verdicts, account: i64, why: Cut) -> Released {
+        self.cut_where(|holding| holding.account == account, why)
+    }
+
+    /// Cuts, for `why`, everything held that `cuts` picks out.
+    fn cut_where(&self, mut cuts: impl FnMut(&Holding) -> bool, why: Cut) -> Released {
         let mut state = lock(&self.state);
         let cut = state
             .held
-            .extract_if(|_, holding| holding.keys.iter().any(|key| keys.contains(key)))
+            .extract_if(|_, holding| cuts(holding))
             .map(|(_, holding)| {
                 holding.cut.send_replace(Some(why));
                 holding.cut
@@ -136,10 +156,14 @@ mod tests {
     fn cutting_a_login_cuts_everything_standing_on_it_and_nothing_else() {
         let holdings = Holdings::new();
         let standing = Verdicts::default();
-        let mut laptop = holdings.hold(&standing, vec![b"laptop".to_vec()]);
-        let mut join = holdings.hold(&standing, vec![b"laptop".to_vec(), b"workstation".to_vec()]);
-        let mut workstation = holdings.hold(&standing, vec![b"workstation".to_vec()]);
-        let mut tablet = holdings.hold(&standing, vec![b"tablet".to_vec()]);
+        let mut laptop = holdings.hold(&standing, vec![b"laptop".to_vec()], 1);
+        let mut join = holdings.hold(
+            &standing,
+            vec![b"laptop".to_vec(), b"workstation".to_vec()],
+            1,
+        );
+        let mut workstation = holdings.hold(&standing, vec![b"workstation".to_vec()], 1);
+        let mut tablet = holdings.hold(&standing, vec![b"tablet".to_vec()], 2);
         assert!(laptop.cut().now_or_never().is_none());
 
         let released = holdings.cut(
@@ -176,5 +200,23 @@ mod tests {
             1,
             "only the tablet's is held"
         );
+    }
+
+    #[test]
+    fn cutting_an_account_cuts_everything_standing_on_its_logins_and_nothing_else() {
+        let holdings = Holdings::new();
+        let standing = Verdicts::default();
+        let mut laptop = holdings.hold(&standing, vec![b"laptop".to_vec()], 1);
+        let mut join = holdings.hold(
+            &standing,
+            vec![b"laptop".to_vec(), b"workstation".to_vec()],
+            1,
+        );
+        let mut stranger = holdings.hold(&standing, vec![b"stranger".to_vec()], 2);
+
+        holdings.cut_account(&standing, 1, Cut::Refused);
+        assert_eq!(laptop.cut().now_or_never(), Some(Cut::Refused));
+        assert_eq!(join.cut().now_or_never(), Some(Cut::Refused));
+        assert!(stranger.cut().now_or_never().is_none());
     }
 }

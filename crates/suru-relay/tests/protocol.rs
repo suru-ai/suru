@@ -3824,6 +3824,175 @@ async fn a_relay_that_cannot_record_a_lapse_its_rules_call_for_as_it_starts_refu
     );
 }
 
+/// Has the records of the running `relay` refuse to record any Account
+/// lapsing — or being restored — as a full disk would, until
+/// [`allow_lapses`].
+fn refuse_lapses(relay: &Relay) {
+    use diesel::{Connection as _, connection::SimpleConnection as _};
+
+    let path = relay.directory.path().join("relay.db");
+    diesel::SqliteConnection::establish(path.to_str().unwrap())
+        .unwrap()
+        .batch_execute(
+            "CREATE TRIGGER no_lapses BEFORE UPDATE OF lapsed_at ON accounts
+             BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;",
+        )
+        .unwrap();
+}
+
+/// Has the records of the running `relay` record lapses again.
+fn allow_lapses(relay: &Relay) {
+    use diesel::{Connection as _, connection::SimpleConnection as _};
+
+    let path = relay.directory.path().join("relay.db");
+    diesel::SqliteConnection::establish(path.to_str().unwrap())
+        .unwrap()
+        .batch_execute("DROP TRIGGER no_lapses;")
+        .unwrap();
+}
+
+/// Waits until `relay`'s records say the Account of the identity `subject`
+/// has lapsed.
+async fn recorded_as_lapsed(relay: &Relay, subject: &str) {
+    timeout(DEADLINE, async {
+        loop {
+            let accounts = relay.running.store().accounts().await.unwrap();
+            if accounts
+                .iter()
+                .any(|account| account.subject == subject && account.lapsed)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the Relay records the lapse once it can");
+}
+
+/// Whether both ends of a join are cut — bounded as a whole, since the
+/// Relay's pings keep each wait for a frame short.
+async fn both_cut(asking: &mut Client, taken_up: &mut Client) -> bool {
+    timeout(DEADLINE, async {
+        asking.ended().await && taken_up.ended().await
+    })
+    .await
+    .expect("the join is cut in time")
+}
+
+#[tokio::test]
+async fn an_account_whose_lapse_cannot_be_recorded_is_refused_and_cut_at_once_and_recorded_once_it_can()
+ {
+    let (writer, mut log) = ConnectionLog::new();
+    let relay = checking_relay(|config| {
+        config
+            .with_connection_log(writer)
+            .with_lapse_retry_interval(Duration::from_millis(10))
+    })
+    .await;
+    let (workstation, laptop, stranger) = (key(), key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    Client::logged_in(&relay, &stranger, "99", "someone-else").await;
+    let (mut asking, mut taken_up) = joined(&relay, &workstation, &laptop).await;
+    asking.carry(&[1; 8]).await;
+    assert_eq!(taken_up.carried().await.len(), 8);
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+    let (mut idle, _) = Client::kept(&relay, &laptop).await;
+
+    // The member leaves the organization while the Relay's records cannot
+    // be written.
+    refuse_lapses(&relay);
+    relay.provider.set_admitted("17", false);
+    assert!(
+        both_cut(&mut asking, &mut taken_up).await,
+        "the join carried for the Account is cut at once, though its lapse cannot be recorded"
+    );
+    assert_eq!(bytes_sent(&log.line().await.unwrap()), (8, 0));
+    assert!(waiting.cut_for_login_needed().await);
+    assert!(idle.cut_for_login_needed().await);
+    for key in [&workstation, &laptop] {
+        assert_eq!(standing(&relay, key).await, None);
+    }
+    let mut refused = Client::connect(&relay).await;
+    refused.prove(&workstation).await;
+    refused.say(&ServerMessage::Wait).await;
+    assert_eq!(refusal(&refused.hear().await), Some(&Refusal::LoginNeeded));
+    let mut refused = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    assert_eq!(refusal(&refused.hear().await), Some(&Refusal::LoginNeeded));
+    assert!(
+        standing(&relay, &stranger).await.is_some(),
+        "another Account stands as it did"
+    );
+    assert!(
+        !relay.running.store().accounts().await.unwrap()[0].lapsed,
+        "the records do not say so yet"
+    );
+
+    // Once they can be written, the lapse is recorded, and the Account stays
+    // refused until one of its Servers logs in afresh, admitted again.
+    allow_lapses(&relay);
+    recorded_as_lapsed(&relay, "17").await;
+    for key in [&workstation, &laptop] {
+        assert_eq!(standing(&relay, key).await, None);
+    }
+    relay.provider.set_admitted("17", true);
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    assert!(standing(&relay, &workstation).await.is_some());
+    let (mut asking, mut taken_up) = joined(&relay, &workstation, &laptop).await;
+    asking.carry(b"again").await;
+    assert_eq!(taken_up.carried().await, b"again");
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_account_coming_due_a_fresh_login_whose_lapse_cannot_be_recorded_is_cut_at_once_all_the_same()
+ {
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    let ahead = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let clock = {
+        let ahead = ahead.clone();
+        Clock::from_fn(move || {
+            std::time::SystemTime::now() + Duration::from_secs(ahead.load(Ordering::Acquire))
+        })
+    };
+    let relay = checking_relay(|config| {
+        config
+            .with_clock(clock)
+            .with_fresh_login_every(7 * DAY)
+            .with_lapse_retry_interval(Duration::from_millis(10))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let (mut asking, mut taken_up) = joined(&relay, &workstation, &laptop).await;
+    asking.carry(b"before").await;
+    assert_eq!(taken_up.carried().await, b"before");
+
+    refuse_lapses(&relay);
+    ahead.fetch_add(8 * DAY.as_secs(), Ordering::AcqRel);
+    assert!(
+        both_cut(&mut asking, &mut taken_up).await,
+        "the join is cut as its Account comes due, though its lapse cannot be recorded"
+    );
+    for key in [&workstation, &laptop] {
+        assert_eq!(standing(&relay, key).await, None);
+    }
+    assert!(!relay.running.store().accounts().await.unwrap()[0].lapsed);
+
+    allow_lapses(&relay);
+    recorded_as_lapsed(&relay, "17").await;
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    assert!(
+        standing(&relay, &workstation).await.is_some(),
+        "one fresh login restores the Account"
+    );
+    relay.running.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_lapsed_account_stays_lapsed_across_a_restart_until_one_of_its_servers_logs_in_afresh() {
     let relay = checking_relay(|config| config).await;

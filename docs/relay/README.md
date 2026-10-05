@@ -29,6 +29,7 @@ commented example.
 - [Requiring a fresh login](#requiring-a-fresh-login)
 - [Keeping the GitHub App working](#keeping-the-github-app-working)
 - [Backups](#backups)
+- [When its records cannot be written](#when-its-records-cannot-be-written)
 - [Versions and upgrades](#versions-and-upgrades)
 - [Using the Relay from Suru](#using-the-relay-from-suru)
 
@@ -554,6 +555,22 @@ again. SQLite keeps it in write-ahead mode, in the database file and a `-wal` fi
 
 To restore, stop the Relay, put the copy in the database's place — removing any `-wal` and `-shm` files there — and
 start it. The `.lock` file needs no backing up.
+
+## When its records cannot be written
+
+Should the database become unwritable while the Relay runs — a full disk, say, or another process holding it longer
+than SQLite waits — a login, a join, or a Server's proof that needs what the Relay cannot read or record is
+refused, Suru telling its user that the Relay could not use its records, and the Relay says why on standard error.
+
+What the admission rules or `fresh_login_days` call for is never put off for it. An Account found to lapse — its
+user out of the organization, or not logged in as for too long — lapses at once all the same: the Relay refuses its
+Logins, cuts every connection that stood on them, and says on standard error that it could not record the lapse.
+It then tries again to record it every 10 seconds, saying so each time it still cannot, and once it can, that it
+has. Until then `accounts list` shows the Account as standing, though the Relay refuses it. One fresh login from any
+of the Account's Servers, once the rules admit it, restores it either way.
+
+A Relay that cannot record a lapse its rules call for as it starts refuses to start, saying why, rather than serve
+an Account its records would still say stands.
 
 ## Versions and upgrades
 

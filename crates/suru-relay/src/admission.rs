@@ -54,12 +54,22 @@
 //! rules are asked with nothing held that a Server's connection waits on: an
 //! Account found no longer admitted lapses only afterwards, under the
 //! standing lock, and only where no check begun later has admitted it since.
+//!
+//! An Account found to lapse lapses at once, whether or not the Relay can
+//! record it: where its records cannot be written — a full disk, say — the
+//! Relay refuses the Account all the same, in memory, cuts everything standing
+//! on its Logins, and tries again to record the lapse every so often until it
+//! can, or until one of its Servers logs in afresh and restores it. A Relay
+//! that cannot record a lapse its rules call for as it starts refuses to
+//! start, so its records never say less than it served by.
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex, atomic::Ordering},
     time::{Duration, SystemTime},
 };
+
+use anyhow::Context as _;
 
 use anyhow::bail;
 use async_trait::async_trait;
@@ -394,7 +404,10 @@ impl Checks {
 
     /// The verdicts its askings reach, for the standing lock to guard.
     pub(crate) fn verdicts(&self) -> Verdicts {
-        Verdicts(self.0.clone())
+        Verdicts {
+            ledger: self.0.clone(),
+            unrecorded: HashMap::new(),
+        }
     }
 
     /// How many identities anything is kept about.
@@ -467,12 +480,42 @@ fn lock(ledger: &Mutex<Ledger>) -> std::sync::MutexGuard<'_, Ledger> {
 /// schedule, and a finding that they no longer admit it lapses nothing a
 /// later asking admitted at login. It is kept by identity rather than by
 /// Account, so a refusal counts as much for an identity that has no Account
-/// yet, and only while an asking about that identity is under way. What the
-/// standing lock guards: each verdict is weighed, and takes effect, under it.
+/// yet, and only while an asking about that identity is under way. And the
+/// Accounts found to lapse whose lapse the Relay has yet to record, each
+/// refused as though its records said it had lapsed. What the standing lock
+/// guards: each verdict is weighed, and takes effect, under it, and every
+/// decision taken on the strength of a Login asks it whether the Login's
+/// Account has lapsed unrecorded.
 #[derive(Default)]
-pub(crate) struct Verdicts(Arc<Mutex<Ledger>>);
+pub(crate) struct Verdicts {
+    ledger: Arc<Mutex<Ledger>>,
+    /// The Accounts found to lapse whose lapse the Relay could not record,
+    /// by id, with how to record it.
+    unrecorded: HashMap<i64, Unrecorded>,
+}
+
+/// A lapse found and not yet recorded: why the Account lapsed, and when.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Unrecorded {
+    why: Lapse,
+    at: SystemTime,
+}
 
 impl Verdicts {
+    /// Whether the Account `account` has lapsed though its records have yet
+    /// to say so: every Login under it refused until they do, or until one
+    /// of its Servers logs in afresh.
+    pub(crate) fn has_lapsed(&self, account: i64) -> bool {
+        self.unrecorded.contains_key(&account)
+    }
+
+    /// The Account `account` has been logged in as afresh, which restores it
+    /// whether or not its lapse was recorded: no lapse found before is
+    /// recorded from then on.
+    pub(crate) fn restored(&mut self, account: i64) {
+        self.unrecorded.remove(&account);
+    }
+
     /// Whether `check` admitting its identity as it logs in may take effect.
     pub(crate) fn may_admit(&self, check: &Check) -> bool {
         lock(self.ledger(check))
@@ -511,14 +554,15 @@ impl Verdicts {
     /// The ledger `check` was begun in, which is this one.
     fn ledger<'a>(&'a self, check: &Check) -> &'a Mutex<Ledger> {
         debug_assert!(
-            Arc::ptr_eq(&self.0, &check.ledger),
+            Arc::ptr_eq(&self.ledger, &check.ledger),
             "a check is weighed in the ledger it was begun in"
         );
-        &self.0
+        &self.ledger
     }
 }
 
 /// Why an Account lapses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Lapse {
     /// The rules no longer admit the identity that logs in as it.
     NotAdmitted,
@@ -526,6 +570,27 @@ enum Lapse {
     /// Servers has logged in as it since `logged_in_at`, as it was read, in
     /// seconds since the Unix epoch.
     LoginDue { logged_in_at: i64 },
+}
+
+impl Lapse {
+    /// When the Account must not have been logged in as since for the lapse
+    /// to be recorded, where that matters.
+    fn unless_logged_in_since(self) -> Option<i64> {
+        match self {
+            Self::NotAdmitted => None,
+            Self::LoginDue { logged_in_at } => Some(logged_in_at),
+        }
+    }
+
+    /// Why the Account lapsed, as the Relay's log says it.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NotAdmitted => "the admission rules no longer admit it",
+            Self::LoginDue { .. } => {
+                "none of its Servers has logged in as it as recently as this Relay requires"
+            }
+        }
+    }
 }
 
 /// Checks every Account a Login stands under every `relay`'s admission
@@ -541,11 +606,67 @@ pub(crate) async fn keep_checking(relay: &Relay) {
         tokio::time::sleep(relay.admission_interval).await;
         if let Err(error) = check_every_account(relay).await {
             tracing::error!(
-                "the Relay could not check its Accounts against its admission rules, as its \
-                 records could not be used: {error:#}"
+                "the Relay could not use its records as it checked its Accounts against its \
+                 admission rules: {error:#}"
             );
         }
     }
+}
+
+/// Tries again every `relay`'s lapse retry interval, until what awaits this
+/// is dropped, to record each lapse the Relay found and could not record,
+/// for as long as any is left unrecorded. Each Account is refused, and
+/// everything that stood on it cut, meanwhile.
+pub(crate) async fn keep_recording_lapses(relay: &Relay) {
+    loop {
+        relay.lapses_unrecorded.notified().await;
+        loop {
+            tokio::time::sleep(relay.lapse_retry_interval).await;
+            if record_lapses(relay).await {
+                break;
+            }
+        }
+    }
+}
+
+/// Tries once more to record each lapse found and not yet recorded, each
+/// under the standing lock, answering whether none is left unrecorded. A
+/// lapse a fresh login has undone meanwhile is not recorded.
+async fn record_lapses(relay: &Relay) -> bool {
+    let unrecorded = relay
+        .standing
+        .lock()
+        .await
+        .unrecorded
+        .iter()
+        .map(|(account, lapse)| (*account, *lapse))
+        .collect::<Vec<_>>();
+    for (account, lapse) in unrecorded {
+        let mut standing = relay.standing.lock().await;
+        if standing.unrecorded.get(&account) != Some(&lapse) {
+            continue;
+        }
+        match relay
+            .store
+            .lapse(account, lapse.at, lapse.why.unless_logged_in_since())
+            .await
+        {
+            Ok(_) => {
+                standing.unrecorded.remove(&account);
+                tracing::info!(
+                    account,
+                    "the Relay has recorded that an Account lapsed, which it could not as it \
+                     found the Account to lapse"
+                );
+            }
+            Err(error) => tracing::warn!(
+                account,
+                "the Relay still cannot record that an Account lapsed, and goes on refusing it \
+                 meanwhile: {error:#}"
+            ),
+        }
+    }
+    relay.standing.lock().await.unrecorded.is_empty()
 }
 
 /// Lapses each Account a Login stands under that is due a fresh login, or
@@ -554,6 +675,10 @@ pub(crate) async fn keep_checking(relay: &Relay) {
 /// before it could not tell about, and comes round to those before it last,
 /// so an Account the rules could not tell about is asked about first next
 /// time, whatever they decided of those after it.
+///
+/// An Account whose lapse cannot be recorded lapses all the same, and the
+/// check goes on to the rest, answering the first failure to use the records
+/// once it has been through them all.
 pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
     let fresh_since = relay.fresh_since();
     let mut undecided = 0_usize;
@@ -562,13 +687,16 @@ pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
     let resume_at = relay.resume_at.load(Ordering::Relaxed);
     accounts.sort_by_key(|account| (account.id < resume_at, account.id));
     let mut first_undecided = None;
+    let mut failed = None;
     for account in accounts {
         if account.is_due(fresh_since) {
-            let standing = relay.standing.lock().await;
+            let mut standing = relay.standing.lock().await;
             let due = Lapse::LoginDue {
                 logged_in_at: account.logged_in_at,
             };
-            lapse(relay, &standing, account.id, due).await?;
+            if let Err(error) = lapse(relay, &mut standing, account.id, due).await {
+                failed.get_or_insert(error);
+            }
             continue;
         }
         let check = relay
@@ -584,7 +712,11 @@ pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
             .await
         {
             Verdict::Admitted => {}
-            Verdict::NotAdmitted => refuse(relay, &check).await?,
+            Verdict::NotAdmitted => {
+                if let Err(error) = refuse(relay, &check).await {
+                    failed.get_or_insert(error);
+                }
+            }
             Verdict::Undecided(why) => {
                 undecided += 1;
                 why_undecided.get_or_insert(why);
@@ -601,7 +733,7 @@ pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
              which stand until they can: {why}"
         );
     }
-    Ok(())
+    failed.map_or(Ok(()), Err)
 }
 
 /// Takes effect, under the standing lock, of `check` finding that the rules
@@ -622,7 +754,7 @@ pub(crate) async fn refuse(relay: &Relay, check: &Check) -> anyhow::Result<()> {
         .account_answering(check.provider(), check.subject())
         .await?
     {
-        Some(account) => lapse(relay, &verdicts, account, Lapse::NotAdmitted).await,
+        Some(account) => lapse(relay, &mut verdicts, account, Lapse::NotAdmitted).await,
         None => Ok(()),
     }
 }
@@ -632,31 +764,47 @@ pub(crate) async fn refuse(relay: &Relay, check: &Check) -> anyhow::Result<()> {
 /// has logged in afresh since it was found due: every Login under it is
 /// refused from then on, and everything standing on them is cut at once.
 /// Nothing of it is forgotten.
-async fn lapse(relay: &Relay, standing: &Verdicts, account: i64, why: Lapse) -> anyhow::Result<()> {
-    let unless_logged_in_since = match why {
-        Lapse::NotAdmitted => None,
-        Lapse::LoginDue { logged_in_at } => Some(logged_in_at),
-    };
-    let Some(keys) = relay
-        .store
-        .lapse(account, relay.clock.now(), unless_logged_in_since)
-        .await?
-    else {
+///
+/// Where the lapse cannot be recorded, the Account lapses all the same,
+/// refused in memory until it is recorded — which the Relay tries again to do
+/// every so often — or until one of its Servers logs in afresh; and the
+/// failure is answered, the Account cut nonetheless.
+async fn lapse(
+    relay: &Relay,
+    standing: &mut Verdicts,
+    account: i64,
+    why: Lapse,
+) -> anyhow::Result<()> {
+    if standing.has_lapsed(account) {
         return Ok(());
-    };
-    relay.cut(standing, &keys, Cut::Refused);
-    match why {
-        Lapse::NotAdmitted => tracing::info!(
-            account,
-            "an Account lapsed: the admission rules no longer admit it"
-        ),
-        Lapse::LoginDue { .. } => tracing::info!(
-            account,
-            "an Account lapsed: none of its Servers has logged in as it as recently as this \
-             Relay requires"
-        ),
     }
-    Ok(())
+    let at = relay.clock.now();
+    match relay
+        .store
+        .lapse(account, at, why.unless_logged_in_since())
+        .await
+    {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => {
+            relay.cut_account(standing, account, Cut::Refused);
+            tracing::info!(account, "an Account lapsed: {}", why.reason());
+            Ok(())
+        }
+        Err(error) => {
+            standing.unrecorded.insert(account, Unrecorded { why, at });
+            relay.cut_account(standing, account, Cut::Refused);
+            relay.lapses_unrecorded.notify_one();
+            tracing::error!(
+                account,
+                "an Account lapsed — {} — and the Relay could not record it, so it refuses the \
+                 Account in memory, has cut everything that stood on it, and tries again to \
+                 record it every {:?} until it can: {error:#}",
+                why.reason(),
+                relay.lapse_retry_interval
+            );
+            Err(error).context("record that an Account lapsed")
+        }
+    }
 }
 
 #[cfg(test)]

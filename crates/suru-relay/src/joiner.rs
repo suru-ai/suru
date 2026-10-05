@@ -195,6 +195,15 @@ impl<T> Joiner<T> {
             .asked
             .retain(|_, asked| asked.server_key != key && asked.asker_key != key);
     }
+
+    /// Gives up every join asked under the Account `account`, which has
+    /// lapsed: no join is made on the strength of Logins that no longer
+    /// stand.
+    pub(crate) fn give_up_joins_under(&self, account: i64) {
+        lock(&self.state)
+            .asked
+            .retain(|_, asked| asked.account != account);
+    }
 }
 
 impl<T> Drop for Waiting<T> {
@@ -316,6 +325,26 @@ mod tests {
         joiner.give_up_joins_of(b"workstation");
         assert!((&mut by_tablet.taken_up).await.is_err());
         assert!(joiner.take_up(&tablets, b"workstation").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_joins_asked_under_an_account_that_lapsed_are_given_up() {
+        let joiner = Joiner::<()>::new();
+        let mut waiting = joiner.wait(b"workstation".to_vec());
+        let mut lapsed = joiner.ask(b"workstation", b"laptop", 1).unwrap();
+        let mut other = joiner.ask(b"workstation", b"tablet", 2).unwrap();
+        let (_, others) = (
+            waiting.reaches.recv().await.unwrap(),
+            waiting.reaches.recv().await.unwrap(),
+        );
+
+        joiner.give_up_joins_under(1);
+        assert!((&mut lapsed.taken_up).await.is_err());
+        assert!(
+            futures_util::FutureExt::now_or_never(&mut other.taken_up).is_none(),
+            "a join under another Account is asked still"
+        );
+        assert!(joiner.take_up(&others, b"workstation").is_some());
     }
 
     #[test]
