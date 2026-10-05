@@ -18,7 +18,7 @@ use suru::{
         UnreachableReason, Way, Workspace,
     },
     tui::{
-        Application, ApplicationEvent, ApplicationTransition, CommandId, RedemptionRequest,
+        Application, ApplicationEvent, ApplicationTransition, CommandId, ConnectRequest,
         SemanticCommandId, WorkspaceResolutionSurface,
     },
 };
@@ -1033,9 +1033,10 @@ fn pairing_another_remote_refuses_a_duplicate_prefilled_name_in_the_draft() {
     application
         .handle_terminal_event(InputEvent::Paste("suru-v1-another".to_owned()))
         .unwrap();
-    press(&mut application, KeyCode::Enter);
+    let request = previewing(press(&mut application, KeyCode::Enter));
     application
         .handle_event(ApplicationEvent::InvitePreviewed {
+            request,
             invite: "suru-v1-another".to_owned(),
             preview: InvitePreview {
                 hostname: "studio".to_owned(),
@@ -1055,6 +1056,14 @@ fn pairing_another_remote_refuses_a_duplicate_prefilled_name_in_the_draft() {
             .join("\n")
             .contains("A Remote named `studio` already exists")
     );
+}
+
+/// The preview `transition` asks for.
+fn previewing(transition: ApplicationTransition) -> ConnectRequest {
+    match transition {
+        ApplicationTransition::PreviewInvite { request, .. } => request,
+        other => panic!("expected an Invite previewed, got {other:?}"),
+    }
 }
 
 /// The redemption `transition` asks for.
@@ -1134,14 +1143,15 @@ fn removal_in_flight() -> Application {
 }
 
 /// A redemption asked for, and the request it was asked under.
-fn redemption_in_flight() -> (Application, RedemptionRequest) {
+fn redemption_in_flight() -> (Application, ConnectRequest) {
     let mut application = invite_entry();
     application
         .handle_terminal_event(InputEvent::Paste("suru-v1-example".to_owned()))
         .unwrap();
-    press(&mut application, KeyCode::Enter);
+    let request = previewing(press(&mut application, KeyCode::Enter));
     application
         .handle_event(ApplicationEvent::InvitePreviewed {
+            request,
             invite: "suru-v1-example".to_owned(),
             preview: InvitePreview {
                 hostname: "studio".to_owned(),
@@ -1169,9 +1179,10 @@ fn every_invite_refusal_is_precise_and_visible_on_the_step_that_failed() {
         application
             .handle_terminal_event(InputEvent::Paste(invite.to_owned()))
             .unwrap();
-        press(&mut application, KeyCode::Enter);
+        let request = previewing(press(&mut application, KeyCode::Enter));
         application
             .handle_event(ApplicationEvent::InvitePreviewFailed {
+                request,
                 invite: invite.to_owned(),
                 error: error.to_owned(),
             })
@@ -1235,9 +1246,10 @@ fn pairing_another_remote_keeps_every_paired_remote_in_the_picker() {
     application
         .handle_terminal_event(InputEvent::Paste("suru-v1-another".to_owned()))
         .unwrap();
-    press(&mut application, KeyCode::Enter);
+    let request = previewing(press(&mut application, KeyCode::Enter));
     application
         .handle_event(ApplicationEvent::InvitePreviewed {
+            request,
             invite: "suru-v1-another".to_owned(),
             preview: InvitePreview {
                 hostname: "laptop".to_owned(),
@@ -1279,12 +1291,15 @@ fn pasted_invite_shows_its_fingerprint_before_pairing_can_advance() {
             .expect("paste Invite"),
         ApplicationTransition::Continue
     );
-    assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        ApplicationTransition::PreviewInvite("suru-v1-example".to_owned())
-    );
+    let ApplicationTransition::PreviewInvite { request, invite } =
+        press(&mut application, KeyCode::Enter)
+    else {
+        panic!("Enter inspects the Invite pasted");
+    };
+    assert_eq!(invite, "suru-v1-example");
     application
         .handle_event(ApplicationEvent::InvitePreviewed {
+            request,
             invite: "suru-v1-example".to_owned(),
             preview: InvitePreview {
                 hostname: "studio".to_owned(),
@@ -1317,14 +1332,16 @@ fn remote_name_is_editable_and_ways_are_redeemed_in_the_visible_priority_order()
     application
         .handle_event(ApplicationEvent::RemotesListed(Vec::new()))
         .unwrap();
+    press(&mut application, KeyCode::Char('a'));
     application
         .handle_terminal_event(InputEvent::Paste("suru-v1-example".to_owned()))
         .unwrap();
-    press(&mut application, KeyCode::Enter);
+    let request = previewing(press(&mut application, KeyCode::Enter));
     let first = Way::Direct("10.0.0.8:7777".parse().unwrap());
     let preferred = Way::Direct("192.168.1.24:7777".parse().unwrap());
     application
         .handle_event(ApplicationEvent::InvitePreviewed {
+            request,
             invite: "suru-v1-example".to_owned(),
             preview: InvitePreview {
                 hostname: "studio".to_owned(),
@@ -1710,9 +1727,10 @@ fn configure_remote_draft() -> Application {
     application
         .handle_terminal_event(InputEvent::Paste("suru-v1-example".to_owned()))
         .unwrap();
-    press(&mut application, KeyCode::Enter);
+    let request = previewing(press(&mut application, KeyCode::Enter));
     application
         .handle_event(ApplicationEvent::InvitePreviewed {
+            request,
             invite: "suru-v1-example".to_owned(),
             preview: InvitePreview {
                 hostname: "studio".to_owned(),

@@ -389,6 +389,29 @@ pub(super) fn command_for_connect_overlay_event(
         return Some(CommandId::InvokeSemantic(SemanticCommandId::ConnectClose));
     }
     match (mode, key.code, key.modifiers) {
+        // What overflows the step scrolls: the preview, Row by Row with the
+        // arrows as nothing else there takes them, and why a redemption was
+        // refused, page by page, beneath the name and ways the arrows walk.
+        (ConnectInputMode::Confirm, KeyCode::Up, KeyModifiers::NONE)
+        | (ConnectInputMode::Confirm, KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(
+            CommandId::InvokeSemantic(SemanticCommandId::ConnectScrollUp),
+        ),
+        (ConnectInputMode::Confirm, KeyCode::Down, KeyModifiers::NONE)
+        | (ConnectInputMode::Confirm, KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(
+            CommandId::InvokeSemantic(SemanticCommandId::ConnectScrollDown),
+        ),
+        (
+            ConnectInputMode::Confirm | ConnectInputMode::Name | ConnectInputMode::Ways,
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        ) => Some(CommandId::InvokeSemantic(SemanticCommandId::ConnectPageUp)),
+        (
+            ConnectInputMode::Confirm | ConnectInputMode::Name | ConnectInputMode::Ways,
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        ) => Some(CommandId::InvokeSemantic(
+            SemanticCommandId::ConnectPageDown,
+        )),
         (ConnectInputMode::Login, KeyCode::Char('a'), KeyModifiers::NONE) => Some(
             CommandId::InvokeSemantic(SemanticCommandId::RelayCopyAddress),
         ),

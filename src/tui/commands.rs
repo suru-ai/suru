@@ -149,6 +149,14 @@ pub enum SemanticCommandId {
     /// Arms the selected Remote's removal, and removes it when it is already
     /// armed: ending a Pairing is asked for twice.
     ConnectRemoveRemote,
+    /// Scrolls what overflows the Connect step the reader is on — an
+    /// Invite's preview, or why a redemption was refused — a Row back, or a
+    /// Row on, so every way an Invite offers is read before it is trusted.
+    ConnectScrollUp,
+    ConnectScrollDown,
+    /// Scrolls it a page back, or a page on.
+    ConnectPageUp,
+    ConnectPageDown,
     ConnectClose,
     ServeOpen,
     ServePrevious,
@@ -556,6 +564,10 @@ impl SemanticCommandId {
             Self::ConnectMoveAddressDown => "connect.address.move-down",
             Self::ConnectPairAnother => "connect.pair-another",
             Self::ConnectRemoveRemote => "connect.remove",
+            Self::ConnectScrollUp => "connect.scroll.up",
+            Self::ConnectScrollDown => "connect.scroll.down",
+            Self::ConnectPageUp => "connect.scroll.page-up",
+            Self::ConnectPageDown => "connect.scroll.page-down",
             Self::ConnectClose => "connect.close",
             Self::ServeOpen => "serve.open",
             Self::ServePrevious => "serve.previous",
@@ -1674,6 +1686,38 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Pair Another Remote",
         reach: SemanticReach::Client,
         description: "Open Invite entry from the paired Remotes picker",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectScrollUp,
+        title: "Scroll Connect Step Up",
+        reach: SemanticReach::Client,
+        description: "Scroll the Invite's preview, or why pairing was refused, a row back",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectScrollDown,
+        title: "Scroll Connect Step Down",
+        reach: SemanticReach::Client,
+        description: "Scroll the Invite's preview, or why pairing was refused, a row on",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectPageUp,
+        title: "Page Connect Step Up",
+        reach: SemanticReach::Client,
+        description: "Scroll the Invite's preview, or why pairing was refused, a page back",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ConnectPageDown,
+        title: "Page Connect Step Down",
+        reach: SemanticReach::Client,
+        description: "Scroll the Invite's preview, or why pairing was refused, a page on",
         slash: None,
         keybinding: None,
     },

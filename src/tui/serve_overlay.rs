@@ -8,18 +8,21 @@
 //! a Relay an Invite offers — and shown otherwise with why, so no Invite is
 //! asked for that the Server would refuse without the reader knowing why.
 //!
-//! The Invite asked for names itself with a [`ServeRequest`], and only the
-//! answer to the one awaited is taken: one the reader has since moved past —
-//! the picker closed and opened again — lands nowhere.
+//! Preparing the picker and the Invite asked for each name themselves with a
+//! [`ServeRequest`], and only the answer to the one awaited is taken: one the
+//! reader has since moved past — the picker closed and opened again — lands
+//! nowhere. The keys stay on the way they are on however the Relays move
+//! around it, moving to its neighbour only where it goes itself.
 
-use std::collections::HashSet;
+use std::{cell::Cell, collections::HashSet};
 
 use crate::protocol::{IssueInviteRequest, IssuedInvite, Peer, Relay, RelayState, Way};
 
 use super::list_window::ListWindow;
 
-/// One Invite the picker asked the Client's own Server to issue, told apart
-/// from every other so its answer reaches only what asked for it.
+/// One request the picker sent the Client's own Server — to prepare Serving,
+/// or to issue an Invite — told apart from every other so its answer reaches
+/// only what asked for it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ServeRequest(u64);
 
@@ -36,7 +39,9 @@ pub(super) struct ServeOverlay {
 enum ServeOverlayState {
     #[default]
     Closed,
-    Preparing,
+    Preparing {
+        request: ServeRequest,
+    },
     Issuing {
         request: ServeRequest,
         choice: Choice,
@@ -62,11 +67,37 @@ struct Choice {
     /// The machine's own addresses, as found when the picker opened.
     addresses: Vec<Way>,
     left_out: HashSet<Way>,
-    selected: usize,
+    /// The way the keys are on, once they have moved.
+    focus: Option<Way>,
+    /// Where among the ways the keys last stood, for them to stand by its
+    /// neighbour where the way they were on goes.
+    at: Cell<usize>,
     error: Option<String>,
 }
 
 impl Choice {
+    /// Where among `candidates` the keys stand: on the way they are on,
+    /// wherever that has moved, or — where it has gone — where it stood.
+    fn focused(&self, candidates: &[CandidateWay]) -> usize {
+        let index = self
+            .focus
+            .as_ref()
+            .and_then(|focus| {
+                candidates
+                    .iter()
+                    .position(|candidate| &candidate.way == focus)
+            })
+            .unwrap_or_else(|| self.at.get().min(candidates.len().saturating_sub(1)));
+        self.at.set(index);
+        index
+    }
+
+    /// Puts the keys on the way at `index` among `candidates`.
+    fn focus_on(&mut self, candidates: &[CandidateWay], index: usize) {
+        self.focus = candidates.get(index).map(|candidate| candidate.way.clone());
+        self.at.set(index);
+    }
+
     /// The ways the picker lists, the machine's addresses first and then the
     /// Server's Relays, each with whether the reader has it offered.
     fn candidates(&self, relays: &[Relay]) -> Vec<CandidateWay> {
@@ -141,8 +172,21 @@ impl Withheld {
 }
 
 impl ServeOverlay {
-    pub(super) fn open(&mut self) {
-        self.state = ServeOverlayState::Preparing;
+    /// Opens the picker, answering the preparation it asks for.
+    pub(super) fn open(&mut self) -> ServeRequest {
+        let request = self.issue();
+        self.state = ServeOverlayState::Preparing { request };
+        request
+    }
+
+    fn issue(&mut self) -> ServeRequest {
+        self.last_request += 1;
+        ServeRequest(self.last_request)
+    }
+
+    /// Whether the preparation `request` asked for is the one awaited.
+    pub(super) fn awaits_preparation(&self, request: ServeRequest) -> bool {
+        matches!(self.state, ServeOverlayState::Preparing { request: awaited } if awaited == request)
     }
 
     pub(super) fn close(&mut self) {
@@ -156,11 +200,16 @@ impl ServeOverlay {
     pub(super) fn is_preparing(&self) -> bool {
         matches!(
             self.state,
-            ServeOverlayState::Preparing | ServeOverlayState::Issuing { .. }
+            ServeOverlayState::Preparing { .. } | ServeOverlayState::Issuing { .. }
         )
     }
 
-    pub(super) fn load_candidates(&mut self, mut addresses: Vec<Way>) {
+    /// Offers the machine's `addresses` the preparation `request` found,
+    /// where it is the one awaited.
+    pub(super) fn load_candidates(&mut self, request: ServeRequest, mut addresses: Vec<Way>) {
+        if !self.awaits_preparation(request) {
+            return;
+        }
         addresses.sort_unstable();
         addresses.dedup();
         self.state = ServeOverlayState::Choosing(Choice {
@@ -170,7 +219,10 @@ impl ServeOverlay {
         self.window.open();
     }
 
-    pub(super) fn fail_preparation(&mut self, error: String) {
+    pub(super) fn fail_preparation(&mut self, request: ServeRequest, error: String) {
+        if !self.awaits_preparation(request) {
+            return;
+        }
         self.state = ServeOverlayState::Choosing(Choice {
             error: Some(error),
             ..Choice::default()
@@ -187,18 +239,19 @@ impl ServeOverlay {
         }
     }
 
-    /// The way the keys are on, among `count` listed.
-    pub(super) fn selected_among(&self, count: usize) -> usize {
-        self.selected().min(count.saturating_sub(1))
+    /// Where among `candidates` — the ways listed — the keys stand.
+    pub(super) fn focused(&self, candidates: &[CandidateWay]) -> usize {
+        match &self.state {
+            ServeOverlayState::Choosing(choice) => choice.focused(candidates),
+            _ => 0,
+        }
     }
 
+    /// The Peer the keys are on.
     pub(super) fn selected(&self) -> usize {
         match &self.state {
-            ServeOverlayState::Choosing(choice) => choice.selected,
             ServeOverlayState::Managing { selected, .. } => *selected,
-            ServeOverlayState::Closed
-            | ServeOverlayState::Preparing
-            | ServeOverlayState::Issuing { .. } => 0,
+            _ => 0,
         }
     }
 
@@ -207,7 +260,7 @@ impl ServeOverlay {
             ServeOverlayState::Choosing(choice) => choice.error.as_deref(),
             ServeOverlayState::Managing { error, .. } => error.as_deref(),
             ServeOverlayState::Closed
-            | ServeOverlayState::Preparing
+            | ServeOverlayState::Preparing { .. }
             | ServeOverlayState::Issuing { .. } => None,
         }
     }
@@ -215,13 +268,13 @@ impl ServeOverlay {
     pub(super) fn select_previous(&mut self, relays: &[Relay]) {
         match &mut self.state {
             ServeOverlayState::Choosing(choice) => {
-                let count = choice.candidates(relays).len();
-                if count > 0 {
-                    choice.selected = choice
-                        .selected
-                        .min(count - 1)
+                let candidates = choice.candidates(relays);
+                if !candidates.is_empty() {
+                    let index = choice
+                        .focused(&candidates)
                         .checked_sub(1)
-                        .unwrap_or(count - 1);
+                        .unwrap_or(candidates.len() - 1);
+                    choice.focus_on(&candidates, index);
                     self.window.reveal();
                 }
             }
@@ -234,7 +287,7 @@ impl ServeOverlay {
                 }
             }
             ServeOverlayState::Closed
-            | ServeOverlayState::Preparing
+            | ServeOverlayState::Preparing { .. }
             | ServeOverlayState::Issuing { .. } => {}
         }
     }
@@ -242,9 +295,10 @@ impl ServeOverlay {
     pub(super) fn select_next(&mut self, relays: &[Relay]) {
         match &mut self.state {
             ServeOverlayState::Choosing(choice) => {
-                let count = choice.candidates(relays).len();
-                if count > 0 {
-                    choice.selected = (choice.selected + 1) % count;
+                let candidates = choice.candidates(relays);
+                if !candidates.is_empty() {
+                    let index = (choice.focused(&candidates) + 1) % candidates.len();
+                    choice.focus_on(&candidates, index);
                     self.window.reveal();
                 }
             }
@@ -257,7 +311,7 @@ impl ServeOverlay {
                 }
             }
             ServeOverlayState::Closed
-            | ServeOverlayState::Preparing
+            | ServeOverlayState::Preparing { .. }
             | ServeOverlayState::Issuing { .. } => {}
         }
     }
@@ -270,9 +324,9 @@ impl ServeOverlay {
             return;
         };
         let candidates = choice.candidates(relays);
-        let Some(candidate) =
-            candidates.get(choice.selected.min(candidates.len().saturating_sub(1)))
-        else {
+        let index = choice.focused(&candidates);
+        choice.focus_on(&candidates, index);
+        let Some(candidate) = candidates.get(index) else {
             return;
         };
         if let (Some(withheld), Way::Relay(address)) = (candidate.withheld, &candidate.way) {
@@ -305,9 +359,8 @@ impl ServeOverlay {
             choice.error = Some("Choose at least one address".to_owned());
             return None;
         }
-        self.last_request += 1;
-        let request = ServeRequest(self.last_request);
         let choice = std::mem::take(choice);
+        let request = self.issue();
         self.state = ServeOverlayState::Issuing { request, choice };
         Some((request, IssueInviteRequest { ways }))
     }

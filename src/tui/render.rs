@@ -543,6 +543,14 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
         if let Some(error) = error {
             lines.push(Line::styled(error.to_owned(), theme.feedback.error));
         }
+        // A login the reader left came to stand since: the Invite now pairs.
+        if let Some(relay) = overlay.logged_in_at() {
+            lines.extend(wrapped_lines(
+                &format!("Logged in at {relay}; paste the Invite again to pair through it"),
+                area.width.saturating_sub(2),
+                theme.text.subdued,
+            ));
+        }
         lines.push(Line::styled(
             "Enter inspect · Esc close",
             theme.text.subdued,
@@ -560,19 +568,7 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
     }
     if let Some(preview) = overlay.confirmation() {
         let content_width = area.width.saturating_sub(2);
-        let mut lines = vec![Line::styled(
-            "Confirm Serving Server",
-            theme.text.primary.add_modifier(Modifier::BOLD),
-        )];
-        lines.push(Line::styled("Fingerprint", theme.text.subdued));
-        lines.extend(wrapped_lines(
-            &preview.fingerprint,
-            content_width,
-            theme.text.primary,
-        ));
-        // Where the Server will connect, Relays among them, each saying how
-        // this Server stands there — and a login it would be asked for first.
-        lines.push(Line::styled("Reached by", theme.text.subdued));
+        let room = usize::from(area.height.saturating_sub(2)).saturating_sub(1);
         let held = |address: &str| state.relay_overlay.held_state(address);
         let needs_login = |address: &str| {
             !matches!(
@@ -585,53 +581,76 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
             Some(RelayState::Unreachable) => "Unreachable",
             Some(RelayState::LoginNeeded) | None => "login needed",
         };
-        let ways = preview
+        let mut body = vec![Line::styled("Fingerprint", theme.text.subdued)];
+        body.extend(wrapped_lines(
+            &preview.fingerprint,
+            content_width,
+            theme.text.primary,
+        ));
+        // Where the Server will connect, Relays among them, each whole and
+        // saying how this Server stands there — and a login it would be
+        // asked for first.
+        body.push(Line::styled("Reached by", theme.text.subdued));
+        for way in &preview.ways {
+            let standing = match way {
+                Way::Relay(address) => Some(standing(address)),
+                Way::Direct(_) => None,
+            };
+            body.extend(way_lines(
+                "",
+                &way.to_string(),
+                standing,
+                content_width,
+                theme.text.primary,
+            ));
+        }
+        if preview
             .ways
             .iter()
-            .map(|way| match way {
-                Way::Direct(_) => Line::styled(way.to_string(), theme.text.primary),
-                Way::Relay(address) => Line::styled(
-                    relay_way_text("", address, standing(address), content_width),
-                    theme.text.primary,
-                ),
-            })
-            .collect::<Vec<_>>();
-        let asks_login = preview
-            .ways
-            .iter()
-            .any(|way| matches!(way, Way::Relay(address) if needs_login(address)));
-        let hint = if asks_login {
-            wrapped_lines(
+            .any(|way| matches!(way, Way::Relay(address) if needs_login(address)))
+        {
+            body.extend(wrapped_lines(
                 "To pair through a Relay that needs a login, this Server logs in there first",
                 content_width,
                 theme.text.subdued,
-            )
-        } else {
-            Vec::new()
-        };
+            ));
+        }
+        let mut lines = vec![Line::styled(
+            "Confirm Serving Server",
+            theme.text.primary.add_modifier(Modifier::BOLD),
+        )];
+        // Nothing an Invite offers is left out before it is trusted: what
+        // the box cannot hold scrolls, and says where more of it is.
         let keys = wrapped_lines(
             "Enter trust · Esc cancel",
             content_width,
             theme.text.subdued,
         );
-        // The ways are given only the Rows the fingerprint, the hint and the
-        // keys leave them, saying how many more there are where that is not
-        // all of them.
-        let capacity = usize::from(area.height.saturating_sub(2))
-            .saturating_sub(lines.len() + hint.len() + keys.len());
-        let more = ways.len().saturating_sub(capacity);
-        if more == 0 {
-            lines.extend(ways);
+        if body.len() + keys.len() <= room {
+            lines.extend(body);
+            lines.extend(keys);
         } else {
-            let shown = capacity.saturating_sub(1);
-            lines.extend(ways.into_iter().take(shown));
-            lines.push(Line::styled(
-                format!("… and {} more", more + 1),
+            let keys = wrapped_lines(
+                "↑↓ scroll · Enter trust · Esc cancel",
+                content_width,
                 theme.text.subdued,
-            ));
+            );
+            let visible = room.saturating_sub(keys.len() + 1);
+            let shown = overlay
+                .preview_window()
+                .settle_rows(body.len(), visible, None);
+            let more = match (shown.start > 0, shown.end < body.len()) {
+                (false, true) => "↓ more below",
+                (true, false) => "↑ more above",
+                (true, true) => "↑↓ more above and below",
+                (false, false) => "",
+            };
+            let showing = shown.len();
+            lines.extend(body.into_iter().skip(shown.start).take(showing));
+            lines.resize(1 + visible, Line::default());
+            lines.push(Line::styled(more, theme.text.subdued));
+            lines.extend(keys);
         }
-        lines.extend(hint);
-        lines.extend(keys);
         render_overlay_box(
             frame,
             state,
@@ -646,15 +665,19 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
     if let Some((relay, step)) = overlay.login_step() {
         let content_width = area.width.saturating_sub(2);
         const CONTEXT: &str = "To pair through this Relay, this Server logs in there first";
+        let heading = || {
+            wrapped_lines(
+                &format!("Log in at {relay}"),
+                content_width,
+                theme.text.primary.add_modifier(Modifier::BOLD),
+            )
+        };
         let lines = match step {
             LoginStep::Waiting(login) => {
                 relay_login_lines(relay, login, Some(CONTEXT), content_width, theme)
             }
             LoginStep::Stopped(why) => {
-                let mut lines = vec![Line::styled(
-                    format!("Log in at {relay}"),
-                    theme.text.primary.add_modifier(Modifier::BOLD),
-                )];
+                let mut lines = heading();
                 lines.extend(wrapped_lines(CONTEXT, content_width, theme.text.subdued));
                 lines.extend(wrapped_lines(why, content_width, theme.feedback.error));
                 lines.extend(wrapped_lines(
@@ -664,8 +687,22 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
                 ));
                 lines
             }
-            // Adding the Relay and beginning the login say so as they wait.
-            LoginStep::Adding(_) | LoginStep::Beginning(_) => Vec::new(),
+            // Adding the Relay and beginning the login name it whole as they
+            // wait.
+            LoginStep::Adding(_) | LoginStep::Beginning(_) => {
+                let mut lines = heading();
+                lines.extend(wrapped_lines(CONTEXT, content_width, theme.text.subdued));
+                lines.push(Line::styled(
+                    if matches!(step, LoginStep::Adding(_)) {
+                        "Adding Relay…"
+                    } else {
+                        "Beginning login…"
+                    },
+                    theme.text.subdued,
+                ));
+                lines.push(Line::styled("Esc back", theme.text.subdued));
+                lines
+            }
         };
         render_overlay_box(
             frame,
@@ -679,6 +716,7 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
         return;
     }
     if let Some(details) = overlay.details() {
+        let content_width = area.width.saturating_sub(2);
         let mut lines = vec![Line::styled(
             "Configure Remote",
             theme.text.primary.add_modifier(Modifier::BOLD),
@@ -693,39 +731,71 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
             },
         ));
         lines.push(Line::styled("Address priority", theme.text.subdued));
-        let content_height = usize::from(area.height.saturating_sub(2));
-        // The error is laid out first, wrapped whole, so the ways are given
-        // only the Rows it and the keys beneath leave them.
-        let error = details.error.map_or_else(Vec::new, |error| {
-            TextLayout::new(error, area.width.saturating_sub(2))
-                .rows()
-                .map(|row| Line::styled(row.text.to_owned(), theme.feedback.error))
-                .collect::<Vec<_>>()
-        });
-        let way_capacity = content_height.saturating_sub(lines.len() + error.len() + 1);
-        let ways = details
+        // Why the redemption was refused — or what has changed since — and
+        // the keys are laid out first, wrapped whole, so the ways are given
+        // only the Rows they leave; the ways keep at least the one the keys
+        // are on, and a refusal longer than the rest scrolls.
+        let said = match (details.error, details.note.as_deref()) {
+            (Some(error), _) => wrapped_lines(error, content_width, theme.feedback.error),
+            (None, Some(note)) => wrapped_lines(note, content_width, theme.text.subdued),
+            (None, None) => Vec::new(),
+        };
+        let keys = wrapped_lines(
+            "↑↓ move · Shift+↑↓ reorder · Tab field · Enter pair · Esc cancel",
+            content_width,
+            theme.text.subdued,
+        );
+        let capacity =
+            usize::from(area.height.saturating_sub(2)).saturating_sub(lines.len() + keys.len());
+        let groups = details
             .ways
             .iter()
             .enumerate()
             .map(|(index, way)| {
                 let selected = index == details.selected;
-                Line::styled(
-                    format!("{}{}. {way}", if selected { "› " } else { "  " }, index + 1),
+                way_lines(
+                    &format!("{}{}. ", if selected { "› " } else { "  " }, index + 1),
+                    &way.to_string(),
+                    None,
+                    content_width,
                     selection_style(selected, !details.name_focused, theme)
                         .unwrap_or(theme.text.primary),
                 )
             })
             .collect::<Vec<_>>();
+        let least = groups.get(details.selected).map_or(0, Vec::len);
+        let (way_capacity, said) = if said.len() + least <= capacity {
+            (capacity - said.len(), said)
+        } else {
+            let visible = capacity.saturating_sub(least + 1);
+            let shown = overlay
+                .refusal_window()
+                .settle_rows(said.len(), visible, None);
+            let mut window = said
+                .into_iter()
+                .skip(shown.start)
+                .take(shown.len())
+                .collect::<Vec<_>>();
+            window.push(Line::styled("PgUp/PgDn for the rest", theme.text.subdued));
+            (least, window)
+        };
+        let entries = groups
+            .iter()
+            .map(|group| WindowEntry::focusable(group.len()))
+            .collect::<Vec<_>>();
+        let shown = overlay
+            .ways_window()
+            .settle(&entries, way_capacity, Some(details.selected));
         lines.extend(
-            overlay
-                .ways_window()
-                .show(ways, way_capacity, Some(details.selected)),
+            groups
+                .into_iter()
+                .skip(shown.start)
+                .take(shown.len())
+                .flatten()
+                .take(way_capacity),
         );
-        lines.extend(error);
-        lines.push(Line::styled(
-            "↑↓ move · Shift+↑↓ reorder · Tab field · Enter pair · Esc cancel",
-            theme.text.subdued,
-        ));
+        lines.extend(said);
+        lines.extend(keys);
         render_overlay_box(
             frame,
             state,
@@ -840,8 +910,9 @@ fn render_relay_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
     } else if let Some((address, error)) = overlay.address_entry() {
         lines.push(heading("Add a Relay".to_owned()));
         lines.push(Line::styled("Relay address", theme.text.subdued));
-        lines.push(Line::styled(
-            format!("> {address}▏"),
+        lines.extend(wrapped_lines(
+            &format!("> {address}▏"),
+            content_width,
             theme.selection.focused,
         ));
         if let Some(error) = error {
@@ -987,9 +1058,8 @@ fn relay_login_lines(
     width: u16,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    let heading =
-        |text: String| Line::styled(text, theme.text.primary.add_modifier(Modifier::BOLD));
-    let mut lines = vec![heading(format!("Log in at {address}"))];
+    let heading = theme.text.primary.add_modifier(Modifier::BOLD);
+    let mut lines = wrapped_lines(&format!("Log in at {address}"), width, heading);
     if let Some(context) = context {
         lines.extend(wrapped_lines(context, width, theme.text.subdued));
     }
@@ -1003,7 +1073,7 @@ fn relay_login_lines(
         theme.text.primary,
     ));
     lines.push(Line::styled("and enter this code", theme.text.subdued));
-    lines.push(heading(login.user_code.clone()));
+    lines.push(Line::styled(login.user_code.clone(), heading));
     lines.push(Line::styled("Waiting for the login…", theme.text.subdued));
     lines.extend(wrapped_lines(
         "a copy address · c copy code · Esc back",
@@ -1013,17 +1083,37 @@ fn relay_login_lines(
     lines
 }
 
-/// The Relay way through the Relay at `address`, after `marker`, saying
-/// `standing` of it where that is anything: the address is shortened to fit
-/// `width` before anything said of it is.
-fn relay_way_text(marker: &str, address: &str, standing: &str, width: u16) -> String {
-    let said = if standing.is_empty() {
-        String::new()
-    } else {
-        format!(" · {standing}")
-    };
-    let room = usize::from(width).saturating_sub(marker.width() + "Relay ".width() + said.width());
-    format!("{marker}Relay {}{said}", truncate_to_width(address, room))
+/// A way, after `prefix`, wrapped whole beneath it however narrow `width`
+/// — a way is never shortened, for what it names is where the Server will
+/// connect — and saying `standing` of it beside it where that fits, and on
+/// a Row of its own beneath where it does not.
+fn way_lines(
+    prefix: &str,
+    way: &str,
+    standing: Option<&str>,
+    width: u16,
+    style: Style,
+) -> Vec<Line<'static>> {
+    if let Some(standing) = standing {
+        let beside = format!("{prefix}{way} · {standing}");
+        if beside.width() <= usize::from(width) {
+            return vec![Line::styled(beside, style)];
+        }
+    }
+    let indent = " ".repeat(prefix.width());
+    let room = width.saturating_sub(u16::try_from(prefix.width()).unwrap_or(u16::MAX));
+    let mut lines = TextLayout::new(way, room)
+        .rows()
+        .enumerate()
+        .map(|(row, laid)| {
+            let lead = if row == 0 { prefix } else { indent.as_str() };
+            Line::styled(format!("{lead}{}", laid.text), style)
+        })
+        .collect::<Vec<_>>();
+    if let Some(standing) = standing {
+        lines.push(Line::styled(format!("{indent}  {standing}"), style));
+    }
+    lines
 }
 
 /// `text` wrapped to `width`, each Row of it in `style`.
@@ -1034,8 +1124,8 @@ fn wrapped_lines(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// A Relay's entry: its address, then how it stands beneath, wrapped across
-/// as many Rows as it takes.
+/// A Relay's entry: its address, whole, then how it stands beneath, each
+/// wrapped across as many Rows as it takes.
 fn relay_entry_lines(
     relay: &crate::protocol::Relay,
     status: &str,
@@ -1048,19 +1138,14 @@ fn relay_entry_lines(
     } else {
         ("  ", theme.text.primary, theme.text.subdued)
     };
-    std::iter::once(Line::styled(
-        format!(
-            "{prefix}{}",
-            truncate_to_width(&relay.address, usize::from(width.saturating_sub(2)))
-        ),
-        address_style,
-    ))
-    .chain(
-        TextLayout::new(status, width.saturating_sub(4))
-            .rows()
-            .map(|row| Line::styled(format!("    {}", row.text), status_style)),
-    )
-    .collect()
+    way_lines(prefix, &relay.address, None, width, address_style)
+        .into_iter()
+        .chain(
+            TextLayout::new(status, width.saturating_sub(4))
+                .rows()
+                .map(|row| Line::styled(format!("    {}", row.text), status_style)),
+        )
+        .collect()
 }
 
 /// The Context Breakdown of the open Session: each source's tokens and share
@@ -1289,19 +1374,31 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
     } else {
         let content_height = usize::from(area.height.saturating_sub(2));
         let capacity = content_height.saturating_sub(lines.len() + error.len() + keys.len());
-        let selected = state.serve_overlay.selected_among(candidates.len());
-        let rows = candidates
+        let selected = state.serve_overlay.focused(&candidates);
+        // A Relay's address wraps beneath its mark across as many Rows as the
+        // box is narrow, so each way is one entry however many Rows it takes.
+        let groups = candidates
             .iter()
             .enumerate()
             .map(|(index, candidate)| {
-                serve_candidate_line(candidate, index == selected, content_width, theme)
+                serve_candidate_lines(candidate, index == selected, content_width, theme)
             })
             .collect::<Vec<_>>();
+        let entries = groups
+            .iter()
+            .map(|group| WindowEntry::focusable(group.len()))
+            .collect::<Vec<_>>();
+        let shown = state
+            .serve_overlay
+            .window()
+            .settle(&entries, capacity, Some(selected));
         lines.extend(
-            state
-                .serve_overlay
-                .window()
-                .show(rows, capacity, Some(selected)),
+            groups
+                .into_iter()
+                .skip(shown.start)
+                .take(shown.len())
+                .flatten()
+                .take(capacity),
         );
     }
     lines.extend(error);
@@ -1319,25 +1416,16 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
 
 /// A way an Invite may offer, marked offered or left out — or, for a Relay
 /// an Invite cannot offer, marked so and saying why.
-fn serve_candidate_line(
+fn serve_candidate_lines(
     candidate: &CandidateWay,
     selected: bool,
     width: u16,
     theme: &Theme,
-) -> Line<'static> {
+) -> Vec<Line<'static>> {
     let marker = match (candidate.withheld, candidate.chosen) {
         (Some(_), _) => "[-] ",
         (None, true) => "[x] ",
         (None, false) => "[ ] ",
-    };
-    let text = match &candidate.way {
-        Way::Relay(address) => relay_way_text(
-            marker,
-            address,
-            candidate.withheld.map_or("", |withheld| withheld.brief()),
-            width,
-        ),
-        way @ Way::Direct(_) => format!("{marker}{way}"),
     };
     let style = if selected {
         theme.selection.focused
@@ -1346,7 +1434,13 @@ fn serve_candidate_line(
     } else {
         theme.text.primary
     };
-    Line::styled(text, style)
+    way_lines(
+        marker,
+        &candidate.way.to_string(),
+        candidate.withheld.map(|withheld| withheld.brief()),
+        width,
+        style,
+    )
 }
 
 /// A Peer's entry: the name it gave itself, by which what a Sidekick on it

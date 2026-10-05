@@ -25,7 +25,7 @@ use suru::{
         RelayState, Remote, RemoteStatus, SidebarVisibility, Way,
     },
     tui::{
-        Application, ApplicationEvent, ApplicationTransition, CommandId, RedemptionRequest,
+        Application, ApplicationEvent, ApplicationTransition, CommandId, ConnectRequest,
         RelayLoginFollow, RelayRequest, SemanticCommandId, ServeRequest,
     },
 };
@@ -523,20 +523,17 @@ fn the_invite_preview_shows_the_relay_it_travels_through_beside_the_fingerprint(
     );
     assert!(shown.contains("Enter trust · Esc cancel"), "{shown}");
 
-    // However narrow, each Relay keeps what it says of it, its address
-    // shortened first.
-    let narrow = rendered_application_rows_at(&application, 40, 24).join("\n");
+    // However narrow, each Relay is shown whole, and what is said of it
+    // beneath where there is no room beside it.
+    let narrow = unbroken_at(&application, 40);
     assert!(
-        narrow
-            .lines()
-            .filter(|row| row.contains("· login needed"))
-            .count()
-            == 1
-            && narrow
-                .lines()
-                .filter(|row| row.contains("· logged in"))
-                .count()
-                == 1,
+        narrow.contains(COMPANY) && narrow.contains(HOME),
+        "{narrow}"
+    );
+    let narrow = prose_at(&application, 40);
+    assert!(
+        narrow.contains(&format!("{COMPANY} logged in"))
+            && narrow.contains(&format!("{HOME} login needed")),
         "{narrow}"
     );
     assert!(narrow.contains("Enter trust · Esc cancel"), "{narrow}");
@@ -1050,6 +1047,529 @@ fn the_login_a_redemption_waits_on_is_copied_by_the_relay_logins_own_commands() 
     );
 }
 
+// Seeing every way an Invite offers, whole, before trusting it.
+
+/// A Relay's address long enough to wrap however wide the box, whose
+/// registrable domain — the part that says who controls it — comes last.
+const LONG: &str =
+    "https://relay.company.example.a-rather-long-label-before-the-real-one.evil.example";
+
+#[test]
+fn the_invite_preview_shows_each_relays_whole_address_however_narrow() {
+    for width in [80, 48, 40] {
+        let mut application = Application::default();
+        push(&mut application, 1, Vec::new());
+        begin_pairing(&mut application);
+        preview(
+            &mut application,
+            vec![direct(), Way::Relay(LONG.to_owned())],
+        );
+
+        let shown = unbroken_at(&application, width);
+        assert!(
+            shown.contains(LONG),
+            "the whole address is shown at {width} columns, never shortened: {shown}"
+        );
+        assert!(
+            prose_at(&application, width).contains("login needed"),
+            "{}",
+            prose_at(&application, width)
+        );
+        assert!(
+            !prose_at(&application, width).contains('…'),
+            "{}",
+            prose_at(&application, width)
+        );
+        assert!(
+            prose_at(&application, width).contains("Enter trust · Esc cancel"),
+            "{}",
+            prose_at(&application, width)
+        );
+
+        // And as the Remote's ways are ordered, once it is trusted.
+        press(&mut application, KeyCode::Enter);
+        let shown = unbroken_at(&application, width);
+        assert!(shown.contains("Configure Remote"), "{shown}");
+        assert!(
+            shown.contains(LONG),
+            "the whole address is shown at {width} columns: {shown}"
+        );
+        assert!(!shown.contains('…'), "{shown}");
+    }
+}
+
+#[test]
+fn every_way_an_invite_offers_can_be_read_before_it_is_trusted() {
+    let mut ways = (1..=20)
+        .map(|last| Way::Direct(SocketAddr::from((Ipv4Addr::new(10, 0, 0, last), 7777))))
+        .collect::<Vec<_>>();
+    ways.push(Way::Relay(COMPANY.to_owned()));
+    let mut application = Application::default();
+    push(&mut application, 1, Vec::new());
+    begin_pairing(&mut application);
+    preview(&mut application, ways);
+
+    let shown = prose(&application);
+    assert!(
+        !shown.contains(COMPANY),
+        "more ways than fit, so the Relay offered last is out of view: {shown}"
+    );
+    assert!(!shown.contains("… and"), "{shown}");
+    assert!(
+        shown.contains("↓ more below") && shown.contains("↑↓ scroll · Enter trust · Esc cancel"),
+        "and the reader is told so, and how to see it: {shown}"
+    );
+    for _ in 0..30 {
+        press(&mut application, KeyCode::Down);
+    }
+    let shown = prose(&application);
+    assert!(
+        shown.contains(&format!("Relay {COMPANY} · login needed")),
+        "every way can be scrolled to before it is trusted: {shown}"
+    );
+    assert!(shown.contains("↑ more above"), "{shown}");
+    assert!(
+        shown.contains("Enter trust · Esc cancel"),
+        "the keys stay in view: {shown}"
+    );
+    for _ in 0..30 {
+        press(&mut application, KeyCode::Up);
+    }
+    assert!(
+        prose(&application).contains("Fingerprint"),
+        "{}",
+        prose(&application)
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        prose(&application).contains("Configure Remote"),
+        "{}",
+        prose(&application)
+    );
+}
+
+#[test]
+fn the_relay_being_added_and_logged_in_at_is_shown_by_its_whole_address() {
+    let mut application = Application::default();
+    push(&mut application, 1, Vec::new());
+    begin_pairing(&mut application);
+    preview(&mut application, vec![Way::Relay(LONG.to_owned())]);
+    press(&mut application, KeyCode::Enter);
+    let (request, _) = redemption(press(&mut application, KeyCode::Enter));
+    let ApplicationTransition::AddRelay { request, .. } =
+        refused_for_login_at(&mut application, request, LONG)
+    else {
+        panic!("a Relay the Server holds no entry for is added first");
+    };
+    let adding = unbroken_at(&application, 40);
+    assert!(adding.contains(LONG), "{adding}");
+    assert!(adding.contains("Adding Relay…"), "{adding}");
+
+    let beginning = beginning(
+        application
+            .handle_event(ApplicationEvent::RelayAdded {
+                request,
+                relay: relay(LONG),
+            })
+            .expect("take the added Relay"),
+        LONG,
+    );
+    assert!(
+        unbroken_at(&application, 40).contains(LONG),
+        "{}",
+        unbroken_at(&application, 40)
+    );
+    begun(&mut application, beginning, pending());
+    let shown = unbroken_at(&application, 40);
+    assert!(shown.contains(LONG), "{shown}");
+    assert!(shown.contains(CODE), "{shown}");
+}
+
+#[test]
+fn the_relay_list_shows_each_relays_whole_address_however_narrow() {
+    let mut application = serving_application(true);
+    push(&mut application, 1, vec![logged_in(LONG)]);
+    let listing = open_relays(&mut application);
+    list(&mut application, listing, 1, vec![logged_in(LONG)]);
+    for width in [80, 40] {
+        let shown = unbroken_at(&application, width);
+        assert!(
+            shown.contains(LONG),
+            "the whole address is listed at {width} columns: {shown}"
+        );
+        assert!(
+            prose_at(&application, width).contains("Logged in as octocat (github)"),
+            "{}",
+            prose_at(&application, width)
+        );
+    }
+}
+
+// A Login restored while the redemption waits on one.
+
+#[test]
+fn a_login_restored_while_its_login_is_being_begun_carries_the_redemption_on_and_shows_no_code() {
+    let mut application = Application::default();
+    push(&mut application, 1, vec![relay(COMPANY)]);
+    let (first, _) = pair(&mut application, vec![Way::Relay(COMPANY.to_owned())]);
+    let beginning = beginning(refused_for_login(&mut application, first), COMPANY);
+
+    // Another Server of the Account restores the Login before the Server
+    // answers the login begun here.
+    push(&mut application, 2, vec![logged_in(COMPANY)]);
+    let (second, _) = resumed(&mut application);
+    assert_eq!(
+        begun(&mut application, beginning, pending()),
+        ApplicationTransition::Continue,
+        "the login begun meanwhile is not followed from here"
+    );
+    let shown = prose(&application);
+    assert!(!shown.contains(CODE), "{shown}");
+    assert!(shown.contains("Pairing Remote…"), "{shown}");
+    assert!(
+        application.take_relay_retries().is_empty(),
+        "carried on once"
+    );
+    redeemed(&mut application, second);
+}
+
+#[test]
+fn a_login_restored_while_its_relay_is_being_added_carries_the_redemption_on() {
+    let mut application = Application::default();
+    push(&mut application, 1, Vec::new());
+    let (first, _) = pair(&mut application, vec![Way::Relay(COMPANY.to_owned())]);
+    let ApplicationTransition::AddRelay { request, .. } =
+        refused_for_login(&mut application, first)
+    else {
+        panic!("a Relay the Server holds no entry for is added first");
+    };
+    push(&mut application, 2, vec![logged_in(COMPANY)]);
+    resumed(&mut application);
+    assert!(
+        !matches!(
+            application
+                .handle_event(ApplicationEvent::RelayAdded {
+                    request,
+                    relay: relay(COMPANY),
+                })
+                .expect("take the added Relay"),
+            ApplicationTransition::BeginRelayLogin { .. }
+        ),
+        "no login is begun for a redemption already carried on"
+    );
+    assert!(application.take_relay_retries().is_empty());
+}
+
+#[test]
+fn a_login_the_client_already_hears_stands_carries_the_redemption_on_at_once() {
+    let mut application = Application::default();
+    push(&mut application, 1, vec![relay(COMPANY)]);
+    let (first, redemption_asked) = pair(&mut application, vec![Way::Relay(COMPANY.to_owned())]);
+    // The Login was restored between the Server refusing and this Client
+    // hearing of it.
+    push(&mut application, 2, vec![logged_in(COMPANY)]);
+    let (second, again) = redemption(refused_for_login(&mut application, first));
+    assert_ne!(first, second);
+    assert_eq!(again, redemption_asked);
+}
+
+// A follower that ends on a later login.
+
+#[test]
+fn a_follower_that_ends_on_a_later_login_never_leaves_the_redemption_waiting() {
+    for (later, carried_on) in [
+        (
+            RelayLogin {
+                user_code: LATER_CODE.to_owned(),
+                outcome: RelayLoginOutcome::Refused {
+                    reason: RelayLoginRefusal::Expired,
+                    message: "nobody finished the login before it expired".to_owned(),
+                },
+                ..pending()
+            },
+            false,
+        ),
+        (
+            done(RelayLogin {
+                user_code: LATER_CODE.to_owned(),
+                ..pending()
+            }),
+            true,
+        ),
+    ] {
+        let mut application = Application::default();
+        push(&mut application, 1, vec![relay(COMPANY)]);
+        let (first, _) = pair(&mut application, vec![Way::Relay(COMPANY.to_owned())]);
+        let beginning = beginning(refused_for_login(&mut application, first), COMPANY);
+        let follower = followed_at(begun(&mut application, beginning, pending()), COMPANY);
+
+        // Another Client began a later login there before this follower
+        // reached the Server, which it followed in its place.
+        settle(&mut application, follower, later);
+        let shown = prose(&application);
+        assert!(
+            !shown.contains("Waiting for the login…"),
+            "nothing is left waiting on a login no follower follows: {shown}"
+        );
+        if carried_on {
+            resumed(&mut application);
+        } else {
+            assert!(
+                shown.contains(&format!(
+                    "Another login begun at {COMPANY} replaced this one. The login at {COMPANY} \
+                     ended: nobody finished the login before it expired"
+                )),
+                "{shown}"
+            );
+            assert!(shown.contains("Enter try again · Esc back"), "{shown}");
+            redemption(press(&mut application, KeyCode::Enter));
+        }
+    }
+}
+
+// `/serve` keeps the keys on the way they were on.
+
+#[test]
+fn a_relay_a_push_removes_above_the_keys_leaves_them_on_the_way_they_were_on() {
+    let mut application = serving_application(true);
+    let a = "https://a.example.com";
+    let b = "https://b.example.com";
+    let c = "https://c.example.com";
+    let offered = |address: &str| serving_through(logged_in(address));
+    push(
+        &mut application,
+        1,
+        vec![offered(a), offered(b), offered(c)],
+    );
+    open_serve(&mut application, vec![direct()]);
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Down);
+
+    // Another Client removes the Relay above the one the keys are on.
+    push(&mut application, 2, vec![offered(b), offered(c)]);
+    press(&mut application, KeyCode::Char(' '));
+    let (_, asked) = issuance(press(&mut application, KeyCode::Enter));
+    assert_eq!(
+        asked.ways,
+        vec![direct(), Way::Relay(c.to_owned())],
+        "Space left out the way the keys were on, not the one that moved under them"
+    );
+
+    // Where the way the keys are on goes itself, they move to its neighbour.
+    let mut application = serving_application(true);
+    push(
+        &mut application,
+        1,
+        vec![offered(a), offered(b), offered(c)],
+    );
+    open_serve(&mut application, vec![direct()]);
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Down);
+    push(&mut application, 2, vec![offered(a), offered(c)]);
+    press(&mut application, KeyCode::Char(' '));
+    let (_, asked) = issuance(press(&mut application, KeyCode::Enter));
+    assert_eq!(asked.ways, vec![direct(), Way::Relay(a.to_owned())]);
+}
+
+// Answers the reader has moved past.
+
+#[test]
+fn a_late_preview_lands_nowhere() {
+    let mut application = Application::default();
+    push(&mut application, 1, vec![relay(COMPANY)]);
+    begin_pairing_with(&mut application, "suru-v1-first");
+    let first = inspecting(press(&mut application, KeyCode::Enter), "suru-v1-first");
+    press(&mut application, KeyCode::Esc);
+    let (second, _) = pair(&mut application, vec![Way::Relay(COMPANY.to_owned())]);
+    let beginning = beginning(refused_for_login(&mut application, second), COMPANY);
+    begun(&mut application, beginning, pending());
+
+    // The preview of the Invite pasted first answers at last.
+    previewed(
+        &mut application,
+        first,
+        "suru-v1-first",
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        vec![direct()],
+    );
+    application
+        .handle_event(ApplicationEvent::InvitePreviewFailed {
+            request: first,
+            invite: "suru-v1-first".to_owned(),
+            error: "Invite is malformed".to_owned(),
+        })
+        .expect("take the late refusal");
+    let shown = prose(&application);
+    assert!(
+        shown.contains(CODE) && shown.contains("Waiting for the login…"),
+        "the login the redemption waits on stands: {shown}"
+    );
+    assert!(!shown.contains("ffffffff"), "{shown}");
+    assert!(!shown.contains("Invite is malformed"), "{shown}");
+}
+
+#[test]
+fn a_late_serving_preparation_lands_nowhere() {
+    let mut application = serving_application(true);
+    let first = begin_serving(&mut application);
+    press(&mut application, KeyCode::Esc);
+    prepared(&mut application, first, vec![direct()]);
+    assert!(
+        !prose(&application).contains("Choose Invite addresses"),
+        "a closed picker stays closed: {}",
+        prose(&application)
+    );
+
+    let second = begin_serving(&mut application);
+    let other = Way::Direct(SocketAddr::from((Ipv4Addr::new(10, 0, 0, 9), 7777)));
+    prepared(&mut application, second, vec![direct(), other.clone()]);
+    press(&mut application, KeyCode::Char(' '));
+    prepared(&mut application, first, vec![direct(), other.clone()]);
+    application
+        .handle_event(ApplicationEvent::ServingPreparationFailed {
+            request: first,
+            error: "could not list the machine's addresses".to_owned(),
+        })
+        .expect("take the late failure");
+    let shown = prose(&application);
+    assert!(
+        shown.contains("[ ] 10.0.0.8:7777") && shown.contains("[x] 10.0.0.9:7777"),
+        "what the reader left out stays left out: {shown}"
+    );
+    assert!(!shown.contains("could not list"), "{shown}");
+}
+
+// A long refusal on the Remote's details.
+
+#[test]
+fn a_long_refusal_on_the_remotes_details_reads_whole_with_the_keys_in_view() {
+    let account = "a-thirty-nine-character-github-username";
+    assert_eq!(account.len(), 39);
+    let refusal = format!(
+        "this Server is logged in at the Relay at {LONG} as {account} (github), and the Server \
+         it would reach there under another Account; a Relay joins only Servers logged in \
+         under the same one, so log this Server in there as the user that Server is logged in \
+         as, or pair the two directly"
+    );
+    let mut application = Application::default();
+    push(&mut application, 1, vec![logged_in(LONG)]);
+    begin_pairing(&mut application);
+    preview(&mut application, vec![Way::Relay(LONG.to_owned())]);
+    press(&mut application, KeyCode::Enter);
+    let (request, _) = redemption(press(&mut application, KeyCode::Enter));
+    application
+        .handle_event(ApplicationEvent::InviteRedemptionFailed {
+            request,
+            error: refusal.clone(),
+            login_needed_at: None,
+        })
+        .expect("take the refusal");
+
+    let keys = "↑↓ move · Shift+↑↓ reorder · Tab field · Enter pair · Esc cancel";
+    let shown = prose_at(&application, 40);
+    assert!(shown.contains("this Server is logged in at"), "{shown}");
+    assert!(shown.contains(keys), "the keys stay in view: {shown}");
+    assert!(shown.contains("PgUp/PgDn"), "and how to read on: {shown}");
+    assert!(!shown.contains("or pair the two directly"), "{shown}");
+
+    let mut read = vec![shown];
+    for _ in 0..20 {
+        press(&mut application, KeyCode::PageDown);
+        read.push(prose_at(&application, 40));
+    }
+    let end = read.last().expect("read at least once");
+    assert!(
+        end.contains("or pair the two directly"),
+        "the refusal's last instruction is reached: {end}"
+    );
+    assert!(end.contains(keys), "the keys stay in view: {end}");
+    press(&mut application, KeyCode::PageUp);
+    for _ in 0..20 {
+        press(&mut application, KeyCode::PageUp);
+    }
+    assert!(
+        prose_at(&application, 40).contains("this Server is logged in at"),
+        "{}",
+        prose_at(&application, 40)
+    );
+}
+
+// No login is begun again for a redemption already carried on.
+
+#[test]
+fn a_redemption_carried_on_and_refused_for_a_login_again_stops_rather_than_log_in_again() {
+    let mut application = Application::default();
+    push(&mut application, 1, vec![relay(COMPANY)]);
+    let (first, _) = pair(&mut application, vec![Way::Relay(COMPANY.to_owned())]);
+    let beginning = beginning(refused_for_login(&mut application, first), COMPANY);
+    let follower = followed_at(begun(&mut application, beginning, pending()), COMPANY);
+    settle(&mut application, follower, done(pending()));
+    let (second, _) = resumed(&mut application);
+
+    assert_eq!(
+        refused_for_login(&mut application, second),
+        ApplicationTransition::Continue,
+        "no login begins a second time on its own"
+    );
+    let shown = prose(&application);
+    assert!(
+        shown.contains(&format!("Pairing was refused again: {NO_LOGIN}")),
+        "{shown}"
+    );
+    assert!(shown.contains("Enter try again · Esc back"), "{shown}");
+
+    // Tried again by the reader, the redemption logs in anew.
+    let (third, _) = redemption(press(&mut application, KeyCode::Enter));
+    beginning_at(refused_for_login(&mut application, third), COMPANY);
+}
+
+#[test]
+fn a_login_done_once_the_reader_left_it_says_the_invite_now_pairs() {
+    // The reader stepped back to the Remote's details.
+    let mut application = Application::default();
+    push(&mut application, 1, vec![relay(COMPANY)]);
+    let (first, _) = pair(&mut application, vec![Way::Relay(COMPANY.to_owned())]);
+    let begin = beginning(refused_for_login(&mut application, first), COMPANY);
+    let follower = followed_at(begun(&mut application, begin, pending()), COMPANY);
+    press(&mut application, KeyCode::Esc);
+    settle(&mut application, follower, done(pending()));
+    let shown = prose(&application);
+    assert!(
+        shown.contains(&format!(
+            "Logged in at {COMPANY}; Enter pairs through it now"
+        )),
+        "{shown}"
+    );
+    assert!(!shown.contains(NO_LOGIN), "{shown}");
+    assert!(
+        application.take_relay_retries().is_empty(),
+        "the reader stepped back, so nothing pairs without them"
+    );
+
+    // The reader closed the overlay altogether.
+    let mut application = Application::default();
+    push(&mut application, 1, vec![relay(COMPANY)]);
+    let (first, _) = pair(&mut application, vec![Way::Relay(COMPANY.to_owned())]);
+    let begin = beginning(refused_for_login(&mut application, first), COMPANY);
+    let follower = followed_at(begun(&mut application, begin, pending()), COMPANY);
+    press(&mut application, KeyCode::Esc);
+    press(&mut application, KeyCode::Esc);
+    settle(&mut application, follower, done(pending()));
+    type_terminal_text(&mut application, "/pair");
+    press(&mut application, KeyCode::Enter);
+    let shown = prose(&application);
+    assert!(shown.contains("Paste Invite"), "{shown}");
+    assert!(
+        shown.contains(&format!(
+            "Logged in at {COMPANY}; paste the Invite again to pair through it"
+        )),
+        "{shown}"
+    );
+}
+
 /// Takes a key the whole way the run loop takes it.
 fn press(application: &mut Application, code: KeyCode) -> ApplicationTransition {
     application
@@ -1140,12 +1660,26 @@ fn chosen(
 
 /// Types `/serve`, and finds the machine's addresses to be `addresses`.
 fn open_serve(application: &mut Application, addresses: Vec<Way>) {
+    let request = begin_serving(application);
+    prepared(application, request, addresses);
+}
+
+/// Types `/serve`, answering the preparation it asks for.
+fn begin_serving(application: &mut Application) -> ServeRequest {
     type_terminal_text(application, "/serve");
-    let ApplicationTransition::BeginServing { .. } = press(application, KeyCode::Enter) else {
+    let ApplicationTransition::BeginServing { request, .. } = press(application, KeyCode::Enter)
+    else {
         panic!("/serve prepares Serving");
     };
+    request
+}
+
+/// Has the preparation `request` asked for find the machine's addresses to
+/// be `addresses`.
+fn prepared(application: &mut Application, request: ServeRequest, addresses: Vec<Way>) {
     application
         .handle_event(ApplicationEvent::ServingPrepared {
+            request,
             settings: None,
             candidates: addresses,
         })
@@ -1163,28 +1697,53 @@ fn issuance(transition: ApplicationTransition) -> (ServeRequest, IssueInviteRequ
 /// Opens `/pair`, with the Remote listing it asks for answered, and pastes
 /// the Invite there.
 fn begin_pairing(application: &mut Application) {
+    begin_pairing_with(application, INVITE);
+}
+
+fn begin_pairing_with(application: &mut Application, invite: &str) {
     type_terminal_text(application, "/pair");
     press(application, KeyCode::Enter);
     application
         .handle_event(ApplicationEvent::RemotesListed(Vec::new()))
         .expect("list the Remotes");
     application
-        .take_terminal_event(InputEvent::Paste(INVITE.to_owned()))
+        .take_terminal_event(InputEvent::Paste(invite.to_owned()))
         .expect("paste the Invite");
 }
 
 /// Inspects the Invite pasted, which offers `ways`.
 fn preview(application: &mut Application, ways: Vec<Way>) {
-    assert_eq!(
-        press(application, KeyCode::Enter),
-        ApplicationTransition::PreviewInvite(INVITE.to_owned())
-    );
+    let request = inspecting(press(application, KeyCode::Enter), INVITE);
+    previewed(application, request, INVITE, FINGERPRINT, ways);
+}
+
+/// The preview `transition` asks for, of `invite`.
+fn inspecting(transition: ApplicationTransition, invite: &str) -> ConnectRequest {
+    match transition {
+        ApplicationTransition::PreviewInvite {
+            request,
+            invite: asked,
+        } if asked == invite => request,
+        other => panic!("expected {invite} previewed, got {other:?}"),
+    }
+}
+
+/// Has the preview `request` asked for show `invite` as offering `ways`,
+/// under `fingerprint`.
+fn previewed(
+    application: &mut Application,
+    request: ConnectRequest,
+    invite: &str,
+    fingerprint: &str,
+    ways: Vec<Way>,
+) {
     application
         .handle_event(ApplicationEvent::InvitePreviewed {
-            invite: INVITE.to_owned(),
+            request,
+            invite: invite.to_owned(),
             preview: InvitePreview {
                 hostname: "studio".to_owned(),
-                fingerprint: FINGERPRINT.to_owned(),
+                fingerprint: fingerprint.to_owned(),
                 ways,
             },
         })
@@ -1193,14 +1752,14 @@ fn preview(application: &mut Application, ways: Vec<Way>) {
 
 /// Pastes the Invite into `/pair`, previews it offering `ways`, trusts it,
 /// and pairs, answering the redemption asked for.
-fn pair(application: &mut Application, ways: Vec<Way>) -> (RedemptionRequest, RedeemInviteRequest) {
+fn pair(application: &mut Application, ways: Vec<Way>) -> (ConnectRequest, RedeemInviteRequest) {
     begin_pairing(application);
     preview(application, ways);
     press(application, KeyCode::Enter);
     redemption(press(application, KeyCode::Enter))
 }
 
-fn redemption(transition: ApplicationTransition) -> (RedemptionRequest, RedeemInviteRequest) {
+fn redemption(transition: ApplicationTransition) -> (ConnectRequest, RedeemInviteRequest) {
     match transition {
         ApplicationTransition::RedeemInvite {
             request,
@@ -1211,7 +1770,7 @@ fn redemption(transition: ApplicationTransition) -> (RedemptionRequest, RedeemIn
 }
 
 /// The redemption carried on once the login it waited on is done.
-fn resumed(application: &mut Application) -> (RedemptionRequest, RedeemInviteRequest) {
+fn resumed(application: &mut Application) -> (ConnectRequest, RedeemInviteRequest) {
     let mut carried = application.take_relay_retries();
     assert_eq!(carried.len(), 1, "one redemption carried on: {carried:?}");
     redemption(carried.remove(0))
@@ -1221,18 +1780,30 @@ fn resumed(application: &mut Application) -> (RedemptionRequest, RedeemInviteReq
 /// Login at the company Relay.
 fn refused_for_login(
     application: &mut Application,
-    request: RedemptionRequest,
+    request: ConnectRequest,
+) -> ApplicationTransition {
+    refused_for_login_at(application, request, COMPANY)
+}
+
+/// Has the Server refuse the redemption `request` asked for, for want of a
+/// Login at the Relay at `relay`.
+fn refused_for_login_at(
+    application: &mut Application,
+    request: ConnectRequest,
+    relay: &str,
 ) -> ApplicationTransition {
     application
         .handle_event(ApplicationEvent::InviteRedemptionFailed {
             request,
-            error: NO_LOGIN.to_owned(),
-            login_needed_at: Some(COMPANY.to_owned()),
+            error: format!(
+                "this Server holds no Login at the Relay at {relay}; log in there, then try again"
+            ),
+            login_needed_at: Some(relay.to_owned()),
         })
         .expect("take the refusal")
 }
 
-fn redeemed(application: &mut Application, request: RedemptionRequest) {
+fn redeemed(application: &mut Application, request: ConnectRequest) {
     application
         .handle_event(ApplicationEvent::RemoteRedeemed {
             request,
@@ -1301,10 +1872,21 @@ fn prose(application: &Application) -> String {
     prose_at(application, 80)
 }
 
-/// What the screen `width` columns wide says — what the overlay open says,
-/// where one is, read from inside its box so nothing drawn beside it is read
-/// with it — its wrapped Rows read on as one line of prose.
+/// What the screen `width` columns wide says, read as [`prose_at`] reads it.
 fn prose_at(application: &Application, width: u16) -> String {
+    boxed_rows_at(application, width).join(" ")
+}
+
+/// What the screen `width` columns wide says, its Rows run together with
+/// nothing between them, so a word split across Rows reads whole.
+fn unbroken_at(application: &Application, width: u16) -> String {
+    boxed_rows_at(application, width).concat()
+}
+
+/// The Rows of the screen `width` columns wide that say anything — what the
+/// overlay open says, where one is, read from inside its box so nothing
+/// drawn beside it is read with it — each trimmed.
+fn boxed_rows_at(application: &Application, width: u16) -> Vec<String> {
     let rows = rendered_application_rows_at(application, width, 24)
         .into_iter()
         .map(|row| row.chars().collect::<Vec<_>>())
@@ -1336,8 +1918,7 @@ fn prose_at(application: &Application, width: u16) -> String {
         .take_while(|row| boxed.is_none_or(|(_, left, _)| row.get(left) != Some(&'└')))
         .map(|row| inside(row).trim().to_owned())
         .filter(|row| !row.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect()
 }
 
 /// The rendered entry for the Relay at `address`: the row naming it, and how

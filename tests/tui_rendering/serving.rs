@@ -34,15 +34,17 @@ fn serving_shows_a_fresh_copyable_invite_and_removes_enrolled_peers() {
     deliver_settings(&mut application, settings);
 
     type_terminal_text(&mut application, "/serve");
-    assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        ApplicationTransition::BeginServing {
-            enable: false,
-            port: 7777,
-        }
-    );
+    let ApplicationTransition::BeginServing {
+        request,
+        enable: false,
+        port: 7777,
+    } = press(&mut application, KeyCode::Enter)
+    else {
+        panic!("/serve prepares Serving on the port set, already on");
+    };
     application
         .handle_event(ApplicationEvent::ServingPrepared {
+            request,
             settings: None,
             candidates: vec![Way::Direct(SocketAddr::from((
                 Ipv4Addr::new(10, 0, 0, 8),
@@ -146,17 +148,19 @@ fn serve_enables_serving_and_invites_only_the_selected_candidate_ways() {
     assert!(completion.contains("/serve"));
     assert!(completion.contains("Serve this machine"));
     assert_eq!(SemanticCommandId::ServeOpen.as_str(), "serve.open");
-    assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        ApplicationTransition::BeginServing {
-            enable: true,
-            port: 7443,
-        }
-    );
+    let ApplicationTransition::BeginServing {
+        request,
+        enable: true,
+        port: 7443,
+    } = press(&mut application, KeyCode::Enter)
+    else {
+        panic!("/serve turns Serving on, on the port set");
+    };
 
     settings.serving.enabled = true;
     application
         .handle_event(ApplicationEvent::ServingPrepared {
+            request,
             settings: Some(SettingsSnapshot {
                 settings,
                 pinned: vec!["serving.enabled".to_owned()],
@@ -202,13 +206,18 @@ fn serve_lists_scroll_to_keep_the_focused_candidate_and_peer_fully_visible() {
     settings.serving.port = 7777;
     deliver_settings(&mut application, settings);
     type_terminal_text(&mut application, "/serve");
-    press(&mut application, KeyCode::Enter);
+    let ApplicationTransition::BeginServing { request, .. } =
+        press(&mut application, KeyCode::Enter)
+    else {
+        panic!("/serve prepares Serving");
+    };
 
     let candidates = (1..=20)
         .map(|last| Way::Direct(SocketAddr::from((Ipv4Addr::new(10, 0, 0, last), 7777))))
         .collect::<Vec<_>>();
     application
         .handle_event(ApplicationEvent::ServingPrepared {
+            request,
             settings: None,
             candidates,
         })

@@ -176,6 +176,11 @@ impl ListWindow {
         self.first.get()
     }
 
+    /// The Rows the window was last settled over, which a page of it is.
+    pub(super) fn capacity(&self) -> usize {
+        self.capacity.get()
+    }
+
     /// Settles the window over `entries` for a frame holding `capacity` Rows
     /// with focus on the entry at `focus`, and answers the entries it shows.
     ///

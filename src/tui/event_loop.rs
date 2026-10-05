@@ -1384,9 +1384,14 @@ impl RunLoop {
                     self.channels.submissions.clone(),
                 );
             }
-            ApplicationTransition::BeginServing { enable, port } => {
+            ApplicationTransition::BeginServing {
+                request,
+                enable,
+                port,
+            } => {
                 spawn_serving_preparation(
                     self.client.session_commands(),
+                    request,
                     enable,
                     port,
                     self.channels.pairing.clone(),
@@ -1487,9 +1492,10 @@ impl RunLoop {
                     self.channels.pairing.clone(),
                 );
             }
-            ApplicationTransition::PreviewInvite(invite) => {
+            ApplicationTransition::PreviewInvite { request, invite } => {
                 spawn_invite_preview(
                     self.client.session_commands(),
+                    request,
                     invite,
                     self.channels.pairing.clone(),
                 );
@@ -1741,7 +1747,7 @@ impl RunLoop {
             | ApplicationTransition::RemoveRelay { .. }
             | ApplicationTransition::SetRelayServeThrough { .. }
             | ApplicationTransition::BeginConnecting
-            | ApplicationTransition::PreviewInvite(_)
+            | ApplicationTransition::PreviewInvite { .. }
             | ApplicationTransition::RedeemInvite { .. }
             | ApplicationTransition::TurnOutlook { .. }
             | ApplicationTransition::TurnOutlookAndViewAndAttach { .. }
@@ -2364,14 +2370,16 @@ impl RunLoop {
         };
         let event = match result {
             PairingResult::Prepared {
+                request,
                 settings,
                 candidates,
             } => ApplicationEvent::ServingPrepared {
+                request,
                 settings: settings.map(|settings| *settings),
                 candidates,
             },
-            PairingResult::PreparationFailed(error) => {
-                ApplicationEvent::ServingPreparationFailed(error)
+            PairingResult::PreparationFailed { request, error } => {
+                ApplicationEvent::ServingPreparationFailed { request, error }
             }
             PairingResult::InviteIssued {
                 request,
@@ -2396,12 +2404,24 @@ impl RunLoop {
             PairingResult::EverywhereRemoteListingFailed { request, error } => {
                 ApplicationEvent::EverywhereRemoteListingFailed { request, error }
             }
-            PairingResult::InvitePreviewed { invite, preview } => {
-                ApplicationEvent::InvitePreviewed { invite, preview }
-            }
-            PairingResult::InvitePreviewFailed { invite, error } => {
-                ApplicationEvent::InvitePreviewFailed { invite, error }
-            }
+            PairingResult::InvitePreviewed {
+                request,
+                invite,
+                preview,
+            } => ApplicationEvent::InvitePreviewed {
+                request,
+                invite,
+                preview,
+            },
+            PairingResult::InvitePreviewFailed {
+                request,
+                invite,
+                error,
+            } => ApplicationEvent::InvitePreviewFailed {
+                request,
+                invite,
+                error,
+            },
             PairingResult::RemoteRedeemed { request, remote } => {
                 ApplicationEvent::RemoteRedeemed { request, remote }
             }
@@ -2544,10 +2564,14 @@ fn spawn_workspace_resolution(
 
 enum PairingResult {
     Prepared {
+        request: crate::tui::ServeRequest,
         settings: Option<Box<SettingsSnapshot>>,
         candidates: Vec<crate::protocol::Way>,
     },
-    PreparationFailed(String),
+    PreparationFailed {
+        request: crate::tui::ServeRequest,
+        error: String,
+    },
     InviteIssued {
         request: crate::tui::ServeRequest,
         invite: crate::protocol::IssuedInvite,
@@ -2569,19 +2593,21 @@ enum PairingResult {
         error: String,
     },
     InvitePreviewed {
+        request: crate::tui::ConnectRequest,
         invite: String,
         preview: crate::protocol::InvitePreview,
     },
     InvitePreviewFailed {
+        request: crate::tui::ConnectRequest,
         invite: String,
         error: String,
     },
     RemoteRedeemed {
-        request: crate::tui::RedemptionRequest,
+        request: crate::tui::ConnectRequest,
         remote: crate::protocol::Remote,
     },
     InviteRedemptionFailed {
-        request: crate::tui::RedemptionRequest,
+        request: crate::tui::ConnectRequest,
         error: String,
         login_needed_at: Option<String>,
     },
@@ -2598,7 +2624,7 @@ enum PairingResult {
 
 fn spawn_invite_redemption(
     commands: SessionCommandClient,
-    request: crate::tui::RedemptionRequest,
+    request: crate::tui::ConnectRequest,
     redemption: crate::protocol::RedeemInviteRequest,
     results: UnboundedSender<PairingResult>,
 ) {
@@ -2630,13 +2656,19 @@ fn relay_login_needed(error: &anyhow::Error) -> Option<String> {
 
 fn spawn_invite_preview(
     commands: SessionCommandClient,
+    request: crate::tui::ConnectRequest,
     invite: String,
     results: UnboundedSender<PairingResult>,
 ) {
     tokio::spawn(async move {
         let result = match commands.preview_invite(invite.clone()).await {
-            Ok(preview) => PairingResult::InvitePreviewed { invite, preview },
+            Ok(preview) => PairingResult::InvitePreviewed {
+                request,
+                invite,
+                preview,
+            },
             Err(error) => PairingResult::InvitePreviewFailed {
+                request,
                 invite,
                 error: error.to_string(),
             },
@@ -2702,6 +2734,7 @@ fn spawn_everywhere_remote_listing(
 
 fn spawn_serving_preparation(
     commands: SessionCommandClient,
+    request: crate::tui::ServeRequest,
     enable: bool,
     port: u16,
     results: UnboundedSender<PairingResult>,
@@ -2726,12 +2759,16 @@ fn spawn_serving_preparation(
             candidates.sort_unstable();
             candidates.dedup();
             Ok::<_, anyhow::Error>(PairingResult::Prepared {
+                request,
                 settings,
                 candidates,
             })
         }
         .await
-        .unwrap_or_else(|error| PairingResult::PreparationFailed(error.to_string()));
+        .unwrap_or_else(|error| PairingResult::PreparationFailed {
+            request,
+            error: error.to_string(),
+        });
         let _ = results.send(result);
     });
 }
