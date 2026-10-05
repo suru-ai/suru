@@ -42,9 +42,6 @@ pub(crate) trait IdentityStore: Send + Sync {
 
     /// Keeps nothing as the item `item` from now on, whether or not it kept
     /// anything until now.
-    // Only a key moving from one store to another is deleted, and none moves
-    // yet.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn delete(&self, item: &ItemId) -> Result<(), StoreUnavailable>;
 }
 

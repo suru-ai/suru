@@ -292,7 +292,7 @@ impl KeptKey {
         let refused = match self.selection.store() {
             IdentityStoreChoice::System => match self.keep_in_store(&key) {
                 Ok(item) => {
-                    Marker::SystemStore { item, fingerprint }.write(&self.marker)?;
+                    self.mark_kept_in_store(item, fingerprint)?;
                     tracing::info!(
                         "Server identity key is made and kept in {PLATFORM_STORE}, as the item \
                          {item}: {why}"
@@ -316,6 +316,24 @@ impl KeptKey {
             ),
         }
         Ok(key)
+    }
+
+    /// Marks a new key the platform credential store keeps as the item
+    /// `item` as kept there. Where the marker cannot be written, the key was
+    /// never used, so it is taken out of the store again rather than left
+    /// behind at each failure. A Server stopping before the marker is
+    /// written leaves the one item, holding a key nothing ever used.
+    fn mark_kept_in_store(&self, item: ItemId, fingerprint: String) -> Result<()> {
+        let marked = Marker::SystemStore { item, fingerprint }.write(&self.marker);
+        if marked.is_err()
+            && let Err(left) = self.store.delete(&item)
+        {
+            tracing::warn!(
+                "a Server identity key never used is left in {PLATFORM_STORE}, as the item \
+                 {item}: {left:#}"
+            );
+        }
+        marked
     }
 
     /// Keeps `key` in the platform credential store as a new item, and reads
@@ -1007,6 +1025,31 @@ mod tests {
         assert!(told.contains("did not answer within 200ms"), "{told}");
         assert_eq!(identity.public_key().await.unwrap(), public_key);
         drop(stalled);
+    }
+
+    /// A first key the platform credential store took, whose marker cannot
+    /// be written, is not left in the store: that use fails, and the next
+    /// one able to write its marker keeps the one key it makes.
+    #[tokio::test]
+    async fn a_first_key_whose_marker_cannot_be_written_is_not_left_in_the_store() {
+        let directory = tempfile::tempdir().unwrap();
+        // Nothing can be written in a data directory that is not there.
+        let data_dir = directory.path().join("data");
+        let store = Arc::new(FakeIdentityStore::default());
+        let identity = IdentityKey::kept_in(&data_dir, kept_in(&store));
+
+        let error = identity.public_key().await.unwrap_err();
+        assert!(
+            format!("{error:#}").starts_with("write Server identity marker"),
+            "{error:#}"
+        );
+        assert!(store.contents().is_empty(), "the key is taken out again");
+
+        fs::create_dir(&data_dir).unwrap();
+        let public_key = identity.public_key().await.unwrap();
+        let kept = store.contents();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(public_key_of(&kept[&marked_item(&data_dir)]), public_key);
     }
 
     /// Two data directories with one platform credential store between them
