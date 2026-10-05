@@ -21,6 +21,7 @@ use std::{
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
 mod secret_service_store;
@@ -229,7 +230,9 @@ impl Drop for CallUnderWay {
 
 impl IdentityStore for BoundedStore {
     fn put(&self, item: &ItemId, label: &str, bytes: &[u8]) -> Result<(), StoreUnavailable> {
-        let (item, label, bytes) = (*item, label.to_owned(), bytes.to_vec());
+        let (item, label) = (*item, label.to_owned());
+        // Wiped once the call is over, given up on or not.
+        let bytes = Zeroizing::new(bytes.to_vec());
         self.call(move |store| store.put(&item, &label, &bytes))
     }
 

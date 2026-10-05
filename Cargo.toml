@@ -74,6 +74,8 @@ unicode-segmentation = "1.13.3"
 icu_normalizer = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
 icu_properties = "2.3.0"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
+# Wipes the copy of a Server identity key a call to the platform credential store is made with.
+zeroize = "1.9.0"
 x509-parser = "0.18.1"
 jsonc-parser = { version = "0.33.1", features = ["cst", "serde"] }
 github-copilot-sdk = { version = "1.0.15-preview.3", default-features = false }
