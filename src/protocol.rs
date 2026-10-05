@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 94;
+pub const PROTOCOL_VERSION: u32 = 95;
 mod attachment;
 mod reading;
 mod relay;
@@ -1458,13 +1458,20 @@ pub struct ProviderSettings {
     pub claude: ClaudeSettings,
 }
 
-/// How the Server's opt-in second listener is exposed. Keeping the bind
-/// address typed means malformed addresses are rejected by Settings loading
-/// before anything reaches the network boundary.
+/// Whether the Server is Serving, and how its opt-in second listener is
+/// exposed while it is. Keeping the bind address typed means malformed
+/// addresses are rejected by Settings loading before anything reaches the
+/// network boundary.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServingSettings {
+    /// Whether the Server accepts paired Servers at all, by whichever ways
+    /// it is reached.
     pub enabled: bool,
+    /// Whether, while Serving, the Server listens at addresses of its own:
+    /// one way it is reached, as each Relay it Serves through is another.
+    /// Off, it opens no port and is reached through its Relays alone.
+    pub listener: bool,
     pub port: u16,
     pub bind_address: IpAddr,
 }
@@ -1720,6 +1727,7 @@ impl Default for ServingSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            listener: true,
             port: 7777,
             // Unspecified dual-stack, because an Invite advertises the
             // machine's non-loopback addresses: a listener that cannot answer
@@ -2014,6 +2022,9 @@ pub enum SettingMutation {
         value: Option<ClaudePermissionMode>,
     },
     ServingEnabled {
+        value: Option<bool>,
+    },
+    ServingListener {
         value: Option<bool>,
     },
     ServingPort {

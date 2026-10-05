@@ -18,7 +18,7 @@ use rcgen::{KeyPair, PublicKeyData};
 use suru::{
     protocol::{
         IssueInviteRequest, PROTOCOL_VERSION, RedeemInviteRequest, Relay, RelayLoginOutcome,
-        SettingMutation, Way,
+        RemoteStatus, SessionErrorCode, SettingMutation, SettingsSnapshot, Way,
     },
     server::ServerTimings,
 };
@@ -71,11 +71,23 @@ impl TestServer {
     }
 
     pub(super) fn serving_address(&self) -> SocketAddr {
+        self.listening_at().expect("the Server is Serving")
+    }
+
+    /// Where the Serving listener listens, if anywhere.
+    pub(super) fn listening_at(&self) -> Option<SocketAddr> {
         self.server
             .as_ref()
             .expect("the Server is running")
             .serving_address()
-            .expect("the Server is Serving")
+    }
+
+    /// Turns the Serving listener on or off, as `on` says, answering the
+    /// Settings then in force or why the listener could not follow them.
+    pub(super) async fn listen(&self, on: bool) -> anyhow::Result<SettingsSnapshot> {
+        self.client
+            .mutate_setting(SettingMutation::ServingListener { value: Some(on) })
+            .await
     }
 
     /// The identity key this Server pairs and proves itself by.
@@ -368,6 +380,19 @@ async fn refused_in_handshake<S: AsyncRead + AsyncWrite + Send + Unpin + 'static
         Ok(mut multiplexed) => multiplexed.health().await.is_err(),
         Err(_) => true,
     }
+}
+
+/// That nothing listens at `address`: a connection there is refused, and its
+/// port is free for anything else to take.
+pub(super) async fn nothing_listens_at(address: SocketAddr) {
+    tokio::net::TcpStream::connect(address)
+        .await
+        .expect_err("nothing listens there");
+    drop(
+        tokio::net::TcpListener::bind(address)
+            .await
+            .unwrap_or_else(|error| panic!("nothing holds {address}: {error}")),
+    );
 }
 
 /// Whether the connection `stream` stands for has ended.
@@ -1074,5 +1099,230 @@ async fn a_join_taken_up_before_serve_through_is_turned_off_and_on_again_is_not_
         !taken,
         "a join taken up before Serving through the Relay was turned off is not handed on once \
          it is turned on again"
+    );
+}
+
+/// Turning the listener off closes it, and every connection dialled to it —
+/// so a Peer that reaches the Server only there finds it Unreachable — and
+/// turning it on listens again where it did; neither disturbs the Server's
+/// Clients, its connection to the Relay, or what the Relay carries. A port
+/// taken meanwhile is said to be, and the Relay carries as before.
+#[tokio::test]
+async fn turning_the_listener_off_and_on_closes_what_was_dialled_and_leaves_what_the_relay_carries()
+{
+    // So long a handshake timeout that a connection dialled to the listener
+    // is let go within the test only by the listener's closing.
+    let serving = ServingThrough::with_timings(
+        "relay-listener-turned",
+        super::relay_timings().with_serving_handshake_timeout(Duration::from_secs(600)),
+    )
+    .await;
+    let (laptop, workstation) = (serving.laptop.identity(), serving.workstation.identity());
+    let laptop_key = serving.laptop.config.data_dir().join("server-identity.pk8");
+    // The listener opens again where it was, where the laptop, paired with
+    // it there alone, finds it.
+    let listened = serving.workstation.serving_address();
+    serving
+        .workstation
+        .client
+        .mutate_setting(SettingMutation::ServingPort {
+            value: Some(listened.port()),
+        })
+        .await
+        .expect("keep the listener's port");
+    let mut carried = Multiplexed::over(
+        paired_tls(serving.join().await, &laptop, &workstation)
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(carried.health().await.unwrap(), StatusCode::OK);
+    // Dialled first, and taken first, so it is handshaking — and saying
+    // nothing — by the time the connection dialled after it is answered.
+    let mut handshaking = tokio::net::TcpStream::connect(listened).await.unwrap();
+    let mut direct = crate::open_paired_health_connection(
+        listened,
+        &laptop_key,
+        workstation.subject_public_key_info(),
+    )
+    .await;
+    let relay_connections = serving.relay.route.opened_connections();
+
+    let turned = serving
+        .workstation
+        .listen(false)
+        .await
+        .expect("turn the listener off");
+    assert!(!turned.settings.serving.listener && turned.settings.serving.enabled);
+    assert_eq!(serving.workstation.listening_at(), None);
+    nothing_listens_at(listened).await;
+    assert!(
+        ended(&mut direct).await,
+        "a connection dialled to the listener closes with it"
+    );
+    assert!(
+        ended(&mut handshaking).await,
+        "one yet to finish its handshake among them"
+    );
+    assert_eq!(
+        carried.health().await.unwrap(),
+        StatusCode::OK,
+        "what the Relay carries stands"
+    );
+    assert_eq!(
+        serving
+            .laptop
+            .client
+            .probe_remote("workstation")
+            .await
+            .expect("probe the Remote")
+            .status,
+        RemoteStatus::Unavailable,
+        "a Peer paired with the listener alone finds the Server Unreachable"
+    );
+    serving
+        .workstation
+        .client
+        .list_peers()
+        .await
+        .expect("the Server's own Client goes on as before");
+
+    // The port taken meanwhile, the listener cannot open there, and says so.
+    let occupant = tokio::net::TcpListener::bind(listened).await.unwrap();
+    let refused = serving
+        .workstation
+        .listen(true)
+        .await
+        .expect_err("a listener cannot open at a port taken");
+    assert!(
+        format!("{refused:#}").contains(&format!("bind Serving listener to {listened}")),
+        "{refused:#}"
+    );
+    assert_eq!(serving.workstation.listening_at(), None);
+    let invite = serving
+        .workstation
+        .client
+        .issue_invite(IssueInviteRequest {
+            ways: vec![Way::Direct(listened)],
+        })
+        .await
+        .expect_err("an Invite offers no address the listener could not open at");
+    assert_eq!(
+        super::error_code(&invite),
+        SessionErrorCode::InvalidInviteWays
+    );
+    assert!(
+        format!("{invite:#}").contains("the Serving listener could not open"),
+        "{invite:#}"
+    );
+    assert_eq!(
+        carried.health().await.unwrap(),
+        StatusCode::OK,
+        "the Relay carries as before"
+    );
+    drop(occupant);
+
+    serving
+        .workstation
+        .listen(true)
+        .await
+        .expect("the port free again, the listener opens there");
+    assert_eq!(serving.workstation.listening_at(), Some(listened));
+    crate::open_paired_health_connection(
+        listened,
+        &laptop_key,
+        workstation.subject_public_key_info(),
+    )
+    .await;
+    serving
+        .laptop
+        .wait_for_remote(RemoteStatus::Available)
+        .await;
+    assert_eq!(carried.health().await.unwrap(), StatusCode::OK);
+    assert_eq!(
+        serving.relay.route.opened_connections(),
+        relay_connections,
+        "neither Server connected to the Relay again"
+    );
+
+    serving.shutdown().await;
+}
+
+/// Changes of the listener asked for at once, each arriving while another
+/// is put in force, end with it as the Settings last say: every opening
+/// finds the port the one before let go, and nothing listens once it is
+/// off.
+#[tokio::test]
+async fn the_listener_turned_off_and_on_at_once_ends_as_the_settings_last_say() {
+    let serving = ServingThrough::start("relay-listener-flipped").await;
+    let (laptop, workstation) = (serving.laptop.identity(), serving.workstation.identity());
+    let listened = serving.workstation.serving_address();
+    serving
+        .workstation
+        .client
+        .mutate_setting(SettingMutation::ServingPort {
+            value: Some(listened.port()),
+        })
+        .await
+        .expect("keep the listener's port");
+    let mut carried = Multiplexed::over(
+        paired_tls(serving.join().await, &laptop, &workstation)
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let flips = [false, true, false, true, false, false, true, false, true];
+    let answers =
+        futures_util::future::join_all(flips.map(|on| serving.workstation.listen(on))).await;
+    for answer in answers {
+        answer.expect("each change is put in force, a listener opening where the last closed");
+    }
+    let in_force = serving
+        .workstation
+        .client
+        .mutate_setting(SettingMutation::AppearanceShowIcons { value: None })
+        .await
+        .expect("read the Settings in force");
+    assert_eq!(
+        serving.workstation.listening_at(),
+        in_force.settings.serving.listener.then_some(listened),
+        "the listener stands as the Settings last say"
+    );
+
+    serving
+        .workstation
+        .listen(false)
+        .await
+        .expect("turn the listener off");
+    nothing_listens_at(listened).await;
+    serving.workstation.listen(true).await.expect("and on");
+    tokio::net::TcpStream::connect(listened)
+        .await
+        .expect("one listener listens");
+    assert_eq!(
+        carried.health().await.unwrap(),
+        StatusCode::OK,
+        "and the Relay carried through it all"
+    );
+
+    serving.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_join_taken_up_before_the_listener_is_turned_off_and_on_again_is_still_handed_on() {
+    let taken = hold_a_take_up("relay-held-take-up-listener", |server, _| async move {
+        for on in [false, true] {
+            server.listen(on).await.expect("turn the listener");
+        }
+        server
+    })
+    .await;
+    assert!(
+        taken,
+        "turning the listener begins no other stretch of Serving, and the Server's waiting at \
+         the Relay stands"
     );
 }

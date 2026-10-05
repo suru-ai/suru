@@ -680,7 +680,12 @@ async fn no_setting_governing_serving_or_pairing_is_listed_described_or_set() {
         .into_iter()
         .map(|descriptor| descriptor.key)
         .collect::<Vec<_>>();
-    for key in ["serving.enabled", "serving.port", "serving.bindAddress"] {
+    for key in [
+        "serving.enabled",
+        "serving.listener",
+        "serving.port",
+        "serving.bindAddress",
+    ] {
         assert!(withheld.contains(&key), "{key} is withheld: {withheld:?}");
     }
 
@@ -694,6 +699,7 @@ async fn no_setting_governing_serving_or_pairing_is_listed_described_or_set() {
         let attempts = [
             ("describe_setting", json!({ "key": key })),
             ("set_setting", json!({ "key": key, "value": true })),
+            ("set_setting", json!({ "key": key, "value": false })),
             ("set_setting", json!({ "key": key, "value": 7777 })),
             ("set_setting", json!({ "key": key, "value": "0.0.0.0" })),
             ("set_setting", json!({ "key": key })),
@@ -715,7 +721,9 @@ async fn no_setting_governing_serving_or_pairing_is_listed_described_or_set() {
     );
     let (_client, in_force) = attached_client(state_dir.path(), channel).await;
     assert!(
-        !in_force.settings.serving.enabled && in_force.settings.serving.port == 9443,
+        !in_force.settings.serving.enabled
+            && in_force.settings.serving.listener
+            && in_force.settings.serving.port == 9443,
         "and nothing about Serving moved"
     );
 

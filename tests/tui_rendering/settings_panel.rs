@@ -793,13 +793,29 @@ fn the_experimental_tab_stands_past_the_providers_and_lists_the_settings_declare
         !has_row(&application, "Session content width") && !has_row(&application, "Codex"),
         "the Experimental tab lists its own Settings and nobody else's"
     );
-    for label in ["Serving", "Serving port", "Serving bind address"] {
+    for label in [
+        "Serving",
+        "Serving listener",
+        "Serving port",
+        "Serving bind address",
+    ] {
         assert!(
             has_row(&application, label),
             "the Experimental tab presents the {label} Server Setting"
         );
     }
-    for key in ["serving.enabled", "serving.port", "serving.bindAddress"] {
+    let listener = row(&application, "Serving listener");
+    assert!(
+        listener.contains("true [default]"),
+        "the listener is on until the reader turns it off, so Serving opens it as it always \
+         has: {listener:?}"
+    );
+    for key in [
+        "serving.enabled",
+        "serving.listener",
+        "serving.port",
+        "serving.bindAddress",
+    ] {
         let descriptor = suru::settings::SCHEMA
             .iter()
             .find(|descriptor| descriptor.key == key)

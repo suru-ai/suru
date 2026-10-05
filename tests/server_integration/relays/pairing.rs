@@ -22,7 +22,7 @@ use suru::{
         IssueInviteRequest, Outlook, PROTOCOL_VERSION, PromptDelivery, PromptId,
         RedeemInviteRequest, RelayState, Remote, RemoteHealth, RemoteStatus,
         SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SessionChange, SessionError,
-        SessionErrorCode, SessionSnapshot, SessionUpdate, UnreachableReason, Way,
+        SessionErrorCode, SessionSnapshot, SessionUpdate, SettingMutation, UnreachableReason, Way,
     },
     server::ServerTimings,
 };
@@ -36,7 +36,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::{
     RelaySocket, TestRelay, TestServer, error_code, greet, heard, relay_timings, scripted_relay,
-    serving::{Multiplexed, paired_tls},
+    serving::{Multiplexed, nothing_listens_at, paired_tls},
     tell,
 };
 use crate::support::PROGRESS_DEADLINE;
@@ -263,6 +263,92 @@ async fn a_relay_the_server_serves_through_is_offered_by_an_invite_and_redeemed_
         .expect("reach the Remote through the Relay");
     assert_eq!(health.status, RemoteStatus::Available);
     assert_eq!(health.protocol_version, Some(PROTOCOL_VERSION));
+
+    laptop.shutdown().await;
+    workstation.shutdown().await;
+}
+
+/// A Server Serving through a Relay with its listener off opens no port at
+/// all: an Invite offers none of its own addresses, and it is paired with
+/// and reached through the Relay alone, as one listening too would be. With
+/// Serving off, nothing reaches it by any way.
+#[tokio::test]
+async fn a_server_serving_with_its_listener_off_is_paired_and_reached_through_its_relay_alone() {
+    let relay = TestRelay::start().await;
+    let workstation = TestServer::start("relay-listener-off-workstation").await;
+    let laptop = TestServer::start("relay-listener-off-laptop").await;
+    // Where the listener would listen were it on: a port nothing holds.
+    let unheld = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .and_then(|listener| listener.local_addr())
+        .expect("find a port nothing holds");
+    for mutation in [
+        SettingMutation::ServingListener { value: Some(false) },
+        SettingMutation::ServingPort {
+            value: Some(unheld.port()),
+        },
+        SettingMutation::ServingBindAddress {
+            value: Some(unheld.ip()),
+        },
+        SettingMutation::ServingEnabled { value: Some(true) },
+    ] {
+        workstation
+            .client
+            .mutate_setting(mutation)
+            .await
+            .expect("Serve with the listener off");
+    }
+    assert_eq!(workstation.listening_at(), None);
+    nothing_listens_at(unheld).await;
+    for server in [&workstation, &laptop] {
+        server.log_in(&relay, "583231", "octocat").await;
+    }
+    workstation.serve_through(&relay, true).await;
+    workstation.waiting_at(&relay, &laptop).await;
+
+    let through = Way::Relay(relay.address());
+    let refused = workstation
+        .client
+        .issue_invite(IssueInviteRequest {
+            ways: vec![Way::Direct(unheld), through.clone()],
+        })
+        .await
+        .expect_err("an Invite offers no address of a Server that listens at none");
+    assert_eq!(error_code(&refused), SessionErrorCode::InvalidInviteWays);
+    assert!(
+        error_message(&refused).contains(&format!(
+            "the Serving listener is off, so an Invite offers none of this Server's own \
+             addresses, {unheld} among them"
+        )),
+        "{refused:#}"
+    );
+    let invite = workstation.invite(vec![through.clone()]).await;
+    let remote = laptop
+        .redeem_as(invite, REMOTE)
+        .await
+        .expect("pair through the Relay with the listener off");
+    assert_eq!(remote.ways, vec![through]);
+    assert_eq!(remote.fingerprint, workstation.fingerprint());
+    let health = laptop
+        .client
+        .probe_remote(REMOTE)
+        .await
+        .expect("reach the Remote through the Relay");
+    assert_eq!(health.status, RemoteStatus::Available);
+    let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
+    RemoteApi::of(&laptop).begin_session(workspace.path()).await;
+    assert_eq!(workstation.listening_at(), None);
+    nothing_listens_at(unheld).await;
+
+    workstation.stop_serving().await;
+    relay
+        .voice()
+        .no_longer_waiting(
+            &laptop.identity(),
+            &workstation.identity().subject_public_key_info(),
+        )
+        .await;
+    laptop.wait_for_remote(RemoteStatus::Unavailable).await;
+    nothing_listens_at(unheld).await;
 
     laptop.shutdown().await;
     workstation.shutdown().await;

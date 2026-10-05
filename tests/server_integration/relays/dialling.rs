@@ -239,6 +239,51 @@ async fn a_remote_is_reached_directly_then_through_the_relay_then_directly_again
     paired.shutdown().await;
 }
 
+/// A laptop carried directly to a workstation whose user turns its listener
+/// off loses that connection with it, and is carried through the Relay the
+/// Pairing also offers, with nothing for its user to do.
+#[tokio::test]
+async fn a_remote_whose_listener_is_turned_off_is_carried_through_the_relay_on_its_own() {
+    // So long a head start that only the direct way failing outright, never
+    // one slow to answer, lets the Relay carry a dial within the test.
+    let paired = PairedBothWays::start(
+        "relay-dialling-listener-off",
+        relay_timings().with_direct_head_start(Duration::from_secs(60)),
+    )
+    .await;
+    let remote = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()));
+    let mut catalog = remote.subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+    assert!(paired.direct.connections() >= 1);
+    assert_eq!(
+        paired.relay.route.opened_connections(),
+        paired.unjoined,
+        "carried directly while the listener listens"
+    );
+
+    paired
+        .workstation
+        .listen(false)
+        .await
+        .expect("turn the workstation's listener off");
+    until_recovering(&mut catalog).await;
+    until_recovered(&mut catalog).await;
+    assert!(
+        paired.relay.route.opened_connections() > paired.unjoined,
+        "the Relay carries the Remote once its listener is off"
+    );
+    assert_eq!(paired.probe().await, RemoteStatus::Available);
+
+    drop(catalog);
+    paired.shutdown().await;
+}
+
 /// Once a joined stream stands, what is asked of the Remote rides it at once
 /// while the direct way neither answers nor fails: the head start is waited
 /// out only where a fresh connection is needed.

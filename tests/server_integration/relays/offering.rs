@@ -225,6 +225,63 @@ async fn a_pairing_formed_directly_gains_a_relay_way_and_is_reached_through_it_o
     paired.shutdown().await;
 }
 
+/// A laptop paired with a workstation by its listener alone, and carried
+/// directly, loses that connection as the workstation's listener is turned
+/// off, and is carried on its own through the Relay it learned the
+/// workstation Serves through. The listener is no Relay, so turning it off
+/// tells the laptop nothing new of the Relays.
+#[tokio::test]
+async fn a_remote_whose_listener_is_turned_off_is_carried_through_a_relay_it_learned() {
+    // So long a head start that only the direct way failing outright, never
+    // one slow to answer, lets the Relay carry a dial within the test.
+    let mut paired = PairedDirectly::with_timings(
+        "relay-offering-listener-off",
+        true,
+        relay_timings()
+            .with_told_relays_store_interval(STORED_SOON)
+            .with_direct_head_start(Duration::from_secs(60)),
+    )
+    .await;
+    let (direct, relayed) = (paired.direct_way(), paired.relay_way());
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+    paired.workstation.serve_through(&paired.relay, true).await;
+    paired
+        .laptop
+        .wait_for_remote_ways(&[direct.clone(), relayed.clone()])
+        .await;
+    paired.relay.route.wait_for_connections(2).await;
+    let unjoined = paired.relay.route.opened_connections();
+
+    paired
+        .workstation
+        .listen(false)
+        .await
+        .expect("turn the workstation's listener off");
+    until_recovering(&mut catalog).await;
+    until_recovered(&mut catalog).await;
+    assert!(
+        paired.relay.route.opened_connections() > unjoined,
+        "the Relay the laptop learned carries the Remote once its listener is off"
+    );
+    assert_eq!(paired.probe_why().await, (RemoteStatus::Available, None));
+    assert_eq!(
+        paired.laptop.remote_ways().await,
+        [direct, relayed],
+        "the Relays told of are as they were"
+    );
+
+    drop(catalog);
+    paired.shutdown().await;
+}
+
 /// A Remote reached through a Relay its Serving Server stops Serving through
 /// drops that way as it is told, over the joined stream already carrying the
 /// Remote — which stands where it is — and no longer dials it: nothing more is

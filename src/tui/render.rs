@@ -39,7 +39,7 @@ use super::{
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
     relay_overlay::serve_through_status,
-    serve_overlay::CandidateWay,
+    serve_overlay::{CandidateWay, LISTENER_OFF, ServeWays},
     session_picker::SessionPickerRow,
     settings_panel::{
         PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, TabBar, TabSpan,
@@ -1375,29 +1375,46 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
         theme.text.primary.add_modifier(Modifier::BOLD),
     )];
     let content_width = area.width.saturating_sub(2);
-    // The Relays are listed as the Server last pictured them, so the ways
-    // follow them while the reader chooses.
-    let candidates = state
-        .serve_overlay
-        .candidates(state.relay_overlay.held_relays());
-    // What went wrong and the keys are laid out first, wrapped whole, so the
+    // The listener as the Settings in force have it, and the Relays as the
+    // Server last pictured them, so the ways follow both while the reader
+    // chooses.
+    let ways = ServeWays::of(state.settings(), state.relay_overlay.held_relays());
+    let candidates = state.serve_overlay.candidates(ways);
+    if !ways.listener {
+        lines.extend(wrapped_lines(
+            LISTENER_OFF,
+            content_width,
+            theme.text.subdued,
+        ));
+    }
+    // What went wrong, what would give an Invite a way where it has none at
+    // all to offer, and the keys are laid out first, wrapped whole, so the
     // ways are given only the Rows they leave.
     let error = state.serve_overlay.error().map_or_else(Vec::new, |error| {
         wrapped_lines(error, content_width, theme.feedback.error)
     });
+    let no_way = state
+        .serve_overlay
+        .nothing_to_offer(ways)
+        .map_or_else(Vec::new, |no_way| {
+            wrapped_lines(no_way, content_width, theme.feedback.error)
+        });
     let keys = wrapped_lines(
         "↑↓ move · Space toggle · Enter issue Invite · Esc close",
         content_width,
         theme.text.subdued,
     );
     if candidates.is_empty() {
-        lines.push(Line::styled(
-            "No non-loopback addresses found",
-            theme.feedback.error,
-        ));
+        if ways.listener {
+            lines.push(Line::styled(
+                "No non-loopback addresses found",
+                theme.feedback.error,
+            ));
+        }
     } else {
         let content_height = usize::from(area.height.saturating_sub(2));
-        let capacity = content_height.saturating_sub(lines.len() + error.len() + keys.len());
+        let capacity =
+            content_height.saturating_sub(lines.len() + error.len() + no_way.len() + keys.len());
         let selected = state.serve_overlay.focused(&candidates);
         // A Relay's address wraps beneath its mark across as many Rows as the
         // box is narrow, so each way is one entry however many Rows it takes.
@@ -1425,6 +1442,7 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
                 .take(capacity),
         );
     }
+    lines.extend(no_way);
     lines.extend(error);
     lines.extend(keys);
     render_overlay_box(

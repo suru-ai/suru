@@ -85,6 +85,7 @@ const PROVIDER_COPILOT_PERMISSIONS: &str = "provider.copilot.permissions";
 const PROVIDER_CLAUDE_ENABLED: &str = "provider.claude.enabled";
 const PROVIDER_CLAUDE_PERMISSION_MODE: &str = "provider.claude.permissionMode";
 const SERVING_ENABLED: &str = "serving.enabled";
+const SERVING_LISTENER: &str = "serving.listener";
 const SERVING_PORT: &str = "serving.port";
 const SERVING_BIND_ADDRESS: &str = "serving.bindAddress";
 const BROKER_ENABLED: &str = "broker.enabled";
@@ -816,6 +817,9 @@ fn in_force(mutation: &SettingMutation, settings: &EffectiveSettings) -> Setting
         }
         SettingMutation::ServingEnabled { .. } => SettingMutation::ServingEnabled {
             value: Some(settings.serving.enabled),
+        },
+        SettingMutation::ServingListener { .. } => SettingMutation::ServingListener {
+            value: Some(settings.serving.listener),
         },
         SettingMutation::ServingPort { .. } => SettingMutation::ServingPort {
             value: Some(settings.serving.port),
@@ -1728,7 +1732,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
     SettingDescriptor {
         key: SERVING_ENABLED,
         label: "Serving",
-        description: "Whether this Server accepts paired Servers on its second listener",
+        description: "Whether this Server accepts paired Servers at all, on its listener or through the Relays it Serves through",
         group: SettingGroup::Experimental,
         scope: SettingScope::Server,
         sidekick: SidekickAccess::Hidden,
@@ -1746,6 +1750,30 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |enabled| {
                 settings.serving.enabled = enabled;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: SERVING_LISTENER,
+        label: "Serving listener",
+        description: "Whether, while Serving, this Server is reached at addresses of its own beside the Relays it Serves through",
+        group: SettingGroup::Experimental,
+        scope: SettingScope::Server,
+        sidekick: SidekickAccess::Hidden,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "true",
+                build_mutation: || SettingMutation::ServingListener { value: Some(true) },
+            },
+            SettingChoice {
+                value: "false",
+                build_mutation: || SettingMutation::ServingListener { value: Some(false) },
+            },
+        ]),
+        reset: SettingMutation::ServingListener { value: None },
+        apply: |settings, value| {
+            apply_value(value, |listener| {
+                settings.serving.listener = listener;
             })
         },
     },
@@ -2097,6 +2125,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
             (PROVIDER_CLAUDE_PERMISSION_MODE, pinned(value))
         }
         SettingMutation::ServingEnabled { value } => (SERVING_ENABLED, pinned(value)),
+        SettingMutation::ServingListener { value } => (SERVING_LISTENER, pinned(value)),
         SettingMutation::ServingPort { value } => (SERVING_PORT, pinned(value)),
         SettingMutation::ServingBindAddress { value } => (SERVING_BIND_ADDRESS, pinned(value)),
         SettingMutation::BrokerEnabled { value } => (BROKER_ENABLED, pinned(value)),
@@ -2636,6 +2665,7 @@ mod tests {
                 "one of true or false".to_owned(),
                 "one of \"default\", \"acceptEdits\", \"dontAsk\", \"bypassPermissions\", or \"auto\"".to_owned(),
                 "one of false or true".to_owned(),
+                "one of true or false".to_owned(),
                 "a port from 0 to 65535".to_owned(),
                 "one of \"127.0.0.1\", \"::1\", \"0.0.0.0\", \"::\", or an IP address".to_owned(),
                 "one of true or false".to_owned(),
@@ -2964,6 +2994,7 @@ mod tests {
         let moved = EffectiveSettings {
             serving: crate::protocol::ServingSettings {
                 enabled: !defaults.serving.enabled,
+                listener: !defaults.serving.listener,
                 port: defaults.serving.port.wrapping_add(1),
                 bind_address: if defaults.serving.bind_address.is_loopback() {
                     IpAddr::V6(Ipv6Addr::UNSPECIFIED)
@@ -2987,7 +3018,12 @@ mod tests {
         }
         assert_eq!(
             followed,
-            [SERVING_ENABLED, SERVING_PORT, SERVING_BIND_ADDRESS]
+            [
+                SERVING_ENABLED,
+                SERVING_LISTENER,
+                SERVING_PORT,
+                SERVING_BIND_ADDRESS
+            ]
         );
     }
 
@@ -3073,7 +3109,12 @@ mod tests {
     fn a_sidekick_reads_and_changes_every_setting_but_those_declared_otherwise() {
         assert_eq!(
             declaring(|access| access == SidekickAccess::Hidden),
-            ["serving.enabled", "serving.port", "serving.bindAddress"]
+            [
+                "serving.enabled",
+                "serving.listener",
+                "serving.port",
+                "serving.bindAddress"
+            ]
         );
         assert_eq!(
             declaring(|access| matches!(access, SidekickAccess::ReadOnly { .. })),
@@ -3087,7 +3128,7 @@ mod tests {
         );
         assert_eq!(
             declaring(|access| access == SidekickAccess::ReadAndChange).len(),
-            SCHEMA.len() - 8
+            SCHEMA.len() - 9
         );
         for descriptor in SCHEMA {
             if let SidekickAccess::ReadOnly { why } = descriptor.sidekick {

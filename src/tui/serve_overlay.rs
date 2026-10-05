@@ -1,12 +1,15 @@
 //! View state for the Serving user's picker of the ways an Invite offers, and
 //! Invite manager.
 //!
-//! The ways are the machine's own addresses, found as `/serve` opens, and the
-//! Client's own Server's Relays as the Server last pictured them, followed
-//! while the picker stands. A Relay is offered where the Server Serves
-//! through it and holds a Login there that stands — what the Server asks of
-//! a Relay an Invite offers — and shown otherwise with why, so no Invite is
-//! asked for that the Server would refuse without the reader knowing why.
+//! The ways are the machine's own addresses, found as `/serve` opens and
+//! listed while the Serving listener is on, and the Client's own Server's
+//! Relays as the Server last pictured them, each followed while the picker
+//! stands. A Relay is offered where the Server Serves through it and holds a
+//! Login there that stands — what the Server asks of a Relay an Invite
+//! offers — and shown otherwise with why, so no Invite is asked for that the
+//! Server would refuse without the reader knowing why. With the listener off
+//! the picker says why it lists no address, and with nothing at all to
+//! offer, what would give it something.
 //!
 //! Preparing the picker and the Invite asked for each name themselves with a
 //! [`ServeRequest`], and only the answer to the one awaited is taken: one the
@@ -16,9 +19,39 @@
 
 use std::{cell::Cell, collections::HashSet};
 
-use crate::protocol::{IssueInviteRequest, IssuedInvite, Peer, Relay, RelayState, Way};
+use crate::protocol::{
+    EffectiveSettings, IssueInviteRequest, IssuedInvite, Peer, Relay, RelayState, Way,
+};
 
 use super::list_window::ListWindow;
+
+/// What the picker says in place of the machine's addresses while the
+/// Serving listener is off.
+pub(super) const LISTENER_OFF: &str =
+    "The Serving listener is off, so an Invite offers none of this machine's addresses";
+
+/// What the picker says where the Serving listener is off and no Relay can be
+/// offered either, so an Invite has no way at all to offer.
+pub(super) const NO_WAY: &str = "An Invite has no way to offer: turn the Serving listener on in \
+                                 the settings panel, or Serve through a Relay from /relay";
+
+/// What the ways an Invite may offer stand on, followed while the picker
+/// stands: whether the Serving listener is on, as the Settings in force say,
+/// and the Client's own Server's Relays as the Server last pictured them.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ServeWays<'a> {
+    pub(super) listener: bool,
+    pub(super) relays: &'a [Relay],
+}
+
+impl<'a> ServeWays<'a> {
+    pub(super) fn of(settings: &EffectiveSettings, relays: &'a [Relay]) -> Self {
+        Self {
+            listener: settings.serving.listener,
+            relays,
+        }
+    }
+}
 
 /// One request the picker sent the Client's own Server — to prepare Serving,
 /// or to issue an Invite — told apart from every other so its answer reaches
@@ -64,7 +97,8 @@ enum ServeOverlayState {
 /// offered while the picker stands is offered with the rest.
 #[derive(Clone, Debug, Default)]
 struct Choice {
-    /// The machine's own addresses, as found when the picker opened.
+    /// The machine's own addresses, as found when the picker opened, listed
+    /// while the Serving listener is on.
     addresses: Vec<Way>,
     left_out: HashSet<Way>,
     /// The way the keys are on, once they have moved.
@@ -98,15 +132,21 @@ impl Choice {
         self.at.set(index);
     }
 
-    /// The ways the picker lists, the machine's addresses first and then the
-    /// Server's Relays, each with whether the reader has it offered.
-    fn candidates(&self, relays: &[Relay]) -> Vec<CandidateWay> {
-        let addresses = self.addresses.iter().map(|way| CandidateWay {
+    /// The ways the picker lists, the machine's addresses first — while the
+    /// Serving listener is on — and then the Server's Relays, each with
+    /// whether the reader has it offered.
+    fn candidates(&self, ways: ServeWays<'_>) -> Vec<CandidateWay> {
+        let listed = if ways.listener {
+            self.addresses.as_slice()
+        } else {
+            &[]
+        };
+        let addresses = listed.iter().map(|way| CandidateWay {
             way: way.clone(),
             chosen: !self.left_out.contains(way),
             withheld: None,
         });
-        let relays = relays.iter().map(|relay| {
+        let relays = ways.relays.iter().map(|relay| {
             let way = Way::Relay(relay.address.clone());
             let withheld = Withheld::of(relay);
             CandidateWay {
@@ -230,13 +270,26 @@ impl ServeOverlay {
         self.window.open();
     }
 
-    /// The ways the picker lists, as `relays` — the Server's, as it last
-    /// pictured them — stand now.
-    pub(super) fn candidates(&self, relays: &[Relay]) -> Vec<CandidateWay> {
+    /// The ways the picker lists, as `ways` stand now.
+    pub(super) fn candidates(&self, ways: ServeWays<'_>) -> Vec<CandidateWay> {
         match &self.state {
-            ServeOverlayState::Choosing(choice) => choice.candidates(relays),
+            ServeOverlayState::Choosing(choice) => choice.candidates(ways),
             _ => Vec::new(),
         }
+    }
+
+    /// Why an Invite has no way at all to offer, as `ways` stand now, where
+    /// it has none for want of the Serving listener: every Relay listed, if
+    /// any, withheld, and the listener off.
+    pub(super) fn nothing_to_offer(&self, ways: ServeWays<'_>) -> Option<&'static str> {
+        let ServeOverlayState::Choosing(choice) = &self.state else {
+            return None;
+        };
+        let offerable = choice
+            .candidates(ways)
+            .iter()
+            .any(|candidate| candidate.withheld.is_none());
+        (!ways.listener && !offerable).then_some(NO_WAY)
     }
 
     /// Where among `candidates` — the ways listed — the keys stand.
@@ -265,10 +318,10 @@ impl ServeOverlay {
         }
     }
 
-    pub(super) fn select_previous(&mut self, relays: &[Relay]) {
+    pub(super) fn select_previous(&mut self, ways: ServeWays<'_>) {
         match &mut self.state {
             ServeOverlayState::Choosing(choice) => {
-                let candidates = choice.candidates(relays);
+                let candidates = choice.candidates(ways);
                 if !candidates.is_empty() {
                     let index = choice
                         .focused(&candidates)
@@ -292,10 +345,10 @@ impl ServeOverlay {
         }
     }
 
-    pub(super) fn select_next(&mut self, relays: &[Relay]) {
+    pub(super) fn select_next(&mut self, ways: ServeWays<'_>) {
         match &mut self.state {
             ServeOverlayState::Choosing(choice) => {
-                let candidates = choice.candidates(relays);
+                let candidates = choice.candidates(ways);
                 if !candidates.is_empty() {
                     let index = (choice.focused(&candidates) + 1) % candidates.len();
                     choice.focus_on(&candidates, index);
@@ -319,11 +372,11 @@ impl ServeOverlay {
     /// Offers the way the keys are on where it is left out, and leaves it
     /// out where it is offered. A Relay an Invite cannot offer says instead
     /// what would have one offer it.
-    pub(super) fn toggle_selected(&mut self, relays: &[Relay]) {
+    pub(super) fn toggle_selected(&mut self, ways: ServeWays<'_>) {
         let ServeOverlayState::Choosing(choice) = &mut self.state else {
             return;
         };
-        let candidates = choice.candidates(relays);
+        let candidates = choice.candidates(ways);
         let index = choice.focused(&candidates);
         choice.focus_on(&candidates, index);
         let Some(candidate) = candidates.get(index) else {
@@ -340,29 +393,33 @@ impl ServeOverlay {
     }
 
     /// Asks for an Invite offering exactly the ways chosen among those
-    /// `relays` leave an Invite able to offer, answering the request that
+    /// `ways` leave an Invite able to offer, answering the request that
     /// asks.
     pub(super) fn issue_request(
         &mut self,
-        relays: &[Relay],
+        ways: ServeWays<'_>,
     ) -> Option<(ServeRequest, IssueInviteRequest)> {
+        let nothing_to_offer = self.nothing_to_offer(ways);
         let ServeOverlayState::Choosing(choice) = &mut self.state else {
             return None;
         };
-        let ways = choice
-            .candidates(relays)
+        let chosen = choice
+            .candidates(ways)
             .into_iter()
             .filter(|candidate| candidate.chosen)
             .map(|candidate| candidate.way)
             .collect::<Vec<_>>();
-        if ways.is_empty() {
-            choice.error = Some("Choose at least one address".to_owned());
+        if chosen.is_empty() {
+            // Where nothing at all can be offered, the picker says so already.
+            if nothing_to_offer.is_none() {
+                choice.error = Some("Choose at least one address".to_owned());
+            }
             return None;
         }
         let choice = std::mem::take(choice);
         let request = self.issue();
         self.state = ServeOverlayState::Issuing { request, choice };
-        Some((request, IssueInviteRequest { ways }))
+        Some((request, IssueInviteRequest { ways: chosen }))
     }
 
     /// Shows the Invite the Server issued for the request awaited.

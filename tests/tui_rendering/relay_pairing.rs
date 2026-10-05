@@ -40,6 +40,13 @@ const INVITE: &str = "suru-v1-through-the-relay";
 const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 /// The run of the Client's own Server the tests' Relays come from.
 const SERVER: uuid::Uuid = uuid::Uuid::from_u128(7);
+/// What `/serve` says in place of the machine's addresses while the Serving
+/// listener is off.
+const LISTENER_OFF: &str =
+    "The Serving listener is off, so an Invite offers none of this machine's addresses";
+/// What `/serve` says where the listener is off and no Relay can be offered.
+const NO_WAY: &str = "An Invite has no way to offer: turn the Serving listener on in the \
+                      settings panel, or Serve through a Relay from /relay";
 const NO_LOGIN: &str = "this Server holds no Login at the Relay at https://relay.company.example; \
                         log in there, then try again";
 const DIFFERENT_ACCOUNTS: &str = "this Server is logged in at the Relay at \
@@ -413,6 +420,86 @@ fn serve_follows_the_relays_as_the_server_pushes_them_while_the_ways_are_chosen(
     );
     let (_, issuance) = issuance(press(&mut application, KeyCode::Enter));
     assert_eq!(issuance.ways, vec![direct()]);
+}
+
+/// While the Serving listener is off, `/serve` lists none of the machine's
+/// addresses and says why, following the Setting as it changes while the
+/// ways are chosen as it follows the Relays, and an Invite then offers the
+/// Relays alone.
+#[test]
+fn serve_offers_no_address_while_the_listener_is_off_and_follows_it_as_it_turns() {
+    let mut application = listening_application(false);
+    push(
+        &mut application,
+        1,
+        vec![serving_through(logged_in(COMPANY))],
+    );
+    open_serve(&mut application, vec![direct()]);
+    let ways = prose(&application);
+    assert!(ways.contains(LISTENER_OFF), "{ways}");
+    assert!(
+        !ways.contains("10.0.0.8"),
+        "no address of the machine's is offered while nothing listens there: {ways}"
+    );
+    assert!(ways.contains(&format!("[x] Relay {COMPANY}")), "{ways}");
+    assert!(
+        !ways.contains(NO_WAY),
+        "the Relay is a way to offer: {ways}"
+    );
+
+    // Turned on while the ways are chosen, the listener offers the address.
+    deliver_settings(&mut application, listening(true));
+    let ways = prose(&application);
+    assert!(ways.contains("[x] 10.0.0.8:7777"), "{ways}");
+    assert!(!ways.contains(LISTENER_OFF), "{ways}");
+
+    // Turned off again before the Invite is issued, it offers it no more.
+    deliver_settings(&mut application, listening(false));
+    let (_, issuance) = issuance(press(&mut application, KeyCode::Enter));
+    assert_eq!(issuance.ways, vec![Way::Relay(COMPANY.to_owned())]);
+}
+
+/// With the Serving listener off and no Relay an Invite can offer, there is
+/// no way to offer at all: `/serve` says so, and what would give it one,
+/// wrapped whole however narrow, and asks for no Invite — until a Relay is
+/// Served through.
+#[test]
+fn serve_says_an_invite_has_no_way_to_offer_with_the_listener_off_and_no_relay_served_through() {
+    for width in [80, 48] {
+        let mut application = listening_application(false);
+        push(&mut application, 1, vec![logged_in(OTHER)]);
+        open_serve(&mut application, vec![direct()]);
+        let shown = prose_at(&application, width);
+        assert!(
+            shown.contains(LISTENER_OFF)
+                && shown.contains(NO_WAY)
+                && shown.contains(&format!("[-] Relay {OTHER}"))
+                && shown.contains("not Served through"),
+            "at {width} columns: {shown}"
+        );
+        assert!(
+            shown.contains("Enter issue Invite · Esc close"),
+            "the keys stay in the box: {shown}"
+        );
+        assert_eq!(
+            press(&mut application, KeyCode::Enter),
+            ApplicationTransition::Continue,
+            "no Invite is asked for with no way to offer"
+        );
+        assert!(prose_at(&application, width).contains(NO_WAY));
+
+        push(&mut application, 2, Vec::new());
+        let shown = prose_at(&application, width);
+        assert!(
+            shown.contains(LISTENER_OFF) && shown.contains(NO_WAY),
+            "with no Relay at all, the same: {shown}"
+        );
+
+        push(&mut application, 3, vec![serving_through(logged_in(OTHER))]);
+        assert!(!prose_at(&application, width).contains(NO_WAY));
+        let (_, issuance) = issuance(press(&mut application, KeyCode::Enter));
+        assert_eq!(issuance.ways, vec![Way::Relay(OTHER.to_owned())]);
+    }
 }
 
 #[test]
@@ -1595,6 +1682,25 @@ fn serving_application(serving: bool) -> Application {
     settings.serving.port = 7777;
     settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
     deliver_settings(&mut application, settings);
+    application
+}
+
+/// What a Client whose Server is Serving with its listener on or off, as
+/// `listener` says, holds of the Settings in force.
+fn listening(listener: bool) -> EffectiveSettings {
+    let mut settings = EffectiveSettings::default();
+    settings.serving.enabled = true;
+    settings.serving.listener = listener;
+    settings.serving.port = 7777;
+    settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    settings
+}
+
+/// A Client whose Server is Serving with its listener on or off, as
+/// `listener` says.
+fn listening_application(listener: bool) -> Application {
+    let mut application = Application::default();
+    deliver_settings(&mut application, listening(listener));
     application
 }
 

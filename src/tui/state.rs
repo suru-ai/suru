@@ -78,7 +78,7 @@ use super::{
     selection::{
         SelectionCell, SelectionFrame, SelectionGranularity, SelectionSurface, TextSelection,
     },
-    serve_overlay::{ServeOverlay, ServeRequest},
+    serve_overlay::{ServeOverlay, ServeRequest, ServeWays},
     session_picker::{SessionPicker, SessionPickerListing},
     settings_panel::{AvailabilityRead, SettingsPanel},
     side_column::ToggleStep,
@@ -9588,26 +9588,30 @@ impl Application {
                 })
             }
             SemanticCommandId::ServePrevious => {
-                let relays = self.state.relay_overlay.held_relays();
-                self.state.serve_overlay.select_previous(relays);
+                let ways =
+                    ServeWays::of(&self.state.settings, self.state.relay_overlay.held_relays());
+                self.state.serve_overlay.select_previous(ways);
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::ServeNext => {
-                let relays = self.state.relay_overlay.held_relays();
-                self.state.serve_overlay.select_next(relays);
+                let ways =
+                    ServeWays::of(&self.state.settings, self.state.relay_overlay.held_relays());
+                self.state.serve_overlay.select_next(ways);
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::ServeToggleAddress => {
-                let relays = self.state.relay_overlay.held_relays();
-                self.state.serve_overlay.toggle_selected(relays);
+                let ways =
+                    ServeWays::of(&self.state.settings, self.state.relay_overlay.held_relays());
+                self.state.serve_overlay.toggle_selected(ways);
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::ServeConfirm => {
-                let relays = self.state.relay_overlay.held_relays();
+                let ways =
+                    ServeWays::of(&self.state.settings, self.state.relay_overlay.held_relays());
                 Ok(self
                     .state
                     .serve_overlay
-                    .issue_request(relays)
+                    .issue_request(ways)
                     .map_or(ApplicationTransition::Continue, |(request, issuance)| {
                         ApplicationTransition::IssueInvite { request, issuance }
                     }))

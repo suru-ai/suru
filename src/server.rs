@@ -767,7 +767,9 @@ impl RunningServer {
     }
 
     /// The address currently owned by the opt-in Serving listener. `None`
-    /// means Serving is disabled or its requested address could not be bound.
+    /// means Serving is disabled, its listener is turned off — the Server
+    /// then reached through its Relays alone — or its requested address
+    /// could not be bound.
     pub fn serving_address(&self) -> Option<std::net::SocketAddr> {
         self.serving.address()
     }

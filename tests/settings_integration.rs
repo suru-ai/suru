@@ -385,6 +385,70 @@ async fn serving_settings_pin_from_the_config_document_with_dual_stack_defaults(
     server.shutdown().await.expect("shut down server");
 }
 
+/// The listener is a way a Serving Server is reached by its user's choice,
+/// as each Relay is: on unless they say otherwise, so turning Serving on
+/// opens it as it always has, and pinned beside the other Serving Settings
+/// by the same Config Document, which an edit of it changes no more of than
+/// its own pin.
+#[tokio::test]
+async fn the_serving_listener_is_on_by_default_and_pins_beside_the_other_serving_settings() {
+    assert!(
+        suru::protocol::EffectiveSettings::default()
+            .serving
+            .listener,
+        "a Serving Server listens at its own addresses unless its user says otherwise"
+    );
+
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let original = concat!(
+        "{\n",
+        "  // This machine is reached through its Relays alone.\n",
+        "  \"serving\": { \"listener\":    false, \"port\": 8443 },\n",
+        "}\n",
+    );
+    std::fs::write(config_dir.path().join("suru.jsonc"), original).expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-serving-listener")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    let (mut editor, opening) = attach(state_dir.path(), "settings-serving-listener").await;
+    let (mut onlooker, _) = attach(state_dir.path(), "settings-serving-listener").await;
+
+    assert!(!opening.settings.serving.listener);
+    assert_eq!(opening.settings.serving.port, 8443);
+    assert_eq!(opening.pinned, ["serving.listener", "serving.port"]);
+    assert_eq!(opening.diagnostics, []);
+
+    let answered = editor
+        .mutate_setting(SettingMutation::ServingListener { value: Some(true) })
+        .await
+        .expect("turn the Serving listener on");
+    assert!(answered.settings.serving.listener);
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, answered);
+    }
+    assert_eq!(
+        config_document(config_dir.path()),
+        original.replace("false", "true"),
+        "only the listener's pin changes"
+    );
+
+    let reset = editor
+        .mutate_setting(SettingMutation::ServingListener { value: None })
+        .await
+        .expect("leave the Serving listener to its default");
+    assert!(reset.settings.serving.listener);
+    assert_eq!(reset.pinned, ["serving.port"]);
+
+    drop(editor);
+    drop(onlooker);
+    server.shutdown().await.expect("shut down server");
+}
+
 #[tokio::test]
 async fn showing_reasoning_pins_from_a_document_and_resets_to_the_hidden_default() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
