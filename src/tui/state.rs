@@ -585,13 +585,18 @@ pub struct TuiState {
     /// found. It is a Notice, not state the run depends on: the reader's next
     /// interaction takes it away for good.
     application_notice: ApplicationNotice,
-    /// The lapses of a Relay's Login this Client has claimed the Notice of,
-    /// by the Relay and the lapse, so each is claimed once however often it
-    /// is pushed before the Server has given it.
-    relay_notices_claimed: HashSet<(String, uuid::Uuid)>,
+    /// The lapses of a Relay's Login this Client has heard the Server ask a
+    /// Notice of, by the Relay and the lapse, so each is claimed once however
+    /// often it is pushed before the Server has given it.
+    relay_notices_heard: HashSet<(String, uuid::Uuid)>,
     /// The lapses whose Notice this Client is yet to claim of the Server,
-    /// which gives it the first Client to claim it alone.
+    /// which gives it the first Client to claim it alone: claimed once a
+    /// frame that could show it is drawn, so a Client that cannot show it
+    /// leaves it to one that can.
     relay_notice_claims: Vec<(String, uuid::Uuid)>,
+    /// The lapses whose Notice this Client has claimed, and has yet to hear
+    /// whether it was given.
+    relay_notices_claiming: HashSet<(String, uuid::Uuid)>,
     /// The Remotes out of reach for want of a login at a Relay now logged in
     /// at again, to be tried again at once.
     relay_retries: Vec<Outlook>,
@@ -722,6 +727,9 @@ pub struct TuiState {
     /// Where the last frame drew the Notice's pointer at logging in at a
     /// Relay, and the command a press there invokes.
     pub(super) relay_notice_area: RefCell<Option<(PointableSpan, SemanticInvocation)>>,
+    /// Whether the last frame had room to draw a Notice, had one been raised:
+    /// a Client claims a Notice only then.
+    pub(super) notice_presentable: Cell<bool>,
     /// Where the last frame drew, among the queued Prompts, the name of each
     /// Sidekick that sent one and whose Session may still be opened, beside
     /// that Sidekick's Session, so a press on the name opens it.
@@ -962,8 +970,9 @@ impl TuiState {
             settings_received: false,
             pinned_settings: Vec::new(),
             application_notice: ApplicationNotice::default(),
-            relay_notices_claimed: HashSet::new(),
+            relay_notices_heard: HashSet::new(),
             relay_notice_claims: Vec::new(),
+            relay_notices_claiming: HashSet::new(),
             relay_retries: Vec::new(),
             resumed_redemption: None,
             transcript_cache: TranscriptCache::default(),
@@ -1018,6 +1027,7 @@ impl TuiState {
             header_icon_area: RefCell::new(None),
             unreachable_banner_area: RefCell::new(None),
             relay_notice_area: RefCell::new(None),
+            notice_presentable: Cell::new(false),
             queued_sidekick_names: RefCell::new(Vec::new()),
             departed_sessions: HashSet::new(),
             opening_led: None,
@@ -1991,26 +2001,49 @@ impl TuiState {
     /// Takes the Client's own Server's Relays as it pushed them. The `/relay`
     /// list follows them, open or not, and each lapse of a Relay's Login the
     /// Server asks a Notice of — one that stood and has come to be refused —
-    /// has its Notice claimed of the Server here once, however often it is
-    /// pushed: the Server gives it the first Client to claim it, which raises
-    /// it, and no other, so however late this Client hears of the lapse it
-    /// raises nothing another was given. Relays pushed before what the list
-    /// holds say nothing of a lapse now, and claim nothing. A later lapse is
-    /// another, whether or not this Client heard the earlier one end.
+    /// has its Notice claimed of the Server once, however often it is
+    /// pushed, as a frame that could show it is drawn: the Server gives it
+    /// the first Client to claim it, which raises it, and no other, so
+    /// however late this Client hears of the lapse it raises nothing another
+    /// was given. Relays pushed before what the list holds say nothing of a
+    /// lapse now, and claim nothing. A later lapse is another, whether or not
+    /// this Client heard the earlier one end.
     fn receive_relays(&mut self, listing: crate::protocol::RelayListing) {
         if self.relay_overlay.takes_pushed(&listing) {
             for relay in &listing.relays {
                 if let Some(lapse) = relay.login_needed_notice
                     && self
-                        .relay_notices_claimed
+                        .relay_notices_heard
                         .insert((relay.address.clone(), lapse))
                 {
                     self.relay_notice_claims
                         .push((relay.address.clone(), lapse));
+                    // Claimed once a frame drawn from here on could show it.
+                    self.notice_presentable.set(false);
                 }
             }
         }
         self.picture_relays(|overlay| overlay.receive_pushed(listing));
+    }
+
+    /// Lets go of what this Client holds of lapses the Relays it now pictures
+    /// show have ended: a Notice not yet claimed of a lapse the Server no
+    /// longer asks one of — another Client given it, or the lapse over — and
+    /// one claimed, or given and not yet drawn, of a lapse over, its Relay
+    /// logged in at again, gone, or come to another lapse.
+    fn forget_ended_lapses(&mut self) {
+        let relays = self.relay_overlay.held_relays();
+        self.relay_notice_claims.retain(|(address, lapse)| {
+            relays
+                .iter()
+                .any(|relay| relay.address == *address && relay.login_needed_notice == Some(*lapse))
+        });
+        self.relay_notices_claiming
+            .retain(|(address, lapse)| lapse_lasts(relays, address, *lapse));
+        self.application_notice
+            .withdraw_unshown_relay_login_needed(|address, lapse| {
+                !lapse_lasts(relays, address, lapse)
+            });
     }
 
     /// Has the `/relay` list take a picture of the Relays as `take` does, and
@@ -2039,6 +2072,7 @@ impl TuiState {
                 self.retry_remotes_waiting_on(&relay);
             }
         }
+        self.forget_ended_lapses();
         self.reconcile_redemption();
         taken
     }
@@ -6051,7 +6085,17 @@ impl Application {
                 lapse,
                 claimed,
             } => {
-                if claimed {
+                // Raised only where this Client still awaits the answer, and
+                // the lapse still lasts as it pictures its Relays: an answer
+                // coming after the lapse ended raises nothing.
+                let awaited = self
+                    .state
+                    .relay_notices_claiming
+                    .remove(&(address.clone(), lapse));
+                if claimed
+                    && awaited
+                    && lapse_lasts(self.state.relay_overlay.held_relays(), &address, lapse)
+                {
                     self.state
                         .application_notice
                         .receive_relay_login_needed(&address, lapse);
@@ -10880,9 +10924,18 @@ impl Application {
     /// The lapses of a Relay's Login whose Notice this Client has heard asked
     /// for since last asked, by the Relay and the lapse, for the run loop to
     /// claim of the Server, answering each with
-    /// [`ApplicationEvent::RelayLoginNeededNoticeClaimed`].
+    /// [`ApplicationEvent::RelayLoginNeededNoticeClaimed`] — only once the
+    /// last frame drawn could show a Notice, so a Client that cannot leaves
+    /// it to one that can.
     pub fn take_relay_notice_claims(&mut self) -> Vec<(String, uuid::Uuid)> {
-        std::mem::take(&mut self.state.relay_notice_claims)
+        if !self.state.notice_presentable.get() {
+            return Vec::new();
+        }
+        let claims = std::mem::take(&mut self.state.relay_notice_claims);
+        self.state
+            .relay_notices_claiming
+            .extend(claims.iter().cloned());
+        claims
     }
 
     /// Every Remote out of reach for want of a login at a Relay the Client
@@ -11350,6 +11403,18 @@ fn relay_login_transition(act: Option<RelayLoginAct>) -> ApplicationTransition {
 }
 
 /// Follows each of the Relay logins named, where there are any to follow.
+/// Whether the Relay at `address` is, as `relays` picture it, still in the
+/// lapse `lapse` of its Login: held, its Login not standing again, and come
+/// to no later lapse. The Server no longer asking a Notice of it — given to
+/// a Client, this one perhaps — does not end it.
+fn lapse_lasts(relays: &[crate::protocol::Relay], address: &str, lapse: uuid::Uuid) -> bool {
+    relays.iter().any(|relay| {
+        relay.address == address
+            && relay.state != RelayState::LoggedIn
+            && relay.login_needed_notice.is_none_or(|asked| asked == lapse)
+    })
+}
+
 fn follow_relay_logins(follows: Vec<RelayLoginFollow>) -> ApplicationTransition {
     if follows.is_empty() {
         ApplicationTransition::Continue

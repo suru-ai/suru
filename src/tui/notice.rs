@@ -134,6 +134,33 @@ impl ApplicationNotice {
         );
     }
 
+    /// Takes back the Notice of each Relay coming to need a login in a lapse
+    /// `ended` says is over, where no frame has drawn it yet: a lapse that
+    /// ended before its reader could see it is nothing to tell them. One
+    /// drawn stands until the reader dismisses it, as any Notice does.
+    pub(super) fn withdraw_unshown_relay_login_needed(
+        &mut self,
+        ended: impl Fn(&str, Uuid) -> bool,
+    ) {
+        let Some(notice) = self.showing.as_mut() else {
+            return;
+        };
+        if notice.shown.get() {
+            return;
+        }
+        notice.parts.retain(|part| {
+            !part.identities.iter().any(|identity| {
+                matches!(
+                    identity,
+                    NoticeIdentity::RelayLoginNeeded { address, lapse } if ended(address, *lapse)
+                )
+            })
+        });
+        if notice.parts.is_empty() {
+            self.showing = None;
+        }
+    }
+
     /// Raises a runtime condition's Notice, joining any Notice already
     /// showing, unless the reader already dismissed that very condition.
     fn raise(

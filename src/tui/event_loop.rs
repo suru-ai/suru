@@ -618,6 +618,9 @@ struct RunLoop {
     /// later follower there takes the place of an earlier one, which nothing
     /// awaits any longer, and one that has answered is let go.
     relay_followers: HashMap<String, (crate::tui::RelayRequest, tokio::task::JoinHandle<()>)>,
+    /// Which Client run this is, as it claims Notices of the Server: one for
+    /// the whole run, so a claim asked again is known for the same one.
+    notice_claimant: uuid::Uuid,
 }
 
 async fn run_loop(
@@ -674,6 +677,7 @@ async fn run_loop(
         spinner_tick: None,
         needs_redraw: true,
         relay_followers: HashMap::new(),
+        notice_claimant: uuid::Uuid::new_v4(),
     };
     let mut clipboard = clipboard_thread::ClipboardThread::new(native_clipboard);
     let mut delivery = ClipboardDelivery::default();
@@ -690,6 +694,9 @@ async fn run_loop(
             run.needs_redraw = false;
             // A frame is what learns which thumbnails a strip in view needs.
             run.fetch_wanted_thumbnails();
+            // And whether a Notice could be shown, which is when one of a
+            // Relay needing a login is claimed of the Server.
+            run.claim_relay_notices();
         }
         // Rendering records which animation is actually visible, including a
         // Working Indicator that may have scrolled out of the viewport.
@@ -994,14 +1001,15 @@ impl RunLoop {
     }
 
     /// Claims of the Server each Notice of a Relay needing a login the Client
-    /// has heard asked for, to raise it where the Server gives it this
-    /// Client.
+    /// has heard asked for, once a frame that could show it is drawn, to
+    /// raise it where the Server gives it this Client.
     fn claim_relay_notices(&mut self) {
         for (address, lapse) in self.application.take_relay_notice_claims() {
             spawn_relay_notice_claim(
                 self.client.session_commands(),
                 address,
                 lapse,
+                self.notice_claimant,
                 self.channels.relays.clone(),
             );
         }
@@ -1678,7 +1686,6 @@ impl RunLoop {
             .handle_event(ApplicationEvent::Managed(event))?;
         self.sync_reconnect_grace();
         self.retry_remotes_waiting_on_relays();
-        self.claim_relay_notices();
         match transition {
             ApplicationTransition::Continue => {}
             ApplicationTransition::SessionEnded => self.tasks.end_subscription(),
@@ -3027,14 +3034,17 @@ where
     }
 }
 
-/// Claims of the Client's own Server the Notice of the Relay at `address`
-/// coming to need a login in `lapse` — again and again while it does not
-/// hear, so a Server that could not store its giving at first is asked once
-/// it can — answering on `answers` whether it gave it this Client.
+/// Claims of the Client's own Server, as the Client run `claimant`, the
+/// Notice of the Relay at `address` coming to need a login in `lapse` — again
+/// and again while it does not hear, so a Server that could not store its
+/// giving at first is asked once it can, and one that gave it as an answer
+/// was lost says so again — answering on `answers` whether it gave it this
+/// Client.
 fn spawn_relay_notice_claim(
     commands: SessionCommandClient,
     address: String,
     lapse: uuid::Uuid,
+    claimant: uuid::Uuid,
     answers: UnboundedSender<ApplicationEvent>,
 ) {
     tokio::spawn(tell_until_heard(
@@ -3046,7 +3056,7 @@ fn spawn_relay_notice_claim(
             // (ADR-0008).
             async move {
                 let claim = commands
-                    .claim_relay_login_needed_notice(&address, lapse)
+                    .claim_relay_login_needed_notice(&address, lapse, claimant)
                     .await;
                 if let Ok(claimed) = claim {
                     let _ = answers.send(ApplicationEvent::RelayLoginNeededNoticeClaimed {

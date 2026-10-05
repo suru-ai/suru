@@ -141,7 +141,7 @@ async fn notice_relay_login_needed(
     };
     match state
         .relays
-        .claim_login_needed_notice(&address, notice.lapse)
+        .claim_login_needed_notice(&address, notice.lapse, notice.claimant)
     {
         Ok(claimed) => Json(RelayLoginNeededNoticeClaim { claimed }).into_response(),
         Err(failure) => failure_response(failure),

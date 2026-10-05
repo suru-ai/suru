@@ -142,6 +142,20 @@ struct StoredRelay {
     /// raises it once and only once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     untold_lapse: Option<Uuid>,
+    /// Where a Client has been given the Notice of the lapse the Relay is in,
+    /// that lapse and that Client, so the Client claiming it again — not
+    /// having heard it was given it — is told it was. It goes as the lapse
+    /// does: as the Login stands again, or a later refusal makes another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    given_notice: Option<GivenNotice>,
+}
+
+/// The Notice of a lapse given to a Client, by the lapse and the Client's
+/// run that claimed it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct GivenNotice {
+    lapse: Uuid,
+    claimant: Uuid,
 }
 
 struct HeldRelay {
@@ -311,16 +325,19 @@ impl RelayController {
         self.published.subscribe()
     }
 
-    /// Gives the Client claiming it the Notice of the Relay at `address`
+    /// Gives the Client run `claimant` the Notice of the Relay at `address`
     /// coming to need a login in `lapse`, where that is the lapse a Notice is
     /// asked of and no Client has been given it — so it is given once, and
-    /// asked of no Client again — answering whether it gave it. Claimed of
-    /// another lapse — an earlier one, claimed late — it gives nothing and
-    /// changes nothing. Nothing is given where it cannot be stored.
+    /// asked of no Client again — answering whether it gave it. The Client
+    /// given it, claiming it again while the lapse lasts, is told it was;
+    /// any other is not. Claimed of another lapse — an earlier one, claimed
+    /// late — it gives nothing and changes nothing. Nothing is given where it
+    /// cannot be stored.
     pub(crate) fn claim_login_needed_notice(
         &self,
         address: &str,
         lapse: Uuid,
+        claimant: Uuid,
     ) -> std::result::Result<bool, RelayFailure> {
         let address = relay_address(address)?;
         let mut relays = self.lock();
@@ -328,16 +345,24 @@ impl RelayController {
             .iter()
             .position(|held| held.stored.address == address)
             .ok_or_else(relay_not_found)?;
+        if let Some(given) = relays[index].stored.given_notice
+            && given.lapse == lapse
+        {
+            return Ok(given.claimant == claimant);
+        }
         if relays[index].stored.untold_lapse != Some(lapse) {
             return Ok(false);
         }
+        let given = Some(GivenNotice { lapse, claimant });
         let mut stored = relays
             .iter()
             .map(|held| held.stored.clone())
             .collect::<Vec<_>>();
         stored[index].untold_lapse = None;
+        stored[index].given_notice = given;
         self.write(&stored).map_err(records_failure)?;
         relays[index].stored.untold_lapse = None;
+        relays[index].stored.given_notice = given;
         self.publish(&relays);
         Ok(true)
     }
@@ -358,6 +383,7 @@ impl RelayController {
                 login_needed: false,
                 serve_through: false,
                 untold_lapse: None,
+                given_notice: None,
             },
             serve_through: watch::Sender::new(ServeThrough::first(false)),
             state: RelayState::LoginNeeded,
@@ -721,6 +747,7 @@ impl RelayController {
         if !relays[index].stored.logged_in
             || relays[index].stored.login_needed
             || relays[index].stored.untold_lapse.is_some()
+            || relays[index].stored.given_notice.is_some()
         {
             let mut stored = relays
                 .iter()
@@ -729,10 +756,12 @@ impl RelayController {
             stored[index].logged_in = true;
             stored[index].login_needed = false;
             stored[index].untold_lapse = None;
+            stored[index].given_notice = None;
             self.write(&stored)?;
             relays[index].stored.logged_in = true;
             relays[index].stored.login_needed = false;
             relays[index].stored.untold_lapse = None;
+            relays[index].stored.given_notice = None;
         }
         let held = &mut relays[index];
         held.state = RelayState::LoggedIn;
@@ -977,17 +1006,23 @@ impl RelayController {
         // its Notice of — not a Relay merely Unreachable, nor one never
         // logged in at — once, until the Login stands again and a later
         // refusal makes another.
+        // The Notice given of a lapse goes as the lapse does.
         let stored = &relays[index].stored;
-        let untold_lapse = match &observed {
-            Observed::LoggedIn(_) => None,
+        let (untold_lapse, given_notice) = match &observed {
+            Observed::LoggedIn(_) => (None, None),
             Observed::LoginNeeded if stored.logged_in && !stored.login_needed => {
-                Some(Uuid::new_v4())
+                (Some(Uuid::new_v4()), None)
             }
-            Observed::LoginNeeded | Observed::Unreachable(_) => stored.untold_lapse,
+            Observed::LoginNeeded | Observed::Unreachable(_) => {
+                (stored.untold_lapse, stored.given_notice)
+            }
         };
-        let changed = stored.login_needed != login_needed || stored.untold_lapse != untold_lapse;
+        let changed = stored.login_needed != login_needed
+            || stored.untold_lapse != untold_lapse
+            || stored.given_notice != given_notice;
         relays[index].stored.login_needed = login_needed;
         relays[index].stored.untold_lapse = untold_lapse;
+        relays[index].stored.given_notice = given_notice;
         // What the Relay last said governs this run whether or not it can be
         // stored. Where it cannot, it is stored as the Server next hears from
         // a Relay — as one that refuses the Login goes on refusing it each

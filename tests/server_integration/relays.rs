@@ -689,11 +689,13 @@ async fn a_relay_whose_account_lapses_reads_login_needed_at_once_rather_than_unr
 /// instance, whatever its revisions. A Relay whose Login stood and is now
 /// refused asks a Client to raise a Notice of that lapse — a Relay never
 /// logged in at, or merely Unreachable, asks nothing — and gives that Notice
-/// to the first Client to claim it: no other Client claiming it is given it,
+/// to the first Client to claim it, telling that Client so however often it
+/// asks again while the lapse lasts: no other Client claiming it is given it,
 /// however late it asks, and none is asked again, the one attached nor one
 /// opened later, nor after the Server restarts. A later lapse, after the
 /// Login has stood again, is another: claiming the earlier one's Notice then
-/// is given nothing, and leaves the later one's asked for.
+/// is given nothing, and leaves the later one's asked for. Once a lapse has
+/// ended, not even the Client given its Notice is told it was.
 #[tokio::test]
 async fn a_relays_state_reaches_the_servers_clients_and_each_lapse_asks_for_one_notice() {
     let mut relay = TestRelay::start().await;
@@ -763,17 +765,27 @@ async fn a_relays_state_reaches_the_servers_clients_and_each_lapse_asks_for_one_
         "every Client attached hears of the lapse"
     );
 
+    // Each Client claims as the one run it is.
+    let (attached, slowest) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
     assert!(
         server
             .client
-            .claim_relay_login_needed_notice(&address, first)
+            .claim_relay_login_needed_notice(&address, first, attached)
             .await
             .expect("claim the Notice"),
         "the first Client to claim the lapse's Notice is given it"
     );
     assert!(
+        server
+            .client
+            .claim_relay_login_needed_notice(&address, first, attached)
+            .await
+            .expect("claim the Notice again, the answer lost"),
+        "the Client given it, claiming it again for want of hearing so, is told it was"
+    );
+    assert!(
         !slower
-            .claim_relay_login_needed_notice(&address, first)
+            .claim_relay_login_needed_notice(&address, first, slowest)
             .await
             .expect("claim the Notice, late"),
         "no other Client is given it, however late it claims it"
@@ -824,7 +836,7 @@ async fn a_relays_state_reaches_the_servers_clients_and_each_lapse_asks_for_one_
     assert!(
         !server
             .client
-            .claim_relay_login_needed_notice(&address, first)
+            .claim_relay_login_needed_notice(&address, first, attached)
             .await
             .expect("claim, late, the earlier Notice")
     );
@@ -835,7 +847,7 @@ async fn a_relays_state_reaches_the_servers_clients_and_each_lapse_asks_for_one_
     assert!(
         server
             .client
-            .claim_relay_login_needed_notice(&address, second)
+            .claim_relay_login_needed_notice(&address, second, attached)
             .await
             .expect("claim this lapse's Notice")
     );
@@ -845,7 +857,7 @@ async fn a_relays_state_reaches_the_servers_clients_and_each_lapse_asks_for_one_
     );
 
     // Nor, once the Login stands again, is a lapse it has since left behind
-    // given to anyone.
+    // given to anyone — not even the Client it was given to, asking again.
     relay.provider.set_admitted("583231", true);
     server.log_in(&relay, "583231", "octocat").await;
     server
@@ -859,6 +871,13 @@ async fn a_relays_state_reaches_the_servers_clients_and_each_lapse_asks_for_one_
             .relays[0],
     )
     .expect("a Login that stood again and is refused anew asks for a Notice anew");
+    assert!(
+        server
+            .client
+            .claim_relay_login_needed_notice(&address, third, attached)
+            .await
+            .expect("claim the third lapse's Notice")
+    );
     relay.provider.set_admitted("583231", true);
     server.log_in(&relay, "583231", "octocat").await;
     server
@@ -867,7 +886,7 @@ async fn a_relays_state_reaches_the_servers_clients_and_each_lapse_asks_for_one_
     assert!(
         !server
             .client
-            .claim_relay_login_needed_notice(&address, third)
+            .claim_relay_login_needed_notice(&address, third, attached)
             .await
             .expect("claim the Notice of a lapse since ended"),
         "a lapse that ended is no Notice to raise"

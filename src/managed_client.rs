@@ -605,17 +605,18 @@ impl ManagedClient {
         self.session_commands().list_relays().await
     }
 
-    /// Claims of the Client's own Server the Notice of the Relay at `address`
-    /// coming to need a login in `lapse`: whether it gave this Client that
-    /// Notice, to raise, as it gives it the first Client to claim it and no
-    /// other.
+    /// Claims of the Client's own Server, as the Client run `claimant`, the
+    /// Notice of the Relay at `address` coming to need a login in `lapse`:
+    /// whether it gave this Client that Notice, to raise, as it gives it the
+    /// first Client to claim it and no other.
     pub async fn claim_relay_login_needed_notice(
         &self,
         address: &str,
         lapse: uuid::Uuid,
+        claimant: uuid::Uuid,
     ) -> Result<bool> {
         self.session_commands()
-            .claim_relay_login_needed_notice(address, lapse)
+            .claim_relay_login_needed_notice(address, lapse, claimant)
             .await
     }
 
@@ -1712,6 +1713,7 @@ impl SessionCommandClient {
         &self,
         address: &str,
         lapse: uuid::Uuid,
+        claimant: uuid::Uuid,
     ) -> Result<bool> {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
@@ -1721,7 +1723,7 @@ impl SessionCommandClient {
                 &[address, "login-needed-notice"],
             )?)
             .bearer_auth(&descriptor.token)
-            .json(&crate::protocol::RelayLoginNeededNotice { lapse })
+            .json(&crate::protocol::RelayLoginNeededNotice { lapse, claimant })
             .send()
             .await
             .context("send Relay login-needed Notice claim")?;

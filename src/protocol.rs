@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 98;
+pub const PROTOCOL_VERSION: u32 = 99;
 mod attachment;
 mod reading;
 mod relay;

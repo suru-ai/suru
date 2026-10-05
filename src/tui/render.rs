@@ -178,8 +178,10 @@ pub(super) fn render_with_slots(
     // The Unreachable banner's "Try again" is pointable on the same terms, and
     // is only there on a frame that drew it.
     *state.unreachable_banner_area.borrow_mut() = None;
-    // So are the names of the Sidekicks that sent queued Prompts.
+    // So are the names of the Sidekicks that sent queued Prompts, and
+    // whether a Notice could be drawn.
     state.queued_sidekick_names.borrow_mut().clear();
+    state.notice_presentable.set(false);
     // Current-Session animation is likewise a fact about this frame, not the
     // Session in the abstract: its transient tail may have scrolled away.
     state.session_animation_on_screen.set(false);
@@ -455,6 +457,8 @@ fn render_application_notice(
 ) -> Rect {
     let inset = horizontal_padding(area.width);
     let width = area.width.saturating_sub(inset.saturating_mul(2));
+    // A frame that comes this far has a row a Notice would take.
+    state.notice_presentable.set(width > 0 && area.height > 1);
     let text = state
         .application_notice()
         .map(|notice| notice.text(width))

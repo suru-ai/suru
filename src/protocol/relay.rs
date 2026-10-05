@@ -56,17 +56,21 @@ pub struct Relay {
 }
 
 /// A Client's claim to the Notice of the Relay coming to need a login in
-/// `lapse`.
+/// `lapse`, made as the Client run `claimant`: one id for the whole of that
+/// run, so the Client claiming again, not having heard it was given the
+/// Notice, is told it was.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayLoginNeededNotice {
     pub lapse: Uuid,
+    pub claimant: Uuid,
 }
 
 /// Whether the Client that claimed the Notice of a Relay coming to need a
 /// login in a lapse was given it, to raise: the first to claim it while the
-/// Server asks a Notice of that lapse is, and no other — however late it
-/// claims it, or after the lapse has ended.
+/// Server asks a Notice of that lapse is — and is told so each time it
+/// claims it again while the lapse lasts — and no other, however late it
+/// claims it, nor any once the lapse has ended.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayLoginNeededNoticeClaim {
