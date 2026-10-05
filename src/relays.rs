@@ -275,6 +275,7 @@ impl RelayController {
             timings,
             carrying: controller.carrying.clone(),
         }));
+        controller.serving.offer_relays(offered(&controller.lock()));
         Ok(controller)
     }
 
@@ -1008,8 +1009,11 @@ impl RelayController {
     }
 
     /// Publishes `relays`, which the caller holds, at the next revision,
-    /// where they differ from what was last published.
+    /// where they differ from what was last published; and has Serving tell
+    /// the Server's Peers which of them it Serves through, where that
+    /// differs from what they were last told.
     fn publish(&self, relays: &[HeldRelay]) {
+        self.serving.offer_relays(offered(relays));
         let relays = relays.iter().map(HeldRelay::relay).collect::<Vec<_>>();
         self.published.send_if_modified(|listing| {
             if listing.relays == relays {
@@ -1064,18 +1068,14 @@ struct Joining {
 impl RelayWays for Joining {
     fn served_through(&self, relay: &str) -> Option<String> {
         let address = relay_protocol::canonical_address(relay)?;
-        // A Login the Relay was last found to refuse is offered to nobody,
-        // however the Relay has answered since, though the Server goes on
-        // connecting there in case it is restored.
         self.lock()
             .iter()
-            .any(|held| {
-                held.stored.address == address
-                    && held.stored.serve_through
-                    && held.stored.logged_in
-                    && !held.stored.login_needed
-            })
+            .any(|held| held.stored.address == address && held.offered())
             .then_some(address)
+    }
+
+    fn chosen(&self, relay: &str) -> bool {
+        self.lock().iter().any(|held| held.stored.address == relay)
     }
 
     fn join(&self, relay: String, server: Vec<u8>, wanted: Wanted) -> RelayJoin {
@@ -1411,7 +1411,27 @@ impl WaitingWish {
     }
 }
 
+/// The addresses of the Relays among `relays` that an Invite may offer, and
+/// which the Server tells its Peers it Serves through.
+fn offered(relays: &[HeldRelay]) -> Vec<String> {
+    relays
+        .iter()
+        .filter(|held| held.offered())
+        .map(|held| held.stored.address.clone())
+        .collect()
+}
+
 impl HeldRelay {
+    /// Whether an Invite may offer the Relay, and the Server tells its Peers
+    /// it Serves through it: where its user has chosen that it does and its
+    /// Login there stands. A Login the Relay was last found to refuse is
+    /// offered to nobody, however the Relay has answered since, though the
+    /// Server goes on connecting there in case it is restored; one merely
+    /// Unreachable still is, as the Server goes on waiting there.
+    fn offered(&self) -> bool {
+        self.stored.serve_through && self.stored.logged_in && !self.stored.login_needed
+    }
+
     fn relay(&self) -> Relay {
         Relay {
             address: self.stored.address.clone(),

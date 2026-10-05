@@ -33,6 +33,8 @@ use crate::support::{
 
 #[path = "relays/dialling.rs"]
 mod dialling;
+#[path = "relays/offering.rs"]
+mod offering;
 #[path = "relays/operator.rs"]
 mod operator;
 #[path = "relays/pairing.rs"]

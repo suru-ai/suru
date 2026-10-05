@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 93;
+pub const PROTOCOL_VERSION: u32 = 94;
 mod attachment;
 mod reading;
 mod relay;
@@ -1583,7 +1583,11 @@ pub struct RedeemInviteRequest {
 pub struct Remote {
     pub name: String,
     pub fingerprint: String,
-    /// The ways of reaching it the Invite offered, in the order to dial them.
+    /// The ways of reaching it, in the order to dial them: the direct ways
+    /// the Invite offered, and the Relays it Serves through, as it last told
+    /// this Server — those the Invite offered until it first does. A Relay
+    /// way at a Relay this Server holds no entry for is listed here and never
+    /// dialled.
     pub ways: Vec<Way>,
     /// The last status observed by this Server, refreshed by explicit probes
     /// and Remote API use so it survives beyond the request that discovered it.

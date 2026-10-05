@@ -2015,7 +2015,10 @@ impl RemoteApi {
     }
 
     /// The stream of `session`'s events, once its snapshot has come.
-    async fn session_events(&self, session: &suru::protocol::SessionId) -> SessionEvents {
+    pub(super) async fn session_events(
+        &self,
+        session: &suru::protocol::SessionId,
+    ) -> SessionEvents {
         let mut events: SessionEvents = Box::pin(
             self.get(&format!("/v1/sessions/{session}/events"))
                 .send()

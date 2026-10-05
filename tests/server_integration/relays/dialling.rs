@@ -411,9 +411,10 @@ async fn a_direct_connection_kept_for_the_next_request_is_closed_once_idle() {
         .list_sessions(None)
         .await
         .expect("the Remote answers directly");
-    // The catalog's stream, and the connection kept from the listing.
+    // The catalog's stream, the one the Remote tells its Relays over, and the
+    // connection kept from the listing.
+    paired.direct.wait_for_connections(3).await;
     paired.direct.wait_for_connections(2).await;
-    paired.direct.wait_for_connections(1).await;
 
     drop(catalog);
     paired.direct.wait_for_connections(0).await;
