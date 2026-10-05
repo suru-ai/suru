@@ -107,7 +107,7 @@ impl std::error::Error for StoreUnavailable {
 /// key in its file instead.
 pub(crate) fn platform_identity_store() -> Arc<dyn IdentityStore> {
     #[cfg(target_os = "linux")]
-    return Arc::new(secret_service_store::SecretServiceStore);
+    return Arc::new(secret_service_store::SecretServiceStore::new());
     #[cfg(not(target_os = "linux"))]
     Arc::new(NoIdentityStore)
 }
