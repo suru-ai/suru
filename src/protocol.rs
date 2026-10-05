@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 95;
+pub const PROTOCOL_VERSION: u32 = 96;
 mod attachment;
 mod reading;
 mod relay;
@@ -4930,6 +4930,10 @@ pub enum SessionErrorCode {
     PairingConnectionFailed,
     PairingAuthenticationFailed,
     PairingProtocolMismatch,
+    /// As many requests await the Remote's answer as this Server asks of it
+    /// at once, so this one was not asked; asked again shortly, once some
+    /// are answered, it may be.
+    RemoteBusy,
     /// The Server holds the Session but could not read what it stored of it.
     SessionUnreadable,
     /// A request carried through a Pairing reached the Server it was for,

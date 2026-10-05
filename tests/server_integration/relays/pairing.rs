@@ -2195,6 +2195,67 @@ impl RemoteApi {
             .unwrap_or_else(|| panic!("{}", String::from_utf8_lossy(&start)))
     }
 
+    /// Asks the Remote `method` `path` on a connection of its own, sending
+    /// the head of what is asked alone — declaring a body `length` bytes
+    /// long, or, where none is given, one sent in chunks — so the local
+    /// Server holds all of the request but its body: the connection it is
+    /// asked on.
+    async fn heading(
+        &self,
+        method: &str,
+        path: &str,
+        length: Option<usize>,
+    ) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt as _;
+        let url = reqwest::Url::parse(&format!("{}{path}", self.remote)).unwrap();
+        let address = url.socket_addrs(|| None).unwrap()[0];
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let framing = length.map_or_else(
+            || "Transfer-Encoding: chunked".to_owned(),
+            |length| format!("Content-Length: {length}"),
+        );
+        let request = format!(
+            "{method} {} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {}\r\n\
+             {framing}\r\n\r\n",
+            url.path(),
+            self.token
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream
+    }
+
+    /// The answer read from `stream`, within the deadline: its status, and
+    /// its body, as text.
+    async fn answer_from(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> (u16, String) {
+        use tokio::io::AsyncReadExt as _;
+        timeout(PROGRESS_DEADLINE, async {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0_u8];
+                stream.read_exact(&mut byte).await.expect("read the answer");
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).expect("the answer's head is text");
+            let status = head[9..12].parse().expect("the answer has a status");
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or_default();
+            let mut body = vec![0_u8; length];
+            stream
+                .read_exact(&mut body)
+                .await
+                .expect("read the answer's body");
+            (status, String::from_utf8_lossy(&body).into_owned())
+        })
+        .await
+        .expect("the answer comes in time")
+    }
+
     pub(super) async fn health(&self) -> reqwest::Result<Health> {
         self.get("/health")
             .send()
@@ -2992,6 +3053,162 @@ async fn the_relays_are_told_beside_as_much_as_a_joined_stream_carries_at_once()
         .expect("a stream opens");
 
     drop(waited);
+    paired.shutdown().await;
+}
+
+/// Past as many requests awaiting a Remote's answer as a joined stream
+/// carries at once and as many again, one more is refused at once — as the
+/// Remote being too busy to ask just now, so it is asked again later — rather
+/// than waiting with the rest, which are answered as the streams ahead end.
+#[tokio::test]
+async fn a_request_past_as_many_again_waiting_as_a_joined_stream_carries_is_refused_at_once() {
+    let paired = PairedThrough::start("relay-pairing-awaiting-bound").await;
+    let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
+    let api = RemoteApi::of(&paired.laptop);
+    let session = api.begin_session(workspace.path()).await;
+
+    let streams = filled(&api, &session).await;
+    let mut asked = (0..201)
+        .map(|_| api.get("/health").send())
+        .collect::<futures_util::stream::FuturesUnordered<_>>();
+    let refused = timeout(PROGRESS_DEADLINE, asked.next())
+        .await
+        .expect("one request is answered at once")
+        .expect("one request is asked")
+        .expect("the local Server answers");
+    assert_eq!(refused.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        refused.json::<SessionError>().await.unwrap().code,
+        SessionErrorCode::RemoteBusy
+    );
+    assert!(
+        timeout(Duration::from_millis(200), asked.next())
+            .await
+            .is_err(),
+        "the rest wait their turn"
+    );
+
+    drop(streams);
+    let answered = timeout(PROGRESS_DEADLINE, asked.collect::<Vec<_>>())
+        .await
+        .expect("the requests waiting are answered as the streams ahead end");
+    assert_eq!(answered.len(), 200);
+    assert!(
+        answered.iter().all(|answer| answer
+            .as_ref()
+            .is_ok_and(|answer| answer.status().is_success())),
+        "every request that waited is answered"
+    );
+
+    paired.shutdown().await;
+}
+
+/// The bodies of the requests awaiting a Remote's answer hold no more between
+/// them than as many of the largest the Session API reads as a Prompt binds
+/// Attachments: a request whose body would hold more is refused as soon as
+/// it says how long its body is, before it is read, and the rest are read
+/// and answered.
+#[tokio::test]
+async fn a_request_whose_body_would_hold_past_what_requests_awaiting_answers_may_is_refused() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let paired = PairedThrough::start("relay-pairing-awaiting-bytes").await;
+    let api = RemoteApi::of(&paired.laptop);
+    let image = crate::padded_png(5 * 1024 * 1024);
+
+    let mut bodies = Vec::new();
+    let mut answers = futures_util::stream::FuturesUnordered::new();
+    for index in 0..11 {
+        let (mut answer, body) = api
+            .heading("POST", "/v1/attachments", Some(image.len()))
+            .await
+            .into_split();
+        bodies.push(body);
+        answers.push(async move { (index, RemoteApi::answer_from(&mut answer).await) });
+    }
+    let (refused, (status, said)) = timeout(PROGRESS_DEADLINE, answers.next())
+        .await
+        .expect("one upload is answered at once")
+        .expect("one upload is asked");
+    assert_eq!(status, 503, "{said}");
+    assert_eq!(
+        serde_json::from_str::<SessionError>(&said).unwrap().code,
+        SessionErrorCode::RemoteBusy
+    );
+    assert!(
+        timeout(Duration::from_millis(200), answers.next())
+            .await
+            .is_err(),
+        "the rest are taken, and wait on their bodies"
+    );
+
+    for (index, body) in bodies.iter_mut().enumerate() {
+        if index != refused {
+            body.write_all(&image).await.unwrap();
+        }
+    }
+    let answered = timeout(PROGRESS_DEADLINE, answers.collect::<Vec<_>>())
+        .await
+        .expect("the uploads taken are answered");
+    assert_eq!(answered.len(), 10);
+    assert!(
+        answered
+            .iter()
+            .all(|(_, (status, _))| *status == 200 || *status == 201),
+        "every upload taken is stored: {answered:?}"
+    );
+
+    paired.shutdown().await;
+}
+
+/// A request carried to a Remote with a body past what the route it names
+/// reads is refused as that route refuses it, without its body being read
+/// whole: at once where it says how long its body is, and as soon as it
+/// has sent past that where it sends its body in chunks.
+#[tokio::test]
+async fn a_body_past_what_its_route_reads_is_refused_before_it_is_read_whole() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let paired = PairedThrough::start("relay-pairing-body-limits").await;
+    let api = RemoteApi::of(&paired.laptop);
+
+    let mut upload = api
+        .heading("POST", "/v1/attachments", Some(6 * 1024 * 1024))
+        .await;
+    let (status, said) = RemoteApi::answer_from(&mut upload).await;
+    assert_eq!(status, 413, "{said}");
+    assert_eq!(
+        serde_json::from_str::<SessionError>(&said).unwrap().code,
+        SessionErrorCode::AttachmentTooLarge,
+        "an image past what an Attachment may be is refused as uploading it is"
+    );
+
+    let mut command = api
+        .heading("POST", "/v1/sessions", Some(2 * 1024 * 1024 + 1))
+        .await;
+    assert_eq!(RemoteApi::answer_from(&mut command).await.0, 413);
+
+    // Sent in chunks, and never ended: each chunk but the last whole, and
+    // the last, past the limit, sent short of the line ending it.
+    let mut chunked = api.heading("POST", "/v1/sessions", None).await;
+    let chunk = vec![b' '; 64 * 1024];
+    for _ in 0..32 {
+        chunked
+            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+            .await
+            .unwrap();
+        chunked.write_all(&chunk).await.unwrap();
+        chunked.write_all(b"\r\n").await.unwrap();
+    }
+    chunked.write_all(b"1\r\n ").await.unwrap();
+    assert_eq!(RemoteApi::answer_from(&mut chunked).await.0, 413);
+
+    // What is within each route's limit is carried as before.
+    timeout(PROGRESS_DEADLINE, api.health())
+        .await
+        .expect("the Remote answers in time")
+        .expect("the Remote answers through the Relay");
+
     paired.shutdown().await;
 }
 

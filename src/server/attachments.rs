@@ -20,7 +20,8 @@ use crate::{
 };
 
 /// Stores the request body's bytes as an Attachment and answers with its
-/// descriptor. Only this route reads a body past the ordinary command cap.
+/// descriptor. Only this route reads a body past the ordinary command cap,
+/// [`super::COMMAND_BODY_LIMIT`].
 /// The body's declared content type is advisory and goes unread: the format
 /// is sniffed from the bytes themselves.
 pub(super) async fn upload_attachment(State(state): State<AppState>, request: Request) -> Response {
@@ -48,7 +49,7 @@ pub(super) async fn upload_attachment(State(state): State<AppState>, request: Re
     }
 }
 
-fn upload_refusal_response(refusal: &UploadRefusal) -> Response {
+pub(super) fn upload_refusal_response(refusal: &UploadRefusal) -> Response {
     let (status, code) = match refusal {
         UploadRefusal::TooLarge { .. } => (
             StatusCode::PAYLOAD_TOO_LARGE,

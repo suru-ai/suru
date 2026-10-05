@@ -9,7 +9,9 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::to_bytes,
-    extract::{Path as AxumPath, Query, Request, State, rejection::QueryRejection},
+    extract::{
+        DefaultBodyLimit, Path as AxumPath, Query, Request, State, rejection::QueryRejection,
+    },
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{self, AUTHORIZATION},
@@ -83,6 +85,19 @@ pub use cutoff::{CUT_OFF_EXIT_STATUS, CUTOFF_MARGIN, ProcessCutoff};
 pub use signals::ShutdownSignals;
 
 pub type ServerConfig = RuntimeConfig;
+
+/// The most of a request's body the Session API's routes read — as much as
+/// axum reads by default — save the Attachment upload route, which reads its
+/// own [`crate::attachments::UPLOAD_BODY_LIMIT`]. A request carried to a
+/// Remote is read no further than the route it names there reads it.
+pub(crate) const COMMAND_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// What the Attachment upload route answers a body past what it reads with.
+pub(crate) fn attachment_too_large_response() -> Response {
+    attachments::upload_refusal_response(&crate::attachments::UploadRefusal::TooLarge {
+        byte_length: None,
+    })
+}
 
 /// How much a Server keeping Remotes in view for its Sidekicks' trees takes
 /// on, so no Remote — nor many — can have it ask, follow or hold without
@@ -1742,6 +1757,7 @@ async fn start(
         )
         .route("/v1/server/stop", post(stop_server))
         .merge(relays::routes())
+        .layer(DefaultBodyLimit::max(COMMAND_BODY_LIMIT))
         .with_state(state)
         .merge(broker_routes);
     let descriptor_path = config.descriptor_path();

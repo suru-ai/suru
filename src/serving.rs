@@ -152,6 +152,23 @@ const JOINED_STREAMS_AT_ONCE: u32 = 100;
 /// How many a joined stream carries at once in all: those, and the one the
 /// Relays are told over, which so never waits behind what is asked.
 const JOINED_STREAMS: u32 = JOINED_STREAMS_AT_ONCE + 1;
+/// How many requests this Server asks of one Remote at once, awaiting its
+/// answer — carried there, or waiting their turn on a joined stream: as many
+/// as a joined stream carries at once, and as many again. One asked past
+/// them is refused at once, as the Remote being too busy to ask just now,
+/// rather than waiting.
+const AWAITED_AT_ONCE: usize = 2 * JOINED_STREAMS_AT_ONCE as usize;
+/// How many bytes the bodies of the requests awaiting one Remote's answer
+/// hold between them: as many of the largest the Session API reads as one
+/// Prompt binds Attachments. A request holds room for its body before it is
+/// read — as much as it says its body is, or as much as its route reads,
+/// where it does not say — so one that would hold past them is refused at
+/// once, its body unread.
+const AWAITED_BODY_BYTES: usize =
+    crate::attachments::MAX_ATTACHMENTS_PER_PROMPT * crate::attachments::UPLOAD_BODY_LIMIT;
+/// Where the Session API takes an Attachment's upload, whose body it reads
+/// further than any other route's.
+const ATTACHMENTS_PATH: &str = "/v1/attachments";
 /// How much of each request's or stream's body a Server lets the other send
 /// it ahead of what reads it.
 const JOINED_STREAM_WINDOW: u32 = 256 * 1024;
@@ -162,8 +179,9 @@ const JOINED_STREAM_WINDOW: u32 = 256 * 1024;
 /// are what a Server holds to send, up to [`JOINED_STREAM_WINDOW`] for each
 /// stream; each request's and answer's headers, up to the 16 KiB HTTP/2
 /// here takes of a header list; the requests waiting their turn past
-/// [`JOINED_STREAMS`], each with its body, which nothing here bounds; and
-/// what the TLS and the Relay's WebSocket buffer.
+/// [`JOINED_STREAMS`], each with its body, which [`AWAITED_AT_ONCE`] and
+/// [`AWAITED_BODY_BYTES`] bound; and what the TLS and the Relay's WebSocket
+/// buffer.
 const JOINED_CONNECTION_WINDOW: u32 = JOINED_STREAMS * JOINED_STREAM_WINDOW;
 /// How each Server on a joined stream makes sure, inside the pinned-key TLS,
 /// that the other still answers — and so that the Relay between them still
@@ -315,6 +333,9 @@ pub(crate) struct ServingController {
     peers: Arc<RwLock<Vec<StoredPeer>>>,
     remotes: Arc<RwLock<Vec<StoredRemote>>>,
     remote_clients: Arc<StdMutex<HashMap<String, Weak<PairingHttpClient>>>>,
+    /// What awaits each Remote's answer, by the Remote's name, for as long as
+    /// anything does.
+    awaiting: Arc<StdMutex<HashMap<String, Weak<Awaiting>>>>,
     revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
     awaiting_revocation: AwaitingRevocation,
     /// What the Serving listener proves it named an act's author with; see
@@ -891,9 +912,12 @@ impl PairingFailure {
             | SessionErrorCode::RelayLoginNeeded
             | SessionErrorCode::RelayDifferentAccounts => StatusCode::CONFLICT,
             // A place comes free once a connection joined for the Account
-            // ends, so what was asked is asked again later, as of any Remote
-            // out of reach.
-            SessionErrorCode::RelayCapReached => StatusCode::SERVICE_UNAVAILABLE,
+            // ends, or once what awaits the Remote's answer is answered, so
+            // what was asked is asked again later, as of any Remote out of
+            // reach.
+            SessionErrorCode::RelayCapReached | SessionErrorCode::RemoteBusy => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             SessionErrorCode::PeerNotFound | SessionErrorCode::RemoteNotFound => {
                 StatusCode::NOT_FOUND
             }
@@ -976,6 +1000,7 @@ impl ServingController {
             peers: Arc::new(RwLock::new(peers)),
             remotes: Arc::new(RwLock::new(read_records(&data_dir.join(REMOTES_FILE))?)),
             remote_clients: Arc::new(StdMutex::new(HashMap::new())),
+            awaiting: Arc::new(StdMutex::new(HashMap::new())),
             revocations: Arc::new(RwLock::new(revocations)),
             awaiting_revocation: Arc::default(),
             forwarded_author_proof: URL_SAFE_NO_PAD.encode(new_token()).into(),
@@ -1322,6 +1347,28 @@ impl ServingController {
         author: Option<&Author>,
     ) -> std::result::Result<Response, PairingFailure> {
         let remote = self.stored_remote(name)?;
+        // Its body is read no further than the route it names reads one, and
+        // only once there is room for it among what awaits the Remote's
+        // answer.
+        let upload = *request.method() == Method::POST
+            && canonical_forward_path(request.uri()).as_deref() == Some(ATTACHMENTS_PATH);
+        let (limit, too_large): (usize, fn() -> Response) = if upload {
+            (
+                crate::attachments::UPLOAD_BODY_LIMIT,
+                crate::server::attachment_too_large_response,
+            )
+        } else {
+            (crate::server::COMMAND_BODY_LIMIT, || {
+                StatusCode::PAYLOAD_TOO_LARGE.into_response()
+            })
+        };
+        let declared = hyper::body::Body::size_hint(request.body())
+            .exact()
+            .map(|length| usize::try_from(length).unwrap_or(usize::MAX));
+        if declared.is_some_and(|length| length > limit) {
+            return Ok(too_large());
+        }
+        let _awaiting = self.await_answer(name, declared.unwrap_or(limit))?;
         // What the request said of its author goes, and so does every
         // hop-by-hop header, before the author this Server names is added
         // last, where nothing the request carried can remove it.
@@ -1346,12 +1393,18 @@ impl ServingController {
                 )
             })?;
         let (parts, body) = request.into_parts();
-        let body = axum::body::to_bytes(body, usize::MAX).await.map_err(|_| {
-            PairingFailure::new(
-                SessionErrorCode::PairingConnectionFailed,
-                "Remote API request body could not be read",
-            )
-        })?;
+        let body = match axum::body::to_bytes(body, limit).await {
+            Ok(body) => body,
+            Err(error) => {
+                if error.into_inner().is::<http_body_util::LengthLimitError>() {
+                    return Ok(too_large());
+                }
+                return Err(PairingFailure::new(
+                    SessionErrorCode::PairingConnectionFailed,
+                    "Remote API request body could not be read",
+                ));
+            }
+        };
         let client = self.pairing_client(&remote)?;
         // A request that may have reached the Remote is never asked again by
         // another way unless asking twice changes nothing: only one that was
@@ -1822,6 +1875,52 @@ impl ServingController {
             .ok_or_else(|| {
                 PairingFailure::new(SessionErrorCode::RemoteNotFound, "Remote not found")
             })
+    }
+
+    /// Takes room among what awaits the Remote `name`'s answer for a request
+    /// whose body holds as much as `body` bytes, held until it is answered or
+    /// fails — refused at once where there is none, past
+    /// [`AWAITED_AT_ONCE`] or [`AWAITED_BODY_BYTES`].
+    fn await_answer(
+        &self,
+        name: &str,
+        body: usize,
+    ) -> std::result::Result<AwaitingAnswer, PairingFailure> {
+        let awaiting = {
+            let mut awaiting = self
+                .awaiting
+                .lock()
+                .expect("awaited answers lock is not poisoned");
+            awaiting.retain(|_, held| held.strong_count() > 0);
+            if let Some(held) = awaiting.get(name).and_then(Weak::upgrade) {
+                held
+            } else {
+                let held = Arc::new(Awaiting::default());
+                awaiting.insert(name.to_owned(), Arc::downgrade(&held));
+                held
+            }
+        };
+        let busy = || {
+            PairingFailure::new(
+                SessionErrorCode::RemoteBusy,
+                "as many requests await the Remote's answer as it is asked at once; try again \
+                 shortly",
+            )
+        };
+        let request = awaiting
+            .requests
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| busy())?;
+        let body = u32::try_from(body)
+            .ok()
+            .and_then(|bytes| awaiting.bytes.clone().try_acquire_many_owned(bytes).ok())
+            .ok_or_else(busy)?;
+        Ok(AwaitingAnswer {
+            _request: request,
+            _body: body,
+            _awaiting: awaiting,
+        })
     }
 
     fn record_remote_status(&self, remote: &StoredRemote, status: RemoteStatus) {
@@ -4622,6 +4721,31 @@ impl Carrier {
             }
         }
     }
+}
+
+/// The room there is among what awaits one Remote's answer: for the requests
+/// asked of it, and for their bodies.
+struct Awaiting {
+    requests: Arc<tokio::sync::Semaphore>,
+    bytes: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for Awaiting {
+    fn default() -> Self {
+        Self {
+            requests: Arc::new(tokio::sync::Semaphore::new(AWAITED_AT_ONCE)),
+            bytes: Arc::new(tokio::sync::Semaphore::new(AWAITED_BODY_BYTES)),
+        }
+    }
+}
+
+/// A request's room among what awaits its Remote's answer, and its body's,
+/// given back as this goes.
+struct AwaitingAnswer {
+    _request: tokio::sync::OwnedSemaphorePermit,
+    _body: tokio::sync::OwnedSemaphorePermit,
+    /// What it is room among, held so another asking meanwhile shares it.
+    _awaiting: Arc<Awaiting>,
 }
 
 /// Why something asked of a Serving Server over a connection got no answer.
