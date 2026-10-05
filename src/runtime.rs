@@ -322,10 +322,14 @@ pub(crate) fn loopback_http_client() -> reqwest::Client {
         .expect("a loopback HTTP client needs nothing that can fail")
 }
 
-/// Replaces the file at `path` with `contents`, whole or not at all: written
-/// beside it, protected to the current user before anything is written, then
-/// renamed over it, so an interrupted write leaves what it held before rather
-/// than part of either.
+/// Replaces the file at `path` with `contents`, whole or not at all, and for
+/// good: written beside it, protected to the current user before anything is
+/// written, flushed to the disk, then renamed over it, the rename itself on
+/// the disk before this returns. So an interrupted write leaves what it held
+/// before rather than part of either, and a crash or power loss once this
+/// has returned leaves the replacement. Where it fails having renamed the
+/// replacement over the file, the replacement is in place, but may not
+/// outlast a crash.
 pub(crate) fn replace_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     use std::io::Write as _;
 
@@ -346,11 +350,89 @@ pub(crate) fn replace_private_file(path: &Path, contents: &[u8]) -> Result<()> {
         .as_file()
         .sync_all()
         .with_context(|| format!("flush a replacement for {path:?}"))?;
+    rename_for_good(replacement, path, directory)?;
+    protect_current_user_file(path)
+}
+
+/// Renames `replacement` over `path`, in `directory`, and has the rename on
+/// the disk before returning.
+///
+/// A rename is an entry in its directory, which is on the disk once the
+/// directory is flushed. A filesystem that cannot flush a directory at all,
+/// as some network and FUSE filesystems cannot, leaves the rename to its own
+/// guarantees, as PostgreSQL's durable rename does.
+#[cfg(unix)]
+fn rename_for_good(
+    replacement: tempfile::NamedTempFile,
+    path: &Path,
+    directory: &Path,
+) -> Result<()> {
     replacement
         .persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("replace {path:?}"))?;
-    protect_current_user_file(path)
+    let flushed = fs::File::open(directory).and_then(|directory| directory.sync_all());
+    match flushed {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        flushed => {
+            flushed.with_context(|| format!("flush the replacement of {path:?} to the disk"))
+        }
+    }
+}
+
+/// Renames `replacement` over `path` and has the rename on the disk before
+/// returning.
+///
+/// Windows gives no way to flush a directory. `MoveFileExW` with
+/// `MOVEFILE_WRITE_THROUGH` instead does not return until the move is on the
+/// disk.
+#[cfg(windows)]
+fn rename_for_good(
+    replacement: tempfile::NamedTempFile,
+    path: &Path,
+    _directory: &Path,
+) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    // Kept, as persisting it would: no longer marked temporary, nor taken
+    // away once dropped.
+    let kept = replacement
+        .into_temp_path()
+        .keep()
+        .map_err(|error| error.error)
+        .with_context(|| format!("keep a replacement for {path:?}"))?;
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>()
+    };
+    let (from, to) = (wide(&kept), wide(path));
+    // SAFETY: both paths are NUL-terminated and outlive the call.
+    let moved = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        let error = io::Error::last_os_error();
+        let _ = fs::remove_file(&kept);
+        return Err(error).with_context(|| format!("replace {path:?}"));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
