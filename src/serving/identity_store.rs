@@ -331,6 +331,11 @@ pub(crate) struct FakeIdentityStore {
     calls: AtomicUsize,
     /// What the next call waits on, where it is to wait.
     stalled: Mutex<Option<mpsc::Receiver<()>>>,
+    /// How many more calls the store answers before it locks, where it is
+    /// to lock.
+    locking: Mutex<Option<usize>>,
+    /// Whether the store keeps something other than what it is put.
+    mangling: AtomicBool,
 }
 
 /// A call to a [`FakeIdentityStore`] left unanswered, until this is dropped.
@@ -385,6 +390,22 @@ impl FakeIdentityStore {
         }
     }
 
+    /// Answers the next `calls` calls as it is, and every one after as an
+    /// unavailable store would until made available again: as a keyring
+    /// that locks partway through what it is asked does.
+    pub(crate) fn lock_after(&self, calls: usize) {
+        *self
+            .locking
+            .lock()
+            .expect("identity store lock is not poisoned") = Some(calls);
+    }
+
+    /// Makes the store keep something other than what it is put from now
+    /// on, as a store that mangles what it keeps does.
+    pub(crate) fn mangle(&self) {
+        self.mangling.store(true, Ordering::SeqCst);
+    }
+
     /// How many calls the store has been asked, answered or not.
     pub(crate) fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
@@ -429,6 +450,20 @@ impl FakeIdentityStore {
                 )
                 .expect("identity store hold is not poisoned"),
         );
+        {
+            let mut locking = self
+                .locking
+                .lock()
+                .expect("identity store lock is not poisoned");
+            match locking.as_mut() {
+                Some(0) => {
+                    self.set_available(false);
+                    *locking = None;
+                }
+                Some(left) => *left -= 1,
+                None => {}
+            }
+        }
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(anyhow!("the identity store is unavailable").into());
         }
@@ -442,8 +477,13 @@ impl FakeIdentityStore {
 #[cfg(test)]
 impl IdentityStore for FakeIdentityStore {
     fn put(&self, item: &ItemId, label: &str, bytes: &[u8]) -> Result<(), StoreUnavailable> {
-        self.answering()?
-            .insert(*item, (label.to_owned(), bytes.to_vec()));
+        let mut items = self.answering()?;
+        let kept = if self.mangling.load(Ordering::SeqCst) {
+            bytes.iter().map(|byte| !byte).collect()
+        } else {
+            bytes.to_vec()
+        };
+        items.insert(*item, (label.to_owned(), kept));
         Ok(())
     }
 
@@ -481,6 +521,27 @@ mod tests {
         assert_eq!(store.get(&second).unwrap(), Stored::NoSuchItem);
         store.delete(&first).unwrap();
         assert_eq!(store.get(&first).unwrap(), Stored::NoSuchItem);
+    }
+
+    /// The fake store can lock partway through what it is asked, and can
+    /// keep something other than what it is put.
+    #[test]
+    fn the_fake_store_locks_after_so_many_calls_and_mangles_what_it_is_put() {
+        let store = FakeIdentityStore::default();
+        let item = ItemId::random();
+        store.lock_after(1);
+        store.put(&item, "label", b"kept").unwrap();
+        assert!(store.get(&item).is_err());
+        assert!(store.get(&item).is_err());
+        store.set_available(true);
+        assert_eq!(store.get(&item).unwrap(), Stored::Found(b"kept".to_vec()));
+
+        store.mangle();
+        store.put(&item, "label", b"kept").unwrap();
+        let Stored::Found(kept) = store.get(&item).unwrap() else {
+            panic!("the store keeps the item");
+        };
+        assert_ne!(kept, b"kept");
     }
 
     /// A bounded store answers as the store it bounds does, while that
