@@ -72,7 +72,9 @@ pub(crate) fn may_be_running(database: &Path) -> bool {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    /// Time is paused, so the second Relay's patience with the lock runs out
+    /// at once rather than after its second.
+    #[tokio::test(start_paused = true)]
     async fn one_relay_runs_on_a_database_at_a_time_and_its_lock_says_so_until_it_stops() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("relay.db");
