@@ -95,10 +95,11 @@ struct KeptKey {
     marker: PathBuf,
     /// The key, once got.
     material: tokio::sync::OnceCell<IdentityMaterial>,
-    /// Held while the key is got or made, off the async workers: a get
-    /// begun while one for a use since given up on is still under way waits
-    /// for it, and gets what it kept, rather than making a key beside it.
-    getting: StdMutex<()>,
+    /// The key as got off the async workers, held while it is got or made:
+    /// a get begun while one for a use since given up on is still under way
+    /// waits for it and takes what it got, rather than making a key beside
+    /// it, or getting it, and saying where it is kept, again.
+    got: StdMutex<Option<IdentityMaterial>>,
     /// The key's fingerprint, once known.
     fingerprint: OnceLock<String>,
 }
@@ -126,7 +127,7 @@ impl IdentityKey {
             },
             marker: data_dir.join(MARKER_FILE),
             material: tokio::sync::OnceCell::new(),
-            getting: StdMutex::default(),
+            got: StdMutex::default(),
             fingerprint: OnceLock::new(),
         }))
     }
@@ -195,10 +196,13 @@ impl KeptKey {
     /// on the store, each call to which is bounded, so it is done off the
     /// async workers.
     fn get(&self) -> Result<IdentityMaterial> {
-        let _getting = self
-            .getting
+        let mut got = self
+            .got
             .lock()
             .expect("Server identity lock is not poisoned");
+        if let Some(material) = got.as_ref() {
+            return Ok(material.clone());
+        }
         let private_key = self.private_key()?;
         let signing_key =
             KeyPair::try_from(private_key.as_slice()).context("read Server identity key")?;
@@ -206,11 +210,13 @@ impl KeptKey {
             .context("describe Server identity certificate")?
             .self_signed(&signing_key)
             .context("mint Server identity certificate")?;
-        Ok(IdentityMaterial {
+        let material = IdentityMaterial {
             public_key: signing_key.subject_public_key_info(),
             private_key,
             certificate: certificate.der().as_ref().to_vec(),
-        })
+        };
+        *got = Some(material.clone());
+        Ok(material)
     }
 
     /// The PKCS#8 private key, got from where the marker says it is kept,
@@ -1037,7 +1043,8 @@ mod tests {
     }
 
     /// A key being made for a use given up on is the key the next use gets:
-    /// none is made beside it.
+    /// none is made beside it, nor got again, so the Log says once where
+    /// it is kept.
     #[tokio::test(flavor = "current_thread")]
     async fn a_key_made_for_a_use_given_up_on_is_the_key_the_next_use_gets() {
         let directory = tempfile::tempdir().unwrap();
@@ -1048,22 +1055,28 @@ mod tests {
             tokio::spawn(async move { identity.public_key().await })
         };
 
-        let held = store.hold();
-        let given_up = getting();
-        while store.calls() == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        given_up.abort();
-        assert!(given_up.await.unwrap_err().is_cancelled());
-        let next = getting();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        drop(held);
-
-        let public_key = next.await.unwrap().unwrap();
-        // Time for what was being got for the use given up on to be done,
-        // were it still under way.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (public_key, log) = record_log(async {
+            let held = store.hold();
+            let given_up = getting();
+            while store.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            given_up.abort();
+            assert!(given_up.await.unwrap_err().is_cancelled());
+            let next = getting();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+            next.await.unwrap().unwrap()
+        })
+        .await;
         assert_eq!(store.contents().len(), 1, "one key is made");
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("Server identity key"))
+                .count(),
+            1,
+            "{log}"
+        );
         assert_eq!(
             IdentityKey::kept_in(directory.path(), kept_in(&store))
                 .public_key()
