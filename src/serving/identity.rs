@@ -631,7 +631,9 @@ const UNANSWERED_HINT: &str = "Try again once it answers.";
 /// What a platform credential store that answers it keeps no item a marker
 /// names has told, and what a user can do before giving the key up for
 /// lost. The Secret Service cannot tell an item it keeps nowhere from one
-/// a keyring database it has closed keeps, which it shows nobody.
+/// a keyring database it has closed keeps, which it shows nobody. A Mac
+/// whose login keychain was made anew after a password reset keeps the old
+/// one, item and all, under another name.
 #[cfg(target_os = "linux")]
 const ITEM_GONE: &str = "which it does not find";
 #[cfg(target_os = "linux")]
@@ -639,7 +641,10 @@ const ITEM_GONE_HINT: &str = "A keyring database or collection holding it may be
                               locked: open or unlock it, and try again. Otherwise restore the item";
 #[cfg(not(target_os = "linux"))]
 const ITEM_GONE: &str = "which it no longer keeps";
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+const ITEM_GONE_HINT: &str = "Restore the item to the login keychain (a password reset can leave \
+                              the old one in ~/Library/Keychains as login_renamed_1 or similar)";
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const ITEM_GONE_HINT: &str = "Restore the item";
 
 impl IdentityKeyUnavailable {
