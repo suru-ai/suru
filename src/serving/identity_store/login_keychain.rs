@@ -18,9 +18,19 @@
 //! and a build the keychain has yet to trust no way to be trusted — and it
 //! can only be barred for the whole process, and the rest of the Security
 //! framework the Server uses besides.
+//!
+//! A search that finds nothing shows the keychain keeps no such item only
+//! where the keychain is there, and was unlocked as the search began and as
+//! it ended. Keychain Services answers a search of a keychain that is not
+//! there — a home folder not mounted, say — as finding nothing, and a locked
+//! keychain may keep an item no search can see; either counts as
+//! unavailable, so a Server is never told its identity is gone while the
+//! keychain may keep it yet.
+
+use std::{ffi::c_void, path::PathBuf};
 
 use anyhow::anyhow;
-use core_foundation::data::CFData;
+use core_foundation::{base::TCFType, data::CFData};
 use security_framework::{
     base::Error,
     item::{
@@ -53,13 +63,43 @@ const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
 const ERR_SEC_INTERACTION_REQUIRED: i32 = -25315;
 
+/// The bit of a keychain's status that says it is unlocked, as
+/// `SecKeychain.h` names it `kSecUnlockStateStatus`.
+const UNLOCKED: u32 = 1;
+
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    /// Keychain Services' `SecKeychainGetStatus`, which `security-framework`
+    /// does not wrap: whether `keychain` is there to be asked at all, and
+    /// unlocked, asking its user nothing.
+    fn SecKeychainGetStatus(keychain: *mut c_void, status: *mut u32) -> i32;
+}
+
 /// The user's login keychain, as an [`super::IdentityStore`].
-pub(crate) struct LoginKeychain;
+pub(crate) struct LoginKeychain {
+    /// The keychain, by its name or its path.
+    keychain: PathBuf,
+}
 
 impl LoginKeychain {
-    /// The login keychain, which is found only once it is asked something.
-    fn keychain() -> Result<SecKeychain, StoreUnavailable> {
-        SecKeychain::open(LOGIN_KEYCHAIN).map_err(unavailable)
+    /// The user's login keychain.
+    pub(crate) fn new() -> Self {
+        Self {
+            keychain: PathBuf::from(LOGIN_KEYCHAIN),
+        }
+    }
+
+    /// The keychain at `path`, in the login keychain's place, in tests.
+    #[cfg(test)]
+    fn at(path: impl Into<PathBuf>) -> Self {
+        Self {
+            keychain: path.into(),
+        }
+    }
+
+    /// The keychain, which is found only once it is asked something.
+    fn keychain(&self) -> Result<SecKeychain, StoreUnavailable> {
+        SecKeychain::open(&self.keychain).map_err(unavailable)
     }
 
     /// A search of `keychain` for the item `item`, and nothing else.
@@ -76,7 +116,10 @@ impl LoginKeychain {
 
 impl IdentityStore for LoginKeychain {
     fn put(&self, item: &ItemId, label: &str, bytes: &[u8]) -> Result<(), StoreUnavailable> {
-        let keychain = Self::keychain()?;
+        let keychain = self.keychain()?;
+        // Keychain Services is never asked to add to a keychain that is not
+        // there.
+        lock_of(&keychain)?;
         let mut adding = ItemAddOptions::new(ItemAddValue::Data {
             class: ItemClass::generic_password(),
             data: CFData::from_buffer(bytes),
@@ -99,12 +142,73 @@ impl IdentityStore for LoginKeychain {
     }
 
     fn get(&self, item: &ItemId) -> Result<Stored, StoreUnavailable> {
-        let mut search = Self::search(Self::keychain()?, item);
-        stored(search.load_data(true).search())
+        let keychain = self.keychain()?;
+        let before = lock_of(&keychain)?;
+        let mut search = Self::search(keychain.clone(), item);
+        match stored(search.load_data(true).search())? {
+            Stored::NoSuchItem => {
+                kept_nothing(before, lock_of(&keychain)?)?;
+                Ok(Stored::NoSuchItem)
+            }
+            found => Ok(found),
+        }
     }
 
     fn delete(&self, item: &ItemId) -> Result<(), StoreUnavailable> {
-        deleted(Self::search(Self::keychain()?, item).delete())
+        let keychain = self.keychain()?;
+        let before = lock_of(&keychain)?;
+        match Self::search(keychain.clone(), item).delete() {
+            Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => {
+                kept_nothing(before, lock_of(&keychain)?)
+            }
+            deleted => deleted.map_err(unavailable),
+        }
+    }
+}
+
+/// Whether a keychain is unlocked, as its status says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lock {
+    Unlocked,
+    Locked,
+}
+
+impl Lock {
+    /// Whether a keychain whose status is `status` is unlocked.
+    fn of_status(status: u32) -> Self {
+        if status & UNLOCKED == 0 {
+            Self::Locked
+        } else {
+            Self::Unlocked
+        }
+    }
+}
+
+/// Whether `keychain` is unlocked, where it is there to be asked at all: one
+/// that is not counts as unavailable.
+fn lock_of(keychain: &SecKeychain) -> Result<Lock, StoreUnavailable> {
+    let mut status = 0;
+    // SAFETY: the keychain reference is live for the call, and status points
+    // to writable storage.
+    let code = unsafe { SecKeychainGetStatus(keychain.as_concrete_TypeRef().cast(), &mut status) };
+    if code != 0 {
+        return Err(unavailable(Error::from_code(code)));
+    }
+    Ok(Lock::of_status(status))
+}
+
+/// That a search finding nothing shows the keychain keeps no such item: it
+/// does where the keychain was unlocked as the search began, `before`, and
+/// as it ended, `after`.
+fn kept_nothing(before: Lock, after: Lock) -> Result<(), StoreUnavailable> {
+    if (before, after) == (Lock::Unlocked, Lock::Unlocked) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "it was locked while Suru searched it, and may keep the item where no search can \
+             see it"
+        )
+        .into())
     }
 }
 
@@ -118,15 +222,6 @@ fn stored(found: Result<Vec<SearchResult>, Error>) -> Result<Stored, StoreUnavai
         },
         Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(Stored::NoSuchItem),
         Err(error) => Err(unavailable(error)),
-    }
-}
-
-/// What deleting an item answered: an item the keychain did not keep is
-/// deleted all the same.
-fn deleted(deleted: Result<(), Error>) -> Result<(), StoreUnavailable> {
-    match deleted {
-        Err(error) if error.code() != ERR_SEC_ITEM_NOT_FOUND => Err(unavailable(error)),
-        _ => Ok(()),
     }
 }
 
@@ -177,14 +272,58 @@ mod tests {
         );
     }
 
-    /// Deleting an item the keychain does not keep is no failure; deleting
-    /// one from a keychain that cannot answer is.
+    /// A search finding nothing shows the keychain keeps no such item only
+    /// where the keychain was unlocked as the search began and as it ended:
+    /// a locked keychain may keep the item where a search cannot see it.
     #[test]
-    fn deleting_an_item_the_keychain_does_not_keep_succeeds() {
-        deleted(Ok(())).unwrap();
-        deleted(Err(Error::from_code(ERR_SEC_ITEM_NOT_FOUND))).unwrap();
-        let error = deleted(Err(Error::from_code(ERR_SEC_INTERACTION_NOT_ALLOWED))).unwrap_err();
-        assert!(error.to_string().starts_with("it is locked"), "{error}");
+    fn nothing_found_shows_no_item_only_where_the_keychain_was_unlocked_throughout() {
+        use Lock::{Locked, Unlocked};
+
+        kept_nothing(Unlocked, Unlocked).unwrap();
+        for (before, after) in [(Locked, Unlocked), (Unlocked, Locked), (Locked, Locked)] {
+            let error = kept_nothing(before, after).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "it was locked while Suru searched it, and may keep the item where no search \
+                 can see it"
+            );
+        }
+    }
+
+    /// The keychain's status says whether it is unlocked, whatever else it
+    /// says.
+    #[test]
+    fn the_keychain_status_says_whether_it_is_unlocked() {
+        assert_eq!(Lock::of_status(0b111), Lock::Unlocked);
+        assert_eq!(Lock::of_status(0b001), Lock::Unlocked);
+        assert_eq!(Lock::of_status(0b110), Lock::Locked);
+        assert_eq!(Lock::of_status(0), Lock::Locked);
+    }
+
+    /// A keychain that is not there — a home folder not mounted, say —
+    /// counts as unavailable, whatever is asked of it, and never as keeping
+    /// no such item, which would have a Server's user give its identity up
+    /// for lost; and putting an item in it makes no keychain in its place.
+    /// It asks Keychain Services of a keychain file that does not exist, so
+    /// no real keychain is touched.
+    #[test]
+    fn a_keychain_that_is_not_there_is_unavailable_and_never_made() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing").join("login.keychain-db");
+        let store = LoginKeychain::at(&path);
+        let item = ItemId::random();
+        let missing = "this user has no login keychain Suru can open: ";
+
+        let error = store.get(&item).unwrap_err().to_string();
+        assert!(error.starts_with(missing), "{error}");
+        let error = store.delete(&item).unwrap_err().to_string();
+        assert!(error.starts_with(missing), "{error}");
+        let error = store.put(&item, "label", b"key").unwrap_err().to_string();
+        assert!(error.starts_with(missing), "{error}");
+        assert!(
+            !directory.path().join("missing").exists(),
+            "no keychain is made"
+        );
     }
 
     /// A keychain that is locked, or that would ask whether Suru may use the
@@ -241,7 +380,7 @@ mod tests {
 
     /// What the login keychain labels the item `item`, where it keeps it.
     fn label_of(item: &ItemId) -> Option<String> {
-        let mut search = LoginKeychain::search(LoginKeychain::keychain().unwrap(), item);
+        let mut search = LoginKeychain::search(LoginKeychain::new().keychain().unwrap(), item);
         match search.load_attributes(true).search() {
             Ok(found) => found
                 .first()
@@ -258,7 +397,7 @@ mod tests {
 
     impl Drop for Throwaway {
         fn drop(&mut self) {
-            if let Err(error) = LoginKeychain.delete(&self.0) {
+            if let Err(error) = LoginKeychain::new().delete(&self.0) {
                 eprintln!("the throwaway item {} is left behind: {error}", self.0);
             }
         }
