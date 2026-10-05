@@ -34,8 +34,10 @@ cool things Suru does:
 
 - Cross-provider subagents - a Claude-managed Opus session can spin up a Codex-managed Astra session to review its work.
 - Remote access - run `/serve` to generate an invite on the host, then paste the invite into `/pair` on another machine
-  to allow the client to view all of the host's sessions. This requires a network path to already exist between the two machines.
-  This uses mTLS after the initial connection.
+  to allow the client to view all of the host's sessions. Reaching the host directly needs a network path between the
+  two machines; where there is none, a Relay can carry the connection instead (below). Every connection, redeeming the
+  invite included, is TLS 1.3 pinned to the host's key, with the joining machine presenting its own key in a client
+  certificate.
 - Relays - where your machines cannot reach each other directly, run a Relay of your own that each connects out to
   over HTTPS. It carries the Pairing's end-to-end TLS without being able to read it, and admits users by GitHub login.
   See [Running a Relay](docs/relay/README.md).

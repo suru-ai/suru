@@ -54,9 +54,9 @@ pub struct Global {
     /// database it names.
     #[arg(long, global = true, env = CONFIG_VARIABLE, value_name = "PATH")]
     pub config: Option<PathBuf>,
-    /// The SQLite database the Relay keeps its Accounts and Logins in, unless
-    /// the configuration file names one: `suru-relay.db` in the working
-    /// directory unless given either way.
+    /// The SQLite database the Relay keeps its Accounts and Logins in,
+    /// overriding the one the configuration file names: `suru-relay.db` in
+    /// the working directory unless given either way.
     #[arg(long, global = true, value_name = "PATH")]
     pub database: Option<PathBuf>,
 }

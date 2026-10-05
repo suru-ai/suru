@@ -48,7 +48,15 @@ commented example.
 ## Installing the Relay
 
 The Relay is released apart from Suru, with a version of its own (see [Versions and upgrades](#versions-and-upgrades)).
-Its releases are the repository's GitHub releases tagged `suru-relay-vX.Y.Z`, each with:
+**No Relay has been released yet.** Until one is, build it from source, from a checkout of the repository:
+
+```sh
+cargo build --locked --profile dist --package suru-relay
+# target/dist/suru-relay
+```
+
+Each Relay release will be published as one of the repository's GitHub releases, tagged `suru-relay-vX.Y.Z` — never
+marked the repository's latest release, which stays Suru's — with:
 
 - an archive for each platform — `suru-relay-vX.Y.Z-<target>.tar.gz`, or `.zip` on Windows — holding the
   `suru-relay` binary, this guide, the configuration reference and the example configuration, for
@@ -56,13 +64,8 @@ Its releases are the repository's GitHub releases tagged `suru-relay-vX.Y.Z`, ea
   `aarch64-pc-windows-msvc`;
 - a Linux container image for `amd64` and `arm64`, `ghcr.io/suru-ai/suru-relay:X.Y.Z`.
 
-Put the binary somewhere on the machine's `PATH`, such as `/usr/local/bin/suru-relay`. To build it from source
-instead, from a checkout of the repository at the release's tag:
-
-```sh
-cargo build --locked --profile dist --package suru-relay
-# target/dist/suru-relay
-```
+Once there is a release, build from its tag, or take its archive for your platform. Either way, put the binary
+somewhere on the machine's `PATH`, such as `/usr/local/bin/suru-relay`.
 
 `suru-relay --version` says the Relay's version and the versions of the Relay protocol it speaks:
 
@@ -388,7 +391,15 @@ systemd starts it again after `RestartSec`.
 
 The image runs `suru-relay run` as an unprivileged user, reads its configuration from
 `/etc/suru-relay/suru-relay.toml` (`SURU_RELAY_CONFIG` names it), and keeps its records in the volume at
-`/var/lib/suru-relay`. Inside the container, the Relay listens on every address, so Docker can reach it:
+`/var/lib/suru-relay`. Until a Relay release publishes the image at `ghcr.io/suru-ai/suru-relay`, build it yourself
+from the root of a checkout of the repository with the Dockerfile beside the Relay's code, and use `suru-relay` in
+place of the image's name below:
+
+```sh
+docker build --file crates/suru-relay/Dockerfile --tag suru-relay .
+```
+
+Inside the container, the Relay listens on every address, so Docker can reach it:
 
 ```toml
 database = "/var/lib/suru-relay/suru-relay.db"
@@ -578,7 +589,9 @@ The Relay carries a version of its own, apart from Suru's, and is released only 
 not a Relay release you need to install. Once released, a Relay is held to a compatibility promise: a newer Suru
 works with an older Relay and an upgraded Relay with an older Suru, so upgrading the Relay needs no coordinating
 with its users' Suru installs, nor theirs with you. A build whose `--version` says it speaks an `unstable-` Relay
-protocol is from before that promise, and works only with Suru built from the same source.
+protocol is from before that promise: until version 1 of the protocol is frozen, a Relay and a Suru must speak the
+same unstable version, which builds from around the same time of the repository do. A Server and a Relay that speak
+different versions are refused, and `/relay` says which side is behind and must be upgraded.
 
 Upgrade in place: stop the Relay, replace the binary or the image, and start the new one's `run` on the same
 configuration and database. As it starts, it carries the database forward to its own version, keeping every Account,
@@ -592,19 +605,69 @@ not start on it again.
 
 ## Using the Relay from Suru
 
-Give your users the Relay's public address. In Suru, each of them:
+Give your users the Relay's public address. In Suru, each of them logs in to it from every Server they want to reach,
+or reach others from, and then makes the Servers they want reachable Serve through it.
 
-1. runs `/relay` to open the list of their Server's Relays;
-2. presses `a`, types the address — exactly the public address — and presses Enter;
-3. chooses the Relay, which reads **login needed**, and presses Enter to log in. Suru shows an address and a code,
-   each of which `a` and `c` copy; they visit the address on any device, enter the code, and authorize the app.
+### Logging in
 
-The Relay then reads as logged in. Each Server logs in on its own, and stays logged in until its user removes the
-Relay (`x`) or you remove its Login. A user the rules do not admit is told so, and that only the Relay's operator
-can change it.
+1. Run `/relay` to open the list of the Server's Relays.
+2. Press `a`, type the address — exactly the public address — and press Enter.
+3. Choose the Relay, which reads **Login needed**, and press Enter to log in. Suru shows an address and a code,
+   each of which `a` and `c` copy; visit the address on any device, enter the code, and authorize the app.
+
+The Relay then reads **Logged in as** the GitHub user. Each Server logs in on its own, and stays logged in until its
+user removes the Relay (`x`) or you remove its Login. A user the rules do not admit is told so, and that only the
+Relay's operator can change it.
+
+Logging in opens nothing: it makes no Server reachable, and nobody can reach it through the Relay for it.
+
+### Serving through the Relay
+
+To make a Server reachable through the Relay, choose the Relay in its `/relay` list and press `s`. Serving through a
+Relay is chosen for each Relay, and is off until chosen. The Server waits at the Relay only while it is logged in
+there and Serving is on, so the Relay's row says what it waits on: **Serving through**, or **Serves through once
+logged in**, or **Serves through once Serving is on** — `/serve` turns Serving on. Press `s` again to stop.
+
+### Issuing an Invite
+
+On the Server to be reached, `/serve` turns Serving on and lists the ways an Invite may offer: this machine's own
+addresses, while its Serving listener listens, and `Relay <address>` for each Relay the Server Serves through and is
+logged in at. Each is ticked, and offered, unless you leave it out with Space. A Relay it holds but cannot offer is
+listed too, marked `[-]` and saying why — **login needed**, or **not Served through** — and an Invite offers it once
+that is put right in `/relay`. Enter issues the Invite, offering exactly the ways ticked: leave the addresses out for
+an Invite reached only through the Relay, or leave both kinds in, and the other machine reaches the Server directly
+where it can and through the Relay where it cannot.
+
+### Pairing through the Relay
+
+On the other machine, `/pair` takes the Invite. Before anything is trusted, Suru shows the Serving Server's
+fingerprint and, under **Reached by**, every way the Invite offers: each Relay whole, saying how this Server stands
+there — **logged in**, **login needed** or **Unreachable**. Enter trusts it; Esc trusts nothing.
+
+Where this Server has yet to log in at a Relay the Invite offers, pairing logs in there first: Suru adds the Relay to
+this Server where it holds no entry for it, shows the login's address and code, and carries on pairing once the login
+is done — one login, and one paste. A Relay joins only Servers logged in under the same Account, so both Servers must
+be logged in there as the same GitHub user; where they are not, Suru says so, and to log in as that user or pair the
+two directly.
+
+### Reaching a Remote
+
+Suru reaches a paired Remote directly where it can, and through a Relay where it cannot, trying the direct ways first.
+`/connect` lists the Remotes, and the one chosen lists the **Relays it Serves through**, saying how this Server
+stands at each — **logged in**, **login needed**, **Unreachable**, or **not added here, so not used**. A Relay this
+Server holds no entry for is never used to reach the Remote until it is added in `/relay` and logged in at.
+
+### When a Login stops standing
 
 Should a Login come to be refused — its Account lapsed, or you removed it — Suru raises a Notice once, *Login needed
-at* the Relay's address, and the Relay reads **login needed** in `/relay`, where Enter logs in again. A Remote that
-nothing but that Relay reaches reads Unreachable, offering to log in to try again, which leads to the same login.
-Where the Account lapsed, one fresh login from any of its Servers restores every Login under it. A Relay that has
-merely stopped answering reads Unreachable instead, and Suru keeps trying it on its own.
+at* the Relay's address, pointing to `/relay` to log in, and the Relay reads **Login needed** there, where Enter logs
+in again. A Remote that nothing but that Relay reaches reads Unreachable, offering *Log in to try again*, which leads
+to the same login. Where the Account lapsed, one fresh login from any of its Servers restores every Login under it. A
+Relay that has merely stopped answering reads Unreachable instead, and Suru keeps trying it on its own.
+
+### Serving with no port open
+
+A Server Serving through a Relay needs no listening port at all. The **Serving listener** setting, in the
+Experimental tab of the settings panel (`/settings`), is on unless turned off: off, the Server binds no port while it
+Serves, and is reached only through the Relays it Serves through, and `/serve` offers none of the machine's own
+addresses.
