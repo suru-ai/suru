@@ -218,66 +218,52 @@ impl KeptKey {
     /// key file the data directory already keeps is the key, and is marked
     /// as kept there; with neither, a key is made.
     fn private_key(&self) -> Result<Vec<u8>> {
-        match Marker::read(&self.marker)? {
-            Some(Marker::SystemStore { item, fingerprint }) => {
-                let key = match self.store.get(&item) {
-                    Ok(Stored::Found(key)) => key,
-                    Ok(Stored::NoSuchItem) => {
-                        return Err(IdentityKeyUnavailable::item_gone(item, &self.marker).into());
-                    }
-                    Err(unavailable) => {
-                        return Err(IdentityKeyUnavailable::unanswered(&unavailable).into());
-                    }
-                };
-                if fingerprint_of(&key)? != fingerprint {
-                    return Err(IdentityKeyUnavailable::not_its_key(
-                        &format!("the item {item} {PLATFORM_STORE} keeps"),
-                        &fingerprint,
-                        &self.marker,
-                    )
-                    .into());
+        let Some(marker) = Marker::read(&self.marker)? else {
+            return self.unmarked();
+        };
+        let key = match &marker {
+            Marker::SystemStore { item, .. } => match self.store.get(item) {
+                Ok(Stored::Found(key)) => key,
+                Ok(Stored::NoSuchItem) => {
+                    return Err(IdentityKeyUnavailable::item_gone(*item, &self.marker).into());
                 }
-                tracing::info!(
-                    "Server identity key is kept in {PLATFORM_STORE}, as the item {item}, as its \
-                     marker records"
-                );
-                Ok(key)
-            }
-            Some(Marker::File { fingerprint }) => {
-                let Some(key) = self.file.read()? else {
-                    return Err(
-                        IdentityKeyUnavailable::file_gone(&self.file.path, &self.marker).into(),
-                    );
-                };
-                if fingerprint_of(&key)? != fingerprint {
-                    return Err(IdentityKeyUnavailable::not_its_key(
-                        &self.file.path.display().to_string(),
-                        &fingerprint,
-                        &self.marker,
-                    )
-                    .into());
+                Err(unavailable) => {
+                    return Err(IdentityKeyUnavailable::unanswered(&unavailable).into());
                 }
-                tracing::info!(
-                    "Server identity key is kept in an owner-only file in the data directory, as \
-                     its marker records"
-                );
-                Ok(key)
-            }
-            None => match self.file.read()? {
-                Some(key) => {
-                    Marker::File {
-                        fingerprint: fingerprint_of(&key)?,
-                    }
-                    .write(&self.marker)?;
-                    tracing::info!(
-                        "Server identity key is kept in the owner-only file in the data \
-                         directory it was found in"
-                    );
-                    Ok(key)
-                }
-                None => self.make(),
             },
+            Marker::File { .. } => self
+                .file
+                .read()?
+                .ok_or_else(|| IdentityKeyUnavailable::file_gone(&self.file.path, &self.marker))?,
+        };
+        let place = marker.place();
+        if fingerprint_of(&key)? != marker.fingerprint() {
+            return Err(IdentityKeyUnavailable::not_its_key(
+                &place,
+                marker.fingerprint(),
+                &self.marker,
+            )
+            .into());
         }
+        tracing::info!("Server identity key is kept in {place}, as its marker records");
+        Ok(key)
+    }
+
+    /// The key where no marker says where it is kept: a key file the data
+    /// directory already keeps, marked as kept there, or else a key made.
+    fn unmarked(&self) -> Result<Vec<u8>> {
+        let Some(key) = self.file.read()? else {
+            return self.make();
+        };
+        Marker::File {
+            fingerprint: fingerprint_of(&key)?,
+        }
+        .write(&self.marker)?;
+        tracing::info!(
+            "Server identity key is kept in the owner-only file in the data directory it was \
+             found in"
+        );
+        Ok(key)
     }
 
     /// A new key, kept in the store the selection says — in the file where
@@ -382,6 +368,14 @@ impl Marker {
         }
     }
 
+    /// Where it says the key is kept, as the Log and its user are told.
+    fn place(&self) -> String {
+        match self {
+            Self::SystemStore { item, .. } => format!("{PLATFORM_STORE}, as the item {item}"),
+            Self::File { .. } => "an owner-only file in the data directory".to_owned(),
+        }
+    }
+
     /// The marker at `path`, where there is one. One there that cannot be
     /// read fails, and is never taken for none.
     fn read(path: &Path) -> Result<Option<Self>> {
@@ -483,12 +477,12 @@ impl IdentityKeyUnavailable {
         ))
     }
 
-    /// The key `kept` names is not the one the marker at `marker` records,
-    /// by its `fingerprint`.
-    fn not_its_key(kept: &str, fingerprint: &str, marker: &Path) -> Self {
+    /// The key kept in `place` is not the one the marker at `marker`
+    /// records, by its `fingerprint`.
+    fn not_its_key(place: &str, fingerprint: &str, marker: &Path) -> Self {
         Self(format!(
-            "{kept} is not this Server's identity key, {fingerprint}, as {} records it; no new \
-             key was made in its place.",
+            "the key kept in {place} is not this Server's identity key, {fingerprint}, as {} \
+             records it; no new key was made in its place.",
             marker.display()
         ))
     }
@@ -908,6 +902,46 @@ mod tests {
         );
         assert_eq!(store.contents()[&item], other);
         assert!(!directory.path().join("server-identity.pk8").exists());
+    }
+
+    /// A key file marked as keeping the key that keeps another, or is gone,
+    /// is never used, and no key is made in its place.
+    #[tokio::test]
+    async fn a_key_file_other_than_the_one_marked_or_gone_is_never_used() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("server-identity.pk8");
+        IdentityKey::new(directory.path())
+            .public_key()
+            .await
+            .unwrap();
+        let other = KeyPair::generate().unwrap().serialize_der();
+        fs::write(&path, &other).unwrap();
+
+        let mismatched = told(
+            &IdentityKey::new(directory.path())
+                .public_key()
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            mismatched.contains("an owner-only file")
+                && mismatched.contains("is not this Server's identity key"),
+            "{mismatched}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), other);
+
+        fs::remove_file(&path).unwrap();
+        let gone = told(
+            &IdentityKey::new(directory.path())
+                .public_key()
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            gone.contains("which is gone") && gone.contains("no new key was made"),
+            "{gone}"
+        );
+        assert!(!path.exists());
     }
 
     /// A marker that cannot be read stands for a key kept somewhere all the
