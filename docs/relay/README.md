@@ -579,7 +579,9 @@ start it. The `.lock` file needs no backing up.
 
 Should the database become unwritable while the Relay runs — a full disk, say, or another process holding it longer
 than SQLite waits — a login, a join, or a Server's proof that needs what the Relay cannot read or record is
-refused, Suru telling its user that the Relay could not use its records, and the Relay says why on standard error.
+refused, and the Relay says why on standard error. A login so refused tells its user that the Relay could not use
+its records; a Server whose proof is refused reads the Relay as Unreachable in `/relay`, and one whose join is
+refused reads its Remote as Unreachable, each trying again on its own.
 
 What the admission rules or `fresh_login_days` call for is never put off for it. An Account found to lapse — its
 user out of the organization, or not logged in as for too long — lapses at once all the same: the Relay refuses its
@@ -653,13 +655,17 @@ where it can and through the Relay where it cannot.
 
 On the other machine, `/pair` takes the Invite. Before anything is trusted, Suru shows the Serving Server's
 fingerprint and, under **Reached by**, every way the Invite offers: each Relay whole, saying how this Server stands
-there — **logged in**, **login needed** or **Unreachable**. Enter trusts it; Esc trusts nothing.
+there — **logged in**, **login needed** or **Unreachable**. Enter trusts it, opening **Configure Remote**, where you
+name the Remote and may reorder the ways it is reached by; another Enter pairs. Esc at either step pairs nothing.
 
-Where this Server has yet to log in at a Relay the Invite offers, pairing logs in there first: Suru adds the Relay to
-this Server where it holds no entry for it, shows the login's address and code, and carries on pairing once the login
-is done — one login, and one paste. A Relay joins only Servers logged in under the same Account, so both Servers must
-be logged in there as the same GitHub user; where they are not, Suru says so, and to log in as that user or pair the
-two directly.
+Pairing tries the direct ways the Invite offers first, and its Relays only once no direct way has answered within a
+moment, so it needs a Relay only where no direct way answers. Where it needs one this Server has yet to log in at, it
+logs in there first: Suru adds the Relay to this Server where it holds no entry for it, shows the login's address and
+code, and carries on pairing once the login is done — one login, and one paste. An Invite offering both kinds that
+pairs directly — on the same network, say — neither adds the Relay it also offers nor logs in there, so reaching the
+Remote through it from elsewhere later needs that Relay added and logged in at in `/relay` first. A Relay joins only
+Servers logged in under the same Account, so both Servers must be logged in there as the same GitHub user; where they
+are not, Suru says so, and to log in as that user or pair the two directly.
 
 ### Reaching a Remote
 
