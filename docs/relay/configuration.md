@@ -200,15 +200,18 @@ to a cap.
   another.
 - `idle_connections_per_server` caps how many idle connections each Server whose Login stands may hold at
   once: connections on which it is doing nothing — not waiting to be reached, not joined nor asking to
-  be, not logging in. A Server holds one, to hear at once that its Login stops standing, unless it waits
-  on that one to be reached, and one more for each join it asks for or takes up, for the moment between
-  proving its key and asking. A connection past it is refused as it proves the Server's key, and one
-  that becomes idle past it — its join refused, say — is let go.
+  be, not logging in. A connection counts as idle only once it has gone five seconds asking nothing, after
+  proving its Server's key or after what it last asked is done with; a Server asks for a join, or takes one
+  up, the moment it has proven its key, so the connections it opens for those are never counted, however
+  many it opens at once. What counts is the one connection a Server keeps to hear at once that its Login
+  stops standing, unless it waits on that one to be reached, and any connection that proves and then sits.
+  One counted past the cap is refused and let go. The least it may be, 1, leaves room for that one kept
+  connection.
 - `idle_connections_per_server_without_login` caps the same for a Server holding no Login that stands:
   one that has yet to log in, or whose Login needs renewing. Such a Server asks what it came for — to
   log in, to be forgotten, or only to learn its Login needs renewing — the moment it has proven its key,
-  so a connection of one that asks nothing for 30 seconds is let go as well. A login under way is not
-  idle, however long it takes.
+  and keeps no connection, so the least it may be, 1, is room enough; a connection of one that asks nothing
+  for 30 seconds is let go as well. A login under way is not idle, however long it takes.
 
 ### `keepalive_seconds`
 

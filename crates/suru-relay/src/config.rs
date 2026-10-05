@@ -184,16 +184,18 @@ pub struct RunArguments {
     pub logins_at_once: Option<NonZeroU32>,
     /// How many idle connections each Server whose Login stands may hold at
     /// once: those on which it is doing nothing — not waiting to be reached,
-    /// not joined nor asking to be, not logging in. A Server holds one, to
-    /// hear at once that its Login stops standing, and one more for a moment
-    /// for each join it asks for or takes up. One past it is refused. 32
-    /// unless given.
+    /// not joined nor asking to be, not logging in — once they have gone five
+    /// seconds asking nothing, so the connections a Server opens to join or
+    /// take joins up, which ask at once, are never counted. A Server keeps
+    /// one, to hear at once that its Login stops standing, so 1 is the least
+    /// that works. One counted past it is refused. 32 unless given.
     #[arg(long, value_name = "CONNECTIONS")]
     pub idle_connections_per_server: Option<NonZeroU32>,
     /// How many idle connections each Server holding no Login that stands
     /// may hold at once, before it logs in or as it learns its Login needs
-    /// renewing. One past it is refused, and each is let go once it has
-    /// asked nothing for 30 seconds. 4 unless given.
+    /// renewing, counted as for --idle-connections-per-server. One counted
+    /// past it is refused, and each is let go once it has asked nothing for
+    /// 30 seconds. 4 unless given.
     #[arg(long, value_name = "CONNECTIONS")]
     pub idle_connections_per_server_without_login: Option<NonZeroU32>,
     /// How many seconds the Relay lets a connection go with nothing sent on

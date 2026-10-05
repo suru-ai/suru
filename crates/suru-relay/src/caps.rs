@@ -70,13 +70,14 @@ pub const CONNECTIONS_AT_ONCE: NonZeroU32 = NonZeroU32::new(8192).unwrap();
 pub const LOGINS_AT_ONCE: NonZeroU32 = NonZeroU32::new(128).unwrap();
 
 /// How many idle connections a Server whose Login stands may hold at a Relay
-/// at once, unless its configuration says otherwise. A Server holds one —
+/// at once, unless its configuration says otherwise. A Server keeps one —
 /// the connection it hears at once on that its Login stops standing, unless
-/// it waits on that one to be reached — and one more for each join it asks
-/// for or takes up, for the moment between proving its key and asking.
-/// 32 leaves room for a Server reaching dozens of Remotes through the Relay
-/// all at once, while bounding what an Account's Servers hold idle, at its
-/// cap of Logins, to 2,048.
+/// it waits on that one to be reached — and those it opens to ask for joins,
+/// or take them up, ask the moment they are proven, within the idle grace,
+/// so are never counted. 32 leaves room many times over — for a Server
+/// connecting again while the Relay has yet to see its last connections go,
+/// say — while bounding what an Account's Servers hold idle, at its cap of
+/// Logins, to 2,048.
 pub const IDLE_CONNECTIONS_PER_SERVER: NonZeroU32 = NonZeroU32::new(32).unwrap();
 
 /// How many idle connections a Server holding no Login that stands may hold

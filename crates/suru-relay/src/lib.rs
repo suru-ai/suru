@@ -128,6 +128,14 @@ const CONNECTION_LOG_CAPACITY: usize = 65_536;
 /// Login asks what it came for the moment it has.
 const IDLE_TIMEOUT_WITHOUT_LOGIN: Duration = GREETING_TIMEOUT;
 
+/// How long a connection proven, or done with what it last asked, may go
+/// idle before it counts among its Server's idle connections, unless the
+/// Relay's configuration says otherwise — and never longer than the greeting
+/// timeout. A Server asks what it came for the moment it has proven its key,
+/// so a burst of connections each opened to ask for a join, or to take one
+/// up, is never counted, while one that proves and then sits is.
+const IDLE_GRACE: Duration = Duration::from_secs(5);
+
 /// How often a Relay asks again about each Account its admission rules could
 /// not tell about as it started — which stands on nothing until they can —
 /// unless its configuration says otherwise: soon, rather than at its next
@@ -227,6 +235,7 @@ pub struct RelayConfig {
     idle_connections_per_server: NonZeroU32,
     idle_connections_per_server_without_login: NonZeroU32,
     idle_timeout_without_login: Duration,
+    idle_grace: Duration,
     lapse_retry_interval: Duration,
     undecided_recheck_interval: Duration,
 }
@@ -272,6 +281,7 @@ impl RelayConfig {
             idle_connections_per_server: IDLE_CONNECTIONS_PER_SERVER,
             idle_connections_per_server_without_login: IDLE_CONNECTIONS_PER_SERVER_WITHOUT_LOGIN,
             idle_timeout_without_login: IDLE_TIMEOUT_WITHOUT_LOGIN,
+            idle_grace: IDLE_GRACE,
             lapse_retry_interval: LAPSE_RETRY_INTERVAL,
             undecided_recheck_interval: UNDECIDED_RECHECK_INTERVAL,
         }
@@ -384,8 +394,10 @@ impl RelayConfig {
     /// at once at `cap` rather than [`IDLE_CONNECTIONS_PER_SERVER`]: those on
     /// which it is doing nothing — not waiting to be reached, not joined nor
     /// asking to be, not logging in — such as the one a Server keeps to hear
-    /// at once that its Login stops standing, and each it opens for a moment
-    /// before asking for a join on it. One past it is refused.
+    /// at once that its Login stops standing. A connection counts once it
+    /// has gone idle past the idle grace ([`Self::with_idle_grace`]), so
+    /// those a Server opens to ask for joins, or take them up, which ask at
+    /// once, never count. One counted past the cap is refused.
     pub fn with_idle_connections_per_server(mut self, cap: NonZeroU32) -> Self {
         self.idle_connections_per_server = cap;
         self
@@ -393,7 +405,9 @@ impl RelayConfig {
 
     /// Caps how many idle connections each Server holding no Login that
     /// stands may hold at once at `cap` rather than
-    /// [`IDLE_CONNECTIONS_PER_SERVER_WITHOUT_LOGIN`]. One past it is refused.
+    /// [`IDLE_CONNECTIONS_PER_SERVER_WITHOUT_LOGIN`], counted as for
+    /// [`Self::with_idle_connections_per_server`]. One counted past the cap is
+    /// refused.
     pub fn with_idle_connections_per_server_without_login(mut self, cap: NonZeroU32) -> Self {
         self.idle_connections_per_server_without_login = cap;
         self
@@ -405,6 +419,15 @@ impl RelayConfig {
     /// timeout allows each step of proving itself.
     pub fn with_idle_timeout_without_login(mut self, timeout: Duration) -> Self {
         self.idle_timeout_without_login = timeout;
+        self
+    }
+
+    /// Has the Relay count a connection among its Server's idle connections
+    /// only once it has gone idle for `grace` — after its Server proved its
+    /// key, or after it was done with what the Server last asked — rather
+    /// than for five seconds; never longer than the greeting timeout.
+    pub fn with_idle_grace(mut self, grace: Duration) -> Self {
+        self.idle_grace = grace;
         self
     }
 
@@ -733,6 +756,7 @@ pub async fn start(
         join_timeout: config.join_timeout,
         keepalive: config.keepalive,
         idle_timeout_without_login: config.idle_timeout_without_login,
+        idle_grace: config.idle_grace.min(config.greeting_timeout),
         idle: caps::Idle::new(
             config.idle_connections_per_server,
             config.idle_connections_per_server_without_login,

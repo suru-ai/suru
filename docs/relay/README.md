@@ -533,9 +533,10 @@ connections are capped as well, whoever opens them:
   (`idle_connections_per_server_without_login`), each of the latter let go once it has asked nothing for 30
   seconds.
 
-A Server holds one idle connection of its own, and one more for a moment for each join it asks for or takes up, so
-only a Server reaching dozens of Remotes through the Relay at the same moment comes near them; one refused is
-tried again. [The configuration reference](configuration.md#connections_at_once-logins_at_once-idle_connections_per_server-idle_connections_per_server_without_login)
+A connection counts as idle only once it has gone five seconds asking nothing. A Server asks for a join, or takes
+one up, the moment it has proven its key, so however many Remotes it reaches through the Relay at once none of
+those connections is counted; what counts is the one connection a Server keeps to hear at once that its Login
+stops standing, and any that proves and then sits. Either idle cap may be as low as 1. [The configuration reference](configuration.md#connections_at_once-logins_at_once-idle_connections_per_server-idle_connections_per_server_without_login)
 says what each counts.
 
 ## Requiring a fresh login

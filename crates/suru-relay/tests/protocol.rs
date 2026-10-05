@@ -4542,22 +4542,29 @@ impl Client {
         .expect("the Relay comes to have room for another connection")
     }
 
-    /// Proves `key` once the Relay takes another idle connection of its
-    /// Server's, trying again for as long as it refuses one: the connection,
-    /// and what the Relay says of its Login.
-    async fn kept_once_there_is_room(relay: &Relay, key: &KeyPair) -> (Self, Option<Account>) {
-        timeout(DEADLINE, async {
-            loop {
-                let mut client = Self::connect(relay).await;
-                match client.prove(key).await {
-                    RelayMessage::Proven { login } => return (client, login),
-                    refused => assert_eq!(refusal(&refused), Some(&Refusal::Unavailable)),
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the Relay comes to take another of the Server's idle connections")
+    /// Proves `key` on a connection kept open idle past the brief grace the
+    /// Relay gives a connection proven before counting it among its Server's
+    /// idle connections: the connection, and what the Relay says of its
+    /// Login.
+    async fn kept_past(relay: &Relay, key: &KeyPair, grace: Duration) -> (Self, Option<Account>) {
+        let kept = Self::kept(relay, key).await;
+        tokio::time::sleep(grace * 3).await;
+        kept
+    }
+
+    /// Whether the Relay refuses this proven connection, which asks nothing,
+    /// as one idle connection too many of its Server's, ending it.
+    async fn refused_as_idle_too_many(&mut self) -> bool {
+        let refused = self.hear().await;
+        let RelayMessage::Refused {
+            refusal: Refusal::Unavailable,
+            message,
+        } = &refused
+        else {
+            panic!("an idle connection past the cap is refused, not {refused:?}");
+        };
+        assert!(message.contains("idle connections"), "{message}");
+        self.ended().await
     }
 
     /// Proves `key` and begins a login on this connection: the code its user
@@ -4706,6 +4713,10 @@ impl Client {
     }
 }
 
+/// How long the Relays of the tests below let a connection proven go idle
+/// before counting it among its Server's idle connections.
+const IDLE_GRACE: Duration = Duration::from_millis(100);
+
 #[tokio::test]
 async fn a_server_holding_as_many_idle_connections_as_it_may_is_refused_another_and_what_it_does_goes_on()
  {
@@ -4716,24 +4727,21 @@ async fn a_server_holding_as_many_idle_connections_as_it_may_is_refused_another_
     }
     // Started afresh, so no connection a login was made on is held still.
     let relay = relay
-        .restarted(|config| config.with_idle_connections_per_server(cap(2)))
+        .restarted(|config| {
+            config
+                .with_idle_connections_per_server(cap(2))
+                .with_idle_grace(IDLE_GRACE)
+        })
         .await;
     let mut waiting = Client::waiting(&relay, &workstation).await;
     let (mut asking, mut taken_up) = joined_on(&relay, &mut waiting, &workstation, &laptop).await;
     let (mut first, _) = Client::kept(&relay, &workstation).await;
-    let (_second, _) = Client::kept(&relay, &workstation).await;
+    let (_second, _) = Client::kept_past(&relay, &workstation, IDLE_GRACE).await;
 
-    let mut one_too_many = Client::connect(&relay).await;
-    let refused = one_too_many.prove(&workstation).await;
-    let RelayMessage::Refused {
-        refusal: Refusal::Unavailable,
-        message,
-    } = &refused
-    else {
-        panic!("an idle connection past the cap is refused, not {refused:?}");
-    };
-    assert!(message.contains("idle connections"), "{message}");
-    assert!(one_too_many.ended().await);
+    // A connection proven and left idle past the grace is one too many.
+    let (mut one_too_many, login) = Client::kept(&relay, &workstation).await;
+    assert!(login.is_some());
+    assert!(one_too_many.refused_as_idle_too_many().await);
 
     // What the Server waits on, and what it has joined, go on, and another
     // Server's connections are its own.
@@ -4745,9 +4753,12 @@ async fn a_server_holding_as_many_idle_connections_as_it_may_is_refused_another_
     first.say(&ServerMessage::Wait).await;
     assert_eq!(first.hear().await, RelayMessage::Waiting);
 
-    // An idle connection put to use makes room for another.
-    let (_third, login) = Client::kept_once_there_is_room(&relay, &workstation).await;
+    // An idle connection put to use makes room for another, which goes on
+    // idle past the grace.
+    let (mut third, login) = Client::kept_past(&relay, &workstation, IDLE_GRACE).await;
     assert!(login.is_some());
+    third.say(&ServerMessage::Wait).await;
+    assert_eq!(third.hear().await, RelayMessage::Waiting);
     relay.running.shutdown().await.unwrap();
 }
 
@@ -4757,6 +4768,7 @@ async fn a_server_holding_no_login_is_held_to_a_few_idle_connections_and_its_log
         config
             .with_idle_connections_per_server_without_login(cap(2))
             .with_idle_connections_per_server(cap(8))
+            .with_idle_grace(IDLE_GRACE)
     })
     .await;
     let (newcomer, stranger) = (key(), key());
@@ -4764,18 +4776,17 @@ async fn a_server_holding_no_login_is_held_to_a_few_idle_connections_and_its_log
     let code = logging_in.begin_login(&newcomer).await;
     let mut idle = Vec::new();
     for _ in 0..2 {
-        let (kept, login) = Client::kept(&relay, &newcomer).await;
+        let (kept, login) = Client::kept_past(&relay, &newcomer, IDLE_GRACE).await;
         assert_eq!(login, None);
         idle.push(kept);
     }
 
-    let mut one_too_many = Client::connect(&relay).await;
-    assert_eq!(
-        refusal(&one_too_many.prove(&newcomer).await),
-        Some(&Refusal::Unavailable),
+    let (mut one_too_many, login) = Client::kept(&relay, &newcomer).await;
+    assert_eq!(login, None);
+    assert!(
+        one_too_many.refused_as_idle_too_many().await,
         "an idle connection past the cap of a Server holding no Login is refused"
     );
-    assert!(one_too_many.ended().await);
     assert_eq!(
         Client::kept(&relay, &stranger).await.1,
         None,
@@ -4786,8 +4797,68 @@ async fn a_server_holding_no_login_is_held_to_a_few_idle_connections_and_its_log
     // held to the cap of a Server holding one.
     assert!(relay.provider.approve(&code, who("17", "octo")));
     assert_eq!(logging_in.hear().await, login_done("octo"));
-    let (_kept, login) = Client::kept(&relay, &newcomer).await;
+    let (mut kept, login) = Client::kept_past(&relay, &newcomer, IDLE_GRACE).await;
     assert!(login.is_some());
+    kept.say(&ServerMessage::Wait).await;
+    assert_eq!(kept.hear().await, RelayMessage::Waiting);
+    relay.running.shutdown().await.unwrap();
+}
+
+/// A Server reaching many Remotes through the Relay at once — as one
+/// restarted with many in view does — opens a connection for each, and each
+/// is idle only for the moment between proving its key and asking for its
+/// join, as are those the Servers it reaches take the joins up on: none of
+/// them is counted among its Server's idle connections, however many there
+/// are, and however few its Server may keep idle.
+#[tokio::test]
+async fn a_burst_of_connections_each_proven_and_put_to_use_at_once_is_never_refused_as_idle() {
+    const GRACE: Duration = Duration::from_millis(500);
+    const JOINS: usize = 40;
+    let relay = relay().await;
+    let laptop = key();
+    let servers = [key(), key(), key()];
+    for key in std::iter::once(&laptop).chain(&servers) {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    // Started afresh, each Server may keep one connection idle, and the
+    // laptop's kept connection holds its one place.
+    let relay = relay
+        .restarted(|config| {
+            config
+                .with_idle_connections_per_server(cap(1))
+                .with_idle_grace(GRACE)
+        })
+        .await;
+    let (mut kept, _) = Client::kept_past(&relay, &laptop, GRACE).await;
+    let mut waiting = Vec::new();
+    for server in &servers {
+        waiting.push(Client::waiting(&relay, server).await);
+    }
+
+    let mut asking = futures_util::future::join_all(
+        (0..JOINS)
+            .map(|index| Client::ask_to_join(&relay, &laptop, &servers[index % servers.len()])),
+    )
+    .await;
+    let mut taking_up = Vec::new();
+    for (index, server) in servers.iter().enumerate() {
+        for _ in (0..JOINS).filter(|join| join % servers.len() == index) {
+            let join = waiting[index].reached().await;
+            taking_up.push(Client::take_up(&relay, server, join));
+        }
+    }
+    for (_, answer) in futures_util::future::join_all(taking_up).await {
+        assert_eq!(answer, RelayMessage::Joined);
+    }
+    for asking in &mut asking {
+        assert_eq!(asking.hear().await, RelayMessage::Joined);
+    }
+    kept.say(&ServerMessage::Wait).await;
+    assert_eq!(
+        kept.hear().await,
+        RelayMessage::Waiting,
+        "the kept connection held its place throughout"
+    );
     relay.running.shutdown().await.unwrap();
 }
 

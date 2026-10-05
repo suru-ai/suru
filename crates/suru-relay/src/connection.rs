@@ -68,6 +68,9 @@ pub(crate) struct Relay {
     pub(crate) idle_timeout_without_login: Duration,
     /// The idle connections each Server holds, held to their caps.
     pub(crate) idle: Idle,
+    /// How long a connection may go idle before it counts among its Server's
+    /// idle connections: no longer than the greeting timeout.
+    pub(crate) idle_grace: Duration,
     /// The logins under way, held to their cap, each Server's on one
     /// connection at a time.
     pub(crate) logins: Logins,
@@ -357,22 +360,16 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Handover>,
             }
         }
     };
+    channel.send(&RelayMessage::Proven { login }).await?;
     // Proven, the connection is idle until its Server asks something of it,
     // and is idle again each time what it asked is done with, held to the
-    // Server's cap on idle connections throughout.
-    let mut idle = Some(idle_place(channel, relay, &key, held.is_some()).await?);
-    channel.send(&RelayMessage::Proven { login }).await?;
+    // Server's cap on idle connections whenever it stays idle past a moment.
     loop {
-        let idle = match idle.take() {
-            Some(idle) => idle,
-            None => idle_place(channel, relay, &key, held.is_some()).await?,
-        };
         let stands = held.is_some();
         let asked = tokio::select! {
-            asked = asked_while_idle(channel, relay, stands) => asked?,
+            asked = asked_while_idle(channel, relay, &key, stands) => asked?,
             why = cut(&mut held) => return cut_off(channel, why).await,
         };
-        drop(idle);
         match asked {
             ServerMessage::BeginLogin { hostname } => {
                 log_in(channel, relay, &key, label(&hostname), &mut held).await?;
@@ -482,21 +479,43 @@ async fn idle_place(
     }
 }
 
-/// The next thing the Server asks on a connection idle until it does, where
-/// its Login stands on the connection, as `stands` says; where it does not,
-/// the connection is let go once it has asked nothing for the Relay's idle
-/// timeout for connections holding no Login.
+/// The next thing the Server whose key is `key` asks on a connection idle
+/// until it does, where its Login stands on the connection, as `stands` says,
+/// or where it does not. The connection counts among the Server's idle
+/// connections only once it has stayed idle past the Relay's idle grace —
+/// within which a Server asks what it came for — so a burst of connections
+/// each put to use at once is never refused; from then on it holds its place
+/// until the Server asks, and is refused and ended where the Server holds as
+/// many as it may. One whose Login does not stand on it is let go once it has
+/// asked nothing for the Relay's idle timeout for connections holding no
+/// Login.
 async fn asked_while_idle(
     channel: &mut Channel,
     relay: &Relay,
+    key: &[u8],
     stands: bool,
 ) -> Result<ServerMessage, Ended> {
-    if stands {
-        return channel.receive().await;
+    let let_go_at =
+        (!stands).then(|| tokio::time::Instant::now() + relay.idle_timeout_without_login);
+    if let Ok(asked) = tokio::time::timeout(relay.idle_grace, asked_by(channel, let_go_at)).await {
+        return asked;
     }
-    tokio::time::timeout(relay.idle_timeout_without_login, channel.receive())
-        .await
-        .unwrap_or(Err(Ended))
+    let _place = idle_place(channel, relay, key, stands).await?;
+    asked_by(channel, let_go_at).await
+}
+
+/// The next thing the Server asks on `channel`, by `let_go_at` where it is
+/// given, or the connection is let go.
+async fn asked_by(
+    channel: &mut Channel,
+    let_go_at: Option<tokio::time::Instant>,
+) -> Result<ServerMessage, Ended> {
+    match let_go_at {
+        Some(at) => tokio::time::timeout_at(at, channel.receive())
+            .await
+            .unwrap_or(Err(Ended)),
+        None => channel.receive().await,
+    }
 }
 
 /// Has a Server wait on this connection to be reached, as `waiting`, telling
