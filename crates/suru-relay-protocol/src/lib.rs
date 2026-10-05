@@ -335,8 +335,10 @@ pub enum Refusal {
     /// The Server's Account has reached `cap`, one of the caps the Relay's
     /// operator sets on each Account, which allows `limit`: only that
     /// operator can raise it, and until what counts against it is fewer, the
-    /// Relay refuses whatever would go past it.
-    CapReached { cap: Cap, limit: u32 },
+    /// Relay refuses whatever would go past it. The limit runs to eight bytes,
+    /// so a cap on what is carried, in bytes, can name its limit as a cap on
+    /// what is counted does.
+    CapReached { cap: Cap, limit: u64 },
     /// The Relay cannot do what was asked just now, for a reason of its own —
     /// it could not record another joined connection, say — and the Server
     /// may ask again later.
@@ -573,6 +575,34 @@ mod tests {
                 refused
             );
         }
+    }
+
+    /// A cap's limit runs to eight bytes, so a cap a later version adds on
+    /// what a Server sends — gibibytes a day, say — can name its limit in the
+    /// field every cap names it in.
+    #[test]
+    fn a_cap_names_a_limit_past_what_four_bytes_hold() {
+        let wire = r#"{"type":"refused","refusal":{"reason":"cap_reached","cap":"bytes_a_day","limit":5368709120},"message":"5 GiB a day"}"#;
+        let refused = serde_json::from_str::<RelayMessage>(wire).unwrap();
+        assert_eq!(
+            refused,
+            RelayMessage::Refused {
+                refusal: Refusal::CapReached {
+                    cap: Cap::Unrecognized,
+                    limit: 5 * 1024 * 1024 * 1024,
+                },
+                message: "5 GiB a day".to_owned(),
+            }
+        );
+        let wire = serde_json::to_value(RelayMessage::Refused {
+            refusal: Refusal::CapReached {
+                cap: Cap::JoinedConnections,
+                limit: u64::MAX,
+            },
+            message: "at its cap".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(wire["refusal"]["limit"], u64::MAX);
     }
 
     #[test]

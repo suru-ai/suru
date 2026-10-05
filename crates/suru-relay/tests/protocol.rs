@@ -4026,7 +4026,7 @@ fn cap(limit: u32) -> NonZeroU32 {
 }
 
 /// The refusal of a login past a cap of `limit` Logins for each Account.
-fn logins_capped(limit: u32) -> Refusal {
+fn logins_capped(limit: u64) -> Refusal {
     Refusal::CapReached {
         cap: Cap::Logins,
         limit,
@@ -4035,7 +4035,7 @@ fn logins_capped(limit: u32) -> Refusal {
 
 /// The refusal of a join past a cap of `limit` connections joined at once
 /// for each Account.
-fn joins_capped(limit: u32) -> Refusal {
+fn joins_capped(limit: u64) -> Refusal {
     Refusal::CapReached {
         cap: Cap::JoinedConnections,
         limit,

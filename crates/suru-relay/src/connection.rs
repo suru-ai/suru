@@ -1080,7 +1080,7 @@ fn logins_capped(provider: &str, username: &str, cap: NonZeroU32) -> RelayMessag
     refused(
         Refusal::CapReached {
             cap: Cap::Logins,
-            limit: cap.get(),
+            limit: u64::from(cap.get()),
         },
         format!(
             "this Relay allows {cap} Logins under each Account, and {username} ({provider}) \
@@ -1096,7 +1096,7 @@ fn joins_capped(cap: NonZeroU32) -> RelayMessage {
     refused(
         Refusal::CapReached {
             cap: Cap::JoinedConnections,
-            limit: cap.get(),
+            limit: u64::from(cap.get()),
         },
         format!(
             "this Relay joins up to {cap} connections at once for each Account, and this \

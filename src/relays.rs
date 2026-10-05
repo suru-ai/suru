@@ -674,7 +674,9 @@ impl RelayController {
                     },
                 ..
             })) => RelayLoginOutcome::Refused {
-                reason: RelayLoginRefusal::LoginsCapReached { limit },
+                reason: RelayLoginRefusal::LoginsCapReached {
+                    limit: u32::try_from(limit).unwrap_or(u32::MAX),
+                },
                 message: logins_capped(&address, limit),
             },
             Ok(Some(RelayMessage::Refused { refusal, message })) => RelayLoginOutcome::Refused {
@@ -1248,7 +1250,7 @@ fn different_accounts(relay: &str, account: &relay_protocol::Account) -> std::io
 
 /// What a login at the Relay at `address` is told where the Account it would
 /// stand under already has as many Servers logged in there as `limit`.
-fn logins_capped(address: &str, limit: u32) -> String {
+fn logins_capped(address: &str, limit: u64) -> String {
     let servers = if limit == 1 { "Server" } else { "Servers" };
     format!(
         "the Relay at {address} allows {limit} {servers} logged in under one Account, and \
@@ -1261,7 +1263,7 @@ fn logins_capped(address: &str, limit: u32) -> String {
 /// Server's Login stands under there has reached `cap`, which allows `limit`,
 /// as the Relay says in `message`: named first, ahead of where, so whatever
 /// shows only the start of it still says which cap.
-fn cap_reached(relay: &str, cap: Cap, limit: u32, message: &str) -> std::io::Error {
+fn cap_reached(relay: &str, cap: Cap, limit: u64, message: &str) -> std::io::Error {
     let (message, unreachable) = match cap {
         Cap::JoinedConnections => {
             let connections = if limit == 1 {
@@ -1278,7 +1280,7 @@ fn cap_reached(relay: &str, cap: Cap, limit: u32, message: &str) -> std::io::Err
                 ),
                 Some(UnreachableReason::RelayCapReached {
                     relay: relay.to_owned(),
-                    limit,
+                    limit: u32::try_from(limit).unwrap_or(u32::MAX),
                 }),
             )
         }
