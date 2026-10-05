@@ -259,7 +259,7 @@ impl KeptKey {
         match marker {
             Marker::SystemStore { .. } => {
                 tracing::info!("Server identity key is kept in {place}, as its marker records");
-                self.delete_file_left(&key);
+                self.delete_file_left(&key, &marker);
             }
             Marker::File { fingerprint } => self.move_from_file(&key, fingerprint),
         }
@@ -306,8 +306,9 @@ impl KeptKey {
 
     /// Moves `key`, whose fingerprint is `fingerprint`, out of the key file
     /// into the platform credential store, as it is: kept there as a new
-    /// item and read back, the marker made to name that item, and only then
-    /// the file deleted. However far a move gets before it stops, the key
+    /// item and read back, the marker made to name that item, and only once
+    /// that marker is on the disk the file deleted. However far a move gets
+    /// before it stops — the Server stopping, or the machine — the key
     /// still loads. Until the marker names the item, the file keeps the key
     /// and the marker says so, and the next move keeps the key as a new
     /// item again: one a move stopped before its marker leaves holds the
@@ -317,28 +318,38 @@ impl KeptKey {
     /// got from there, and a file still left is deleted then.
     fn move_into_store(&self, key: &[u8], fingerprint: String) -> Result<()> {
         let item = self.keep_in_store(key)?;
-        self.mark_kept_in_store(item, fingerprint)?;
+        let marked = self.mark_kept_in_store(item, fingerprint)?;
         tracing::info!(
             "Server identity key is moved from an owner-only file in the data directory into \
              {PLATFORM_STORE}, as the item {item}: {}",
             self.selection.why()
         );
-        if let Err(left) = self.file.delete() {
+        let deleted = match marked {
+            Marked::ForGood => self.file.delete(),
+            Marked::InPlace => Err(anyhow!(
+                "the marker naming its item may not be on the disk yet"
+            )),
+        };
+        if let Err(left) = deleted {
             moved_file_left(&left);
         }
         Ok(())
     }
 
     /// Deletes the key file where it keeps `key`, which the platform
-    /// credential store keeps as the item the marker names: the file a move
+    /// credential store keeps as the item `marker` names: the file a move
     /// into the store stopped before deleting. A file keeping another key
     /// is no file a move left, and is left as it is. The key is got all the
     /// same, so what stands in the way is Logged, and the next load tries
     /// again.
-    fn delete_file_left(&self, key: &[u8]) {
+    fn delete_file_left(&self, key: &[u8], marker: &Marker) {
         let deleted = match self.file.read() {
             Ok(None) => return,
-            Ok(Some(left)) if left == key => self.file.delete(),
+            // A move can stop with the marker in place but not yet on the
+            // disk, so it is written again, for good, before the file goes.
+            Ok(Some(left)) if left == key => {
+                marker.write(&self.marker).and_then(|()| self.file.delete())
+            }
             Ok(Some(_)) => {
                 tracing::warn!(
                     "{} keeps a key other than this Server's identity key, and is left as it is",
@@ -396,16 +407,16 @@ impl KeptKey {
     }
 
     /// Marks a key the platform credential store has just taken as the item
-    /// `item` as kept there. Where the marker cannot be written, nothing
-    /// gets the key from the item, so it is taken out of the store again
-    /// rather than left behind at each failure — unless a marker names it
-    /// all the same, or may: the writing can fail after it put the marker
-    /// in place, and a marker must never outlive the item it names. A
-    /// Server stopping before the marker is written leaves the one item,
-    /// which no marker names.
-    fn mark_kept_in_store(&self, item: ItemId, fingerprint: String) -> Result<()> {
+    /// `item` as kept there, and says how the marker stands. Where the
+    /// marker cannot be written, nothing gets the key from the item, so it
+    /// is taken out of the store again rather than left behind at each
+    /// failure — unless a marker names it all the same, or may: the writing
+    /// can fail after it put the marker in place, and a marker must never
+    /// outlive the item it names. A Server stopping before the marker is
+    /// written leaves the one item, which no marker names.
+    fn mark_kept_in_store(&self, item: ItemId, fingerprint: String) -> Result<Marked> {
         let Err(error) = (Marker::SystemStore { item, fingerprint }).write(&self.marker) else {
-            return Ok(());
+            return Ok(Marked::ForGood);
         };
         match MarkingLeft::after(Marker::read(&self.marker), item) {
             MarkingLeft::Marked => {
@@ -413,7 +424,7 @@ impl KeptKey {
                     "Server identity marker naming the item {item} is in place, though writing \
                      it failed: {error:#}"
                 );
-                Ok(())
+                Ok(Marked::InPlace)
             }
             MarkingLeft::Unmarked => {
                 if let Err(left) = self.store.delete(&item) {
@@ -514,6 +525,16 @@ impl Marker {
         write_private_json(path, self)
             .with_context(|| format!("write Server identity marker {path:?}"))
     }
+}
+
+/// How the marker naming a new item stands, once marking it is done.
+#[derive(Debug, PartialEq, Eq)]
+enum Marked {
+    /// Written, and on the disk.
+    ForGood,
+    /// In place, though writing it failed after it put it there, so it may
+    /// not be on the disk yet.
+    InPlace,
 }
 
 /// What writing the marker naming a new key's item left in place, where the
