@@ -622,7 +622,10 @@ pub(crate) struct IdentityKeyUnavailable(String);
 #[cfg(target_os = "macos")]
 const UNANSWERED_HINT: &str = "Unlock the login keychain, by logging in at this Mac or with \
                                `security unlock-keychain`, and try again.";
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+const UNANSWERED_HINT: &str = "Unlock the keyring, as logging in at this machine's desktop does, \
+                               and try again.";
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 const UNANSWERED_HINT: &str = "Try again once it answers.";
 
 impl IdentityKeyUnavailable {
