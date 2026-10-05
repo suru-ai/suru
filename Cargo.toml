@@ -111,6 +111,12 @@ signal-hook = "0.3.18"
 secret-service = { version = "5.2.0", features = ["rt-tokio-crypto-rust"] }
 zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 
+# The login keychain a Server keeps its identity key in on macOS (ADR-0050), through Keychain Services' item
+# API. Both are already built for rustls-platform-verifier.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+security-framework = { version = "3.7.0", default-features = false }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
