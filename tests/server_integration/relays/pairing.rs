@@ -856,6 +856,76 @@ async fn accounts_differing_at_one_relay_are_said_over_a_cap_reached_at_another_
     workstation.shutdown().await;
 }
 
+/// A Relay asking again soon about an Account it could not tell about as it
+/// started.
+fn rechecking_undecided_soon(config: RelayConfig) -> RelayConfig {
+    config.with_undecided_recheck_interval(Duration::from_millis(10))
+}
+
+/// A Relay that starts unable to tell whether its rules still admit the
+/// Account two paired Servers stand under refuses each Server's proof as
+/// unavailable for now: each reads the Relay Unreachable, never as needing a
+/// login, and the Remote reached through it reads Unreachable saying
+/// nothing more, as for any Relay that does not answer. Each tries again on
+/// its own, and once the Relay can tell, both stand there again and the
+/// Remote answers, without anyone logging in.
+#[tokio::test]
+async fn a_relay_that_cannot_yet_tell_of_the_account_reads_unreachable_and_is_tried_again() {
+    let mut relay = TestRelay::configured(rechecking_undecided_soon).await;
+    let (workstation, laptop) =
+        serving_through(&relay, "relay-pairing-undecided", relay_timings()).await;
+    let invite = workstation.invite(vec![Way::Relay(relay.address())]).await;
+    laptop
+        .redeem_as(invite, REMOTE)
+        .await
+        .expect("pair through the Relay");
+    let address = relay.address();
+
+    relay.provider.set_admission_undecided(true);
+    relay.restart().await;
+    for server in [&workstation, &laptop] {
+        let undecided = server
+            .wait_for_state(&address, RelayState::Unreachable)
+            .await;
+        assert_eq!(
+            undecided.login_needed_notice, None,
+            "no Notice asks for a login"
+        );
+    }
+    let health = laptop
+        .client
+        .probe_remote(REMOTE)
+        .await
+        .expect("probe the Remote");
+    assert_eq!(
+        (health.status, health.unreachable),
+        (RemoteStatus::Unavailable, None),
+        "the Remote is out of reach as through any Relay not answering, needing no login"
+    );
+    for server in [&workstation, &laptop] {
+        assert_eq!(
+            server.relay(&address).await.unwrap().state,
+            RelayState::Unreachable,
+            "the Relay never reads as needing a login meanwhile"
+        );
+    }
+
+    relay.provider.set_admission_undecided(false);
+    for server in [&workstation, &laptop] {
+        server.wait_for_state(&address, RelayState::LoggedIn).await;
+    }
+    assert_eq!(
+        laptop
+            .wait_for_remote(RemoteStatus::Available)
+            .await
+            .unreachable,
+        None
+    );
+
+    laptop.shutdown().await;
+    workstation.shutdown().await;
+}
+
 /// A Remote offering two Relays, each refusing it for a reason of its own,
 /// is said to need a login where one of them needs it, whichever is dialled
 /// first: a login is the user's own to do, where a cap is the operator's to
