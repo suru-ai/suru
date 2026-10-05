@@ -533,6 +533,16 @@ mod tests {
             let error = store.get(&item).unwrap_err();
             assert_eq!(error.to_string(), "it did not answer within 20ms");
         }
+        // Each call given up on reaches the store on its own thread, in its
+        // own time.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while fake.calls() - asked < CALLS_AT_ONCE {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the calls given up on reach the store"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
         let error = store.get(&item).unwrap_err();
         assert_eq!(
             error.to_string(),
