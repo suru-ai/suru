@@ -324,10 +324,7 @@ impl KeptKey {
             self.selection.why()
         );
         if let Err(left) = self.file.delete() {
-            tracing::warn!(
-                "the owner-only file in the data directory the Server identity key was moved \
-                 out of is left, and is deleted at its next load: {left:#}"
-            );
+            moved_file_left(&left);
         }
         Ok(())
     }
@@ -356,10 +353,7 @@ impl KeptKey {
                 "the owner-only file in the data directory the Server identity key was moved out \
                  of is deleted"
             ),
-            Err(left) => tracing::warn!(
-                "the owner-only file in the data directory the Server identity key was moved out \
-                 of is left, and is deleted at its next load: {left:#}"
-            ),
+            Err(left) => moved_file_left(&left),
         }
     }
 
@@ -545,6 +539,15 @@ impl MarkingLeft {
             Err(_) => Self::Unknown,
         }
     }
+}
+
+/// Logs that the key file the key was moved out of is left, as `why` says,
+/// for the next load that gets the key to delete.
+fn moved_file_left(why: &anyhow::Error) {
+    tracing::warn!(
+        "the owner-only file in the data directory the Server identity key was moved out of is \
+         left, and is deleted at its next load: {why:#}"
+    );
 }
 
 /// The owner-only file in a data directory an identity key is kept in,
