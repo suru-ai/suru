@@ -11,6 +11,7 @@ use std::{
 };
 use tokio::process::Command;
 mod branches;
+mod executable;
 mod on_disk;
 mod preparation;
 mod recovery;
@@ -22,7 +23,9 @@ const CONCURRENT_ROOT_CONFIRMATIONS: usize = 8;
 /// Git command execution stays on its owning Server. Timeouts and the executable
 /// are injectable so unavailable/hung installations need no global environment edits.
 pub struct GitSourceControl {
-    executable: PathBuf,
+    /// What every Git command is spawned as. Named outright, or found on
+    /// `PATH` by the first command, so that building an adapter spawns nothing.
+    executable: tokio::sync::OnceCell<executable::Executable>,
     timeout: Duration,
     mutation_timeout: Duration,
     configuration_file: Option<PathBuf>,
@@ -60,7 +63,10 @@ fn git_marker(root: &Path) -> Option<GitMarker> {
 }
 impl Default for GitSourceControl {
     fn default() -> Self {
-        Self::new("git")
+        Self {
+            executable: tokio::sync::OnceCell::new(),
+            ..Self::new("git")
+        }
     }
 }
 impl GitSourceControl {
@@ -208,7 +214,9 @@ impl GitSourceControl {
 
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
-            executable: executable.into(),
+            executable: tokio::sync::OnceCell::new_with(Some(executable::Executable::named(
+                executable,
+            ))),
             timeout: Duration::from_secs(5),
             mutation_timeout: Duration::from_secs(120),
             configuration_file: None,
@@ -268,8 +276,15 @@ impl GitSourceControl {
         } else {
             Stdio::null()
         };
-        let mut command = Command::new(&self.executable);
+        let executable = self
+            .executable
+            .get_or_init(|| executable::on_path(self.timeout))
+            .await;
+        let mut command = Command::new(&executable.program);
         command.arg("-C").arg(directory).args(args).stdin(stdin);
+        for (name, value) in &executable.environment {
+            command.env(name, value);
+        }
         // Ambient Git overrides must not redirect discovery into another checkout.
         for name in [
             "GIT_DIR",

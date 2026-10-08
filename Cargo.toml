@@ -118,7 +118,7 @@ core-foundation = "0.10.1"
 security-framework = { version = "3.7.0", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 # The binaries that ship, built only by CI for a release tag (`cargo build --profile dist`). Cargo's defaults
 # shipped a 46 MB binary: over a quarter of it symbol names nothing reads, and nearly a tenth generic code that each

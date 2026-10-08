@@ -161,6 +161,55 @@ async fn managed_branch_records_the_planned_source_commit_and_branch_when_claime
     );
 }
 
+/// Hooks find the shell and the tools Git ships beside it, as they do when
+/// Git for Windows' launcher sets up their environment.
+#[tokio::test]
+async fn hooks_run_with_the_shell_and_tools_their_git_ships() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    // Recorded under a name the hook must quote, as a home like
+    // `C:\Users\O'Connor` would be.
+    let ran = root.join("O'Connor").join("hook-ran");
+    std::fs::create_dir(ran.parent().unwrap()).unwrap();
+    let hook = main
+        .join(".git")
+        .join("hooks")
+        .join("reference-transaction");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    // `cat` is no shell builtin: on Windows only Git's own PATH holds it.
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' \"$1\" | cat >> '{}'\n",
+            ran.to_str()
+                .unwrap()
+                .replace('\\', "/")
+                .replace('\'', r"'\''")
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let adapter = GitSourceControl::default();
+    let source = adapter.discover(&main).await;
+    let plan = adapter
+        .plan_checkout(Default::default(), &source, "hooked", &[])
+        .await
+        .unwrap();
+    adapter.prepare_checkout(&plan).await.unwrap();
+
+    let ran = std::fs::read_to_string(&ran).unwrap_or_default();
+    assert!(
+        ran.lines().any(|state| state == "committed"),
+        "the branch Suru created ran the reference-transaction hook: {ran:?}"
+    );
+}
+
 #[tokio::test]
 async fn same_named_tag_cannot_hide_an_unmerged_local_source_branch() {
     let (_temporary, root) = root();
