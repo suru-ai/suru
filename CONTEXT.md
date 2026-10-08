@@ -380,7 +380,7 @@ A paired Serving Server as the redeeming side knows it: carrying a name its user
 _Avoid_: Remote server, host, upstream; forget (removal is the one verb for ending a Pairing from either side)
 
 **Peer**:
-A paired redeeming Server as the Serving side knows it: an entry its user can list and remove, and removing it ends the Pairing. A Peer is known by the name it gave itself when it redeemed its Invite — its machine's hostname, where a reader can be shown it — followed, where another Peer already goes by that name however it is cased or composed, by the first characters of its key's fingerprint; and what a Sidekick on it sends is attributed by that name and that key, and stands so whatever the Peer is known by later. A Peer may also withdraw — its own user removing the Remote on their side — and a withdrawn Peer simply leaves the list; only the Serving user's own removal marks it revoked.
+A paired redeeming Server as the Serving side knows it: an entry its user can list and remove, and removing it ends the Pairing. A Peer is known by the name it gave itself when it redeemed its Invite — its machine's hostname up to the first `.`, where a reader can be shown it — followed, where another Peer already goes by that name however it is cased or composed, by the first characters of its key's fingerprint; and what a Sidekick on it sends is attributed by that name and that key, and stands so whatever the Peer is known by later. A Peer may also withdraw — its own user removing the Remote on their side — and a withdrawn Peer simply leaves the list; only the Serving user's own removal marks it revoked.
 _Avoid_: Authorized client, key entry
 
 **Unreachable**:

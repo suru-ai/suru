@@ -422,12 +422,13 @@ async fn run_server(
     (server, client)
 }
 
-/// The name the Server reports itself by: its machine's hostname.
+/// The name the Server reports itself by: its machine's hostname up to its
+/// first `.`.
 fn machine_hostname() -> String {
     hostname::get()
         .ok()
         .and_then(|name| name.into_string().ok())
-        .map(|name| name.trim().to_owned())
+        .map(|name| name.split('.').next().unwrap_or_default().trim().to_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "remote".to_owned())
 }
