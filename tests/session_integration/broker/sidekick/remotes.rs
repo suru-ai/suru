@@ -426,6 +426,20 @@ async fn own_server(
     (own, claude, [state, config_root])
 }
 
+/// The database of the running Server `config` configures, waiting out
+/// whatever lock the Server's own writes hold on it rather than refusing a
+/// read at once.
+fn running_database(config: &ServerConfig) -> SqliteConnection {
+    let database = config.data_dir().join("suru.db");
+    let mut database =
+        SqliteConnection::establish(database.to_str().expect("the database's path is UTF-8"))
+            .expect("open the running Server's database");
+    diesel::sql_query("PRAGMA busy_timeout = 5000")
+        .execute(&mut database)
+        .expect("wait out the Server's writes");
+    database
+}
+
 /// The Sidekick's own Server for `channel`, kept by its config so it can be
 /// stopped and started again on the same data, paired with what it was.
 struct OwnServer {
@@ -520,14 +534,7 @@ impl OwnServer {
             #[diesel(sql_type = diesel::sql_types::Bool)]
             confirmed: bool,
         }
-        let database = self.config.data_dir().join("suru.db");
-        let mut database =
-            SqliteConnection::establish(database.to_str().expect("the database's path is UTF-8"))
-                .expect("open the own Server's database");
-        // The running Server may be writing as it is read.
-        diesel::sql_query("PRAGMA busy_timeout = 5000")
-            .execute(&mut database)
-            .expect("wait out the Server's writes");
+        let mut database = running_database(&self.config);
         diesel::sql_query(
             "SELECT origin, session_id, confirmed FROM sidekick_acts WHERE origin <> ''",
         )
