@@ -2078,13 +2078,16 @@ async fn a_forwarded_address_is_believed_only_from_a_proxy_the_operator_names() 
 }
 
 /// The Relay's database as it stands on disk: each of its files but SQLite's
-/// shared-memory index, which reading alone changes.
+/// shared-memory index, which reading alone changes, and the lock beside the
+/// records that says the Relay runs on them — no part of the database, and
+/// on Windows the lock the Relay holds on it keeps anything else from
+/// reading it.
 fn database_files(relay: &Relay) -> BTreeMap<String, Vec<u8>> {
     std::fs::read_dir(relay.directory.path())
         .unwrap()
         .map(Result::unwrap)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| !name.ends_with("-shm"))
+        .filter(|name| !name.ends_with("-shm") && !name.ends_with(".lock"))
         .map(|name| {
             let contents = std::fs::read(relay.directory.path().join(&name)).unwrap();
             (name, contents)
