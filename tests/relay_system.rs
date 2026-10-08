@@ -57,12 +57,10 @@ fn a_server_reaches_its_relays_through_the_system_proxy_and_trust_and_logs_nothi
     // while it changes: the binary holds this one test, and no runtime has
     // started yet.
     unsafe {
-        for name in ["HTTP_PROXY", "HTTPS_PROXY"] {
-            std::env::set_var(name, format!("http://{}", proxy.local_addr().unwrap()));
-        }
-        // On Linux the operating system's trust store is the certificate
-        // bundle this names, which a machine's own CA would be added to.
-        std::env::set_var("SSL_CERT_FILE", &trust.bundle);
+        // What could name another proxy, or exempt the Relay from this one,
+        // goes first: on Windows a variable's name is matched regardless of
+        // case, so clearing `https_proxy` after setting `HTTPS_PROXY` would
+        // clear the proxy itself.
         for name in [
             "http_proxy",
             "https_proxy",
@@ -74,6 +72,12 @@ fn a_server_reaches_its_relays_through_the_system_proxy_and_trust_and_logs_nothi
         ] {
             std::env::remove_var(name);
         }
+        for name in ["HTTP_PROXY", "HTTPS_PROXY"] {
+            std::env::set_var(name, format!("http://{}", proxy.local_addr().unwrap()));
+        }
+        // On Linux the operating system's trust store is the certificate
+        // bundle this names, which a machine's own CA would be added to.
+        std::env::set_var("SSL_CERT_FILE", &trust.bundle);
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
