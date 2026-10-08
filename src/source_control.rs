@@ -330,12 +330,16 @@ impl SourceControlService {
         Some(reading)
     }
 
-    /// The adapter's reading of `directory`, but for the Sidekick Workspace's,
-    /// which no adapter is asked about.
-    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+    /// The adapter's reading of `directory` within `batch`, but for the
+    /// Sidekick Workspace's, which no adapter is asked about.
+    async fn discover_in_batch(
+        &self,
+        batch: &mut DiscoveryBatch,
+        directory: &Path,
+    ) -> ResolvedWorkspace {
         match self.sidekick_reading(directory) {
             Some(reading) => reading,
-            None => self.adapter.discover(directory).await,
+            None => batch.discover(self.adapter.as_ref(), directory).await,
         }
     }
     pub(crate) async fn inspect_removal(
@@ -666,6 +670,10 @@ impl SourceControlService {
     }
     /// Selection has a different contract from explicit path entry: a Client's
     /// remembered directory remains selected when unavailable, never substituted.
+    ///
+    /// One selection is one discovery batch: each revalidation below asks
+    /// whether a directory still belongs to the Workspace as of this request,
+    /// so a directory already read for it is not read from source control again.
     pub(crate) async fn resolve_selection(
         &self,
         named: &Path,
@@ -692,7 +700,8 @@ impl SourceControlService {
             }
             .to_owned());
         }
-        let mut resolved = self.resolve(&path, known).await;
+        let mut batch = DiscoveryBatch::default();
+        let mut resolved = self.resolve_in_batch(&mut batch, &path, known).await;
         if request
             .workspace_id
             .as_ref()
@@ -709,7 +718,9 @@ impl SourceControlService {
             if let SourceControlAvailability::Unavailable { reason } = &checkout.availability {
                 return Err(reason.clone());
             }
-            let selected = self.resolve(&checkout.association.root, None).await;
+            let selected = self
+                .resolve_in_batch(&mut batch, &checkout.association.root, None)
+                .await;
             if selected.workspace.id != resolved.workspace.id
                 || selected
                     .checkout
@@ -730,7 +741,7 @@ impl SourceControlService {
         if let Some(directory) = &request.remembered_execution_directory {
             // Revalidate actual membership without restoring a durable association:
             // an unrelated replacement directory must not inherit its old Repository.
-            let remembered = self.discover(&directory.path).await;
+            let remembered = self.discover_in_batch(&mut batch, &directory.path).await;
             resolved.execution_directory = Some(ExecutionDirectory {
                 path: directory.path.clone(),
             });
@@ -766,7 +777,7 @@ impl SourceControlService {
             && resolved.execution_directory.is_some()
             && resolved.workspace.repository.is_some()
         {
-            let actual = self.discover(&path).await;
+            let actual = self.discover_in_batch(&mut batch, &path).await;
             if actual.workspace.id != resolved.workspace.id {
                 resolved.execution_status = ExecutionDirectoryStatus::Unavailable {
                     reason:
@@ -1002,6 +1013,135 @@ mod tests {
                 };
             }
             resolved
+        }
+    }
+
+    /// Knows one Repository by its main and one linked checkout, counting how
+    /// often each directory is read.
+    struct Counting {
+        main: PathBuf,
+        linked: PathBuf,
+        readings: Mutex<HashMap<PathBuf, usize>>,
+    }
+
+    impl Counting {
+        fn take_readings(&self) -> HashMap<PathBuf, usize> {
+            std::mem::take(&mut self.readings.lock().unwrap())
+        }
+    }
+
+    #[async_trait]
+    impl SourceControl for Counting {
+        async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+            *self
+                .readings
+                .lock()
+                .unwrap()
+                .entry(directory.to_owned())
+                .or_default() += 1;
+            let mut resolved = ResolvedWorkspace::directory(directory.to_owned());
+            if directory != self.main && directory != self.linked {
+                return resolved;
+            }
+            let id = RepositoryId::from_metadata("fake", &self.main);
+            let repository = Repository {
+                id: id.clone(),
+                system: "fake".to_owned(),
+                metadata_directory: self.main.clone(),
+                location: RepositoryLocation::Main {
+                    root: self.main.clone(),
+                },
+                availability: SourceControlAvailability::Available,
+                capabilities: crate::protocol::SourceControlCapabilities::discovery_only(),
+            };
+            resolved.workspace = repository_workspace(&repository);
+            resolved.checkouts = [
+                (&self.main, crate::protocol::CheckoutKind::Main),
+                (&self.linked, crate::protocol::CheckoutKind::Linked),
+            ]
+            .into_iter()
+            .map(|(root, kind)| crate::protocol::CheckoutSummary {
+                association: crate::protocol::CheckoutAssociation {
+                    recovery_revision: None,
+                    reclaim: None,
+                    id: crate::protocol::CheckoutId::from_root(&id, root),
+                    repository: id.clone(),
+                    root: root.clone(),
+                    kind,
+                },
+                revision: None,
+                availability: SourceControlAvailability::Available,
+            })
+            .collect();
+            resolved.checkout = resolved
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.association.root == directory)
+                .map(|checkout| checkout.association.clone());
+            resolved
+        }
+    }
+
+    #[tokio::test]
+    async fn one_selection_reads_each_directory_once() {
+        use crate::protocol::{ExecutionDirectory, ResolveWorkspaceRequest};
+        let main = PathBuf::from("repository-main");
+        let linked = PathBuf::from("repository-linked");
+        let adapter = Arc::new(Counting {
+            main: main.clone(),
+            linked: linked.clone(),
+            readings: Default::default(),
+        });
+        let service = SourceControlService::new(adapter.clone());
+        let known = service.resolve(&main, None).await;
+        let workspace = known.workspace;
+        let checkout_of = |root: &Path| {
+            known
+                .checkouts
+                .iter()
+                .find(|checkout| checkout.association.root == root)
+                .map(|checkout| checkout.association.id.clone())
+        };
+        let request = |checkout_id, remembered_execution_directory| ResolveWorkspaceRequest {
+            checkout_id,
+            remembered_execution_directory,
+            workspace_id: Some(workspace.id.clone()),
+            base: None,
+            path: PathBuf::new(),
+        };
+        let selections = [
+            ("the Workspace alone", request(None, None), &main),
+            (
+                "its main checkout",
+                request(checkout_of(&main), None),
+                &main,
+            ),
+            (
+                "its main checkout remembered",
+                request(None, Some(ExecutionDirectory { path: main.clone() })),
+                &main,
+            ),
+            (
+                "a linked checkout",
+                request(checkout_of(&linked), None),
+                &linked,
+            ),
+        ];
+        adapter.take_readings();
+        for (case, request, selected) in selections {
+            let resolved = service
+                .resolve_selection(&main, Some(&workspace), &request)
+                .await
+                .unwrap();
+            assert_eq!(resolved.workspace.id, workspace.id, "{case}");
+            assert_eq!(
+                resolved.checkout.map(|checkout| checkout.root).as_ref(),
+                Some(selected),
+                "{case}"
+            );
+            let mut expected = HashMap::from([(main.clone(), 1)]);
+            expected.insert(selected.clone(), 1);
+            assert_eq!(adapter.take_readings(), expected, "{case}");
         }
     }
 
