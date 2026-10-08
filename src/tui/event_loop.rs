@@ -1562,6 +1562,21 @@ impl RunLoop {
                     &self.channels.workspaces,
                 );
             }
+            ApplicationTransition::DetachSessionAndResolveWorkspace {
+                outlook,
+                request_id,
+                request,
+            } => {
+                self.tasks.leave_session();
+                self.tasks.resolve_workspace(
+                    self.client.session_commands_for(outlook.clone()),
+                    outlook,
+                    WorkspaceResolutionSurface::WorkspacePicker,
+                    request_id,
+                    request,
+                    &self.channels.workspaces,
+                );
+            }
             ApplicationTransition::ResolveSidekickWorkspace {
                 outlook,
                 request_id,
@@ -1762,6 +1777,7 @@ impl RunLoop {
             | ApplicationTransition::RedeemInvite { .. }
             | ApplicationTransition::TurnOutlook { .. }
             | ApplicationTransition::TurnOutlookAndViewAndAttach { .. }
+            | ApplicationTransition::DetachSessionAndResolveWorkspace { .. }
             | ApplicationTransition::ResolveSidekickWorkspace { .. }
             | ApplicationTransition::CancelWorkspaceResolution(_) => {
                 unreachable!("managed events issue no other Session command");

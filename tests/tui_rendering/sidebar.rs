@@ -10,11 +10,10 @@ use std::{
 
 use crate::support::{
     ADD_WORKSPACE, SELECTOR_ROW, SIDEBAR_PRESS_HEIGHT as PRESS_HEIGHT, SIDEBAR_WIDE as WIDE,
-    add_workspace, answer_workspace_resolution, connected_application, deliver_settings,
-    drawn_in_sidebar, enter_active_session, enter_session, failed_session_snapshot,
-    fixture_instance_id, noncanonical_spelling, press_add_workspace, rendered_application_buffer,
-    rendered_application_rows_at, rendered_row, selector_label, sidebar_column, text_on,
-    text_position, type_terminal_text, workspace_dir,
+    add_workspace, connected_application, deliver_settings, drawn_in_sidebar, enter_active_session,
+    enter_session, failed_session_snapshot, fixture_instance_id, noncanonical_spelling,
+    press_add_workspace, rendered_application_buffer, rendered_application_rows_at, rendered_row,
+    selector_label, sidebar_column, text_on, text_position, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -2856,10 +2855,13 @@ fn moving_workspace_while_a_session_is_opening_reports_the_client_letting_go() {
     press_sidebar_key(&mut application, KeyCode::Down);
 
     let chosen = press_sidebar_key(&mut application, KeyCode::Enter);
-    assert_eq!(
-        answer_workspace_resolution(&mut application, chosen),
-        ApplicationTransition::DetachSession,
-        "moving Workspace leaves the Session the client was opening behind with it"
+    assert!(
+        matches!(
+            chosen,
+            ApplicationTransition::DetachSessionAndResolveWorkspace { .. }
+        ),
+        "moving Workspace leaves the Session the client was opening behind with it, \
+         before the Workspace chosen is resolved: {chosen:?}"
     );
 }
 

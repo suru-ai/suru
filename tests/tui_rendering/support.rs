@@ -16,15 +16,15 @@ use suru::{
         Activity, ActivityId, AgentSelection, Approval, ApprovalId, ApprovalOutcome,
         ApprovalSubject, Decision, EffectiveSettings, ExecutionDirectory, Health, LifecycleState,
         Message, MessageId, MessageRole, MessageStatus, ModelAvailability, ModelDescriptor,
-        ModelId, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Question,
-        Questionnaire, QuestionnaireId, QuestionnaireOutcome, ServerIdentity, Session,
-        SessionChange, SessionId, SessionListItem, SessionRevision, SessionSnapshot, SessionStatus,
-        SessionSummary, SessionTimestamp, SettingsSnapshot, TranscriptItem, Turn, TurnId,
-        TurnStatus, Workspace, WorkspacePaths,
+        ModelId, Outlook, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
+        Question, Questionnaire, QuestionnaireId, QuestionnaireOutcome, ResolveWorkspaceRequest,
+        ServerIdentity, Session, SessionChange, SessionId, SessionListItem, SessionRevision,
+        SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SettingsSnapshot,
+        TranscriptItem, Turn, TurnId, TurnStatus, Workspace, WorkspacePaths,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
-        TerminalFacts,
+        TerminalFacts, WorkspaceResolutionSurface,
     },
 };
 use uuid::Uuid;
@@ -376,6 +376,39 @@ pub fn add_workspace(application: &mut Application, path: &str) -> ApplicationTr
     answer_workspace_resolution(application, transition)
 }
 
+/// The Workspace resolution `transition` asks of a Server, if it asks one:
+/// the Outlook asked, the surface its answer is delivered to, the request's
+/// id, and the request. A Workspace chosen in the picker, which lets go of the
+/// open Session, is answered as the picker's.
+pub fn workspace_resolution(
+    transition: &ApplicationTransition,
+) -> Option<(
+    Outlook,
+    WorkspaceResolutionSurface,
+    u64,
+    ResolveWorkspaceRequest,
+)> {
+    match transition {
+        ApplicationTransition::ResolveWorkspace {
+            outlook,
+            surface,
+            request_id,
+            request,
+        } => Some((outlook.clone(), *surface, *request_id, request.clone())),
+        ApplicationTransition::DetachSessionAndResolveWorkspace {
+            outlook,
+            request_id,
+            request,
+        } => Some((
+            outlook.clone(),
+            WorkspaceResolutionSurface::WorkspacePicker,
+            *request_id,
+            request.clone(),
+        )),
+        _ => None,
+    }
+}
+
 /// Answers a Workspace resolution transition the way the local Server would.
 /// Rendering tests stay at the Application seam: they deliver the server's
 /// visible answer rather than reaching into picker or Sidebar state.
@@ -383,13 +416,7 @@ pub fn answer_workspace_resolution(
     application: &mut Application,
     transition: ApplicationTransition,
 ) -> ApplicationTransition {
-    let ApplicationTransition::ResolveWorkspace {
-        outlook,
-        surface,
-        request_id,
-        request,
-    } = transition
-    else {
+    let Some((outlook, surface, request_id, request)) = workspace_resolution(&transition) else {
         return transition;
     };
     let base = request

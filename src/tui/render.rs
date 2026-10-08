@@ -1905,19 +1905,14 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
         // Named in full where the box can hold it, and by the keys alone where
         // it cannot — the same trade the rows make of "[current]" for "C", so
         // a narrow terminal loses wording rather than an affordance.
-        let (footer, style) = if let Some(refusal) = state.workspace_picker.refusal() {
-            (refusal, theme.feedback.error)
-        } else if content_width < usize::from(NARROW_TERMINAL_WIDTH) {
-            ("Enter · ^E · Esc", theme.text.subdued)
+        let footer = if content_width < usize::from(NARROW_TERMINAL_WIDTH) {
+            "Enter · ^E · Esc"
         } else {
-            (
-                "Enter switch · Ctrl+E describe · Esc close",
-                theme.text.subdued,
-            )
+            "Enter switch · Ctrl+E describe · Esc close"
         };
         lines.push(Line::styled(
             truncate_to_width(footer, content_width),
-            style,
+            theme.text.subdued,
         ));
     }
     render_overlay_box(
@@ -4619,6 +4614,15 @@ fn pad_to_width(text: &str, width: usize) -> String {
 /// is what the reader acts on, and a path keeps its most telling end, as a
 /// Workspace Picker row's does.
 fn execution_context(state: &TuiState, show_icons: bool, width: usize) -> String {
+    // A Workspace whose Server has yet to answer for it is named with the
+    // Spinner a reading on its way carries, where its Checkout State will
+    // stand: the Worktree, Checkout State, and subdirectory the client holds
+    // are the Workspace being left's, and the chosen one's are not known yet.
+    if let Some(workspace) = state.resolving_workspace() {
+        let reading = format!(" · {}", spinner::frame(state.spinner_frame / 3));
+        let workspace = workspace_context(state, workspace, width.saturating_sub(reading.width()));
+        return truncate_to_width(&format!("{workspace}{reading}"), width);
+    }
     let trailing = match state.execution_directory.as_deref() {
         Some(_) => {
             let status = if matches!(
@@ -4802,6 +4806,11 @@ fn render_landing(
             workspace_height,
         ),
     );
+    // The Spinner that line carries for a Workspace still resolving turns
+    // only while the presentation tick runs.
+    if state.resolving_workspace().is_some() {
+        state.session_animation_on_screen.set(true);
+    }
 
     render_slot(
         frame,

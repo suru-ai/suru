@@ -320,6 +320,8 @@ pub enum WorkspaceResolutionSurface {
     WorktreeList,
     WorktreeSelection,
     Outlook,
+    /// A Workspace chosen in the Workspace Picker, whose Landing the reader
+    /// already stands on while its Server answers.
     WorkspacePicker,
     Sidebar,
     /// `/sidekick`, which opens the Landing in the Sidekick Workspace once
@@ -535,6 +537,9 @@ pub struct TuiState {
     initial_context_resolved: bool,
     workspace_resolution_sequence: u64,
     pending_workspace_resolutions: HashMap<WorkspaceResolutionSurface, u64>,
+    /// The Workspace last chosen in the Workspace Picker, with the
+    /// resolution it was chosen as; see [`Self::resolving_workspace`].
+    chosen_workspace: Option<(u64, Workspace)>,
     pub(super) identity: Option<ServerIdentity>,
     /// What each Origin's connection is presently recovering from, keyed by
     /// the Origin whose Server stopped answering. `Outlook::Local` is this
@@ -616,7 +621,8 @@ pub struct TuiState {
     pub(super) shimmer_clock: super::shimmer::Clock,
     pub(super) rail_origins:
         RefCell<HashMap<SessionReference, (crate::protocol::SessionTimestamp, usize)>>,
-    /// Whether the last frame actually drew current-Session animation. A
+    /// Whether the last frame actually drew main-view animation: the current
+    /// Session's, or the Landing's while its Workspace is still resolving. A
     /// Working Indicator that scrolled away cannot justify 32ms redraws.
     pub(super) session_animation_on_screen: Cell<bool>,
     /// The Monitoring Session whose Watches the reader has confirmed stopping,
@@ -952,6 +958,7 @@ impl TuiState {
             initial_context_resolved: false,
             workspace_resolution_sequence: 0,
             pending_workspace_resolutions: HashMap::new(),
+            chosen_workspace: None,
             identity: None,
             recovering: HashMap::new(),
             manually_stopped: false,
@@ -1131,7 +1138,7 @@ impl TuiState {
     /// swaps — and what it sends is taken and dropped rather than drawn,
     /// because a projection under this route would be the wrong Session.
     fn open_session_route(&mut self, target: SessionReference) {
-        self.forget_sidekick_resolution();
+        self.forget_route_resolutions();
         self.opening_led = None;
         self.abandon_provisional_session();
         self.forget_awaited_withdrawals();
@@ -1167,7 +1174,7 @@ impl TuiState {
     /// reader is on their way to, and leaving is them saying they are not
     /// going after all — so it is left behind exactly as a hydrated one is.
     fn leave_session_route(&mut self) -> bool {
-        self.forget_sidekick_resolution();
+        self.forget_route_resolutions();
         self.opening_led = None;
         self.abandon_provisional_session();
         self.forget_awaited_withdrawals();
@@ -1358,6 +1365,13 @@ impl TuiState {
             self.pending_workspace_resolutions
                 .remove(&WorkspaceResolutionSurface::Outlook);
         }
+        // Anywhere else the reader asks to work is asked for later than the
+        // Workspace the Landing is waiting on was chosen, so its answer is
+        // the one adopted, whichever of the two the Server gives first.
+        if surface != WorkspaceResolutionSurface::WorkspacePicker {
+            self.pending_workspace_resolutions
+                .remove(&WorkspaceResolutionSurface::WorkspacePicker);
+        }
         let id = self.workspace_resolution_sequence;
         self.pending_workspace_resolutions.insert(surface, id);
         id
@@ -1375,14 +1389,51 @@ impl TuiState {
         true
     }
 
-    /// Lets go of a `/sidekick` still waiting on its Server's answer. Going
-    /// anywhere — another Session, the Landing, a Session begun from it — is
-    /// the reader saying they are not going to the Sidekick after all, so an
-    /// answer arriving later finds nothing to answer and leaves them, and the
-    /// draft they have since begun, where they are.
-    fn forget_sidekick_resolution(&mut self) {
-        self.pending_workspace_resolutions
-            .remove(&WorkspaceResolutionSurface::Sidekick);
+    /// Lets go of the resolutions a route is still waiting on: a `/sidekick`
+    /// waiting on its Server's answer, and a Workspace chosen in the Workspace
+    /// Picker whose Landing is waiting on its own. Going anywhere — another
+    /// Session, the Landing, a Session begun from it — is the reader saying
+    /// they are not going there after all, so an answer arriving later finds
+    /// nothing to answer and leaves them, and the draft they have since begun,
+    /// where they are.
+    fn forget_route_resolutions(&mut self) {
+        for surface in [
+            WorkspaceResolutionSurface::Sidekick,
+            WorkspaceResolutionSurface::WorkspacePicker,
+        ] {
+            self.pending_workspace_resolutions.remove(&surface);
+        }
+    }
+
+    /// The copies of a Workspace the Landing may name: the client's current
+    /// one, and the one chosen in the Workspace Picker while it is resolving.
+    fn landing_workspaces_mut(&mut self) -> impl Iterator<Item = &mut Workspace> {
+        std::iter::once(&mut self.workspace).chain(
+            self.chosen_workspace
+                .as_mut()
+                .map(|(_, workspace)| workspace),
+        )
+    }
+
+    /// The Workspace the Landing stands in before its Server has answered for
+    /// it: the one the reader chose in the Workspace Picker, for as long as
+    /// that choice is the one still awaited.
+    ///
+    /// Only the Landing's naming of the Workspace moves at once, because its
+    /// name is all the client knows of it. Everything else that reads where
+    /// the client works — its Execution Directory and Worktree, the Skill
+    /// Catalog, current-Workspace scope, the base a relative path is read
+    /// from — stays with the context last resolved until the answer adopts
+    /// the chosen one in full, and nothing acts on the chosen one before
+    /// then: the Landing begins no Session and offers no Worktree in a place
+    /// the Server has yet to say.
+    pub(super) fn resolving_workspace(&self) -> Option<&Workspace> {
+        let (request_id, workspace) = self.chosen_workspace.as_ref()?;
+        (self
+            .pending_workspace_resolutions
+            .get(&WorkspaceResolutionSurface::WorkspacePicker)
+            == Some(request_id))
+        .then_some(workspace)
     }
 
     fn cancel_workspace_resolution(&mut self, surface: WorkspaceResolutionSurface) -> bool {
@@ -1418,6 +1469,12 @@ impl TuiState {
         // already left answers for neither. Skill resolution waits with every
         // other act that needs the Session.
         if self.open_session_is_loading() {
+            return None;
+        }
+        // Nor does a Landing still waiting on its Workspace say an Execution
+        // Directory, and the one the client last resolved is not the chosen
+        // Workspace's.
+        if self.resolving_workspace().is_some() {
             return None;
         }
         let selection = self.agent_selection()?;
@@ -2294,9 +2351,12 @@ impl TuiState {
             ManagedEvent::WorkspaceIconChanged(changed) => {
                 // The Sidebar already took this in `apply_sidebar_catalog_event`,
                 // called ahead of this match. What is left is the Landing's own
-                // current Workspace and the two pickers.
-                if self.workspace.id == changed.workspace_id {
-                    self.workspace.icon = changed.icon.clone();
+                // current Workspace, the one it may still be waiting on, and
+                // the two pickers.
+                for workspace in self.landing_workspaces_mut() {
+                    if workspace.id == changed.workspace_id {
+                        workspace.icon = changed.icon.clone();
+                    }
                 }
                 self.session_picker.set_workspace_icon_origin(
                     self.outlook.clone(),
@@ -2314,8 +2374,10 @@ impl TuiState {
             // as it keeps its Icon, so every copy of a Workspace this client
             // holds says what its server says.
             ManagedEvent::WorkspaceDescriptionChanged(changed) => {
-                if self.workspace.id == changed.workspace_id {
-                    self.workspace.description = changed.description.clone();
+                for workspace in self.landing_workspaces_mut() {
+                    if workspace.id == changed.workspace_id {
+                        workspace.description = changed.description.clone();
+                    }
                 }
                 self.workspace_picker.set_workspace_description_origin(
                     self.outlook.clone(),
@@ -3882,7 +3944,7 @@ impl TuiState {
     /// own composer, which is where the migration onto the created Session's
     /// key reads it from.
     fn begin_provisional_session(&mut self, prompt: InitialPrompt) -> ApplicationTransition {
-        self.forget_sidekick_resolution();
+        self.forget_route_resolutions();
         self.text_selection.set(None);
         self.command_mode = CommandMode::Composer;
         self.submission_error = None;
@@ -5287,6 +5349,16 @@ pub enum ApplicationTransition {
         request_id: u64,
         request: ResolveWorkspaceRequest,
     },
+    /// Let go of whatever Session the client was on or on its way to, as
+    /// [`Self::DetachSession`] does, for the Landing a Workspace chosen in the
+    /// Workspace Picker has opened, and ask `outlook`'s Server to resolve that
+    /// Workspace, answering as the [`WorkspaceResolutionSurface::WorkspacePicker`]
+    /// resolution `request_id`.
+    DetachSessionAndResolveWorkspace {
+        outlook: Outlook,
+        request_id: u64,
+        request: ResolveWorkspaceRequest,
+    },
     /// Ask `outlook`'s Server for its Sidekick Workspace, which it makes the
     /// first time it is asked, and answer with it as the
     /// [`WorkspaceResolutionSurface::Sidekick`] resolution `request_id`.
@@ -6149,9 +6221,16 @@ impl Application {
                                 self.state.sidebar.refresh_after_outlook_workspace();
                                 Ok(self.take_session_listing_transition())
                             }
+                            // The reader has stood on this Workspace's Landing
+                            // since choosing it, so its answer fills in the
+                            // rest beneath whatever they have begun writing
+                            // rather than opening a fresh one over it.
                             WorkspaceResolutionSurface::WorkspacePicker => {
-                                self.state.workspace_picker.close();
-                                Ok(self.open_landing())
+                                self.state.chosen_workspace = None;
+                                // Nor is the Landing still waiting, whatever
+                                // it told a reader who pressed Enter meanwhile.
+                                self.state.submission_error = None;
+                                Ok(ApplicationTransition::Continue)
                             }
                             WorkspaceResolutionSurface::Sidekick => Ok(self.open_landing()),
                             WorkspaceResolutionSurface::Sidebar => {
@@ -6192,8 +6271,20 @@ impl Application {
                             | WorkspaceResolutionSurface::WorktreeSelection => {
                                 self.state.worktree_picker.fail(error);
                             }
+                            // The Landing the choice opened goes back to
+                            // naming the Workspace the client still works in,
+                            // since a refused choice moves nothing, and says
+                            // why above the draft the reader goes on keeping.
                             WorkspaceResolutionSurface::WorkspacePicker => {
-                                self.state.workspace_picker.fail_resolution(error);
+                                let (_, chosen) = self
+                                    .state
+                                    .chosen_workspace
+                                    .take()
+                                    .expect("a Workspace Picker resolution names its choice");
+                                let name =
+                                    self.state.workspace_name(&self.state.outlook, &chosen.path);
+                                self.state.submission_error =
+                                    Some(format!("Could not open the {name} Workspace: {error}"));
                             }
                             WorkspaceResolutionSurface::Sidebar => {
                                 self.state.sidebar.fail_workspace_resolution(error);
@@ -7384,6 +7475,11 @@ impl Application {
                         Some("Start a new Session before choosing a Worktree".to_owned());
                     return ApplicationTransition::Continue;
                 }
+                // The Worktrees on offer are a Repository's, and the Landing
+                // waiting on its Workspace cannot yet say which.
+                if self.state.resolving_workspace().is_some() {
+                    return ApplicationTransition::Continue;
+                }
                 self.state.worktree_picker.open();
                 self.state.command_mode = CommandMode::Composer;
                 let request = self.current_workspace_request();
@@ -7554,41 +7650,38 @@ impl Application {
             CommandId::SelectNextWorkspace => self.state.workspace_picker.select_next(),
             CommandId::PagePreviousWorkspaces => self.state.workspace_picker.page_previous(),
             CommandId::PageNextWorkspaces => self.state.workspace_picker.page_next(),
-            CommandId::CloseWorkspacePicker => {
-                let cancelled = self
-                    .state
-                    .cancel_workspace_resolution(WorkspaceResolutionSurface::WorkspacePicker);
-                self.state.workspace_picker.close();
-                if cancelled {
-                    return ApplicationTransition::CancelWorkspaceResolution(
-                        WorkspaceResolutionSurface::WorkspacePicker,
-                    );
-                }
-            }
-            // Choosing a Workspace adopts it in full and lands the reader in
-            // it. Before the listing arrives no row is the reader's, so there
-            // is nothing to choose and the picker stands on its loading line.
+            CommandId::CloseWorkspacePicker => self.state.workspace_picker.close(),
+            // Choosing a Workspace lands the reader in it at once, and adopts
+            // it in full once its Server has resolved it, which can take that
+            // Server seconds the reader need not spend watching the picker.
+            // Before the listing arrives no row is the reader's, so there is
+            // nothing to choose and the picker stands on its loading line.
             CommandId::SelectWorkspace => {
                 if let Some(workspace) = self.state.workspace_picker.offer_selected() {
+                    self.state.workspace_picker.close();
+                    let ApplicationTransition::DetachSession = self.open_landing() else {
+                        unreachable!("opening the Landing lets go of the Session being left");
+                    };
+                    let request = ResolveWorkspaceRequest {
+                        checkout_id: None,
+                        remembered_execution_directory: self
+                            .state
+                            .remembered_execution_directories
+                            .get(&(self.state.outlook.clone(), workspace.id.clone()))
+                            .and_then(|remembered| remembered.directory.clone())
+                            .map(|path| crate::protocol::ExecutionDirectory { path }),
+                        workspace_id: Some(workspace.id.clone()),
+                        base: None,
+                        path: workspace.path.clone(),
+                    };
                     let request_id = self
                         .state
                         .begin_workspace_resolution(WorkspaceResolutionSurface::WorkspacePicker);
-                    return ApplicationTransition::ResolveWorkspace {
+                    self.state.chosen_workspace = Some((request_id, workspace));
+                    return ApplicationTransition::DetachSessionAndResolveWorkspace {
                         outlook: self.state.outlook.clone(),
-                        surface: WorkspaceResolutionSurface::WorkspacePicker,
                         request_id,
-                        request: ResolveWorkspaceRequest {
-                            checkout_id: None,
-                            remembered_execution_directory: self
-                                .state
-                                .remembered_execution_directories
-                                .get(&(self.state.outlook.clone(), workspace.id.clone()))
-                                .and_then(|remembered| remembered.directory.clone())
-                                .map(|path| crate::protocol::ExecutionDirectory { path }),
-                            workspace_id: Some(workspace.id),
-                            base: None,
-                            path: workspace.path,
-                        },
+                        request,
                     };
                 }
             }
@@ -8409,6 +8502,20 @@ impl Application {
         // not one yet. The draft stands where the reader wrote it and the
         // delivery waits, rather than racing a snapshot that may not come.
         if self.state.open_session_is_loading() {
+            return ApplicationTransition::Continue;
+        }
+        // Nor is a Session begun from a Landing still waiting on its
+        // Workspace: it would begin in the Workspace the reader has left, or
+        // somewhere the Server has yet to say. The draft stands and waits for
+        // the answer, which leaves sending it to the reader, and the Landing
+        // says so as work waiting on an Unreachable Remote does.
+        if let Some(workspace) = self.state.resolving_workspace() {
+            let name = self
+                .state
+                .workspace_name(&self.state.outlook, &workspace.path);
+            self.state.submission_error = Some(format!(
+                "{name} is still resolving; this waits until its Server answers"
+            ));
             return ApplicationTransition::Continue;
         }
         let key = self.state.composer_key();

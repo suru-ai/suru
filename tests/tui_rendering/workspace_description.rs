@@ -743,9 +743,8 @@ fn a_local_description_never_reaches_a_remote_workspace_of_the_same_identity() {
     if !rendered_application_rows_at(&application, WIDE, TALL)[usize::from(row)].contains('›') {
         press_key(&mut application, KeyCode::Down);
     }
-    let ApplicationTransition::ResolveWorkspace {
+    let ApplicationTransition::DetachSessionAndResolveWorkspace {
         outlook,
-        surface,
         request_id,
         ..
     } = press_key(&mut application, KeyCode::Enter)
@@ -755,7 +754,7 @@ fn a_local_description_never_reaches_a_remote_workspace_of_the_same_identity() {
     application
         .handle_event(ApplicationEvent::WorkspaceResolved {
             outlook,
-            surface,
+            surface: suru::tui::WorkspaceResolutionSurface::WorkspacePicker,
             request_id,
             result: Ok(suru::protocol::ResolvedWorkspace::directory(shared.clone())),
         })

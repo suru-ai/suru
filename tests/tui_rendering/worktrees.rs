@@ -1,7 +1,7 @@
 //! Landing execution navigation through semantic commands and Server responses.
 use crate::support::{
     deliver_settings, fixture_instance_id, ready_health, rendered_application_rows_at,
-    selector_label, type_terminal_text,
+    selector_label, type_terminal_text, workspace_resolution,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use std::path::{Path, PathBuf};
@@ -140,15 +140,8 @@ impl Layout {
     }
 }
 fn answer(app: &mut Application, transition: ApplicationTransition, context: ResolvedWorkspace) {
-    let ApplicationTransition::ResolveWorkspace {
-        outlook,
-        surface,
-        request_id,
-        ..
-    } = transition
-    else {
-        panic!("expected owning Server resolution: {transition:?}")
-    };
+    let (outlook, surface, request_id, _) = workspace_resolution(&transition)
+        .unwrap_or_else(|| panic!("expected owning Server resolution: {transition:?}"));
     app.handle_event(ApplicationEvent::WorkspaceResolved {
         outlook,
         surface,
@@ -686,7 +679,8 @@ fn workspace_picker_remembers_exact_directory_and_missing_choice_without_changin
         scope
     );
     let transition = pick_other_workspace(&mut app, &[layout.context.clone(), other]);
-    let ApplicationTransition::ResolveWorkspace { request, .. } = &transition else {
+    let ApplicationTransition::DetachSessionAndResolveWorkspace { request, .. } = &transition
+    else {
         panic!("restore Workspace")
     };
     assert_eq!(
@@ -719,6 +713,50 @@ fn workspace_picker_remembers_exact_directory_and_missing_choice_without_changin
     };
     assert_eq!(request.execution_directory.path, layout.main);
     assert_eq!(request.prompt.text, "Keep this draft");
+}
+
+/// The Landing names a Workspace chosen in the picker before its Server has
+/// answered for it, and names nothing else of it: the Worktree, Checkout
+/// State, and subdirectory it was showing belong to the Workspace being left,
+/// and the chosen one's are not yet known. Nor does it offer the Worktrees of
+/// a Repository it cannot yet name; once the Server answers, the Landing
+/// says what it said.
+#[test]
+fn a_workspace_still_resolving_is_named_without_the_worktree_left_behind() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    let left = text(&app);
+    assert!(left.contains("abcdef0 · nested"), "{left}");
+
+    let other = ResolvedWorkspace::directory(layout.root.join("other"));
+    let transition = pick_other_workspace(&mut app, &[layout.context.clone(), other.clone()]);
+    let waiting = text(&app);
+    let location = Path::new("~").join("other");
+    assert!(
+        waiting.contains(&location.display().to_string()),
+        "the Landing names the Workspace chosen: {waiting}"
+    );
+    assert!(
+        !waiting.contains("abcdef0") && !waiting.contains("nested"),
+        "and nothing of the Worktree left behind as though it were the chosen one's: {waiting}"
+    );
+    assert_eq!(
+        command(&mut app, SemanticCommandId::WorktreeList),
+        ApplicationTransition::Continue,
+        "no Worktree is offered until the Server says which Repository it would be of"
+    );
+    assert!(!text(&app).contains("Loading Worktrees"), "{}", text(&app));
+
+    answer(&mut app, transition, other);
+    let resolved = text(&app);
+    assert!(
+        resolved.contains(&location.display().to_string()) && !resolved.contains("nested"),
+        "{resolved}"
+    );
+    assert!(matches!(
+        command(&mut app, SemanticCommandId::WorktreeList),
+        ApplicationTransition::ResolveWorkspace { .. }
+    ));
 }
 
 #[test]

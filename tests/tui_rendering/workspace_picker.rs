@@ -533,9 +533,12 @@ fn a_press_over_the_rows_moves_nothing() {
 
 /// The whole of the switch: Enter on a row takes the reader out of the picker
 /// and puts them on the Landing of the Workspace they chose, ready to write
-/// the first Prompt of a Session rooted there.
+/// the first Prompt of a Session rooted there. It does so at once: resolving a
+/// Workspace can take its Server seconds, and a reader who has chosen has
+/// already said where they are going, so the Landing names the Workspace
+/// chosen while the Server works out the rest.
 #[test]
-fn enter_closes_the_picker_and_shows_the_landing_of_the_workspace_chosen() {
+fn enter_closes_the_picker_and_lands_in_the_workspace_chosen_before_its_server_answers() {
     let root = workspace_dir();
     let here = workspace_in(root.path(), "here");
     let atlas = workspace_in(root.path(), "atlas");
@@ -545,11 +548,18 @@ fn enter_closes_the_picker_and_shows_the_landing_of_the_workspace_chosen() {
     press(&mut application, KeyCode::Down);
     assert_eq!(selected_row(&application), "atlas");
 
+    let ApplicationTransition::DetachSessionAndResolveWorkspace { request, .. } =
+        choose_unanswered(&mut application)
+    else {
+        panic!(
+            "moving Workspace opens the Landing, which is the client letting go of whatever \
+             it was on or on its way to, and asks the Server to resolve the Workspace chosen"
+        );
+    };
+    assert_eq!(request.path, atlas);
     assert_eq!(
-        choose(&mut application),
-        ApplicationTransition::DetachSession,
-        "moving Workspace opens the Landing, which is the client letting go of \
-         whatever it was on or on its way to"
+        request.workspace_id,
+        Some(suru::protocol::WorkspaceId::directory(&atlas))
     );
 
     let landing = rendered_application_rows_at(&application, 120, 20).join("\n");
@@ -562,94 +572,223 @@ fn enter_closes_the_picker_and_shows_the_landing_of_the_workspace_chosen() {
         "the Landing stands in its place: {landing}"
     );
     // The Landing's line is only as wide as its composer, so a long temporary
-    // path gives up its front: the Workspace is known by the end it keeps —
-    // the fixture root, then the name that sets it apart from `here`.
-    let chosen = atlas
-        .strip_prefix(root.path().parent().expect("the fixture root has a parent"))
-        .expect("the chosen Workspace lies in the fixture root");
+    // path gives up its front: the Workspace is known by the end it keeps.
     assert!(
-        landing.contains(chosen.to_string_lossy().as_ref()),
-        "and it stands in the Workspace the reader chose: {landing}"
+        landing_location(&application).ends_with(&format!("atlas · {SPINNER}")),
+        "and it stands in the Workspace the reader chose before the Server has answered: \
+         {landing}"
+    );
+}
+
+/// A Prompt written while the Landing waits on its Workspace is a Prompt for
+/// that Workspace, which the client cannot yet say where to begin in. Enter
+/// begins nothing until the Server has answered — the draft stands where the
+/// reader wrote it, as it does in a Session still loading — and once it has,
+/// the same draft begins its Session in the Workspace chosen.
+#[test]
+fn a_prompt_written_before_the_server_answers_waits_for_it() {
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
+    let mut application = connected_application(&here);
+
+    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    press(&mut application, KeyCode::Down);
+    let resolution = choose_unanswered(&mut application);
+
+    type_terminal_text(&mut application, "Initial Prompt");
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+            .expect("submit before the Server answers"),
+        ApplicationTransition::Continue,
+        "no Session begins, in the Workspace left behind or in one not yet resolved"
+    );
+    let waiting = rendered_application_rows_at(&application, 120, 20).join("\n");
+    assert!(
+        waiting.contains("Initial Prompt"),
+        "the draft stands where the reader wrote it: {waiting}"
+    );
+    assert!(
+        waiting.contains("atlas is still resolving; this waits until its Server answers"),
+        "and the Landing says why Enter began nothing, as work waiting on a Remote does: \
+         {waiting}"
+    );
+
+    assert_eq!(
+        answer_workspace_resolution(&mut application, resolution),
+        ApplicationTransition::Continue,
+        "the answer begins nothing on the reader's behalf"
+    );
+    let answered = rendered_application_rows_at(&application, 120, 20).join("\n");
+    assert!(
+        !answered.contains("still resolving"),
+        "what the Landing was waiting on has arrived, so it no longer says so: {answered}"
+    );
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit once the Server has answered")
+    else {
+        panic!("a Landing submission creates a Session once its Workspace is resolved");
+    };
+    assert_eq!(request.execution_directory.path, atlas);
+    assert_eq!(request.prompt.text, "Initial Prompt");
+}
+
+/// While its Server works the chosen Workspace out, the Landing says so where
+/// the Checkout State will stand, with the Spinner a row being read carries,
+/// and keeps it turning for as long as it is drawn; the answer puts the
+/// Workspace's own reading in its place and lets the tick go.
+#[test]
+fn a_workspace_still_resolving_turns_a_spinner_where_its_checkout_state_will_stand() {
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
+    let mut application = connected_application(&here);
+
+    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    press(&mut application, KeyCode::Down);
+    let resolution = choose_unanswered(&mut application);
+
+    let waiting = landing_location(&application);
+    assert!(
+        waiting.ends_with(&format!("atlas · {SPINNER}")),
+        "the Landing names the Workspace chosen and that its reading is on its way: {waiting}"
+    );
+    assert!(
+        application.wants_spinner(),
+        "a Spinner on screen keeps the presentation tick armed"
+    );
+
+    answer_workspace_resolution(&mut application, resolution);
+    let answered = landing_location(&application);
+    assert!(
+        answered.ends_with("atlas") && !answered.contains(SPINNER),
+        "the answer takes the Spinner's place: {answered}"
+    );
+    assert!(
+        !application.wants_spinner(),
+        "and nothing left on screen animates"
+    );
+}
+
+/// The Server's answer fills in what the Landing could not say before it, and
+/// moves every reading of "where I am" with it, beneath a reader who has
+/// already begun writing: the draft is theirs, and the answer is not a fresh
+/// Landing.
+#[test]
+fn the_answer_fills_in_the_landing_beneath_the_draft_written_while_it_waited() {
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
+    let mut application = connected_application(&here);
+
+    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    press(&mut application, KeyCode::Down);
+    let resolution = choose_unanswered(&mut application);
+    assert_eq!(
+        session_picker_scope(&mut application),
+        SessionListScope::CurrentWorkspace(here.clone().into()),
+        "nothing but the Landing's naming moves before the Server answers"
+    );
+    press(&mut application, KeyCode::Esc);
+    type_terminal_text(&mut application, "half a thought");
+
+    assert_eq!(
+        answer_workspace_resolution(&mut application, resolution),
+        ApplicationTransition::Continue,
+        "the Landing is already open, so the answer has no Session to let go of"
+    );
+
+    let landing = rendered_application_rows_at(&application, 120, 20).join("\n");
+    assert!(
+        landing.contains("half a thought"),
+        "the draft written while the Landing waited survives its answer: {landing}"
+    );
+    assert!(
+        landing_location(&application).ends_with("atlas"),
+        "{landing}"
+    );
+    assert_eq!(
+        session_picker_scope(&mut application),
+        SessionListScope::CurrentWorkspace(atlas.into()),
+        "and current-Workspace scope has come to mean the Workspace chosen"
     );
 }
 
 /// A Workspace offered from old work may have disappeared since the listing
-/// was recorded. Choosing it costs nothing: the refusal stands where the
-/// reader can see it, and the picker leaves both their row and its listing in
-/// place so they can choose again.
+/// was recorded. The reader is already on its Landing when the Server says
+/// so, and the refusal is said there: the Landing goes back to naming the
+/// Workspace the client still works in, because a refused choice moves
+/// nothing, and the draft written meanwhile stays for the reader to send
+/// there or take elsewhere.
 #[test]
-fn a_workspace_whose_directory_is_gone_is_refused_in_place_and_moves_nothing() {
-    let here = workspace_dir();
-    let gone = here.path().join("gone");
-    let atlas = workspace_in(here.path(), "atlas");
-    let mut application = connected_application(here.path());
+fn a_workspace_whose_directory_is_gone_is_refused_on_its_landing_and_moves_nothing() {
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let gone = root.path().join("gone");
+    let atlas = workspace_in(root.path(), "atlas");
+    let mut application = connected_application(&here);
 
-    let mut sessions = vec![
-        rooted("Gone work", &gone, 100),
-        rooted("Atlas work", &atlas, 90),
-    ];
-    for (index, name) in [
-        "ledger", "engine", "notes", "website", "service", "client", "tools", "archive",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        sessions.push(rooted(
-            "Older work",
-            &workspace(&["work", name]),
-            80 - index as u64,
-        ));
-    }
-    open_picker_with(&mut application, sessions);
+    open_picker_with(
+        &mut application,
+        vec![
+            rooted("Gone work", &gone, 100),
+            rooted("Atlas work", &atlas, 90),
+        ],
+    );
     press(&mut application, KeyCode::Down);
-    let rows_before = picker_rows(&application);
     assert_eq!(selected_row(&application), "gone");
+    let resolution = choose_unanswered(&mut application);
+    type_terminal_text(&mut application, "Keep this draft");
 
     assert_eq!(
-        choose(&mut application),
+        answer_workspace_resolution(&mut application, resolution),
         ApplicationTransition::Continue,
-        "a refused pick asks nothing of the server and opens no Landing"
+        "a refused pick asks nothing more of the server"
     );
 
-    let frame = rendered_application_rows(&application).join("\n");
+    let frame = rendered_application_rows_at(&application, 120, 20).join("\n");
     assert!(
-        frame.contains("No directory there"),
-        "the path entry's refusal stands in the picker: {frame}"
+        frame.contains("Could not open the gone Workspace: No directory there"),
+        "the refusal stands on the Landing the reader is on: {frame}"
     );
     assert!(
-        frame.contains("Workspaces"),
-        "the picker stays open: {frame}"
+        !frame.contains("Workspaces"),
+        "the picker stays closed: {frame}"
     );
-    assert_eq!(selected_row(&application), "gone");
-    assert_eq!(
-        picker_rows(&application),
-        rows_before,
-        "the refused pick neither removes nor rearranges any visible row, even when the viewport is full"
-    );
-    for height in [5, 6] {
-        let compact = rendered_application_rows_at(&application, 80, height).join("\n");
-        assert!(
-            compact.contains("No directory there") && compact.contains("gone"),
-            "the refusal and selected row both remain visible at 80x{height}: {compact}"
-        );
-    }
-
-    press(&mut application, KeyCode::Down);
-    assert_eq!(selected_row(&application), "atlas");
-    assert_eq!(
-        choose(&mut application),
-        ApplicationTransition::DetachSession,
-        "a valid pick opens the Landing, which is the client leaving whatever it was on"
-    );
-    let switched = rendered_application_rows_at(&application, 120, 20).join("\n");
+    assert!(frame.contains("Keep this draft"), "{frame}");
     assert!(
-        switched.contains("Type a prompt"),
-        "a subsequent valid pick from the still-open picker closes it on a Landing: {switched}"
+        landing_location(&application).ends_with("here"),
+        "the Landing names the Workspace the client still works in: {frame}"
     );
     assert_eq!(
         session_picker_scope(&mut application),
-        SessionListScope::CurrentWorkspace((atlas).into()),
-        "the subsequent valid pick switched normally"
+        SessionListScope::CurrentWorkspace(here.into()),
+        "current-Workspace scope did not follow the refused path"
+    );
+    press(&mut application, KeyCode::Esc);
+
+    open_picker_with(
+        &mut application,
+        vec![
+            rooted("Gone work", &gone, 100),
+            rooted("Atlas work", &atlas, 90),
+        ],
+    );
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "atlas");
+    choose(&mut application);
+    let switched = rendered_application_rows_at(&application, 120, 20).join("\n");
+    assert!(
+        !switched.contains("Could not open"),
+        "a later choice is not told of the earlier refusal: {switched}"
+    );
+    assert_eq!(
+        session_picker_scope(&mut application),
+        SessionListScope::CurrentWorkspace(atlas.into()),
+        "a valid pick after a refused one switches normally"
     );
 }
 
@@ -662,32 +801,22 @@ fn a_workspace_replaced_by_a_file_is_refused_without_moving_any_scope() {
     std::fs::write(&file, "not a directory").expect("replace the old Workspace with a file");
     let mut application = application_choosing_skills(here.path());
     load_skills(&mut application, here.path(), "review");
-    type_terminal_text(&mut application, "$rev");
     show_sidebar(&mut application, Vec::new());
 
     open_picker_with(&mut application, vec![rooted("Old work", &file, 30)]);
     press(&mut application, KeyCode::Down);
     assert_eq!(selected_row(&application), "old-work");
 
-    assert_eq!(choose(&mut application), ApplicationTransition::Continue);
+    choose(&mut application);
     let refusal = rendered_application_rows_at(&application, SIDEBAR_WIDE, 20).join("\n");
     assert!(
         refusal.contains("Not a directory"),
-        "the picker gives the path entry's corresponding refusal: {refusal}"
+        "the Landing gives the path entry's corresponding refusal: {refusal}"
     );
-    assert!(
-        refusal.contains("Workspaces"),
-        "the picker stays open: {refusal}"
-    );
-    assert_eq!(selected_row(&application), "old-work");
 
-    press(&mut application, KeyCode::Esc);
+    type_terminal_text(&mut application, "$rev");
     let unchanged = rendered_application_rows_at(&application, SIDEBAR_WIDE, 20);
     let unchanged_frame = unchanged.join("\n");
-    assert!(
-        unchanged_frame.contains("│ $rev"),
-        "the Landing's draft was untouched: {unchanged_frame}"
-    );
     assert!(
         unchanged_frame.contains("$review"),
         "the Skill Catalog still answers for the Workspace the reader is in: {unchanged_frame}"
@@ -701,6 +830,137 @@ fn a_workspace_replaced_by_a_file_is_refused_without_moving_any_scope() {
         session_picker_scope(&mut application),
         SessionListScope::CurrentWorkspace((here.path().to_owned()).into()),
         "current-Workspace scope did not follow the refused path"
+    );
+}
+
+/// The Workspace a reader chose last is the one they land in. Choosing again
+/// before the Server has answered the first choice lets go of it, so an answer
+/// to it arriving late finds nothing left to answer.
+#[test]
+fn a_newer_choice_supersedes_a_workspace_still_resolving() {
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
+    let ledger = workspace_in(root.path(), "ledger");
+    let listed = || vec![rooted("Newer", &atlas, 30), rooted("Older", &ledger, 20)];
+    let mut application = connected_application(&here);
+
+    open_picker_with(&mut application, listed());
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "atlas");
+    let first = choose_unanswered(&mut application);
+
+    open_picker_with(&mut application, listed());
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "ledger");
+    let second = choose_unanswered(&mut application);
+    assert!(
+        landing_location(&application).ends_with(&format!("ledger · {SPINNER}")),
+        "the Landing names the Workspace chosen last"
+    );
+
+    assert_eq!(
+        answer_workspace_resolution(&mut application, first),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        landing_location(&application).ends_with(&format!("ledger · {SPINNER}")),
+        "the superseded answer does not pull the Landing back to the earlier choice, \
+         which is still waiting on its own"
+    );
+    assert_eq!(
+        session_picker_scope(&mut application),
+        SessionListScope::CurrentWorkspace(here.clone().into()),
+        "nor does it move the client there"
+    );
+    press(&mut application, KeyCode::Esc);
+
+    answer_workspace_resolution(&mut application, second);
+    assert_eq!(
+        session_picker_scope(&mut application),
+        SessionListScope::CurrentWorkspace(ledger.into()),
+        "the answer to the latest choice is the one adopted"
+    );
+}
+
+/// Going to a fresh Landing is a newer route than the one still resolving,
+/// as it is for a `/sidekick` still waiting: the reader is not going to the
+/// Workspace they chose after all, and its answer arriving late leaves them,
+/// and the draft they have since begun, where they are.
+#[test]
+fn a_fresh_landing_lets_go_of_a_workspace_still_resolving() {
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
+    let mut application = connected_application(&here);
+
+    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    press(&mut application, KeyCode::Down);
+    let resolution = choose_unanswered(&mut application);
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SessionNew,
+            )))
+            .expect("go to a fresh Landing instead"),
+        ApplicationTransition::DetachSession
+    );
+    assert!(
+        landing_location(&application).ends_with("here"),
+        "the fresh Landing stands in the Workspace the client still works in"
+    );
+    type_terminal_text(&mut application, "a different thought");
+
+    assert_eq!(
+        answer_workspace_resolution(&mut application, resolution),
+        ApplicationTransition::Continue,
+        "the reader went elsewhere, so the answer has nothing left to answer"
+    );
+    let landing = rendered_application_rows_at(&application, 120, 20).join("\n");
+    assert!(landing.contains("a different thought"), "{landing}");
+    assert!(
+        landing_location(&application).ends_with("here"),
+        "{landing}"
+    );
+    assert_eq!(
+        session_picker_scope(&mut application),
+        SessionListScope::CurrentWorkspace(here.into())
+    );
+}
+
+/// A directory named at the Sidebar's entry is a Workspace asked for later
+/// than the one the Landing awaits, so it is the one the reader is left in,
+/// whichever of the two the Server answers first.
+#[test]
+fn a_directory_named_at_the_sidebar_supersedes_a_workspace_still_resolving() {
+    let root = workspace_dir();
+    let atlas = workspace_in(root.path(), "atlas");
+    let notes = workspace_in(root.path(), "notes");
+    let mut application = connected_application(root.path());
+    show_sidebar(&mut application, Vec::new());
+
+    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    press(&mut application, KeyCode::Down);
+    let resolution = choose_unanswered(&mut application);
+
+    add_workspace(&mut application, "notes");
+    assert_eq!(
+        answer_workspace_resolution(&mut application, resolution),
+        ApplicationTransition::Continue
+    );
+
+    type_terminal_text(&mut application, "Initial Prompt");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the initial Prompt")
+    else {
+        panic!("a Landing submission creates a Session");
+    };
+    assert_eq!(
+        request.execution_directory.path, notes,
+        "the late answer to the picker did not move the reader off the directory named since"
     );
 }
 
@@ -883,9 +1143,11 @@ fn an_open_session_is_left_working_and_listed_and_nothing_is_asked() {
     open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
     press(&mut application, KeyCode::Down);
 
-    assert_eq!(
-        choose(&mut application),
-        ApplicationTransition::DetachSession,
+    assert!(
+        matches!(
+            choose(&mut application),
+            ApplicationTransition::DetachSessionAndResolveWorkspace { .. }
+        ),
         "the client stops watching the Session; the Turn is neither interrupted \
          nor confirmed away"
     );
@@ -923,9 +1185,11 @@ fn choosing_the_workspace_the_client_is_already_in_opens_the_landing() {
         "the picker opens on the Workspace the reader is in"
     );
 
-    assert_eq!(
-        choose(&mut application),
-        ApplicationTransition::DetachSession,
+    assert!(
+        matches!(
+            choose(&mut application),
+            ApplicationTransition::DetachSessionAndResolveWorkspace { .. }
+        ),
         "opening the Landing is the client leaving whatever it was on"
     );
 
@@ -1322,11 +1586,7 @@ fn picker_rows_at(application: &Application, width: u16, height: u16) -> Vec<Str
     let search = rendered_row(&rows, "Search:");
     let footer = rows
         .iter()
-        .position(|row| {
-            row.contains("Esc")
-                || row.contains("No directory there")
-                || row.contains("Not a directory")
-        })
+        .position(|row| row.contains("Esc"))
         .expect("the picker draws its footer");
     rows[search + 1..footer]
         .iter()
@@ -1365,15 +1625,37 @@ fn selected_row(application: &Application) -> String {
         .to_owned()
 }
 
-/// Enter on the row the reader is on, which is how a Workspace is chosen.
+/// Enter on the row the reader is on, which is how a Workspace is chosen,
+/// followed by its Server's answer. Answers what the choice itself asked for.
 fn choose(application: &mut Application) -> ApplicationTransition {
-    let transition = application
+    let transition = choose_unanswered(application);
+    answer_workspace_resolution(application, transition.clone());
+    transition
+}
+
+/// Enter on the row the reader is on, with its Server yet to answer — as a
+/// slow one would be — answering what the choice asked for.
+fn choose_unanswered(application: &mut Application) -> ApplicationTransition {
+    application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,
         )))
-        .expect("choose the Workspace the reader is on");
-    answer_workspace_resolution(application, transition)
+        .expect("choose the Workspace the reader is on")
+}
+
+/// The Spinner's first frame, which is what a reading on its way shows.
+const SPINNER: char = '⠋';
+
+/// The line beneath the Landing's composer, which names the Workspace the
+/// Landing stands in by the end of its path.
+fn landing_location(application: &Application) -> String {
+    let screen = rendered_application_rows_at(application, 120, 20);
+    let composer_bottom = screen
+        .iter()
+        .position(|row| row.contains('└'))
+        .unwrap_or_else(|| panic!("the Landing draws its composer: {screen:#?}"));
+    screen[composer_bottom + 1].trim().to_owned()
 }
 
 /// A listed Session mid-Turn, named by the Session it stands for so a frame
@@ -1646,7 +1928,7 @@ fn repository_rows_deduplicate_by_metadata_identity_and_preserve_execution_conte
     let rows = picker_rows_at(&application, 140, 18);
     assert_eq!(rows.len(), 1, "known and unknown main are one Repository");
     assert!(rows[0].contains("[current]"));
-    let ApplicationTransition::ResolveWorkspace { request, .. } = application
+    let ApplicationTransition::DetachSessionAndResolveWorkspace { request, .. } = application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,
@@ -1657,8 +1939,13 @@ fn repository_rows_deduplicate_by_metadata_identity_and_preserve_execution_conte
     };
     assert_eq!(request.workspace_id, Some(unknown.id));
     assert_eq!(request.path, main);
-    // Merely receiving newer grouping labels did not change execution context.
-    press(&mut application, KeyCode::Esc);
+    // A fresh Landing lets go of the choice before it is answered, and merely
+    // receiving newer grouping labels did not change execution context.
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionNew,
+        )))
+        .unwrap();
     let ApplicationTransition::ResolveWorkspace { request, .. } = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
             SemanticCommandId::WorktreeList,

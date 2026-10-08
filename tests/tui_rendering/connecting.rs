@@ -511,8 +511,11 @@ fn a_remote_catalog_change_refreshes_the_remote_sidebar() {
     assert_eq!(refresh.outlook(), &Outlook::Remote("studio".to_owned()));
 }
 
+/// A Workspace chosen on a Remote resolves there, and a fresh Landing is a
+/// newer route than the one it was resolving for: its answer arriving late
+/// moves nothing.
 #[test]
-fn closing_the_workspace_picker_cancels_its_pending_resolution() {
+fn a_fresh_landing_lets_go_of_a_remote_workspace_still_resolving() {
     let mut application = Application::default();
     turn_to_studio(&mut application);
     let ApplicationTransition::ListSessions(request) = application
@@ -559,9 +562,8 @@ fn closing_the_workspace_picker_cancels_its_pending_resolution() {
         })
         .unwrap();
     press(&mut application, KeyCode::Down);
-    let ApplicationTransition::ResolveWorkspace {
+    let ApplicationTransition::DetachSessionAndResolveWorkspace {
         outlook,
-        surface,
         request_id,
         ..
     } = press(&mut application, KeyCode::Enter)
@@ -569,16 +571,18 @@ fn closing_the_workspace_picker_cancels_its_pending_resolution() {
         panic!("choosing a Workspace asks its Server to resolve it");
     };
     assert_eq!(
-        press(&mut application, KeyCode::Esc),
-        ApplicationTransition::CancelWorkspaceResolution(
-            WorkspaceResolutionSurface::WorkspacePicker,
-        )
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SessionNew,
+            )))
+            .unwrap(),
+        ApplicationTransition::DetachSession
     );
     assert_eq!(
         application
             .handle_event(ApplicationEvent::WorkspaceResolved {
                 outlook,
-                surface,
+                surface: WorkspaceResolutionSurface::WorkspacePicker,
                 request_id,
                 result: Ok(suru::protocol::ResolvedWorkspace::directory(
                     remote_only.clone()
@@ -755,9 +759,8 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
 
     assert_eq!(
         press(&mut application, KeyCode::Enter),
-        ApplicationTransition::ResolveWorkspace {
+        ApplicationTransition::DetachSessionAndResolveWorkspace {
             outlook: Outlook::Remote("studio".to_owned()),
-            surface: WorkspaceResolutionSurface::WorkspacePicker,
             request_id: 2,
             request: suru::protocol::ResolveWorkspaceRequest {
                 checkout_id: None,

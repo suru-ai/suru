@@ -39,10 +39,6 @@ pub(super) struct WorkspacePicker {
     /// number so a listing landing beneath them leaves them on the Workspace
     /// they were choosing rather than on whatever now stands in its place.
     selected: Option<WorkspaceId>,
-    /// Why the selected Workspace could not be read when the reader chose it.
-    /// It belongs to the picker rather than to the listing: the row is still
-    /// true of past work even when its directory has since disappeared.
-    refusal: Option<String>,
     /// One row's own context menu, opened by a right press on it: editing
     /// that Workspace's Description always, and choosing its Icon while
     /// `appearance.showIcons` is on (see [`Self::open_menu_at`]). Once open it
@@ -226,7 +222,6 @@ impl WorkspacePicker {
             ),
             query: String::new(),
             selected: None,
-            refusal: None,
             menu: None,
             description_editor: None,
             submitted_description: None,
@@ -240,7 +235,6 @@ impl WorkspacePicker {
         self.open = true;
         self.query.clear();
         self.selected = None;
-        self.refusal = None;
         self.menu = None;
         self.description_editor = None;
         self.submitted_description = None;
@@ -253,7 +247,6 @@ impl WorkspacePicker {
         self.open = false;
         self.query.clear();
         self.selected = None;
-        self.refusal = None;
         self.menu = None;
         self.description_editor = None;
         self.submitted_description = None;
@@ -276,10 +269,6 @@ impl WorkspacePicker {
         &self.query
     }
 
-    pub(super) fn refusal(&self) -> Option<&str> {
-        self.refusal.as_deref()
-    }
-
     /// Takes what the reader typed into the query, and leaves them on a
     /// Workspace the narrowed list still offers.
     ///
@@ -289,7 +278,6 @@ impl WorkspacePicker {
     /// towards one they can already see should not be walked away from it.
     pub(super) fn insert(&mut self, text: &str) {
         self.query.push_str(text);
-        self.refusal = None;
         self.keep_selection_offered();
         self.window.open();
     }
@@ -297,7 +285,6 @@ impl WorkspacePicker {
     /// Gives the last character of the query back, widening the list again.
     pub(super) fn delete_backward(&mut self) {
         self.query.pop();
-        self.refusal = None;
         self.keep_selection_offered();
         self.window.open();
     }
@@ -390,10 +377,6 @@ impl WorkspacePicker {
     /// so Enter names nothing rather than naming whatever would stand first.
     pub(super) fn offer_selected(&mut self) -> Option<crate::protocol::Workspace> {
         self.selected_workspace()
-    }
-
-    pub(super) fn fail_resolution(&mut self, error: String) {
-        self.refusal = Some(error);
     }
 
     pub(super) fn select_previous(&mut self) {
@@ -495,7 +478,6 @@ impl WorkspacePicker {
     }
 
     fn move_selection(&mut self, distance: isize) {
-        self.refusal = None;
         let offered = self.offered();
         if offered.is_empty() {
             self.selected = None;
@@ -650,7 +632,6 @@ impl WorkspacePicker {
             return;
         };
         self.menu = None;
-        self.refusal = None;
         self.description_editor = Some(DescriptionEditor {
             origin,
             workspace_id,
