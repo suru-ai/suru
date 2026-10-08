@@ -421,6 +421,26 @@ impl ScriptedCodex {
         .expect("scripted Codex is asked to run an Errand");
     }
 
+    /// Waits until a one-shot Errand run has recorded its PID — the first
+    /// thing it records — and answers with it, for a test whose Errand may be
+    /// taken down before it records anything else.
+    pub async fn wait_for_errand_launch(&self) -> u32 {
+        timeout(PROGRESS_DEADLINE, async {
+            loop {
+                // A PID is whole once the line holding it is.
+                if let Some(pid) = std::fs::read_to_string(self.errand_file("pid"))
+                    .ok()
+                    .and_then(|recorded| recorded.strip_suffix('\n')?.parse().ok())
+                {
+                    return pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scripted Codex is launched to run an Errand")
+    }
+
     /// What Codex was invoked with for its one-shot Errand run, one argument
     /// per element and in the order they were passed.
     pub fn errand_arguments(&self) -> Vec<String> {
@@ -444,15 +464,6 @@ impl ScriptedCodex {
                 .expect("read the Errand's output schema"),
         )
         .expect("decode the Errand's output schema")
-    }
-
-    /// The process the one-shot Errand run was carried out by.
-    pub fn errand_pid(&self) -> u32 {
-        std::fs::read_to_string(self.errand_file("pid"))
-            .expect("read the Errand's PID")
-            .trim()
-            .parse()
-            .expect("the Errand's PID is numeric")
     }
 
     /// The directory the one-shot Errand run was started in.
