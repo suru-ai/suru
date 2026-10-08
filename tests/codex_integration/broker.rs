@@ -50,8 +50,11 @@ use suru::{
 };
 use tokio::time::timeout;
 
-/// An app-server whose first process runs a Turn and then exits, so the next Turn resumes the same
-/// thread on a process of its own. Each process answers `config/read` with `__USER_CONFIG__`, the
+/// An app-server whose first process takes a Turn and exits before finishing it, so the next Turn
+/// resumes the same thread on a process of its own. The process goes with its Turn open so that
+/// Suru learns of the loss as that Turn fails, which a test can wait on: a process that left between
+/// Turns would be lost where no client can see it, and a Prompt racing the loss would reach the
+/// dying process and fail rather than resume. Each process answers `config/read` with `__USER_CONFIG__`, the
 /// user's own configuration as that launch finds it, and every request by the id it came with,
 /// since a launch made while the Broker is off reads no configuration.
 const LOST_THEN_RESUMED: &str = r#"
@@ -69,11 +72,10 @@ const LOST_THEN_RESUMED: &str = r#"
     *'"method":"turn/start"'*)
       id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9][0-9]*\),.*/\1/p')
       printf '%s\n' '{"id":'"$id"',"result":{"turn":{"id":"turn-'"$attempt"'"}}}'
-      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"broker-thread","turn":{"id":"turn-'"$attempt"'","status":"completed","items":[]}}}'
       if [ "$attempt" -eq 1 ]; then
-        printf '%s\n' 'exited' > "$CODEX_FIXTURE_EXITED"
         exit 17
       fi
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"broker-thread","turn":{"id":"turn-'"$attempt"'","status":"completed","items":[]}}}'
       ;;
 "#;
 
@@ -142,8 +144,9 @@ impl ResumedThread {
             .await
             .expect("create Session");
         let session_id = created.session.id;
-        turn_settles(&client, session_id, 0).await;
-        codex.wait_for_exit().await;
+        // The first Turn failing is Suru having lost the app-server, so the next Prompt
+        // relaunches it rather than reaching the process that left.
+        turn_settles_as(&client, session_id, 0, TurnStatus::Failed).await;
 
         client
             .admit_prompt(
@@ -187,21 +190,37 @@ impl ResumedThread {
 }
 
 async fn turn_settles(client: &ManagedClient, session_id: SessionId, turn_index: usize) {
+    turn_settles_as(client, session_id, turn_index, TurnStatus::Completed).await;
+}
+
+/// Waits for the Turn `turn_index` names to settle, and fails as soon as it settles as anything but
+/// `expected` — saying why — rather than at the deadline.
+async fn turn_settles_as(
+    client: &ManagedClient,
+    session_id: SessionId,
+    turn_index: usize,
+    expected: TurnStatus,
+) {
     timeout(PROGRESS_DEADLINE, async {
         loop {
             let snapshot = client.read_session(session_id).await.expect("read Session");
-            if snapshot
+            if let Some(turn) = snapshot
                 .turns
                 .get(turn_index)
-                .is_some_and(|turn| turn.status == TurnStatus::Completed)
+                .filter(|turn| turn.status.is_terminal())
             {
+                assert_eq!(
+                    turn.status, expected,
+                    "Codex Turn {turn_index} settled otherwise: {:?}",
+                    snapshot.activities
+                );
                 return;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("Codex Turn {turn_index} completes"));
+    .unwrap_or_else(|_| panic!("Codex Turn {turn_index} settles as {expected:?}"));
 }
 
 /// The Broker's entry in a thread request's `config` map, which must be the map's only override,
