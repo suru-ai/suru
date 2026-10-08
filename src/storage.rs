@@ -34,8 +34,8 @@ mod writer;
 
 pub(crate) use unsaved::{SessionRows, Unsaved};
 pub(crate) use writer::{
-    Deletion, HeldSessions, SAVE_RETRY_INTERVAL, StorageSink, StorageWriter, TakenSaves,
-    is_turn_boundary,
+    Deletion, HeldSessions, IDLE_FLUSH_DELAY, SAVE_RETRY_INTERVAL, StorageSink, StorageWriter,
+    TakenSaves, is_turn_boundary,
 };
 
 use rows::{
@@ -221,6 +221,9 @@ pub(crate) struct StorageRepository {
     /// How long the writer, holding a Session storage refused to save, waits
     /// before an idle tick tries it again.
     save_retry_interval: std::time::Duration,
+    /// How long the writer waits without a command before an idle tick, and
+    /// how long nothing held must have moved for that tick to take saves.
+    idle_flush_delay: std::time::Duration,
     /// Where the time an Attachment's grace and the sweep interval are
     /// measured by is read.
     clock: crate::clock::ServerClock,
@@ -463,6 +466,7 @@ impl StorageRepository {
             attachment_sweep_interval: crate::attachments::ATTACHMENT_SWEEP_INTERVAL,
             attachments_swept_at: Arc::default(),
             save_retry_interval: SAVE_RETRY_INTERVAL,
+            idle_flush_delay: IDLE_FLUSH_DELAY,
             clock: crate::clock::ServerClock::default(),
         };
         let database_path = repository.database_path.as_ref().clone();
@@ -488,6 +492,16 @@ impl StorageRepository {
     /// again every `interval`.
     pub(crate) fn with_save_retry_interval(mut self, interval: std::time::Duration) -> Self {
         self.save_retry_interval = interval;
+        self
+    }
+
+    /// Has the writer go idle, and take what the held Sessions owe, only once
+    /// `delay` passes without a command and with nothing held moving, so a
+    /// test can keep idle ticks from landing saves it means to hand over
+    /// itself.
+    #[cfg(test)]
+    pub(crate) fn with_idle_flush_delay(mut self, delay: std::time::Duration) -> Self {
+        self.idle_flush_delay = delay;
         self
     }
 
