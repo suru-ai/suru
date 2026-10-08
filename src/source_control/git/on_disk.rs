@@ -1,5 +1,6 @@
 //! Git's on-disk metadata, read without spawning Git, for the readings
-//! checkout observation repeats on every poll. Each reading either answers as
+//! checkout observation repeats on every poll and discovery repeats for every
+//! Worktree a Repository lists. Each reading either answers as
 //! Git would or declines with `None`, and a declined reading is taken by
 //! running Git instead: anything this does not fully understand — refs kept
 //! in a reftable, a branch that is itself symbolic, an include in the
@@ -104,16 +105,7 @@ impl OnDisk {
     /// one by path. They are named only; observation reads their revisions.
     pub(super) fn worktrees(&self, common: &Path) -> Option<Vec<Entry>> {
         let format = Format::of(common, common)?;
-        // Git recognizes the metadata it runs in by a HEAD of a ref's shape.
-        let head = regular_file(&common.join("HEAD"))??;
-        let head = trim_end(&head);
-        match head.strip_prefix(b"ref:") {
-            Some(target) if trim_start(target).starts_with(b"refs/") => {}
-            Some(_) => return None,
-            None => {
-                format.object_id(head)?;
-            }
-        }
+        recognized_head(common, &format)?;
         // Git reads each Worktree's HEAD for its listing, and fails it on
         // packed refs it would refuse.
         self.packed_branches(common, &format)?;
@@ -173,6 +165,48 @@ impl OnDisk {
         Some(entries)
     }
 
+    /// The root `rev-parse --show-toplevel` would answer at `path`, where
+    /// `--git-common-dir` there would answer `common`: Git finds `path`'s own
+    /// `.git` first, recognizes the metadata it leads to as sharing `common`,
+    /// and takes `path` for that metadata's work tree. Only a root Git would
+    /// accept outright is confirmed; one whose ownership only
+    /// `safe.directory` could vouch for, or anything else less plain, is left
+    /// to Git to judge.
+    ///
+    /// Git run there would refuse configuration it cannot accept, which is
+    /// judged here only as far as the Git that discovered the Repository
+    /// already ran on it: the shared, user and system configuration, but not
+    /// what a Worktree has of its own, which only Git run in that Worktree
+    /// reads. A Worktree with any is left to Git. What user or system
+    /// configuration includes for some Worktrees alone, by their branch or
+    /// metadata, is not read here at all.
+    pub(super) fn worktree_root(&self, path: &Path, common: &Path) -> Option<PathBuf> {
+        let root = crate::paths::canonical(path).ok()?;
+        let metadata = crate::paths::canonical(metadata_directory(&root)?).ok()?;
+        if crate::paths::canonical(common_directory(&metadata)?).ok()? != common {
+            return None;
+        }
+        let format = Format::of(common, &metadata)?;
+        if format.worktree_config && regular_file(&metadata.join("config.worktree"))?.is_some() {
+            return None;
+        }
+        recognized_head(&metadata, &format)?;
+        // A linked Worktree takes the shared configuration's bareness only
+        // where each Worktree may have configuration of its own.
+        let linked = regular_file(&metadata.join("commondir"))?.is_some();
+        let bare = if linked && !format.worktree_config {
+            None
+        } else {
+            format.bare
+        };
+        // Git runs in a Repository outright only where the root, its `.git`,
+        // and the metadata it finds there are all the user's own.
+        let owned = [&root, &root.join(".git"), &metadata]
+            .into_iter()
+            .all(|path| owned_by_current_user(path));
+        (bare != Some(true) && owned).then_some(root)
+    }
+
     fn packed_branches(
         &self,
         common: &Path,
@@ -217,6 +251,9 @@ fn metadata_directory(root: &Path) -> Option<PathBuf> {
     if metadata.is_dir() {
         return Some(entry);
     }
+    if !metadata.is_file() {
+        return None;
+    }
     let pointer = std::fs::read(&entry).ok()?;
     let path = pointer_path(trim_line_ends(&pointer).strip_prefix(b"gitdir: ")?)?;
     Some(root.join(path))
@@ -229,6 +266,89 @@ fn common_directory(metadata: &Path) -> Option<PathBuf> {
         None => Some(metadata.to_owned()),
         Some(pointer) => Some(metadata.join(pointer_path(trim_line_ends(&pointer))?)),
     }
+}
+
+/// Whether Git would recognize `metadata` as metadata to run in, by a HEAD
+/// of a ref's shape.
+fn recognized_head(metadata: &Path, format: &Format) -> Option<()> {
+    let head = regular_file(&metadata.join("HEAD"))??;
+    let head = trim_end(&head);
+    match head.strip_prefix(b"ref:") {
+        Some(target) if trim_start(target).starts_with(b"refs/") => Some(()),
+        Some(_) => None,
+        None => format.object_id(head).map(|_| ()),
+    }
+}
+
+/// Whether Git takes `path` for the user's own, as it requires of the
+/// Repository it runs in: owned by the user Git runs as.
+#[cfg(unix)]
+fn owned_by_current_user(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let user = unsafe { libc::geteuid() };
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.uid() == user)
+}
+
+/// Whether Git takes `path` for the user's own, as it requires of the
+/// Repository it runs in: owned by the user Git runs as, or by the
+/// Administrators group where that user is one of them.
+#[cfg(windows)]
+fn owned_by_current_user(path: &Path) -> bool {
+    use std::{os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::{ERROR_SUCCESS, LocalFree},
+        Security::{
+            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            CheckTokenMembership, IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
+            PSECURITY_DESCRIPTOR, PSID, WinBuiltinAdministratorsSid,
+        },
+    };
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect::<Vec<_>>();
+    let mut owner: PSID = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let read = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if read != ERROR_SUCCESS {
+        return false;
+    }
+    let mut member = 0;
+    let owned = !owner.is_null()
+        && unsafe { IsValidSid(owner) } != 0
+        && (current_user_is(owner)
+            || (unsafe { IsWellKnownSid(owner, WinBuiltinAdministratorsSid) } != 0
+                && unsafe { CheckTokenMembership(ptr::null_mut(), owner, &mut member) } != 0
+                && member != 0));
+    // The owner lies within the descriptor, freed only once it is compared.
+    unsafe { LocalFree(descriptor) };
+    owned
+}
+
+/// Whether `sid` is the user this process runs as.
+#[cfg(windows)]
+fn current_user_is(sid: windows_sys::Win32::Security::PSID) -> bool {
+    use windows_sys::Win32::Security::EqualSid;
+    crate::runtime::CurrentWindowsUser::read()
+        .is_ok_and(|user| unsafe { EqualSid(sid, user.sid()) } != 0)
+}
+
+/// Elsewhere ownership is left to Git to judge.
+#[cfg(not(any(unix, windows)))]
+fn owned_by_current_user(_path: &Path) -> bool {
+    false
 }
 
 /// The path a pointer file names, unless it holds a NUL: Git would read the
@@ -370,6 +490,8 @@ struct Format {
     /// The length of an object id in hexadecimal, by the Repository's hash.
     id_length: usize,
     bare: Option<bool>,
+    /// Whether each Worktree has configuration of its own.
+    worktree_config: bool,
 }
 impl Format {
     /// The format of the Repository whose shared metadata is `common`, read
@@ -498,6 +620,7 @@ impl Config {
         Some(Format {
             id_length,
             bare: self.bare,
+            worktree_config: self.worktree_config,
         })
     }
 }
@@ -730,6 +853,39 @@ mod tests {
             assert_eq!(read, self.adapter.git_revision(root).await);
             read
         }
+        /// The root the disk confirms `path` as a Worktree of the Repository
+        /// whose shared metadata is `common` at, after asserting Git
+        /// confirms the same.
+        async fn agreed_root(&self, on_disk: &OnDisk, path: &Path, common: &Path) -> PathBuf {
+            let read = on_disk.worktree_root(path, common);
+            assert!(
+                read.is_some(),
+                "{} was not confirmed from disk",
+                path.display()
+            );
+            assert_eq!(
+                read,
+                self.adapter.valid_root(path, common).await,
+                "{}",
+                path.display()
+            );
+            read.unwrap()
+        }
+        /// What Git makes of a root the disk declines to confirm.
+        async fn declined_root(
+            &self,
+            on_disk: &OnDisk,
+            path: &Path,
+            common: &Path,
+        ) -> Option<PathBuf> {
+            assert_eq!(
+                on_disk.worktree_root(path, common),
+                None,
+                "{}",
+                path.display()
+            );
+            self.adapter.valid_root(path, common).await
+        }
         async fn git_listing(&self, common: &Path) -> Option<Vec<Entry>> {
             let output = self
                 .adapter
@@ -758,6 +914,29 @@ mod tests {
             };
             assert_eq!(named(&read), named(&listed), "{}", common.display());
         }
+    }
+
+    /// What `act` answers, and how many Git commands it ran, by the Log each
+    /// one leaves.
+    async fn counting_git<T>(act: impl std::future::Future<Output = T>) -> (T, usize) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("git.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::sync::Arc::new(std::fs::File::create(&path).unwrap()))
+            .finish();
+        let answered = {
+            let _log = tracing::subscriber::set_default(subscriber);
+            act.await
+        };
+        let log = std::fs::read_to_string(path).unwrap();
+        let commands = log
+            .lines()
+            .filter(|line| line.contains("Git command"))
+            .count();
+        (answered, commands)
     }
 
     fn branch(name: &str, commit: Option<&str>) -> CheckoutRevision {
@@ -1178,5 +1357,263 @@ mod tests {
         assert_eq!(fixture.declined_revision(&on_disk, &locked).await, None);
         std::fs::rename(main.join("objects"), common.join("objects")).unwrap();
         fixture.agreed_listing(&on_disk, &common).await;
+    }
+
+    #[tokio::test]
+    async fn confirms_worktree_roots_as_git_does() {
+        let fixture = Fixture::new();
+        let on_disk = OnDisk::default();
+        let main = fixture.repository("main");
+        let common = main.join(".git");
+        assert_eq!(
+            fixture.agreed_root(&on_disk, &main, &common).await,
+            main,
+            "an unborn main Worktree"
+        );
+        fixture.commit(&main);
+        let topic = fixture.worktree(&main, "topic", &["-b", "topic"]);
+        assert_eq!(fixture.agreed_root(&on_disk, &topic, &common).await, topic);
+        let detached = fixture.worktree(&main, "detached", &["--detach"]);
+        fixture.agreed_root(&on_disk, &detached, &common).await;
+        let relative = fixture.root.join("relative");
+        if fixture.supports(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--relative-paths",
+                "-b",
+                "relative",
+                relative.to_str().unwrap(),
+            ],
+        ) {
+            assert_eq!(
+                fixture.agreed_root(&on_disk, &relative, &common).await,
+                relative
+            );
+        }
+        // A pointer with Windows line ends, or a root spelled another way,
+        // names the same Worktree.
+        let pointer = std::fs::read_to_string(topic.join(".git")).unwrap();
+        std::fs::write(topic.join(".git"), format!("{}\r\n", pointer.trim_end())).unwrap();
+        fixture.agreed_root(&on_disk, &topic, &common).await;
+        let waypoint = topic.join("..").join("topic");
+        assert_eq!(
+            fixture.agreed_root(&on_disk, &waypoint, &common).await,
+            topic
+        );
+        // A bare Repository's linked Worktree is a work tree all the same,
+        // though the Repository's own metadata is none.
+        let bare = fixture.root.join("bare.git");
+        fixture.git(
+            &fixture.root,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                main.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        let from_bare = fixture.worktree(&bare, "from-bare", &["-b", "from-bare"]);
+        fixture.agreed_root(&on_disk, &from_bare, &bare).await;
+        assert_eq!(fixture.declined_root(&on_disk, &bare, &bare).await, None);
+        // So with separately kept metadata, which Git lists in place of the
+        // main Worktree it cannot name.
+        let metadata = fixture.root.join("separate-metadata");
+        let separate = fixture
+            .initializes(
+                "separate",
+                &["--separate-git-dir", metadata.to_str().unwrap()],
+            )
+            .unwrap();
+        fixture.agreed_root(&on_disk, &separate, &metadata).await;
+        assert_eq!(
+            fixture.declined_root(&on_disk, &metadata, &metadata).await,
+            None
+        );
+        // Neither a directory within a Worktree, another Repository's root,
+        // nor a root of another Repository than the one asked about is one.
+        let inside = topic.join("inside");
+        std::fs::create_dir(&inside).unwrap();
+        assert_eq!(
+            fixture.declined_root(&on_disk, &inside, &common).await,
+            None
+        );
+        let other = fixture.repository("other");
+        assert_eq!(fixture.declined_root(&on_disk, &other, &common).await, None);
+        assert_eq!(fixture.declined_root(&on_disk, &topic, &bare).await, None);
+        // Nor is a Worktree gone, or replaced by a plain directory.
+        std::fs::remove_dir_all(&detached).unwrap();
+        assert_eq!(
+            fixture.declined_root(&on_disk, &detached, &common).await,
+            None
+        );
+        std::fs::create_dir(&detached).unwrap();
+        assert_eq!(
+            fixture.declined_root(&on_disk, &detached, &common).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn leaves_worktree_roots_to_git_where_it_reads_them_its_own_way() {
+        let fixture = Fixture::new();
+        let on_disk = OnDisk::default();
+        let main = fixture.repository("main");
+        fixture.commit(&main);
+        let common = main.join(".git");
+        let topic = fixture.worktree(&main, "topic", &["-b", "topic"]);
+        let config = std::fs::read_to_string(common.join("config")).unwrap();
+        // Configuration the disk cannot read whole is Git's to judge.
+        std::fs::write(
+            common.join("config"),
+            format!("{config}[include]\n\tpath = elsewhere\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.declined_root(&on_disk, &main, &common).await,
+            Some(main.clone())
+        );
+        assert_eq!(
+            fixture.declined_root(&on_disk, &topic, &common).await,
+            Some(topic.clone())
+        );
+        std::fs::write(common.join("config"), &config).unwrap();
+        // A Repository configured bare has no main Worktree, though its
+        // linked ones keep theirs: the setting is not theirs to read.
+        fixture.git(&main, &["config", "core.bare", "true"]);
+        assert_eq!(fixture.declined_root(&on_disk, &main, &common).await, None);
+        fixture.agreed_root(&on_disk, &topic, &common).await;
+        // Unless each Worktree reads configuration of its own, where the
+        // shared setting settles it for a Worktree without any.
+        fixture.git(&common, &["config", "extensions.worktreeConfig", "true"]);
+        assert_eq!(fixture.declined_root(&on_disk, &topic, &common).await, None);
+        fixture.git(&common, &["config", "core.bare", "false"]);
+        fixture.agreed_root(&on_disk, &main, &common).await;
+        fixture.agreed_root(&on_disk, &topic, &common).await;
+        // A Worktree's own configuration is read only by Git run in that
+        // Worktree, so discovery from another never judged it: whatever it
+        // says, of bareness or of anything Git would refuse, is Git's to judge.
+        let topic_own = common
+            .join("worktrees")
+            .join("topic")
+            .join("config.worktree");
+        let main_own = common.join("config.worktree");
+        for (root, own, elsewhere) in [(&topic, &topic_own, &main), (&main, &main_own, &topic)] {
+            for (contents, valid) in [
+                ("[core]\n\tfilemode = invalid\n", false),
+                ("[core]\n\tbare = true\n", false),
+                ("[core]\n\tbare = false\n", true),
+                ("[core]\n\tfilemode = false\n", true),
+            ] {
+                std::fs::write(own, contents).unwrap();
+                let passed = fixture.adapter.valid_root(elsewhere, &common).await;
+                assert_eq!(
+                    passed.as_ref(),
+                    Some(elsewhere),
+                    "Git run elsewhere passes over {}",
+                    own.display()
+                );
+                assert_eq!(
+                    fixture.declined_root(&on_disk, root, &common).await,
+                    valid.then(|| root.clone()),
+                    "{contents:?} in {}",
+                    own.display()
+                );
+            }
+            std::fs::remove_file(own).unwrap();
+            fixture.agreed_root(&on_disk, root, &common).await;
+        }
+        std::fs::write(common.join("config"), &config).unwrap();
+        // Metadata whose HEAD Git would not recognize is no Worktree's.
+        let head = common.join("worktrees").join("topic").join("HEAD");
+        let contents = std::fs::read(&head).unwrap();
+        std::fs::write(&head, "not a revision\n").unwrap();
+        assert_eq!(fixture.declined_root(&on_disk, &topic, &common).await, None);
+        std::fs::write(&head, contents).unwrap();
+        fixture.agreed_root(&on_disk, &topic, &common).await;
+    }
+
+    #[tokio::test]
+    async fn discovery_confirms_listed_worktrees_from_disk_and_the_rest_with_git() {
+        use crate::{
+            protocol::{RepositoryLocation, ResolvedWorkspace, SourceControlAvailability},
+            source_control::SourceControl,
+        };
+        let readings = |resolved: &ResolvedWorkspace| {
+            resolved
+                .checkouts
+                .iter()
+                .map(|checkout| {
+                    (
+                        checkout.association.root.clone(),
+                        checkout.availability.clone(),
+                        checkout.association.recovery_revision.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let fixture = Fixture::new();
+        let main = fixture.repository("main");
+        fixture.commit(&main);
+        let (_, alone) = counting_git(fixture.adapter.discover(&main)).await;
+        let linked = ["a", "b", "c"].map(|name| fixture.worktree(&main, name, &["-b", name]));
+        let (resolved, commands) = counting_git(fixture.adapter.discover(&main)).await;
+        assert_eq!(commands, alone, "no Git command reads a listed Worktree");
+        let read = readings(&resolved);
+        assert_eq!(read.len(), 4);
+        for (root, availability, recovery) in &read {
+            assert_eq!(
+                availability,
+                &SourceControlAvailability::Available,
+                "{}",
+                root.display()
+            );
+            assert!(recovery.is_some(), "{}", root.display());
+        }
+        // Discovered from a linked Worktree, the main one is established from
+        // disk too.
+        let (from_linked, commands) = counting_git(fixture.adapter.discover(&linked[0])).await;
+        assert_eq!(commands, alone);
+        assert_eq!(
+            from_linked.workspace.repository.as_ref().unwrap().location,
+            RepositoryLocation::Main { root: main.clone() }
+        );
+        assert_eq!(readings(&from_linked), read);
+        // Where the disk cannot confirm them, Git confirms each in turn, to
+        // the same effect.
+        let config = main.join(".git").join("config");
+        let contents = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            &config,
+            format!("{contents}[include]\n\tpath = elsewhere\n"),
+        )
+        .unwrap();
+        let (confirmed, commands) = counting_git(fixture.adapter.discover(&main)).await;
+        assert_eq!(readings(&confirmed), read);
+        assert_eq!(commands, alone + 2 * read.len());
+        // A Worktree whose own configuration Git refuses is unavailable,
+        // though discovery from another Worktree never reads it.
+        std::fs::write(&config, &contents).unwrap();
+        fixture.git(&main, &["config", "extensions.worktreeConfig", "true"]);
+        let own = main
+            .join(".git")
+            .join("worktrees")
+            .join("a")
+            .join("config.worktree");
+        std::fs::write(&own, "[core]\n\tfilemode = invalid\n").unwrap();
+        let (refused, commands) = counting_git(fixture.adapter.discover(&main)).await;
+        assert_eq!(commands, alone + 1, "Git confirms that Worktree alone");
+        for (root, availability, recovery) in readings(&refused) {
+            let available = root != linked[0];
+            assert_eq!(
+                availability == SourceControlAvailability::Available,
+                available,
+                "{}",
+                root.display()
+            );
+            assert_eq!(recovery.is_some(), available, "{}", root.display());
+        }
     }
 }

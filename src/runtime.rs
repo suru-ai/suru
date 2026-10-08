@@ -558,67 +558,89 @@ fn protect_windows_owner(path: &Path, directory: bool) -> Result<()> {
     Ok(())
 }
 
+/// The user this process runs as, as its token names it: the `TOKEN_USER` the
+/// token holds, kept in a buffer of words so it is aligned as it must be.
 #[cfg(windows)]
-fn current_windows_user_sid() -> Result<String> {
-    use std::{mem, ptr, slice};
+pub(crate) struct CurrentWindowsUser(Vec<usize>);
 
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, HANDLE, LocalFree},
-        Security::{
-            Authorization::ConvertSidToStringSidW, GetTokenInformation, TOKEN_QUERY, TOKEN_USER,
-            TokenUser,
-        },
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
-    };
+#[cfg(windows)]
+impl CurrentWindowsUser {
+    pub(crate) fn read() -> Result<Self> {
+        use std::{mem, ptr};
 
-    struct OwnedHandle(HANDLE);
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, HANDLE},
+            Security::{GetTokenInformation, TOKEN_QUERY, TokenUser},
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        };
 
-    impl Drop for OwnedHandle {
-        fn drop(&mut self) {
-            // SAFETY: the handle was returned by OpenProcessToken and is owned by this guard.
-            unsafe {
-                CloseHandle(self.0);
+        struct OwnedHandle(HANDLE);
+
+        impl Drop for OwnedHandle {
+            fn drop(&mut self) {
+                // SAFETY: the handle was returned by OpenProcessToken and is owned by this guard.
+                unsafe {
+                    CloseHandle(self.0);
+                }
             }
         }
+
+        let mut token = ptr::null_mut();
+        // SAFETY: GetCurrentProcess returns a valid pseudo-handle and token points to writable
+        // storage.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(std::io::Error::last_os_error()).context("open current process token");
+        }
+        let token = OwnedHandle(token);
+
+        let mut required_bytes = 0;
+        // SAFETY: a null buffer with length zero is the documented size-query operation.
+        unsafe {
+            GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut required_bytes);
+        }
+        if required_bytes == 0 {
+            return Err(std::io::Error::last_os_error()).context("size current user token data");
+        }
+
+        let word_count = (required_bytes as usize).div_ceil(mem::size_of::<usize>());
+        let mut token_data = vec![0usize; word_count];
+        // SAFETY: token_data is aligned, writable, and at least required_bytes long.
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                token_data.as_mut_ptr().cast(),
+                required_bytes,
+                &mut required_bytes,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("read current user token data");
+        }
+        Ok(Self(token_data))
     }
 
-    let mut token = ptr::null_mut();
-    // SAFETY: GetCurrentProcess returns a valid pseudo-handle and token points to writable storage.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(std::io::Error::last_os_error()).context("open current process token");
-    }
-    let token = OwnedHandle(token);
+    /// The user's SID, which lies within this reading and is valid only as long as it is.
+    pub(crate) fn sid(&self) -> windows_sys::Win32::Security::PSID {
+        use windows_sys::Win32::Security::TOKEN_USER;
 
-    let mut required_bytes = 0;
-    // SAFETY: a null buffer with length zero is the documented size-query operation.
-    unsafe {
-        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut required_bytes);
+        // SAFETY: read initialized the buffer with a TOKEN_USER value.
+        unsafe { (*self.0.as_ptr().cast::<TOKEN_USER>()).User.Sid }
     }
-    if required_bytes == 0 {
-        return Err(std::io::Error::last_os_error()).context("size current user token data");
-    }
+}
 
-    let word_count = (required_bytes as usize).div_ceil(mem::size_of::<usize>());
-    let mut token_data = vec![0usize; word_count];
-    // SAFETY: token_data is aligned, writable, and at least required_bytes long.
-    if unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenUser,
-            token_data.as_mut_ptr().cast(),
-            required_bytes,
-            &mut required_bytes,
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error()).context("read current user token data");
-    }
-    // SAFETY: GetTokenInformation initialized the buffer with a TOKEN_USER value.
-    let token_user = unsafe { &*token_data.as_ptr().cast::<TOKEN_USER>() };
+#[cfg(windows)]
+fn current_windows_user_sid() -> Result<String> {
+    use std::{ptr, slice};
 
+    use windows_sys::Win32::{
+        Foundation::LocalFree, Security::Authorization::ConvertSidToStringSidW,
+    };
+
+    let user = CurrentWindowsUser::read()?;
     let mut sid_string = ptr::null_mut();
-    // SAFETY: token_user contains a valid SID and sid_string points to writable storage.
-    if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string) } == 0 {
+    // SAFETY: user holds a valid SID and sid_string points to writable storage.
+    if unsafe { ConvertSidToStringSidW(user.sid(), &mut sid_string) } == 0 {
         return Err(std::io::Error::last_os_error()).context("format current user SID");
     }
     struct LocalSidString(*mut u16);

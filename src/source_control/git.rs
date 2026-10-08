@@ -1,6 +1,7 @@
 use super::{SourceControl, repository_workspace};
 use crate::protocol::*;
 use async_trait::async_trait;
+use futures_util::StreamExt as _;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -14,6 +15,9 @@ mod on_disk;
 mod preparation;
 mod recovery;
 mod removal;
+
+/// How many listed Worktree roots discovery has Git confirm at once.
+const CONCURRENT_ROOT_CONFIRMATIONS: usize = 8;
 
 /// Git command execution stays on its owning Server. Timeouts and the executable
 /// are injectable so unavailable/hung installations need no global environment edits.
@@ -382,6 +386,14 @@ impl GitSourceControl {
             )
             .await?;
         crate::paths::canonical(path).ok()
+    }
+    /// [`Self::valid_root`] for a Worktree discovery lists, answered from
+    /// disk wherever the disk confirms it outright.
+    async fn listed_root(&self, path: &Path, common: &Path) -> Option<PathBuf> {
+        match self.on_disk.worktree_root(path, common) {
+            Some(root) => Some(root),
+            None => self.valid_root(path, common).await,
+        }
     }
     async fn valid_root(&self, path: &Path, common: &Path) -> Option<PathBuf> {
         let root = self.text(path, &["rev-parse", "--show-toplevel"]).await?;
@@ -940,16 +952,28 @@ impl SourceControl for GitSourceControl {
                 let main_root = match (bare, entries.first()) {
                     (false, Some(first)) if !first.bare => match &location {
                         RepositoryLocation::Main { root } => Some(root.clone()),
-                        _ => self.valid_root(&first.root, &common).await.inspect(|root| {
-                            location = RepositoryLocation::Main { root: root.clone() };
-                        }),
+                        _ => self
+                            .listed_root(&first.root, &common)
+                            .await
+                            .inspect(|root| {
+                                location = RepositoryLocation::Main { root: root.clone() };
+                            }),
                     },
                     _ => None,
                 };
-                for (entry, mut association) in listed_checkouts(entries, &id, main_root.as_deref())
-                {
-                    let valid = self.valid_root(&association.root, &common).await.is_some()
-                        && !recovery_in_progress(&association.root);
+                let listed = listed_checkouts(entries, &id, main_root.as_deref());
+                // Roots the disk cannot confirm are confirmed by Git a few at
+                // a time rather than one after another.
+                let confirmations = listed
+                    .iter()
+                    .map(|(_, association)| self.listed_root(&association.root, &common))
+                    .collect::<Vec<_>>();
+                let roots = futures_util::stream::iter(confirmations)
+                    .buffered(CONCURRENT_ROOT_CONFIRMATIONS)
+                    .collect::<Vec<_>>()
+                    .await;
+                for ((entry, mut association), root) in listed.into_iter().zip(roots) {
+                    let valid = root.is_some() && !recovery_in_progress(&association.root);
                     // Discovery is already a successful reading. Preserve it
                     // before any Client starts live observation, but never
                     // promote stale Git listing data for an unavailable root.
