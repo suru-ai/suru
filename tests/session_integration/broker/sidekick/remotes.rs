@@ -70,8 +70,11 @@ struct Serving {
 }
 
 impl Serving {
-    /// A Server for `channel`, Serving on a port of its own that it keeps
-    /// across a restart, so the route to it outlives one.
+    /// A Server for `channel`, Serving on whatever port this machine gives
+    /// it, reached by way of a route that outlives a restart. The port is
+    /// given back as the Server stops, and anything else on this machine may
+    /// take it before the Server starts again, so a restarted Server Serves
+    /// on a port given it anew and the route is turned toward that.
     async fn start(channel: &str) -> Self {
         Self::start_keeping_alive(channel, ServerTimings::default().sse_keepalive_interval).await
     }
@@ -112,13 +115,6 @@ impl Serving {
             mutate_setting(server.descriptor(), mutation).await;
         }
         let address = server.serving_address().expect("the Remote is Serving");
-        mutate_setting(
-            server.descriptor(),
-            SettingMutation::ServingPort {
-                value: Some(address.port()),
-            },
-        )
-        .await;
         Self {
             server,
             provider,
@@ -161,14 +157,14 @@ impl Serving {
     }
 
     /// The same Server stopped and started again speaking `protocol_version`
-    /// to its Peers, Serving where it was.
+    /// to its Peers, reached by way of the route it was.
     async fn restart_speaking(self, protocol_version: u32) -> Self {
         self.restart(protocol_version, |_| {}).await
     }
 
     /// The same Server stopped, its database `meanwhile` handed while it is
     /// stopped, and started again speaking `protocol_version` to its Peers,
-    /// Serving where it was.
+    /// reached by way of the route it was.
     async fn restart(self, protocol_version: u32, meanwhile: impl FnOnce(&Path)) -> Self {
         let Self {
             server,
@@ -184,6 +180,11 @@ impl Serving {
         meanwhile(&config.data_dir().join("suru.db"));
         let (server, provider) =
             Self::spawn(&config, protocol_version, keep_alive, &hosted, &git).await;
+        route.retarget(
+            server
+                .serving_address()
+                .expect("the Remote is Serving again"),
+        );
         Self {
             server,
             provider,
