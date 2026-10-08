@@ -165,6 +165,15 @@ impl OnDisk {
         Some(entries)
     }
 
+    /// Whether `rev-parse --is-bare-repository` run at `common`, a
+    /// Repository's shared metadata, would deny it is bare because the
+    /// Repository's own configuration says it is not. Discovery reads Git
+    /// failing to answer there as a denial too, so only configuration that
+    /// calls the Repository bare, or leaves it unsaid, is Git's to judge.
+    pub(super) fn configured_not_bare(&self, common: &Path) -> bool {
+        Format::of(common, common).is_some_and(|format| format.bare == Some(false))
+    }
+
     /// The root `rev-parse --show-toplevel` would answer at `path`, where
     /// `--git-common-dir` there would answer `common`: Git finds `path`'s own
     /// `.git` first, recognizes the metadata it leads to as sharing `common`,
@@ -1581,8 +1590,8 @@ mod tests {
             RepositoryLocation::Main { root: main.clone() }
         );
         assert_eq!(readings(&from_linked), read);
-        // Where the disk cannot confirm them, Git confirms each in turn, to
-        // the same effect.
+        // Where the disk cannot confirm them, or the Repository's bareness,
+        // Git confirms each, to the same effect.
         let config = main.join(".git").join("config");
         let contents = std::fs::read_to_string(&config).unwrap();
         std::fs::write(
@@ -1592,7 +1601,7 @@ mod tests {
         .unwrap();
         let (confirmed, commands) = counting_git(fixture.adapter.discover(&main)).await;
         assert_eq!(readings(&confirmed), read);
-        assert_eq!(commands, alone + 2 * read.len());
+        assert_eq!(commands, alone + 1 + 2 * read.len());
         // A Worktree whose own configuration Git refuses is unavailable,
         // though discovery from another Worktree never reads it.
         std::fs::write(&config, &contents).unwrap();
@@ -1615,5 +1624,96 @@ mod tests {
             );
             assert_eq!(recovery.is_some(), available, "{}", root.display());
         }
+    }
+
+    #[tokio::test]
+    async fn discovery_reads_a_repository_with_one_rev_parse_and_its_listing() {
+        use crate::{
+            protocol::{
+                RepositoryLocation, ResolvedWorkspace, SourceControlAvailability,
+                SourceControlCapability,
+            },
+            source_control::SourceControl,
+        };
+        let creation = |resolved: &ResolvedWorkspace| {
+            let repository = resolved.workspace.repository.as_ref().unwrap();
+            (
+                repository.location.clone(),
+                repository.capabilities.create_checkout.clone(),
+            )
+        };
+        let fixture = Fixture::new();
+        let main = fixture.repository("main");
+        let (unborn, commands) = counting_git(fixture.adapter.discover(&main)).await;
+        assert_eq!(commands, 2);
+        assert!(matches!(
+            creation(&unborn).1,
+            SourceControlCapability::Unsupported { reason } if reason.contains("unborn")
+        ));
+        fixture.commit(&main);
+        let topic = fixture.worktree(&main, "topic", &["-b", "topic"]);
+        let inside = topic.join("inside");
+        std::fs::create_dir(&inside).unwrap();
+        for directory in [&main, &topic, &inside] {
+            let (resolved, commands) = counting_git(fixture.adapter.discover(directory)).await;
+            assert_eq!(commands, 2, "{}", directory.display());
+            assert_eq!(
+                creation(&resolved),
+                (
+                    RepositoryLocation::Main { root: main.clone() },
+                    SourceControlCapability::Available
+                ),
+                "{}",
+                directory.display()
+            );
+        }
+        // A bare Repository's bareness is Git's to read at its metadata.
+        let bare = fixture.root.join("bare.git");
+        fixture.git(
+            &fixture.root,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                main.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        let from_bare = fixture.worktree(&bare, "from-bare", &["-b", "from-bare"]);
+        for directory in [&bare, &from_bare] {
+            let (resolved, commands) = counting_git(fixture.adapter.discover(directory)).await;
+            assert_eq!(commands, 3, "{}", directory.display());
+            assert_eq!(
+                creation(&resolved),
+                (
+                    RepositoryLocation::Bare { root: bare.clone() },
+                    SourceControlCapability::Available
+                ),
+                "{}",
+                directory.display()
+            );
+        }
+        // A directory in no Repository, or in one Git cannot read, is told by
+        // the one command.
+        let plain = fixture.root.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let (resolved, commands) = counting_git(fixture.adapter.discover(&plain)).await;
+        assert_eq!(commands, 1);
+        assert_eq!(
+            resolved.workspace.source_control,
+            SourceControlAvailability::NotDetected
+        );
+        std::fs::write(plain.join(".git"), "gitdir: missing\n").unwrap();
+        let (resolved, commands) = counting_git(fixture.adapter.discover(&plain)).await;
+        assert_eq!(commands, 1);
+        assert!(
+            matches!(
+                &resolved.workspace.source_control,
+                SourceControlAvailability::Unavailable { reason }
+                    if reason.starts_with("Git Repository discovery failed: fatal:")
+            ),
+            "{:?}",
+            resolved.workspace.source_control
+        );
     }
 }

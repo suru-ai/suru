@@ -670,6 +670,39 @@ async fn symlinked_working_copy_canonicalizes_shared_identity() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn paths_holding_line_breaks_are_discovered_like_any_other() {
+    let (_temporary, root) = root();
+    let main = root.join("main\nline");
+    init(&main);
+    commit(&main);
+    let linked_root = root.join("linked\nline");
+    linked(&main, &linked_root, "topic");
+    let adapter = GitSourceControl::default();
+    for directory in [&main, &linked_root] {
+        let resolved = adapter.discover(directory).await;
+        assert_eq!(resolved.workspace.path, main);
+        assert_eq!(&resolved.checkout.unwrap().root, directory);
+        let repository = resolved.workspace.repository.unwrap();
+        assert_eq!(
+            repository.location,
+            RepositoryLocation::Main { root: main.clone() }
+        );
+        assert_eq!(
+            repository.capabilities.create_checkout,
+            SourceControlCapability::Available
+        );
+        assert_eq!(resolved.checkouts.len(), 2);
+        assert!(
+            resolved
+                .checkouts
+                .iter()
+                .all(|checkout| checkout.availability == SourceControlAvailability::Available)
+        );
+    }
+}
+
 #[tokio::test]
 async fn checkout_observation_tracks_unborn_branch_detachment_missing_and_unreadable() {
     let (_temporary, root) = root();

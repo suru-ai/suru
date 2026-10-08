@@ -868,10 +868,24 @@ impl SourceControl for GitSourceControl {
             };
             return resolved;
         }
+        // One command reads where the directory's shared and own metadata
+        // are, the way to the root of the Worktree it is in — which
+        // `--show-cdup` leaves unsaid outside any, where `--show-toplevel`
+        // would fail the command — and, last and quietly, whether HEAD names
+        // a commit.
         let probe = match self
             .command(
                 &path,
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                    "--absolute-git-dir",
+                    "--show-cdup",
+                    "--verify",
+                    "--quiet",
+                    "HEAD^{commit}",
+                ],
             )
             .await
         {
@@ -882,25 +896,42 @@ impl SourceControl for GitSourceControl {
                 return resolved;
             }
         };
-        if !probe.status.success() {
-            let markers = path.ancestors().any(|parent| {
-                parent.join(".git").exists()
-                    || (parent.join("HEAD").exists() && parent.join("objects").is_dir())
-            });
-            if markers {
-                resolved.workspace.source_control = SourceControlAvailability::Unavailable {
-                    reason: format!(
-                        "Git Repository discovery failed: {}",
-                        String::from_utf8_lossy(&probe.stderr).trim()
-                    ),
-                };
+        // `--verify --quiet` exits 1, and nothing else does, where HEAD names
+        // no commit; any other failure is Git unable to read the directory.
+        let committed = match probe.status.code() {
+            Some(0) => true,
+            Some(1) => false,
+            _ => {
+                let markers = path.ancestors().any(|parent| {
+                    parent.join(".git").exists()
+                        || (parent.join("HEAD").exists() && parent.join("objects").is_dir())
+                });
+                if markers {
+                    resolved.workspace.source_control = SourceControlAvailability::Unavailable {
+                        reason: format!(
+                            "Git Repository discovery failed: {}",
+                            String::from_utf8_lossy(&probe.stderr).trim()
+                        ),
+                    };
+                }
+                return resolved;
             }
-            return resolved;
-        }
-        let common = match String::from_utf8(probe.stdout)
-            .ok()
-            .and_then(|text| crate::paths::canonical(text.trim_end_matches(['\r', '\n'])).ok())
-        {
+        };
+        let [common, git_dir, top] = match probed_layout(&probe.stdout, committed) {
+            Some(layout) => layout,
+            // A line break within a path leaves the lines indistinct, so each
+            // is read by a command of its own.
+            None => [
+                self.text(
+                    &path,
+                    &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                )
+                .await,
+                self.text(&path, &["rev-parse", "--absolute-git-dir"]).await,
+                self.text(&path, &["rev-parse", "--show-toplevel"]).await,
+            ],
+        };
+        let common = match common.and_then(|common| crate::paths::canonical(common).ok()) {
             Some(path) => path,
             None => {
                 resolved.workspace.source_control = SourceControlAvailability::Unavailable {
@@ -910,20 +941,22 @@ impl SourceControl for GitSourceControl {
             }
         };
         let id = RepositoryId::from_metadata("git", &common);
-        // Bare is a Repository property, not the linked checkout's rev-parse reading.
-        let bare = self
-            .text(&common, &["rev-parse", "--is-bare-repository"])
-            .await
-            .as_deref()
-            == Some("true");
-        let git_dir = self
-            .text(&path, &["rev-parse", "--absolute-git-dir"])
-            .await
-            .and_then(|path| crate::paths::canonical(path).ok());
-        let top = self
-            .text(&path, &["rev-parse", "--show-toplevel"])
-            .await
-            .and_then(|path| crate::paths::canonical(path).ok());
+        let git_dir = git_dir.and_then(|path| crate::paths::canonical(path).ok());
+        // The way back from the directory, or the root itself.
+        let top = top.and_then(|top| crate::paths::canonical(path.join(top)).ok());
+        // Bare is a Repository property, not the linked checkout's rev-parse
+        // reading, so Git is asked at the shared metadata, beside the listing,
+        // unless the Repository's own configuration already says it is not.
+        let bare = async {
+            !self.on_disk.configured_not_bare(&common)
+                && self
+                    .text(&common, &["rev-parse", "--is-bare-repository"])
+                    .await
+                    .as_deref()
+                    == Some("true")
+        };
+        let listing = self.command(&path, &["worktree", "list", "--porcelain", "-z"]);
+        let (bare, listing) = tokio::join!(bare, listing);
         let mut location = if bare {
             RepositoryLocation::Bare {
                 root: common.clone(),
@@ -938,9 +971,6 @@ impl SourceControl for GitSourceControl {
             location = RepositoryLocation::Main { root: root.clone() };
         }
         let mut checkouts = Vec::new();
-        let listing = self
-            .command(&path, &["worktree", "list", "--porcelain", "-z"])
-            .await;
         let mut availability = SourceControlAvailability::Available;
         match listing {
             Ok(output) if output.status.success() => {
@@ -1028,11 +1058,7 @@ impl SourceControl for GitSourceControl {
             SourceControlCapability::Unsupported {
                 reason: "The main checkout location is unknown".to_owned(),
             }
-        } else if self
-            .text(directory, &["rev-parse", "--verify", "HEAD^{commit}"])
-            .await
-            .is_none()
-        {
+        } else if !committed {
             SourceControlCapability::Unsupported {
                 reason: "A usable local commit is required; this Repository may be unborn"
                     .to_owned(),
@@ -1064,6 +1090,47 @@ impl SourceControl for GitSourceControl {
         resolved.checkouts = checkouts;
         resolved
     }
+}
+
+/// The lines of discovery's layout probe, as `[common, git_dir, cdup]`: the
+/// paths of a directory's shared and own metadata, then the way from it to
+/// the root of the Worktree it is in — or that root itself, where it is
+/// outside it — and nothing where it is in no Worktree. The commit
+/// `--verify` adds last, where there is one, is left off. A path that is not
+/// UTF-8 reads as nothing, as it would by a command of its own. `None` where
+/// the lines cannot be told apart, as where a path among them holds a line
+/// break.
+fn probed_layout(stdout: &[u8], committed: bool) -> Option<[Option<String>; 3]> {
+    let mut lines = stdout
+        .split(|byte| *byte == b'\n')
+        .map(|line| {
+            String::from_utf8(line.to_vec())
+                .ok()
+                .map(|line| line.trim_end_matches('\r').to_owned())
+        })
+        .collect::<Vec<_>>();
+    // Every line ends in a break, leaving nothing after the last.
+    if lines.pop()? != Some(String::new()) {
+        return None;
+    }
+    if committed {
+        lines.pop()?;
+    }
+    let cdup = match lines.len() {
+        2 => None,
+        3 => match lines.pop()? {
+            Some(cdup)
+                if cdup.split_terminator('/').all(|step| step == "..")
+                    || Path::new(&cdup).is_absolute() =>
+            {
+                Some(cdup)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let git_dir = lines.pop()?;
+    Some([lines.pop()?, git_dir, cdup])
 }
 
 /// The Worktrees a `worktree list --porcelain -z` listing names, each paired
@@ -1197,4 +1264,66 @@ fn recovery_in_progress(root: &Path) -> bool {
     metadata.join("suru-recovery").exists()
         || std::fs::read_to_string(metadata.join("locked"))
             .is_ok_and(|lock| lock.starts_with("suru-recovery:"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probed_layout;
+
+    #[test]
+    fn reads_the_layout_probe_by_line_and_declines_lines_it_cannot_tell_apart() {
+        let root = std::env::current_dir().unwrap();
+        let root = root.to_str().unwrap();
+        let common = format!("{root}/.git");
+        let probe = |lines: &[&str]| {
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>()
+                .into_bytes()
+        };
+        let read = |common: &str, cdup: Option<&str>| {
+            Some([
+                Some(common.to_owned()),
+                Some(common.to_owned()),
+                cdup.map(str::to_owned),
+            ])
+        };
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            probed_layout(&probe(&[&common, &common, "", commit]), true),
+            read(&common, Some(""))
+        );
+        assert_eq!(
+            probed_layout(&probe(&[&common, &common, "../../"]), false),
+            read(&common, Some("../../"))
+        );
+        // In no Worktree, and in metadata whose Worktree lies elsewhere.
+        assert_eq!(
+            probed_layout(&probe(&[&common, &common, commit]), true),
+            read(&common, None)
+        );
+        assert_eq!(
+            probed_layout(&probe(&[&common, &common, root]), false),
+            read(&common, Some(root))
+        );
+        assert_eq!(
+            probed_layout(format!("{common}\r\n{common}\r\n\r\n").as_bytes(), false),
+            read(&common, Some(""))
+        );
+        let mut unreadable = b"\xff\n".to_vec();
+        unreadable.extend(probe(&[&common]));
+        assert_eq!(
+            probed_layout(&unreadable, false),
+            Some([None, Some(common.clone()), None])
+        );
+        for indistinct in [
+            probe(&[&common]),
+            probe(&[&common, &common, "", "line"]),
+            probe(&[&common, &common, "line"]),
+            format!("{common}\n{common}").into_bytes(),
+        ] {
+            assert_eq!(probed_layout(&indistinct, false), None);
+        }
+    }
 }
