@@ -1235,12 +1235,11 @@ async fn delete_session(descriptor: &RuntimeDescriptor, session_id: SessionId) {
 async fn deleting_a_session_past_the_grace_period_removes_the_attachments_only_it_references() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = spawn_with_timings(
-        state_dir.path(),
-        "attachment-deletion-test",
-        ServerTimings::default().with_attachment_grace(Duration::ZERO),
-    )
-    .await;
+    // The grace period passes by the test's hand rather than being zero: with
+    // none, the writer's idle sweep may reclaim an upload before the Prompt
+    // binding it is admitted.
+    let (server, clock) =
+        spawn_with_manual_clock(state_dir.path(), "attachment-deletion-test").await;
     let descriptor = server.descriptor().clone();
     let own = uploaded(&descriptor, png(10, 10)).await;
     let shared = uploaded(&descriptor, gif(20, 20)).await;
@@ -1263,6 +1262,7 @@ async fn deleting_a_session_past_the_grace_period_removes_the_attachments_only_i
         vec![bound(&shared, "[Image 1]", "[Image 1]")],
     )
     .await;
+    clock.advance(HOUR + MINUTE);
     delete_session(&descriptor, deleted).await;
 
     assert_eq!(

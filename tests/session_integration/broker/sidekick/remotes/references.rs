@@ -26,9 +26,7 @@ async fn copied_sessions(config: &ServerConfig, sessions: &[SessionId], copy: &P
         .map(|session_id| format!("'{session_id}'"))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut database =
-        SqliteConnection::establish(config.data_dir().join("suru.db").to_str().unwrap())
-            .expect("open the Remote's database");
+    let mut database = running_database(config);
     timeout(PROGRESS_DEADLINE, async {
         loop {
             let stored = diesel::sql_query(format!(

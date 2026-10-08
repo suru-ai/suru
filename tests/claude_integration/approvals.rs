@@ -169,7 +169,7 @@ async fn a_failed_live_mode_update_is_visible_and_retried_without_restarting_on_
     ));
     let live = LiveTurn::start(
         ClaudeRuntime::new(fixture.executable())
-            .with_control_request_timeout(tokio::time::Duration::from_millis(50)),
+            .with_posture_request_timeout(tokio::time::Duration::from_millis(250)),
         "claude-live-posture-failure",
         "Wait",
     )

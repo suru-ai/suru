@@ -50,6 +50,7 @@ pub struct ClaudeRuntime {
     availability: ClaudeAvailability,
     control_request_timeout: Duration,
     interrupt_request_timeout: Duration,
+    posture_request_timeout: Duration,
     context_request_timeout: Duration,
     skills: ClaudeSkills,
     permission_mode: Arc<StdMutex<ClaudePermissionMode>>,
@@ -63,6 +64,7 @@ impl ClaudeRuntime {
             availability: ClaudeAvailability::new(),
             control_request_timeout: CONTROL_REQUEST_TIMEOUT,
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
+            posture_request_timeout: CONTROL_REQUEST_TIMEOUT,
             context_request_timeout: Duration::from_secs(5),
             skills: ClaudeSkills::default(),
             permission_mode: Arc::new(StdMutex::new(ClaudePermissionMode::default())),
@@ -88,6 +90,14 @@ impl ClaudeRuntime {
     /// wait out the default.
     pub fn with_interrupt_request_timeout(mut self, timeout: Duration) -> Self {
         self.interrupt_request_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long a live permission-mode update waits for the CLI to acknowledge it;
+    /// injectable so tests can watch one fail without shrinking the budget a Session's startup
+    /// gets.
+    pub fn with_posture_request_timeout(mut self, timeout: Duration) -> Self {
+        self.posture_request_timeout = timeout;
         self
     }
 
@@ -190,6 +200,7 @@ impl ProviderRuntime for ClaudeRuntime {
         let timings = ClaudeTimings {
             control_request: self.control_request_timeout,
             interrupt_request: self.interrupt_request_timeout,
+            posture_request: self.posture_request_timeout,
             context_request: self.context_request_timeout,
         };
         let skills = self.skills.clone();

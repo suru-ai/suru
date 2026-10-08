@@ -70,8 +70,11 @@ struct Serving {
 }
 
 impl Serving {
-    /// A Server for `channel`, Serving on a port of its own that it keeps
-    /// across a restart, so the route to it outlives one.
+    /// A Server for `channel`, Serving on whatever port this machine gives
+    /// it, reached by way of a route that outlives a restart. The port is
+    /// given back as the Server stops, and anything else on this machine may
+    /// take it before the Server starts again, so a restarted Server Serves
+    /// on a port given it anew and the route is turned toward that.
     async fn start(channel: &str) -> Self {
         Self::start_keeping_alive(channel, ServerTimings::default().sse_keepalive_interval).await
     }
@@ -112,13 +115,6 @@ impl Serving {
             mutate_setting(server.descriptor(), mutation).await;
         }
         let address = server.serving_address().expect("the Remote is Serving");
-        mutate_setting(
-            server.descriptor(),
-            SettingMutation::ServingPort {
-                value: Some(address.port()),
-            },
-        )
-        .await;
         Self {
             server,
             provider,
@@ -161,14 +157,14 @@ impl Serving {
     }
 
     /// The same Server stopped and started again speaking `protocol_version`
-    /// to its Peers, Serving where it was.
+    /// to its Peers, reached by way of the route it was.
     async fn restart_speaking(self, protocol_version: u32) -> Self {
         self.restart(protocol_version, |_| {}).await
     }
 
     /// The same Server stopped, its database `meanwhile` handed while it is
     /// stopped, and started again speaking `protocol_version` to its Peers,
-    /// Serving where it was.
+    /// reached by way of the route it was.
     async fn restart(self, protocol_version: u32, meanwhile: impl FnOnce(&Path)) -> Self {
         let Self {
             server,
@@ -184,6 +180,11 @@ impl Serving {
         meanwhile(&config.data_dir().join("suru.db"));
         let (server, provider) =
             Self::spawn(&config, protocol_version, keep_alive, &hosted, &git).await;
+        route.retarget(
+            server
+                .serving_address()
+                .expect("the Remote is Serving again"),
+        );
         Self {
             server,
             provider,
@@ -426,6 +427,20 @@ async fn own_server(
     (own, claude, [state, config_root])
 }
 
+/// The database of the running Server `config` configures, waiting out
+/// whatever lock the Server's own writes hold on it rather than refusing a
+/// read at once.
+fn running_database(config: &ServerConfig) -> SqliteConnection {
+    let database = config.data_dir().join("suru.db");
+    let mut database =
+        SqliteConnection::establish(database.to_str().expect("the database's path is UTF-8"))
+            .expect("open the running Server's database");
+    diesel::sql_query("PRAGMA busy_timeout = 5000")
+        .execute(&mut database)
+        .expect("wait out the Server's writes");
+    database
+}
+
 /// The Sidekick's own Server for `channel`, kept by its config so it can be
 /// stopped and started again on the same data, paired with what it was.
 struct OwnServer {
@@ -520,14 +535,7 @@ impl OwnServer {
             #[diesel(sql_type = diesel::sql_types::Bool)]
             confirmed: bool,
         }
-        let database = self.config.data_dir().join("suru.db");
-        let mut database =
-            SqliteConnection::establish(database.to_str().expect("the database's path is UTF-8"))
-                .expect("open the own Server's database");
-        // The running Server may be writing as it is read.
-        diesel::sql_query("PRAGMA busy_timeout = 5000")
-            .execute(&mut database)
-            .expect("wait out the Server's writes");
+        let mut database = running_database(&self.config);
         diesel::sql_query(
             "SELECT origin, session_id, confirmed FROM sidekick_acts WHERE origin <> ''",
         )

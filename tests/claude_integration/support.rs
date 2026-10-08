@@ -1042,10 +1042,17 @@ impl LiveTurn {
             created.session.id,
             "the Prompt begins a Turn Claude is running",
             |snapshot| {
-                snapshot
-                    .turns
-                    .first()
-                    .is_some_and(|turn| turn.status == TurnStatus::Active)
+                snapshot.turns.first().is_some_and(|turn| {
+                    // A Turn that settles before it is seen running never
+                    // will be; say why now rather than at the deadline.
+                    assert_eq!(
+                        turn.status,
+                        TurnStatus::Active,
+                        "the first Turn settled before it ran: {:?}",
+                        snapshot.activities
+                    );
+                    true
+                })
             },
         )
         .await;

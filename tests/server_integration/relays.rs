@@ -422,12 +422,13 @@ async fn run_server(
     (server, client)
 }
 
-/// The name the Server reports itself by: its machine's hostname.
+/// The name the Server reports itself by: its machine's hostname up to its
+/// first `.`.
 fn machine_hostname() -> String {
     hostname::get()
         .ok()
         .and_then(|name| name.into_string().ok())
-        .map(|name| name.trim().to_owned())
+        .map(|name| name.split('.').next().unwrap_or_default().trim().to_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "remote".to_owned())
 }
@@ -2072,6 +2073,12 @@ async fn a_relay_that_pings_without_reading_reads_unreachable() {
                 }
                 return;
             }
+            // The Server dials the Relay again only once the connection it
+            // kept has gone, so being dialled again shows it let go of the
+            // last.
+            if connection > 1 {
+                letting_go.notify_one();
+            }
             // The connection the Server keeps is pinged without end, and
             // nothing it sends is read.
             while socket
@@ -2079,7 +2086,6 @@ async fn a_relay_that_pings_without_reading_reads_unreachable() {
                 .await
                 .is_ok()
             {}
-            letting_go.notify_one();
         }
     })
     .await;
@@ -2114,7 +2120,7 @@ async fn a_relay_that_pings_without_reading_reads_unreachable() {
     );
     timeout(PROGRESS_DEADLINE, let_go.notified())
         .await
-        .expect("the Server lets go of a Relay that never reads what it asks");
+        .expect("the Server lets go of a Relay that never reads what it asks, and dials it afresh");
 
     relay.abort();
     server.shutdown().await;

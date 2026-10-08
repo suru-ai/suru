@@ -75,7 +75,12 @@ fn named_only_by_the_beginning(home: &Path) -> (PathBuf, PathBuf) {
 /// held there as the Remote first reads its directory, `reached` says, and
 /// the beginning is kept; then has every answer lost on the way back from the
 /// Remote before letting the request go on, by `release`, so the Remote does
-/// what it was asked and nothing of it is heard.
+/// what it was asked and nothing of it is heard. Once the Remote has answered
+/// — so all it was asked is done there — the route goes offline, ending the
+/// connection the answer was lost on, and this Server learns at once it will
+/// never hear it. A reach timeout passing instead would race the Remote's
+/// work on a slow machine, ending the request while the Remote was still at
+/// it, and bound every step asked again just as tightly.
 async fn lose_the_answer_to(
     remote: &mut Serving,
     own: &OwnServer,
@@ -97,6 +102,8 @@ async fn lose_the_answer_to(
     release
         .send(())
         .expect("the Remote goes on with the beginning");
+    remote.route.wait_for_lost_answer().await;
+    remote.route.set_online(false).await;
 }
 
 /// Answers the start `start` waited on, freeing the Repository it held.
@@ -210,7 +217,9 @@ async fn a_beginning_whose_answer_was_lost_is_asked_again_as_the_same_beginning(
     let mut remote = Serving::start("sidekick-remote-unconfirmed-beginning").await;
     let mut own = OwnServer::start(
         "sidekick-remote-unconfirmed-beginning",
-        ServerTimings::default().with_remote_reach_timeout(Duration::from_secs(2)),
+        // Nothing here waits out the reach timeout: every step it bounds
+        // should be answered, however slow the machine.
+        ServerTimings::default().with_remote_reach_timeout(PROGRESS_DEADLINE),
     )
     .await;
     pair(&own.descriptor(), &remote, REMOTE).await;
@@ -293,7 +302,9 @@ async fn a_prepared_beginning_whose_answer_was_lost_resumes_the_same_preparation
     let mut remote = Serving::start("sidekick-remote-unconfirmed-prepared").await;
     let mut own = OwnServer::start(
         "sidekick-remote-unconfirmed-prepared",
-        ServerTimings::default().with_remote_reach_timeout(Duration::from_secs(2)),
+        // Nothing here waits out the reach timeout: every step it bounds
+        // should be answered, however slow the machine.
+        ServerTimings::default().with_remote_reach_timeout(PROGRESS_DEADLINE),
     )
     .await;
     pair(&own.descriptor(), &remote, REMOTE).await;

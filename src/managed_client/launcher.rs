@@ -254,6 +254,7 @@ impl LaunchedServer {
     }
 }
 
+#[cfg(unix)]
 impl Drop for LaunchedServer {
     fn drop(&mut self) {
         let Some(mut child) = self.0.take() else {
@@ -262,7 +263,6 @@ impl Drop for LaunchedServer {
         if !matches!(child.try_wait(), Ok(None)) {
             return;
         }
-        #[cfg(unix)]
         let _ = std::thread::Builder::new()
             .name("suru-server-reaper".to_owned())
             .spawn(move || child.wait());

@@ -137,6 +137,8 @@ pub(super) struct ClaudeTimings {
     pub(super) context_request: Duration,
     /// How long an interrupt — and each of the task stops that go ahead of it — waits.
     pub(super) interrupt_request: Duration,
+    /// How long a live permission-mode update waits for the CLI to acknowledge it.
+    pub(super) posture_request: Duration,
 }
 
 pub(super) async fn start_claude_session(
@@ -210,7 +212,7 @@ pub(super) async fn start_claude_session(
         turn,
         skills,
         permission_mode: StdMutex::new(permission_mode),
-        posture_request_timeout: timings.control_request,
+        posture_request_timeout: timings.posture_request,
         interrupt_request_timeout: timings.interrupt_request,
         shutdown_started: AtomicBool::new(false),
     });

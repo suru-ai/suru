@@ -1151,6 +1151,7 @@ mod tests {
             assert!(on_disk.worktrees(&common).is_none(), "{case}");
         }
         std::fs::write(&packed, &contents).unwrap();
+        #[cfg_attr(not(unix), expect(unused_variables))]
         let read = fixture.agreed_revision(&on_disk, &main).await;
         // A file rewritten in place with its modification time set back is
         // still told apart by the time of its change, where there is one.

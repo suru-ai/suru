@@ -308,10 +308,23 @@ async fn two_peers_giving_one_name_are_told_apart_in_what_their_sidekicks_send()
     let [first_peer, second_peer] = peers.as_slice() else {
         panic!("the Remote has both Servers as Peers: {peers:?}");
     };
-    assert_eq!(
-        second_peer.name,
-        format!("{} ({})", first_peer.name, &second_peer.fingerprint[..8]),
-        "the second Peer giving the same name is told apart by its fingerprint"
+    // A hostname near the longest name gives way for the fingerprint, so the
+    // second name need only begin as the first does.
+    let told_apart = format!(" ({})", &second_peer.fingerprint[..8]);
+    let given = second_peer
+        .name
+        .strip_suffix(&told_apart)
+        .unwrap_or_else(|| {
+            panic!(
+                "the second Peer giving the same name is told apart by its fingerprint: {:?}",
+                second_peer.name
+            )
+        });
+    assert!(
+        !given.is_empty() && first_peer.name.starts_with(given),
+        "the second Peer goes by the name the first does: {:?} and {:?}",
+        first_peer.name,
+        second_peer.name
     );
 
     let there = tempfile::tempdir().expect("create a Workspace on the Remote");

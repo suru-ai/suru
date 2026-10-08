@@ -5803,16 +5803,25 @@ fn enrollment_token_from_certificate(certificate: &CertificateDer<'_>) -> Option
     URL_SAFE_NO_PAD.decode(encoded).ok()?.try_into().ok()
 }
 
+/// The name this Server reports itself by: its machine's hostname.
 pub(crate) fn machine_hostname() -> String {
-    let hostname = hostname::get()
-        .ok()
-        .and_then(|name| name.into_string().ok())
-        .unwrap_or_else(|| "remote".to_owned());
-    let hostname = hostname.trim();
-    if hostname.is_empty() {
+    short_hostname(
+        &hostname::get()
+            .ok()
+            .and_then(|name| name.into_string().ok())
+            .unwrap_or_default(),
+    )
+}
+
+/// `hostname` up to its first `.`, so a machine is named as its user knows it
+/// — `laptop`, not `laptop.local` or a domain it happens to sit in — and
+/// `remote` where that leaves nothing.
+fn short_hostname(hostname: &str) -> String {
+    let name = hostname.split('.').next().unwrap_or_default().trim();
+    if name.is_empty() {
         "remote".to_owned()
     } else {
-        hostname.to_owned()
+        name.to_owned()
     }
 }
 
@@ -6776,6 +6785,16 @@ mod tests {
         );
 
         serving.shutdown().await;
+    }
+
+    #[test]
+    fn a_machine_is_named_by_its_hostname_up_to_the_first_dot() {
+        assert_eq!(short_hostname("laptop"), "laptop");
+        assert_eq!(short_hostname(" laptop.local\n"), "laptop");
+        assert_eq!(short_hostname("build-7.ci.example.com"), "build-7");
+        for nameless in ["", "  ", ".local", " .example.com"] {
+            assert_eq!(short_hostname(nameless), "remote", "{nameless:?}");
+        }
     }
 
     #[test]

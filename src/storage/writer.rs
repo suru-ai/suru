@@ -48,7 +48,9 @@ use super::{
     WorkspaceWrite,
 };
 
-const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(100);
+/// How long the writer waits without a command before an idle tick, and how
+/// long nothing held must have moved for that tick to take saves.
+pub(crate) const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(100);
 
 /// How long the writer, stopping, waits between tries of the store's lock,
 /// reading any command that arrives meanwhile.
@@ -239,6 +241,9 @@ struct Writer {
     /// Sidekick's Session storage held no row of when their save landed.
     unwritten_acts: Vec<StoredSidekickAct>,
     refusal: Refusal,
+    /// How long the writer waits without a command before an idle tick, and
+    /// how long nothing held must have moved for that tick to take saves.
+    idle_flush_delay: Duration,
     /// Told to every sink once the writer begins to stop.
     stopping: Arc<AtomicBool>,
     /// Whether work arrived or landed since the writer last went idle: the
@@ -258,6 +263,7 @@ impl StorageWriter {
                 retry_interval: repository.save_retry_interval,
                 retry_at: None,
             },
+            idle_flush_delay: repository.idle_flush_delay,
             repository,
             held: Vec::new(),
             pending: VecDeque::new(),
@@ -267,7 +273,7 @@ impl StorageWriter {
         };
         let task = thread::spawn(move || {
             loop {
-                match receiver.recv_timeout(IDLE_FLUSH_DELAY) {
+                match receiver.recv_timeout(writer.idle_flush_delay) {
                     Ok(command) => {
                         writer.worked = true;
                         if writer.handle(command).is_break() {
@@ -587,7 +593,7 @@ impl Writer {
         if self.refusal.holds_idle_flush() {
             return;
         }
-        let taken = self.take_held(Some(IDLE_FLUSH_DELAY));
+        let taken = self.take_held(Some(self.idle_flush_delay));
         let landed = self.land();
         self.write_unwritten_acts();
         // Every Session held has landed its joins, so an Attachment none is

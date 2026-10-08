@@ -2078,13 +2078,16 @@ async fn a_forwarded_address_is_believed_only_from_a_proxy_the_operator_names() 
 }
 
 /// The Relay's database as it stands on disk: each of its files but SQLite's
-/// shared-memory index, which reading alone changes.
+/// shared-memory index, which reading alone changes, and the lock beside the
+/// records that says the Relay runs on them — no part of the database, and
+/// on Windows the lock the Relay holds on it keeps anything else from
+/// reading it.
 fn database_files(relay: &Relay) -> BTreeMap<String, Vec<u8>> {
     std::fs::read_dir(relay.directory.path())
         .unwrap()
         .map(Result::unwrap)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| !name.ends_with("-shm"))
+        .filter(|name| !name.ends_with("-shm") && !name.ends_with(".lock"))
         .map(|name| {
             let contents = std::fs::read(relay.directory.path().join(&name)).unwrap();
             (name, contents)
@@ -2525,7 +2528,7 @@ async fn the_relay_binary_logs_to_standard_output_believing_forwarded_addresses_
 }
 
 #[tokio::test]
-async fn a_frame_passed_on_as_a_join_closes_is_counted_and_the_join_ends_once_it_has_gone() {
+async fn a_frame_passed_on_as_a_join_closes_is_counted_and_the_join_ends_as_it_closes() {
     let (writer, mut log) = ConnectionLog::new();
     let now = Arc::new(std::sync::Mutex::new(
         UNIX_EPOCH + Duration::from_millis(1_790_000_000_123),
@@ -2579,7 +2582,10 @@ async fn a_frame_passed_on_as_a_join_closes_is_counted_and_the_join_ends_once_it
     wait_until_stalled(&said).await;
 
     // The serving Server, still taking nothing in, closes the join; the
-    // Relay closes both sides, telling the joining Server so.
+    // Relay closes both sides, telling the joining Server so. The clock
+    // moves first: the Relay may finish closing as soon as the kernel takes
+    // the rest of the frame, before the stalled Server reads a byte of it.
+    *now.lock().unwrap() = UNIX_EPOCH + Duration::from_millis(1_790_000_754_456);
     stalled.socket.send(Message::Close(None)).await.unwrap();
     timeout(DEADLINE, async {
         while let Some(Ok(heard)) = hearing.next().await {
@@ -2593,7 +2599,6 @@ async fn a_frame_passed_on_as_a_join_closes_is_counted_and_the_join_ends_once_it
 
     // As the Relay closes it, the serving Server takes in everything it was
     // sent, the frame the Relay was waiting to pass on among it.
-    *now.lock().unwrap() = UNIX_EPOCH + Duration::from_millis(1_790_000_754_456);
     let delivered = timeout(DEADLINE, async {
         let mut delivered = 0;
         loop {
@@ -2612,9 +2617,12 @@ async fn a_frame_passed_on_as_a_join_closes_is_counted_and_the_join_ends_once_it
         (u64::try_from(delivered).unwrap(), 0),
         "every whole frame passed on is counted"
     );
+    // That it ends only once what it carried has gone, rather than at the
+    // Close, rests on how much a real socket buffers; the unit test in
+    // `connection.rs` pins it with a flush it controls.
     assert_eq!(
         line["end"], "2026-09-21T14:25:54.456Z",
-        "the join ends once what it carried has gone"
+        "the join ends as it closes, not as it began"
     );
     timeout(DEADLINE, flooding).await.unwrap().unwrap();
     relay.running.shutdown().await.unwrap();

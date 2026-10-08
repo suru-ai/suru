@@ -52,9 +52,13 @@ const CATALOG_WITHOUT_ERRAND_MODEL: &str = r#"{"data":[{"id":"gpt-fixture","disp
 
 /// What the fixture does when it is invoked as `codex exec`: record everything
 /// about the invocation, then run the body the test gave it. Recorded last of
-/// all is the marker a test waits on, so nothing is read half-written.
+/// all is the marker a test waits on, so nothing is read half-written. The PID
+/// is recorded first of all, with nothing but a builtin ahead of it, so a test
+/// whose Errand deadline may cut the rest short still learns which process it
+/// has to see taken down.
 const ERRAND_SCRIPT_PREFIX: &str = r#"#!/bin/sh
 if [ "$1" = "exec" ]; then
+  printf '%s\n' "$$" > "$CODEX_FIXTURE_ERRAND-pid"
   : > "$CODEX_FIXTURE_ERRAND-arguments"
   answer=
   schema=
@@ -68,7 +72,6 @@ if [ "$1" = "exec" ]; then
     previous="$argument"
   done
   pwd -P > "$CODEX_FIXTURE_ERRAND-cwd"
-  printf '%s\n' "$$" > "$CODEX_FIXTURE_ERRAND-pid"
   cat > "$CODEX_FIXTURE_ERRAND-prompt"
   cp "$schema" "$CODEX_FIXTURE_ERRAND-schema"
   printf 'recorded\n' > "$CODEX_FIXTURE_ERRAND-recorded"
@@ -451,17 +454,23 @@ async fn a_codex_errand_that_never_answers_leaves_the_prompt_derived_title_stand
     let (server, mut client, _state_dir) = running_server(
         &codex,
         "codex-errand-timeout",
-        ServerTimings::default().with_errand_timeout(Duration::from_millis(50)),
+        // The deadline runs from before Codex is launched, so it must outlast
+        // a loaded runner starting a shell: the test waits for the Errand's
+        // process to name itself, and one cut short before it could would
+        // leave that wait nothing to see.
+        ServerTimings::default().with_errand_timeout(Duration::from_secs(1)),
     )
     .await;
 
     let session_id = create_session(&client, workspace.path()).await;
-    codex.wait_for_errand().await;
+    // Only the PID: the deadline may take the run down before it has recorded
+    // the rest of what it was asked, which this test has no use for.
+    let errand_pid = codex.wait_for_errand_launch().await;
 
     // Abandoning the wait is not enough on its own: a Codex left running would
     // hold the Workspace open and the Model's clock ticking for a Title nobody
     // is waiting for any more.
-    assert_process_exited(codex.errand_pid()).await;
+    assert_process_exited(errand_pid).await;
     assert_eq!(
         listed_title(&client, session_id).await,
         FIRST_PROMPT,

@@ -33,7 +33,13 @@ impl ProviderActors for NoActors {
 /// A store over storage the way the Server opens one, so a tree it evicts
 /// can be read back, with the writer it saves through.
 async fn store(data_dir: &Path) -> (StorageRepository, StorageWriter, SessionStore) {
-    let repository = StorageRepository::open(data_dir).await.unwrap();
+    store_over(StorageRepository::open(data_dir).await.unwrap()).await
+}
+
+/// A store over `repository`, with the writer it saves through.
+async fn store_over(
+    repository: StorageRepository,
+) -> (StorageRepository, StorageWriter, SessionStore) {
     let restored = repository.load_sessions().await.unwrap();
     let (writer, sink) = StorageWriter::spawn(repository.clone());
     let store = SessionStore::new(restored, sink, Vec::new(), Default::default());
@@ -701,7 +707,16 @@ async fn a_deletion_waits_for_a_session_storage_is_out_of_step_with_to_be_writte
 async fn a_session_out_of_step_whose_deletion_fails_is_still_written_whole() {
     let data_dir = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let (repository, writer, store) = store(data_dir.path()).await;
+    // The writer takes no idle tick before the assertions below are made, so
+    // none finds the store quiet enough to take the whole rewrite first: only
+    // the deletion's failure is left to account for it.
+    let (repository, writer, store) = store_over(
+        StorageRepository::open(data_dir.path())
+            .await
+            .unwrap()
+            .with_idle_flush_delay(Duration::from_secs(60 * 60)),
+    )
+    .await;
     let (session_id, turn_id) = working(&store, workspace.path());
     settle(&store, session_id, turn_id);
     database(data_dir.path())
@@ -716,36 +731,6 @@ async fn a_session_out_of_step_whose_deletion_fails_is_still_written_whole() {
             }],
         )
         .unwrap();
-    // Another Session kept moving until the assertions below are made, so
-    // no idle tick finds the store quiet enough to take the whole rewrite
-    // first: only the deletion's failure is left to account for it.
-    let (mover, mover_turn) = working(&store, workspace.path());
-    settle(&store, mover, mover_turn);
-    let moving = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let move_on = move |store: &SessionStore, step: usize| {
-        store
-            .publish(
-                mover,
-                vec![SessionChange::TitleChanged {
-                    title: format!("Moving {step}"),
-                    icon: None,
-                }],
-            )
-            .unwrap();
-    };
-    move_on(&store, 0);
-    let mover_task = tokio::spawn({
-        let store = store.clone();
-        let moving = moving.clone();
-        async move {
-            let mut step = 1;
-            while moving.load(std::sync::atomic::Ordering::SeqCst) {
-                move_on(&store, step);
-                step += 1;
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        }
-    });
     // The save building on the lost row is let go, the Session owed whole.
     save_now(&store, session_id);
 
@@ -766,8 +751,6 @@ async fn a_session_out_of_step_whose_deletion_fails_is_still_written_whole() {
             .is_empty(),
         "its history is the only complete copy, so it is not evicted"
     );
-    moving.store(false, std::sync::atomic::Ordering::SeqCst);
-    mover_task.await.unwrap();
     database(data_dir.path())
         .batch_execute("DROP TRIGGER refuse_deletions;")
         .unwrap();

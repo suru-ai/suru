@@ -146,8 +146,10 @@ fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
     #[cfg(windows)]
     {
         let wide = bytes
-            .chunks_exact(2)
-            .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&unit| u16::from_le_bytes(unit))
             .collect::<Vec<_>>();
         PathBuf::from(<OsString as std::os::windows::ffi::OsStringExt>::from_wide(
             &wide,
