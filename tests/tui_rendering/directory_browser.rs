@@ -28,7 +28,7 @@ use suru::{
     managed_client::ManagedEvent,
     protocol::{
         AgentSelection, CheckoutAssociation, CheckoutId, CheckoutKind, CheckoutRevision,
-        CheckoutSummary, ChildDirectory, DirectoryListing, DirectorySourceControl,
+        CheckoutSummary, ChildDirectory, DRIVE_LIST, DirectoryListing, DirectorySourceControl,
         EffectiveSettings, ExecutionDirectory, ExecutionDirectoryStatus, ListDirectoryRequest,
         ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId,
         ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
@@ -3267,6 +3267,284 @@ fn wheel_at(
             modifiers: KeyModifiers::NONE,
         }))
         .expect("turn the wheel")
+}
+
+/// Above a drive on Windows stands the drive list, which the Server names as
+/// the drive root's parent: Left reaches it as Left reaches any parent, the
+/// former drive open and focused beneath it, and the path field names it as
+/// nothing, since it is no path that exists. The drives are what the Server
+/// can see, so these are a Windows Remote's answers whichever platform this
+/// Client runs on.
+#[test]
+fn left_on_a_drive_root_reaches_the_drive_list_with_the_path_field_empty() {
+    let mut application = browsing_a_windows_drive(r"C:\", &["Users", "Windows"]);
+
+    let (_, listing_id, request) = expect_listing(key(&mut application, KeyCode::Left));
+
+    assert_eq!(
+        request,
+        ListDirectoryRequest {
+            path: PathBuf::from(DRIVE_LIST),
+            base: Some(PathBuf::from(r"C:\")),
+        },
+        "the drive list is asked for by the path the Server named the drive's parent"
+    );
+    assert_eq!(path_field(&application), "", "the drive list is no path");
+    assert_eq!(tree(&application), ["  ▾ Drives", "    Loading…"]);
+
+    answer_drive_list(&mut application, listing_id, &[r"C:\", r"D:\"]);
+    assert_eq!(path_field(&application), "");
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ Drives",
+            r"›   ▾ C:\ · [current]",
+            "      ▸ Users",
+            "      ▸ Windows",
+            r"    ▸ D:\"
+        ],
+        "the former drive stands open and focused among the drives"
+    );
+}
+
+/// The drive list has no parent, so there is nowhere further up to go.
+#[test]
+fn left_on_the_drive_list_moves_nothing() {
+    let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
+    key(&mut application, KeyCode::Up);
+    assert_eq!(focused(&application), "Drives");
+    let rows = tree(&application);
+
+    assert_eq!(
+        key(&mut application, KeyCode::Left),
+        ApplicationTransition::Continue,
+        "nothing is asked of the Server"
+    );
+    assert_eq!(path_field(&application), "");
+    assert_eq!(tree(&application), rows);
+}
+
+/// The drive list is not a directory a Session can work in, so Enter on its
+/// row chooses nothing and leaves the browser open where it stands.
+#[test]
+fn enter_on_the_drive_list_chooses_nothing() {
+    let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
+    key(&mut application, KeyCode::Up);
+    let rows = tree(&application);
+
+    assert_eq!(
+        key(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "no Workspace resolution is asked for"
+    );
+    assert_eq!(path_field(&application), "");
+    assert_eq!(tree(&application), rows, "the browser stays open");
+}
+
+/// A drive is a directory like any other, so Enter on one chooses it.
+#[test]
+fn enter_on_a_drive_in_the_drive_list_chooses_it() {
+    let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
+    assert_eq!(focused(&application), r"C:\");
+
+    let (_, _, request) = expect_choice(&key(&mut application, KeyCode::Enter));
+
+    assert_eq!(request.path, Path::new(r"C:\"));
+}
+
+/// Opening a drive from the drive list roots the tree there rather than
+/// unfolding it beneath a root the path field cannot name, so the field
+/// names the drive and Left goes back up to the drive list.
+#[test]
+fn opening_another_drive_from_the_drive_list_roots_the_tree_there() {
+    for opens in [KeyCode::Right, KeyCode::Char(' ')] {
+        let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
+        for _ in ["Users", "Windows", r"D:\"] {
+            key(&mut application, KeyCode::Down);
+        }
+        assert_eq!(focused(&application), r"D:\");
+
+        let (_, listing_id, request) = expect_listing(key(&mut application, opens));
+
+        assert_eq!(request.path, Path::new(r"D:\"), "{opens:?}");
+        assert_eq!(path_field(&application), r"D:\", "{opens:?}");
+        assert_eq!(
+            tree(&application),
+            [r"› ▾ D:\", "    Loading…"],
+            "{opens:?}: the drive is the root, still being read"
+        );
+
+        answer_from_windows(
+            &mut application,
+            listing_id,
+            r"D:\",
+            Some(DRIVE_LIST),
+            &["Data"],
+        );
+        assert_eq!(tree(&application), [r"› ▾ D:\", "    ▸ Data"], "{opens:?}");
+
+        assert_eq!(
+            key(&mut application, KeyCode::Left),
+            ApplicationTransition::Continue,
+            "{opens:?}: the drive list is listed already"
+        );
+        assert_eq!(path_field(&application), "", "{opens:?}");
+        assert_eq!(
+            tree(&application),
+            [
+                "  ▾ Drives",
+                r"    ▸ C:\ · [current]",
+                r"›   ▾ D:\",
+                "      ▸ Data"
+            ],
+            "{opens:?}: the drive opened stands open and focused among the drives"
+        );
+    }
+}
+
+/// Left then Right walks up to the drive list and back down into the drive
+/// it came from, which is listed already and so asks nothing again.
+#[test]
+fn right_on_the_former_drive_roots_the_tree_back_there() {
+    let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
+
+    assert_eq!(
+        key(&mut application, KeyCode::Right),
+        ApplicationTransition::Continue,
+        "the drive's children are had already"
+    );
+
+    assert_eq!(path_field(&application), r"C:\");
+    assert_eq!(
+        tree(&application),
+        [r"› ▾ C:\ · [current]", "    ▸ Users", "    ▸ Windows"]
+    );
+}
+
+/// The empty path field names the drive list, so what is typed into it
+/// narrows the drives, and a drive typed whole roots the tree there as any
+/// absolute path does.
+#[test]
+fn typing_a_drive_into_the_empty_path_field_roots_the_tree_there() {
+    let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
+
+    assert!(
+        type_path(&mut application, "d:").is_empty(),
+        "the empty leading part still names the drive list"
+    );
+    assert_eq!(tree(&application), ["  ▾ Drives", r"›   ▸ D:\"]);
+
+    let asked = type_path(&mut application, r"\");
+
+    let [(listing_id, request)] = asked.as_slice() else {
+        panic!("the drive typed is asked for once: {asked:?}");
+    };
+    assert_eq!(request.path, Path::new(r"d:\"));
+    answer_from_windows(
+        &mut application,
+        *listing_id,
+        r"D:\",
+        Some(DRIVE_LIST),
+        &["Data"],
+    );
+    assert_eq!(path_field(&application), r"d:\");
+    assert_eq!(tree(&application), [r"› ▾ D:\", "    ▸ Data"]);
+}
+
+/// A Client turned toward a Remote on Windows, its Landing working at that
+/// Remote's `drive` and the browser open there, the drive listed with plain
+/// children by name and the drive list named as its parent.
+fn browsing_a_windows_drive(drive: &str, children: &[&str]) -> Application {
+    let mut application = application_looking_at_studio();
+    expect_listing(invoke(&mut application, SemanticCommandId::WorkspaceBrowse));
+    let choice = key(&mut application, KeyCode::Enter);
+    resolve(
+        &mut application,
+        &choice,
+        Ok(ResolvedWorkspace::directory(PathBuf::from(drive))),
+    );
+    let (_, listing_id, request) =
+        expect_listing(invoke(&mut application, SemanticCommandId::WorkspaceBrowse));
+    assert_eq!(request.path, Path::new(drive));
+    answer_from_windows(
+        &mut application,
+        listing_id,
+        drive,
+        Some(DRIVE_LIST),
+        children,
+    );
+    application
+}
+
+/// The browser on a Windows Remote's `drive`, holding `Users` and `Windows`,
+/// walked up to the drive list, which the Remote answers with `drives`.
+fn drive_list_reached_from(drive: &str, drives: &[&str]) -> Application {
+    let mut application = browsing_a_windows_drive(drive, &["Users", "Windows"]);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Left));
+    answer_drive_list(&mut application, listing_id, drives);
+    application
+}
+
+/// A Windows Server's listing of `root`, with `parent` and plain children by
+/// name, each spelled beneath `root` in that Server's syntax whatever this
+/// Client's own is.
+fn answer_from_windows(
+    application: &mut Application,
+    listing_id: DirectoryListingId,
+    root: &str,
+    parent: Option<&str>,
+    children: &[&str],
+) -> ApplicationTransition {
+    let beneath = if root.ends_with('\\') {
+        root.to_owned()
+    } else {
+        format!(r"{root}\")
+    };
+    answer_listing(
+        application,
+        listing_id,
+        DirectoryListing {
+            root: PathBuf::from(root),
+            parent: parent.map(PathBuf::from),
+            source_control: DirectorySourceControl::Plain,
+            children: children
+                .iter()
+                .map(|name| ChildDirectory {
+                    name: (*name).to_owned(),
+                    path: PathBuf::from(format!("{beneath}{name}")),
+                    source_control: DirectorySourceControl::Plain,
+                    hidden: false,
+                })
+                .collect(),
+        },
+    )
+}
+
+/// A Windows Server's drive list: parentless, a child for each of `drives`
+/// named and spelled as its root.
+fn answer_drive_list(
+    application: &mut Application,
+    listing_id: DirectoryListingId,
+    drives: &[&str],
+) -> ApplicationTransition {
+    answer_listing(
+        application,
+        listing_id,
+        DirectoryListing {
+            root: PathBuf::from(DRIVE_LIST),
+            parent: None,
+            source_control: DirectorySourceControl::Plain,
+            children: drives
+                .iter()
+                .map(|drive| ChildDirectory {
+                    name: (*drive).to_owned(),
+                    path: PathBuf::from(drive),
+                    source_control: DirectorySourceControl::Plain,
+                    hidden: false,
+                })
+                .collect(),
+        },
+    )
 }
 
 fn landing_in_subdirectory(workspace: &Path, subdirectory: &Path) -> Application {

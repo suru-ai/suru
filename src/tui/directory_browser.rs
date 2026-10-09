@@ -12,7 +12,7 @@ use std::{
 use ratatui::layout::{Position, Rect};
 
 use crate::protocol::{
-    DirectoryListing, DirectorySourceControl, ListDirectoryRequest, PathStyle,
+    DRIVE_LIST, DirectoryListing, DirectorySourceControl, ListDirectoryRequest, PathStyle,
     ResolveWorkspaceRequest,
 };
 
@@ -271,6 +271,13 @@ impl DirectoryBrowser {
         &self.root
     }
 
+    /// Whether the tree stands on the drive list a Windows Server names above
+    /// its drives, which is no directory: the path field names it as nothing,
+    /// and it cannot be chosen.
+    pub(super) fn stands_on_drive_list(&self) -> bool {
+        is_drive_list(&self.root)
+    }
+
     /// Why the Server would not read the directory the path field's leading
     /// part names, or the root itself, which the frame says where the path
     /// field names it rather than beneath the root's row.
@@ -315,11 +322,16 @@ impl DirectoryBrowser {
         if self.opened.remove(&self.focused) {
             return None;
         }
-        self.open_row(self.focused.clone())
+        self.open_focused()
     }
 
-    /// Opens the focused row, answering the listing that asks for.
+    /// Opens the focused row, answering the listing that asks for. A drive
+    /// the drive list holds is not unfolded beneath it but made the root, so
+    /// the path field names where the reader stands rather than nothing.
     pub(super) fn open_focused(&mut self) -> Option<DirectoryListingAsk> {
+        if self.stands_on_drive_list() && self.focused.0.len() == 2 {
+            return self.root_at_drive(self.focused.directory().to_owned());
+        }
         self.open_row(self.focused.clone())
     }
 
@@ -344,6 +356,9 @@ impl DirectoryBrowser {
         let former = std::mem::replace(&mut self.root, parent.clone());
         self.field = self.beneath(&parent.to_string_lossy());
         self.leading_changed();
+        // A parent that is the drive list goes by the empty path, so from
+        // here on an empty field names it rather than the Execution
+        // Directory.
         self.resolved.insert(self.leading.clone(), parent.clone());
         self.filter.clear();
         // Every row open stands beneath the former root, which stands open
@@ -413,11 +428,15 @@ impl DirectoryBrowser {
     /// Landing's Execution Directory, with no Workspace or remembered
     /// directory beside it, because the directory chosen is itself where the
     /// next Session works — and where the browser was opened from, which the
-    /// choice is done with too.
+    /// choice is done with too. The drive list is no directory to work in, so
+    /// focus standing on it chooses nothing and leaves the browser open.
     pub(super) fn choose_focused(
         &mut self,
-    ) -> (ResolveWorkspaceRequest, DirectoryBrowserProvenance) {
+    ) -> Option<(ResolveWorkspaceRequest, DirectoryBrowserProvenance)> {
         let path = self.focused.directory().to_owned();
+        if is_drive_list(&path) {
+            return None;
+        }
         let base = self.base.clone();
         let provenance = self.close();
         let request = ResolveWorkspaceRequest {
@@ -427,7 +446,7 @@ impl DirectoryBrowser {
             base: Some(base),
             path,
         };
-        (request, provenance)
+        Some((request, provenance))
     }
 
     /// Shows the directories the Server flagged hidden, each in its place
@@ -643,6 +662,15 @@ impl DirectoryBrowser {
                 base: Some(self.base.clone()),
             },
         }
+    }
+
+    /// Stands the tree on `drive`, by the Server's own path for it, with the
+    /// path field naming it, answering the listing it asks for where its
+    /// children are not had.
+    fn root_at_drive(&mut self, drive: PathBuf) -> Option<DirectoryListingAsk> {
+        self.field = self.beneath(&drive.to_string_lossy());
+        self.resolved.entry(spelling(&drive)).or_insert(drive);
+        self.follow_field()
     }
 
     /// Takes the path field as it now reads. Where its leading part names a
@@ -1021,6 +1049,11 @@ fn window_entries(rows: &[DirectoryBrowserRow]) -> Vec<WindowEntry> {
 /// a listing holds: the home, the directory itself, or its parent.
 fn is_path_atom(name: &str) -> bool {
     matches!(name, "~" | "." | "..")
+}
+
+/// Whether `path` is the drive list a Windows Server names above its drives.
+fn is_drive_list(path: &Path) -> bool {
+    path.as_os_str() == DRIVE_LIST
 }
 
 /// `path` as the field spells it.

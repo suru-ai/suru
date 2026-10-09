@@ -2013,9 +2013,14 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
     }
     let footer_rows = usize::from(shows_footer) + usize::from(shows_field_keys);
     let capacity = content_height.saturating_sub(lines.len() + footer_rows);
-    // The root goes by its name in the Server's own path syntax; every other
-    // row by the name the Server listed it under.
-    let root_name = state.workspace_name(&state.outlook, browser.root());
+    // The root goes by its name in the Server's own path syntax, or as the
+    // drive list where it is that; every other row by the name the Server
+    // listed it under.
+    let root_name = if browser.stands_on_drive_list() {
+        "Drives".to_owned()
+    } else {
+        state.workspace_name(&state.outlook, browser.root())
+    };
     let known = KnownWorkspaces {
         workspaces: state.sidebar.workspaces(),
         current: &state.workspace.id,

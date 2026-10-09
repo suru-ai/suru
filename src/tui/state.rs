@@ -7826,7 +7826,9 @@ impl Application {
             // reader chose is the directory itself, so that is what the
             // Landing names while it waits.
             SemanticCommandId::DirectoryBrowserChoose => {
-                let (request, provenance) = browser.choose_focused();
+                let Some((request, provenance)) = browser.choose_focused() else {
+                    return ApplicationTransition::Continue;
+                };
                 match provenance {
                     DirectoryBrowserProvenance::Standalone => {}
                     // A choice is done with the picker the browser was
