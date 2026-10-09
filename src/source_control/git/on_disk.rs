@@ -7,9 +7,9 @@
 //! in a reftable, a branch that is itself symbolic, an include in the
 //! configuration, a file Git would refuse as malformed — costs a spawn rather
 //! than a wrong answer. A listing alone spawns nothing, since it would cost a
-//! spawn per row: a revision it cannot read here goes to the Client as
-//! unavailable, and a directory it cannot tell for a bare Repository as
-//! plain.
+//! spawn per row, and reads only what [`listed_source_control`] names: a
+//! revision it cannot read there goes to the Client as unavailable, and a
+//! directory it cannot tell for a bare Repository as plain.
 //!
 //! Two differences are deliberate. Git confirms that the object a branch
 //! names exists and peels it to a commit; this takes the object id as the
@@ -35,7 +35,7 @@ use std::{
 };
 
 #[derive(Default)]
-pub(in crate::source_control) struct OnDisk {
+pub(super) struct OnDisk {
     /// Each Repository's packed branches, kept while its `packed-refs` is
     /// unchanged: a large one would otherwise be read whole on every poll.
     packed: Mutex<HashMap<PathBuf, Packed>>,
@@ -102,37 +102,6 @@ impl OnDisk {
             name: branch.to_owned(),
             commit,
         })
-    }
-
-    /// What `directory` is to Git, for a Directory Browser listing that may
-    /// not run Git once per row: a Worktree's root, main or linked as its
-    /// metadata says, with the revision its HEAD names where that can be read
-    /// here; a bare Repository, where the directory is itself metadata Git
-    /// would run in and its configuration does not deny bareness — Git,
-    /// asked there, takes a Repository with no Worktree for bare; or neither.
-    pub(in crate::source_control) fn directory_source_control(
-        &self,
-        directory: &Path,
-    ) -> DirectorySourceControl {
-        if let Some(metadata) = metadata_directory(directory) {
-            let revision = self.revision(directory);
-            // A linked Worktree's metadata names the Repository's shared
-            // metadata in a `commondir` file, where a main Worktree's own
-            // metadata is the shared one.
-            return if regular_file(&metadata.join("commondir")) == Some(None) {
-                DirectorySourceControl::RepositoryRoot { revision }
-            } else {
-                DirectorySourceControl::LinkedWorktreeRoot { revision }
-            };
-        }
-        let bare = Format::of(directory, directory).is_some_and(|format| {
-            format.bare != Some(false) && recognized_head(directory, &format).is_some()
-        });
-        if bare {
-            DirectorySourceControl::BareRepository
-        } else {
-            DirectorySourceControl::Plain
-        }
     }
 
     /// The Worktrees `git worktree list` names for the Repository whose
@@ -285,6 +254,67 @@ impl OnDisk {
         );
         Some(branches)
     }
+}
+
+/// What `directory` is to Git, read for a Directory Browser listing, which
+/// reads every directory it names and so is held to a bound: a Worktree's
+/// root costs a look at its `.git` — a read where that is a file — a look
+/// for its metadata's `commondir`, which tells a linked Worktree from a
+/// main one, and one read of its HEAD; a directory shaped like a
+/// Repository's own metadata costs its configuration, which says whether it
+/// is bare, and its HEAD; and any other directory a look or two.
+///
+/// HEAD is read alone, never the refs it names, so a branch is named without
+/// the commit it stands at and a detached commit is taken at the width of
+/// either hash Git knows, without the configuration saying which.
+pub(in crate::source_control) fn listed_source_control(directory: &Path) -> DirectorySourceControl {
+    if let Some(metadata) = metadata_directory(directory) {
+        let revision = listed_head(&metadata);
+        // A linked Worktree's metadata names the Repository's shared
+        // metadata in a `commondir` file, where a main Worktree's own
+        // metadata is the shared one.
+        return if std::fs::symlink_metadata(metadata.join("commondir")).is_ok() {
+            DirectorySourceControl::LinkedWorktreeRoot { revision }
+        } else {
+            DirectorySourceControl::RepositoryRoot { revision }
+        };
+    }
+    // Git, asked in a Repository with no Worktree, takes it for bare unless
+    // its configuration denies it.
+    let bare = Format::of(directory, directory).is_some_and(|format| {
+        format.bare != Some(false) && recognized_head(directory, &format).is_some()
+    });
+    if bare {
+        DirectorySourceControl::BareRepository
+    } else {
+        DirectorySourceControl::Plain
+    }
+}
+
+/// The revision a Worktree's HEAD names, read from that file alone: the
+/// branch it is on, without the commit, or the commit it is detached at.
+/// `None` where HEAD names neither, as a reftable Repository's decoy HEAD
+/// does.
+fn listed_head(metadata: &Path) -> Option<CheckoutRevision> {
+    let head = regular_file(&metadata.join("HEAD"))??;
+    let head = trim_end(&head);
+    let Some(target) = head.strip_prefix(b"ref:") else {
+        let hex = head
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte));
+        let null = head.iter().all(|byte| *byte == b'0');
+        return (hex && !null && matches!(head.len(), 40 | 64)).then(|| {
+            CheckoutRevision::Detached {
+                commit: String::from_utf8_lossy(head).into_owned(),
+            }
+        });
+    };
+    let name = std::str::from_utf8(trim_start(target)).ok()?;
+    let branch = name.strip_prefix("refs/heads/")?;
+    valid_ref_name(name).then(|| CheckoutRevision::Branch {
+        name: branch.to_owned(),
+        commit: None,
+    })
 }
 
 /// Where a Worktree root keeps its own metadata: its `.git` directory, or

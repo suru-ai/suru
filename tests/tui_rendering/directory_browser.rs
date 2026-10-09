@@ -1143,7 +1143,7 @@ fn the_current_workspace_is_marked_current_as_the_workspace_picker_marks_it() {
 
     assert_eq!(
         tree_drawn(&here, Icons::Hidden, sessions.clone(), &children),
-        ["› ▾ here · [current]", "    ▸ other · main", "    ▸ plain",],
+        ["› ▾ here · [current]", "    ▸ other · main", "    ▸ plain"],
         "only the current Workspace is marked current, not every Workspace"
     );
     assert_eq!(
@@ -1193,22 +1193,135 @@ fn a_workspace_icon_stands_before_a_repository_glyph_and_that_before_the_folder(
     );
 }
 
+/// The root is listed as each child is, so a browser opened on a
+/// Repository's main root, a linked Worktree's root, or a bare Repository
+/// says so of its first row, in the words and glyphs a child's row would.
+#[test]
+fn the_root_row_shows_what_the_server_read_of_it() {
+    let main = directory(&["nowhere", "main"]);
+    let linked = directory(&["nowhere", "linked"]);
+    let bare = directory(&["nowhere", "bare.git"]);
+    // The Landing stands at the main root of its Workspace, which is current.
+    let at_main = |read: DirectorySourceControl, icons| {
+        tree_drawn_from(
+            connected_application(&main),
+            &main,
+            &read,
+            icons,
+            Vec::new(),
+            &[],
+        )[0]
+        .clone()
+    };
+
+    assert_eq!(
+        at_main(repository_root(branch("main")), Icons::Hidden),
+        "› ▾ main · [current] · main"
+    );
+    assert_eq!(
+        at_main(repository_root(branch("main")), Icons::Shown),
+        format!("› ▾ {REPOSITORY} main · [current] · {BRANCH} main")
+    );
+    assert_eq!(
+        at_main(repository_root(None), Icons::Hidden),
+        "› ▾ main · [current] · [unavailable]"
+    );
+    assert_eq!(
+        at_main(repository_root(None), Icons::Shown),
+        format!("› ▾ {REPOSITORY} main · [current] · [unavailable]")
+    );
+
+    // The Landing stands in a linked Worktree of the Workspace at `main`.
+    let at_linked = |icons| {
+        tree_drawn_from(
+            landing_in_subdirectory(&main, &linked),
+            &linked,
+            &linked_worktree_root(branch("topic")),
+            icons,
+            Vec::new(),
+            &[],
+        )[0]
+        .clone()
+    };
+    assert_eq!(at_linked(Icons::Hidden), "› ▾ linked · topic (worktree)");
+    assert_eq!(
+        at_linked(Icons::Shown),
+        format!("› ▾ {REPOSITORY} linked · {WORKTREE} topic")
+    );
+
+    let at_bare = |icons| {
+        tree_drawn_from(
+            connected_application(&bare),
+            &bare,
+            &DirectorySourceControl::BareRepository,
+            icons,
+            Vec::new(),
+            &[],
+        )[0]
+        .clone()
+    };
+    assert_eq!(at_bare(Icons::Hidden), "› ▾ bare.git · [current] · [bare]");
+    assert_eq!(
+        at_bare(Icons::Shown),
+        format!("› ▾ {REPOSITORY} bare.git · [current] · [bare]")
+    );
+}
+
+/// Until the root's listing arrives nothing is known of what it is, so it
+/// is drawn as a plain directory and says only that it is being read.
+#[test]
+fn the_root_row_is_plain_until_its_listing_arrives() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let mut settings = EffectiveSettings::default();
+    settings.appearance.show_icons = true;
+    deliver_settings(&mut application, settings);
+    browse(&mut application);
+
+    assert_eq!(
+        tree(&application),
+        [
+            format!("› ▾ {FOLDER} here · [current]"),
+            "    Loading…".to_owned()
+        ]
+    );
+}
+
 #[derive(Clone, Copy)]
 enum Icons {
     Shown,
     Hidden,
 }
 
-/// The tree a browser opened at `here` draws once the Server lists
-/// `children`, each with what it is to source control, while the Sidebar's
-/// listing holds `sessions` and Icons are shown or hidden.
+/// The tree a browser opened at `here`, a plain directory, draws once the
+/// Server lists `children`, each with what it is to source control, while
+/// the Sidebar's listing holds `sessions` and Icons are shown or hidden.
 fn tree_drawn(
     here: &Path,
     icons: Icons,
     sessions: Vec<SessionListItem>,
     children: &[(&str, DirectorySourceControl)],
 ) -> Vec<String> {
-    let mut application = connected_application(here);
+    tree_drawn_from(
+        connected_application(here),
+        here,
+        &DirectorySourceControl::Plain,
+        icons,
+        sessions,
+        children,
+    )
+}
+
+/// The tree `application` draws once a browser opened at its Execution
+/// Directory, `root`, is listed by the Server as `read` with `children`.
+fn tree_drawn_from(
+    mut application: Application,
+    root: &Path,
+    read: &DirectorySourceControl,
+    icons: Icons,
+    sessions: Vec<SessionListItem>,
+    children: &[(&str, DirectorySourceControl)],
+) -> Vec<String> {
     let mut settings = EffectiveSettings::default();
     settings.appearance.show_icons = matches!(icons, Icons::Shown);
     let ApplicationTransition::ListSessions(request) = deliver_settings(&mut application, settings)
@@ -1219,7 +1332,7 @@ fn tree_drawn(
         .handle_event(ApplicationEvent::SessionsListed { request, sessions })
         .expect("list the Sidebar's Sessions");
     let (_, listing_id, _) = browse(&mut application);
-    answer_with(&mut application, listing_id, here, children);
+    answer_with(&mut application, listing_id, root, read, children);
     tree(&application)
 }
 
@@ -1586,15 +1699,22 @@ fn answer(
         .iter()
         .map(|name| (*name, DirectorySourceControl::Plain))
         .collect::<Vec<_>>();
-    answer_with(application, listing_id, root, &children);
+    answer_with(
+        application,
+        listing_id,
+        root,
+        &DirectorySourceControl::Plain,
+        &children,
+    );
 }
 
-/// The Server's listing of `root` with child directories by name, each with
-/// what the Server read it to be.
+/// The Server's listing of `root`, read as `read`, with child directories by
+/// name, each with what the Server read it to be.
 fn answer_with(
     application: &mut Application,
     listing_id: DirectoryListingId,
     root: &Path,
+    read: &DirectorySourceControl,
     children: &[(&str, DirectorySourceControl)],
 ) {
     application
@@ -1603,6 +1723,7 @@ fn answer_with(
             result: Ok(DirectoryListing {
                 root: root.to_owned(),
                 parent: root.parent().map(Path::to_owned),
+                source_control: read.clone(),
                 children: children
                     .iter()
                     .map(|(name, source_control)| ChildDirectory {

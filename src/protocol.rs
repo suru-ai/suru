@@ -636,6 +636,8 @@ pub struct DirectoryListing {
     /// Absent where the root is the filesystem's own, or a drive's on Windows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<PathBuf>,
+    /// What the root itself is to source control, read as each child's is.
+    pub source_control: DirectorySourceControl,
     /// Case set aside and a run of digits read as the number it spells, so
     /// `a2` comes before `a10`.
     pub children: Vec<ChildDirectory>,
@@ -654,9 +656,9 @@ pub struct ChildDirectory {
     pub source_control: DirectorySourceControl,
 }
 
-/// What a [`ChildDirectory`] is to source control, read by its Server from
+/// What a listed directory is to source control, read by its Server from
 /// Git's metadata on disk rather than by running Git, so a listing costs one
-/// directory read and one HEAD read per Repository among its children.
+/// directory read and one HEAD read per Repository it names.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DirectorySourceControl {
@@ -664,7 +666,8 @@ pub enum DirectorySourceControl {
     Plain,
     /// The root of a Repository's main Worktree, with the Checkout State its
     /// HEAD stands on: `None` where that could not be read from disk, which
-    /// a Client marks unavailable.
+    /// a Client marks unavailable. Only HEAD is read, so a branch is named
+    /// without its commit; a detached HEAD carries its own.
     RepositoryRoot { revision: Option<CheckoutRevision> },
     /// The root of a linked Worktree, with its Checkout State as for a
     /// [`Self::RepositoryRoot`].

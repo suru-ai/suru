@@ -335,38 +335,16 @@ async fn the_filesystem_root_answers_with_no_parent() {
 
 /// What each child is to source control is read from Git's own metadata on
 /// the Server's disk: a Repository's main root and a linked Worktree's root
-/// carry the Checkout State their HEAD stands on, whether a branch or a
-/// detached commit, or nothing where that HEAD cannot be read there; a bare
-/// Repository is told apart from both, and a directory outside source
-/// control is plain.
+/// carry the Checkout State their HEAD stands on — a branch, named alone
+/// since HEAD is all a listing reads, or a detached commit — or nothing
+/// where that HEAD cannot be read there; a bare Repository is told apart
+/// from both, and a directory outside source control is plain.
 #[tokio::test]
 async fn each_child_says_what_it_is_to_source_control() {
     let pair = paired_servers("directory-listing-source-control").await;
     let fixture = tempfile::tempdir().expect("create the directory to list");
     let root = canonical(fixture.path());
-    let main_commit = committed_repository(&root.join("main"));
-    git(
-        &root.join("main"),
-        &[
-            "worktree",
-            "add",
-            "-b",
-            "topic",
-            root.join("linked")
-                .to_str()
-                .expect("a Unicode fixture path"),
-        ],
-    );
-    let detached_commit = committed_repository(&root.join("detached"));
-    git(&root.join("detached"), &["checkout", "--detach"]);
-    committed_repository(&root.join("unreadable"));
-    std::fs::write(
-        root.join("unreadable").join(".git").join("HEAD"),
-        "neither a ref nor a commit\n",
-    )
-    .expect("spoil the Repository's HEAD");
-    git(&root, &["init", "--bare", "-b", "main", "bare.git"]);
-    std::fs::create_dir(root.join("plain")).expect("create a plain directory");
+    let layout = SourceControlLayout::at(&root);
 
     for (way, client) in both_ways(&pair) {
         let listing = listed(&client, &root, None).await;
@@ -381,49 +359,186 @@ async fn each_child_says_what_it_is_to_source_control() {
         };
 
         assert_eq!(
-            source_control("main"),
-            DirectorySourceControl::RepositoryRoot {
-                revision: Some(CheckoutRevision::Branch {
-                    name: "main".to_owned(),
-                    commit: Some(main_commit.clone()),
-                }),
-            },
-            "{way}: a Repository's main root, on its branch"
-        );
-        assert_eq!(
-            source_control("linked"),
-            DirectorySourceControl::LinkedWorktreeRoot {
-                revision: Some(CheckoutRevision::Branch {
-                    name: "topic".to_owned(),
-                    commit: Some(main_commit.clone()),
-                }),
-            },
-            "{way}: a linked Worktree's root, on its own branch"
-        );
-        assert_eq!(
-            source_control("detached"),
-            DirectorySourceControl::RepositoryRoot {
-                revision: Some(CheckoutRevision::Detached {
-                    commit: detached_commit.clone(),
-                }),
-            },
-            "{way}: a Repository's main root, at a detached commit"
-        );
-        assert_eq!(
-            source_control("unreadable"),
-            DirectorySourceControl::RepositoryRoot { revision: None },
-            "{way}: a Repository's main root whose HEAD cannot be read"
-        );
-        assert_eq!(
-            source_control("bare.git"),
-            DirectorySourceControl::BareRepository,
+            listing.source_control,
+            DirectorySourceControl::Plain,
             "{way}"
         );
+        for (name, expected) in layout.expected() {
+            assert_eq!(source_control(name), expected, "{way}: {name}");
+        }
+    }
+    pair.shutdown().await;
+}
+
+/// The root is read as each child is, so a Directory Browser opened on a
+/// Worktree's root or a bare Repository says so of its first row.
+#[tokio::test]
+async fn the_root_says_what_it_is_to_source_control() {
+    let pair = paired_servers("directory-listing-root-source-control").await;
+    let fixture = tempfile::tempdir().expect("create the directories to list");
+    let root = canonical(fixture.path());
+    let layout = SourceControlLayout::at(&root);
+
+    for (way, client) in both_ways(&pair) {
+        for (name, expected) in layout.expected() {
+            let listing = listed(&client, root.join(name), None).await;
+            assert_eq!(listing.source_control, expected, "{way}: {name}");
+        }
+    }
+    pair.shutdown().await;
+}
+
+/// Several Repositories side by side, one with several linked Worktrees
+/// beside it and its branches packed away so no loose ref names them, are
+/// each read for themselves: HEAD alone names the branch each stands on.
+#[tokio::test]
+async fn sibling_repositories_and_worktrees_are_each_read_for_themselves() {
+    let pair = paired_servers("directory-listing-siblings").await;
+    let fixture = tempfile::tempdir().expect("create the directory to list");
+    let root = canonical(fixture.path());
+    committed_repository(&root.join("alpha"));
+    for branch in ["one", "two", "three"] {
+        git(
+            &root.join("alpha"),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                root.join(format!("alpha-{branch}"))
+                    .to_str()
+                    .expect("a Unicode fixture path"),
+            ],
+        );
+    }
+    git(&root.join("alpha"), &["pack-refs", "--all"]);
+    committed_repository(&root.join("beta"));
+    git(&root.join("beta"), &["checkout", "-b", "feature"]);
+    committed_repository(&root.join("gamma"));
+
+    for (way, client) in both_ways(&pair) {
+        let listing = listed(&client, &root, None).await;
+        let read = listing
+            .children
+            .iter()
+            .map(|child| (child.name.as_str(), child.source_control.clone()))
+            .collect::<Vec<_>>();
         assert_eq!(
-            source_control("plain"),
-            DirectorySourceControl::Plain,
+            read,
+            [
+                (
+                    "alpha",
+                    DirectorySourceControl::RepositoryRoot {
+                        revision: on("main")
+                    }
+                ),
+                (
+                    "alpha-one",
+                    DirectorySourceControl::LinkedWorktreeRoot {
+                        revision: on("one")
+                    }
+                ),
+                (
+                    "alpha-three",
+                    DirectorySourceControl::LinkedWorktreeRoot {
+                        revision: on("three")
+                    }
+                ),
+                (
+                    "alpha-two",
+                    DirectorySourceControl::LinkedWorktreeRoot {
+                        revision: on("two")
+                    }
+                ),
+                (
+                    "beta",
+                    DirectorySourceControl::RepositoryRoot {
+                        revision: on("feature")
+                    }
+                ),
+                (
+                    "gamma",
+                    DirectorySourceControl::RepositoryRoot {
+                        revision: on("main")
+                    }
+                ),
+            ],
             "{way}"
         );
     }
     pair.shutdown().await;
+}
+
+/// A branch as a listing names it: from HEAD alone, without its commit.
+fn on(branch: &str) -> Option<CheckoutRevision> {
+    Some(CheckoutRevision::Branch {
+        name: branch.to_owned(),
+        commit: None,
+    })
+}
+
+/// One directory of every kind a listing tells apart, made with Git beneath
+/// a root, and what each is expected to read as.
+struct SourceControlLayout {
+    detached_commit: String,
+}
+
+impl SourceControlLayout {
+    fn at(root: &Path) -> Self {
+        committed_repository(&root.join("main"));
+        git(
+            &root.join("main"),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "topic",
+                root.join("linked")
+                    .to_str()
+                    .expect("a Unicode fixture path"),
+            ],
+        );
+        let detached_commit = committed_repository(&root.join("detached"));
+        git(&root.join("detached"), &["checkout", "--detach"]);
+        committed_repository(&root.join("unreadable"));
+        std::fs::write(
+            root.join("unreadable").join(".git").join("HEAD"),
+            "neither a ref nor a commit\n",
+        )
+        .expect("spoil the Repository's HEAD");
+        git(root, &["init", "--bare", "-b", "main", "bare.git"]);
+        std::fs::create_dir(root.join("plain")).expect("create a plain directory");
+        Self { detached_commit }
+    }
+
+    fn expected(&self) -> [(&'static str, DirectorySourceControl); 6] {
+        [
+            (
+                "main",
+                DirectorySourceControl::RepositoryRoot {
+                    revision: on("main"),
+                },
+            ),
+            (
+                "linked",
+                DirectorySourceControl::LinkedWorktreeRoot {
+                    revision: on("topic"),
+                },
+            ),
+            (
+                "detached",
+                DirectorySourceControl::RepositoryRoot {
+                    revision: Some(CheckoutRevision::Detached {
+                        commit: self.detached_commit.clone(),
+                    }),
+                },
+            ),
+            (
+                "unreadable",
+                DirectorySourceControl::RepositoryRoot { revision: None },
+            ),
+            ("bare.git", DirectorySourceControl::BareRepository),
+            ("plain", DirectorySourceControl::Plain),
+        ]
+    }
 }

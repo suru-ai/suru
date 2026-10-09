@@ -8,8 +8,7 @@ use std::{
 };
 
 use crate::protocol::{
-    ChildDirectory, DirectoryListing, DirectorySourceControl, ListDirectoryRequest,
-    ResolveWorkspaceRequest,
+    DirectoryListing, DirectorySourceControl, ListDirectoryRequest, ResolveWorkspaceRequest,
 };
 
 use super::list_window::{ListWindow, WindowEntry};
@@ -103,7 +102,9 @@ impl RowKey {
 #[derive(Clone, Debug)]
 enum DirectoryEntries {
     Loading,
-    Listed(Vec<ChildDirectory>),
+    /// The directory as the Server read it: its children, and what it is
+    /// itself to source control, which the root's row draws.
+    Listed(DirectoryListing),
     Refused(String),
 }
 
@@ -125,8 +126,9 @@ pub(super) enum DirectoryBrowserRowKind {
         key: RowKey,
         opened: bool,
         focused: bool,
-        /// What the Server read the directory to be as it listed it beneath
-        /// its parent; `None` for the root, which no listing here names.
+        /// What the Server read the directory to be: as it listed it beneath
+        /// its parent, or for the root as it listed the root itself, which
+        /// is `None` until that listing arrives.
         source_control: Option<DirectorySourceControl>,
     },
     /// Beneath an open directory still being read.
@@ -264,7 +266,7 @@ impl DirectoryBrowser {
             return;
         };
         let entries = match result {
-            Ok(listing) => DirectoryEntries::Listed(listing.children),
+            Ok(listing) => DirectoryEntries::Listed(listing),
             Err(reason) => DirectoryEntries::Refused(reason),
         };
         self.tree.insert(directory, entries);
@@ -332,7 +334,11 @@ impl DirectoryBrowser {
     /// the reader keeps opening it.
     fn rows(&self) -> Vec<DirectoryBrowserRow> {
         let root = RowKey::root(self.root.clone());
-        let mut rows = vec![self.directory_row(0, None, root.clone())];
+        let read = match self.tree.get(root.directory()) {
+            Some(DirectoryEntries::Listed(listing)) => Some(&listing.source_control),
+            _ => None,
+        };
+        let mut rows = vec![self.directory_row(0, None, read, root.clone())];
         self.push_children(&root, 1, &mut rows);
         rows
     }
@@ -352,31 +358,35 @@ impl DirectoryBrowser {
                 depth,
                 kind: DirectoryBrowserRowKind::Refused(reason.clone()),
             }),
-            Some(DirectoryEntries::Listed(children)) => {
-                for child in children {
+            Some(DirectoryEntries::Listed(listing)) => {
+                for child in &listing.children {
                     let child_row = row.child(&child.path);
-                    rows.push(self.directory_row(depth, Some(child), child_row.clone()));
+                    rows.push(self.directory_row(
+                        depth,
+                        Some(&child.name),
+                        Some(&child.source_control),
+                        child_row.clone(),
+                    ));
                     self.push_children(&child_row, depth + 1, rows);
                 }
             }
         }
     }
 
-    /// The row `key` makes, for the root where `listed` is `None` and
-    /// otherwise for the child the Server listed.
     fn directory_row(
         &self,
         depth: usize,
-        listed: Option<&ChildDirectory>,
+        name: Option<&str>,
+        source_control: Option<&DirectorySourceControl>,
         key: RowKey,
     ) -> DirectoryBrowserRow {
         DirectoryBrowserRow {
             depth,
             kind: DirectoryBrowserRowKind::Directory {
-                name: listed.map(|child| child.name.clone()),
+                name: name.map(str::to_owned),
                 opened: self.opened.contains(&key),
                 focused: self.focused == key,
-                source_control: listed.map(|child| child.source_control.clone()),
+                source_control: source_control.cloned(),
                 key,
             },
         }
