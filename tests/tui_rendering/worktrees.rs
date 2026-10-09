@@ -739,92 +739,237 @@ fn a_workspace_still_resolving_is_named_without_the_worktree_left_behind() {
     ));
 }
 
-/// Presses the reading beneath the Landing's composer spelled `reading`, the
-/// way a pointer does: on its first cell, found on the line beneath the
-/// composer as the frame draws it, so the press lands where the reader would
-/// point rather than on a column the test assumes.
-fn press_reading(app: &mut Application, reading: &str) -> ApplicationTransition {
-    let rows = buffer_rows(&rendered_application_buffer(app, 160, 30));
+/// A way of framing the Landing that moves where the readings beneath its
+/// composer are drawn: the size of the frame, and what is arranged around the
+/// Landing before it is drawn.
+#[derive(Clone, Copy)]
+struct Framing {
+    what: &'static str,
+    size: (u16, u16),
+    arrange: fn(&mut Application),
+}
+
+/// The framings every reading beneath the Landing's composer is pressed in:
+/// a roomy frame; beside the Sidebar, which moves every column over; beneath
+/// a draft of several lines, which moves the line down; and a terminal narrow
+/// enough to narrow the padding and, where the line runs long, cut it.
+const FRAMINGS: [Framing; 4] = [
+    Framing {
+        what: "a roomy frame",
+        size: (160, 30),
+        arrange: |_| {},
+    },
+    Framing {
+        what: "beside the Sidebar",
+        size: (160, 30),
+        arrange: show_sidebar,
+    },
+    Framing {
+        what: "beneath a draft of several lines",
+        size: (160, 30),
+        arrange: write_long_draft,
+    },
+    Framing {
+        what: "a narrow terminal",
+        size: NARROW,
+        arrange: |_| {},
+    },
+];
+
+/// A terminal narrow enough that the line beneath a pending Worktree intent
+/// no longer fits beneath the composer.
+const NARROW: (u16, u16) = (40, 30);
+
+fn show_sidebar(app: &mut Application) {
+    deliver_settings(
+        app,
+        EffectiveSettings {
+            sidebar: SidebarSettings {
+                initial_visibility: SidebarVisibility::Shown,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+}
+
+fn write_long_draft(app: &mut Application) {
+    app.handle_terminal_event(InputEvent::Paste("A draft\nof several\nlines".to_owned()))
+        .unwrap();
+}
+
+/// A Landing laid out as `framing` arranges it, with `prepare` done to it
+/// first.
+fn framed(layout: &Layout, framing: Framing, prepare: impl Fn(&mut Application)) -> Application {
+    let mut app = layout.app();
+    prepare(&mut app);
+    (framing.arrange)(&mut app);
+    app
+}
+
+/// The rows of `app` drawn in a frame of `size`, and the row beneath its
+/// composer, where the readings stand.
+fn reading_line(app: &Application, size: (u16, u16)) -> (Vec<String>, usize) {
+    let rows = buffer_rows(&rendered_application_buffer(app, size.0, size.1));
     let composer_bottom = rows
         .iter()
-        .position(|row| row.contains('└'))
-        .unwrap_or_else(|| panic!("the Landing draws its composer: {rows:#?}"));
-    let line = &rows[composer_bottom + 1];
-    let offset = line.find(reading).unwrap_or_else(|| {
-        panic!("the Landing does not say {reading:?} beneath its composer: {line}")
-    });
+        .rposition(|row| row.contains("└─"))
+        .unwrap_or_else(|| panic!("the view draws its composer: {rows:#?}"));
+    (rows, composer_bottom + 1)
+}
+
+/// The cell `reading` begins at on the line beneath the composer, drawn in a
+/// frame of `size`, found on the frame so a press lands where the reader
+/// would point rather than on a column the test assumes.
+fn reading_cell(app: &Application, size: (u16, u16), reading: &str) -> (u16, u16) {
+    let (rows, line) = reading_line(app, size);
+    let offset = rows[line]
+        .find(reading)
+        .unwrap_or_else(|| panic!("{reading:?} is not beneath the composer: {}", rows[line]));
+    (
+        rows[line][..offset].chars().count().try_into().unwrap(),
+        line.try_into().unwrap(),
+    )
+}
+
+/// Presses the pointer at `cell` of the frame `app` draws at `size`, the way
+/// a reader does: on a frame already on screen.
+fn press_at(
+    app: &mut Application,
+    size: (u16, u16),
+    (column, row): (u16, u16),
+) -> ApplicationTransition {
+    rendered_application_buffer(app, size.0, size.1);
     click_mouse(
         app,
         MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: line[..offset].chars().count().try_into().unwrap(),
-            row: (composer_bottom + 1).try_into().unwrap(),
+            column,
+            row,
             modifiers: KeyModifiers::NONE,
         },
     )
     .unwrap()
 }
 
+fn press_reading(app: &mut Application, size: (u16, u16), reading: &str) -> ApplicationTransition {
+    let cell = reading_cell(app, size, reading);
+    press_at(app, size, cell)
+}
+
+/// Presses `reading` and answers whether the press moved nothing: no
+/// transition, and the frame drawn as it was.
+fn press_moves_nothing(app: &mut Application, size: (u16, u16), reading: &str) -> bool {
+    let before = rendered_application_rows_at(app, size.0, size.1);
+    press_reading(app, size, reading) == ApplicationTransition::Continue
+        && rendered_application_rows_at(app, size.0, size.1) == before
+}
+
 /// The Workspace named beneath the Landing's composer is a way in under the
 /// pointer: pressing it opens the Workspace Picker, asking exactly what
-/// `/workspace` asks.
+/// `/workspace` asks, wherever the frame puts it.
 #[test]
 fn pressing_the_workspace_beneath_the_landing_composer_opens_the_workspace_picker() {
     let layout = Layout::new();
-    let asked = command(&mut layout.app(), SemanticCommandId::WorkspaceList);
-    let mut app = layout.app();
-
     let location = Path::new("~").join("main").display().to_string();
-    let pressed = press_reading(&mut app, &location);
+    let mut cells = Vec::new();
+    for framing in FRAMINGS {
+        let asked = command(
+            &mut framed(&layout, framing, |_| {}),
+            SemanticCommandId::WorkspaceList,
+        );
+        let mut app = framed(&layout, framing, |_| {});
+        cells.push(reading_cell(&app, framing.size, &location));
 
-    assert!(
-        matches!(pressed, ApplicationTransition::ListSessions(_)),
-        "{pressed:?}"
-    );
-    assert_eq!(pressed, asked, "the press asks what `/workspace` asks");
-    let drawn = text(&app);
-    assert!(drawn.contains(" Workspaces "), "{drawn}");
+        let pressed = press_reading(&mut app, framing.size, &location);
+
+        assert!(
+            matches!(pressed, ApplicationTransition::ListSessions(_)),
+            "{}: {pressed:?}",
+            framing.what
+        );
+        assert_eq!(
+            pressed, asked,
+            "{}: the press asks what `/workspace` asks",
+            framing.what
+        );
+        let drawn = rendered_application_rows_at(&app, framing.size.0, framing.size.1).join("\n");
+        assert!(drawn.contains(" Workspaces "), "{}: {drawn}", framing.what);
+    }
+    // Each framing draws the line somewhere else, which is what makes it a
+    // case of its own.
+    for (index, cell) in cells.iter().enumerate() {
+        assert!(
+            !cells[..index].contains(cell),
+            "{} draws the Workspace where another framing does: {cells:?}",
+            FRAMINGS[index].what
+        );
+    }
 }
 
 /// The Checkout State beneath the Landing's composer opens the Worktree
-/// Selector as `/worktree` does.
+/// Selector as `/worktree` does, wherever the frame puts it.
 #[test]
 fn pressing_the_checkout_state_beneath_the_landing_composer_opens_the_worktree_selector() {
     let layout = Layout::new();
-    let asked = command(&mut layout.app(), SemanticCommandId::WorktreeList);
-    let mut app = layout.app();
+    for framing in FRAMINGS {
+        let asked = command(
+            &mut framed(&layout, framing, |_| {}),
+            SemanticCommandId::WorktreeList,
+        );
+        let mut app = framed(&layout, framing, |_| {});
 
-    let pressed = press_reading(&mut app, "abcdef0");
+        let pressed = press_reading(&mut app, framing.size, "abcdef0");
 
-    assert!(
-        matches!(pressed, ApplicationTransition::ResolveWorkspace { .. }),
-        "{pressed:?}"
-    );
-    assert_eq!(pressed, asked, "the press asks what `/worktree` asks");
-    assert!(text(&app).contains("Loading Worktrees"), "{}", text(&app));
-    answer(&mut app, pressed, layout.context.clone());
-    assert!(text(&app).contains("Current:"), "{}", text(&app));
+        assert!(
+            matches!(pressed, ApplicationTransition::ResolveWorkspace { .. }),
+            "{}: {pressed:?}",
+            framing.what
+        );
+        assert_eq!(
+            pressed, asked,
+            "{}: the press asks what `/worktree` asks",
+            framing.what
+        );
+        answer(&mut app, pressed, layout.context.clone());
+        let drawn = rendered_application_rows_at(&app, framing.size.0, framing.size.1).join("\n");
+        assert!(drawn.contains("Current:"), "{}: {drawn}", framing.what);
+    }
 }
 
 /// A pending "New Worktree on submit" is revised where it is shown: pressing
-/// it opens the Worktree Selector as `/worktree` does.
+/// it opens the Worktree Selector as `/worktree` does, wherever the frame puts
+/// it — in a narrow terminal, on what the cut line leaves of it.
 #[test]
 fn pressing_the_pending_worktree_intent_beneath_the_landing_composer_opens_the_worktree_selector() {
     let layout = Layout::new();
-    let mut twin = layout.app();
-    choose_new(&mut twin, &layout);
-    let asked = command(&mut twin, SemanticCommandId::WorktreeList);
-    let mut app = layout.app();
-    choose_new(&mut app, &layout);
+    let pending = |app: &mut Application| choose_new(app, &layout);
+    for framing in FRAMINGS {
+        let asked = command(
+            &mut framed(&layout, framing, pending),
+            SemanticCommandId::WorktreeList,
+        );
+        let mut app = framed(&layout, framing, pending);
 
-    let pressed = press_reading(&mut app, "New Worktree on submit");
+        let pressed = press_reading(&mut app, framing.size, "New Worktree");
 
-    assert!(
-        matches!(pressed, ApplicationTransition::ResolveWorkspace { .. }),
-        "{pressed:?}"
-    );
-    assert_eq!(pressed, asked, "the press asks what `/worktree` asks");
-    assert!(text(&app).contains("Loading Worktrees"), "{}", text(&app));
+        assert!(
+            matches!(pressed, ApplicationTransition::ResolveWorkspace { .. }),
+            "{}: {pressed:?}",
+            framing.what
+        );
+        assert_eq!(
+            pressed, asked,
+            "{}: the press asks what `/worktree` asks",
+            framing.what
+        );
+        let drawn = rendered_application_rows_at(&app, framing.size.0, framing.size.1).join("\n");
+        assert!(
+            drawn.contains("Loading Worktrees"),
+            "{}: {drawn}",
+            framing.what
+        );
+    }
 }
 
 /// Icons drawn in front of the readings move where each one stands, and a
@@ -841,11 +986,90 @@ fn the_landing_readings_answer_the_pointer_where_icons_are_drawn() {
     show_icons(&mut app);
     choose_new(&mut app, &layout);
 
-    assert_eq!(press_reading(&mut app, "New Worktree on submit"), asked);
+    assert_eq!(
+        press_reading(&mut app, (160, 30), "New Worktree on submit"),
+        asked
+    );
+}
+
+/// A line too long for its frame gives up the Workspace's path to the marker
+/// saying it was cut, then is cut at its end. A reading the end cut runs
+/// through answers over what is left of it, the marker ending the line takes
+/// no press, and the Workspace, though only its marker is left, still opens
+/// the Workspace Picker.
+#[test]
+fn a_reading_the_line_cuts_short_answers_over_what_is_left_of_it() {
+    let layout = Layout::new();
+    let cut = || {
+        let mut app = layout.app();
+        choose_new(&mut app, &layout);
+        app
+    };
+    let (rows, line) = reading_line(&cut(), NARROW);
+    let drawn = rows[line].trim();
+    assert!(
+        drawn.starts_with('…') && drawn.ends_with('…') && !drawn.contains("on submit"),
+        "the narrow line is cut at both ends of its readings: {drawn}"
+    );
+    let (column, row) = reading_cell(&cut(), NARROW, drawn);
+    let last = column + u16::try_from(drawn.chars().count() - 1).unwrap();
+
+    let mut app = cut();
+    let before = rendered_application_rows_at(&app, NARROW.0, NARROW.1);
+    assert_eq!(
+        press_at(&mut app, NARROW, (last, row)),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        rendered_application_rows_at(&app, NARROW.0, NARROW.1),
+        before
+    );
+
+    let mut app = cut();
+    let cell = reading_cell(&app, NARROW, "New Worktree");
+    let worktree = command(&mut cut(), SemanticCommandId::WorktreeList);
+    assert_eq!(press_at(&mut app, NARROW, (last - 1, cell.1)), worktree);
+
+    let mut app = cut();
+    let workspace = command(&mut cut(), SemanticCommandId::WorkspaceList);
+    assert_eq!(press_at(&mut app, NARROW, (column, row)), workspace);
+}
+
+/// On a Remote the Remote's name stands before the Workspace. The Workspace
+/// after it still opens the Workspace Picker; the name is not a choice and
+/// takes no press.
+#[test]
+fn on_a_remote_the_workspace_after_the_remotes_name_opens_the_workspace_picker() {
+    let layout = Layout::new();
+    let on_studio = || {
+        let mut app = layout.app();
+        crate::connecting::turn_to_studio(&mut app);
+        app.handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook: Outlook::Remote("studio".to_owned()),
+            surface: suru::tui::WorkspaceResolutionSurface::Outlook,
+            request_id: 2,
+            result: Ok(layout.context.clone()),
+        })
+        .unwrap();
+        app
+    };
+    let size = (160, 30);
+    let named = "studio · ";
+    let (column, row) = reading_cell(&on_studio(), size, named);
+
+    let asked = command(&mut on_studio(), SemanticCommandId::WorkspaceList);
+    let mut app = on_studio();
+    let workspace = column + u16::try_from(named.chars().count()).unwrap();
+    assert_eq!(press_at(&mut app, size, (workspace, row)), asked);
+
+    assert!(
+        press_moves_nothing(&mut on_studio(), size, "studio"),
+        "the Remote's name takes no press"
+    );
 }
 
 /// The unavailable marker says the Execution Directory cannot be used; it is
-/// not a choice, so a press on it does nothing.
+/// not a choice, so a press on it does nothing, wherever the frame puts it.
 #[test]
 fn pressing_the_unavailable_marker_beneath_the_landing_composer_does_nothing() {
     let layout = Layout::new();
@@ -853,32 +1077,35 @@ fn pressing_the_unavailable_marker_beneath_the_landing_composer_does_nothing() {
     missing.execution_status = ExecutionDirectoryStatus::Unavailable {
         reason: "Directory was removed".to_owned(),
     };
-    let mut app = layout.app_in(missing);
-    let before = text(&app);
-    assert!(before.contains("· unavailable"), "{before}");
-
-    assert_eq!(
-        press_reading(&mut app, "unavailable"),
-        ApplicationTransition::Continue
-    );
-    assert_eq!(text(&app), before);
+    for framing in FRAMINGS {
+        let mut app = layout.app_in(missing.clone());
+        (framing.arrange)(&mut app);
+        assert!(
+            press_moves_nothing(&mut app, framing.size, "unavailable"),
+            "{}",
+            framing.what
+        );
+    }
 }
 
 /// The Spinner a Workspace still resolving carries says its reading is on its
-/// way, which is not a choice, so a press on it does nothing.
+/// way, which is not a choice, so a press on it does nothing, wherever the
+/// frame puts it.
 #[test]
 fn pressing_a_workspace_resolution_still_in_flight_does_nothing() {
     let layout = Layout::new();
-    let mut app = layout.app();
     let other = ResolvedWorkspace::directory(layout.root.join("other"));
-    let _resolving = pick_other_workspace(&mut app, &[layout.context.clone(), other]);
-    let before = text(&app);
-
-    assert_eq!(
-        press_reading(&mut app, "⠋"),
-        ApplicationTransition::Continue
-    );
-    assert_eq!(text(&app), before);
+    let resolving = |app: &mut Application| {
+        pick_other_workspace(app, &[layout.context.clone(), other.clone()]);
+    };
+    for framing in FRAMINGS {
+        let mut app = framed(&layout, framing, resolving);
+        assert!(
+            press_moves_nothing(&mut app, framing.size, "⠋"),
+            "{}",
+            framing.what
+        );
+    }
 }
 
 /// The subdirectory beneath the Landing's composer takes no press yet: it is
@@ -886,14 +1113,39 @@ fn pressing_a_workspace_resolution_still_in_flight_does_nothing() {
 #[test]
 fn pressing_the_subdirectory_beneath_the_landing_composer_does_nothing_for_now() {
     let layout = Layout::new();
-    let mut app = layout.app();
-    let before = text(&app);
+    for framing in FRAMINGS {
+        let mut app = framed(&layout, framing, |_| {});
+        assert!(
+            press_moves_nothing(&mut app, framing.size, "nested"),
+            "{}",
+            framing.what
+        );
+    }
+}
 
-    assert_eq!(
-        press_reading(&mut app, "nested"),
-        ApplicationTransition::Continue
+/// The Provisional Session draws the Landing's line word for word, but it is
+/// not the Landing: none of its readings takes a press.
+#[test]
+fn the_provisional_sessions_line_takes_no_press() {
+    let layout = Layout::new();
+    let location = Path::new("~").join("main").display().to_string();
+    let mut app = layout.app();
+    type_terminal_text(&mut app, "Begin here");
+    let ApplicationTransition::CreateSession(_) = key(&mut app, KeyCode::Enter) else {
+        panic!("the Prompt claims a Provisional Session")
+    };
+    let size = (160, 30);
+    assert!(
+        text(&app).contains("Begin here"),
+        "the Provisional Session stands in the Landing's place"
     );
-    assert_eq!(text(&app), before);
+
+    for reading in [location.as_str(), "abcdef0", "nested"] {
+        assert!(
+            press_moves_nothing(&mut app, size, reading),
+            "{reading:?} takes no press beneath the Provisional Session"
+        );
+    }
 }
 
 #[test]
