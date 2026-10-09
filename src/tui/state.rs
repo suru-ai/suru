@@ -742,6 +742,12 @@ pub struct TuiState {
     /// Sidekick that sent one and whose Session may still be opened, beside
     /// that Sidekick's Session, so a press on the name opens it.
     pub(super) queued_sidekick_names: RefCell<Vec<(PointableSpan, SessionId)>>,
+    /// Where the last frame drew each reading beneath the Landing's composer
+    /// that is a way in, beside the command a press there invokes: the
+    /// Workspace opens the Workspace Picker, and the Checkout State or a
+    /// pending Worktree intent the Worktree Selector. The parts of that line
+    /// that are not choices record nothing, so a press there reaches nothing.
+    pub(super) landing_readings: RefCell<Vec<(PointableSpan, SemanticInvocation)>>,
     /// The Sessions this client has heard were deleted. A Sidekick whose
     /// Session is among them is still named where it sent a Prompt, by the
     /// Title it sent under, but nothing offers the way into a Session that is
@@ -1039,6 +1045,7 @@ impl TuiState {
             relay_notice_area: RefCell::new(None),
             notice_presentable: Cell::new(false),
             queued_sidekick_names: RefCell::new(Vec::new()),
+            landing_readings: RefCell::new(Vec::new()),
             departed_sessions: HashSet::new(),
             opening_led: None,
             connect_overlay: ConnectOverlay::default(),
@@ -7340,6 +7347,18 @@ impl Application {
             && let Some(session) = self.state.session_reference.clone()
         {
             return self.invoke_semantic(SemanticCommandId::SessionIconChoose.on_session(session));
+        }
+        // A reading beneath the Landing's composer is a way into the surface
+        // that changes it, invoked as that surface's own command is.
+        let reading = self
+            .state
+            .landing_readings
+            .borrow()
+            .iter()
+            .find(|(span, _)| span.contains(position))
+            .map(|(_, invocation)| invocation.clone());
+        if let Some(invocation) = reading {
+            return self.invoke_semantic(invocation);
         }
         // The name of a Sidekick that sent a queued Prompt leads into its
         // Session, as the heading of a Prompt it sent does in the Transcript.

@@ -182,6 +182,9 @@ pub(super) fn render_with_slots(
     // So are the names of the Sidekicks that sent queued Prompts, and
     // whether a Notice could be drawn.
     state.queued_sidekick_names.borrow_mut().clear();
+    // The readings beneath the Landing's composer are pointable on the same
+    // terms, and only on a frame that drew the Landing.
+    state.landing_readings.borrow_mut().clear();
     state.notice_presentable.set(false);
     // Current-Session animation is likewise a fact about this frame, not the
     // Session in the abstract: its transient tail may have scrolled away.
@@ -4698,69 +4701,153 @@ fn pad_to_width(text: &str, width: usize) -> String {
 /// is what the reader acts on, and a path keeps its most telling end, as a
 /// Workspace Picker row's does.
 fn execution_context(state: &TuiState, show_icons: bool, width: usize) -> String {
+    fit_execution_readings(execution_readings(state, show_icons, width), width).0
+}
+
+/// One reading on the execution line, and what a press on it invokes where
+/// the Landing makes it a way in: `None` for the parts that are not choices.
+struct ExecutionReading {
+    text: String,
+    press: Option<SemanticInvocation>,
+}
+
+impl ExecutionReading {
+    fn inert(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            press: None,
+        }
+    }
+
+    fn pressable(text: impl Into<String>, press: impl Into<SemanticInvocation>) -> Self {
+        Self {
+            text: text.into(),
+            press: Some(press.into()),
+        }
+    }
+}
+
+/// The readings [`execution_context`] says, in order, with the Workspace's
+/// path already cut to leave the rest of the line `width`.
+///
+/// The Workspace is a way into the Workspace Picker, and the Checkout State
+/// and a pending Worktree intent into the Worktree Selector. The separators,
+/// a Remote's name, the unavailable marker, and the Spinner of a resolution
+/// still in flight are not choices. Nor yet is the subdirectory: it opens the
+/// Directory Browser rooted there, which this client does not have yet.
+fn execution_readings(state: &TuiState, show_icons: bool, width: usize) -> Vec<ExecutionReading> {
     // A Workspace whose Server has yet to answer for it is named with the
     // Spinner a reading on its way carries, where its Checkout State will
     // stand: the Worktree, Checkout State, and subdirectory the client holds
     // are the Workspace being left's, and the chosen one's are not known yet.
     if let Some(workspace) = state.resolving_workspace() {
-        let reading = format!(" · {}", spinner::frame(state.spinner_frame / 3));
-        let workspace = workspace_context(state, workspace, width.saturating_sub(reading.width()));
-        return truncate_to_width(&format!("{workspace}{reading}"), width);
+        let spinner = format!(" · {}", spinner::frame(state.spinner_frame / 3));
+        let mut readings =
+            workspace_readings(state, workspace, width.saturating_sub(spinner.width()));
+        readings.push(ExecutionReading::inert(spinner));
+        return readings;
     }
-    let trailing = match state.execution_directory.as_deref() {
+    let worktree_intent = || {
+        ExecutionReading::pressable(
+            icon_label(show_icons, NF_COD_WORKTREE, "New Worktree on submit"),
+            SemanticCommandId::WorktreeList,
+        )
+    };
+    let mut trailing = Vec::new();
+    match state.execution_directory.as_deref() {
         Some(_) => {
-            let status = if matches!(
+            if matches!(
                 state.execution_status,
                 crate::protocol::ExecutionDirectoryStatus::Unavailable { .. }
             ) {
-                " · unavailable"
-            } else {
-                ""
-            };
+                trailing.push(ExecutionReading::inert(" · unavailable"));
+            }
             // What the next Session would begin on, said exactly as a
             // Sidebar row says it, and live: the catalog's reading
             // stands in front of the one the resolution carried.
-            let checkout = state
+            if let Some(checkout) = state
                 .execution_checkout_state()
                 .and_then(|checkout| checkout_state_context(checkout, show_icons))
-                .map(|checkout| format!(" · {checkout}"))
-                .unwrap_or_default();
-            let subdirectory = state
-                .execution_subdirectory()
-                .map(|path| format!(" · {}", icon_label(show_icons, NF_FA_FOLDER_TREE, &path)))
-                .unwrap_or_default();
+            {
+                trailing.push(ExecutionReading::inert(" · "));
+                trailing.push(ExecutionReading::pressable(
+                    checkout,
+                    SemanticCommandId::WorktreeList,
+                ));
+            }
+            if let Some(path) = state.execution_subdirectory() {
+                trailing.push(ExecutionReading::inert(" · "));
+                trailing.push(ExecutionReading::inert(icon_label(
+                    show_icons,
+                    NF_FA_FOLDER_TREE,
+                    &path,
+                )));
+            }
             // A pending intent is only ever said where there is a
             // Repository to make it in, and only until it has been carried
             // out: a Worktree already made is said by the path above and the
             // Checkout State beside it.
-            let intent = if state.new_worktree.is_some()
+            if state.new_worktree.is_some()
                 && state.workspace.repository.is_some()
                 && !state.intent_already_prepared()
             {
-                format!(
-                    " · {}",
-                    icon_label(show_icons, NF_COD_WORKTREE, "New Worktree on submit")
-                )
-            } else {
-                String::new()
-            };
-            format!("{status}{checkout}{subdirectory}{intent}")
+                trailing.push(ExecutionReading::inert(" · "));
+                trailing.push(worktree_intent());
+            }
         }
         None => {
-            let intent = if state.new_worktree.is_some() {
-                icon_label(show_icons, NF_COD_WORKTREE, "New Worktree on submit")
+            trailing.push(ExecutionReading::inert(" · "));
+            trailing.push(if state.new_worktree.is_some() {
+                worktree_intent()
             } else {
-                "Choose a working copy to start a Session".to_owned()
-            };
-            format!(" · {intent}")
+                ExecutionReading::inert("Choose a working copy to start a Session")
+            });
         }
-    };
-    let workspace = workspace_context(
+    }
+    let trailing_width = trailing
+        .iter()
+        .map(|reading| reading.text.width())
+        .sum::<usize>();
+    let mut readings = workspace_readings(
         state,
         &state.workspace,
-        width.saturating_sub(trailing.width()),
+        width.saturating_sub(trailing_width),
     );
-    truncate_to_width(&format!("{workspace}{trailing}"), width)
+    readings.extend(trailing);
+    readings
+}
+
+/// The execution line `readings` make, fitted to `width`, beside the columns
+/// each reading a press may land on stands in, counted from the line's start.
+/// A reading the fitting cut short answers only over what is left of it, and
+/// one it cut away entirely answers nowhere.
+fn fit_execution_readings(
+    readings: Vec<ExecutionReading>,
+    width: usize,
+) -> (String, Vec<(std::ops::Range<usize>, SemanticInvocation)>) {
+    let whole = readings
+        .iter()
+        .map(|reading| reading.text.as_str())
+        .collect::<String>();
+    let line = truncate_to_width(&whole, width);
+    // What the fitting kept of the readings themselves, short of the one
+    // marker saying it cut them.
+    let kept = match line.strip_suffix('…') {
+        Some(kept) if line != whole => kept.width(),
+        _ => line.width(),
+    };
+    let mut start = 0;
+    let mut presses = Vec::new();
+    for reading in readings {
+        let end = start + reading.text.width();
+        if let Some(press) = reading.press
+            && start < kept
+        {
+            presses.push((start..end.min(kept), press));
+        }
+        start = end;
+    }
+    (line, presses)
 }
 
 fn render_landing(
@@ -4876,20 +4963,31 @@ fn render_landing(
         theme,
     ));
 
-    frame.render_widget(
-        Paragraph::new(execution_context(
-            state,
-            show_icons,
-            usize::from(panel.width),
-        ))
-        .style(theme.text.subdued),
-        Rect::new(
-            panel.x,
-            composer_area.bottom(),
-            panel.width,
-            workspace_height,
-        ),
+    let (execution_line, presses) = fit_execution_readings(
+        execution_readings(state, show_icons, usize::from(panel.width)),
+        usize::from(panel.width),
     );
+    let execution_row = composer_area.bottom();
+    frame.render_widget(
+        Paragraph::new(execution_line).style(theme.text.subdued),
+        Rect::new(panel.x, execution_row, panel.width, workspace_height),
+    );
+    // Each reading that is a way in answers a press over the cells it was
+    // drawn in.
+    state
+        .landing_readings
+        .borrow_mut()
+        .extend(presses.into_iter().map(|(columns, press)| {
+            let column = |offset: usize| {
+                panel
+                    .x
+                    .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX))
+            };
+            (
+                PointableSpan::new(execution_row, column(columns.start)..column(columns.end)),
+                press,
+            )
+        }));
     // The Spinner that line carries for a Workspace still resolving turns
     // only while the presentation tick runs.
     if state.resolving_workspace().is_some() {
@@ -6601,12 +6699,13 @@ fn connection_status_text(state: &TuiState, detail: ResponsiveDetail) -> String 
 
 /// The Workspace an execution context names: its Remote, when it has one, and
 /// its path, cut from the left to fit `width`. The path always keeps at least
-/// the marker saying it was cut.
-fn workspace_context(
+/// the marker saying it was cut. The Workspace is a way into the Workspace
+/// Picker; the Remote's name beside it is not a choice.
+fn workspace_readings(
     state: &TuiState,
     workspace: &crate::protocol::Workspace,
     width: usize,
-) -> String {
+) -> Vec<ExecutionReading> {
     let show_icons = state.settings().appearance.show_icons;
     let remote = state
         .outlook
@@ -6626,7 +6725,13 @@ fn workspace_context(
         &state.workspace_label(&state.outlook, &workspace.path),
         path_budget,
     );
-    format!("{remote}{}", icon_label(show_icons, workspace_icon, &path))
+    vec![
+        ExecutionReading::inert(remote),
+        ExecutionReading::pressable(
+            icon_label(show_icons, workspace_icon, &path),
+            SemanticCommandId::WorkspaceList,
+        ),
+    ]
 }
 
 fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {

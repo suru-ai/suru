@@ -1,9 +1,12 @@
 //! Landing execution navigation through semantic commands and Server responses.
 use crate::support::{
-    deliver_settings, fixture_instance_id, ready_health, rendered_application_rows_at,
-    selector_label, type_terminal_text, workspace_resolution,
+    buffer_rows, click_mouse, deliver_settings, fixture_instance_id, ready_health,
+    rendered_application_buffer, rendered_application_rows_at, selector_label, type_terminal_text,
+    workspace_resolution,
 };
-use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use std::path::{Path, PathBuf};
 use suru::{
     managed_client::ManagedEvent,
@@ -124,6 +127,10 @@ impl Layout {
         context
     }
     fn app(&self) -> Application {
+        self.app_in(self.context.clone())
+    }
+    /// A Landing the owning Server answered `context` for.
+    fn app_in(&self, context: ResolvedWorkspace) -> Application {
         let mut app = Application::new(&self.nested, Default::default());
         let transition = app
             .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
@@ -135,7 +142,7 @@ impl Layout {
                     })),
             )))
             .unwrap();
-        answer(&mut app, transition, self.context.clone());
+        answer(&mut app, transition, context);
         app
     }
 }
@@ -730,6 +737,163 @@ fn a_workspace_still_resolving_is_named_without_the_worktree_left_behind() {
         command(&mut app, SemanticCommandId::WorktreeList),
         ApplicationTransition::ResolveWorkspace { .. }
     ));
+}
+
+/// Presses the reading beneath the Landing's composer spelled `reading`, the
+/// way a pointer does: on its first cell, found on the line beneath the
+/// composer as the frame draws it, so the press lands where the reader would
+/// point rather than on a column the test assumes.
+fn press_reading(app: &mut Application, reading: &str) -> ApplicationTransition {
+    let rows = buffer_rows(&rendered_application_buffer(app, 160, 30));
+    let composer_bottom = rows
+        .iter()
+        .position(|row| row.contains('└'))
+        .unwrap_or_else(|| panic!("the Landing draws its composer: {rows:#?}"));
+    let line = &rows[composer_bottom + 1];
+    let offset = line.find(reading).unwrap_or_else(|| {
+        panic!("the Landing does not say {reading:?} beneath its composer: {line}")
+    });
+    click_mouse(
+        app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: line[..offset].chars().count().try_into().unwrap(),
+            row: (composer_bottom + 1).try_into().unwrap(),
+            modifiers: KeyModifiers::NONE,
+        },
+    )
+    .unwrap()
+}
+
+/// The Workspace named beneath the Landing's composer is a way in under the
+/// pointer: pressing it opens the Workspace Picker, asking exactly what
+/// `/workspace` asks.
+#[test]
+fn pressing_the_workspace_beneath_the_landing_composer_opens_the_workspace_picker() {
+    let layout = Layout::new();
+    let asked = command(&mut layout.app(), SemanticCommandId::WorkspaceList);
+    let mut app = layout.app();
+
+    let location = Path::new("~").join("main").display().to_string();
+    let pressed = press_reading(&mut app, &location);
+
+    assert!(
+        matches!(pressed, ApplicationTransition::ListSessions(_)),
+        "{pressed:?}"
+    );
+    assert_eq!(pressed, asked, "the press asks what `/workspace` asks");
+    let drawn = text(&app);
+    assert!(drawn.contains(" Workspaces "), "{drawn}");
+}
+
+/// The Checkout State beneath the Landing's composer opens the Worktree
+/// Selector as `/worktree` does.
+#[test]
+fn pressing_the_checkout_state_beneath_the_landing_composer_opens_the_worktree_selector() {
+    let layout = Layout::new();
+    let asked = command(&mut layout.app(), SemanticCommandId::WorktreeList);
+    let mut app = layout.app();
+
+    let pressed = press_reading(&mut app, "abcdef0");
+
+    assert!(
+        matches!(pressed, ApplicationTransition::ResolveWorkspace { .. }),
+        "{pressed:?}"
+    );
+    assert_eq!(pressed, asked, "the press asks what `/worktree` asks");
+    assert!(text(&app).contains("Loading Worktrees"), "{}", text(&app));
+    answer(&mut app, pressed, layout.context.clone());
+    assert!(text(&app).contains("Current:"), "{}", text(&app));
+}
+
+/// A pending "New Worktree on submit" is revised where it is shown: pressing
+/// it opens the Worktree Selector as `/worktree` does.
+#[test]
+fn pressing_the_pending_worktree_intent_beneath_the_landing_composer_opens_the_worktree_selector() {
+    let layout = Layout::new();
+    let mut twin = layout.app();
+    choose_new(&mut twin, &layout);
+    let asked = command(&mut twin, SemanticCommandId::WorktreeList);
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+
+    let pressed = press_reading(&mut app, "New Worktree on submit");
+
+    assert!(
+        matches!(pressed, ApplicationTransition::ResolveWorkspace { .. }),
+        "{pressed:?}"
+    );
+    assert_eq!(pressed, asked, "the press asks what `/worktree` asks");
+    assert!(text(&app).contains("Loading Worktrees"), "{}", text(&app));
+}
+
+/// Icons drawn in front of the readings move where each one stands, and a
+/// press still lands on the reading drawn under it: the pending intent stands
+/// last, behind every glyph the line draws.
+#[test]
+fn the_landing_readings_answer_the_pointer_where_icons_are_drawn() {
+    let layout = Layout::new();
+    let mut twin = layout.app();
+    show_icons(&mut twin);
+    choose_new(&mut twin, &layout);
+    let asked = command(&mut twin, SemanticCommandId::WorktreeList);
+    let mut app = layout.app();
+    show_icons(&mut app);
+    choose_new(&mut app, &layout);
+
+    assert_eq!(press_reading(&mut app, "New Worktree on submit"), asked);
+}
+
+/// The unavailable marker says the Execution Directory cannot be used; it is
+/// not a choice, so a press on it does nothing.
+#[test]
+fn pressing_the_unavailable_marker_beneath_the_landing_composer_does_nothing() {
+    let layout = Layout::new();
+    let mut missing = layout.context.clone();
+    missing.execution_status = ExecutionDirectoryStatus::Unavailable {
+        reason: "Directory was removed".to_owned(),
+    };
+    let mut app = layout.app_in(missing);
+    let before = text(&app);
+    assert!(before.contains("· unavailable"), "{before}");
+
+    assert_eq!(
+        press_reading(&mut app, "unavailable"),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(text(&app), before);
+}
+
+/// The Spinner a Workspace still resolving carries says its reading is on its
+/// way, which is not a choice, so a press on it does nothing.
+#[test]
+fn pressing_a_workspace_resolution_still_in_flight_does_nothing() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    let other = ResolvedWorkspace::directory(layout.root.join("other"));
+    let _resolving = pick_other_workspace(&mut app, &[layout.context.clone(), other]);
+    let before = text(&app);
+
+    assert_eq!(
+        press_reading(&mut app, "⠋"),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(text(&app), before);
+}
+
+/// The subdirectory beneath the Landing's composer takes no press yet: it is
+/// to open the Directory Browser rooted there, which is not yet built.
+#[test]
+fn pressing_the_subdirectory_beneath_the_landing_composer_does_nothing_for_now() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    let before = text(&app);
+
+    assert_eq!(
+        press_reading(&mut app, "nested"),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(text(&app), before);
 }
 
 #[test]
