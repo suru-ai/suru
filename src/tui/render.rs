@@ -4930,11 +4930,11 @@ impl ExecutionReading {
 /// The readings [`execution_context`] says, in order, with the Workspace's
 /// path already cut to leave the rest of the line `width`.
 ///
-/// The Workspace is a way into the Workspace Picker, and the Checkout State
-/// and a pending Worktree intent into the Worktree Selector. The separators,
-/// a Remote's name, the unavailable marker, and the Spinner of a resolution
-/// still in flight are not choices. Nor yet is the subdirectory: it opens the
-/// Directory Browser rooted there, which this client does not have yet.
+/// The Workspace is a way into the Workspace Picker, the Checkout State and a
+/// pending Worktree intent into the Worktree Selector, and the subdirectory
+/// into the Directory Browser, which roots itself at the Execution Directory
+/// that subdirectory names. The separators, a Remote's name, the unavailable
+/// marker, and the Spinner of a resolution still in flight are not choices.
 fn execution_readings(state: &TuiState, show_icons: bool, width: usize) -> Vec<ExecutionReading> {
     // A Workspace whose Server has yet to answer for it is named with the
     // Spinner a reading on its way carries, where its Checkout State will
@@ -4977,11 +4977,10 @@ fn execution_readings(state: &TuiState, show_icons: bool, width: usize) -> Vec<E
             }
             if let Some(path) = state.execution_subdirectory() {
                 trailing.push(ExecutionReading::inert(" · "));
-                trailing.push(ExecutionReading::inert(icon_label(
-                    show_icons,
-                    NF_FA_FOLDER_TREE,
-                    &path,
-                )));
+                trailing.push(ExecutionReading::pressable(
+                    icon_label(show_icons, NF_FA_FOLDER_TREE, &path),
+                    SemanticCommandId::WorkspaceBrowse,
+                ));
             }
             // A pending intent is only ever said where there is a
             // Repository to make it in, and only until it has been carried

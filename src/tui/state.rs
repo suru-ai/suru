@@ -746,9 +746,10 @@ pub struct TuiState {
     pub(super) queued_sidekick_names: RefCell<Vec<(PointableSpan, SessionId)>>,
     /// Where the last frame drew each reading beneath the Landing's composer
     /// that is a way in, beside the command a press there invokes: the
-    /// Workspace opens the Workspace Picker, and the Checkout State or a
-    /// pending Worktree intent the Worktree Selector. The parts of that line
-    /// that are not choices record nothing, so a press there reaches nothing.
+    /// Workspace opens the Workspace Picker, the Checkout State or a pending
+    /// Worktree intent the Worktree Selector, and the subdirectory the
+    /// Directory Browser rooted there. The parts of that line that are not
+    /// choices record nothing, so a press there reaches nothing.
     pub(super) landing_readings: RefCell<Vec<(PointableSpan, SemanticInvocation)>>,
     /// The Sessions this client has heard were deleted. A Sidekick whose
     /// Session is among them is still named where it sent a Prompt, by the

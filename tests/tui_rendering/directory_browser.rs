@@ -95,6 +95,110 @@ fn the_leader_chord_opens_the_browser() {
     assert_eq!(tree(&application), ["› ▾ here · [current]", "    Loading…"]);
 }
 
+/// The Landing working in a subdirectory of a Worktree names it beneath the
+/// composer, and that name is a way in: pressing it opens the browser rooted
+/// at the subdirectory, its root row focused and its children asked of the
+/// Outlook's Server.
+#[test]
+fn pressing_the_landing_s_subdirectory_opens_the_browser_rooted_there() {
+    let main = directory(&["nowhere", "repo", "main"]);
+    let linked = directory(&["nowhere", "repo", "linked"]);
+    let source = linked.join("src");
+    let mut application = landing_in_worktree_subdirectory(&main, &linked, &source);
+
+    let (outlook, _, request) = expect_listing(press_on(&mut application, "src"));
+
+    assert_eq!(
+        outlook,
+        Outlook::Local,
+        "the Outlook's Server is asked for its directories"
+    );
+    assert_eq!(
+        request,
+        ListDirectoryRequest {
+            path: source.clone(),
+            base: Some(source.clone()),
+        },
+        "the root is the subdirectory the Landing named"
+    );
+    assert_eq!(path_field(&application), spelled(&source));
+    assert_eq!(tree(&application), ["› ▾ src", "    Loading…"]);
+}
+
+/// Opened from the Landing, the browser chooses as it does from anywhere:
+/// the directory chosen becomes where the next Session works.
+#[test]
+fn choosing_from_the_browser_the_landing_s_subdirectory_opened_lands_there() {
+    let main = directory(&["nowhere", "repo", "main"]);
+    let linked = directory(&["nowhere", "repo", "linked"]);
+    let source = linked.join("src");
+    let library = source.join("lib");
+    let mut application = landing_in_worktree_subdirectory(&main, &linked, &source);
+    let (_, listing_id, _) = expect_listing(press_on(&mut application, "src"));
+    answer(&mut application, listing_id, &source, &["lib"]);
+    key(&mut application, KeyCode::Down);
+
+    let choice = key(&mut application, KeyCode::Enter);
+
+    let (_, surface, request) = expect_choice(&choice);
+    assert_eq!(surface, WorkspaceResolutionSurface::WorkspacePicker);
+    assert_eq!(
+        request,
+        ResolveWorkspaceRequest {
+            checkout_id: None,
+            remembered_execution_directory: None,
+            workspace_id: None,
+            base: Some(source.clone()),
+            path: library.clone(),
+        }
+    );
+    resolve(
+        &mut application,
+        &choice,
+        Ok(inside_linked_worktree(&main, &linked, &library)),
+    );
+    let location = landing_location(&application);
+    assert!(
+        location.ends_with(&format!(
+            "feature/browse (worktree) · {}",
+            Path::new("src").join("lib").display()
+        )),
+        "the Landing works in the directory chosen: {location}"
+    );
+    assert_eq!(next_session_directory(&mut application), library);
+}
+
+/// Opened from the Landing rather than over the Workspace Picker, the
+/// browser has nothing beneath it to go back to: Esc closes it outright.
+#[test]
+fn escape_closes_the_browser_the_landing_s_subdirectory_opened_outright() {
+    let main = directory(&["nowhere", "repo", "main"]);
+    let linked = directory(&["nowhere", "repo", "linked"]);
+    let source = linked.join("src");
+    let mut application = landing_in_worktree_subdirectory(&main, &linked, &source);
+    let location = landing_location(&application);
+    let (_, listing_id, _) = expect_listing(press_on(&mut application, "src"));
+    answer(&mut application, listing_id, &source, &["lib"]);
+
+    assert_eq!(
+        key(&mut application, KeyCode::Esc),
+        ApplicationTransition::Continue,
+        "backing out of the browser asks the Server for nothing"
+    );
+
+    let screen = rendered_application_rows_at(&application, WIDTH, HEIGHT).join("\n");
+    assert!(!screen.contains("Path:"), "the browser is gone: {screen}");
+    assert!(
+        !screen.contains(" Workspaces "),
+        "and no Workspace Picker stands in its place: {screen}"
+    );
+    assert_eq!(
+        landing_location(&application),
+        location,
+        "the Landing is as it was"
+    );
+}
+
 #[test]
 fn the_root_s_children_are_listed_beneath_it_as_the_server_answers() {
     let here = directory(&["nowhere", "here"]);
@@ -3166,7 +3270,27 @@ fn wheel_at(
 }
 
 fn landing_in_subdirectory(workspace: &Path, subdirectory: &Path) -> Application {
-    let mut application = Application::new(workspace, TerminalFacts::default());
+    landing_resolved_to(
+        workspace,
+        ResolvedWorkspace {
+            execution_directory: Some(ExecutionDirectory {
+                path: subdirectory.to_owned(),
+            }),
+            ..ResolvedWorkspace::directory(workspace.to_owned())
+        },
+    )
+}
+
+/// A Landing working in `directory` within the linked Worktree at `linked` of
+/// the Repository whose main Worktree is at `main`, which names `directory`
+/// beneath its composer as a subdirectory of the Worktree.
+fn landing_in_worktree_subdirectory(main: &Path, linked: &Path, directory: &Path) -> Application {
+    landing_resolved_to(directory, inside_linked_worktree(main, linked, directory))
+}
+
+/// A Landing launched in `launched` that its Server resolved to `resolved`.
+fn landing_resolved_to(launched: &Path, resolved: ResolvedWorkspace) -> Application {
+    let mut application = Application::new(launched, TerminalFacts::default());
     let launch = application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
             ready_health(fixture_instance_id(), 42_424),
@@ -3179,14 +3303,9 @@ fn landing_in_subdirectory(workspace: &Path, subdirectory: &Path) -> Application
             outlook,
             surface,
             request_id,
-            result: Ok(ResolvedWorkspace {
-                execution_directory: Some(ExecutionDirectory {
-                    path: subdirectory.to_owned(),
-                }),
-                ..ResolvedWorkspace::directory(workspace.to_owned())
-            }),
+            result: Ok(resolved),
         })
-        .expect("resolve the Landing into a subdirectory of its Workspace");
+        .expect("resolve the Landing where the client launched");
     application
 }
 

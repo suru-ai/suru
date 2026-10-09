@@ -1108,19 +1108,132 @@ fn pressing_a_workspace_resolution_still_in_flight_does_nothing() {
     }
 }
 
-/// The subdirectory beneath the Landing's composer takes no press yet: it is
-/// to open the Directory Browser rooted there, which is not yet built.
+/// The subdirectory beneath the Landing's composer opens the Directory
+/// Browser rooted at that subdirectory, its root row focused, asking exactly
+/// what `/browse` asks, wherever the frame puts it.
 #[test]
-fn pressing_the_subdirectory_beneath_the_landing_composer_does_nothing_for_now() {
+fn pressing_the_subdirectory_beneath_the_landing_composer_opens_the_directory_browser_there() {
     let layout = Layout::new();
     for framing in FRAMINGS {
+        let asked = command(
+            &mut framed(&layout, framing, |_| {}),
+            SemanticCommandId::WorkspaceBrowse,
+        );
         let mut app = framed(&layout, framing, |_| {});
+
+        let pressed = press_reading(&mut app, framing.size, "nested");
+
+        let ApplicationTransition::ListDirectory {
+            outlook, request, ..
+        } = &pressed
+        else {
+            panic!(
+                "{}: the press asks for the subdirectory's children, not {pressed:?}",
+                framing.what
+            );
+        };
+        assert_eq!(
+            (outlook, &request.path),
+            (&Outlook::Local, &layout.nested),
+            "{}: the root is the subdirectory, on the Outlook's Server",
+            framing.what
+        );
+        assert_eq!(
+            pressed, asked,
+            "{}: the press asks what `/browse` asks",
+            framing.what
+        );
+        let drawn = rendered_application_rows_at(&app, framing.size.0, framing.size.1).join("\n");
         assert!(
-            press_moves_nothing(&mut app, framing.size, "nested"),
-            "{}",
+            drawn.contains("› ▾ nested"),
+            "{}: the root row stands first, focused: {drawn}",
             framing.what
         );
     }
+}
+
+/// At the root of a Worktree the Landing shows no subdirectory, so nothing
+/// past the Checkout State is a way in: a press where the subdirectory would
+/// stand reaches nothing, wherever the frame puts the line.
+#[test]
+fn at_the_root_of_a_worktree_no_subdirectory_takes_a_press() {
+    let layout = Layout::new();
+    let at_root = layout.at(&layout.linked);
+    for framing in FRAMINGS {
+        let mut app = layout.app_in(at_root.clone());
+        (framing.arrange)(&mut app);
+        let (rows, line) = reading_line(&app, framing.size);
+        assert!(
+            !rows[line].contains("nested"),
+            "{}: no subdirectory is shown: {}",
+            framing.what,
+            rows[line]
+        );
+        let (column, row) = reading_cell(&app, framing.size, "abcdef0");
+        let after = column + u16::try_from("abcdef0".chars().count()).unwrap();
+        let subdirectory = u16::try_from(" · nested".chars().count()).unwrap();
+
+        for column in after..after + subdirectory {
+            let before = rendered_application_rows_at(&app, framing.size.0, framing.size.1);
+            assert_eq!(
+                press_at(&mut app, framing.size, (column, row)),
+                ApplicationTransition::Continue,
+                "{}: column {column}",
+                framing.what
+            );
+            assert_eq!(
+                rendered_application_rows_at(&app, framing.size.0, framing.size.1),
+                before,
+                "{}: column {column}",
+                framing.what
+            );
+        }
+    }
+}
+
+/// The press is the `/browse` command, so an Outlook turned toward a Remote
+/// that has stopped answering refuses it exactly as it refuses `/browse`:
+/// nothing is asked of the Remote and the Landing says why.
+#[test]
+fn pressing_the_subdirectory_is_refused_while_the_remote_is_unreachable() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    crate::connecting::turn_to_studio(&mut app);
+    // The Remote spells its paths for the Landing, which is what lets the
+    // Landing say where within the Worktree it works.
+    app.handle_event(ApplicationEvent::OriginCatalog {
+        outlook: Outlook::Remote("studio".to_owned()),
+        event: ManagedEvent::SessionCatalogReconciled(SessionCatalogSnapshot {
+            workspace_paths: WorkspacePaths::from_home(Some(&layout.root)),
+            revision: SessionCatalogRevision::INITIAL,
+            session_ids: Vec::new(),
+            checkout_states: Vec::new(),
+        }),
+    })
+    .unwrap();
+    app.handle_event(ApplicationEvent::WorkspaceResolved {
+        outlook: Outlook::Remote("studio".to_owned()),
+        surface: suru::tui::WorkspaceResolutionSurface::Outlook,
+        request_id: 2,
+        result: Ok(layout.context.clone()),
+    })
+    .unwrap();
+    let size = (160, 30);
+    reading_cell(&app, size, "nested");
+    crate::support::studio_stops_answering(&mut app, 1, std::time::Duration::from_secs(5));
+
+    assert_eq!(
+        press_reading(&mut app, size, "nested"),
+        ApplicationTransition::Continue,
+        "nothing is asked of a Remote that is not answering"
+    );
+
+    let drawn = rendered_application_rows_at(&app, size.0, size.1).join("\n");
+    assert!(
+        drawn.contains("studio is unreachable"),
+        "the refusal is said where `/browse`'s is: {drawn}"
+    );
+    assert!(!drawn.contains("Path:"), "no browser opens: {drawn}");
 }
 
 /// The Provisional Session draws the Landing's line word for word, but it is
