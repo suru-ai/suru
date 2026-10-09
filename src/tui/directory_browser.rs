@@ -46,16 +46,20 @@ pub(super) struct DirectoryBrowser {
     field: String,
     /// The path field's leading part as the field last read.
     leading: String,
-    /// The directory each leading part this opening has read names, by the
-    /// Server's own path for it: a leading part not here is asked of the
-    /// Server before the tree stands on it.
-    roots: HashMap<String, PathBuf>,
-    /// The partial name the root's children are narrowed to: the field's tail
-    /// while its leading part names the root, and what it last was while the
-    /// Server has yet to say, or would not say, where a newer leading part is.
+    /// The directory each spelling of a path this opening has read names, by
+    /// the path the Server resolved it to: what the reader typed for a root
+    /// the Server read, and the Server's own spelling of every directory it
+    /// listed or named as a parent. A leading part that is neither here nor a
+    /// name listed beneath one that is is asked of the Server.
+    resolved: HashMap<String, PathBuf>,
+    /// The partial name the root's children are narrowed to: the name in the
+    /// field after the part of it naming the root — its tail where that part
+    /// is the whole leading part — and what it last was while the Server has
+    /// yet to say where a newer leading part is.
     filter: String,
     /// Why the Server would not read the field's leading part, which leaves
-    /// the tree on the last root it could read.
+    /// the tree on the longest part of it the Server reads, or on the last
+    /// root it read where it reads none.
     field_refusal: Option<String>,
     /// The directory the tree stands on, its first row.
     root: PathBuf,
@@ -120,8 +124,9 @@ impl RowKey {
 enum Asked {
     /// A directory by the Server's own path, which its answer is kept under.
     Directory(PathBuf),
-    /// The directory the path field's leading part names, as the reader typed
-    /// it, which only the Server's answer says the path of.
+    /// The directory the path field's leading part names, or a shorter part
+    /// of it, as the reader typed it, which only the Server's answer says the
+    /// path of.
     Root(String),
 }
 
@@ -185,11 +190,11 @@ impl DirectoryBrowser {
         self.provenance = provenance;
         self.base.clone_from(&execution_directory);
         self.field = self.beneath(&execution_directory.to_string_lossy());
-        self.leading = self.split_field().0.to_owned();
+        self.leading = self.field_leading().to_owned();
         // An empty leading part is the relative path naming the directory
         // every listing is read from.
-        for leading in [String::new(), self.leading.clone()] {
-            self.roots.insert(leading, execution_directory.clone());
+        for spelling in [String::new(), self.leading.clone()] {
+            self.resolved.insert(spelling, execution_directory.clone());
         }
         self.root.clone_from(&execution_directory);
         self.focused = RowKey::root(execution_directory);
@@ -202,7 +207,7 @@ impl DirectoryBrowser {
     /// from, which is where the reader goes back to.
     pub(super) fn close(&mut self) -> DirectoryBrowserProvenance {
         self.open = false;
-        self.roots.clear();
+        self.resolved.clear();
         self.filter.clear();
         self.field_refusal = None;
         self.tree.clear();
@@ -297,14 +302,18 @@ impl DirectoryBrowser {
         let former = std::mem::replace(&mut self.root, parent.clone());
         self.field = self.beneath(&parent.to_string_lossy());
         self.leading_changed();
-        self.roots.insert(self.leading.clone(), parent.clone());
+        self.resolved.insert(self.leading.clone(), parent.clone());
         self.filter.clear();
+        // Every row open stands beneath the former root, which stands open
+        // beneath its parent even where the reader had closed it.
+        let beneath_parent = |row: RowKey| RowKey([vec![parent.clone()], row.0].concat());
+        let former = beneath_parent(RowKey::root(former));
         self.opened = std::mem::take(&mut self.opened)
             .into_iter()
-            .filter(|row| row.0.first() == Some(&former))
-            .map(|row| RowKey([vec![parent.clone()], row.0].concat()))
+            .map(beneath_parent)
+            .chain([former.clone()])
             .collect();
-        self.focused = RowKey(vec![parent.clone(), former]);
+        self.focused = former;
         self.window.reveal();
         self.open_row(RowKey::root(parent))
     }
@@ -337,7 +346,7 @@ impl DirectoryBrowser {
     /// otherwise begins at the Server's own path for the root.
     pub(super) fn complete_field(&mut self) -> Option<DirectoryListingAsk> {
         let names = self.names_beneath_root(&self.focused)?;
-        let mut field = if self.roots.get(&self.leading) == Some(&self.root) {
+        let mut field = if self.known_directory(&self.leading).as_ref() == Some(&self.root) {
             self.leading.clone()
         } else {
             self.root.to_string_lossy().into_owned()
@@ -353,9 +362,6 @@ impl DirectoryBrowser {
             return None;
         }
         self.field = field;
-        let directory = self.focused.directory().to_owned();
-        let leading = self.split_field().0.to_owned();
-        self.roots.insert(leading, directory);
         self.follow_field()
     }
 
@@ -379,42 +385,43 @@ impl DirectoryBrowser {
     }
 
     /// Takes the Server's answer to `listing_id`, where it is one this
-    /// opening still awaits. An answer for the field's leading part stands
-    /// the tree on the root the Server read it as; a refusal of it leaves the
-    /// tree on the last root it could read, with every child shown, since the
-    /// tail typed after the refused part says nothing of that root.
+    /// opening still awaits, answering the listing it leads to asking for.
+    /// The tree goes by the root the Server resolved its directory to, which
+    /// a link's own path is not. An answer for the field's leading part, or
+    /// for a shorter part of it, stands the tree on that root; a refusal walks
+    /// the leading part back a directory.
     pub(super) fn load(
         &mut self,
         listing_id: DirectoryListingId,
         result: Result<DirectoryListing, String>,
-    ) {
-        let Some(asked) = self.awaiting.remove(&listing_id) else {
-            return;
-        };
+    ) -> Option<DirectoryListingAsk> {
+        let asked = self.awaiting.remove(&listing_id)?;
         match (asked, result) {
-            (Asked::Directory(directory), result) => {
-                let lands_on_root = directory == self.root;
-                let entries = match result {
-                    Ok(listing) => DirectoryEntries::Listed(listing),
-                    Err(reason) => DirectoryEntries::Refused(reason),
-                };
-                self.tree.insert(directory, entries);
-                if lands_on_root {
-                    self.settle_focus();
-                }
-            }
-            (Asked::Root(leading), Ok(listing)) => {
+            (Asked::Directory(directory), Ok(listing)) => {
                 let root = listing.root.clone();
-                self.tree
-                    .insert(root.clone(), DirectoryEntries::Listed(listing));
-                self.roots.insert(leading, root);
-                let listed = self.follow_field();
-                debug_assert!(listed.is_none(), "the root was listed just now");
-            }
-            (Asked::Root(_), Err(reason)) => {
-                self.field_refusal = Some(reason);
-                self.filter.clear();
+                self.adopt(Some(&directory), listing);
+                if directory != self.root {
+                    return None;
+                }
+                let listed = (root != self.root).then(|| self.reroot(root)).flatten();
                 self.settle_focus();
+                listed
+            }
+            (Asked::Directory(directory), Err(reason)) => {
+                self.tree
+                    .insert(directory, DirectoryEntries::Refused(reason));
+                None
+            }
+            (Asked::Root(spelling), Ok(listing)) => {
+                let root = listing.root.clone();
+                self.resolved.insert(spelling.clone(), root.clone());
+                self.adopt(None, listing);
+                let filter = self.name_after(&spelling);
+                self.stand_on(root, filter)
+            }
+            (Asked::Root(spelling), Err(reason)) => {
+                self.field_refusal.get_or_insert(reason);
+                self.walk_back(&spelling)
             }
         }
     }
@@ -484,22 +491,19 @@ impl DirectoryBrowser {
     }
 
     /// Takes the path field as it now reads. Where its leading part names a
-    /// directory this opening knows, the tree stands there at once, asking
+    /// directory this opening can tell, the tree stands there at once, asking
     /// for its children if they are not had, and the tail narrows them; a
-    /// leading part not read yet is asked of the Server, the tree standing
+    /// leading part it cannot tell is asked of the Server, the tree standing
     /// where it was until the answer. Only a change of leading part asks.
     fn follow_field(&mut self) -> Option<DirectoryListingAsk> {
-        let tail = self.split_field().1.to_owned();
-        let changed = self.split_field().0 != self.leading;
+        let changed = self.field_leading() != self.leading;
         if changed {
             self.leading_changed();
         }
-        match self.roots.get(&self.leading).cloned() {
+        match self.known_directory(&self.leading) {
             Some(root) => {
-                let listed = (root != self.root).then(|| self.reroot(root)).flatten();
-                self.filter = tail;
-                self.settle_focus();
-                listed
+                let filter = self.name_after(&self.leading);
+                self.stand_on(root, filter)
             }
             None if changed => Some(self.ask(Asked::Root(self.leading.clone()))),
             None => None,
@@ -508,22 +512,144 @@ impl DirectoryBrowser {
 
     /// Takes the path field's leading part as it now reads, letting go of
     /// what was said or asked of the one it had until now: its refusal, and
-    /// an answer for it still on its way.
+    /// an answer for it, or for a shorter part of it, still on its way.
     fn leading_changed(&mut self) {
-        self.leading = self.split_field().0.to_owned();
+        self.leading = self.field_leading().to_owned();
         self.field_refusal = None;
         self.awaiting
             .retain(|_, asked| !matches!(asked, Asked::Root(_)));
     }
 
-    /// Stands the tree afresh on `root`, open and focused, answering the
-    /// listing it asks for where its children are not had.
+    /// Walks the field's leading part back from `refused` to the part one
+    /// directory shorter, standing the tree on it where this opening can tell
+    /// what it names and asking the Server for it otherwise, one part at a
+    /// time, so the root is the longest part that names a directory. With
+    /// nothing shorter left the tree stays on the last root it read, every
+    /// child shown, since the field says nothing of that root.
+    fn walk_back(&mut self, refused: &str) -> Option<DirectoryListingAsk> {
+        let Some(shorter) = self.shorter(refused).map(str::to_owned) else {
+            self.filter.clear();
+            self.settle_focus();
+            return None;
+        };
+        match self.known_directory(&shorter) {
+            Some(directory) => {
+                let filter = self.name_after(&shorter);
+                self.stand_on(directory, filter)
+            }
+            None => Some(self.ask(Asked::Root(shorter))),
+        }
+    }
+
+    /// Stands the tree on `root` with its children narrowed to `filter`,
+    /// answering the listing `root` asks for where its children are not had.
+    fn stand_on(&mut self, root: PathBuf, filter: String) -> Option<DirectoryListingAsk> {
+        let listed = (root != self.root).then(|| self.reroot(root)).flatten();
+        self.filter = filter;
+        self.settle_focus();
+        listed
+    }
+
+    /// Stands the tree on `root`, open. Whatever was open beneath a row
+    /// standing for `root` stays open beneath the root, and focus stays where
+    /// it stood there, landing on the root otherwise. Answers the listing
+    /// `root` asks for where its children are not had.
     fn reroot(&mut self, root: PathBuf) -> Option<DirectoryListingAsk> {
-        self.root.clone_from(&root);
-        self.opened.clear();
-        self.focused = RowKey::root(root);
+        let beneath_root = |row: &RowKey| {
+            let at = row
+                .0
+                .iter()
+                .position(|directory| self.resolve(directory) == root)?;
+            Some(RowKey(
+                [vec![root.clone()], row.0[at + 1..].to_vec()].concat(),
+            ))
+        };
+        let opened = self.opened.iter().filter_map(beneath_root).collect();
+        let focused = beneath_root(&self.focused).unwrap_or_else(|| RowKey::root(root.clone()));
+        self.opened = opened;
+        self.focused = focused;
+        self.root = root;
         self.window.reveal();
-        self.open_row(self.focused.clone())
+        self.open_row(RowKey::root(self.root.clone()))
+    }
+
+    /// Keeps the Server's listing under every path it goes by: the directory
+    /// `asked` for by the Server's own path, where it was, and the root the
+    /// Server resolved it to. Each of those paths, and the parent the Server
+    /// named, is a spelling the field may come to, and whatever went by the
+    /// path asked goes by the root from now on.
+    fn adopt(&mut self, asked: Option<&Path>, listing: DirectoryListing) {
+        let root = listing.root.clone();
+        if let Some(asked) = asked.filter(|asked| *asked != root) {
+            for directory in self.resolved.values_mut() {
+                if directory.as_path() == asked {
+                    directory.clone_from(&root);
+                }
+            }
+            self.resolved.insert(spelling(asked), root.clone());
+            self.tree
+                .insert(asked.to_owned(), DirectoryEntries::Listed(listing.clone()));
+        }
+        self.resolved.insert(spelling(&root), root.clone());
+        if let Some(parent) = &listing.parent {
+            self.resolved
+                .entry(spelling(parent))
+                .or_insert_with(|| parent.clone());
+        }
+        self.tree.insert(root, DirectoryEntries::Listed(listing));
+    }
+
+    /// The directory `spelling` names, by the path the Server resolved it to,
+    /// where this opening can tell without asking: a spelling it has read, or
+    /// a name the Server listed beneath a directory it can tell.
+    fn known_directory(&self, spelling: &str) -> Option<PathBuf> {
+        if let Some(directory) = self.resolved.get(spelling) {
+            return Some(directory.clone());
+        }
+        let (above, name) = self.split(spelling);
+        if name.is_empty() || is_path_atom(name) {
+            return None;
+        }
+        let Some(DirectoryEntries::Listed(listing)) = self.tree.get(&self.known_directory(above)?)
+        else {
+            return None;
+        };
+        listing
+            .children
+            .iter()
+            .find(|child| child.name == name)
+            .map(|child| self.resolve(&child.path))
+    }
+
+    /// The path the Server resolved `directory` to, where it has said.
+    fn resolve(&self, directory: &Path) -> PathBuf {
+        self.resolved
+            .get(spelling(directory).as_str())
+            .cloned()
+            .unwrap_or_else(|| directory.to_owned())
+    }
+
+    /// The leading part one directory shorter than `spelling`, except where
+    /// the field names nothing above it: the filesystem's root or a drive's,
+    /// and `~`, which names the home no other way.
+    fn shorter<'a>(&self, spelling: &'a str) -> Option<&'a str> {
+        let (above, _) = self.split(spelling);
+        (spelling != "~" && above != spelling).then_some(above)
+    }
+
+    /// The name in the path field right after `leading`, one of its leading
+    /// parts: the partial name narrowing the children of the directory that
+    /// part names, which for the field's own leading part is its tail.
+    fn name_after(&self, leading: &str) -> String {
+        let style = self.style();
+        self.field
+            .get(leading.len()..)
+            .unwrap_or_default()
+            .trim_start_matches(|character| style.is_separator(character))
+            .split(|character| style.is_separator(character))
+            .next()
+            .unwrap_or_default()
+            .to_owned()
     }
 
     /// Puts focus where the field's tail leaves it. While the tail narrows the
@@ -545,31 +671,37 @@ impl DirectoryBrowser {
         self.window.reveal();
     }
 
-    /// The path field split at its last separator: the leading part naming
-    /// the root, and the partial name after it narrowing the root's children.
-    /// A separator standing for the filesystem's root or a drive's stays with
-    /// the leading part, which would name somewhere else without it; a field
-    /// without a separator is all tail, beneath the directory a relative path
-    /// is read from.
-    fn split_field(&self) -> (&str, &str) {
+    /// The path field's leading part, naming the root: all of it before its
+    /// last separator, except that `~`, `.` and `..` are never a partial name
+    /// after it, since each names a directory as it stands.
+    fn field_leading(&self) -> &str {
+        let (leading, tail) = self.split(&self.field);
+        if is_path_atom(tail) {
+            &self.field
+        } else {
+            leading
+        }
+    }
+
+    /// `text` split at its last separator: the leading part naming a
+    /// directory, and the name after it. A separator standing for the
+    /// filesystem's root or a drive's stays with the leading part, which would
+    /// name somewhere else without it; text without a separator is all name,
+    /// beneath the directory a relative path is read from.
+    fn split<'a>(&self, text: &'a str) -> (&'a str, &'a str) {
         let style = self.style();
-        let Some((index, separator)) = self
-            .field
+        let Some((index, separator)) = text
             .char_indices()
             .rfind(|(_, character)| style.is_separator(*character))
         else {
-            return ("", &self.field);
+            return ("", text);
         };
         let after = index + separator.len_utf8();
-        let head = &self.field[..index];
+        let head = &text[..index];
         let names_a_root = head.chars().all(|character| style.is_separator(character))
             || (style == PathStyle::Windows && head.ends_with(':'));
-        let leading = if names_a_root {
-            &self.field[..after]
-        } else {
-            head
-        };
-        (leading, &self.field[after..])
+        let leading = if names_a_root { &text[..after] } else { head };
+        (leading, &text[after..])
     }
 
     /// `path` in the Server's syntax with a separator after it, ready for a
@@ -710,4 +842,15 @@ impl DirectoryBrowser {
         self.focused = directories.swap_remove(next);
         self.window.reveal();
     }
+}
+
+/// Whether `name` names a directory by where it stands rather than by a name
+/// a listing holds: the home, the directory itself, or its parent.
+fn is_path_atom(name: &str) -> bool {
+    matches!(name, "~" | "." | "..")
+}
+
+/// `path` as the field spells it.
+fn spelling(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }

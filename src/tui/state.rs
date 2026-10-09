@@ -6297,11 +6297,15 @@ impl Application {
                 }
             }
             // An answer to a listing the browser no longer awaits — one an
-            // earlier opening asked for — moves nothing.
-            ApplicationEvent::DirectoryListed { listing_id, result } => {
-                self.state.directory_browser.load(listing_id, result);
-                Ok(ApplicationTransition::Continue)
-            }
+            // earlier opening asked for — moves nothing; a refusal of the
+            // path field's leading part asks for the next shorter part.
+            ApplicationEvent::DirectoryListed { listing_id, result } => Ok(self
+                .state
+                .directory_browser
+                .load(listing_id, result)
+                .map_or(ApplicationTransition::Continue, |ask| {
+                    self.list_directory(ask)
+                })),
             ApplicationEvent::PromptAdmissionSucceeded { session, prompt_id } => {
                 if self
                     .state

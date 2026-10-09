@@ -1483,10 +1483,9 @@ fn typing_narrows_the_root_s_children_to_those_the_tail_begins() {
     assert_eq!(tree(&application), ["  ▾ here · [current]", "›   ▸ bravo"]);
 }
 
-/// A separator ends the leading part on a directory this opening has not read,
-/// so the Server is asked for it as typed, read from the Execution Directory.
-/// Until it answers the tree stands where it was and the field says its root
-/// is being read; the answer stands the tree there.
+/// A separator ends the leading part on one of the root's children, which
+/// the tree stands on at once, asking for its children by the Server's own
+/// path for it, read from the Execution Directory.
 #[test]
 fn typing_a_separator_re_roots_the_tree_at_the_directory_the_leading_part_names() {
     let here = directory(&["nowhere", "here"]);
@@ -1505,28 +1504,17 @@ fn typing_a_separator_re_roots_the_tree_at_the_directory_the_leading_part_names(
         ListDirectoryRequest {
             path: beta.clone(),
             base: Some(here.clone()),
-        },
-        "the Server is asked for the leading part as typed, read from the Execution Directory"
-    );
-    assert_eq!(
-        beneath_path_field(&application),
-        ["Loading…"],
-        "the field says its root is still being read"
+        }
     );
     assert_eq!(
         tree(&application),
-        ["  ▾ here · [current]", "›   ▸ beta"],
-        "the tree stands where it was until the Server answers"
+        ["› ▾ beta", "    Loading…"],
+        "the tree stands on the directory the leading part names, focused, still being read"
     );
 
     answer(&mut application, *listing_id, &beta, &["inner"]);
 
-    assert_eq!(
-        tree(&application),
-        ["› ▾ beta", "    ▸ inner"],
-        "the tree stands on the directory the leading part names, focused"
-    );
-    assert!(beneath_path_field(&application).is_empty());
+    assert_eq!(tree(&application), ["› ▾ beta", "    ▸ inner"]);
     assert_eq!(path_field(&application), spelled(&beta));
 }
 
@@ -1692,8 +1680,9 @@ fn tab_completes_the_path_field_to_the_focused_row_and_a_separator() {
 }
 
 /// A relative path is the Server's to read, from the Landing's Execution
-/// Directory: the tree stands on the directory it answers with, while the
-/// field keeps what the reader typed.
+/// Directory: `..` names a directory on its own, before any separator, and
+/// the tree stands on the directory the Server answers with, while the field
+/// keeps what the reader typed.
 #[test]
 fn a_relative_path_is_read_from_the_execution_directory_and_the_server_s_root_is_shown() {
     let parent = directory(&["nowhere"]);
@@ -1703,10 +1692,10 @@ fn a_relative_path_is_read_from_the_execution_directory_and_the_server_s_root_is
     answer(&mut application, listing_id, &here, &["alpha"]);
     clear_path_field(&mut application);
 
-    let asked = type_path(&mut application, &format!("..{SEPARATOR}"));
+    let asked = type_path(&mut application, "..");
 
-    let [(listing_id, request)] = asked.as_slice() else {
-        panic!("the relative leading part is asked for once: {asked:?}");
+    let Some((listing_id, request)) = asked.last() else {
+        panic!("`..` is asked for as soon as it is typed");
     };
     assert_eq!(
         *request,
@@ -1715,11 +1704,20 @@ fn a_relative_path_is_read_from_the_execution_directory_and_the_server_s_root_is
             base: Some(here.clone()),
         }
     );
+    assert_eq!(
+        tree(&application),
+        ["› ▾ here · [current]", "    ▸ alpha"],
+        "`..` is not a partial name narrowing the children"
+    );
     answer(&mut application, *listing_id, &parent, &["here", "there"]);
     assert_eq!(
         tree(&application),
         ["› ▾ nowhere", "    ▸ here · [current]", "    ▸ there"],
         "the root is the directory the Server read the path as"
+    );
+    assert!(
+        type_path(&mut application, MAIN_SEPARATOR_STR).is_empty(),
+        "a separator after `..` leaves the leading part as it was"
     );
     assert_eq!(
         path_field(&application),
@@ -1728,6 +1726,39 @@ fn a_relative_path_is_read_from_the_execution_directory_and_the_server_s_root_is
     );
 }
 
+/// `.` names the Execution Directory itself, so it lists every child rather
+/// than narrowing them to the dot-named.
+#[test]
+fn a_dot_alone_is_read_as_the_execution_directory() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha", "beta"]);
+    clear_path_field(&mut application);
+
+    let asked = type_path(&mut application, ".");
+
+    let [(listing_id, request)] = asked.as_slice() else {
+        panic!("`.` is asked for as soon as it is typed: {asked:?}");
+    };
+    assert_eq!(
+        *request,
+        ListDirectoryRequest {
+            path: PathBuf::from("."),
+            base: Some(here.clone()),
+        }
+    );
+    answer(&mut application, *listing_id, &here, &["alpha", "beta"]);
+    assert_eq!(
+        tree(&application),
+        ["› ▾ here · [current]", "    ▸ alpha", "    ▸ beta"]
+    );
+    assert_eq!(path_field(&application), ".");
+}
+
+/// `~` names the Server's home on its own, before any separator; until the
+/// Server answers, the tree stands where it was and the field says its root
+/// is being read.
 #[test]
 fn a_tilde_is_read_from_the_server_s_home() {
     let here = directory(&["nowhere", "here"]);
@@ -1737,10 +1768,10 @@ fn a_tilde_is_read_from_the_server_s_home() {
     answer(&mut application, listing_id, &here, &["alpha"]);
     clear_path_field(&mut application);
 
-    let asked = type_path(&mut application, &format!("~{SEPARATOR}"));
+    let asked = type_path(&mut application, "~");
 
     let [(listing_id, request)] = asked.as_slice() else {
-        panic!("the home is asked for once: {asked:?}");
+        panic!("the home is asked for as soon as `~` is typed: {asked:?}");
     };
     assert_eq!(
         *request,
@@ -1750,39 +1781,78 @@ fn a_tilde_is_read_from_the_server_s_home() {
         },
         "the Server reads `~` itself"
     );
+    assert_eq!(beneath_path_field(&application), ["Loading…"]);
+    assert_eq!(tree(&application), ["› ▾ here · [current]", "    ▸ alpha"]);
+
     answer(&mut application, *listing_id, &home, &["projects"]);
+    assert!(beneath_path_field(&application).is_empty());
     assert_eq!(tree(&application), ["› ▾ home", "    ▸ projects"]);
+    assert!(type_path(&mut application, MAIN_SEPARATOR_STR).is_empty());
     assert_eq!(path_field(&application), format!("~{SEPARATOR}"));
 }
 
-/// A leading part naming no directory the Server can read leaves the tree
-/// on the last root it could, with every child shown, since the tail typed
-/// after it says nothing of that root; why stands beneath the field until
+/// A home the Server cannot read has nothing shorter to fall back to, so the
+/// tree stays on the last root it read, with every child shown.
+#[test]
+fn a_home_the_server_cannot_read_leaves_the_last_good_root_standing() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha"]);
+    clear_path_field(&mut application);
+    let asked = type_path(&mut application, "~");
+    let [(listing_id, _)] = asked.as_slice() else {
+        panic!("the home is asked for once: {asked:?}");
+    };
+
+    assert_eq!(
+        refuse(
+            &mut application,
+            *listing_id,
+            "The Server's home is unknown"
+        ),
+        ApplicationTransition::Continue,
+        "nothing shorter than `~` is asked for"
+    );
+
+    assert_eq!(
+        beneath_path_field(&application),
+        ["Error: The Server's home is unknown"]
+    );
+    assert_eq!(tree(&application), ["› ▾ here · [current]", "    ▸ alpha"]);
+}
+
+/// A leading part naming no directory the Server can read leaves the tree on
+/// the longest part of it that does, which here is the root it already stood
+/// on: the name after that part narrows its children as it did before the
+/// separator, and why the rest was refused stands beneath the field until
 /// the leading part changes.
 #[test]
-fn a_leading_part_the_server_refuses_leaves_the_tree_on_its_last_good_root() {
+fn a_leading_part_the_server_refuses_leaves_the_tree_on_the_longest_part_it_reads() {
     let here = directory(&["nowhere", "here"]);
     let mut application = connected_application(&here);
     let (_, listing_id, _) = browse(&mut application);
     answer(&mut application, listing_id, &here, &["alpha", "beta"]);
-    let asked = type_path(&mut application, &format!("missing{SEPARATOR}"));
-    let [(listing_id, _)] = asked.as_slice() else {
+    let asked = type_path(&mut application, &format!("al{SEPARATOR}"));
+    let [(listing_id, request)] = asked.as_slice() else {
         panic!("the leading part is asked for once: {asked:?}");
     };
+    assert_eq!(request.path, here.join("al"));
 
-    refuse(&mut application, *listing_id, "No directory there");
+    assert_eq!(
+        refuse(&mut application, *listing_id, "No directory there"),
+        ApplicationTransition::Continue,
+        "the root's own listing is had already, so nothing more is asked"
+    );
 
     assert_eq!(
         beneath_path_field(&application),
         ["Error: No directory there"]
     );
-    assert_eq!(
-        tree(&application),
-        ["› ▾ here · [current]", "    ▸ alpha", "    ▸ beta"]
-    );
+    assert_eq!(tree(&application), ["  ▾ here · [current]", "›   ▸ alpha"]);
     assert_eq!(
         path_field(&application),
-        format!("{}missing{SEPARATOR}", spelled(&here)),
+        format!("{}al{SEPARATOR}", spelled(&here)),
         "the field keeps what the reader typed"
     );
 
@@ -1793,24 +1863,211 @@ fn a_leading_part_the_server_refuses_leaves_the_tree_on_its_last_good_root() {
     );
 }
 
+/// A pasted path whose middle names nothing is walked back a directory at a
+/// time, one request at a time, until the Server reads one: that becomes the
+/// root, narrowed by the name after it, while the refusal of the whole
+/// leading part is what the field says.
 #[test]
-fn an_answer_for_a_leading_part_since_typed_over_moves_nothing() {
+fn a_pasted_path_missing_its_middle_stands_the_tree_on_its_longest_existing_part() {
     let here = directory(&["nowhere", "here"]);
+    let elsewhere = directory(&["elsewhere"]);
+    let gone = elsewhere.join("gone");
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha"]);
+    clear_path_field(&mut application);
+
+    let pasted = format!("{}{SEPARATOR}missing{SEPARATOR}deep", gone.display());
+    let (_, listing_id, request) = expect_listing(paste(&mut application, &pasted));
+    assert_eq!(request.path, gone.join("missing"));
+
+    let (_, listing_id, request) =
+        expect_listing(refuse(&mut application, listing_id, "No directory there"));
+    assert_eq!(
+        request.path, gone,
+        "the next shorter leading part is asked for"
+    );
+    let (_, listing_id, request) =
+        expect_listing(refuse(&mut application, listing_id, "Not a directory"));
+    assert_eq!(request.path, elsewhere);
+    assert_eq!(
+        tree(&application),
+        ["› ▾ here · [current]", "    ▸ alpha"],
+        "until one is read the tree stands where it was"
+    );
+
+    answer(
+        &mut application,
+        listing_id,
+        &elsewhere,
+        &["gone-by", "gondola", "here"],
+    );
+
+    assert_eq!(
+        tree(&application),
+        ["  ▾ elsewhere", "›   ▸ gone-by"],
+        "the longest part read is the root, narrowed by the name after it"
+    );
+    assert_eq!(
+        beneath_path_field(&application),
+        ["Error: No directory there"]
+    );
+    assert_eq!(path_field(&application), pasted);
+}
+
+/// A directory this opening has already listed is not asked for again when
+/// the field comes to it, whether by the name the Server listed it under or
+/// by the Server's own path for a root it read another way.
+#[test]
+fn a_directory_already_listed_is_not_asked_for_again_when_the_field_reaches_it() {
+    let parent = directory(&["nowhere"]);
+    let here = parent.join("here");
     let alpha = here.join("alpha");
     let mut application = connected_application(&here);
     let (_, listing_id, _) = browse(&mut application);
     answer(&mut application, listing_id, &here, &["alpha", "beta"]);
-    let asked = type_path(&mut application, &format!("alpha{SEPARATOR}"));
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
+    answer(&mut application, listing_id, &alpha, &["inner"]);
+
+    assert!(
+        type_path(&mut application, &format!("alpha{SEPARATOR}")).is_empty(),
+        "alpha was listed when its row was opened"
+    );
+    assert_eq!(tree(&application), ["› ▾ alpha", "    ▸ inner"]);
+
+    clear_path_field(&mut application);
+    let asked = type_path(
+        &mut application,
+        &format!("..{SEPARATOR}sibling{SEPARATOR}"),
+    );
+    let Some((listing_id, request)) = asked.last() else {
+        panic!("the relative leading part is asked for");
+    };
+    assert_eq!(request.path, Path::new("..").join("sibling"), "{asked:?}");
+    let sibling = parent.join("sibling");
+    answer(&mut application, *listing_id, &sibling, &["leaf"]);
+    clear_path_field(&mut application);
+
+    assert_eq!(
+        paste(&mut application, &spelled(&sibling)),
+        ApplicationTransition::Continue,
+        "the Server's own path for a root it read by another spelling asks nothing"
+    );
+    assert_eq!(tree(&application), ["› ▾ sibling", "    ▸ leaf"]);
+}
+
+/// Left leaves the former root open beneath its parent even where the reader
+/// had closed it.
+#[test]
+fn left_on_a_closed_root_leaves_it_open_beneath_its_parent() {
+    let parent = directory(&["nowhere"]);
+    let here = parent.join("here");
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha"]);
+    key(&mut application, KeyCode::Char(' '));
+    assert_eq!(tree(&application), ["› ▸ here · [current]"]);
+
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Left));
+    answer(&mut application, listing_id, &parent, &["here", "there"]);
+
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ nowhere",
+            "›   ▾ here · [current]",
+            "      ▸ alpha",
+            "    ▸ there"
+        ]
+    );
+}
+
+/// The Server reads a link where it leads, so a directory completed to by
+/// its link's name is the tree's root by the path the Server resolved it to,
+/// and Left walks up from there.
+#[test]
+fn tab_into_a_link_then_left_walks_up_from_where_the_link_leads() {
+    let parent = directory(&["nowhere"]);
+    let here = parent.join("here");
+    let link = here.join("link");
+    let target = parent.join("target");
+    let project = target.join("project");
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["link"]);
+    type_path(&mut application, "l");
+
+    let (_, listing_id, request) = expect_listing(key(&mut application, KeyCode::Tab));
+    assert_eq!(request.path, link);
+    answer_listing(
+        &mut application,
+        listing_id,
+        DirectoryListing {
+            root: project.clone(),
+            parent: Some(target.clone()),
+            source_control: DirectorySourceControl::Plain,
+            children: vec![ChildDirectory {
+                name: "inner".to_owned(),
+                path: project.join("inner"),
+                source_control: DirectorySourceControl::Plain,
+            }],
+        },
+    );
+    assert_eq!(
+        tree(&application),
+        ["› ▾ project", "    ▸ inner"],
+        "the root goes by where the link leads"
+    );
+    assert_eq!(
+        path_field(&application),
+        spelled(&link),
+        "the field keeps the link's name"
+    );
+    assert!(
+        type_path(&mut application, "i").is_empty(),
+        "the root reached by the link's name is the one the tail narrows"
+    );
+    key(&mut application, KeyCode::Backspace);
+    key(&mut application, KeyCode::Up);
+
+    let (_, listing_id, request) = expect_listing(key(&mut application, KeyCode::Left));
+    assert_eq!(request.path, target);
+    answer(&mut application, listing_id, &target, &["other", "project"]);
+
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ target",
+            "    ▸ other",
+            "›   ▾ project",
+            "      ▸ inner"
+        ],
+        "the former root stands open and focused beneath where the link leads"
+    );
+}
+
+/// A leading part the root does not list is asked of the Server; typing over
+/// it lets that request go, so its answer moves nothing, and asking again is
+/// a request of its own.
+#[test]
+fn an_answer_for_a_leading_part_since_typed_over_moves_nothing() {
+    let here = directory(&["nowhere", "here"]);
+    let gamma = here.join("gamma");
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha", "beta"]);
+    let asked = type_path(&mut application, &format!("gamma{SEPARATOR}"));
     let [(superseded, _)] = asked.as_slice() else {
         panic!("the leading part is asked for once: {asked:?}");
     };
     let superseded = *superseded;
     key(&mut application, KeyCode::Backspace);
 
-    answer(&mut application, superseded, &alpha, &["stale"]);
+    answer(&mut application, superseded, &gamma, &["stale"]);
     assert_eq!(
         tree(&application),
-        ["  ▾ here · [current]", "›   ▸ alpha"],
+        ["› ▾ here · [current]"],
         "the leading part asked for is no longer the field's"
     );
 
@@ -1819,15 +2076,15 @@ fn an_answer_for_a_leading_part_since_typed_over_moves_nothing() {
         panic!("typing the separator again asks again: {asked:?}");
     };
     assert_ne!(*awaited, superseded);
-    answer(&mut application, superseded, &alpha, &["stale"]);
+    answer(&mut application, superseded, &gamma, &["stale"]);
     assert_eq!(
         tree(&application),
-        ["  ▾ here · [current]", "›   ▸ alpha"],
+        ["› ▾ here · [current]"],
         "an answer to the earlier request is not this one's"
     );
 
-    answer(&mut application, *awaited, &alpha, &["fresh"]);
-    assert_eq!(tree(&application), ["› ▾ alpha", "    ▸ fresh"]);
+    answer(&mut application, *awaited, &gamma, &["fresh"]);
+    assert_eq!(tree(&application), ["› ▾ gamma", "    ▸ fresh"]);
 }
 
 /// The path field is spelled as the Outlook's Server spells its paths, which
@@ -2216,7 +2473,7 @@ fn answer(
     listing_id: DirectoryListingId,
     root: &Path,
     children: &[&str],
-) {
+) -> ApplicationTransition {
     let children = children
         .iter()
         .map(|name| (*name, DirectorySourceControl::Plain))
@@ -2227,7 +2484,7 @@ fn answer(
         root,
         &DirectorySourceControl::Plain,
         &children,
-    );
+    )
 }
 
 /// The Server's listing of `root`, read as `read`, with child directories by
@@ -2238,7 +2495,7 @@ fn answer_with(
     root: &Path,
     read: &DirectorySourceControl,
     children: &[(&str, DirectorySourceControl)],
-) {
+) -> ApplicationTransition {
     answer_listing(
         application,
         listing_id,
@@ -2255,29 +2512,33 @@ fn answer_with(
                 })
                 .collect(),
         },
-    );
+    )
 }
 
 fn answer_listing(
     application: &mut Application,
     listing_id: DirectoryListingId,
     listing: DirectoryListing,
-) {
+) -> ApplicationTransition {
     application
         .handle_event(ApplicationEvent::DirectoryListed {
             listing_id,
             result: Ok(listing),
         })
-        .expect("deliver the Server's listing");
+        .expect("deliver the Server's listing")
 }
 
-fn refuse(application: &mut Application, listing_id: DirectoryListingId, reason: &str) {
+fn refuse(
+    application: &mut Application,
+    listing_id: DirectoryListingId,
+    reason: &str,
+) -> ApplicationTransition {
     application
         .handle_event(ApplicationEvent::DirectoryListed {
             listing_id,
             result: Err(reason.to_owned()),
         })
-        .expect("deliver the Server's refusal");
+        .expect("deliver the Server's refusal")
 }
 
 /// What the path field says, read off its line.
