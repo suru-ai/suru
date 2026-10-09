@@ -225,6 +225,43 @@ async fn a_symlink_to_a_directory_is_listed_and_one_to_anything_else_is_not() {
     pair.shutdown().await;
 }
 
+/// Every path crosses the wire as Unicode text, so a directory whose name is
+/// not Unicode can be neither named nor chosen: it is left out of its
+/// parent's children without costing its siblings their listing, and a
+/// symlink leading into it is refused as a root with the reason. Windows
+/// names are UTF-16 and cannot be spelled this way, and macOS refuses such a
+/// name outright, so this is pinned wherever a filesystem keeps one.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_directory_whose_name_is_not_unicode_is_left_out_and_refused_as_a_root() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt as _};
+
+    let fixture = tempfile::tempdir().expect("create the directory to list");
+    let unnameable = fixture.path().join(OsStr::from_bytes(b"caf\xe9"));
+    match std::fs::create_dir(&unnameable) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => return,
+        Err(error) => panic!("create a directory whose name is not Unicode: {error}"),
+    }
+    std::fs::create_dir(fixture.path().join("plain")).expect("create a sibling");
+    std::os::unix::fs::symlink(&unnameable, fixture.path().join("aliased"))
+        .expect("create a symlink into the directory");
+    let pair = paired_servers("directory-listing-not-unicode").await;
+
+    for (way, client) in both_ways(&pair) {
+        let listing = listed(&client, fixture.path(), None).await;
+        assert_eq!(names(&listing), ["aliased", "plain"], "{way}");
+
+        let aliased = refused(&client, fixture.path().join("aliased")).await;
+        assert_eq!(aliased.code, SessionErrorCode::InvalidWorkspace, "{way}");
+        assert_eq!(
+            aliased.message, "This directory's path is not Unicode",
+            "{way}"
+        );
+    }
+    pair.shutdown().await;
+}
+
 /// The root of the filesystem the fixtures live on: `/` on Unix, and on
 /// Windows the drive root the temporary directory stands under.
 #[tokio::test]

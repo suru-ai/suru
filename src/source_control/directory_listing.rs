@@ -7,8 +7,12 @@ use crate::protocol::{ChildDirectory, DirectoryListing};
 /// The directory `path` names, listed: read from `base` when relative and
 /// from `home` when it begins with `~`, resolved to its root, and answered
 /// with that root's parent and the directories directly within it. A path
-/// naming nothing, a file, or a directory this Server cannot read is refused
-/// with the reason a reader is told.
+/// naming nothing, a file, a directory this Server cannot read, or one whose
+/// path is not Unicode is refused with the reason a reader is told.
+///
+/// Every path crosses the wire as Unicode text, so a directory whose name
+/// is not Unicode can be neither named to a Client nor chosen by one; like a
+/// file, it is left out of the children.
 pub(crate) fn list_directory(
     path: &Path,
     base: &Path,
@@ -27,11 +31,13 @@ pub(crate) fn list_directory(
     if !root.is_dir() {
         return Err("Not a directory".to_owned());
     }
+    if root.to_str().is_none() {
+        return Err("This directory's path is not Unicode".to_owned());
+    }
     let mut children = std::fs::read_dir(&root)
         .map_err(|error| unreadable(&error))?
         .flatten()
         .filter(is_directory)
-        // A name the wire cannot spell names nothing a Client could ask for.
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
             Some(ChildDirectory {

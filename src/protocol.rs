@@ -624,8 +624,11 @@ pub struct ListDirectoryRequest {
 
 /// One directory of a Server as the Directory Browser reads it: the root the
 /// asked-for path resolved to, the root's parent, and the directories directly
-/// within the root in the order the browser lists them. Files are never
-/// listed, since a file can never be chosen.
+/// within the root in the order the browser lists them. Only what can be
+/// chosen is listed: never a file, and never a directory whose name is not
+/// Unicode, since every path here crosses the wire as Unicode text and such a
+/// directory could be neither named nor chosen. A root whose own path is not
+/// Unicode is refused rather than listed.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DirectoryListing {
@@ -638,7 +641,8 @@ pub struct DirectoryListing {
     pub children: Vec<ChildDirectory>,
 }
 
-/// A directory directly within a [`DirectoryListing`]'s root.
+/// A directory directly within a [`DirectoryListing`]'s root, whose name is
+/// Unicode.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChildDirectory {
