@@ -484,7 +484,11 @@ impl DirectoryBrowser {
     /// and the lines beneath a directory still being read or refused, like
     /// the footer, are no rows to stand on.
     ///
-    /// What was pressed was in view already, so the window holds.
+    /// A press goes by the frame the reader saw, so a listing that has moved
+    /// rows since leaves it on the row drawn under it; one the keys have
+    /// taken out of the tree since — narrowed or hidden away — is no longer
+    /// there to press. What was pressed was in view already, so the window
+    /// holds.
     pub(super) fn press_at(
         &mut self,
         position: Position,
@@ -499,7 +503,8 @@ impl DirectoryBrowser {
             .rows
             .iter()
             .find(|row| row.line == position.y && row.columns.contains(&position.x))
-            .map(|row| row.key.clone());
+            .map(|row| row.key.clone())
+            .filter(|key| self.directories().contains(key));
         let last = std::mem::replace(&mut self.pressed, pressed.clone());
         let row = pressed?;
         let command = if repeats && last.as_ref() == Some(&row) {

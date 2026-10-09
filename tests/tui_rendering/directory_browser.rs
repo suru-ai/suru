@@ -2464,6 +2464,127 @@ fn a_double_press_on_a_row_chooses_it_as_enter_does() {
     );
 }
 
+/// A double press on a row already open chooses it all the same: the first
+/// press closes the row, as any single press on an open row does, and the
+/// second, landing on the row where it still stands, chooses it.
+#[test]
+fn a_double_press_on_an_open_row_closes_it_then_chooses_it() {
+    let here = directory(&["nowhere", "here"]);
+    let opened = || {
+        let (mut application, clock) = browsing(&here, &["alpha", "beta"]);
+        key(&mut application, KeyCode::Down);
+        let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Char(' ')));
+        answer(
+            &mut application,
+            listing_id,
+            &here.join("alpha"),
+            &["inner"],
+        );
+        (application, clock)
+    };
+    let (mut keyed, _) = opened();
+    key(&mut keyed, KeyCode::Char(' '));
+    let entered = key(&mut keyed, KeyCode::Enter);
+    let (mut pointed, clock) = opened();
+    assert_eq!(
+        tree(&pointed),
+        [
+            "  ▾ here · [current]",
+            "›   ▾ alpha",
+            "      ▸ inner",
+            "    ▸ beta"
+        ]
+    );
+
+    assert_eq!(
+        press_on(&mut pointed, "alpha"),
+        ApplicationTransition::Continue,
+        "the first press closes the row, asking nothing"
+    );
+    assert_eq!(
+        tree(&pointed),
+        ["  ▾ here · [current]", "›   ▸ alpha", "    ▸ beta"]
+    );
+    wait(&clock, CLICK_INTERVAL);
+    let pressed = press_on(&mut pointed, "alpha");
+
+    let (_, _, request) = expect_choice(&pressed);
+    assert_eq!(request.path, here.join("alpha"));
+    assert_eq!(pressed, entered, "the second asks what Enter asks");
+}
+
+/// The first press of a double press asks for the row's children and the
+/// second chooses the row before the Server answers: that answer, arriving
+/// once the browser has closed, moves nothing.
+#[test]
+fn a_listing_answered_after_a_double_press_chose_its_row_moves_nothing() {
+    let here = directory(&["nowhere", "here"]);
+    let (mut application, clock) = browsing(&here, &["alpha"]);
+    let (_, listing_id, request) = expect_listing(press_on(&mut application, "alpha"));
+    assert_eq!(request.path, here.join("alpha"));
+    wait(&clock, Duration::from_millis(1));
+    expect_choice(&press_on(&mut application, "alpha"));
+    let landing = rendered_application_rows_at(&application, WIDTH, HEIGHT);
+    assert!(
+        !landing.join("\n").contains("Path:"),
+        "the choice closed the browser: {landing:#?}"
+    );
+
+    assert_eq!(
+        answer(
+            &mut application,
+            listing_id,
+            &here.join("alpha"),
+            &["inner"]
+        ),
+        ApplicationTransition::Continue,
+        "the late answer asks for nothing more"
+    );
+    assert_eq!(
+        rendered_application_rows_at(&application, WIDTH, HEIGHT),
+        landing,
+        "no browser is drawn again, and the Landing stands as it was"
+    );
+}
+
+/// Each opening begins afresh, the press it last took included: the first
+/// press in a new opening is a single press however soon it follows one in
+/// the last, even on the very same cell.
+#[test]
+fn the_first_press_after_reopening_the_browser_is_a_single_press() {
+    let here = directory(&["nowhere", "here"]);
+    let (mut application, clock) = browsing(&here, &["alpha"]);
+    let alpha = text_position(
+        &rendered_application_buffer(&application, WIDTH, HEIGHT),
+        "alpha",
+    );
+    expect_listing(press_at(&mut application, alpha));
+    key(&mut application, KeyCode::Esc);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha"]);
+    assert_eq!(
+        text_position(
+            &rendered_application_buffer(&application, WIDTH, HEIGHT),
+            "alpha"
+        ),
+        alpha,
+        "alpha is drawn where it was in the last opening"
+    );
+
+    wait(&clock, Duration::from_millis(1));
+    let (_, _, request) = expect_listing(press_at(&mut application, alpha));
+
+    assert_eq!(
+        request.path,
+        here.join("alpha"),
+        "the press opens alpha rather than choosing it"
+    );
+    assert_eq!(
+        tree(&application),
+        ["  ▾ here · [current]", "›   ▾ alpha", "      Loading…"]
+    );
+}
+
 /// A double press is two presses on one row: a second press within the
 /// interval on the row beside the first is a single press there, opening
 /// that row rather than choosing either.
@@ -2695,6 +2816,150 @@ fn a_press_lands_on_the_row_drawn_under_it_beside_a_sidebar() {
     assert_eq!(focused(&application), "beta");
 }
 
+/// A press goes by the frame the reader saw: where a listing arrives between
+/// that frame and the press, moving the rows beneath the directory it lists,
+/// the press lands on the row the frame drew under it rather than on
+/// whatever the listing has since moved there.
+#[test]
+fn a_press_lands_on_the_row_the_last_frame_drew_there_though_a_listing_moved_it_since() {
+    let here = directory(&["nowhere", "here"]);
+    let (mut application, _) = browsing(&here, &["alpha", "beta"]);
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Char(' ')));
+    let beta = text_position(
+        &rendered_application_buffer(&application, WIDTH, HEIGHT),
+        "beta",
+    );
+    answer(
+        &mut application,
+        listing_id,
+        &here.join("alpha"),
+        &["inner", "other"],
+    );
+
+    let (_, _, request) = expect_listing(press_at(&mut application, beta));
+
+    assert_eq!(
+        request.path,
+        here.join("beta"),
+        "the press opens beta, drawn there when it was made, rather than the row the listing \
+         has since moved onto that line"
+    );
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ here · [current]",
+            "    ▾ alpha",
+            "      ▸ inner",
+            "      ▸ other",
+            "›   ▾ beta",
+            "      Loading…"
+        ]
+    );
+}
+
+/// A row the keys have taken out of the tree since the last frame — here
+/// narrowed away by a letter typed into the path field — is no longer there
+/// to press, so a press where it was drawn moves nothing.
+#[test]
+fn a_press_where_a_row_since_narrowed_away_was_drawn_moves_nothing() {
+    let here = directory(&["nowhere", "here"]);
+    let (mut application, _) = browsing(&here, &["alpha", "beta"]);
+    let beta = text_position(
+        &rendered_application_buffer(&application, WIDTH, HEIGHT),
+        "beta",
+    );
+    assert!(
+        type_path(&mut application, "a").is_empty(),
+        "the leading part still names the root"
+    );
+
+    assert_eq!(
+        press_at(&mut application, beta),
+        ApplicationTransition::Continue,
+        "nothing is asked for beta"
+    );
+    assert_eq!(
+        tree(&application),
+        ["  ▾ here · [current]", "›   ▸ alpha"],
+        "and focus stays on alpha, the one row the tail leaves"
+    );
+}
+
+/// In a narrow terminal a long name is cut at the box's edge, and a press on
+/// what is left of its row still lands on it.
+#[test]
+fn a_press_on_a_row_cut_short_by_a_narrow_terminal_lands_on_it() {
+    const NARROW: (u16, u16) = (50, HEIGHT);
+    let long = "a-directory-whose-name-runs-well-past-the-edge-of-the-box";
+    let here = directory(&["nowhere", "here"]);
+    let (mut application, _) = browsing(&here, &["alpha", long]);
+    let rows = rendered_application_rows_at(&application, NARROW.0, NARROW.1);
+    let cut = &rows[rendered_row(&rows, "a-directory-whose")];
+    assert!(
+        !cut.contains(long) && cut.contains('…'),
+        "the name is cut at the box's edge: {cut:?}"
+    );
+
+    let (_, _, request) =
+        expect_listing(press_on_in(&mut application, NARROW, "a-directory-whose"));
+
+    assert_eq!(request.path, here.join(long));
+    assert_eq!(focused(&application), long, "the row pressed is focused");
+}
+
+/// The wheel outside the browser's box goes on reaching what it is over —
+/// the Sidebar's list over the Sidebar — and never moves the tree.
+#[test]
+fn the_wheel_outside_the_browser_moves_what_it_is_over_and_not_the_tree() {
+    let here = directory(&["nowhere", "here"]);
+    let titles = (1..=20)
+        .map(|index| format!("Work {index:02}"))
+        .collect::<Vec<_>>();
+    let mut application = connected_application(&here);
+    show_sidebar_scoped_to_current_workspace(
+        &mut application,
+        titles
+            .iter()
+            .map(|title| working(title, SessionId::new(), &here))
+            .collect(),
+    );
+    let (_, listing_id, _) = browse_by_chord(&mut application);
+    let names = (1..=40)
+        .map(|index| format!("dir{index:02}"))
+        .collect::<Vec<_>>();
+    answer(
+        &mut application,
+        listing_id,
+        &here,
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let drawn_titles = |application: &Application| {
+        let rows = rendered_application_rows_at(application, WIDTH, HEIGHT);
+        titles
+            .iter()
+            .filter(|title| drawn_in_sidebar(&rows, title))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let listed = drawn_titles(&application);
+    let tree_before = tree(&application);
+    let rows = rendered_application_rows_at(&application, WIDTH, HEIGHT);
+    let line = u16::try_from(rendered_row(&rows, &listed[0])).expect("a frame row");
+
+    assert_eq!(
+        wheel_at(&mut application, (1, line), MouseEventKind::ScrollDown),
+        ApplicationTransition::Continue
+    );
+
+    let wheeled = drawn_titles(&application);
+    assert!(
+        !wheeled.contains(&listed[0]),
+        "the wheel over the Sidebar moves its list: {listed:?} became {wheeled:?}"
+    );
+    assert_eq!(tree(&application), tree_before, "and never the tree");
+}
+
 /// The browser offers no menu of its own, and a right press while it stands
 /// opens none beneath it either, over the Sidebar's rows or its own.
 #[test]
@@ -2847,7 +3112,16 @@ fn wait(clock: &Clock, by: Duration) {
 /// Presses the left button on the first cell of `needle` as the frame draws
 /// it, so the press lands where the reader would point.
 fn press_on(application: &mut Application, needle: &str) -> ApplicationTransition {
-    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    press_on_in(application, (WIDTH, HEIGHT), needle)
+}
+
+/// [`press_on`] in a frame of `size`.
+fn press_on_in(
+    application: &mut Application,
+    (width, height): (u16, u16),
+    needle: &str,
+) -> ApplicationTransition {
+    let buffer = rendered_application_buffer(application, width, height);
     press_at(application, text_position(&buffer, needle))
 }
 
@@ -2872,7 +3146,15 @@ fn wheel_on(
     kind: MouseEventKind,
 ) -> ApplicationTransition {
     let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
-    let (column, row) = text_position(&buffer, needle);
+    wheel_at(application, text_position(&buffer, needle), kind)
+}
+
+/// Turns the wheel a step `kind` over one cell of the frame.
+fn wheel_at(
+    application: &mut Application,
+    (column, row): (u16, u16),
+    kind: MouseEventKind,
+) -> ApplicationTransition {
     application
         .handle_terminal_event(InputEvent::Mouse(MouseEvent {
             kind,
