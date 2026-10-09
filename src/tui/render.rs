@@ -1847,13 +1847,22 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
             theme.text.subdued,
         ));
     }
-    if let Some(error) = state.workspace_picker.error()
-        && lines.len() < content_height
+    // Why the listing failed, and why the reader's last choice was refused,
+    // stand beneath the search line, above the rows, so the rows give way to
+    // them however short the box.
+    for error in [
+        state.workspace_picker.error(),
+        state.workspace_picker.refusal(),
+    ]
+    .into_iter()
+    .flatten()
     {
-        lines.push(Line::styled(
-            truncate_to_width(&format!("Error: {error}"), content_width),
-            theme.feedback.error,
-        ));
+        if lines.len() < content_height {
+            lines.push(Line::styled(
+                truncate_to_width(&format!("Error: {error}"), content_width),
+                theme.feedback.error,
+            ));
+        }
     }
     if state.workspace_picker.is_loading() && lines.len() < content_height {
         lines.push(Line::styled("Loading Workspaces…", theme.text.subdued));

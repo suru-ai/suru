@@ -45,6 +45,10 @@ pub(super) struct WorkspacePicker {
     /// from, so Esc from the browser brings it back as the reader left it
     /// (see [`Self::step_aside`] and [`Self::step_back`]).
     stepped_aside: bool,
+    /// Why what the reader asked of the picker was refused before it reached
+    /// the Server, said inside the picker because the picker stands over the
+    /// Landing where a refusal is otherwise said.
+    refusal: Option<String>,
     /// One row's own context menu, opened by a right press on it: editing
     /// that Workspace's Description always, and choosing its Icon while
     /// `appearance.showIcons` is on (see [`Self::open_menu_at`]). Once open it
@@ -285,6 +289,7 @@ impl WorkspacePicker {
             query: String::new(),
             selected: None,
             stepped_aside: false,
+            refusal: None,
             menu: None,
             description_editor: None,
             submitted_description: None,
@@ -297,6 +302,7 @@ impl WorkspacePicker {
     pub(super) fn open(&mut self) -> SessionListRequest {
         self.open = true;
         self.stepped_aside = false;
+        self.refusal = None;
         self.query.clear();
         self.selected = None;
         self.menu = None;
@@ -310,6 +316,7 @@ impl WorkspacePicker {
     pub(super) fn close(&mut self) {
         self.open = false;
         self.stepped_aside = false;
+        self.refusal = None;
         self.query.clear();
         self.selected = None;
         self.menu = None;
@@ -321,7 +328,8 @@ impl WorkspacePicker {
     /// Stands the picker aside for the Directory Browser opened from it: it
     /// draws nothing and takes no keys, but keeps everything the reader left
     /// it with for [`Self::step_back`]. Only its row menu is put away, being
-    /// no part of where the reader was.
+    /// no part of where the reader was, and any refusal it was saying, which
+    /// a browser that opened has answered.
     pub(super) fn step_aside(&mut self) {
         if !self.open {
             return;
@@ -329,6 +337,7 @@ impl WorkspacePicker {
         self.open = false;
         self.stepped_aside = true;
         self.menu = None;
+        self.refusal = None;
     }
 
     /// Brings back a picker standing aside for the Directory Browser, as the
@@ -353,6 +362,18 @@ impl WorkspacePicker {
 
     pub(super) fn query(&self) -> &str {
         &self.query
+    }
+
+    /// Why what the reader last asked of the picker was refused before it
+    /// reached the Server.
+    pub(super) fn refusal(&self) -> Option<&str> {
+        self.refusal.as_deref()
+    }
+
+    /// Says `refusal` inside the picker until it closes, leaving its query
+    /// and the row the reader is on as they were.
+    pub(super) fn refuse(&mut self, refusal: String) {
+        self.refusal = Some(refusal);
     }
 
     /// Takes what the reader typed into the query, and leaves them on a

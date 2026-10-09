@@ -700,6 +700,13 @@ fn a_left_press_on_a_row_is_refused_for_an_unreachable_remote_as_enter_is() {
             rendered_application_rows_at(&keyed, frame.0, frame.1),
             "{frame:?}"
         );
+        let lines = picker_lines(&pointed);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("studio is unreachable")),
+            "{frame:?}: the refusal is said inside the picker, which covers the Landing: {lines:?}"
+        );
         press(&mut pointed, KeyCode::Esc);
         let refused = rendered_application_rows_at(&pointed, frame.0, frame.1).join("\n");
         assert!(
@@ -2056,26 +2063,65 @@ fn the_browse_row_has_no_menu_and_no_description_to_edit() {
 }
 
 /// The browser reads the Outlook's Server, so once that Remote stops
-/// answering, Ctrl+O and Enter on the Browse row are refused as any other
-/// start is: nothing is asked, the picker stands, and the refusal is said.
+/// answering, Ctrl+O, Enter on the Browse row, and a press on it are refused
+/// as any other start is: nothing is asked, and the picker stands as the
+/// reader left it, saying why inside it — where they are looking, since it
+/// covers the Landing, which goes on saying it once the picker is put away.
 #[test]
 fn opening_the_browser_from_the_picker_is_refused_for_an_unreachable_remote() {
-    let ways_in: [fn(&mut Application) -> ApplicationTransition; 2] = [ctrl_o, |application| {
-        press(application, KeyCode::Up);
-        choose_unanswered(application)
-    }];
-    for open in ways_in {
+    type WayIn = fn(&mut Application) -> ApplicationTransition;
+    let ways_in: [(&str, &str, bool, WayIn); 3] = [
+        ("Ctrl+O under a query", "atl", false, ctrl_o),
+        ("Enter on the Browse row", "", true, choose_unanswered),
+        ("a press on the Browse row", "", true, |application| {
+            press_row(application, (80, 15), MouseButton::Left, BROWSE_ROW)
+        }),
+    ];
+    for (way, query, on_browse_row, open) in ways_in {
         let mut application = application_looking_at_studio();
-        open_picker_with(&mut application, Vec::new());
+        open_picker_with(
+            &mut application,
+            vec![rooted(
+                "Remote work",
+                &crate::support::named_workspace_path("atlas"),
+                30,
+            )],
+        );
         studio_stops_answering(&mut application, 1, Duration::from_secs(5));
+        type_terminal_text(&mut application, query);
+        if on_browse_row {
+            press(&mut application, KeyCode::Up);
+        }
+        let left_on = (picker_query(&application), selected_row(&application));
 
-        assert_eq!(open(&mut application), ApplicationTransition::Continue);
-        assert_eq!(overlays_drawn(&application), (true, false));
-        press(&mut application, KeyCode::Esc);
-        let refused = rendered_application_rows_at(&application, 120, 20).join("\n");
+        assert_eq!(
+            open(&mut application),
+            ApplicationTransition::Continue,
+            "{way}: nothing is asked"
+        );
+
+        assert_eq!(
+            overlays_drawn(&application),
+            (true, false),
+            "{way}: no browser opens, and the picker stands"
+        );
+        let lines = picker_lines(&application);
         assert!(
-            refused.contains("studio is unreachable"),
-            "the refusal is said: {refused}"
+            lines
+                .iter()
+                .any(|line| line.contains("studio is unreachable")),
+            "{way}: the refusal is said inside the picker: {lines:?}"
+        );
+        assert_eq!(
+            (picker_query(&application), selected_row(&application)),
+            left_on,
+            "{way}: the query and the row the reader was on are as they left them"
+        );
+        press(&mut application, KeyCode::Esc);
+        let landing = rendered_application_rows_at(&application, 120, 20).join("\n");
+        assert!(
+            landing.contains("studio is unreachable"),
+            "{way}: the Landing goes on saying it: {landing}"
         );
     }
 }

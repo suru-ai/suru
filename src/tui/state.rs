@@ -7098,11 +7098,15 @@ impl Application {
             .map(|reason| format!(" · {}", super::unreachable_reason::brief(reason)))
             .unwrap_or_default();
         let refusal = format!("{remote} is unreachable{why}; this waits until it answers");
-        // The Directory Browser stands over the Landing and keeps the keys,
-        // so what it asked for is refused inside it, where the reader is
-        // looking; the Landing goes on saying it once the browser closes.
+        // The Directory Browser and the Workspace Picker each stand over the
+        // Landing and keep the keys, so what either asked for is refused
+        // inside it, where the reader is looking; the Landing goes on saying
+        // it once that overlay closes.
         if self.state.directory_browser.is_open() {
             self.state.directory_browser.refuse(refusal.clone());
+        }
+        if self.state.workspace_picker.is_open() {
+            self.state.workspace_picker.refuse(refusal.clone());
         }
         self.state.submission_error = Some(refusal);
         true
