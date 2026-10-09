@@ -18,6 +18,34 @@ pub enum PathStyle {
     Windows,
 }
 
+impl PathStyle {
+    /// The syntax of a Server that spelled `path`, an absolute path of its
+    /// own, read from the path's own text rather than from the platform
+    /// reading it: a Unix path begins at `/`, where a Windows one begins at a
+    /// drive or a share.
+    pub fn of_absolute(path: &Path) -> Self {
+        if path.to_string_lossy().starts_with('/') {
+            Self::Unix
+        } else {
+            Self::Windows
+        }
+    }
+
+    /// The separator this syntax spells a path with.
+    pub const fn separator(self) -> char {
+        match self {
+            Self::Unix => '/',
+            Self::Windows => '\\',
+        }
+    }
+
+    /// Whether `character` separates one directory from the next, which on
+    /// Windows a forward slash does as well as its own.
+    pub const fn is_separator(self, character: char) -> bool {
+        character == self.separator() || matches!((self, character), (Self::Windows, '/'))
+    }
+}
+
 /// What a client names the Sidekick Workspace by in place of its directory,
 /// which lies with the Server's data and so says nothing to a reader.
 const SIDEKICK_WORKSPACE_NAME: &str = "Sidekick";
@@ -188,11 +216,8 @@ impl WorkspacePaths {
         })
     }
 
-    fn separator(&self) -> char {
-        match self.style {
-            PathStyle::Unix => '/',
-            PathStyle::Windows => '\\',
-        }
+    const fn separator(&self) -> char {
+        self.style.separator()
     }
 
     fn spelling(&self, path: &str) -> String {
