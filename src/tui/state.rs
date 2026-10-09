@@ -7300,14 +7300,15 @@ impl Application {
             return Ok(ApplicationTransition::Continue);
         }
         // The Workspace Picker itself answers next: a press on one of its rows
-        // chooses the Workspace it names — the same command Enter invokes —
-        // and one anywhere else inside its box moves nothing, never reaching
-        // what the picker covers. A press outside the box never reaches here,
-        // since `PointerClick` already turned it into the Escape that closes
-        // the picker.
+        // puts the reader on it and chooses it through the very path Enter
+        // takes, so it waits out a pending Agent Selection and is refused for
+        // an Unreachable Outlook exactly as Enter is. A press anywhere else
+        // inside its box moves nothing, never reaching what the picker covers;
+        // one outside the box never reaches here, since `PointerClick` already
+        // turned it into the Escape that closes the picker.
         if self.state.workspace_picker.is_open() {
             if self.state.workspace_picker.row_hit(position) {
-                return Ok(self.handle_workspace_picker_command(CommandId::SelectWorkspace));
+                return self.handle_command(CommandId::SelectWorkspace);
             }
             return Ok(ApplicationTransition::Continue);
         }

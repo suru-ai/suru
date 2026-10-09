@@ -2,14 +2,18 @@
 //! order it stands them in, narrowing them by typing, choosing one, and
 //! walking away from it unchanged.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crate::support::{
-    SIDEBAR_WIDE, answer_workspace_resolution, connected_application, deliver_settings,
-    drawn_in_sidebar, enter_active_session, fixture_instance_id, noncanonical_spelling,
-    ready_health, rendered_application_buffer, rendered_application_rows,
-    rendered_application_rows_at, rendered_row, selector_label, sidebar_column, text_position,
-    type_terminal_text, workspace_dir,
+    SIDEBAR_WIDE, answer_workspace_resolution, application_looking_at_studio,
+    connected_application, deliver_settings, drawn_in_sidebar, enter_active_session,
+    fixture_instance_id, model_descriptor, noncanonical_spelling, ready_health,
+    rendered_application_buffer, rendered_application_rows, rendered_application_rows_at,
+    rendered_row, selected_session_snapshot, selector_label, sidebar_column,
+    studio_stops_answering, text_position, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -17,11 +21,11 @@ use crossterm::event::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AgentSelection, EffectiveSettings, ModelAvailability, ModelId, ProviderId, Session,
-        SessionId, SessionListItem, SessionStatus, SessionSummary, SessionTimestamp,
-        SidebarSettings, SidebarVisibility, SkillCatalog, SkillCatalogCapabilities,
-        SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery,
-        Workspace,
+        AgentSelection, EffectiveSettings, ModelAvailability, ModelCatalog, ModelId,
+        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, Session, SessionId,
+        SessionListItem, SessionStatus, SessionSummary, SessionTimestamp, SidebarSettings,
+        SidebarVisibility, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest,
+        SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -505,87 +509,241 @@ fn a_refused_listing_is_reported_in_the_picker() {
     );
 }
 
+/// The frames the picker's pointer tests are drawn in: roomy, then shorter and
+/// narrower, each moving where the box and its rows stand and holding fewer
+/// rows in its list window.
+const PICKER_FRAMES: [(u16, u16); 3] = [(120, 20), (80, 15), (60, 12)];
+
 /// A left press on a row chooses the Workspace it names exactly as Enter on
 /// that row does: the same request goes to its Server, and the same Landing
 /// stands in the picker's place before and after the answer.
 #[test]
 fn a_left_press_on_a_row_chooses_it_exactly_as_enter_does() {
-    let root = workspace_dir();
-    let here = workspace_in(root.path(), "here");
-    let atlas = workspace_in(root.path(), "atlas");
+    for frame in PICKER_FRAMES {
+        let root = workspace_dir();
+        let here = workspace_in(root.path(), "here");
+        let atlas = workspace_in(root.path(), "atlas");
+        let picking = || {
+            let mut application = connected_application(&here);
+            open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+            application
+        };
 
-    let mut keyed = connected_application(&here);
-    open_picker_with(&mut keyed, vec![rooted("Newer", &atlas, 30)]);
-    press(&mut keyed, KeyCode::Down);
-    let entered = choose_unanswered(&mut keyed);
+        let mut keyed = picking();
+        press(&mut keyed, KeyCode::Down);
+        let entered = choose_unanswered(&mut keyed);
 
-    let mut pointed = connected_application(&here);
-    open_picker_with(&mut pointed, vec![rooted("Newer", &atlas, 30)]);
-    assert_eq!(
-        selected_row(&pointed),
-        "here",
-        "the press lands on a row the reader is not on"
-    );
-    let pressed = press_row(&mut pointed, MouseButton::Left, "atlas");
+        let mut pointed = picking();
+        assert_eq!(
+            selected_row(&pointed),
+            "here",
+            "the press lands on a row the reader is not on"
+        );
+        let pressed = press_row(&mut pointed, frame, MouseButton::Left, "atlas");
 
-    assert!(
-        matches!(
-            pressed,
-            ApplicationTransition::DetachSessionAndResolveWorkspace { .. }
-        ),
-        "{pressed:?}"
-    );
-    assert_eq!(pressed, entered, "the press asks what Enter asks");
-    assert_eq!(
-        rendered_application_rows_at(&pointed, 120, 20),
-        rendered_application_rows_at(&keyed, 120, 20),
-        "and the same Landing stands in the picker's place"
-    );
+        assert!(
+            matches!(
+                pressed,
+                ApplicationTransition::DetachSessionAndResolveWorkspace { .. }
+            ),
+            "{frame:?}: {pressed:?}"
+        );
+        assert_eq!(
+            pressed, entered,
+            "{frame:?}: the press asks what Enter asks"
+        );
+        assert_eq!(
+            rendered_application_rows_at(&pointed, frame.0, frame.1),
+            rendered_application_rows_at(&keyed, frame.0, frame.1),
+            "{frame:?}: and the same Landing stands in the picker's place"
+        );
 
-    answer_workspace_resolution(&mut keyed, entered);
-    answer_workspace_resolution(&mut pointed, pressed);
-    assert_eq!(
-        rendered_application_rows_at(&pointed, 120, 20),
-        rendered_application_rows_at(&keyed, 120, 20),
-        "and the same Landing once the Server has answered"
-    );
+        answer_workspace_resolution(&mut keyed, entered);
+        answer_workspace_resolution(&mut pointed, pressed);
+        assert_eq!(
+            rendered_application_rows_at(&pointed, frame.0, frame.1),
+            rendered_application_rows_at(&keyed, frame.0, frame.1),
+            "{frame:?}: and the same Landing once the Server has answered"
+        );
+    }
+}
+
+/// A row the list window has scrolled into view is chosen by a press where it
+/// is drawn now, not where it would stand unscrolled.
+#[test]
+fn a_left_press_on_a_row_scrolled_into_view_chooses_that_row() {
+    const NAMES: [&str; 12] = [
+        "alder", "birch", "cedar", "dogwood", "elm", "fir", "ginkgo", "hazel", "ironwood",
+        "juniper", "larch", "maple",
+    ];
+    for frame in PICKER_FRAMES {
+        let root = workspace_dir();
+        let here = workspace_in(root.path(), "here");
+        let listed = NAMES
+            .iter()
+            .zip(0..)
+            .map(|(name, age)| rooted(name, &workspace_in(root.path(), name), 100 - age))
+            .collect::<Vec<_>>();
+        let picking = || {
+            let mut application = connected_application(&here);
+            open_picker_with(&mut application, listed.clone());
+            application
+        };
+        // The last row but one, which the window holds only once the reader
+        // has walked past its end.
+        let target = NAMES[NAMES.len() - 2];
+
+        let mut keyed = picking();
+        press(&mut keyed, KeyCode::Up);
+        press(&mut keyed, KeyCode::Up);
+        assert_eq!(selected_row_at(&keyed, frame), target, "{frame:?}");
+        let entered = choose_unanswered(&mut keyed);
+
+        let mut pointed = picking();
+        let unscrolled = rendered_application_rows_at(&pointed, frame.0, frame.1).join("\n");
+        assert!(
+            !unscrolled.contains(target),
+            "{frame:?}: the window does not hold {target} before it scrolls: {unscrolled}"
+        );
+        press(&mut pointed, KeyCode::Up);
+        let pressed = press_row(&mut pointed, frame, MouseButton::Left, target);
+
+        assert!(
+            matches!(
+                pressed,
+                ApplicationTransition::DetachSessionAndResolveWorkspace { .. }
+            ),
+            "{frame:?}: {pressed:?}"
+        );
+        assert_eq!(pressed, entered, "{frame:?}: the press chooses {target}");
+    }
+}
+
+/// While an Agent Selection update is still on its way to its Server, Enter on
+/// a row waits rather than race it, and a press on the row waits exactly as
+/// Enter does: nothing is asked, and the picker stands as Enter leaves it.
+#[test]
+fn a_left_press_on_a_row_waits_out_a_pending_agent_selection_as_enter_does() {
+    for frame in PICKER_FRAMES {
+        let root = workspace_dir();
+        let here = workspace_in(root.path(), "here");
+        let atlas = workspace_in(root.path(), "atlas");
+        let picking = || {
+            let mut application = application_awaiting_agent_selection(&here);
+            open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+            application
+        };
+
+        let mut keyed = picking();
+        press(&mut keyed, KeyCode::Down);
+        let entered = choose_unanswered(&mut keyed);
+        let mut pointed = picking();
+        let pressed = press_row(&mut pointed, frame, MouseButton::Left, "atlas");
+
+        assert_eq!(
+            entered,
+            ApplicationTransition::Continue,
+            "{frame:?}: Enter waits for the Agent Selection"
+        );
+        assert_eq!(pressed, entered, "{frame:?}: and so does the press");
+        assert_eq!(
+            rendered_application_rows_at(&pointed, frame.0, frame.1),
+            rendered_application_rows_at(&keyed, frame.0, frame.1),
+            "{frame:?}"
+        );
+    }
+}
+
+/// A Workspace the picker offers is resolved on the Server the Outlook is
+/// turned toward, so once that Remote stops answering Enter on a row is
+/// refused, saying why, and a press on the row is refused exactly as Enter is.
+#[test]
+fn a_left_press_on_a_row_is_refused_for_an_unreachable_remote_as_enter_is() {
+    for frame in PICKER_FRAMES {
+        let picking = || {
+            let mut application = application_looking_at_studio();
+            open_picker_with(
+                &mut application,
+                vec![rooted(
+                    "Remote work",
+                    &crate::support::named_workspace_path("atlas"),
+                    30,
+                )],
+            );
+            studio_stops_answering(&mut application, 1, Duration::from_secs(5));
+            application
+        };
+
+        let mut keyed = picking();
+        press(&mut keyed, KeyCode::Down);
+        let entered = choose_unanswered(&mut keyed);
+        let mut pointed = picking();
+        let pressed = press_row(&mut pointed, frame, MouseButton::Left, "atlas");
+
+        assert_eq!(
+            entered,
+            ApplicationTransition::Continue,
+            "{frame:?}: Enter is refused"
+        );
+        assert_eq!(pressed, entered, "{frame:?}: and so is the press");
+        assert_eq!(
+            rendered_application_rows_at(&pointed, frame.0, frame.1),
+            rendered_application_rows_at(&keyed, frame.0, frame.1),
+            "{frame:?}"
+        );
+        press(&mut pointed, KeyCode::Esc);
+        let refused = rendered_application_rows_at(&pointed, frame.0, frame.1).join("\n");
+        assert!(
+            refused.contains("studio is unreachable"),
+            "{frame:?}: the refusal is said: {refused}"
+        );
+    }
 }
 
 /// A right press on a row still opens that row's own menu rather than
 /// choosing it, leaving the picker standing beneath the menu.
 #[test]
 fn a_right_press_on_a_row_still_opens_its_menu() {
-    let here = workspace(&["work", "here"]);
-    let ledger = workspace(&["work", "ledger"]);
-    let mut application = connected_application(&here);
-    open_picker_with(&mut application, vec![rooted("Older", &ledger, 10)]);
+    for frame in PICKER_FRAMES {
+        let here = workspace(&["work", "here"]);
+        let ledger = workspace(&["work", "ledger"]);
+        let mut application = connected_application(&here);
+        open_picker_with(&mut application, vec![rooted("Older", &ledger, 10)]);
 
-    assert_eq!(
-        press_row(&mut application, MouseButton::Right, "ledger"),
-        ApplicationTransition::Continue,
-        "nothing is chosen"
-    );
+        assert_eq!(
+            press_row(&mut application, frame, MouseButton::Right, "ledger"),
+            ApplicationTransition::Continue,
+            "{frame:?}: nothing is chosen"
+        );
 
-    let drawn = rendered_application_rows_at(&application, 120, 20).join("\n");
-    assert!(drawn.contains("Edit description"), "{drawn}");
-    assert!(drawn.contains(" Workspaces "), "{drawn}");
+        let drawn = rendered_application_rows_at(&application, frame.0, frame.1).join("\n");
+        assert!(drawn.contains("Edit description"), "{frame:?}: {drawn}");
+        assert!(drawn.contains(" Workspaces "), "{frame:?}: {drawn}");
+    }
 }
 
 /// A press inside the picker that lands on no row — its search line — chooses
 /// nothing and leaves the picker standing.
 #[test]
 fn a_press_inside_the_picker_off_its_rows_moves_nothing() {
-    let here = workspace(&["work", "here"]);
-    let ledger = workspace(&["work", "ledger"]);
-    let mut application = connected_application(&here);
-    open_picker_with(&mut application, vec![rooted("Older", &ledger, 10)]);
-    let before = rendered_application_rows_at(&application, 120, 20);
+    for frame in PICKER_FRAMES {
+        let here = workspace(&["work", "here"]);
+        let ledger = workspace(&["work", "ledger"]);
+        let mut application = connected_application(&here);
+        open_picker_with(&mut application, vec![rooted("Older", &ledger, 10)]);
+        let before = rendered_application_rows_at(&application, frame.0, frame.1);
 
-    assert_eq!(
-        press_row(&mut application, MouseButton::Left, "Search:"),
-        ApplicationTransition::Continue
-    );
-    assert_eq!(rendered_application_rows_at(&application, 120, 20), before);
+        assert_eq!(
+            press_row(&mut application, frame, MouseButton::Left, "Search:"),
+            ApplicationTransition::Continue,
+            "{frame:?}"
+        );
+        assert_eq!(
+            rendered_application_rows_at(&application, frame.0, frame.1),
+            before,
+            "{frame:?}"
+        );
+    }
 }
 
 /// The whole of the switch: Enter on a row takes the reader out of the picker
@@ -1661,14 +1819,15 @@ fn session_picker_scope(application: &mut Application) -> SessionListScope {
     request.scope().clone()
 }
 
-/// Presses `button` on the first cell of `needle` as the frame draws it, so
-/// the press lands where the reader would point.
+/// Presses `button` on the first cell of `needle` as the frame of `size`
+/// draws it, so the press lands where the reader would point.
 fn press_row(
     application: &mut Application,
+    size: (u16, u16),
     button: MouseButton,
     needle: &str,
 ) -> ApplicationTransition {
-    let buffer = rendered_application_buffer(application, 120, 20);
+    let buffer = rendered_application_buffer(application, size.0, size.1);
     let (column, row) = text_position(&buffer, needle);
     super::support::click_mouse(
         application,
@@ -1680,6 +1839,74 @@ fn press_row(
         },
     )
     .expect("press over the Workspace Picker")
+}
+
+/// An Application with a Session open in `workspace` whose Agent Selection is
+/// changing to a Model chosen in the Model picker, with its Server yet to
+/// answer: the update is still on its way.
+fn application_awaiting_agent_selection(workspace: &Path) -> Application {
+    let codex = ProviderId::new("codex");
+    let mut application = Application::new(workspace, Default::default());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            selected_session_snapshot(
+                SessionId::new(),
+                workspace,
+                AgentSelection {
+                    provider: codex.clone(),
+                    model: ModelId::new("old"),
+                    options: vec![],
+                },
+            ),
+        ))
+        .expect("attach a Session");
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelList,
+        )))
+        .expect("open the Model picker")
+    else {
+        panic!("the Model picker asks for its catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    display_name: "Codex".to_owned(),
+                    provider: codex,
+                    models: vec![
+                        model_descriptor(
+                            "codex",
+                            "old",
+                            "Old Model",
+                            true,
+                            ModelAvailability::Available,
+                        ),
+                        model_descriptor(
+                            "codex",
+                            "new",
+                            "New Model",
+                            false,
+                            ModelAvailability::Available,
+                        ),
+                    ],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("load the Model catalog");
+    type_terminal_text(&mut application, "New Model");
+    let ApplicationTransition::UpdateAgentSelection { .. } = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("choose the Model")
+    else {
+        panic!("choosing a Model for the open Session updates its Agent Selection");
+    };
+    application
 }
 
 fn press(application: &mut Application, code: KeyCode) {
@@ -1726,6 +1953,22 @@ fn backspace(application: &mut Application) {
 /// draws in front of it.
 fn selected_row(application: &Application) -> String {
     let rows = picker_rows(application);
+    let selected = rows
+        .iter()
+        .find(|row| row.starts_with('›'))
+        .unwrap_or_else(|| panic!("no row is marked as the reader's: {rows:?}"));
+    selected
+        .trim_start_matches(['›', ' '])
+        .split(' ')
+        .next()
+        .expect("a marked row names a Workspace")
+        .to_owned()
+}
+
+/// The name of the Workspace the reader is on in a frame of `size`, read off
+/// the marker the frame draws in front of it.
+fn selected_row_at(application: &Application, size: (u16, u16)) -> String {
+    let rows = picker_rows_at(application, size.0, size.1);
     let selected = rows
         .iter()
         .find(|row| row.starts_with('›'))
