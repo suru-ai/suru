@@ -69,7 +69,7 @@ use super::{
     transcript::{TranscriptView, client_error_lines},
     unreachable_reason,
     usage::{compact_cost, compact_count},
-    workspace_picker::{WorkspacePickerMenuGeometry, WorkspacePickerRow},
+    workspace_picker::{WorkspacePickerMenuGeometry, WorkspacePickerRowKind, WorkspaceRow},
 };
 
 const NARROW_TERMINAL_WIDTH: u16 = 44;
@@ -1876,19 +1876,29 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
                 };
                 let row_y =
                     content_y.saturating_add(u16::try_from(lines.len() + index).unwrap_or(0));
-                state.workspace_picker.record_row(
-                    row_y,
-                    row_columns.clone(),
-                    row.workspace_id.clone(),
-                    row.origin.clone(),
-                );
-                Line::styled(workspace_picker_row_text(row, content_width, state), style)
+                state
+                    .workspace_picker
+                    .record_row(row_y, row_columns.clone(), &row.kind);
+                let marker = if row.selected { "› " } else { "  " };
+                let text = match &row.kind {
+                    WorkspacePickerRowKind::Browse => {
+                        let show_icons = state.settings().appearance.show_icons;
+                        let label =
+                            icon_label(show_icons, NF_FA_FOLDER_TREE, "Browse directories…");
+                        truncate_to_width(&format!("{marker}{label}"), content_width)
+                    }
+                    WorkspacePickerRowKind::Workspace(workspace) => {
+                        workspace_picker_row_text(marker, workspace, content_width, state)
+                    }
+                };
+                Line::styled(text, style)
             })
             .collect::<Vec<_>>();
         if rows.is_empty() && lines.len() < content_height.saturating_sub(footer_rows) {
-            // Only a query can empty the list — the Workspace the client works
-            // in always stands otherwise — and it is said in words, because an
-            // empty box would read as the reader having no Workspaces at all.
+            // Only a query can empty the list — the Browse row and the
+            // Workspace the client works in always stand otherwise — and it is
+            // said in words, because an empty box would read as the reader
+            // having no Workspaces at all.
             lines.push(Line::styled("No Workspaces found", theme.text.subdued));
         } else {
             lines.extend(rows);
@@ -1915,10 +1925,11 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
         // Named in full where the box can hold it, and by the keys alone where
         // it cannot — the same trade the rows make of "[current]" for "C", so
         // a narrow terminal loses wording rather than an affordance.
-        let footer = if content_width < usize::from(NARROW_TERMINAL_WIDTH) {
-            "Enter · ^E · Esc"
+        const FOOTER: &str = "Enter switch · Ctrl+O browse · Ctrl+E describe · Esc close";
+        let footer = if FOOTER.width() <= content_width {
+            FOOTER
         } else {
-            "Enter switch · Ctrl+E describe · Esc close"
+            "Enter · ^O · ^E · Esc"
         };
         lines.push(Line::styled(
             truncate_to_width(footer, content_width),
@@ -2357,13 +2368,18 @@ fn render_workspace_description_editor(
     );
 }
 
-/// One Workspace Picker row: the name the Workspace goes by, whether it is
-/// where the client is working, and the path spelled in full — truncated from
-/// the left where the row cannot hold it, so the directories that tell two
-/// Workspaces of the same name apart are what survives. A path that says no
-/// more than the name, as the Sidekick Workspace's does, is left off.
-fn workspace_picker_row_text(row: &WorkspacePickerRow, width: usize, state: &TuiState) -> String {
-    let marker = if row.selected { "› " } else { "  " };
+/// One Workspace Picker Workspace row after its `marker`: the name the
+/// Workspace goes by, whether it is where the client is working, and the path
+/// spelled in full — truncated from the left where the row cannot hold it, so
+/// the directories that tell two Workspaces of the same name apart are what
+/// survives. A path that says no more than the name, as the Sidekick
+/// Workspace's does, is left off.
+fn workspace_picker_row_text(
+    marker: &str,
+    row: &WorkspaceRow,
+    width: usize,
+    state: &TuiState,
+) -> String {
     let compact = width < usize::from(NARROW_TERMINAL_WIDTH);
     let separator = if compact { " " } else { " · " };
     let show_icons = state.settings().appearance.show_icons;

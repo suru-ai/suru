@@ -35,10 +35,16 @@ pub(super) struct WorkspacePicker {
     /// against each one's name the way the session picker reads its own query
     /// against a Title.
     query: String,
-    /// The Workspace the reader is on, held by identity rather than as a row
+    /// The row the reader is on, held by what it offers rather than as a row
     /// number so a listing landing beneath them leaves them on the Workspace
     /// they were choosing rather than on whatever now stands in its place.
-    selected: Option<WorkspaceId>,
+    selected: Option<Offer>,
+    /// Whether the picker has stepped aside for a Directory Browser opened
+    /// from it, drawing nothing and taking no keys while it keeps its query,
+    /// the row the reader was on, its scroll, and the listing it drew them
+    /// from, so Esc from the browser brings it back as the reader left it
+    /// (see [`Self::step_aside`] and [`Self::step_back`]).
+    stepped_aside: bool,
     /// One row's own context menu, opened by a right press on it: editing
     /// that Workspace's Description always, and choosing its Icon while
     /// `appearance.showIcons` is on (see [`Self::open_menu_at`]). Once open it
@@ -65,17 +71,54 @@ pub(super) struct WorkspacePicker {
     window: ListWindow,
 }
 
+/// What a Workspace Picker row offers, which is how the picker holds the row
+/// the reader is on.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Offer {
+    /// The Browse row, which opens the Directory Browser.
+    Browse,
+    /// A Workspace row, by the Workspace's own identity.
+    Workspace(WorkspaceId),
+}
+
+/// What choosing the row the reader is on does.
+#[derive(Clone, Debug)]
+pub(super) enum WorkspacePickerChoice {
+    /// Opens the Directory Browser, from the Browse row.
+    Browse,
+    /// Lands in the Workspace the row names.
+    Workspace(crate::protocol::Workspace),
+}
+
+/// One row of the picker as a frame draws it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct WorkspacePickerRow {
+    pub(super) selected: bool,
+    pub(super) kind: WorkspacePickerRowKind,
+}
+
+/// What a row stands for, which decides how it is drawn and what choosing it
+/// does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum WorkspacePickerRowKind {
+    /// The picker's way out to a directory it does not list, standing above
+    /// the Workspace rows while no query is typed.
+    Browse,
+    Workspace(WorkspaceRow),
+}
+
+/// What a Workspace row draws of the Workspace it names, and what a press on
+/// it acts on.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct WorkspaceRow {
     /// The Workspace by the name a row gives it, which is the directory a
     /// reader thinks of the work as being in.
     pub(super) name: String,
     /// Where it stands, spelled in full, so two Workspaces named alike stay
     /// told apart.
     pub(super) path: PathBuf,
-    pub(super) selected: bool,
     /// Whether this is the Workspace the client is working in, which is the
-    /// one the picker stands first.
+    /// one the picker stands first among its Workspaces.
     pub(super) current: bool,
     /// The Workspace's Icon, resolved to a glyph already, where the listing
     /// carries one and the reader keeps Icons on. `None` draws the plain
@@ -203,12 +246,30 @@ pub(super) struct DescriptionEdit {
 struct WorkspacePickerRowGeometry {
     row: u16,
     columns: Range<u16>,
-    workspace_id: WorkspaceId,
-    /// The row's own Origin, carried from [`WorkspacePickerRow::origin`]
-    /// rather than re-read off the listing at hit-testing time, so a right
-    /// press always names the Origin the row it landed on was actually drawn
-    /// for.
-    origin: Outlook,
+    target: RowTarget,
+}
+
+/// What a row drawn in the last frame stands for, as a press on it resolves.
+#[derive(Clone, Debug)]
+enum RowTarget {
+    Browse,
+    /// A Workspace, by its identity and by its own Origin, carried from
+    /// [`WorkspaceRow::origin`] rather than re-read off the listing at
+    /// hit-testing time, so a right press always names the Origin the row it
+    /// landed on was actually drawn for.
+    Workspace {
+        origin: Outlook,
+        workspace_id: WorkspaceId,
+    },
+}
+
+impl RowTarget {
+    fn offer(&self) -> Offer {
+        match self {
+            Self::Browse => Offer::Browse,
+            Self::Workspace { workspace_id, .. } => Offer::Workspace(workspace_id.clone()),
+        }
+    }
 }
 
 impl WorkspacePicker {
@@ -223,6 +284,7 @@ impl WorkspacePicker {
             ),
             query: String::new(),
             selected: None,
+            stepped_aside: false,
             menu: None,
             description_editor: None,
             submitted_description: None,
@@ -234,6 +296,7 @@ impl WorkspacePicker {
 
     pub(super) fn open(&mut self) -> SessionListRequest {
         self.open = true;
+        self.stepped_aside = false;
         self.query.clear();
         self.selected = None;
         self.menu = None;
@@ -246,12 +309,34 @@ impl WorkspacePicker {
 
     pub(super) fn close(&mut self) {
         self.open = false;
+        self.stepped_aside = false;
         self.query.clear();
         self.selected = None;
         self.menu = None;
         self.description_editor = None;
         self.submitted_description = None;
         self.listing.clear();
+    }
+
+    /// Stands the picker aside for the Directory Browser opened from it: it
+    /// draws nothing and takes no keys, but keeps everything the reader left
+    /// it with for [`Self::step_back`]. Only its row menu is put away, being
+    /// no part of where the reader was.
+    pub(super) fn step_aside(&mut self) {
+        if !self.open {
+            return;
+        }
+        self.open = false;
+        self.stepped_aside = true;
+        self.menu = None;
+    }
+
+    /// Brings back a picker standing aside for the Directory Browser, as the
+    /// reader left it; one that has since closed stays closed.
+    pub(super) fn step_back(&mut self) {
+        if std::mem::take(&mut self.stepped_aside) {
+            self.open = true;
+        }
     }
 
     pub(super) const fn is_open(&self) -> bool {
@@ -373,11 +458,25 @@ impl WorkspacePicker {
         self.listing.awaits(request)
     }
 
-    /// The Workspace the row the reader is on names, which is the one choosing
-    /// takes. There is none while the listing is on its way: no row is marked,
-    /// so Enter names nothing rather than naming whatever would stand first.
-    pub(super) fn offer_selected(&mut self) -> Option<crate::protocol::Workspace> {
-        self.selected_workspace()
+    /// What choosing the row the reader is on does: open the Directory
+    /// Browser from the Browse row, or land in the Workspace a Workspace row
+    /// names. There is nothing to choose while the listing is on its way: no
+    /// row is marked, so Enter names nothing rather than naming whatever
+    /// would stand first.
+    pub(super) fn offer_selected(&self) -> Option<WorkspacePickerChoice> {
+        match self.selected.as_ref()? {
+            Offer::Browse => self
+                .offers_browse()
+                .then_some(WorkspacePickerChoice::Browse),
+            Offer::Workspace(_) => self
+                .selected_workspace()
+                .map(WorkspacePickerChoice::Workspace),
+        }
+    }
+
+    /// Whether the row the reader is on is the Browse row.
+    pub(super) fn browse_is_selected(&self) -> bool {
+        self.offers_browse() && self.selected == Some(Offer::Browse)
     }
 
     pub(super) fn select_previous(&mut self) {
@@ -399,22 +498,33 @@ impl WorkspacePicker {
     fn rows(&self) -> Vec<WorkspacePickerRow> {
         let current = self.listing.current_workspace().to_owned();
         let origin = self.listing.outlook().clone();
-        self.offered()
+        let browse = self.offers_browse().then(|| WorkspacePickerRow {
+            selected: self.selected == Some(Offer::Browse),
+            kind: WorkspacePickerRowKind::Browse,
+        });
+        let selected_workspace = match &self.selected {
+            Some(Offer::Workspace(selected)) => Some(selected),
+            _ => None,
+        };
+        let workspaces = self
+            .offered()
             .into_iter()
             .map(|workspace| WorkspacePickerRow {
-                name: self.paths().workspace_name(&workspace),
-                current: workspace.id == current.id,
-                selected: self.selected.as_ref() == Some(&workspace.id),
-                icon: workspace
-                    .icon
-                    .as_deref()
-                    .and_then(crate::icon_catalog::glyph),
-                path: workspace.path,
-                workspace_id: workspace.id,
-                origin: origin.clone(),
-                description: workspace.description.map(|description| description.text),
-            })
-            .collect()
+                selected: selected_workspace == Some(&workspace.id),
+                kind: WorkspacePickerRowKind::Workspace(WorkspaceRow {
+                    name: self.paths().workspace_name(&workspace),
+                    current: workspace.id == current.id,
+                    icon: workspace
+                        .icon
+                        .as_deref()
+                        .and_then(crate::icon_catalog::glyph),
+                    path: workspace.path,
+                    workspace_id: workspace.id,
+                    origin: origin.clone(),
+                    description: workspace.description.map(|description| description.text),
+                }),
+            });
+        browse.into_iter().chain(workspaces).collect()
     }
 
     /// The Description of the Workspace the reader is on, which is the one
@@ -434,7 +544,9 @@ impl WorkspacePicker {
     }
 
     fn selected_workspace(&self) -> Option<crate::protocol::Workspace> {
-        let selected = self.selected.as_ref()?;
+        let Some(Offer::Workspace(selected)) = &self.selected else {
+            return None;
+        };
         self.offered()
             .into_iter()
             .find(|workspace| &workspace.id == selected)
@@ -478,44 +590,69 @@ impl WorkspacePicker {
         offered
     }
 
+    /// Whether the Browse row stands above the Workspaces, which it does only
+    /// while no query is typed, so search results are only Workspaces.
+    fn offers_browse(&self) -> bool {
+        self.query.is_empty()
+    }
+
+    /// Every row on offer, top to bottom: the Browse row where it stands, then
+    /// the Workspaces in the order [`Self::offered`] stands them.
+    fn offers(&self) -> Vec<Offer> {
+        self.offers_browse()
+            .then_some(Offer::Browse)
+            .into_iter()
+            .chain(
+                self.offered()
+                    .into_iter()
+                    .map(|workspace| Offer::Workspace(workspace.id)),
+            )
+            .collect()
+    }
+
     fn move_selection(&mut self, distance: isize) {
-        let offered = self.offered();
-        if offered.is_empty() {
+        let mut offers = self.offers();
+        if offers.is_empty() {
             self.selected = None;
             return;
         }
         let current = self
             .selected
             .as_ref()
-            .and_then(|selected| offered.iter().position(|path| &path.id == selected))
+            .and_then(|selected| offers.iter().position(|offer| offer == selected))
             .unwrap_or(0);
-        let length = offered.len() as isize;
+        let length = offers.len() as isize;
         let next = (current as isize + distance).rem_euclid(length) as usize;
-        self.selected = Some(offered[next].id.clone());
+        self.selected = Some(offers.swap_remove(next));
         self.window.reveal();
     }
 
     /// Puts the reader on a row that is still offered: the one they were on
-    /// where it stands, and the first row otherwise — which is the current
-    /// Workspace until a query takes it away, and no row at all when a query
-    /// leaves none.
+    /// where it stands, and the first Workspace row otherwise — which is the
+    /// current Workspace until a query takes it away, and no row at all when
+    /// a query leaves none. The Browse row is somewhere the reader walks to
+    /// and never where they are put, so the picker opens on the Workspace
+    /// they are in and Enter goes on choosing it.
     fn keep_selection_offered(&mut self) {
-        let offered = self.offered();
+        let offers = self.offers();
         if self
             .selected
             .as_ref()
-            .is_some_and(|selected| offered.iter().any(|workspace| &workspace.id == selected))
+            .is_some_and(|selected| offers.contains(selected))
         {
             return;
         }
-        self.selected = offered.first().map(|workspace| workspace.id.clone());
+        self.selected = offers
+            .into_iter()
+            .find(|offer| matches!(offer, Offer::Workspace(_)));
     }
 
     /// Opens a row's own context menu at `position`, naming the Workspace the
     /// row it landed on stands for. It offers editing that Workspace's
     /// Description, and choosing its Icon while Icons are shown. A press
-    /// outside every row opens nothing, leaving whatever menu already stood
-    /// there put away regardless.
+    /// outside every Workspace row — the Browse row stands for none — opens
+    /// nothing, leaving whatever menu already stood there put away
+    /// regardless.
     pub(super) fn open_menu_at(&mut self, position: Position, show_icons: bool) {
         self.menu = None;
         let Some((origin, workspace_id)) = self.hit_row(position) else {
@@ -804,20 +941,20 @@ impl WorkspacePicker {
 
     /// Records where the frame in force drew one row, so a left press over it
     /// can choose it and a right press open that row's own menu.
-    pub(super) fn record_row(
-        &self,
-        row: u16,
-        columns: Range<u16>,
-        workspace_id: WorkspaceId,
-        origin: Outlook,
-    ) {
+    pub(super) fn record_row(&self, row: u16, columns: Range<u16>, kind: &WorkspacePickerRowKind) {
+        let target = match kind {
+            WorkspacePickerRowKind::Browse => RowTarget::Browse,
+            WorkspacePickerRowKind::Workspace(workspace) => RowTarget::Workspace {
+                origin: workspace.origin.clone(),
+                workspace_id: workspace.workspace_id.clone(),
+            },
+        };
         self.row_geometry
             .borrow_mut()
             .push(WorkspacePickerRowGeometry {
                 row,
                 columns,
-                workspace_id,
-                origin,
+                target,
             });
     }
 
@@ -825,25 +962,32 @@ impl WorkspacePicker {
     /// row the picker still offers is drawn there — so a press chooses the
     /// row it landed on through the same path Enter takes.
     pub(super) fn row_hit(&mut self, position: Position) -> bool {
-        let Some((_, workspace_id)) = self.hit_row(position) else {
+        let Some(offer) = self.target_at(position).map(|target| target.offer()) else {
             return false;
         };
-        if !self
-            .offered()
-            .iter()
-            .any(|workspace| workspace.id == workspace_id)
-        {
+        if !self.offers().contains(&offer) {
             return false;
         }
-        self.selected = Some(workspace_id);
+        self.selected = Some(offer);
         true
     }
 
+    /// The Workspace drawn at `position`, by Origin and identity.
     fn hit_row(&self, position: Position) -> Option<(Outlook, WorkspaceId)> {
+        match self.target_at(position)? {
+            RowTarget::Browse => None,
+            RowTarget::Workspace {
+                origin,
+                workspace_id,
+            } => Some((origin, workspace_id)),
+        }
+    }
+
+    fn target_at(&self, position: Position) -> Option<RowTarget> {
         self.row_geometry
             .borrow()
             .iter()
             .find(|cell| cell.row == position.y && cell.columns.contains(&position.x))
-            .map(|cell| (cell.origin.clone(), cell.workspace_id.clone()))
+            .map(|cell| cell.target.clone())
     }
 }

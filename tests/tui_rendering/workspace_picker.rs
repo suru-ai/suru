@@ -13,7 +13,7 @@ use crate::support::{
     fixture_instance_id, model_descriptor, noncanonical_spelling, ready_health,
     rendered_application_buffer, rendered_application_rows, rendered_application_rows_at,
     rendered_row, selected_session_snapshot, selector_label, sidebar_column,
-    studio_stops_answering, text_position, type_terminal_text, workspace_dir,
+    studio_stops_answering, text_position, type_terminal_text, workspace_dir, workspace_resolution,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -21,15 +21,18 @@ use crossterm::event::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AgentSelection, EffectiveSettings, ModelAvailability, ModelCatalog, ModelId,
-        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, Session, SessionId,
-        SessionListItem, SessionStatus, SessionSummary, SessionTimestamp, SidebarSettings,
-        SidebarVisibility, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest,
-        SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery, Workspace,
+        AgentSelection, ChildDirectory, DirectoryListing, DirectorySourceControl,
+        EffectiveSettings, ListDirectoryRequest, ModelAvailability, ModelCatalog, ModelId,
+        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ResolvedWorkspace, Session,
+        SessionId, SessionListItem, SessionStatus, SessionSummary, SessionTimestamp,
+        SidebarSettings, SidebarVisibility, SkillCatalog, SkillCatalogCapabilities,
+        SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery,
+        Workspace,
     },
     tui::{
-        Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
-        SessionListRequest, SessionListScope, SessionListSurface,
+        Application, ApplicationEvent, ApplicationTransition, CommandId, DirectoryListingId,
+        SemanticCommandId, SessionListRequest, SessionListScope, SessionListSurface, TerminalFacts,
+        WorkspaceResolutionSurface,
     },
 };
 
@@ -381,9 +384,12 @@ fn the_arrows_walk_the_rows_and_wrap_past_the_ends() {
     press(&mut application, KeyCode::Down);
     assert_eq!(
         selected_row(&application),
-        "here",
-        "walking past the last row comes back to the first"
+        "Browse",
+        "walking past the last row comes back to the first, the Browse row"
     );
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "here");
+    press(&mut application, KeyCode::Up);
     press(&mut application, KeyCode::Up);
     assert_eq!(
         selected_row(&application),
@@ -590,12 +596,14 @@ fn a_left_press_on_a_row_scrolled_into_view_chooses_that_row() {
             application
         };
         // The last row but one, which the window holds only once the reader
-        // has walked past its end.
+        // has walked past its end — past the Browse row above the current
+        // Workspace, which is where walking up from it goes first.
         let target = NAMES[NAMES.len() - 2];
 
         let mut keyed = picking();
-        press(&mut keyed, KeyCode::Up);
-        press(&mut keyed, KeyCode::Up);
+        for _ in 0..3 {
+            press(&mut keyed, KeyCode::Up);
+        }
         assert_eq!(selected_row_at(&keyed, frame), target, "{frame:?}");
         let entered = choose_unanswered(&mut keyed);
 
@@ -605,6 +613,7 @@ fn a_left_press_on_a_row_scrolled_into_view_chooses_that_row() {
             !unscrolled.contains(target),
             "{frame:?}: the window does not hold {target} before it scrolls: {unscrolled}"
         );
+        press(&mut pointed, KeyCode::Up);
         press(&mut pointed, KeyCode::Up);
         let pressed = press_row(&mut pointed, frame, MouseButton::Left, target);
 
@@ -1702,6 +1711,375 @@ fn enter_on_a_query_no_workspace_carries_chooses_nothing() {
     );
 }
 
+/// What the Browse row says, which tells it from the Workspace rows beneath it.
+const BROWSE_ROW: &str = "Browse directories…";
+
+/// Above its Workspaces the picker stands a Browse row, its way out to a
+/// directory it does not list, and the current Workspace stands first beneath
+/// it.
+#[test]
+fn the_browse_row_stands_first_above_the_workspace_rows() {
+    let here = workspace(&["work", "here"]);
+    let ledger = workspace(&["work", "ledger"]);
+    let mut application = connected_application(&here);
+
+    open_picker_with(&mut application, vec![rooted("Older", &ledger, 10)]);
+
+    let lines = picker_lines(&application);
+    assert_eq!(
+        lines[0], BROWSE_ROW,
+        "the Browse row stands first: {lines:?}"
+    );
+    assert!(
+        lines[1].contains("here") && lines[1].contains("[current]"),
+        "the current Workspace stands first beneath it: {lines:?}"
+    );
+    assert!(lines[2].contains("ledger"), "{lines:?}");
+}
+
+/// The picker opens on the Workspace the reader is in rather than on the
+/// Browse row above it, so Enter goes on choosing what it always chose.
+#[test]
+fn the_picker_opens_on_the_current_workspace_rather_than_the_browse_row() {
+    let here = workspace(&["work", "here"]);
+    let mut application = connected_application(&here);
+
+    open_picker_with(&mut application, narrowable_sessions());
+
+    assert_eq!(selected_row(&application), "here");
+    let (_, _, _, request) = workspace_resolution(&choose_unanswered(&mut application))
+        .expect("Enter chooses the Workspace the reader is on");
+    assert_eq!(request.path, here);
+}
+
+/// Search results are only Workspaces: a query takes the Browse row away, and
+/// giving the query up brings it back above the Workspaces, the reader left
+/// on the Workspace they were on.
+#[test]
+fn a_query_hides_the_browse_row_and_clearing_it_brings_it_back() {
+    let mut application = connected_application(&workspace(&["work", "here"]));
+    open_picker_with(&mut application, narrowable_sessions());
+    press(&mut application, KeyCode::Up);
+    assert_eq!(selected_row(&application), "Browse");
+
+    type_terminal_text(&mut application, "e");
+
+    let narrowed = picker_lines(&application);
+    assert!(
+        !narrowed.iter().any(|line| line.contains(BROWSE_ROW)),
+        "a query leaves only Workspaces: {narrowed:?}"
+    );
+    assert_eq!(
+        selected_row(&application),
+        "here",
+        "the reader is put on the first Workspace the query leaves"
+    );
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "engine");
+
+    backspace(&mut application);
+
+    let restored = picker_lines(&application);
+    assert_eq!(
+        restored[0], BROWSE_ROW,
+        "the Browse row stands first again once the query is given up: {restored:?}"
+    );
+    assert_eq!(
+        selected_row(&application),
+        "engine",
+        "and the reader stays on the Workspace they were on"
+    );
+}
+
+/// Enter on the Browse row opens the Directory Browser in the picker's place,
+/// rooted where `/browse` roots it: at the Landing's Execution Directory,
+/// here a subdirectory of its Workspace.
+#[test]
+fn enter_on_the_browse_row_opens_the_directory_browser_at_the_execution_directory() {
+    let repository = workspace(&["work", "repo"]);
+    let here = repository.join("here");
+    let mut application = landing_in_subdirectory(&repository, &here);
+    open_picker_with(&mut application, narrowable_sessions());
+    press(&mut application, KeyCode::Up);
+
+    let (_, request) = expect_directory_listing(choose_unanswered(&mut application));
+
+    assert_eq!(
+        request,
+        ListDirectoryRequest {
+            path: here.clone(),
+            base: Some(here),
+        },
+        "the browser is rooted at the Landing's Execution Directory, and reads from it"
+    );
+    assert_eq!(
+        overlays_drawn(&application),
+        (false, true),
+        "the browser stands in the picker's place"
+    );
+}
+
+/// Ctrl+O opens the Directory Browser from anywhere in the picker, a query
+/// typed or not, so the reader need not walk to the Browse row — which a
+/// query takes away.
+#[test]
+fn ctrl_o_opens_the_directory_browser_with_or_without_a_query() {
+    for query in ["", "eng"] {
+        let here = workspace(&["work", "here"]);
+        let mut application = connected_application(&here);
+        open_picker_with(&mut application, narrowable_sessions());
+        type_terminal_text(&mut application, query);
+
+        let (_, request) = expect_directory_listing(ctrl_o(&mut application));
+
+        assert_eq!(
+            request.path, here,
+            "{query:?}: rooted at the Landing's Execution Directory"
+        );
+        assert_eq!(
+            overlays_drawn(&application),
+            (false, true),
+            "{query:?}: the browser stands in the picker's place"
+        );
+    }
+}
+
+/// Esc from a browser the picker opened goes back to the picker as the reader
+/// left it — the query typed, the row they were on, and how far the list had
+/// scrolled to keep that row in view — asking the Server for nothing. A
+/// second Esc closes the picker as it always does.
+#[test]
+fn escape_from_a_browser_opened_from_the_picker_returns_to_the_picker_as_it_was() {
+    let here = workspace(&["work", "here"]);
+    let mut application = connected_application(&here);
+    open_picker_with(
+        &mut application,
+        (1..=20)
+            .map(|index| {
+                rooted(
+                    "Work",
+                    &workspace(&["work", &format!("ws{index:02}")]),
+                    index,
+                )
+            })
+            .collect(),
+    );
+    type_terminal_text(&mut application, "ws");
+    press(&mut application, KeyCode::Up);
+    let left = rendered_application_rows(&application);
+    assert!(
+        !left.join("\n").contains("ws20"),
+        "the row the reader walked to is beneath the first ones, so the list has scrolled: {left:#?}"
+    );
+    let (listing_id, _) = expect_directory_listing(ctrl_o(&mut application));
+    application
+        .handle_event(ApplicationEvent::DirectoryListed {
+            listing_id,
+            result: Ok(DirectoryListing {
+                root: here.clone(),
+                parent: here.parent().map(Path::to_owned),
+                source_control: DirectorySourceControl::Plain,
+                children: Vec::new(),
+            }),
+        })
+        .expect("list the browser's root");
+
+    assert_eq!(
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE
+            )))
+            .expect("back out of the browser"),
+        ApplicationTransition::Continue,
+        "going back to the picker asks the Server for nothing"
+    );
+
+    assert_eq!(
+        rendered_application_rows(&application),
+        left,
+        "the picker stands exactly as the reader left it"
+    );
+    press(&mut application, KeyCode::Esc);
+    assert_eq!(overlays_drawn(&application), (false, false));
+}
+
+/// A choice in a browser the picker opened is done with both: the Landing
+/// opens on the directory chosen, resolved as the picker's own choice is,
+/// and neither overlay stands over it.
+#[test]
+fn a_choice_in_a_browser_opened_from_the_picker_closes_both() {
+    let here = workspace(&["work", "here"]);
+    let alpha = here.join("alpha");
+    let mut application = connected_application(&here);
+    open_picker_with(&mut application, narrowable_sessions());
+    type_terminal_text(&mut application, "eng");
+    let (listing_id, _) = expect_directory_listing(ctrl_o(&mut application));
+    application
+        .handle_event(ApplicationEvent::DirectoryListed {
+            listing_id,
+            result: Ok(DirectoryListing {
+                root: here.clone(),
+                parent: here.parent().map(Path::to_owned),
+                source_control: DirectorySourceControl::Plain,
+                children: vec![ChildDirectory {
+                    name: "alpha".to_owned(),
+                    path: alpha.clone(),
+                    source_control: DirectorySourceControl::Plain,
+                    hidden: false,
+                }],
+            }),
+        })
+        .expect("list the browser's root");
+    press(&mut application, KeyCode::Down);
+
+    let choice = choose_unanswered(&mut application);
+
+    assert!(
+        matches!(
+            choice,
+            ApplicationTransition::DetachSessionAndResolveWorkspace { .. }
+        ),
+        "choosing opens the Landing and asks the Server where it is: {choice:?}"
+    );
+    let (_, surface, _, request) =
+        workspace_resolution(&choice).expect("choosing asks for a Workspace resolution");
+    assert_eq!(surface, WorkspaceResolutionSurface::WorkspacePicker);
+    assert_eq!(request.path, alpha);
+    assert_eq!(
+        overlays_drawn(&application),
+        (false, false),
+        "neither the browser nor the picker beneath it is left standing"
+    );
+}
+
+/// The footer names Ctrl+O beside the keys it already named: in words where
+/// the box holds them, and by the chord alone where it does not.
+#[test]
+fn the_footer_names_ctrl_o() {
+    let mut application = connected_application(&workspace(&["work", "here"]));
+    open_picker_with(&mut application, narrowable_sessions());
+
+    let wide = rendered_application_rows_at(&application, 80, 15);
+    let footer = &wide[rendered_row(&wide, "Esc close")];
+    assert!(footer.contains("Ctrl+O browse"), "{footer}");
+
+    let narrow = rendered_application_rows_at(&application, 43, 10);
+    let footer = &narrow[rendered_row(&narrow, "^E")];
+    assert!(footer.contains("^O"), "{footer}");
+}
+
+/// A left press on the Browse row opens the Directory Browser exactly as
+/// Enter on it does.
+#[test]
+fn a_left_press_on_the_browse_row_opens_the_browser_exactly_as_enter_does() {
+    for frame in PICKER_FRAMES {
+        let here = workspace(&["work", "here"]);
+        let picking = || {
+            let mut application = connected_application(&here);
+            open_picker_with(&mut application, narrowable_sessions());
+            application
+        };
+
+        let mut keyed = picking();
+        press(&mut keyed, KeyCode::Up);
+        let entered = choose_unanswered(&mut keyed);
+        let mut pointed = picking();
+        let pressed = press_row(&mut pointed, frame, MouseButton::Left, BROWSE_ROW);
+
+        let (_, request) = expect_directory_listing(pressed.clone());
+        assert_eq!(request.path, here, "{frame:?}");
+        assert_eq!(
+            pressed, entered,
+            "{frame:?}: the press asks what Enter asks"
+        );
+        assert_eq!(
+            rendered_application_rows_at(&pointed, frame.0, frame.1),
+            rendered_application_rows_at(&keyed, frame.0, frame.1),
+            "{frame:?}: and the same browser stands in the picker's place"
+        );
+    }
+}
+
+/// Choosing a Workspace waits out an Agent Selection update still on its way,
+/// since it opens the Landing; the Browse row only opens the browser, so
+/// Enter on it opens the browser at once, as Ctrl+O does.
+#[test]
+fn enter_on_the_browse_row_does_not_wait_out_a_pending_agent_selection() {
+    let here = workspace(&["work", "here"]);
+    let mut application = application_awaiting_agent_selection(&here);
+    open_picker_with(&mut application, narrowable_sessions());
+    press(&mut application, KeyCode::Up);
+
+    let (_, request) = expect_directory_listing(choose_unanswered(&mut application));
+
+    assert_eq!(request.path, here);
+    assert_eq!(overlays_drawn(&application), (false, true));
+}
+
+/// The Browse row stands for no Workspace, so nothing acts on it as on one: a
+/// right press on it opens no menu, and Ctrl+E on it describes nothing.
+#[test]
+fn the_browse_row_has_no_menu_and_no_description_to_edit() {
+    for frame in PICKER_FRAMES {
+        let mut application = connected_application(&workspace(&["work", "here"]));
+        open_picker_with(&mut application, narrowable_sessions());
+        let before = rendered_application_rows_at(&application, frame.0, frame.1);
+
+        assert_eq!(
+            press_row(&mut application, frame, MouseButton::Right, BROWSE_ROW),
+            ApplicationTransition::Continue,
+            "{frame:?}"
+        );
+        assert_eq!(
+            rendered_application_rows_at(&application, frame.0, frame.1),
+            before,
+            "{frame:?}: no menu opens"
+        );
+    }
+
+    let mut application = connected_application(&workspace(&["work", "here"]));
+    open_picker_with(&mut application, narrowable_sessions());
+    press(&mut application, KeyCode::Up);
+    let before = rendered_application_rows(&application);
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("press Ctrl+E");
+    assert_eq!(
+        rendered_application_rows(&application),
+        before,
+        "no Description editor opens"
+    );
+}
+
+/// The browser reads the Outlook's Server, so once that Remote stops
+/// answering, Ctrl+O and Enter on the Browse row are refused as any other
+/// start is: nothing is asked, the picker stands, and the refusal is said.
+#[test]
+fn opening_the_browser_from_the_picker_is_refused_for_an_unreachable_remote() {
+    let ways_in: [fn(&mut Application) -> ApplicationTransition; 2] = [ctrl_o, |application| {
+        press(application, KeyCode::Up);
+        choose_unanswered(application)
+    }];
+    for open in ways_in {
+        let mut application = application_looking_at_studio();
+        open_picker_with(&mut application, Vec::new());
+        studio_stops_answering(&mut application, 1, Duration::from_secs(5));
+
+        assert_eq!(open(&mut application), ApplicationTransition::Continue);
+        assert_eq!(overlays_drawn(&application), (true, false));
+        press(&mut application, KeyCode::Esc);
+        let refused = rendered_application_rows_at(&application, 120, 20).join("\n");
+        assert!(
+            refused.contains("studio is unreachable"),
+            "the refusal is said: {refused}"
+        );
+    }
+}
+
 /// The Workspaces the narrowing tests narrow: the client works in `here`, and
 /// the rest stand by which held work most recently — `engine`, `atlas`, then
 /// `ledger`.
@@ -1915,13 +2293,27 @@ fn press(application: &mut Application, code: KeyCode) {
         .expect("drive the Workspace Picker");
 }
 
-/// The picker's own rows, taken from the frame between the search line and the
-/// footer and trimmed of the box that draws them.
+/// The picker's Workspace rows, taken from the frame between the search line
+/// and the footer and trimmed of the box that draws them, leaving out the
+/// Browse row above them.
 fn picker_rows(application: &Application) -> Vec<String> {
     picker_rows_at(application, 80, 15)
 }
 
 fn picker_rows_at(application: &Application, width: u16, height: u16) -> Vec<String> {
+    picker_lines_at(application, width, height)
+        .into_iter()
+        .filter(|row| row.trim_start_matches(['›', ' ']) != BROWSE_ROW)
+        .collect()
+}
+
+/// Every line the picker draws between its search line and its footer, the
+/// Browse row among them, trimmed of the box that draws them.
+fn picker_lines(application: &Application) -> Vec<String> {
+    picker_lines_at(application, 80, 15)
+}
+
+fn picker_lines_at(application: &Application, width: u16, height: u16) -> Vec<String> {
     let rows = rendered_application_rows_at(application, width, height);
     let search = rendered_row(&rows, "Search:");
     let footer = rows
@@ -1950,9 +2342,9 @@ fn backspace(application: &mut Application) {
 }
 
 /// The name of the Workspace the reader is on, read off the marker the frame
-/// draws in front of it.
+/// draws in front of it — `Browse` where they are on the Browse row.
 fn selected_row(application: &Application) -> String {
-    let rows = picker_rows(application);
+    let rows = picker_lines(application);
     let selected = rows
         .iter()
         .find(|row| row.starts_with('›'))
@@ -1966,9 +2358,10 @@ fn selected_row(application: &Application) -> String {
 }
 
 /// The name of the Workspace the reader is on in a frame of `size`, read off
-/// the marker the frame draws in front of it.
+/// the marker the frame draws in front of it — `Browse` where they are on the
+/// Browse row.
 fn selected_row_at(application: &Application, size: (u16, u16)) -> String {
-    let rows = picker_rows_at(application, size.0, size.1);
+    let rows = picker_lines_at(application, size.0, size.1);
     let selected = rows
         .iter()
         .find(|row| row.starts_with('›'))
@@ -1998,6 +2391,68 @@ fn choose_unanswered(application: &mut Application) -> ApplicationTransition {
             KeyModifiers::NONE,
         )))
         .expect("choose the Workspace the reader is on")
+}
+
+/// Ctrl+O, which opens the Directory Browser from anywhere in the picker.
+fn ctrl_o(application: &mut Application) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("press Ctrl+O")
+}
+
+/// The listing a Directory Browser opening asks the Outlook's Server for.
+fn expect_directory_listing(
+    transition: ApplicationTransition,
+) -> (DirectoryListingId, ListDirectoryRequest) {
+    let ApplicationTransition::ListDirectory {
+        listing_id,
+        request,
+        ..
+    } = transition
+    else {
+        panic!("the browser asks the Server for a directory's children, not {transition:?}");
+    };
+    (listing_id, request)
+}
+
+/// Whether a frame draws the Workspace Picker, and whether it draws the
+/// Directory Browser.
+fn overlays_drawn(application: &Application) -> (bool, bool) {
+    let frame = rendered_application_rows(application).join("\n");
+    (
+        frame.contains(" Workspaces "),
+        frame.contains(" Directory Browser "),
+    )
+}
+
+/// A Landing in `workspace` whose Execution Directory is `subdirectory`, a
+/// directory beneath it, as the Server resolves the launch to.
+fn landing_in_subdirectory(workspace: &Path, subdirectory: &Path) -> Application {
+    let mut application = Application::new(workspace, TerminalFacts::default());
+    let launch = application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(fixture_instance_id(), 42_424),
+        )))
+        .expect("connect the application");
+    let (outlook, surface, request_id, _) =
+        workspace_resolution(&launch).expect("connecting resolves where the client launched");
+    application
+        .handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface,
+            request_id,
+            result: Ok(ResolvedWorkspace {
+                execution_directory: Some(suru::protocol::ExecutionDirectory {
+                    path: subdirectory.to_owned(),
+                }),
+                ..ResolvedWorkspace::directory(workspace.to_owned())
+            }),
+        })
+        .expect("resolve the Landing into a subdirectory of its Workspace");
+    application
 }
 
 /// The Spinner's first frame, which is what a reading on its way shows.

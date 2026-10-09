@@ -541,18 +541,25 @@ pub(super) fn command_for_theme_picker_event(event: InputEvent) -> Option<Comman
 ///
 /// Ctrl+E describes the Workspace the reader is on: a letter would only
 /// narrow the list, so the one key that acts on a row is a chord, as Ctrl+D
-/// is in the session picker.
+/// is in the session picker. Ctrl+O opens the Directory Browser, as the
+/// Browse row does, from anywhere in the picker — a query typed or not, since
+/// a query takes that row away — and as a chord for the same reason; bare
+/// Ctrl+N stays "down", as it is in every list.
 pub(super) fn command_for_workspace_picker_event(event: InputEvent) -> Option<CommandId> {
     match event {
         event @ InputEvent::Mouse(_) => command_for_terminal_event(event),
         InputEvent::Key(key)
-            if key.kind == KeyEventKind::Press
-                && key.code == KeyCode::Char('e')
-                && key.modifiers == KeyModifiers::CONTROL =>
+            if key.kind == KeyEventKind::Press && key.modifiers == KeyModifiers::CONTROL =>
         {
-            Some(CommandId::InvokeSemantic(
-                SemanticCommandId::WorkspaceDescriptionEdit,
-            ))
+            match key.code {
+                KeyCode::Char('e') => Some(CommandId::InvokeSemantic(
+                    SemanticCommandId::WorkspaceDescriptionEdit,
+                )),
+                KeyCode::Char('o') => Some(CommandId::InvokeSemantic(
+                    SemanticCommandId::WorkspaceBrowse,
+                )),
+                _ => command_for_picker_event(InputEvent::Key(key), &WORKSPACE_PICKER_COMMANDS),
+            }
         }
         event => command_for_picker_event(event, &WORKSPACE_PICKER_COMMANDS),
     }

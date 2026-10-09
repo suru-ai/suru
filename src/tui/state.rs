@@ -94,7 +94,7 @@ use super::{
         PendingPrompt, TranscriptCache, TranscriptDisclosure, TranscriptFolds, TranscriptGroups,
         TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart, streams_live_output,
     },
-    workspace_picker::WorkspacePicker,
+    workspace_picker::{WorkspacePicker, WorkspacePickerChoice},
 };
 
 #[cfg(test)]
@@ -6916,7 +6916,7 @@ impl Application {
             | CommandId::PagePreviousWorkspaces
             | CommandId::PageNextWorkspaces
             | CommandId::SelectWorkspace
-            | CommandId::CloseWorkspacePicker) => Ok(self.handle_workspace_picker_command(command)),
+            | CommandId::CloseWorkspacePicker) => self.handle_workspace_picker_command(command),
             command @ (CommandId::SelectPreviousSubagent
             | CommandId::SelectNextSubagent
             | CommandId::OpenSelectedSubagent
@@ -6945,15 +6945,19 @@ impl Application {
     /// Agent Selection update instead of racing it. Choosing a Workspace, or a
     /// directory in the Directory Browser, is one of them: it opens the
     /// Landing, which takes over the Agent Selection from the Session being
-    /// left.
+    /// left. Choosing the Workspace Picker's Browse row only opens the
+    /// browser, so it does not wait.
     fn defers_for_agent_selection(&self, command: &CommandId) -> bool {
-        self.state.selection_update_pending()
-            && matches!(
+        if !self.state.selection_update_pending() {
+            return false;
+        }
+        match command {
+            CommandId::SelectWorkspace => !self.state.workspace_picker.browse_is_selected(),
+            command => matches!(
                 command,
                 CommandId::SubmitSteer
                     | CommandId::SubmitQueue
                     | CommandId::SelectSession
-                    | CommandId::SelectWorkspace
                     | CommandId::SelectModel
                     | CommandId::InvokeSemantic(
                         SemanticCommandId::SessionList
@@ -6962,7 +6966,8 @@ impl Application {
                             | SemanticCommandId::ModelOptionsApply
                             | SemanticCommandId::DirectoryBrowserChoose
                     )
-            )
+            ),
+        }
     }
 
     /// Tries an Origin that has stopped answering again, now, rather than
@@ -7686,7 +7691,10 @@ impl Application {
         }
     }
 
-    fn handle_workspace_picker_command(&mut self, command: CommandId) -> ApplicationTransition {
+    fn handle_workspace_picker_command(
+        &mut self,
+        command: CommandId,
+    ) -> Result<ApplicationTransition> {
         match command {
             CommandId::InsertWorkspaceSearch(text) => self.state.workspace_picker.insert(&text),
             CommandId::DeleteWorkspaceSearchBackward => {
@@ -7702,8 +7710,13 @@ impl Application {
             // Server seconds the reader need not spend watching the picker.
             // Before the listing arrives no row is the reader's, so there is
             // nothing to choose and the picker stands on its loading line.
-            CommandId::SelectWorkspace => {
-                if let Some(workspace) = self.state.workspace_picker.offer_selected() {
+            // Choosing the Browse row opens the Directory Browser in the
+            // picker's place, as the picker's own key does.
+            CommandId::SelectWorkspace => match self.state.workspace_picker.offer_selected() {
+                Some(WorkspacePickerChoice::Browse) => {
+                    return self.invoke_semantic(SemanticCommandId::WorkspaceBrowse);
+                }
+                Some(WorkspacePickerChoice::Workspace(workspace)) => {
                     self.state.workspace_picker.close();
                     let request = ResolveWorkspaceRequest {
                         checkout_id: None,
@@ -7717,12 +7730,13 @@ impl Application {
                         base: None,
                         path: workspace.path.clone(),
                     };
-                    return self.land_in_chosen_workspace(workspace, request);
+                    return Ok(self.land_in_chosen_workspace(workspace, request));
                 }
-            }
+                None => {}
+            },
             _ => {}
         }
-        ApplicationTransition::Continue
+        Ok(ApplicationTransition::Continue)
     }
 
     /// Opens the Landing in `workspace` at once, letting go of whatever the
@@ -7783,14 +7797,27 @@ impl Application {
             // reader chose is the directory itself, so that is what the
             // Landing names while it waits.
             SemanticCommandId::DirectoryBrowserChoose => {
-                let request = browser.choose_focused();
+                let (request, provenance) = browser.choose_focused();
+                match provenance {
+                    DirectoryBrowserProvenance::Standalone => {}
+                    // A choice is done with the picker the browser was
+                    // opened from as well, so nothing is left to dismiss.
+                    DirectoryBrowserProvenance::FromWorkspacePicker => {
+                        self.state.workspace_picker.close();
+                    }
+                }
                 let directory = Workspace::directory(request.path.clone());
                 return self.land_in_chosen_workspace(directory, request);
             }
             SemanticCommandId::DirectoryBrowserClose => {
-                // A browser opened standalone has nowhere to go back to, so
-                // Esc closes it outright.
-                let DirectoryBrowserProvenance::Standalone = browser.close();
+                match browser.close() {
+                    // A browser opened standalone has nowhere to go back to,
+                    // so Esc closes it outright.
+                    DirectoryBrowserProvenance::Standalone => {}
+                    DirectoryBrowserProvenance::FromWorkspacePicker => {
+                        self.state.workspace_picker.step_back();
+                    }
+                }
                 None
             }
             SemanticCommandId::DirectoryBrowserHiddenToggle => {
@@ -10257,17 +10284,25 @@ impl Application {
                 Ok(ApplicationTransition::ListSessions(request))
             }
             // The browser starts where the Landing would begin a Session, on
-            // whichever Server the Outlook is turned toward.
+            // whichever Server the Outlook is turned toward. Opened over the
+            // Workspace Picker — by its Browse row or its key — it stands in
+            // the picker's place, which steps aside until the browser is done.
             SemanticCommandId::WorkspaceBrowse => {
                 let execution_directory = self
                     .state
                     .execution_directory
                     .clone()
                     .unwrap_or_else(|| self.state.workspace.path.clone());
+                let provenance = if self.state.workspace_picker.is_open() {
+                    self.state.workspace_picker.step_aside();
+                    DirectoryBrowserProvenance::FromWorkspacePicker
+                } else {
+                    DirectoryBrowserProvenance::Standalone
+                };
                 let ask = self
                     .state
                     .directory_browser
-                    .open(execution_directory, DirectoryBrowserProvenance::Standalone);
+                    .open(execution_directory, provenance);
                 self.state.command_mode = CommandMode::Composer;
                 Ok(self.list_directory(ask))
             }

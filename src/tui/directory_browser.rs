@@ -34,6 +34,10 @@ pub(super) enum DirectoryBrowserProvenance {
     /// Opened by `/browse` or its chord, so Esc closes it outright.
     #[default]
     Standalone,
+    /// Opened from the Workspace Picker, by its Browse row or its key, so Esc
+    /// goes back to the picker as the reader left it, and a choice closes
+    /// the picker as well as the browser.
+    FromWorkspacePicker,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -372,21 +376,25 @@ impl DirectoryBrowser {
 
     /// Chooses the focused row, closing the browser since a choice is done
     /// with it, and answers the Workspace resolution that lands the reader in
-    /// the row's directory: named by the Server's own path and read from the
+    /// the row's directory — named by the Server's own path and read from the
     /// Landing's Execution Directory, with no Workspace or remembered
     /// directory beside it, because the directory chosen is itself where the
-    /// next Session works.
-    pub(super) fn choose_focused(&mut self) -> ResolveWorkspaceRequest {
+    /// next Session works — and where the browser was opened from, which the
+    /// choice is done with too.
+    pub(super) fn choose_focused(
+        &mut self,
+    ) -> (ResolveWorkspaceRequest, DirectoryBrowserProvenance) {
         let path = self.focused.directory().to_owned();
         let base = self.base.clone();
-        self.close();
-        ResolveWorkspaceRequest {
+        let provenance = self.close();
+        let request = ResolveWorkspaceRequest {
             checkout_id: None,
             remembered_execution_directory: None,
             workspace_id: None,
             base: Some(base),
             path,
-        }
+        };
+        (request, provenance)
     }
 
     /// Shows the directories the Server flagged hidden, each in its place
