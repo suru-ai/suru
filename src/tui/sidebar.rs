@@ -607,6 +607,10 @@ pub(super) enum SidebarPress {
     /// The press asked for a behavior, which its caller invokes: a press
     /// mints no behavior of its own, it only says which one and on what.
     Invoke(SemanticInvocation),
+    /// The press landed on the new-Session affordance, which stands for `/new`
+    /// rather than for an entry of the Sidebar's own: the client opens the
+    /// Landing by that command, and nothing here moves unless it does.
+    NewSession,
     /// The Sidebar answered the press itself and there is nothing to invoke —
     /// a menu put away, or an item that asked to be confirmed rather than
     /// acting. Either way the press is spent and reaches nothing else.
@@ -641,7 +645,8 @@ pub(super) enum SidebarActivation {
         context: Box<crate::protocol::ResolvedWorkspace>,
     },
     /// The reader asked for a fresh Landing in the current Workspace, which
-    /// the client opens by the very command `/new` invokes.
+    /// the client opens by the very command `/new` invokes. The Sidebar has
+    /// moved nothing for it: only a Landing that opens takes the keys.
     NewSession,
 }
 
@@ -1107,6 +1112,11 @@ impl Sidebar {
             && !self.is_readable(reference)
         {
             return SidebarPress::Answered;
+        }
+        // Row focus is not borrowed for the affordance: `/new` may yet be
+        // refused, and a refusal must leave the Sidebar exactly as it stood.
+        if target == SidebarTarget::NewSession {
+            return SidebarPress::NewSession;
         }
         self.open_entry.press();
         self.focus_on(target);
@@ -1933,13 +1943,9 @@ impl Sidebar {
                 }
                 return SidebarActivation::Answered;
             }
-            // The reader is done choosing: the Landing is where the Prompt
-            // they asked for it to write is written, so its composer takes
-            // the keys as an opened Session's does.
-            SidebarFocus::NewSession => {
-                self.hand_back_keys();
-                return SidebarActivation::NewSession;
-            }
+            // Nothing here moves yet: `/new` may be refused, and a refusal
+            // leaves the reader in the Sidebar exactly as they stood.
+            SidebarFocus::NewSession => return SidebarActivation::NewSession,
         };
         if !self.is_readable(&wanted) {
             return SidebarActivation::Answered;

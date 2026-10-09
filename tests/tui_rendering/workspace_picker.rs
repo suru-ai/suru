@@ -930,6 +930,57 @@ fn a_fresh_landing_lets_go_of_a_workspace_still_resolving() {
     );
 }
 
+/// A refusal is an answer too. Arriving for a Workspace the reader has since
+/// let go of by going to a fresh Landing, it is said nowhere, and that Landing
+/// and the draft begun on it stand exactly as they were.
+#[test]
+fn a_late_refusal_for_a_workspace_let_go_of_moves_nothing() {
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
+    let mut application = connected_application(&here);
+
+    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    press(&mut application, KeyCode::Down);
+    let resolution = choose_unanswered(&mut application);
+    let (outlook, surface, request_id, _) = crate::support::workspace_resolution(&resolution)
+        .expect("choosing a Workspace asks its Server to resolve it");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionNew,
+        )))
+        .expect("go to a fresh Landing instead");
+    type_terminal_text(&mut application, "a different thought");
+    let before = rendered_application_rows_at(&application, 120, 20);
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::WorkspaceResolved {
+                outlook,
+                surface,
+                request_id,
+                result: Err("the disk is full".to_owned()),
+            })
+            .expect("deliver the late refusal"),
+        ApplicationTransition::Continue,
+        "the reader went elsewhere, so the refusal has nothing left to answer"
+    );
+    let after = rendered_application_rows_at(&application, 120, 20);
+    let landing = after.join("\n");
+    assert!(
+        !landing.contains("the disk is full") && !landing.contains("Could not open"),
+        "no refusal is said for a choice the reader let go of: {landing}"
+    );
+    assert_eq!(
+        after, before,
+        "the fresh Landing and its draft stand exactly as they were"
+    );
+    assert_eq!(
+        session_picker_scope(&mut application),
+        SessionListScope::CurrentWorkspace(here.into())
+    );
+}
+
 /// A Workspace asked for anywhere else — here the Sidekick's — is asked for
 /// later than the one the Landing awaits, so it is the one the reader is left
 /// in, whichever of the two the Server answers first.

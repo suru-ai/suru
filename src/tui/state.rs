@@ -7359,8 +7359,22 @@ impl Application {
     fn answer_sidebar_press(&mut self, press: SidebarPress) -> Result<ApplicationTransition> {
         match press {
             SidebarPress::Invoke(invocation) => self.invoke_semantic(invocation),
+            SidebarPress::NewSession => self.new_session_from_sidebar(),
             SidebarPress::Answered | SidebarPress::Elsewhere => Ok(ApplicationTransition::Continue),
         }
+    }
+
+    /// Opens the Landing for the Sidebar's new-Session affordance by invoking
+    /// `/new` itself, so it is refused exactly where `/new` is. Only a Landing
+    /// that opened takes the keys from the Sidebar, the reader being done
+    /// choosing as they are when a Session opens: a refusal leaves the query,
+    /// the selector, and row focus exactly as they stood.
+    fn new_session_from_sidebar(&mut self) -> Result<ApplicationTransition> {
+        let transition = self.invoke_semantic(SemanticCommandId::SessionNew)?;
+        if transition == ApplicationTransition::DetachSession {
+            self.state.sidebar.hand_back_keys();
+        }
+        Ok(transition)
     }
 
     /// Worktree choices affect the next Session's execution context only.
@@ -7871,11 +7885,8 @@ impl Application {
                                 }
                             }
                         }
-                        // The new-Session affordance stands for `/new`, so it
-                        // invokes that very command, refused as it is wherever the
-                        // Outlook cannot be reached.
                         SidebarActivation::NewSession => {
-                            return self.invoke_semantic(SemanticCommandId::SessionNew);
+                            return self.new_session_from_sidebar();
                         }
                     },
                 );

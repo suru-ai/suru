@@ -7676,11 +7676,10 @@ fn no_path_entry_opens_from_the_sidebar_by_any_key_or_press() {
     }
 }
 
-/// The affordance invokes `/new` itself rather than something like it, so an
-/// Outlook whose Remote has stopped answering refuses it as it refuses the
-/// command, saying so where the reader can see it.
-#[test]
-fn the_new_session_affordance_is_refused_like_new_while_the_outlook_is_unreachable() {
+/// A Sidebar the reader is driving, beside a Remote Outlook that has stopped
+/// answering: the keys in the column, row focus on the selector, and two
+/// Sessions of that Remote listed.
+fn driving_the_sidebar_of_an_unreachable_studio() -> Application {
     let mut application = application_looking_at_studio();
     let request = expect_sidebar_listing(
         application
@@ -7689,23 +7688,120 @@ fn the_new_session_affordance_is_refused_like_new_while_the_outlook_is_unreachab
             )))
             .expect("reveal the Sidebar"),
     );
+    let studio = crate::support::named_workspace_path("studio");
     application
         .handle_event(ApplicationEvent::SessionsListed {
             request,
-            sessions: Vec::new(),
+            sessions: vec![
+                listed("Studio work", &studio, 2, now()),
+                listed("Studio notes", &studio, 1, now()),
+            ],
         })
         .expect("hydrate the Sidebar");
     studio_stops_answering(&mut application, 1, Duration::from_secs(5));
+    application
+}
+
+/// Everything the Sidebar draws and where its row focus stands, which a
+/// refused act must leave exactly as it was.
+fn sidebar_as_it_stands(application: &Application) -> (Vec<String>, String) {
+    (
+        sidebar_rows(application),
+        selected_sidebar_text(application),
+    )
+}
+
+fn assert_refused_as_unreachable(application: &Application) {
+    let screen = rendered_application_rows_at(application, WIDE, 20).join("\n");
+    assert!(
+        screen.contains("studio is unreachable"),
+        "the refusal names the Remote where the reader can see it: {screen}"
+    );
+}
+
+/// The affordance invokes `/new` itself rather than something like it, so an
+/// Outlook whose Remote has stopped answering refuses it as it refuses the
+/// command, saying so where the reader can see it.
+#[test]
+fn the_new_session_affordance_is_refused_like_new_while_the_outlook_is_unreachable() {
+    let mut application = driving_the_sidebar_of_an_unreachable_studio();
 
     assert_eq!(
         press_new_session(&mut application),
         ApplicationTransition::Continue,
         "nothing is begun on a Remote that does not answer"
     );
-    let screen = rendered_application_rows_at(&application, WIDE, 20).join("\n");
+    assert_refused_as_unreachable(&application);
+}
+
+/// A refused press is no Landing to hand the keys to, so it takes nothing
+/// from the Sidebar the reader is driving: `/new` refused leaves the query
+/// typed, the selector open, and row focus where they stood, and so does the
+/// affordance.
+#[test]
+fn a_refused_press_on_the_new_session_affordance_leaves_the_sidebar_as_it_stood() {
+    let mut application = driving_the_sidebar_of_an_unreachable_studio();
+    type_terminal_text(&mut application, "Studio");
+    // Row focus begins on the selector: Enter opens its entries, and Down
+    // stands on one of them.
+    press_sidebar_key(&mut application, KeyCode::Enter);
+    press_sidebar_key(&mut application, KeyCode::Down);
+    let before = sidebar_as_it_stands(&application);
+    let focused = before.1.trim();
     assert!(
-        screen.contains("studio is unreachable"),
-        "the refusal names the Remote where the reader can see it: {screen}"
+        before.0.iter().any(|row| row.contains("Search: Studio"))
+            && before.0.iter().any(|row| row.starts_with('\u{25be}'))
+            && !focused.is_empty()
+            && selector_entries(&application)
+                .iter()
+                .any(|entry| entry == focused),
+        "the fixture has a query typed, the selector open, and focus on an entry: {before:?}"
+    );
+
+    assert_eq!(
+        press_new_session(&mut application),
+        ApplicationTransition::Continue
+    );
+
+    assert_refused_as_unreachable(&application);
+    assert_eq!(
+        sidebar_as_it_stands(&application),
+        before,
+        "the refused press moved nothing in the Sidebar"
+    );
+}
+
+/// Enter refused on the affordance leaves the reader on it, with their query
+/// in hand and the keys still the Sidebar's.
+#[test]
+fn a_refused_enter_on_the_new_session_affordance_leaves_the_sidebar_as_it_stood() {
+    let mut application = driving_the_sidebar_of_an_unreachable_studio();
+    type_terminal_text(&mut application, "Studio");
+    press_sidebar_key(&mut application, KeyCode::Down);
+    let before = sidebar_as_it_stands(&application);
+    assert!(
+        before.0.iter().any(|row| row.contains("Search: Studio"))
+            && before.1.trim() == NEW_SESSION.to_string(),
+        "the fixture has a query typed and focus on the affordance: {before:?}"
+    );
+
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+
+    assert_refused_as_unreachable(&application);
+    assert_eq!(
+        sidebar_as_it_stands(&application),
+        before,
+        "the refused Enter moved nothing in the Sidebar"
+    );
+    type_terminal_text(&mut application, " work");
+    assert!(
+        sidebar_rows(&application)
+            .iter()
+            .any(|row| row.contains("Search: Studio work")),
+        "and the keys are still the Sidebar's"
     );
 }
 
