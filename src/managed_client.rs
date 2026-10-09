@@ -908,6 +908,16 @@ impl OutlookClient {
         self.commands.resolve_workspace(request).await
     }
 
+    /// One directory of the Server this Outlook names, read there for the
+    /// Directory Browser: its root, the root's parent, and its child
+    /// directories.
+    pub async fn list_directory(
+        &self,
+        request: crate::protocol::ListDirectoryRequest,
+    ) -> Result<crate::protocol::DirectoryListing> {
+        self.commands.list_directory(request).await
+    }
+
     /// The Sidekick Workspace of the Server this Client's own Outlook names,
     /// made there first if it is not there yet.
     pub async fn sidekick_workspace(&self) -> Result<crate::protocol::ResolvedWorkspace> {
@@ -1144,6 +1154,26 @@ impl SessionCommandClient {
     ) -> Result<crate::protocol::ResolvedWorkspace> {
         self.post_session_command("/v1/workspaces/resolve", &request, "Workspace resolution")
             .await
+    }
+
+    pub(crate) async fn list_directory(
+        &self,
+        request: crate::protocol::ListDirectoryRequest,
+    ) -> Result<crate::protocol::DirectoryListing> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .get(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/workspaces/directory",
+            )?)
+            .bearer_auth(&descriptor.token)
+            .query(&request)
+            .send()
+            .await
+            .context("send directory listing")?;
+        decode_api_response(response, "Directory listing").await
     }
 
     /// The Sidekick Workspace of the Server this Outlook names, which that

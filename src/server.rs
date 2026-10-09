@@ -36,16 +36,17 @@ use crate::errands::{DEFAULT_ERRAND_TIMEOUT, ErrandRunner};
 use crate::model_catalog::{CatalogMemory, ModelCatalogService};
 use crate::protocol::{
     AUTHOR_HEADER, Activity, AdmitPromptRequest, AgentSelection, Author, CompactSessionRequest,
-    CreateSessionRequest, InterruptOutcome, IssueInviteRequest, LifecycleState, ListenerState,
-    MODEL_CATALOG_EVENT, Message, MessageId, MessageRole, MessageStatus, ModelCatalog,
-    PROMPT_ADMISSION_HEADER, PROTOCOL_VERSION, Peer, ProviderId, RELAYS_EVENT, RedeemInviteRequest,
-    RelayListing, Remote, ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
-    SERVING_LISTENER_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
-    SESSION_ERROR_CODE_HEADER, SESSION_READING_PATH, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
-    SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT,
-    SUBAGENT_TREE_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision,
-    SessionChange, SessionError, SessionErrorCode, SessionId, SessionReadingQuery, SessionRevision,
-    SessionUpdate, SetSessionIconRequest, SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest,
+    CreateSessionRequest, InterruptOutcome, IssueInviteRequest, LifecycleState,
+    ListDirectoryRequest, ListenerState, MODEL_CATALOG_EVENT, Message, MessageId, MessageRole,
+    MessageStatus, ModelCatalog, PROMPT_ADMISSION_HEADER, PROTOCOL_VERSION, Peer, ProviderId,
+    RELAYS_EVENT, RedeemInviteRequest, RelayListing, Remote, ResolveWorkspaceRequest,
+    RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SERVING_LISTENER_EVENT,
+    SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_ERROR_CODE_HEADER,
+    SESSION_READING_PATH, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
+    SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT,
+    ServerIdentity, ServerShutdown, SessionCatalogRevision, SessionChange, SessionError,
+    SessionErrorCode, SessionId, SessionReadingQuery, SessionRevision, SessionUpdate,
+    SetSessionIconRequest, SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest,
     SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
     SkillCatalogRequest, SubagentTreeRevision, SubagentTreeUpdate, TurnId,
     UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
@@ -1651,7 +1652,7 @@ async fn start(
         // The paths this Server's clients name Workspaces by, its Sidekick
         // Workspace among them. The listing an Agent reads keeps the bare
         // discovery, naming that Workspace by the directory it can act on.
-        workspace_paths: crate::protocol::WorkspacePaths::discover()
+        workspace_paths: crate::protocol::WorkspacePaths::from_home(config.home_dir().as_deref())
             .with_sidekick_workspace(&sidekick_workspace.directory()),
         descriptor: Arc::new(descriptor.clone()),
         sessions: sessions.clone(),
@@ -1703,6 +1704,7 @@ async fn start(
         )
         .route("/v1/workspaces", get(list_workspaces))
         .route("/v1/workspaces/resolve", post(resolve_workspace))
+        .route("/v1/workspaces/directory", get(list_directory))
         .route("/v1/workspaces/icon", post(set_workspace_icon))
         .route(
             "/v1/workspaces/description",
@@ -3499,6 +3501,55 @@ async fn resolve_workspace(State(state): State<AppState>, request: Request) -> R
         );
     }
     Json(resolved).into_response()
+}
+
+/// One directory of this Server for the Directory Browser: its root, the
+/// root's parent, and its child directories. `~` is read from this Server's
+/// home and a relative path from the base the Client gives, as Workspace
+/// resolution reads one; a Peer reaches it as it reaches the rest of the
+/// Session API, so a Client turned toward a Remote browses the Remote's own.
+async fn list_directory(
+    State(state): State<AppState>,
+    query: std::result::Result<Query<ListDirectoryRequest>, QueryRejection>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(Query(request)) = query else {
+        return session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidCommand,
+            "A directory listing names a path, and at most a base to read it from",
+        );
+    };
+    let base = match request.base {
+        Some(base) => base,
+        None => match std::env::current_dir() {
+            Ok(base) => base,
+            Err(_) => {
+                return session_error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    SessionErrorCode::InvalidWorkspace,
+                    "Could not read the Server's current directory",
+                );
+            }
+        },
+    };
+    let home = state.workspace_paths.home.clone().map(PathBuf::from);
+    let listing = tokio::task::spawn_blocking(move || {
+        crate::source_control::list_directory(&request.path, &base, home.as_deref())
+    })
+    .await;
+    match listing {
+        Ok(Ok(listing)) => Json(listing).into_response(),
+        Ok(Err(reason)) => session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::InvalidWorkspace,
+            reason,
+        ),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 /// Answers with this Server's Sidekick Workspace, made first if it is not

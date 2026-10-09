@@ -33,6 +33,8 @@ mod support;
 
 #[path = "server_integration/checkouts.rs"]
 mod checkout_observation;
+#[path = "server_integration/directory_listing.rs"]
+mod directory_listing;
 #[path = "server_integration/preparation_recovery.rs"]
 mod preparation_recovery;
 #[path = "server_integration/relays.rs"]
@@ -1060,19 +1062,24 @@ async fn paired_servers_with_runtime(
     alternate: bool,
     runtime: Option<std::sync::Arc<dyn suru::provider::ProviderRuntime>>,
 ) -> PairedServers {
-    paired_servers_with_source_control(name, alternate, runtime, None, None, None).await
+    paired_servers_with_source_control(name, alternate, runtime, None, None, None, None).await
+}
+
+/// Pairs two Servers whose Serving side reads `~` as `home`.
+async fn paired_servers_at_home(name: &str, home: &std::path::Path) -> PairedServers {
+    paired_servers_with_source_control(name, false, None, None, None, None, Some(home)).await
 }
 
 /// Pairs two Servers whose redeeming side gives a Remote only `timeout` to
 /// acknowledge its own removal.
 async fn paired_servers_with_withdrawal_timeout(name: &str, timeout: Duration) -> PairedServers {
-    paired_servers_with_source_control(name, false, None, None, Some(timeout), None).await
+    paired_servers_with_source_control(name, false, None, None, Some(timeout), None, None).await
 }
 
 /// Pairs two Servers whose redeeming side dials the Serving one's direct ways
 /// through `proxies`.
 async fn paired_servers_through(name: &str, proxies: DirectProxies) -> PairedServers {
-    paired_servers_with_source_control(name, false, None, None, None, Some(proxies)).await
+    paired_servers_with_source_control(name, false, None, None, None, Some(proxies), None).await
 }
 
 async fn paired_servers_with_source_control(
@@ -1082,6 +1089,7 @@ async fn paired_servers_with_source_control(
     source_control: Option<std::sync::Arc<dyn suru::source_control::SourceControl>>,
     withdrawal_timeout: Option<Duration>,
     direct_proxies: Option<DirectProxies>,
+    serving_home: Option<&std::path::Path>,
 ) -> PairedServers {
     let serving_state = tempfile::tempdir().expect("create Serving state directory");
     let serving_config_root = tempfile::tempdir().expect("create Serving config directory");
@@ -1089,6 +1097,10 @@ async fn paired_servers_with_source_control(
     let config = ServerConfig::new(serving_state.path(), &serving_channel)
         .expect("configure Serving Server")
         .with_config_dir(serving_config_root.path());
+    let config = match serving_home {
+        Some(home) => config.with_home_dir(home),
+        None => config,
+    };
     let serving_data_dir = config.data_dir().to_path_buf();
     let timings = ServerTimings {
         shutdown_grace: Duration::from_millis(5),

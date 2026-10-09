@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 99;
+pub const PROTOCOL_VERSION: u32 = 100;
 mod attachment;
 mod reading;
 mod relay;
@@ -607,6 +607,45 @@ pub struct ResolveWorkspaceRequest {
     #[serde(default)]
     pub workspace_id: Option<WorkspaceId>,
     pub base: Option<PathBuf>,
+    pub path: PathBuf,
+}
+
+/// A directory a Client asks its Outlook Server to list for the Directory
+/// Browser. A relative path is read from `base`, or from the Server process's
+/// current directory when no base is supplied, and one beginning with `~` from
+/// the Server's home.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListDirectoryRequest {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<PathBuf>,
+}
+
+/// One directory of a Server as the Directory Browser reads it: the root the
+/// asked-for path resolved to, the root's parent, and the directories directly
+/// within the root in the order the browser lists them. Files are never
+/// listed, since a file can never be chosen.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryListing {
+    pub root: PathBuf,
+    /// Absent where the root is the filesystem's own, or a drive's on Windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<PathBuf>,
+    /// Case set aside and a run of digits read as the number it spells, so
+    /// `a2` comes before `a10`.
+    pub children: Vec<ChildDirectory>,
+}
+
+/// A directory directly within a [`DirectoryListing`]'s root.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildDirectory {
+    pub name: String,
+    /// The root joined with `name` in the Server's own syntax, so a Client
+    /// lists or chooses the directory without joining paths in a syntax it
+    /// may not share.
     pub path: PathBuf,
 }
 

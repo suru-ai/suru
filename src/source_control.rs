@@ -9,9 +9,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+mod directory_listing;
 mod git;
 pub mod naming;
 mod preparation;
+pub(crate) use directory_listing::list_directory;
 pub use git::GitSourceControl;
 pub(crate) use preparation::PreparationStore;
 

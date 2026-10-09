@@ -64,6 +64,9 @@ pub struct RuntimeConfig {
     /// `SURU_IDENTITY_STORE` names one. See
     /// [`RuntimeConfig::with_identity_store`].
     identity_store: Option<IdentityStoreChoice>,
+    /// The home this Server reads `~` from and abbreviates paths to, where it
+    /// is given rather than discovered. See [`RuntimeConfig::with_home_dir`].
+    home_dir: Option<PathBuf>,
 }
 
 impl RuntimeConfig {
@@ -81,6 +84,7 @@ impl RuntimeConfig {
             makes_dirs: true,
             launched_after: None,
             identity_store: None,
+            home_dir: None,
         })
     }
 
@@ -157,6 +161,21 @@ impl RuntimeConfig {
     /// is named.
     pub(crate) fn identity_store(&self) -> Option<IdentityStoreChoice> {
         self.identity_store
+    }
+
+    /// Configures a Server to take `home_dir` as its home: the directory `~`
+    /// names in a path its Clients send it, and the one it abbreviates to `~`
+    /// in the paths it names Workspaces by. Without this, the Server takes
+    /// the platform's home for the user it runs as.
+    pub fn with_home_dir(mut self, home_dir: impl AsRef<Path>) -> Self {
+        self.home_dir = Some(home_dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// This Server's home, given or discovered; none where the platform
+    /// knows none.
+    pub(crate) fn home_dir(&self) -> Option<PathBuf> {
+        self.home_dir.clone().or_else(dirs::home_dir)
     }
 
     pub(crate) fn state_base_dir(&self) -> &Path {
