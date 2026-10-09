@@ -5,7 +5,7 @@ use super::*;
 use std::path::{Path, PathBuf};
 use suru::{
     managed_client::OutlookClient,
-    protocol::{DirectoryListing, ListDirectoryRequest},
+    protocol::{CheckoutRevision, DirectoryListing, DirectorySourceControl, ListDirectoryRequest},
 };
 
 /// The Serving Server asked as a Client's own Outlook, and the same Server
@@ -61,6 +61,48 @@ fn names(listing: &DirectoryListing) -> Vec<&str> {
 
 fn canonical(path: &Path) -> PathBuf {
     suru::paths::canonical(path).expect("read the fixture's canonical path")
+}
+
+/// Runs Git at `directory` as a fixture's author, answering what it printed.
+fn git(directory: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Suru Test")
+        .env("GIT_AUTHOR_EMAIL", "suru@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Suru Test")
+        .env("GIT_COMMITTER_EMAIL", "suru@example.invalid")
+        .output()
+        .expect("run Git");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("Git prints Unicode here")
+        .trim_end()
+        .to_owned()
+}
+
+/// A Repository made at `directory` on `main`, with one commit, answering
+/// that commit.
+fn committed_repository(directory: &Path) -> String {
+    std::fs::create_dir(directory).expect("create the Repository's root");
+    git(directory, &["init", "-b", "main"]);
+    git(
+        directory,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    git(directory, &["rev-parse", "HEAD"])
 }
 
 #[tokio::test]
@@ -287,6 +329,101 @@ async fn the_filesystem_root_answers_with_no_parent() {
         let listing = listed(&client, &filesystem_root, None).await;
         assert_eq!(listing.root, filesystem_root, "{way}");
         assert_eq!(listing.parent, None, "{way}");
+    }
+    pair.shutdown().await;
+}
+
+/// What each child is to source control is read from Git's own metadata on
+/// the Server's disk: a Repository's main root and a linked Worktree's root
+/// carry the Checkout State their HEAD stands on, whether a branch or a
+/// detached commit, or nothing where that HEAD cannot be read there; a bare
+/// Repository is told apart from both, and a directory outside source
+/// control is plain.
+#[tokio::test]
+async fn each_child_says_what_it_is_to_source_control() {
+    let pair = paired_servers("directory-listing-source-control").await;
+    let fixture = tempfile::tempdir().expect("create the directory to list");
+    let root = canonical(fixture.path());
+    let main_commit = committed_repository(&root.join("main"));
+    git(
+        &root.join("main"),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "topic",
+            root.join("linked")
+                .to_str()
+                .expect("a Unicode fixture path"),
+        ],
+    );
+    let detached_commit = committed_repository(&root.join("detached"));
+    git(&root.join("detached"), &["checkout", "--detach"]);
+    committed_repository(&root.join("unreadable"));
+    std::fs::write(
+        root.join("unreadable").join(".git").join("HEAD"),
+        "neither a ref nor a commit\n",
+    )
+    .expect("spoil the Repository's HEAD");
+    git(&root, &["init", "--bare", "-b", "main", "bare.git"]);
+    std::fs::create_dir(root.join("plain")).expect("create a plain directory");
+
+    for (way, client) in both_ways(&pair) {
+        let listing = listed(&client, &root, None).await;
+        let source_control = |name: &str| {
+            listing
+                .children
+                .iter()
+                .find(|child| child.name == name)
+                .unwrap_or_else(|| panic!("{way}: {name} is listed"))
+                .source_control
+                .clone()
+        };
+
+        assert_eq!(
+            source_control("main"),
+            DirectorySourceControl::RepositoryRoot {
+                revision: Some(CheckoutRevision::Branch {
+                    name: "main".to_owned(),
+                    commit: Some(main_commit.clone()),
+                }),
+            },
+            "{way}: a Repository's main root, on its branch"
+        );
+        assert_eq!(
+            source_control("linked"),
+            DirectorySourceControl::LinkedWorktreeRoot {
+                revision: Some(CheckoutRevision::Branch {
+                    name: "topic".to_owned(),
+                    commit: Some(main_commit.clone()),
+                }),
+            },
+            "{way}: a linked Worktree's root, on its own branch"
+        );
+        assert_eq!(
+            source_control("detached"),
+            DirectorySourceControl::RepositoryRoot {
+                revision: Some(CheckoutRevision::Detached {
+                    commit: detached_commit.clone(),
+                }),
+            },
+            "{way}: a Repository's main root, at a detached commit"
+        );
+        assert_eq!(
+            source_control("unreadable"),
+            DirectorySourceControl::RepositoryRoot { revision: None },
+            "{way}: a Repository's main root whose HEAD cannot be read"
+        );
+        assert_eq!(
+            source_control("bare.git"),
+            DirectorySourceControl::BareRepository,
+            "{way}"
+        );
+        assert_eq!(
+            source_control("plain"),
+            DirectorySourceControl::Plain,
+            "{way}"
+        );
     }
     pair.shutdown().await;
 }

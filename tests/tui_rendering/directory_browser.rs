@@ -21,7 +21,7 @@ use suru::{
     managed_client::ManagedEvent,
     protocol::{
         AgentSelection, CheckoutAssociation, CheckoutId, CheckoutKind, CheckoutRevision,
-        CheckoutSummary, ChildDirectory, DirectoryListing, EffectiveSettings, ExecutionDirectory,
+        CheckoutSummary, ChildDirectory, DirectoryListing, DirectorySourceControl, EffectiveSettings, ExecutionDirectory,
         ExecutionDirectoryStatus, ListDirectoryRequest, ModelAvailability, ModelCatalog, ModelId,
         ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
         ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue, Outlook,
@@ -1314,6 +1314,7 @@ fn answer(
                     .map(|name| ChildDirectory {
                         name: (*name).to_owned(),
                         path: root.join(name),
+                        source_control: DirectorySourceControl::Plain,
                     })
                     .collect(),
             }),

@@ -2,11 +2,13 @@
 
 use std::{cmp::Ordering, io, path::Path};
 
+use super::git::OnDisk;
 use crate::protocol::{ChildDirectory, DirectoryListing};
 
 /// The directory `path` names, listed: read from `base` when relative and
 /// from `home` when it begins with `~`, resolved to its root, and answered
-/// with that root's parent and the directories directly within it. A path
+/// with that root's parent and the directories directly within it, each
+/// with what it is to source control as Git's metadata on disk says. A path
 /// naming nothing, a file, a directory this Server cannot read, or one whose
 /// path is not Unicode is refused with the reason a reader is told.
 ///
@@ -34,14 +36,19 @@ pub(crate) fn list_directory(
     if root.to_str().is_none() {
         return Err("This directory's path is not Unicode".to_owned());
     }
+    // One reader for the whole listing, so the Worktrees of one Repository
+    // listed side by side read its packed branches once between them.
+    let git = OnDisk::default();
     let mut children = std::fs::read_dir(&root)
         .map_err(|error| unreadable(&error))?
         .flatten()
         .filter(is_directory)
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
+            let path = entry.path();
             Some(ChildDirectory {
-                path: entry.path(),
+                source_control: git.directory_source_control(&path),
+                path,
                 name,
             })
         })

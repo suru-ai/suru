@@ -16,6 +16,7 @@ mod on_disk;
 mod preparation;
 mod recovery;
 mod removal;
+pub(super) use on_disk::OnDisk;
 
 /// How many listed Worktree roots discovery has Git confirm at once.
 const CONCURRENT_ROOT_CONFIRMATIONS: usize = 8;

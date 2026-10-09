@@ -21,7 +21,7 @@
 //! Git replaces a ref, `packed-refs`, and `HEAD` by renaming a finished file
 //! into place, so no read here sees one half-written.
 use super::{Entry, path_from_bytes};
-use crate::protocol::CheckoutRevision;
+use crate::protocol::{CheckoutRevision, DirectorySourceControl};
 use std::{
     collections::HashMap,
     io::ErrorKind,
@@ -31,7 +31,7 @@ use std::{
 };
 
 #[derive(Default)]
-pub(super) struct OnDisk {
+pub(in crate::source_control) struct OnDisk {
     /// Each Repository's packed branches, kept while its `packed-refs` is
     /// unchanged: a large one would otherwise be read whole on every poll.
     packed: Mutex<HashMap<PathBuf, Packed>>,
@@ -98,6 +98,37 @@ impl OnDisk {
             name: branch.to_owned(),
             commit,
         })
+    }
+
+    /// What `directory` is to Git, for a Directory Browser listing that may
+    /// not run Git once per row: a Worktree's root, main or linked as its
+    /// metadata says, with the revision its HEAD names where that can be read
+    /// here; a bare Repository, where the directory is itself metadata Git
+    /// would run in and its configuration does not deny bareness — Git,
+    /// asked there, takes a Repository with no Worktree for bare; or neither.
+    pub(in crate::source_control) fn directory_source_control(
+        &self,
+        directory: &Path,
+    ) -> DirectorySourceControl {
+        if let Some(metadata) = metadata_directory(directory) {
+            let revision = self.revision(directory);
+            // A linked Worktree's metadata names the Repository's shared
+            // metadata in a `commondir` file, where a main Worktree's own
+            // metadata is the shared one.
+            return if regular_file(&metadata.join("commondir")) == Some(None) {
+                DirectorySourceControl::RepositoryRoot { revision }
+            } else {
+                DirectorySourceControl::LinkedWorktreeRoot { revision }
+            };
+        }
+        let bare = Format::of(directory, directory).is_some_and(|format| {
+            format.bare != Some(false) && recognized_head(directory, &format).is_some()
+        });
+        if bare {
+            DirectorySourceControl::BareRepository
+        } else {
+            DirectorySourceControl::Plain
+        }
     }
 
     /// The Worktrees `git worktree list` names for the Repository whose

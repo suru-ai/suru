@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 100;
+pub const PROTOCOL_VERSION: u32 = 101;
 mod attachment;
 mod reading;
 mod relay;
@@ -651,6 +651,27 @@ pub struct ChildDirectory {
     /// lists or chooses the directory without joining paths in a syntax it
     /// may not share.
     pub path: PathBuf,
+    pub source_control: DirectorySourceControl,
+}
+
+/// What a [`ChildDirectory`] is to source control, read by its Server from
+/// Git's metadata on disk rather than by running Git, so a listing costs one
+/// directory read and one HEAD read per Repository among its children.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DirectorySourceControl {
+    /// Neither a Worktree's root nor a bare Repository.
+    Plain,
+    /// The root of a Repository's main Worktree, with the Checkout State its
+    /// HEAD stands on: `None` where that could not be read from disk, which
+    /// a Client marks unavailable.
+    RepositoryRoot { revision: Option<CheckoutRevision> },
+    /// The root of a linked Worktree, with its Checkout State as for a
+    /// [`Self::RepositoryRoot`].
+    LinkedWorktreeRoot { revision: Option<CheckoutRevision> },
+    /// A bare Repository, which has no Worktree of its own: choosing it
+    /// leaves a Worktree still to choose.
+    BareRepository,
 }
 
 /// Safe presentation metadata for one user-invocable Skill. The Provider keeps
