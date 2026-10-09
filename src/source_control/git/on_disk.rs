@@ -300,10 +300,10 @@ pub(in crate::source_control) fn listed_source_control(directory: &Path) -> Dire
 /// Unlike [`Format::of`], this judges neither the Repository's format nor
 /// how its refs are kept, since a listing reads no refs: the configuration
 /// is read for those two settings alone, and only as far as it says them
-/// itself. What a file it includes would say is left unsaid, as is all of a
-/// configuration that is missing or cannot be read in full, leaving its
-/// shape to decide; so one that says it is not bare only through an include
-/// is still marked bare.
+/// itself. What a file it includes would say is left unsaid, as is what a
+/// line that cannot be read would, or a configuration that is missing or
+/// cannot be read at all, leaving its shape to decide; so one that says it
+/// is not bare only through an include is still marked bare.
 fn listed_bare(directory: &Path) -> bool {
     let within = |name| std::fs::metadata(directory.join(name)).is_ok_and(|m| m.is_dir());
     if !within("objects") || !within("refs") || !listed_recognized_head(directory) {
@@ -311,7 +311,7 @@ fn listed_bare(directory: &Path) -> bool {
     }
     let read = |name| {
         let mut config = Config::default();
-        config.read_own(&regular_file(&directory.join(name))??)?;
+        config.read_own(&regular_file(&directory.join(name))??);
         Some(config)
     };
     let Some(shared) = read("config") else {
@@ -661,9 +661,9 @@ impl Format {
 }
 
 /// The settings of a Repository's own configuration that decide how it is
-/// read. Reading declines a file Git would refuse to parse, and one whose
-/// settings could come from elsewhere: a continued line, or, unless only the
-/// file's own settings are asked for, an include.
+/// read. Reading the file whole declines one Git would refuse to parse, and
+/// one whose settings could come from elsewhere: an include, or a continued
+/// line.
 #[derive(Default)]
 struct Config {
     bare: Option<bool>,
@@ -676,35 +676,64 @@ struct Config {
 }
 impl Config {
     fn read(&mut self, contents: &[u8]) -> Option<()> {
-        self.read_own(contents)?;
+        self.read_lines(std::str::from_utf8(contents).ok()?, false)?;
         (!self.includes).then_some(())
     }
 
-    /// Reads the settings `contents` gives itself, passing over any file it
-    /// includes.
-    fn read_own(&mut self, contents: &[u8]) -> Option<()> {
-        let contents = std::str::from_utf8(contents).ok()?;
+    /// Reads what `contents` says of these settings itself, as far as it
+    /// can be read: a file it includes is passed over, a value continued
+    /// onto the lines after it is read on to its end as Git reads it, and a
+    /// line that still cannot be read says nothing, undoing nothing the rest
+    /// of the file says.
+    fn read_own(&mut self, contents: &[u8]) {
+        self.read_lines(&String::from_utf8_lossy(contents), true);
+    }
+
+    /// Reads `contents` line by line, declining it at the first line that
+    /// cannot be read unless `lenient`, which passes that line over.
+    fn read_lines(&mut self, contents: &str, lenient: bool) -> Option<()> {
         let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
         // `None` before any section; `Some(None)` within one with a
         // subsection, which never holds these settings.
         let mut section: Option<Option<String>> = None;
-        for line in contents.split('\n') {
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            let mut rest = line.trim_start_matches([' ', '\t']);
-            if let Some(header) = rest.strip_prefix('[') {
-                let (name, subsection, after) = section_header(header)?;
-                self.includes |= name == "include" || name == "includeif";
-                section = Some((!subsection).then_some(name));
-                // A setting may follow its header on the same line.
-                rest = after.trim_start_matches([' ', '\t']);
+        let mut lines = contents
+            .split('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line));
+        while let Some(line) = lines.next() {
+            let continued = lenient.then_some(&mut lines as &mut dyn Iterator<Item = &str>);
+            if self.read_line(line, &mut section, continued).is_none() && !lenient {
+                return None;
             }
-            if rest.is_empty() || rest.starts_with(['#', ';']) {
-                continue;
-            }
-            let (key, value) = setting(rest)?;
-            if let Some(name) = section.as_ref()? {
-                self.set(name, &key, value.as_deref())?;
-            }
+        }
+        Some(())
+    }
+
+    /// Reads one line within `section`, and the lines after it that a value
+    /// continues onto from `continued`, a continued value being declined
+    /// where it gives none.
+    fn read_line<'a>(
+        &mut self,
+        line: &'a str,
+        section: &mut Option<Option<String>>,
+        continued: Option<&mut dyn Iterator<Item = &'a str>>,
+    ) -> Option<()> {
+        let mut rest = line.trim_start_matches([' ', '\t']);
+        if let Some(header) = rest.strip_prefix('[') {
+            // What follows a header that cannot be read is not taken for
+            // these settings.
+            *section = Some(None);
+            let (name, subsection, after) = section_header(header)?;
+            self.includes |= name == "include" || name == "includeif";
+            *section = Some((!subsection).then_some(name));
+            // A setting may follow its header on the same line.
+            rest = after.trim_start_matches([' ', '\t']);
+        }
+        if rest.is_empty() || rest.starts_with(['#', ';']) {
+            return Some(());
+        }
+        let (key, value) = setting(rest, continued)?;
+        if let Some(name) = section.as_ref()? {
+            self.set(name, &key, value.as_deref())?;
         }
         Some(())
     }
@@ -801,8 +830,12 @@ fn section_header(header: &str) -> Option<(String, bool, &str)> {
 }
 
 /// A setting's lowercased key and its value: `None` for a key without one,
-/// which Git reads as true and lets nothing follow, not even a comment.
-fn setting(line: &str) -> Option<(String, Option<String>)> {
+/// which Git reads as true and lets nothing follow, not even a comment. A
+/// value continued past `line` is read on from `continued`.
+fn setting<'a>(
+    line: &'a str,
+    continued: Option<&mut dyn Iterator<Item = &'a str>>,
+) -> Option<(String, Option<String>)> {
     let end = line
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
         .unwrap_or(line.len());
@@ -812,7 +845,7 @@ fn setting(line: &str) -> Option<(String, Option<String>)> {
     }
     let rest = rest.trim_start_matches([' ', '\t']);
     let value = match rest.strip_prefix('=') {
-        Some(value) => Some(config_value(value)?),
+        Some(value) => Some(config_value(value, continued)?),
         None if rest.is_empty() => None,
         None => return None,
     };
@@ -821,10 +854,16 @@ fn setting(line: &str) -> Option<(String, Option<String>)> {
 
 /// A value as Git reads one: quotes joined and removed, escapes resolved,
 /// a trailing comment and unquoted outer spaces dropped. A backslash ending
-/// the line continues the value onto the next, which is declined.
-fn config_value(value: &str) -> Option<String> {
+/// the line continues the value onto the next, taken from `continued`, and
+/// declined where that gives none. A value that cannot be read is still
+/// read to its end, so that no line it continues onto is taken for another.
+fn config_value<'a>(
+    value: &'a str,
+    mut continued: Option<&mut dyn Iterator<Item = &'a str>>,
+) -> Option<String> {
     let mut read = String::new();
     let mut quoted = false;
+    let mut readable = true;
     let mut spaces = 0;
     let mut chars = value.chars();
     while let Some(c) = chars.next() {
@@ -839,19 +878,24 @@ fn config_value(value: &str) -> Option<String> {
         }
         read.extend(std::iter::repeat_n(' ', std::mem::take(&mut spaces)));
         match c {
-            '\\' => read.push(match chars.next()? {
-                '\\' => '\\',
-                '"' => '"',
-                'n' => '\n',
-                't' => '\t',
-                'b' => '\u{8}',
-                _ => return None,
-            }),
+            '\\' => match chars.next() {
+                Some('\\') => read.push('\\'),
+                Some('"') => read.push('"'),
+                Some('n') => read.push('\n'),
+                Some('t') => read.push('\t'),
+                Some('b') => read.push('\u{8}'),
+                Some(_) => readable = false,
+                // Git reads the end of the file as the end of a line.
+                None => match continued.as_mut()?.next() {
+                    Some(line) => chars = line.chars(),
+                    None => break,
+                },
+            },
             '"' => quoted = !quoted,
             c => read.push(c),
         }
     }
-    (!quoted).then_some(read)
+    (readable && !quoted).then_some(read)
 }
 
 /// A boolean as Git spells one; a key without a value is true.

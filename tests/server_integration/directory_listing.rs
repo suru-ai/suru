@@ -674,6 +674,88 @@ async fn a_bare_repository_is_told_by_the_shape_git_requires_of_one() {
     pair.shutdown().await;
 }
 
+/// A value a backslash continues onto the next line is read as Git reads
+/// it, as the one value, so a configuration giving one still says what it
+/// says of bareness: a Repository's own metadata, listed hidden beside the
+/// rest of its root, stays plain while that root stays a Repository's
+/// root; a bare Repository stays bare; and what a continued value carries
+/// onto its next line is never taken for a setting of its own.
+#[tokio::test]
+async fn a_value_continued_onto_the_next_line_leaves_bareness_as_the_configuration_says() {
+    let pair = paired_servers("directory-listing-continued-value").await;
+    let fixture = tempfile::tempdir().expect("create the directories to list");
+    let root = canonical(fixture.path());
+    committed_repository(&root.join("repository"));
+    continue_a_value(&root.join("repository").join(".git").join("config"));
+    git(&root, &["init", "--bare", "-b", "main", "bare.git"]);
+    continue_a_value(&root.join("bare.git").join("config"));
+    git(&root, &["init", "--bare", "-b", "main", "carried.git"]);
+    append_to(
+        &root.join("carried.git").join("config"),
+        "[core]\n\tnote = first \\\nbare = false\n",
+    );
+    // Git reads each configuration as the listing must.
+    assert_eq!(
+        git(&root.join("repository"), &["config", "alias.continued"]),
+        "first second"
+    );
+    for (directory, bare) in [
+        (root.join("repository").join(".git"), "false"),
+        (root.join("bare.git"), "true"),
+        (root.join("carried.git"), "true"),
+    ] {
+        assert_eq!(
+            git(&directory, &["rev-parse", "--is-bare-repository"]),
+            bare,
+            "{}",
+            directory.display()
+        );
+    }
+
+    for (way, client) in both_ways(&pair) {
+        let listing = listed(&client, &root, None).await;
+        let read = listing
+            .children
+            .iter()
+            .map(|child| (child.name.as_str(), child.source_control.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read,
+            [
+                ("bare.git", DirectorySourceControl::BareRepository),
+                ("carried.git", DirectorySourceControl::BareRepository),
+                (
+                    "repository",
+                    DirectorySourceControl::RepositoryRoot {
+                        revision: on("main")
+                    }
+                ),
+            ],
+            "{way}"
+        );
+        let repository = listed(&client, root.join("repository"), None).await;
+        assert_eq!(
+            repository.source_control,
+            DirectorySourceControl::RepositoryRoot {
+                revision: on("main")
+            },
+            "{way}"
+        );
+        let metadata = repository
+            .children
+            .iter()
+            .find(|child| child.name == ".git")
+            .unwrap_or_else(|| panic!("{way}: the Repository's metadata is listed"));
+        assert!(metadata.hidden, "{way}");
+        assert_eq!(
+            metadata.source_control,
+            DirectorySourceControl::Plain,
+            "{way}"
+        );
+    }
+    pair.shutdown().await;
+}
+
 /// Several Repositories side by side, one with several linked Worktrees
 /// beside it and its branches packed away so no loose ref names them, are
 /// each read for themselves: HEAD alone names the branch each stands on.
@@ -877,14 +959,23 @@ fn reftable_bare_repository(directory: &Path) {
 /// Has the configuration at `config` include another file, both outright
 /// and on a condition, as a user's `git config include.path` would.
 fn include_another_file(config: &Path) {
+    append_to(
+        config,
+        "[include]\n\tpath = other\n[includeIf \"gitdir:~/\"]\n\tpath = elsewhere\n",
+    );
+}
+
+/// Has the configuration at `config` give an alias whose value a backslash
+/// continues onto the next line, which Git reads as the one value.
+fn continue_a_value(config: &Path) {
+    append_to(config, "[alias]\n    continued = first \\\nsecond\n");
+}
+
+fn append_to(config: &Path, settings: &str) {
     use std::io::Write as _;
     std::fs::OpenOptions::new()
         .append(true)
         .open(config)
-        .and_then(|mut file| {
-            file.write_all(
-                b"[include]\n\tpath = other\n[includeIf \"gitdir:~/\"]\n\tpath = elsewhere\n",
-            )
-        })
-        .expect("include another file in the configuration");
+        .and_then(|mut file| file.write_all(settings.as_bytes()))
+        .expect("add to the configuration");
 }
