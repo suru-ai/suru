@@ -8,7 +8,8 @@ use std::{
 };
 
 use crate::protocol::{
-    ChildDirectory, DirectoryListing, ListDirectoryRequest, ResolveWorkspaceRequest,
+    ChildDirectory, DirectoryListing, DirectorySourceControl, ListDirectoryRequest,
+    ResolveWorkspaceRequest,
 };
 
 use super::list_window::{ListWindow, WindowEntry};
@@ -89,7 +90,7 @@ impl RowKey {
 
     /// The directory the row stands for, by the Server's own path, which is
     /// what a listing of it asks for.
-    fn directory(&self) -> &Path {
+    pub(super) fn directory(&self) -> &Path {
         self.0.last().map_or(Path::new(""), PathBuf::as_path)
     }
 
@@ -124,6 +125,9 @@ pub(super) enum DirectoryBrowserRowKind {
         key: RowKey,
         opened: bool,
         focused: bool,
+        /// What the Server read the directory to be as it listed it beneath
+        /// its parent; `None` for the root, which no listing here names.
+        source_control: Option<DirectorySourceControl>,
     },
     /// Beneath an open directory still being read.
     Loading,
@@ -351,20 +355,28 @@ impl DirectoryBrowser {
             Some(DirectoryEntries::Listed(children)) => {
                 for child in children {
                     let child_row = row.child(&child.path);
-                    rows.push(self.directory_row(depth, Some(&child.name), child_row.clone()));
+                    rows.push(self.directory_row(depth, Some(child), child_row.clone()));
                     self.push_children(&child_row, depth + 1, rows);
                 }
             }
         }
     }
 
-    fn directory_row(&self, depth: usize, name: Option<&str>, key: RowKey) -> DirectoryBrowserRow {
+    /// The row `key` makes, for the root where `listed` is `None` and
+    /// otherwise for the child the Server listed.
+    fn directory_row(
+        &self,
+        depth: usize,
+        listed: Option<&ChildDirectory>,
+        key: RowKey,
+    ) -> DirectoryBrowserRow {
         DirectoryBrowserRow {
             depth,
             kind: DirectoryBrowserRowKind::Directory {
-                name: name.map(str::to_owned),
+                name: listed.map(|child| child.name.clone()),
                 opened: self.opened.contains(&key),
                 focused: self.focused == key,
+                source_control: listed.map(|child| child.source_control.clone()),
                 key,
             },
         }

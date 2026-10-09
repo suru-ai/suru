@@ -87,6 +87,8 @@ const LANDING_LOGO: [&str; 7] = [
 ];
 /// Nerd Fonts `nf-cod-folder` (Codicons folder).
 const NF_COD_FOLDER: char = '\u{ea83}';
+/// Nerd Fonts `nf-cod-repo` (Codicons repo).
+const NF_COD_REPO: char = '\u{ea62}';
 /// Nerd Fonts `nf-fa-folder_tree` (Font Awesome folder tree).
 const NF_FA_FOLDER_TREE: char = '\u{ef81}';
 /// Nerd Fonts `nf-md-monitor` (Material Design monitor).
@@ -1984,11 +1986,16 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
     // The root goes by its name in the Server's own path syntax; every other
     // row by the name the Server listed it under.
     let root_name = state.workspace_name(&state.outlook, browser.root());
+    let known = KnownWorkspaces {
+        workspaces: state.sidebar.workspaces(),
+        current: &state.workspace.id,
+        show_icons: state.settings().appearance.show_icons,
+    };
     lines.extend(
         browser
             .visible_rows(capacity)
             .iter()
-            .map(|row| directory_browser_line(row, &root_name, content_width, theme)),
+            .map(|row| directory_browser_line(row, &root_name, &known, content_width, theme)),
     );
     if shows_footer && lines.len() < content_height {
         // The footer holds the box's last line however much of the tree is
@@ -2019,12 +2026,33 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
     );
 }
 
+/// What the Client knows of the Outlook's Workspaces, which the Directory
+/// Browser lays over what the Server read of each directory.
+struct KnownWorkspaces<'a> {
+    /// As the Sidebar's listing knows them, the current one among them.
+    workspaces: Vec<crate::protocol::Workspace>,
+    current: &'a crate::protocol::WorkspaceId,
+    show_icons: bool,
+}
+
+impl KnownWorkspaces<'_> {
+    /// The Workspace presented by `directory`, by the Server's own path for
+    /// both.
+    fn at(&self, directory: &std::path::Path) -> Option<&crate::protocol::Workspace> {
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.path == directory)
+    }
+}
+
 /// One Directory Browser row: the focus marker, the indent its depth gives
-/// it, and — for a directory — whether it is open, then its name; beneath an
-/// open directory, that it is being read or why it cannot be.
+/// it, and — for a directory — whether it is open, then its name and what is
+/// known of it; beneath an open directory, that it is being read or why it
+/// cannot be.
 fn directory_browser_line(
     row: &DirectoryBrowserRow,
     root_name: &str,
+    known: &KnownWorkspaces<'_>,
     width: usize,
     theme: &Theme,
 ) -> Line<'static> {
@@ -2032,15 +2060,22 @@ fn directory_browser_line(
     let (text, style) = match &row.kind {
         DirectoryBrowserRowKind::Directory {
             name,
+            key,
             opened,
             focused,
-            ..
+            source_control,
         } => (
-            format!(
-                "{}{indent}{}{}",
-                if *focused { "› " } else { "  " },
-                if *opened { "▾ " } else { "▸ " },
+            directory_browser_row_text(
+                &format!(
+                    "{}{indent}{}",
+                    if *focused { "› " } else { "  " },
+                    if *opened { "▾ " } else { "▸ " },
+                ),
                 name.as_deref().unwrap_or(root_name),
+                key.directory(),
+                source_control.as_ref(),
+                known,
+                width,
             ),
             if *focused {
                 theme.selection.focused
@@ -2054,6 +2089,60 @@ fn directory_browser_line(
         }
     };
     Line::styled(truncate_to_width(&text, width), style)
+}
+
+/// A `directory`'s row after its `lead`: its glyph while Icons are shown —
+/// its Workspace's Icon where it is one of the Outlook's Workspaces with one,
+/// a Repository's glyph where it is a Repository's root or a bare
+/// Repository, and the folder's otherwise — then its name; whether it is the
+/// current Workspace, said as the Workspace Picker says it; and what the
+/// Server read of it: a bare Repository marked as such, or a Worktree root's
+/// Checkout State drawn as a Sidebar row draws it in the columns left.
+fn directory_browser_row_text(
+    lead: &str,
+    name: &str,
+    directory: &std::path::Path,
+    source_control: Option<&crate::protocol::DirectorySourceControl>,
+    known: &KnownWorkspaces<'_>,
+    width: usize,
+) -> String {
+    use crate::protocol::{CheckoutKind, DirectorySourceControl};
+    let workspace = known.at(directory);
+    let compact = width < usize::from(NARROW_TERMINAL_WIDTH);
+    let separator = if compact { " " } else { " · " };
+    let repository_glyph = match source_control {
+        None | Some(DirectorySourceControl::Plain) => NF_COD_FOLDER,
+        Some(_) => NF_COD_REPO,
+    };
+    let glyph = workspace
+        .and_then(|workspace| workspace.icon.as_deref())
+        .and_then(crate::icon_catalog::glyph)
+        .unwrap_or(repository_glyph);
+    let mut text = format!("{lead}{}", icon_label(known.show_icons, glyph, name));
+    if workspace.is_some_and(|workspace| &workspace.id == known.current) {
+        text.push_str(separator);
+        text.push_str(current_workspace_mark(compact));
+    }
+    let (kind, revision) = match source_control {
+        None | Some(DirectorySourceControl::Plain) => return truncate_to_width(&text, width),
+        Some(DirectorySourceControl::BareRepository) => {
+            text.push_str(separator);
+            text.push_str("[bare]");
+            return truncate_to_width(&text, width);
+        }
+        Some(DirectorySourceControl::RepositoryRoot { revision }) => (CheckoutKind::Main, revision),
+        Some(DirectorySourceControl::LinkedWorktreeRoot { revision }) => {
+            (CheckoutKind::Linked, revision)
+        }
+    };
+    text.push_str(separator);
+    let reading = CheckoutStateReading {
+        kind,
+        revision: revision.as_ref(),
+    };
+    let left = width.saturating_sub(text.width());
+    text.push_str(&reading.as_a_sidebar_row_draws_it(left, known.show_icons));
+    truncate_to_width(&text, width)
 }
 
 /// The focused Workspace's Description as the picker draws it beneath its
@@ -2257,7 +2346,7 @@ fn workspace_picker_row_text(row: &WorkspacePickerRow, width: usize, state: &Tui
     let name = icon_label(show_icons, row.icon.unwrap_or(NF_COD_FOLDER), &row.name);
     let mut fields = vec![name];
     if row.current {
-        fields.push((if compact { "C" } else { "[current]" }).to_owned());
+        fields.push(current_workspace_mark(compact).to_owned());
     }
     let label = state.workspace_label(&state.outlook, &row.path);
     let path_budget = width
@@ -2268,6 +2357,12 @@ fn workspace_picker_row_text(row: &WorkspacePickerRow, width: usize, state: &Tui
         fields.push(truncate_from_left_to_width(&label, path_budget));
     }
     truncate_to_width(&format!("{marker}{}", fields.join(separator)), width)
+}
+
+/// What marks the Workspace the client is working in wherever Workspaces are
+/// listed: in words, or by its letter alone where a row is narrow.
+const fn current_workspace_mark(compact: bool) -> &'static str {
+    if compact { "C" } else { "[current]" }
 }
 
 /// The Icon Picker: a Workspace-Picker-style overlay whose rows are a grid of
@@ -4336,19 +4431,72 @@ fn sidebar_checkout_label(shelf: SidebarShelf<'_>, width: usize, show_icons: boo
     else {
         return String::new();
     };
-    if show_icons {
-        return checkout_state_context(reading, true).unwrap_or_default();
-    }
-    CheckoutStateLabel::read(reading)
-        .map(|label| label.truncated(width))
+    CheckoutStateReading::of(reading)
+        .map(|reading| reading.as_a_sidebar_row_draws_it(width, show_icons))
         .unwrap_or_default()
+}
+
+/// One Worktree's Checkout State as every surface reads it: whether it is
+/// the main Worktree or a linked one, and the revision its HEAD names, which
+/// is `None` where that could not be read and is then marked unavailable.
+/// A Session's reading and a Directory Browser row's both come to this, so
+/// they are drawn by one hand.
+#[derive(Clone, Copy)]
+struct CheckoutStateReading<'a> {
+    kind: crate::protocol::CheckoutKind,
+    revision: Option<&'a crate::protocol::CheckoutRevision>,
+}
+
+impl<'a> CheckoutStateReading<'a> {
+    /// Nothing at all where the Worktree's source control was never detected:
+    /// a directory outside source control has no Checkout State to present.
+    fn of(reading: &'a crate::protocol::CheckoutSummary) -> Option<Self> {
+        use crate::protocol::SourceControlAvailability;
+        let revision = match &reading.availability {
+            SourceControlAvailability::NotDetected => return None,
+            SourceControlAvailability::Unavailable { .. } => None,
+            SourceControlAvailability::Available => reading.revision.as_ref(),
+        };
+        Some(Self {
+            kind: reading.association.kind,
+            revision,
+        })
+    }
+
+    /// As a Sidebar row's line beneath its Title draws it, `width` columns
+    /// wide: led by a glyph saying what HEAD stands on while Icons are shown,
+    /// and otherwise in words alone, a linked Worktree's own label kept
+    /// standing where a long branch name is cut.
+    fn as_a_sidebar_row_draws_it(self, width: usize, show_icons: bool) -> String {
+        if show_icons {
+            return self.context(true);
+        }
+        CheckoutStateLabel::spell(self, CheckoutStateForm::Standing).truncated(width)
+    }
+
+    /// The reading led by the glyph for what HEAD stands on where Icons are
+    /// shown, which also tells a linked Worktree apart; an unreadable one is
+    /// said in words either way.
+    fn context(self, show_icons: bool) -> String {
+        use crate::protocol::{CheckoutKind, CheckoutRevision};
+        let label = CheckoutStateLabel::spell(self, CheckoutStateForm::Standing);
+        let icon = match self.revision.filter(|_| show_icons) {
+            None => return label.text(),
+            Some(CheckoutRevision::Branch { .. }) => match self.kind {
+                CheckoutKind::Main => NF_COD_GIT_BRANCH,
+                CheckoutKind::Linked => NF_COD_WORKTREE,
+            },
+            Some(CheckoutRevision::Detached { .. }) => NF_COD_GIT_COMMIT,
+        };
+        icon_label(true, icon, &label.state)
+    }
 }
 
 /// A Worktree's Checkout State as every surface presenting one spells it: the
 /// branch it stands on, the commit a detached head stands at, or the plain
 /// fact that the reading could not be taken. The Sidebar, the Landing, the
-/// Worktree Selector, and a Session's header all read one Checkout State, so
-/// they say it in one voice.
+/// Worktree Selector, a Session's header, and the Directory Browser all read
+/// the same Checkout States, so they say them in one voice.
 struct CheckoutStateLabel {
     state: String,
     /// Kept apart from the state so a long branch name is what truncation
@@ -4371,50 +4519,43 @@ enum CheckoutStateForm {
 }
 
 impl CheckoutStateLabel {
-    /// Nothing at all where the Worktree's source control was never detected:
-    /// a directory outside source control has no Checkout State to present.
-    fn read(reading: &crate::protocol::CheckoutSummary) -> Option<Self> {
-        Self::read_in(reading, CheckoutStateForm::Standing)
-    }
-
     fn read_in(
         reading: &crate::protocol::CheckoutSummary,
         form: CheckoutStateForm,
     ) -> Option<Self> {
-        use crate::protocol::{CheckoutKind, CheckoutRevision, SourceControlAvailability};
-        let unavailable = || Self {
-            state: "[unavailable]".to_owned(),
-            suffix: "",
-        };
-        Some(match &reading.availability {
-            SourceControlAvailability::NotDetected => return None,
-            SourceControlAvailability::Unavailable { .. } => unavailable(),
-            SourceControlAvailability::Available => match &reading.revision {
-                // The main working copy needs no label of its own.
-                Some(CheckoutRevision::Branch { name, commit }) => Self {
-                    state: match form {
-                        CheckoutStateForm::Choosing if commit.is_none() => {
-                            format!("{name} (unborn)")
-                        }
-                        _ => name.clone(),
-                    },
-                    suffix: match reading.association.kind {
-                        CheckoutKind::Main => "",
-                        CheckoutKind::Linked => " (worktree)",
-                    },
+        CheckoutStateReading::of(reading).map(|reading| Self::spell(reading, form))
+    }
+
+    fn spell(reading: CheckoutStateReading<'_>, form: CheckoutStateForm) -> Self {
+        use crate::protocol::{CheckoutKind, CheckoutRevision};
+        match reading.revision {
+            // The main working copy needs no label of its own.
+            Some(CheckoutRevision::Branch { name, commit }) => Self {
+                state: match form {
+                    CheckoutStateForm::Choosing if commit.is_none() => {
+                        format!("{name} (unborn)")
+                    }
+                    _ => name.clone(),
                 },
-                Some(CheckoutRevision::Detached { commit }) => Self {
-                    state: match form {
-                        CheckoutStateForm::Standing => commit.chars().take(7).collect(),
-                        CheckoutStateForm::Choosing => {
-                            format!("detached {}", commit.chars().take(8).collect::<String>())
-                        }
-                    },
-                    suffix: "",
+                suffix: match reading.kind {
+                    CheckoutKind::Main => "",
+                    CheckoutKind::Linked => " (worktree)",
                 },
-                None => unavailable(),
             },
-        })
+            Some(CheckoutRevision::Detached { commit }) => Self {
+                state: match form {
+                    CheckoutStateForm::Standing => commit.chars().take(7).collect(),
+                    CheckoutStateForm::Choosing => {
+                        format!("detached {}", commit.chars().take(8).collect::<String>())
+                    }
+                },
+                suffix: "",
+            },
+            None => Self {
+                state: "[unavailable]".to_owned(),
+                suffix: "",
+            },
+        }
     }
 
     fn text(&self) -> String {
@@ -4442,21 +4583,7 @@ fn checkout_state_context(
     reading: &crate::protocol::CheckoutSummary,
     show_icons: bool,
 ) -> Option<String> {
-    use crate::protocol::{CheckoutKind, CheckoutRevision, SourceControlAvailability};
-
-    let label = CheckoutStateLabel::read(reading)?;
-    if !show_icons || reading.availability != SourceControlAvailability::Available {
-        return Some(label.text());
-    }
-    let icon = match &reading.revision {
-        Some(CheckoutRevision::Branch { .. }) => match reading.association.kind {
-            CheckoutKind::Main => NF_COD_GIT_BRANCH,
-            CheckoutKind::Linked => NF_COD_WORKTREE,
-        },
-        Some(CheckoutRevision::Detached { .. }) => NF_COD_GIT_COMMIT,
-        None => return Some(label.text()),
-    };
-    Some(icon_label(true, icon, &label.state))
+    CheckoutStateReading::of(reading).map(|reading| reading.context(show_icons))
 }
 
 /// One Session set aside, as the single slim line the settled shelf gives it:

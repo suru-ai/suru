@@ -2124,6 +2124,13 @@ impl Sidebar {
         }
     }
 
+    /// The Outlook's Workspaces as the Sidebar's listing knows them, which is
+    /// what its selector offers: every one its Sessions are rooted in, and
+    /// the one the client works in.
+    pub(super) fn workspaces(&self) -> Vec<crate::protocol::Workspace> {
+        self.listing.workspaces()
+    }
+
     /// Whether the Sidebar is answering for one Workspace rather than for the
     /// reader's whole body of work, which is what an empty column means by
     /// nothing being here.

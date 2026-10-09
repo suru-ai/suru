@@ -21,13 +21,14 @@ use suru::{
     managed_client::ManagedEvent,
     protocol::{
         AgentSelection, CheckoutAssociation, CheckoutId, CheckoutKind, CheckoutRevision,
-        CheckoutSummary, ChildDirectory, DirectoryListing, DirectorySourceControl, EffectiveSettings, ExecutionDirectory,
-        ExecutionDirectoryStatus, ListDirectoryRequest, ModelAvailability, ModelCatalog, ModelId,
-        ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
-        ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue, Outlook,
-        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, Repository, RepositoryId,
-        RepositoryLocation, ResolveWorkspaceRequest, ResolvedWorkspace, SessionId, SessionListItem,
-        SessionStatus, SessionTimestamp, SidebarScope, SidebarSettings, SidebarVisibility,
+        CheckoutSummary, ChildDirectory, DirectoryListing, DirectorySourceControl,
+        EffectiveSettings, ExecutionDirectory, ExecutionDirectoryStatus, ListDirectoryRequest,
+        ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId,
+        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
+        ModelOptionSelection, ModelOptionValue, Outlook, ProviderCatalogStatus, ProviderId,
+        ProviderModelCatalog, Repository, RepositoryId, RepositoryLocation,
+        ResolveWorkspaceRequest, ResolvedWorkspace, SessionId, SessionListItem, SessionStatus,
+        SessionTimestamp, SidebarScope, SidebarSettings, SidebarVisibility,
         SourceControlAvailability, SourceControlCapabilities, Workspace,
     },
     tui::{
@@ -84,7 +85,7 @@ fn the_leader_chord_opens_the_browser() {
     let (_, _, request) = browse_by_chord(&mut application);
 
     assert_eq!(request.path, here);
-    assert_eq!(tree(&application), ["› ▾ here", "    Loading…"]);
+    assert_eq!(tree(&application), ["› ▾ here · [current]", "    Loading…"]);
 }
 
 #[test]
@@ -97,7 +98,7 @@ fn the_root_s_children_are_listed_beneath_it_as_the_server_answers() {
 
     assert_eq!(
         tree(&application),
-        ["› ▾ here", "    ▸ alpha", "    ▸ beta"],
+        ["› ▾ here · [current]", "    ▸ alpha", "    ▸ beta"],
         "only what the Server listed stands beneath the root, indented"
     );
 }
@@ -127,7 +128,12 @@ fn a_directory_s_children_are_asked_for_only_when_it_is_opened() {
     );
     assert_eq!(
         tree(&application),
-        ["  ▾ here", "›   ▾ alpha", "      Loading…", "    ▸ beta"],
+        [
+            "  ▾ here · [current]",
+            "›   ▾ alpha",
+            "      Loading…",
+            "    ▸ beta"
+        ],
         "the row opened says it is being read until the Server answers"
     );
 
@@ -139,7 +145,12 @@ fn a_directory_s_children_are_asked_for_only_when_it_is_opened() {
     );
     assert_eq!(
         tree(&application),
-        ["  ▾ here", "›   ▾ alpha", "      ▸ inner", "    ▸ beta"]
+        [
+            "  ▾ here · [current]",
+            "›   ▾ alpha",
+            "      ▸ inner",
+            "    ▸ beta"
+        ]
     );
 }
 
@@ -166,7 +177,12 @@ fn right_opens_the_focused_row_and_left_closes_it() {
     );
     assert_eq!(
         tree(&application),
-        ["  ▾ here", "›   ▾ alpha", "      ▸ inner", "    ▸ beta"]
+        [
+            "  ▾ here · [current]",
+            "›   ▾ alpha",
+            "      ▸ inner",
+            "    ▸ beta"
+        ]
     );
 
     assert_eq!(
@@ -175,7 +191,7 @@ fn right_opens_the_focused_row_and_left_closes_it() {
     );
     assert_eq!(
         tree(&application),
-        ["  ▾ here", "›   ▸ alpha", "    ▸ beta"],
+        ["  ▾ here · [current]", "›   ▸ alpha", "    ▸ beta"],
         "Left closes the row it is on and keeps focus there"
     );
 
@@ -186,7 +202,12 @@ fn right_opens_the_focused_row_and_left_closes_it() {
     );
     assert_eq!(
         tree(&application),
-        ["  ▾ here", "›   ▾ alpha", "      ▸ inner", "    ▸ beta"]
+        [
+            "  ▾ here · [current]",
+            "›   ▾ alpha",
+            "      ▸ inner",
+            "    ▸ beta"
+        ]
     );
 }
 
@@ -203,7 +224,7 @@ fn space_opens_and_closes_the_focused_row() {
     );
     assert_eq!(
         tree(&application),
-        ["› ▸ here"],
+        ["› ▸ here · [current]"],
         "Space closes the open row it is on, the root included"
     );
 
@@ -212,7 +233,7 @@ fn space_opens_and_closes_the_focused_row() {
         ApplicationTransition::Continue,
         "and opens it again without asking for what is already listed"
     );
-    assert_eq!(tree(&application), ["› ▾ here", "    ▸ alpha"]);
+    assert_eq!(tree(&application), ["› ▾ here · [current]", "    ▸ alpha"]);
 }
 
 #[test]
@@ -226,7 +247,7 @@ fn left_on_the_root_moves_nothing() {
         key(&mut application, KeyCode::Left),
         ApplicationTransition::Continue
     );
-    assert_eq!(tree(&application), ["› ▾ here", "    ▸ alpha"]);
+    assert_eq!(tree(&application), ["› ▾ here · [current]", "    ▸ alpha"]);
     assert_eq!(path_field(&application), here.to_string_lossy());
 }
 
@@ -294,7 +315,7 @@ fn a_directory_two_open_branches_both_list_is_a_row_beneath_each() {
     assert_eq!(
         tree(&application),
         [
-            "  ▾ here",
+            "  ▾ here · [current]",
             "    ▾ alpha",
             "      ▸ inner",
             "›   ▾ beta",
@@ -313,7 +334,7 @@ fn a_directory_two_open_branches_both_list_is_a_row_beneath_each() {
     assert_eq!(
         rows,
         [
-            "  ▾ here",
+            "  ▾ here · [current]",
             "    ▾ alpha",
             "      ▸ inner",
             "    ▾ beta",
@@ -344,7 +365,7 @@ fn a_directory_two_open_branches_both_list_is_a_row_beneath_each() {
     assert_eq!(
         tree(&application),
         [
-            "  ▾ here",
+            "  ▾ here · [current]",
             "    ▾ alpha",
             "      ▸ inner",
             "    ▾ beta",
@@ -370,7 +391,7 @@ fn a_directory_the_server_refuses_keeps_its_row_and_says_why_beneath_it() {
     assert_eq!(
         tree(&application),
         [
-            "  ▾ here",
+            "  ▾ here · [current]",
             "›   ▾ alpha",
             "      Error: Permission denied",
             "    ▸ beta"
@@ -400,7 +421,7 @@ fn a_root_the_server_refuses_says_why_in_the_path_field_s_place() {
     );
     assert_eq!(
         tree(&application),
-        ["› ▾ here"],
+        ["› ▾ here · [current]"],
         "the root keeps its row, with nothing said beneath it a second time"
     );
 }
@@ -507,12 +528,12 @@ fn an_answer_the_browser_no_longer_awaits_moves_nothing() {
     answer(&mut application, abandoned, &here, &["stale"]);
     assert_eq!(
         tree(&application),
-        ["› ▾ here", "    Loading…"],
+        ["› ▾ here · [current]", "    Loading…"],
         "an answer to an earlier opening's request is not this one's"
     );
 
     answer(&mut application, awaited, &here, &["fresh"]);
-    assert_eq!(tree(&application), ["› ▾ here", "    ▸ fresh"]);
+    assert_eq!(tree(&application), ["› ▾ here · [current]", "    ▸ fresh"]);
 }
 
 #[test]
@@ -539,13 +560,13 @@ fn every_opening_begins_afresh_at_the_root() {
     );
     assert_eq!(
         tree(&application),
-        ["› ▾ here", "    Loading…"],
+        ["› ▾ here · [current]", "    Loading…"],
         "focus is back on the root and nothing opened before stands open"
     );
     answer(&mut application, listing_id, &here, &["alpha", "beta"]);
     assert_eq!(
         tree(&application),
-        ["› ▾ here", "    ▸ alpha", "    ▸ beta"]
+        ["› ▾ here · [current]", "    ▸ alpha", "    ▸ beta"]
     );
 }
 
@@ -970,6 +991,264 @@ fn choosing_leaves_the_open_session_working_and_the_sidebar_its_scope() {
     );
 }
 
+/// Glyphs the browser draws while Icons are shown, as the Sidebar and the
+/// Workspace Picker draw them.
+const FOLDER: char = '\u{ea83}';
+const REPOSITORY: char = '\u{ea62}';
+const BRANCH: char = '\u{ec6f}';
+const WORKTREE: char = '\u{ec7e}';
+const COMMIT: char = '\u{eafc}';
+/// The `dev-rust` and `dev-python` Icons a Workspace here may wear.
+const RUST: char = '\u{e7a8}';
+const PYTHON: char = '\u{e73c}';
+
+/// A Repository's main root and a linked Worktree's root show the branch
+/// each stands on as a Sidebar row draws it: the main Worktree left implicit
+/// and a linked one told apart, by its glyph while Icons are shown and in
+/// words while they are not.
+#[test]
+fn a_worktree_root_shows_the_branch_it_stands_on_as_a_sidebar_row_draws_it() {
+    let here = directory(&["nowhere", "here"]);
+    let children = [
+        ("linked", linked_worktree_root(branch("topic"))),
+        ("main", repository_root(branch("main"))),
+    ];
+
+    assert_eq!(
+        tree_drawn(&here, Icons::Hidden, Vec::new(), &children)[1..],
+        ["    ▸ linked · topic (worktree)", "    ▸ main · main"]
+    );
+    assert_eq!(
+        tree_drawn(&here, Icons::Shown, Vec::new(), &children)[1..],
+        [
+            format!("    ▸ {REPOSITORY} linked · {WORKTREE} topic"),
+            format!("    ▸ {REPOSITORY} main · {BRANCH} main"),
+        ]
+    );
+}
+
+#[test]
+fn a_root_at_a_detached_commit_shows_the_commit_as_a_sidebar_row_draws_it() {
+    let here = directory(&["nowhere", "here"]);
+    let detached = Some(CheckoutRevision::Detached {
+        commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+    });
+    let children = [
+        ("detached", repository_root(detached.clone())),
+        ("linked", linked_worktree_root(detached)),
+    ];
+
+    assert_eq!(
+        tree_drawn(&here, Icons::Hidden, Vec::new(), &children)[1..],
+        ["    ▸ detached · 0123456", "    ▸ linked · 0123456"],
+        "a detached head names its commit, short, wherever its Worktree is"
+    );
+    assert_eq!(
+        tree_drawn(&here, Icons::Shown, Vec::new(), &children)[1..],
+        [
+            format!("    ▸ {REPOSITORY} detached · {COMMIT} 0123456"),
+            format!("    ▸ {REPOSITORY} linked · {COMMIT} 0123456"),
+        ]
+    );
+}
+
+#[test]
+fn a_root_whose_checkout_state_the_server_could_not_read_is_marked_unavailable() {
+    let here = directory(&["nowhere", "here"]);
+    let children = [
+        ("linked", linked_worktree_root(None)),
+        ("main", repository_root(None)),
+    ];
+
+    assert_eq!(
+        tree_drawn(&here, Icons::Hidden, Vec::new(), &children)[1..],
+        ["    ▸ linked · [unavailable]", "    ▸ main · [unavailable]"]
+    );
+    assert_eq!(
+        tree_drawn(&here, Icons::Shown, Vec::new(), &children)[1..],
+        [
+            format!("    ▸ {REPOSITORY} linked · [unavailable]"),
+            format!("    ▸ {REPOSITORY} main · [unavailable]"),
+        ],
+        "the marker is words alike either way, as a Sidebar row draws it"
+    );
+}
+
+#[test]
+fn a_bare_repository_is_marked_as_such() {
+    let here = directory(&["nowhere", "here"]);
+    let children = [
+        ("bare.git", DirectorySourceControl::BareRepository),
+        ("plain", DirectorySourceControl::Plain),
+    ];
+
+    assert_eq!(
+        tree_drawn(&here, Icons::Hidden, Vec::new(), &children)[1..],
+        ["    ▸ bare.git · [bare]", "    ▸ plain"]
+    );
+    assert_eq!(
+        tree_drawn(&here, Icons::Shown, Vec::new(), &children)[1..],
+        [
+            format!("    ▸ {REPOSITORY} bare.git · [bare]"),
+            format!("    ▸ {FOLDER} plain"),
+        ]
+    );
+}
+
+/// A directory that is already one of the Outlook's Workspaces, as the
+/// Sidebar's listing knows them, wears that Workspace's Icon; one with none
+/// is drawn as any other directory is, and no Icon is drawn while Icons are
+/// hidden, as the Workspace Picker draws its rows.
+#[test]
+fn a_directory_that_is_one_of_the_outlook_s_workspaces_wears_its_icon() {
+    let here = directory(&["nowhere", "here"]);
+    let sessions = vec![
+        session_in(&here.join("iconed"), Some("dev-rust")),
+        session_in(&here.join("iconless"), None),
+    ];
+    let children = [
+        ("iconed", DirectorySourceControl::Plain),
+        ("iconless", DirectorySourceControl::Plain),
+        ("unknown", DirectorySourceControl::Plain),
+    ];
+
+    assert_eq!(
+        tree_drawn(&here, Icons::Shown, sessions.clone(), &children)[1..],
+        [
+            format!("    ▸ {RUST} iconed"),
+            format!("    ▸ {FOLDER} iconless"),
+            format!("    ▸ {FOLDER} unknown"),
+        ]
+    );
+    assert_eq!(
+        tree_drawn(&here, Icons::Hidden, sessions, &children)[1..],
+        ["    ▸ iconed", "    ▸ iconless", "    ▸ unknown"]
+    );
+}
+
+/// The Workspace the Landing is in is marked current wherever its directory
+/// stands in the tree, as the Workspace Picker marks it, in words whether
+/// or not Icons are shown; its Icon stands beside it like any Workspace's.
+#[test]
+fn the_current_workspace_is_marked_current_as_the_workspace_picker_marks_it() {
+    let here = directory(&["nowhere", "here"]);
+    let sessions = vec![
+        session_in(&here, Some("dev-python")),
+        session_in(&here.join("other"), Some("dev-rust")),
+    ];
+    let children = [
+        ("other", repository_root(branch("main"))),
+        ("plain", DirectorySourceControl::Plain),
+    ];
+
+    assert_eq!(
+        tree_drawn(&here, Icons::Hidden, sessions.clone(), &children),
+        ["› ▾ here · [current]", "    ▸ other · main", "    ▸ plain",],
+        "only the current Workspace is marked current, not every Workspace"
+    );
+    assert_eq!(
+        tree_drawn(&here, Icons::Shown, sessions, &children),
+        [
+            format!("› ▾ {PYTHON} here · [current]"),
+            format!("    ▸ {RUST} other · {BRANCH} main"),
+            format!("    ▸ {FOLDER} plain"),
+        ]
+    );
+}
+
+/// A Workspace's Icon stands where a Repository's glyph would, and the
+/// Repository glyph where the folder's would; while Icons are hidden none of
+/// them is drawn, and what each row says in words still tells them apart.
+#[test]
+fn a_workspace_icon_stands_before_a_repository_glyph_and_that_before_the_folder() {
+    let here = directory(&["nowhere", "here"]);
+    let sessions = vec![
+        session_in(&here.join("iconed-repository"), Some("dev-rust")),
+        session_in(&here.join("iconless-repository"), None),
+    ];
+    let children = [
+        ("iconed-repository", repository_root(branch("main"))),
+        ("iconless-repository", repository_root(branch("main"))),
+        ("plain", DirectorySourceControl::Plain),
+        ("repository", repository_root(branch("main"))),
+    ];
+
+    assert_eq!(
+        tree_drawn(&here, Icons::Shown, sessions.clone(), &children)[1..],
+        [
+            format!("    ▸ {RUST} iconed-repository · {BRANCH} main"),
+            format!("    ▸ {REPOSITORY} iconless-repository · {BRANCH} main"),
+            format!("    ▸ {FOLDER} plain"),
+            format!("    ▸ {REPOSITORY} repository · {BRANCH} main"),
+        ]
+    );
+    assert_eq!(
+        tree_drawn(&here, Icons::Hidden, sessions, &children)[1..],
+        [
+            "    ▸ iconed-repository · main",
+            "    ▸ iconless-repository · main",
+            "    ▸ plain",
+            "    ▸ repository · main",
+        ]
+    );
+}
+
+#[derive(Clone, Copy)]
+enum Icons {
+    Shown,
+    Hidden,
+}
+
+/// The tree a browser opened at `here` draws once the Server lists
+/// `children`, each with what it is to source control, while the Sidebar's
+/// listing holds `sessions` and Icons are shown or hidden.
+fn tree_drawn(
+    here: &Path,
+    icons: Icons,
+    sessions: Vec<SessionListItem>,
+    children: &[(&str, DirectorySourceControl)],
+) -> Vec<String> {
+    let mut application = connected_application(here);
+    let mut settings = EffectiveSettings::default();
+    settings.appearance.show_icons = matches!(icons, Icons::Shown);
+    let ApplicationTransition::ListSessions(request) = deliver_settings(&mut application, settings)
+    else {
+        panic!("a Sidebar coming into view asks for its Sessions");
+    };
+    application
+        .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+        .expect("list the Sidebar's Sessions");
+    let (_, listing_id, _) = browse(&mut application);
+    answer_with(&mut application, listing_id, here, children);
+    tree(&application)
+}
+
+/// A Session the Sidebar lists in the Workspace at `path`, wearing the Icon
+/// the Catalog names `icon`.
+fn session_in(path: &Path, icon: Option<&str>) -> SessionListItem {
+    let mut session = listed_session(SessionId::new(), "Work", path, 1, 1);
+    let SessionListItem::Readable(summary) = &mut session else {
+        unreachable!("a listed Session is readable")
+    };
+    summary.session.workspace.icon = icon.map(str::to_owned);
+    session
+}
+
+fn branch(name: &str) -> Option<CheckoutRevision> {
+    Some(CheckoutRevision::Branch {
+        name: name.to_owned(),
+        commit: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+    })
+}
+
+fn repository_root(revision: Option<CheckoutRevision>) -> DirectorySourceControl {
+    DirectorySourceControl::RepositoryRoot { revision }
+}
+
+fn linked_worktree_root(revision: Option<CheckoutRevision>) -> DirectorySourceControl {
+    DirectorySourceControl::LinkedWorktreeRoot { revision }
+}
+
 /// A Landing in `workspace` whose Execution Directory is `subdirectory`, a
 /// directory beneath it, as the Server resolves the launch to.
 fn landing_in_subdirectory(workspace: &Path, subdirectory: &Path) -> Application {
@@ -1295,13 +1574,28 @@ fn expect_listing(
     (outlook, listing_id, request)
 }
 
-/// The Server's listing of `root` with child directories named `children`,
-/// each spelled beneath it the way the Server spells it.
+/// The Server's listing of `root` with plain child directories named
+/// `children`, each spelled beneath it the way the Server spells it.
 fn answer(
     application: &mut Application,
     listing_id: DirectoryListingId,
     root: &Path,
     children: &[&str],
+) {
+    let children = children
+        .iter()
+        .map(|name| (*name, DirectorySourceControl::Plain))
+        .collect::<Vec<_>>();
+    answer_with(application, listing_id, root, &children);
+}
+
+/// The Server's listing of `root` with child directories by name, each with
+/// what the Server read it to be.
+fn answer_with(
+    application: &mut Application,
+    listing_id: DirectoryListingId,
+    root: &Path,
+    children: &[(&str, DirectorySourceControl)],
 ) {
     application
         .handle_event(ApplicationEvent::DirectoryListed {
@@ -1311,10 +1605,10 @@ fn answer(
                 parent: root.parent().map(Path::to_owned),
                 children: children
                     .iter()
-                    .map(|name| ChildDirectory {
+                    .map(|(name, source_control)| ChildDirectory {
                         name: (*name).to_owned(),
                         path: root.join(name),
-                        source_control: DirectorySourceControl::Plain,
+                        source_control: source_control.clone(),
                     })
                     .collect(),
             }),
@@ -1346,7 +1640,10 @@ fn path_field(application: &Application) -> String {
 fn tree(application: &Application) -> Vec<String> {
     let screen = rendered_application_rows_at(application, WIDTH, HEIGHT);
     let field = rendered_row(&screen, "Path:");
-    let footer = rendered_row(&screen, "Esc close");
+    // The footer names the keys bare where the box is too narrow to say what
+    // each does, as it is beside a Sidebar, and begins with Up and Down
+    // either way.
+    let footer = rendered_row(&screen, "↑↓");
     screen[field + 1..footer]
         .iter()
         .map(|row| inside_box(row).trim_end().to_owned())
@@ -1357,22 +1654,24 @@ fn tree(application: &Application) -> Vec<String> {
         .collect()
 }
 
-/// The name on the row focus stands on.
+/// The name on the row focus stands on, without what is said beside it.
 fn focused(application: &Application) -> String {
     let rows = tree(application);
     let row = rows
         .iter()
         .find(|row| row.starts_with('›'))
         .unwrap_or_else(|| panic!("no row is focused: {rows:?}"));
-    row.trim_start_matches(['›', ' ', '▸', '▾']).to_owned()
+    let name = row.trim_start_matches(['›', ' ', '▸', '▾']);
+    name.split(" · ").next().unwrap_or(name).to_owned()
 }
 
-/// A frame row's content between the overlay box's borders.
+/// A frame row's content between the overlay box's borders: the last two on
+/// the row, since a Sidebar shown beside the main view draws its edge
+/// further left.
 fn inside_box(row: &str) -> &str {
-    let start = row.find('│').map_or(0, |index| index + '│'.len_utf8());
-    let end = row
-        .rfind('│')
-        .filter(|end| *end >= start)
-        .unwrap_or(row.len());
-    &row[start..end]
+    let mut borders = row.rmatch_indices('│').map(|(index, _)| index);
+    match (borders.next(), borders.next()) {
+        (Some(end), Some(start)) => &row[start + '│'.len_utf8()..end],
+        _ => row,
+    }
 }
