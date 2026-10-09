@@ -23,17 +23,17 @@ impl PreparationObserver for InterruptedCreation {
 #[tokio::test]
 async fn remote_preparation_retries_reuse_owning_servers_checkout_and_admission() {
     let (runtime, mut provider) = provider_support::ControlledProvider::new();
-    let pair = paired_servers_with_source_control(
+    let pair = paired_servers_with(
         "remote-preparation-retry",
-        false,
-        Some(runtime),
-        Some(Arc::new(
-            GitSourceControl::default()
-                .with_preparation_observer(Arc::new(InterruptedCreation(AtomicBool::new(false)))),
-        )),
-        None,
-        None,
-        None,
+        PairOptions {
+            runtime: Some(runtime),
+            source_control: Some(Arc::new(
+                GitSourceControl::default().with_preparation_observer(Arc::new(
+                    InterruptedCreation(AtomicBool::new(false)),
+                )),
+            )),
+            ..PairOptions::default()
+        },
     )
     .await;
     let temp = tempfile::tempdir().unwrap();

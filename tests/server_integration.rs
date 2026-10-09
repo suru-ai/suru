@@ -1062,35 +1062,85 @@ async fn paired_servers_with_runtime(
     alternate: bool,
     runtime: Option<std::sync::Arc<dyn suru::provider::ProviderRuntime>>,
 ) -> PairedServers {
-    paired_servers_with_source_control(name, alternate, runtime, None, None, None, None).await
+    paired_servers_with(
+        name,
+        PairOptions {
+            alternate,
+            runtime,
+            ..PairOptions::default()
+        },
+    )
+    .await
 }
 
 /// Pairs two Servers whose Serving side reads `~` as `home`.
 async fn paired_servers_at_home(name: &str, home: &std::path::Path) -> PairedServers {
-    paired_servers_with_source_control(name, false, None, None, None, None, Some(home)).await
+    paired_servers_with(
+        name,
+        PairOptions {
+            serving_home: Some(home),
+            ..PairOptions::default()
+        },
+    )
+    .await
 }
 
 /// Pairs two Servers whose redeeming side gives a Remote only `timeout` to
 /// acknowledge its own removal.
 async fn paired_servers_with_withdrawal_timeout(name: &str, timeout: Duration) -> PairedServers {
-    paired_servers_with_source_control(name, false, None, None, Some(timeout), None, None).await
+    paired_servers_with(
+        name,
+        PairOptions {
+            withdrawal_timeout: Some(timeout),
+            ..PairOptions::default()
+        },
+    )
+    .await
 }
 
 /// Pairs two Servers whose redeeming side dials the Serving one's direct ways
 /// through `proxies`.
 async fn paired_servers_through(name: &str, proxies: DirectProxies) -> PairedServers {
-    paired_servers_with_source_control(name, false, None, None, None, Some(proxies), None).await
+    paired_servers_with(
+        name,
+        PairOptions {
+            direct_proxies: Some(proxies),
+            ..PairOptions::default()
+        },
+    )
+    .await
 }
 
-async fn paired_servers_with_source_control(
-    name: &str,
+/// How a pair of Servers differs from the pair [`paired_servers`] makes;
+/// each field left at its default leaves that part as it is there.
+#[derive(Default)]
+struct PairOptions<'a> {
+    /// A second way to the Serving Server, offered in the Invite beside the
+    /// first.
     alternate: bool,
+    /// The Serving Server's Provider, in place of the built-in runtimes.
     runtime: Option<std::sync::Arc<dyn suru::provider::ProviderRuntime>>,
+    /// The Serving Server's source control, which needs `runtime` given too.
     source_control: Option<std::sync::Arc<dyn suru::source_control::SourceControl>>,
+    /// How long the redeeming side waits on a Remote to acknowledge its own
+    /// removal.
     withdrawal_timeout: Option<Duration>,
+    /// The proxies the redeeming side dials the Serving one's direct ways
+    /// through, in place of those the environment names.
     direct_proxies: Option<DirectProxies>,
-    serving_home: Option<&std::path::Path>,
-) -> PairedServers {
+    /// The Serving Server's home, in place of the platform's.
+    serving_home: Option<&'a std::path::Path>,
+}
+
+async fn paired_servers_with(name: &str, options: PairOptions<'_>) -> PairedServers {
+    let PairOptions {
+        alternate,
+        runtime,
+        source_control,
+        withdrawal_timeout,
+        direct_proxies,
+        serving_home,
+    } = options;
     let serving_state = tempfile::tempdir().expect("create Serving state directory");
     let serving_config_root = tempfile::tempdir().expect("create Serving config directory");
     let serving_channel = format!("{name}-serving");
