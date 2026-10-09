@@ -530,10 +530,9 @@ fn landing_submit_draws_the_provisional_session_at_once() {
     // Prompt gives it heads the view.
     assert_eq!(drawn.matches("Rename the widget").count(), 2);
     // Working, with interruption guidance but no elapsed time: only the Server
-    // knows when Working began.
-    assert!(drawn.contains("Working"), "{drawn}");
-    assert!(drawn.contains("Esc to interrupt"), "{drawn}");
-    assert!(!drawn.contains("0s"), "{drawn}");
+    // knows when Working began. Pinned as the whole indicator, since the
+    // Workspace's random temporary name is drawn too and may hold "0s".
+    assert!(drawn.contains("Working (Esc to interrupt)"), "{drawn}");
     // The composer stands empty and ready for a draft.
     assert!(drawn.contains("Type a prompt"), "{drawn}");
 }
