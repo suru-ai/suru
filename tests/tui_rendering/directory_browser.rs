@@ -2654,6 +2654,76 @@ fn a_double_press_on_a_row_chooses_it_as_enter_does() {
     );
 }
 
+/// What happens between the two presses of a double press landing on one
+/// cell.
+#[derive(Clone, Copy, Debug)]
+enum BetweenPresses {
+    /// Nothing: the second press lands on the frame the first landed on.
+    Nothing,
+    /// A frame is drawn.
+    Frame,
+    /// The Server answers the listing the first press asked for, and no
+    /// frame is drawn.
+    Listing,
+    /// The Server answers the listing the first press asked for, and a frame
+    /// is drawn with it.
+    ListingAndFrame,
+}
+
+const BETWEEN_PRESSES: [BetweenPresses; 4] = [
+    BetweenPresses::Nothing,
+    BetweenPresses::Frame,
+    BetweenPresses::Listing,
+    BetweenPresses::ListingAndFrame,
+];
+
+impl BetweenPresses {
+    /// Lets this happen to `application`, which `answer` gives the Server's
+    /// answer to the listing the first press asked for.
+    fn happen(self, application: &mut Application, answer: impl FnOnce(&mut Application)) {
+        if matches!(self, Self::Listing | Self::ListingAndFrame) {
+            answer(application);
+        }
+        if matches!(self, Self::Frame | Self::ListingAndFrame) {
+            rendered_application_buffer(application, WIDTH, HEIGHT);
+        }
+    }
+}
+
+/// Two presses on one cell within the double-press interval choose the row
+/// drawn there as Enter does, whether or not a frame is drawn or the listing
+/// the first press asked for is answered between them.
+#[test]
+fn a_double_press_on_a_row_chooses_it_whatever_happens_between_its_presses() {
+    let here = directory(&["nowhere", "here"]);
+    for between in BETWEEN_PRESSES {
+        let (mut keyed, _) = browsing(&here, &["alpha", "beta"]);
+        key(&mut keyed, KeyCode::Down);
+        key(&mut keyed, KeyCode::Down);
+        key(&mut keyed, KeyCode::Char(' '));
+        let entered = key(&mut keyed, KeyCode::Enter);
+        let (mut pointed, clock) = browsing(&here, &["alpha", "beta"]);
+        let beta = text_position(
+            &rendered_application_buffer(&pointed, WIDTH, HEIGHT),
+            "beta",
+        );
+
+        let (_, listing_id, _) = expect_listing(press_at(&mut pointed, beta));
+        between.happen(&mut pointed, |application| {
+            answer(application, listing_id, &here.join("beta"), &["inner"]);
+        });
+        wait(&clock, CLICK_INTERVAL);
+        let pressed = press_at(&mut pointed, beta);
+
+        let (_, _, request) = expect_choice(&pressed);
+        assert_eq!(request.path, here.join("beta"), "{between:?}");
+        assert_eq!(
+            pressed, entered,
+            "{between:?}: the double press asks what Enter asks"
+        );
+    }
+}
+
 /// A double press on a row already open chooses it all the same: the first
 /// press closes the row, as any single press on an open row does, and the
 /// second, landing on the row where it still stands, chooses it.
@@ -3676,6 +3746,86 @@ fn a_press_on_the_drive_list_s_row_opens_or_closes_it_and_a_double_press_chooses
         ],
         "a single press past the interval opens the row again"
     );
+}
+
+/// A double press on a drive the drive list holds chooses that drive as
+/// Enter does, though the first press, opening the drive as Space does,
+/// stood the tree on it and so carried its row to the root's place: the
+/// second press, on the cell the first landed on, still stands for the
+/// drive, whatever is drawn in that cell by then or whether a frame was
+/// drawn at all.
+#[test]
+fn a_double_press_on_a_drive_in_the_drive_list_chooses_it_as_enter_does() {
+    for between in BETWEEN_PRESSES {
+        let mut keyed = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
+        for _ in ["Users", "Windows", r"D:\"] {
+            key(&mut keyed, KeyCode::Down);
+        }
+        key(&mut keyed, KeyCode::Char(' '));
+        let entered = key(&mut keyed, KeyCode::Enter);
+        let (mut pointed, clock) = pointing(drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]));
+        let drive = text_position(
+            &rendered_application_buffer(&pointed, WIDTH, HEIGHT),
+            r"D:\",
+        );
+
+        let (_, listing_id, request) = expect_listing(press_at(&mut pointed, drive));
+        assert_eq!(request.path, Path::new(r"D:\"), "{between:?}");
+        between.happen(&mut pointed, |application| {
+            answer_from_windows(
+                application,
+                listing_id,
+                r"D:\",
+                Some(DRIVE_LIST),
+                &["Data", "Games", "Media", "Music"],
+            );
+        });
+        wait(&clock, CLICK_INTERVAL);
+        let pressed = press_at(&mut pointed, drive);
+
+        let (_, _, request) = expect_choice(&pressed);
+        assert_eq!(request.path, Path::new(r"D:\"), "{between:?}");
+        assert_eq!(
+            pressed, entered,
+            "{between:?}: the double press asks what Enter asks"
+        );
+    }
+}
+
+/// Once the drive a press opened stands at the root, the cell that press
+/// landed on holds another row, and a press on it past the double-press
+/// interval is a single press on that row.
+#[test]
+fn a_press_past_the_interval_on_the_cell_a_drive_was_opened_from_opens_the_row_drawn_there() {
+    let (mut application, clock) = pointing(drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]));
+    let drive = text_position(
+        &rendered_application_buffer(&application, WIDTH, HEIGHT),
+        r"D:\",
+    );
+    let (_, listing_id, _) = expect_listing(press_at(&mut application, drive));
+    answer_from_windows(
+        &mut application,
+        listing_id,
+        r"D:\",
+        Some(DRIVE_LIST),
+        &["Data", "Games", "Media", "Music"],
+    );
+    assert_eq!(
+        tree(&application),
+        [
+            r"› ▾ D:\",
+            "    ▸ Data",
+            "    ▸ Games",
+            "    ▸ Media",
+            "    ▸ Music"
+        ]
+    );
+
+    wait(&clock, CLICK_INTERVAL + Duration::from_millis(1));
+    let (_, _, request) = expect_listing(press_at(&mut application, drive));
+
+    assert_eq!(request.path, Path::new(r"D:\Music"));
+    assert_eq!(focused(&application), "Music");
 }
 
 /// A Client turned toward a Remote on Windows, its Landing working at that

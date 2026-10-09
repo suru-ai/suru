@@ -103,7 +103,7 @@ pub(super) struct DirectoryBrowser {
     shows_hidden: bool,
     /// The row the last press landed on, which a second press within the
     /// double-press interval must land on too to choose it.
-    pressed: Option<RowKey>,
+    pressed: Option<PressedRow>,
     /// Where the last frame drew the browser, which the pointer resolves
     /// against.
     drawn: RefCell<DrawnBrowser>,
@@ -127,6 +127,23 @@ struct DrawnRow {
     line: u16,
     columns: Range<u16>,
     key: RowKey,
+}
+
+impl DrawnRow {
+    fn contains(&self, position: Position) -> bool {
+        self.line == position.y && self.columns.contains(&position.x)
+    }
+}
+
+/// The row a press landed on, where the frame the reader pressed drew it.
+#[derive(Clone, Debug)]
+struct PressedRow {
+    row: DrawnRow,
+    /// Whether opening the row stood the tree on it, carrying it to the
+    /// root's place, as opening a drive the drive list holds does. The
+    /// second press of a double press still finds the row where the first
+    /// did, since that is where the reader pressed it.
+    rerooted: bool,
 }
 
 /// Where a row stands in the tree: the directories from the root down to it,
@@ -330,7 +347,19 @@ impl DirectoryBrowser {
     /// the path field names where the reader stands rather than nothing.
     pub(super) fn open_focused(&mut self) -> Option<DirectoryListingAsk> {
         if self.stands_on_drive_list() && self.focused.0.len() == 2 {
-            return self.root_at_drive(self.focused.directory().to_owned());
+            let drive = self.focused.clone();
+            let ask = self.root_at_drive(drive.directory().to_owned());
+            // A press that opened the drive goes on standing for it at the
+            // root, so a second press where it landed chooses the drive.
+            if let Some(pressed) = self
+                .pressed
+                .as_mut()
+                .filter(|pressed| pressed.row.key == drive)
+            {
+                pressed.row.key = self.focused.clone();
+                pressed.rerooted = true;
+            }
+            return ask;
         }
         self.open_row(self.focused.clone())
     }
@@ -506,8 +535,10 @@ impl DirectoryBrowser {
     /// A press goes by the frame the reader saw, so a listing that has moved
     /// rows since leaves it on the row drawn under it; one the keys have
     /// taken out of the tree since — narrowed or hidden away — is no longer
-    /// there to press. What was pressed was in view already, so the window
-    /// holds.
+    /// there to press. The one row a press moves itself is a drive the
+    /// first press of a double press stood the tree on, which the second,
+    /// landing where the first did, still stands for. What was pressed was
+    /// in view already, so the window holds.
     pub(super) fn press_at(
         &mut self,
         position: Position,
@@ -516,22 +547,33 @@ impl DirectoryBrowser {
         if !self.open {
             return None;
         }
-        let pressed = self
-            .drawn
-            .borrow()
-            .rows
-            .iter()
-            .find(|row| row.line == position.y && row.columns.contains(&position.x))
-            .map(|row| row.key.clone())
-            .filter(|key| self.directories().contains(key));
-        let last = std::mem::replace(&mut self.pressed, pressed.clone());
-        let row = pressed?;
-        let command = if repeats && last.as_ref() == Some(&row) {
+        let last = self.pressed.take();
+        let directories = self.directories();
+        let in_tree = |row: &DrawnRow| directories.contains(&row.key);
+        let row = last
+            .as_ref()
+            .filter(|last| repeats && last.rerooted && last.row.contains(position))
+            .map(|last| last.row.clone())
+            .filter(in_tree)
+            .or_else(|| {
+                self.drawn
+                    .borrow()
+                    .rows
+                    .iter()
+                    .find(|row| row.contains(position))
+                    .cloned()
+                    .filter(in_tree)
+            })?;
+        let command = if repeats && last.is_some_and(|last| last.row.key == row.key) {
             SemanticCommandId::DirectoryBrowserChoose
         } else {
             SemanticCommandId::DirectoryBrowserRowToggle
         };
-        self.focused = row;
+        self.focused = row.key.clone();
+        self.pressed = Some(PressedRow {
+            row,
+            rerooted: false,
+        });
         self.window.hold();
         Some(command)
     }
