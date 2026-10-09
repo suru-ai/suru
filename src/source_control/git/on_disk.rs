@@ -1,11 +1,15 @@
 //! Git's on-disk metadata, read without spawning Git, for the readings
-//! checkout observation repeats on every poll and discovery repeats for every
-//! Worktree a Repository lists. Each reading either answers as
+//! checkout observation repeats on every poll, discovery repeats for every
+//! Worktree a Repository lists, and a Directory Browser listing repeats for
+//! every directory it lists. Each reading either answers as
 //! Git would or declines with `None`, and a declined reading is taken by
 //! running Git instead: anything this does not fully understand — refs kept
 //! in a reftable, a branch that is itself symbolic, an include in the
 //! configuration, a file Git would refuse as malformed — costs a spawn rather
-//! than a wrong answer.
+//! than a wrong answer. A listing alone spawns nothing, since it would cost a
+//! spawn per row: a revision it cannot read here goes to the Client as
+//! unavailable, and a directory it cannot tell for a bare Repository as
+//! plain.
 //!
 //! Two differences are deliberate. Git confirms that the object a branch
 //! names exists and peels it to a commit; this takes the object id as the
