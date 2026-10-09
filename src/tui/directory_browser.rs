@@ -84,6 +84,11 @@ pub(super) struct DirectoryBrowser {
     /// said inside the browser because the browser stands over the Landing
     /// where a refusal is otherwise said.
     refusal: Option<String>,
+    /// Whether directories the Server flagged hidden are drawn among the
+    /// others. Unlike everything else here it outlives an opening, so the
+    /// reader's choice holds for the rest of the client run; it is no
+    /// Setting.
+    shows_hidden: bool,
     sequence: u64,
     window: ListWindow,
 }
@@ -382,6 +387,32 @@ impl DirectoryBrowser {
             base: Some(base),
             path,
         }
+    }
+
+    /// Shows the directories the Server flagged hidden, each in its place
+    /// among the others, or leaves them out again. Every listing already
+    /// carries them, so nothing is asked of the Server. Where leaving them
+    /// out takes away the row focus stood on — a hidden directory, or one
+    /// beneath it — focus moves to the nearest row drawn above it that
+    /// remains, which stands within that hidden directory's parent or is the
+    /// parent itself; the root is never hidden, so one always remains.
+    pub(super) fn toggle_hidden(&mut self) {
+        let drawn = self.directories();
+        self.shows_hidden = !self.shows_hidden;
+        let remaining = self.directories().into_iter().collect::<HashSet<_>>();
+        if !remaining.contains(&self.focused) {
+            let focus = drawn
+                .iter()
+                .position(|key| *key == self.focused)
+                .unwrap_or_default();
+            self.focused = drawn[..focus]
+                .iter()
+                .rev()
+                .find(|key| remaining.contains(key))
+                .cloned()
+                .unwrap_or_else(|| RowKey::root(self.root.clone()));
+        }
+        self.window.reveal();
     }
 
     /// Takes the Server's answer to `listing_id`, where it is one this
@@ -788,14 +819,18 @@ impl DirectoryBrowser {
                 kind: DirectoryBrowserRowKind::Refused(reason.clone()),
             }),
             Some(DirectoryEntries::Listed(listing)) => {
-                // Only the root's children are narrowed, by how their names
-                // begin with the field's tail, case set aside.
+                // Hidden directories are left out at every depth until the
+                // reader shows them, while only the root's children are
+                // narrowed, by how their names begin with the field's tail,
+                // case set aside.
                 let narrowed = row.is_root().then(|| self.filter.to_lowercase());
-                for child in listing.children.iter().filter(|child| {
-                    narrowed
-                        .as_ref()
-                        .is_none_or(|filter| child.name.to_lowercase().starts_with(filter.as_str()))
-                }) {
+                let shown = listing.children.iter().filter(|child| {
+                    (self.shows_hidden || !child.hidden)
+                        && narrowed.as_ref().is_none_or(|filter| {
+                            child.name.to_lowercase().starts_with(filter.as_str())
+                        })
+                });
+                for child in shown {
                     let child_row = row.child(&child.path);
                     rows.push(self.directory_row(
                         depth,

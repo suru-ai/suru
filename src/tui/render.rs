@@ -1957,7 +1957,9 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
     let shows_field = content_height >= 3;
     let shows_footer = content_height >= 2;
     // The path field's keys take a line of their own above the tree's where
-    // the box is tall enough to spare it.
+    // the box is tall enough to spare it, and Alt+H with them: like the
+    // field, it decides which directories the tree lists, and the tree's own
+    // line has no room left for it.
     let shows_field_keys = content_height >= 6;
     if shows_field {
         // A path is read from its end, so a long one gives up its head.
@@ -2019,8 +2021,8 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
         };
         if shows_field_keys {
             lines.push(named(
-                "Type a path · Backspace delete · Tab complete",
-                "Type · Backspace · Tab",
+                "Type a path · Backspace delete · Tab complete · Alt+H hidden",
+                "Type · Backspace · Tab · Alt+H",
             ));
         }
         lines.push(named(

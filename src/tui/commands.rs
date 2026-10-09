@@ -265,6 +265,9 @@ pub enum SemanticCommandId {
     /// works, as choosing a Workspace in the Workspace Picker does.
     DirectoryBrowserChoose,
     DirectoryBrowserClose,
+    /// Shows the Directory Browser's hidden directories among the others, or
+    /// leaves them out again, for the rest of the client run.
+    DirectoryBrowserHiddenToggle,
     WorktreeRemove,
     WorktreeForceRemove,
     WorktreeList,
@@ -667,6 +670,7 @@ impl SemanticCommandId {
             Self::DirectoryBrowserPathComplete => "directory-browser.path.complete",
             Self::DirectoryBrowserChoose => "directory-browser.choose",
             Self::DirectoryBrowserClose => "directory-browser.close",
+            Self::DirectoryBrowserHiddenToggle => "directory-browser.hidden.toggle",
             Self::WorktreeRemove => "worktree.remove",
             Self::WorktreeForceRemove => "worktree.force_remove",
             Self::WorktreeList => "worktree.list",
@@ -1348,6 +1352,16 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Close Directory Browser",
         reach: SemanticReach::Client,
         description: "Dismiss the Directory Browser without choosing",
+        slash: None,
+        keybinding: None,
+    },
+    // Every listing carries its hidden directories already, so showing or
+    // hiding them asks the Server for nothing.
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::DirectoryBrowserHiddenToggle,
+        title: "Show or Hide Hidden Directories",
+        reach: SemanticReach::Client,
+        description: "Show the Directory Browser's hidden directories among the others, or leave them out again",
         slash: None,
         keybinding: None,
     },

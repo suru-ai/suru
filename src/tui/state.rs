@@ -7793,6 +7793,10 @@ impl Application {
                 let DirectoryBrowserProvenance::Standalone = browser.close();
                 None
             }
+            SemanticCommandId::DirectoryBrowserHiddenToggle => {
+                browser.toggle_hidden();
+                None
+            }
             _ => None,
         };
         ask.map_or(ApplicationTransition::Continue, |ask| {
@@ -10276,7 +10280,8 @@ impl Application {
             | SemanticCommandId::DirectoryBrowserPathDeleteBackward
             | SemanticCommandId::DirectoryBrowserPathComplete
             | SemanticCommandId::DirectoryBrowserChoose
-            | SemanticCommandId::DirectoryBrowserClose) => {
+            | SemanticCommandId::DirectoryBrowserClose
+            | SemanticCommandId::DirectoryBrowserHiddenToggle) => {
                 Ok(self.handle_directory_browser_command(command, invocation.subject))
             }
             SemanticCommandId::TranscriptFoldsToggle => {

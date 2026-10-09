@@ -494,12 +494,250 @@ fn the_footer_names_the_keys_the_browser_answers() {
         );
     }
     let path_keys = &screen[footer - 1];
-    for named in ["Type a path", "Backspace", "Tab complete"] {
+    for named in ["Type a path", "Backspace", "Tab complete", "Alt+H hidden"] {
         assert!(
             path_keys.contains(named),
-            "the path field's keys are named above the tree's: {path_keys}"
+            "{named} is named above the tree's keys: {path_keys}"
         );
     }
+}
+
+/// The Server lists every directory and flags the hidden ones — dot-named,
+/// or marked hidden by the platform as `marked` stands for here — so the
+/// browser leaves them out by that flag alone, and shows them again without
+/// asking the Server a second time.
+#[test]
+fn hidden_directories_are_left_out_until_alt_h_shows_them_in_place() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer_flagging_hidden(
+        &mut application,
+        listing_id,
+        &here,
+        &[
+            (".config", true),
+            ("alpha", false),
+            ("marked", true),
+            ("zeta", false),
+        ],
+    );
+    assert_eq!(
+        tree(&application),
+        ["› ▾ here · [current]", "    ▸ alpha", "    ▸ zeta"],
+        "a hidden directory is left out by default"
+    );
+
+    assert_eq!(
+        show_or_hide_hidden(&mut application),
+        ApplicationTransition::Continue,
+        "showing hidden directories asks the Server for nothing"
+    );
+    assert_eq!(
+        tree(&application),
+        [
+            "› ▾ here · [current]",
+            "    ▸ .config",
+            "    ▸ alpha",
+            "    ▸ marked",
+            "    ▸ zeta"
+        ],
+        "each stands in its place among the others, as the Server ordered them"
+    );
+
+    assert_eq!(
+        show_or_hide_hidden(&mut application),
+        ApplicationTransition::Continue,
+        "nor does leaving them out again"
+    );
+    assert_eq!(
+        tree(&application),
+        ["› ▾ here · [current]", "    ▸ alpha", "    ▸ zeta"]
+    );
+}
+
+#[test]
+fn hidden_directories_are_left_out_beneath_every_open_directory() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha"]);
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Char(' ')));
+    answer_flagging_hidden(
+        &mut application,
+        listing_id,
+        &here.join("alpha"),
+        &[(".git", true), ("src", false)],
+    );
+    assert_eq!(
+        tree(&application),
+        ["  ▾ here · [current]", "›   ▾ alpha", "      ▸ src"]
+    );
+
+    show_or_hide_hidden(&mut application);
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ here · [current]",
+            "›   ▾ alpha",
+            "      ▸ .git",
+            "      ▸ src"
+        ]
+    );
+}
+
+/// The path field's tail and the hidden flag each leave directories out: a
+/// hidden child of the root stays out though the tail begins it, and shown,
+/// it is still narrowed like any other; beneath the root, where the tail
+/// narrows nothing, hidden directories are left out all the same.
+#[test]
+fn a_hidden_directory_the_tail_begins_is_left_out_until_alt_h_shows_it() {
+    let here = directory(&["nowhere", "here"]);
+    let mint = here.join("mint");
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer_flagging_hidden(
+        &mut application,
+        listing_id,
+        &here,
+        &[
+            (".config", true),
+            ("alpha", false),
+            ("marked", true),
+            ("mint", false),
+        ],
+    );
+    type_path(&mut application, "m");
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
+    answer_flagging_hidden(
+        &mut application,
+        listing_id,
+        &mint,
+        &[(".git", true), ("src", false)],
+    );
+    assert_eq!(
+        tree(&application),
+        ["  ▾ here · [current]", "›   ▾ mint", "      ▸ src"],
+        "the tail begins marked, but marked is hidden, so focus lands on mint"
+    );
+
+    assert_eq!(
+        show_or_hide_hidden(&mut application),
+        ApplicationTransition::Continue,
+        "showing hidden directories asks the Server for nothing"
+    );
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ here · [current]",
+            "    ▸ marked",
+            "›   ▾ mint",
+            "      ▸ .git",
+            "      ▸ src"
+        ],
+        "marked stands in its place, .config is still narrowed away by the \
+         tail, and mint's hidden child is shown though the tail does not \
+         begin it"
+    );
+
+    assert_eq!(
+        show_or_hide_hidden(&mut application),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        tree(&application),
+        ["  ▾ here · [current]", "›   ▾ mint", "      ▸ src"]
+    );
+}
+
+/// Every opening otherwise begins afresh, but whether hidden directories are
+/// shown is the reader's choice for the rest of the client run.
+#[test]
+fn the_hidden_directories_choice_lasts_over_closing_and_reopening_the_browser() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let listed = [(".config", true), ("alpha", false)];
+    let (_, listing_id, _) = browse(&mut application);
+    answer_flagging_hidden(&mut application, listing_id, &here, &listed);
+    show_or_hide_hidden(&mut application);
+    key(&mut application, KeyCode::Esc);
+
+    let (_, listing_id, _) = browse(&mut application);
+    answer_flagging_hidden(&mut application, listing_id, &here, &listed);
+    assert_eq!(
+        tree(&application),
+        ["› ▾ here · [current]", "    ▸ .config", "    ▸ alpha"],
+        "hidden directories are still shown"
+    );
+    show_or_hide_hidden(&mut application);
+    key(&mut application, KeyCode::Esc);
+
+    let (_, listing_id, _) = browse(&mut application);
+    answer_flagging_hidden(&mut application, listing_id, &here, &listed);
+    assert_eq!(
+        tree(&application),
+        ["› ▾ here · [current]", "    ▸ alpha"],
+        "and once left out again, still left out"
+    );
+}
+
+/// Leaving hidden directories out takes away the row focus stood on when it
+/// is one of them or beneath one, so focus moves to the nearest row drawn
+/// above it that remains: never outside the hidden directory's parent, and
+/// at furthest the parent itself.
+#[test]
+fn hiding_the_focused_directory_moves_focus_to_the_nearest_row_above_that_remains() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer_flagging_hidden(
+        &mut application,
+        listing_id,
+        &here,
+        &[("alpha", false), ("marked", true), ("zeta", false)],
+    );
+    show_or_hide_hidden(&mut application);
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Char(' ')));
+    answer(&mut application, listing_id, &here.join("alpha"), &["src"]);
+    key(&mut application, KeyCode::Down);
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Char(' ')));
+    answer(
+        &mut application,
+        listing_id,
+        &here.join("marked"),
+        &["inner"],
+    );
+    key(&mut application, KeyCode::Down);
+    assert_eq!(focused(&application), "inner");
+
+    show_or_hide_hidden(&mut application);
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ here · [current]",
+            "    ▾ alpha",
+            "›     ▸ src",
+            "    ▸ zeta"
+        ],
+        "focus stands on the row drawn just above the hidden directory"
+    );
+
+    show_or_hide_hidden(&mut application);
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ here · [current]",
+            "    ▾ alpha",
+            "›     ▸ src",
+            "    ▾ marked",
+            "      ▸ inner",
+            "    ▸ zeta"
+        ],
+        "shown again, the hidden directory is as it was left, and focus stays put"
+    );
 }
 
 #[test]
@@ -2439,6 +2677,11 @@ fn chord(
         .expect("deliver a key press")
 }
 
+/// Presses Alt+H, which shows hidden directories or leaves them out again.
+fn show_or_hide_hidden(application: &mut Application) -> ApplicationTransition {
+    chord(application, KeyCode::Char('h'), KeyModifiers::ALT)
+}
+
 /// Opens the browser the way a reader does, by `/browse`, answering the
 /// listing it asked for.
 fn browse(application: &mut Application) -> (Outlook, DirectoryListingId, ListDirectoryRequest) {
@@ -2512,6 +2755,34 @@ fn answer_with(
                     path: root.join(name),
                     source_control: source_control.clone(),
                     hidden: false,
+                })
+                .collect(),
+        },
+    )
+}
+
+/// The Server's listing of `root` with plain child directories by name, in
+/// the order given, each flagged hidden or not as the Server flagged it.
+fn answer_flagging_hidden(
+    application: &mut Application,
+    listing_id: DirectoryListingId,
+    root: &Path,
+    children: &[(&str, bool)],
+) -> ApplicationTransition {
+    answer_listing(
+        application,
+        listing_id,
+        DirectoryListing {
+            root: root.to_owned(),
+            parent: root.parent().map(Path::to_owned),
+            source_control: DirectorySourceControl::Plain,
+            children: children
+                .iter()
+                .map(|(name, hidden)| ChildDirectory {
+                    name: (*name).to_owned(),
+                    path: root.join(name),
+                    source_control: DirectorySourceControl::Plain,
+                    hidden: *hidden,
                 })
                 .collect(),
         },
