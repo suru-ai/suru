@@ -1936,10 +1936,10 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
     );
 }
 
-/// The Directory Browser: the path field naming the tree's root, any refusal
-/// of the root or of the reader's choice beneath it, the tree itself, and the
-/// keys it answers. A tree wants height, so it stands taller than the other
-/// pickers.
+/// The Directory Browser: the path field naming the tree's root, beneath it
+/// that the root it names is still being read or why it or the reader's
+/// choice was refused, the tree itself, and the keys it answers. A tree wants
+/// height, so it stands taller than the other pickers.
 fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
     let browser = &state.directory_browser;
     let area = centered_rect(
@@ -1956,6 +1956,9 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
     let mut lines = Vec::with_capacity(content_height);
     let shows_field = content_height >= 3;
     let shows_footer = content_height >= 2;
+    // The path field's keys take a line of their own above the tree's where
+    // the box is tall enough to spare it.
+    let shows_field_keys = content_height >= 6;
     if shows_field {
         // A path is read from its end, so a long one gives up its head.
         const LABEL: &str = "Path: ";
@@ -1969,6 +1972,9 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
             ),
             theme.text.subdued,
         ));
+        if browser.root_is_loading() {
+            lines.push(Line::styled("Loading…", theme.text.subdued));
+        }
         for refusal in [browser.root_refusal(), browser.refusal()]
             .into_iter()
             .flatten()
@@ -1981,7 +1987,7 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
             }
         }
     }
-    let footer_rows = usize::from(shows_footer);
+    let footer_rows = usize::from(shows_footer) + usize::from(shows_field_keys);
     let capacity = content_height.saturating_sub(lines.len() + footer_rows);
     // The root goes by its name in the Server's own path syntax; every other
     // row by the name the Server listed it under.
@@ -1997,22 +2003,29 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
             .iter()
             .map(|row| directory_browser_line(row, &root_name, &known, content_width, theme)),
     );
-    if shows_footer && lines.len() < content_height {
-        // The footer holds the box's last line however much of the tree is
+    if shows_footer && lines.len() + footer_rows <= content_height {
+        // The footer holds the box's last lines however much of the tree is
         // open, so opening and closing rows never moves it.
-        lines.resize(content_height.saturating_sub(1), Line::default());
+        lines.resize(content_height - footer_rows, Line::default());
         // Where the keys cannot each be told with what they do, they are
         // named bare rather than some of them cut away.
-        const FOOTER: &str =
-            "↑↓ move · Space open/close · → open · ← close · Enter choose · Esc close";
-        let footer = if FOOTER.width() <= content_width {
-            FOOTER
-        } else {
-            "↑↓ · Space · → · ← · Enter · Esc"
+        let named = |told: &'static str, bare: &'static str| {
+            let footer = if told.width() <= content_width {
+                told
+            } else {
+                bare
+            };
+            Line::styled(truncate_to_width(footer, content_width), theme.text.subdued)
         };
-        lines.push(Line::styled(
-            truncate_to_width(footer, content_width),
-            theme.text.subdued,
+        if shows_field_keys {
+            lines.push(named(
+                "Type a path · Backspace delete · Tab complete",
+                "Type · Backspace · Tab",
+            ));
+        }
+        lines.push(named(
+            "↑↓ move · Space open/close · → open · ← close/up · Enter choose · Esc close",
+            "↑↓ · Space · → · ← · Enter · Esc",
         ));
     }
     render_overlay_box(

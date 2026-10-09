@@ -8,7 +8,8 @@ use std::{
 };
 
 use crate::protocol::{
-    DirectoryListing, DirectorySourceControl, ListDirectoryRequest, ResolveWorkspaceRequest,
+    DirectoryListing, DirectorySourceControl, ListDirectoryRequest, PathStyle,
+    ResolveWorkspaceRequest,
 };
 
 use super::list_window::{ListWindow, WindowEntry};
@@ -39,8 +40,23 @@ pub(super) enum DirectoryBrowserProvenance {
 pub(super) struct DirectoryBrowser {
     open: bool,
     provenance: DirectoryBrowserProvenance,
-    /// The text of the path field, which names the tree's root.
+    /// The text of the path field, in the Server's own syntax, which names the
+    /// tree's root by its leading part and narrows the root's children by its
+    /// tail. What the reader typed stays as they typed it.
     field: String,
+    /// The path field's leading part as the field last read.
+    leading: String,
+    /// The directory each leading part this opening has read names, by the
+    /// Server's own path for it: a leading part not here is asked of the
+    /// Server before the tree stands on it.
+    roots: HashMap<String, PathBuf>,
+    /// The partial name the root's children are narrowed to: the field's tail
+    /// while its leading part names the root, and what it last was while the
+    /// Server has yet to say, or would not say, where a newer leading part is.
+    filter: String,
+    /// Why the Server would not read the field's leading part, which leaves
+    /// the tree on the last root it could read.
+    field_refusal: Option<String>,
     /// The directory the tree stands on, its first row.
     root: PathBuf,
     /// The Landing's Execution Directory as the browser opened, which every
@@ -56,9 +72,10 @@ pub(super) struct DirectoryBrowser {
     /// number, so a listing landing above it leaves the reader where they
     /// were.
     focused: RowKey,
-    /// The directory each listing still awaited was asked for, so an answer
-    /// to anything else — an earlier opening's request — moves nothing.
-    awaiting: HashMap<DirectoryListingId, PathBuf>,
+    /// What each listing still awaited was asked for, so an answer to
+    /// anything else — an earlier opening's request, or a leading part the
+    /// reader has since typed over — moves nothing.
+    awaiting: HashMap<DirectoryListingId, Asked>,
     /// Why the reader's choice was refused before it reached the Server,
     /// said inside the browser because the browser stands over the Landing
     /// where a refusal is otherwise said.
@@ -96,6 +113,16 @@ impl RowKey {
     fn is_root(&self) -> bool {
         self.0.len() == 1
     }
+}
+
+/// What one listing the browser awaits was asked for.
+#[derive(Clone, Debug)]
+enum Asked {
+    /// A directory by the Server's own path, which its answer is kept under.
+    Directory(PathBuf),
+    /// The directory the path field's leading part names, as the reader typed
+    /// it, which only the Server's answer says the path of.
+    Root(String),
 }
 
 /// What the Server has said of one directory's children.
@@ -145,8 +172,9 @@ impl DirectoryBrowserRowKind {
 
 impl DirectoryBrowser {
     /// Opens the browser afresh, rooted at `execution_directory` with the
-    /// root open and focused, and asks for the root's children. Nothing is
-    /// kept from an earlier opening, including any answer it still awaits.
+    /// root open and focused, and asks for the root's children. The path
+    /// field names the root, ready for a name beneath it. Nothing is kept
+    /// from an earlier opening, including any answer it still awaits.
     pub(super) fn open(
         &mut self,
         execution_directory: PathBuf,
@@ -155,9 +183,15 @@ impl DirectoryBrowser {
         self.close();
         self.open = true;
         self.provenance = provenance;
-        self.field = execution_directory.to_string_lossy().into_owned();
-        self.root.clone_from(&execution_directory);
         self.base.clone_from(&execution_directory);
+        self.field = self.beneath(&execution_directory.to_string_lossy());
+        self.leading = self.split_field().0.to_owned();
+        // An empty leading part is the relative path naming the directory
+        // every listing is read from.
+        for leading in [String::new(), self.leading.clone()] {
+            self.roots.insert(leading, execution_directory.clone());
+        }
+        self.root.clone_from(&execution_directory);
         self.focused = RowKey::root(execution_directory);
         self.window.open();
         self.open_row(self.focused.clone())
@@ -168,6 +202,9 @@ impl DirectoryBrowser {
     /// from, which is where the reader goes back to.
     pub(super) fn close(&mut self) -> DirectoryBrowserProvenance {
         self.open = false;
+        self.roots.clear();
+        self.filter.clear();
+        self.field_refusal = None;
         self.tree.clear();
         self.opened.clear();
         self.awaiting.clear();
@@ -187,13 +224,24 @@ impl DirectoryBrowser {
         &self.root
     }
 
-    /// Why the Server would not read the root, which the frame says where the
-    /// path field names it rather than beneath the root's row.
+    /// Why the Server would not read the directory the path field's leading
+    /// part names, or the root itself, which the frame says where the path
+    /// field names it rather than beneath the root's row.
     pub(super) fn root_refusal(&self) -> Option<&str> {
-        match self.tree.get(&self.root) {
-            Some(DirectoryEntries::Refused(reason)) => Some(reason),
-            _ => None,
-        }
+        self.field_refusal
+            .as_deref()
+            .or_else(|| match self.tree.get(&self.root) {
+                Some(DirectoryEntries::Refused(reason)) => Some(reason),
+                _ => None,
+            })
+    }
+
+    /// Whether the Server is still reading the directory the path field's
+    /// leading part names, which the tree is not yet standing on.
+    pub(super) fn root_is_loading(&self) -> bool {
+        self.awaiting
+            .values()
+            .any(|asked| matches!(asked, Asked::Root(_)))
     }
 
     /// Why the reader's choice was refused before it reached the Server.
@@ -228,12 +276,87 @@ impl DirectoryBrowser {
         self.open_row(self.focused.clone())
     }
 
-    /// Closes the focused row, unless it is the root: Left there is to stand
-    /// the tree on the root's parent rather than to fold the tree away.
-    pub(super) fn close_focused(&mut self) {
+    /// Closes the focused row, unless it is the root: Left there stands the
+    /// tree on the root's parent, as the Server named it, rather than folding
+    /// the tree away, leaving the former root open and focused beneath it,
+    /// and answers the listing the parent asks for. A root without a parent
+    /// stands where it is.
+    pub(super) fn close_focused(&mut self) -> Option<DirectoryListingAsk> {
         if !self.focused.is_root() {
             self.opened.remove(&self.focused);
+            return None;
         }
+        let Some(DirectoryEntries::Listed(DirectoryListing {
+            parent: Some(parent),
+            ..
+        })) = self.tree.get(&self.root)
+        else {
+            return None;
+        };
+        let parent = parent.clone();
+        let former = std::mem::replace(&mut self.root, parent.clone());
+        self.field = self.beneath(&parent.to_string_lossy());
+        self.leading_changed();
+        self.roots.insert(self.leading.clone(), parent.clone());
+        self.filter.clear();
+        self.opened = std::mem::take(&mut self.opened)
+            .into_iter()
+            .filter(|row| row.0.first() == Some(&former))
+            .map(|row| RowKey([vec![parent.clone()], row.0].concat()))
+            .collect();
+        self.focused = RowKey(vec![parent.clone(), former]);
+        self.window.reveal();
+        self.open_row(RowKey::root(parent))
+    }
+
+    /// Adds what the reader typed or pasted to the end of the path field,
+    /// leaving out what no path holds — a line break carried in by a paste —
+    /// and answers the listing the root it now names asks for.
+    pub(super) fn type_into_field(&mut self, text: &str) -> Option<DirectoryListingAsk> {
+        let typed = text
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>();
+        if typed.is_empty() {
+            return None;
+        }
+        self.field.push_str(&typed);
+        self.follow_field()
+    }
+
+    /// Takes the path field's last character back, answering the listing the
+    /// root it now names asks for.
+    pub(super) fn delete_from_field(&mut self) -> Option<DirectoryListingAsk> {
+        self.field.pop()?;
+        self.follow_field()
+    }
+
+    /// Completes the path field to the focused row and a separator, so the
+    /// tree stands on that row, answering the listing it asks for. The field
+    /// keeps the leading part the reader typed where that names the root, and
+    /// otherwise begins at the Server's own path for the root.
+    pub(super) fn complete_field(&mut self) -> Option<DirectoryListingAsk> {
+        let names = self.names_beneath_root(&self.focused)?;
+        let mut field = if self.roots.get(&self.leading) == Some(&self.root) {
+            self.leading.clone()
+        } else {
+            self.root.to_string_lossy().into_owned()
+        };
+        for name in names {
+            field = self.beneath(&field);
+            field.push_str(&name);
+        }
+        if !field.is_empty() {
+            field = self.beneath(&field);
+        }
+        if field == self.field {
+            return None;
+        }
+        self.field = field;
+        let directory = self.focused.directory().to_owned();
+        let leading = self.split_field().0.to_owned();
+        self.roots.insert(leading, directory);
+        self.follow_field()
     }
 
     /// Chooses the focused row, closing the browser since a choice is done
@@ -256,20 +379,44 @@ impl DirectoryBrowser {
     }
 
     /// Takes the Server's answer to `listing_id`, where it is one this
-    /// opening still awaits.
+    /// opening still awaits. An answer for the field's leading part stands
+    /// the tree on the root the Server read it as; a refusal of it leaves the
+    /// tree on the last root it could read, with every child shown, since the
+    /// tail typed after the refused part says nothing of that root.
     pub(super) fn load(
         &mut self,
         listing_id: DirectoryListingId,
         result: Result<DirectoryListing, String>,
     ) {
-        let Some(directory) = self.awaiting.remove(&listing_id) else {
+        let Some(asked) = self.awaiting.remove(&listing_id) else {
             return;
         };
-        let entries = match result {
-            Ok(listing) => DirectoryEntries::Listed(listing),
-            Err(reason) => DirectoryEntries::Refused(reason),
-        };
-        self.tree.insert(directory, entries);
+        match (asked, result) {
+            (Asked::Directory(directory), result) => {
+                let lands_on_root = directory == self.root;
+                let entries = match result {
+                    Ok(listing) => DirectoryEntries::Listed(listing),
+                    Err(reason) => DirectoryEntries::Refused(reason),
+                };
+                self.tree.insert(directory, entries);
+                if lands_on_root {
+                    self.settle_focus();
+                }
+            }
+            (Asked::Root(leading), Ok(listing)) => {
+                let root = listing.root.clone();
+                self.tree
+                    .insert(root.clone(), DirectoryEntries::Listed(listing));
+                self.roots.insert(leading, root);
+                let listed = self.follow_field();
+                debug_assert!(listed.is_none(), "the root was listed just now");
+            }
+            (Asked::Root(_), Err(reason)) => {
+                self.field_refusal = Some(reason);
+                self.filter.clear();
+                self.settle_focus();
+            }
+        }
     }
 
     /// The rows a tree `capacity` rows tall shows, wound on far enough to
@@ -312,18 +459,168 @@ impl DirectoryBrowser {
         ) {
             return None;
         }
-        self.sequence = self.sequence.wrapping_add(1);
-        let listing_id = DirectoryListingId(self.sequence);
         self.tree
             .insert(directory.clone(), DirectoryEntries::Loading);
-        self.awaiting.insert(listing_id, directory.clone());
-        Some(DirectoryListingAsk {
+        Some(self.ask(Asked::Directory(directory)))
+    }
+
+    /// The listing `asked` names, awaited under an identity of its own and
+    /// read from the Execution Directory.
+    fn ask(&mut self, asked: Asked) -> DirectoryListingAsk {
+        self.sequence = self.sequence.wrapping_add(1);
+        let listing_id = DirectoryListingId(self.sequence);
+        let path = match &asked {
+            Asked::Directory(directory) => directory.clone(),
+            Asked::Root(leading) => PathBuf::from(leading),
+        };
+        self.awaiting.insert(listing_id, asked);
+        DirectoryListingAsk {
             listing_id,
             request: ListDirectoryRequest {
-                path: directory,
+                path,
                 base: Some(self.base.clone()),
             },
-        })
+        }
+    }
+
+    /// Takes the path field as it now reads. Where its leading part names a
+    /// directory this opening knows, the tree stands there at once, asking
+    /// for its children if they are not had, and the tail narrows them; a
+    /// leading part not read yet is asked of the Server, the tree standing
+    /// where it was until the answer. Only a change of leading part asks.
+    fn follow_field(&mut self) -> Option<DirectoryListingAsk> {
+        let tail = self.split_field().1.to_owned();
+        let changed = self.split_field().0 != self.leading;
+        if changed {
+            self.leading_changed();
+        }
+        match self.roots.get(&self.leading).cloned() {
+            Some(root) => {
+                let listed = (root != self.root).then(|| self.reroot(root)).flatten();
+                self.filter = tail;
+                self.settle_focus();
+                listed
+            }
+            None if changed => Some(self.ask(Asked::Root(self.leading.clone()))),
+            None => None,
+        }
+    }
+
+    /// Takes the path field's leading part as it now reads, letting go of
+    /// what was said or asked of the one it had until now: its refusal, and
+    /// an answer for it still on its way.
+    fn leading_changed(&mut self) {
+        self.leading = self.split_field().0.to_owned();
+        self.field_refusal = None;
+        self.awaiting
+            .retain(|_, asked| !matches!(asked, Asked::Root(_)));
+    }
+
+    /// Stands the tree afresh on `root`, open and focused, answering the
+    /// listing it asks for where its children are not had.
+    fn reroot(&mut self, root: PathBuf) -> Option<DirectoryListingAsk> {
+        self.root.clone_from(&root);
+        self.opened.clear();
+        self.focused = RowKey::root(root);
+        self.window.reveal();
+        self.open_row(self.focused.clone())
+    }
+
+    /// Puts focus where the field's tail leaves it. While the tail narrows the
+    /// root's children, focus standing on the root or on a row narrowed away
+    /// moves to the first child left — the one Tab completes to — or to the
+    /// root where none is; otherwise it stays where it stands while that row
+    /// is still drawn.
+    fn settle_focus(&mut self) {
+        let directories = self.directories();
+        let drawn = directories.contains(&self.focused);
+        if !self.filter.is_empty() && (!drawn || self.focused.is_root()) {
+            self.focused = directories
+                .into_iter()
+                .nth(1)
+                .unwrap_or_else(|| RowKey::root(self.root.clone()));
+        } else if !drawn {
+            self.focused = RowKey::root(self.root.clone());
+        }
+        self.window.reveal();
+    }
+
+    /// The path field split at its last separator: the leading part naming
+    /// the root, and the partial name after it narrowing the root's children.
+    /// A separator standing for the filesystem's root or a drive's stays with
+    /// the leading part, which would name somewhere else without it; a field
+    /// without a separator is all tail, beneath the directory a relative path
+    /// is read from.
+    fn split_field(&self) -> (&str, &str) {
+        let style = self.style();
+        let Some((index, separator)) = self
+            .field
+            .char_indices()
+            .rfind(|(_, character)| style.is_separator(*character))
+        else {
+            return ("", &self.field);
+        };
+        let after = index + separator.len_utf8();
+        let head = &self.field[..index];
+        let names_a_root = head.chars().all(|character| style.is_separator(character))
+            || (style == PathStyle::Windows && head.ends_with(':'));
+        let leading = if names_a_root {
+            &self.field[..after]
+        } else {
+            head
+        };
+        (leading, &self.field[after..])
+    }
+
+    /// `path` in the Server's syntax with a separator after it, ready for a
+    /// name beneath it; one ending in a separator already, or empty, is left
+    /// as it is.
+    fn beneath(&self, path: &str) -> String {
+        let style = self.style();
+        let mut path = path.to_owned();
+        if path
+            .chars()
+            .last()
+            .is_some_and(|last| !style.is_separator(last))
+        {
+            path.push(style.separator());
+        }
+        path
+    }
+
+    /// The Outlook's Server's path syntax, read from the Execution Directory
+    /// as that Server spelled it rather than from this Client's platform,
+    /// which a Remote need not share.
+    fn style(&self) -> PathStyle {
+        PathStyle::of_absolute(&self.base)
+    }
+
+    /// The names the Server listed `row` and each directory above it beneath
+    /// the root under, root first; `None` where any of them is no longer
+    /// listed.
+    fn names_beneath_root(&self, row: &RowKey) -> Option<Vec<String>> {
+        row.0
+            .windows(2)
+            .map(|pair| match self.tree.get(&pair[0]) {
+                Some(DirectoryEntries::Listed(listing)) => listing
+                    .children
+                    .iter()
+                    .find(|child| child.path == pair[1])
+                    .map(|child| child.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The directories drawn, in the order the tree draws them.
+    fn directories(&self) -> Vec<RowKey> {
+        self.rows()
+            .into_iter()
+            .filter_map(|row| match row.kind {
+                DirectoryBrowserRowKind::Directory { key, .. } => Some(key),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The tree projected from what the Server has said: the root first, then
@@ -359,7 +656,14 @@ impl DirectoryBrowser {
                 kind: DirectoryBrowserRowKind::Refused(reason.clone()),
             }),
             Some(DirectoryEntries::Listed(listing)) => {
-                for child in &listing.children {
+                // Only the root's children are narrowed, by how their names
+                // begin with the field's tail, case set aside.
+                let narrowed = row.is_root().then(|| self.filter.to_lowercase());
+                for child in listing.children.iter().filter(|child| {
+                    narrowed
+                        .as_ref()
+                        .is_none_or(|filter| child.name.to_lowercase().starts_with(filter.as_str()))
+                }) {
                     let child_row = row.child(&child.path);
                     rows.push(self.directory_row(
                         depth,
@@ -396,14 +700,7 @@ impl DirectoryBrowser {
     /// past either end; the lines beneath a directory still being read or
     /// refused are not rows to stand on.
     fn move_focus(&mut self, distance: isize) {
-        let mut directories = self
-            .rows()
-            .into_iter()
-            .filter_map(|row| match row.kind {
-                DirectoryBrowserRowKind::Directory { key, .. } => Some(key),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let mut directories = self.directories();
         let current = directories
             .iter()
             .position(|key| *key == self.focused)

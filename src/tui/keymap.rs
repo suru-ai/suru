@@ -560,13 +560,23 @@ pub(super) fn command_for_workspace_picker_event(event: InputEvent) -> Option<Co
 
 /// The Directory Browser walks its tree with the keys every picker walks its
 /// rows with — the arrows, and Ctrl+P and Ctrl+N — while Space opens or
-/// closes the focused row, Right opens it, Left closes it, Enter chooses it,
-/// and Esc closes the browser. The pointer is not one of its ways in yet: a
-/// press inside it moves nothing, and one outside it is already an Escape by
-/// the time it gets here.
+/// closes the focused row, Right opens it, Left closes it or walks the root
+/// up to its parent, Enter chooses it, and Esc closes the browser. Everything
+/// else the reader types or pastes goes to the end of the path field, which
+/// has no cursor for Left and Right to move: Backspace takes a character
+/// back, and Tab completes the field to the focused row. The pointer is not
+/// one of its ways in yet: a press inside it moves nothing, and one outside
+/// it is already an Escape by the time it gets here.
 pub(super) fn command_for_directory_browser_event(event: InputEvent) -> Option<CommandId> {
-    let InputEvent::Key(key) = event else {
-        return None;
+    let key = match event {
+        InputEvent::Key(key) => key,
+        InputEvent::Paste(text) => {
+            return Some(CommandId::InvokeSemanticText(
+                SemanticCommandId::DirectoryBrowserPathInsert,
+                text,
+            ));
+        }
+        _ => return None,
     };
     if key.kind != KeyEventKind::Press {
         return None;
@@ -583,6 +593,18 @@ pub(super) fn command_for_directory_browser_event(event: InputEvent) -> Option<C
         (KeyCode::Left, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserRowClose,
         (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserChoose,
         (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserClose,
+        (KeyCode::Tab, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserPathComplete,
+        (KeyCode::Backspace, KeyModifiers::NONE) => {
+            SemanticCommandId::DirectoryBrowserPathDeleteBackward
+        }
+        (KeyCode::Char(character), modifiers)
+            if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            return Some(CommandId::InvokeSemanticText(
+                SemanticCommandId::DirectoryBrowserPathInsert,
+                character.to_string(),
+            ));
+        }
         _ => return None,
     };
     Some(CommandId::InvokeSemantic(semantic))

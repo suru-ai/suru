@@ -252,7 +252,15 @@ pub enum SemanticCommandId {
     /// closes it where it is open.
     DirectoryBrowserRowToggle,
     DirectoryBrowserRowOpen,
+    /// Closes the Directory Browser's focused row, or on the root stands the
+    /// tree on the root's parent.
     DirectoryBrowserRowClose,
+    /// Adds the typed or pasted text its invocation carries to the end of the
+    /// Directory Browser's path field.
+    DirectoryBrowserPathInsert,
+    DirectoryBrowserPathDeleteBackward,
+    /// Completes the Directory Browser's path field to the focused row.
+    DirectoryBrowserPathComplete,
     /// Chooses the Directory Browser's focused row as where the next Session
     /// works, as choosing a Workspace in the Workspace Picker does.
     DirectoryBrowserChoose,
@@ -654,6 +662,9 @@ impl SemanticCommandId {
             Self::DirectoryBrowserRowToggle => "directory-browser.row.toggle",
             Self::DirectoryBrowserRowOpen => "directory-browser.row.open",
             Self::DirectoryBrowserRowClose => "directory-browser.row.close",
+            Self::DirectoryBrowserPathInsert => "directory-browser.path.insert",
+            Self::DirectoryBrowserPathDeleteBackward => "directory-browser.path.delete-backward",
+            Self::DirectoryBrowserPathComplete => "directory-browser.path.complete",
             Self::DirectoryBrowserChoose => "directory-browser.choose",
             Self::DirectoryBrowserClose => "directory-browser.close",
             Self::WorktreeRemove => "worktree.remove",
@@ -1289,7 +1300,35 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::DirectoryBrowserRowClose,
         title: "Close Directory",
         reach: SemanticReach::Client,
-        description: "Fold the Directory Browser's focused directory back to its row",
+        description: "Fold the Directory Browser's focused directory back to its row, or on the \
+                      root stand the tree on its parent",
+        slash: None,
+        keybinding: None,
+    },
+    // Editing the path field may ask the Server for the root it now names,
+    // as opening a row asks for its children, and stays with the Client on
+    // the same terms.
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::DirectoryBrowserPathInsert,
+        title: "Insert Path Text",
+        reach: SemanticReach::Client,
+        description: "Add typed or pasted text to the end of the Directory Browser's path field",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::DirectoryBrowserPathDeleteBackward,
+        title: "Delete Path Text",
+        reach: SemanticReach::Client,
+        description: "Take the last character back from the Directory Browser's path field",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::DirectoryBrowserPathComplete,
+        title: "Complete Path",
+        reach: SemanticReach::Client,
+        description: "Complete the Directory Browser's path field to the focused directory",
         slash: None,
         keybinding: None,
     },

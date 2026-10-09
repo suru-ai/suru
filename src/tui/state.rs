@@ -7751,6 +7751,7 @@ impl Application {
     fn handle_directory_browser_command(
         &mut self,
         command: SemanticCommandId,
+        subject: SemanticSubject,
     ) -> ApplicationTransition {
         let browser = &mut self.state.directory_browser;
         if !browser.is_open() {
@@ -7767,10 +7768,13 @@ impl Application {
             }
             SemanticCommandId::DirectoryBrowserRowToggle => browser.toggle_focused(),
             SemanticCommandId::DirectoryBrowserRowOpen => browser.open_focused(),
-            SemanticCommandId::DirectoryBrowserRowClose => {
-                browser.close_focused();
-                None
-            }
+            SemanticCommandId::DirectoryBrowserRowClose => browser.close_focused(),
+            SemanticCommandId::DirectoryBrowserPathInsert => match subject {
+                SemanticSubject::Text(text) => browser.type_into_field(&text),
+                _ => None,
+            },
+            SemanticCommandId::DirectoryBrowserPathDeleteBackward => browser.delete_from_field(),
+            SemanticCommandId::DirectoryBrowserPathComplete => browser.complete_field(),
             // Until the Server answers, all the client knows of where the
             // reader chose is the directory itself, so that is what the
             // Landing names while it waits.
@@ -10264,9 +10268,12 @@ impl Application {
             | SemanticCommandId::DirectoryBrowserRowToggle
             | SemanticCommandId::DirectoryBrowserRowOpen
             | SemanticCommandId::DirectoryBrowserRowClose
+            | SemanticCommandId::DirectoryBrowserPathInsert
+            | SemanticCommandId::DirectoryBrowserPathDeleteBackward
+            | SemanticCommandId::DirectoryBrowserPathComplete
             | SemanticCommandId::DirectoryBrowserChoose
             | SemanticCommandId::DirectoryBrowserClose) => {
-                Ok(self.handle_directory_browser_command(command))
+                Ok(self.handle_directory_browser_command(command, invocation.subject))
             }
             SemanticCommandId::TranscriptFoldsToggle => {
                 self.state.toggle_fold_posture();
