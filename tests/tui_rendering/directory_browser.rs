@@ -11,17 +11,21 @@ use std::path::{Path, PathBuf};
 use crate::support::{
     SIDEBAR_WIDE, application_looking_at_studio, connected_application, deliver_settings,
     drawn_in_sidebar, enter_active_session, fixture_instance_id, invoke, key, listed_session,
-    ready_health, rendered_application_rows_at, rendered_row, selector_label, sidebar_column,
-    studio_stops_answering, type_terminal_text, workspace_resolution,
+    model_descriptor, ready_health, rendered_application_rows_at, rendered_row,
+    selected_session_snapshot, selector_label, sidebar_column, studio_stops_answering,
+    type_terminal_text, workspace_resolution,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use std::time::Duration;
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        CheckoutAssociation, CheckoutId, CheckoutKind, CheckoutRevision, CheckoutSummary,
-        ChildDirectory, DirectoryListing, EffectiveSettings, ExecutionDirectory,
-        ExecutionDirectoryStatus, ListDirectoryRequest, Outlook, Repository, RepositoryId,
+        AgentSelection, CheckoutAssociation, CheckoutId, CheckoutKind, CheckoutRevision,
+        CheckoutSummary, ChildDirectory, DirectoryListing, EffectiveSettings, ExecutionDirectory,
+        ExecutionDirectoryStatus, ListDirectoryRequest, ModelAvailability, ModelCatalog, ModelId,
+        ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
+        ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue, Outlook,
+        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, Repository, RepositoryId,
         RepositoryLocation, ResolveWorkspaceRequest, ResolvedWorkspace, SessionId, SessionListItem,
         SessionStatus, SessionTimestamp, SidebarScope, SidebarSettings, SidebarVisibility,
         SourceControlAvailability, SourceControlCapabilities, Workspace,
@@ -811,6 +815,109 @@ fn a_newer_choice_supersedes_a_directory_still_resolving() {
     assert_eq!(next_session_directory(&mut application), beta);
 }
 
+/// The Remote the Outlook is turned toward may stop answering while the
+/// browser stands open. Choosing is then refused as the Workspace Picker's
+/// choice is: nothing is asked of the Remote and the reader is told why.
+#[test]
+fn choosing_is_refused_while_the_remote_has_stopped_answering() {
+    let mut application = application_looking_at_studio();
+    let (_, listing_id, request) =
+        expect_listing(invoke(&mut application, SemanticCommandId::WorkspaceBrowse));
+    answer(&mut application, listing_id, &request.path, &["alpha"]);
+    key(&mut application, KeyCode::Down);
+    studio_stops_answering(&mut application, 1, Duration::from_secs(5));
+
+    assert_eq!(
+        key(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "nothing is asked of a Remote that is not answering"
+    );
+
+    let screen = rendered_application_rows_at(&application, WIDTH, HEIGHT);
+    let field = rendered_row(&screen, "Path:");
+    assert_eq!(
+        inside_box(&screen[field + 1]).trim_end(),
+        "Error: studio is unreachable; this waits until it answers",
+        "the refusal is said inside the browser, which stands over the Landing: {screen:#?}"
+    );
+    assert_eq!(
+        focused(&application),
+        "alpha",
+        "the browser stays open where the reader was, to choose again once the Remote answers"
+    );
+
+    key(&mut application, KeyCode::Esc);
+    let landing = rendered_application_rows_at(&application, WIDTH, HEIGHT).join("\n");
+    assert!(
+        landing.contains("studio is unreachable; this waits until it answers"),
+        "the Landing goes on saying it once the browser closes: {landing}"
+    );
+}
+
+/// Choosing opens the Landing, which takes the Agent Selection over from
+/// the Session being left, so it waits while a change to that selection is
+/// still unsettled rather than carry a choice the Server may yet reject onto
+/// the Landing. Once the Server has settled it — here by rejecting it — the
+/// same Enter chooses, and the Landing begins from the selection that stands.
+#[test]
+fn choosing_waits_while_an_agent_selection_change_is_unsettled() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = Application::new(&here, TerminalFacts::default());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            selected_session_snapshot(SessionId::new(), &here, reasoning_selection("low")),
+        ))
+        .expect("attach a Session with an Agent Selection");
+    warm_model_catalog(&mut application);
+    let ApplicationTransition::UpdateAgentSelection {
+        request: change, ..
+    } = chord(&mut application, KeyCode::Char('t'), KeyModifiers::CONTROL)
+    else {
+        panic!("cycling reasoning asks the Server to change the Agent Selection");
+    };
+    assert_eq!(change.selection, reasoning_selection("high"));
+    let (_, listing_id, _) = browse_by_chord(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha"]);
+    key(&mut application, KeyCode::Down);
+
+    assert_eq!(
+        key(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "nothing is chosen while the change is unsettled"
+    );
+    assert_eq!(
+        invoke(&mut application, SemanticCommandId::DirectoryBrowserChoose),
+        ApplicationTransition::Continue,
+        "however the choice is invoked"
+    );
+    assert_eq!(
+        focused(&application),
+        "alpha",
+        "the browser stays open where the reader was"
+    );
+
+    application
+        .handle_event(ApplicationEvent::AgentSelectionUpdateFailed {
+            operation_id: change.operation_id,
+            error: "Effort rejected".to_owned(),
+        })
+        .expect("reject the change");
+    let choice = key(&mut application, KeyCode::Enter);
+    let (_, _, request) = expect_choice(&choice);
+    assert_eq!(request.path, here.join("alpha"));
+    resolve(
+        &mut application,
+        &choice,
+        Ok(ResolvedWorkspace::directory(here.join("alpha"))),
+    );
+
+    let landing = rendered_application_rows_at(&application, WIDTH, HEIGHT).join("\n");
+    assert!(
+        landing.contains("Reasoning GPT · Low") && !landing.contains("Reasoning GPT · High"),
+        "the Landing begins from the selection that stands, not the rejected one: {landing}"
+    );
+}
+
 /// Choosing from an open Session is plain navigation: the client stops
 /// watching the Session, which goes on working and stays listed, and the
 /// Sidebar goes on answering for the scope the reader gave it.
@@ -1036,6 +1143,69 @@ fn bare_repository(root: &Path) -> ResolvedWorkspace {
         checkout: None,
         checkouts: Vec::new(),
     }
+}
+
+/// The Agent Selection of a Model whose reasoning effort is `effort`.
+fn reasoning_selection(effort: &str) -> AgentSelection {
+    AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-reasoning"),
+        options: vec![ModelOptionSelection {
+            id: ModelOptionId::new("reasoning_effort"),
+            value: ModelOptionValue::Select {
+                choice: ModelOptionChoiceId::new(effort),
+            },
+        }],
+    }
+}
+
+/// Holds the Model Catalog the reasoning cycle reads, as the Model picker
+/// leaves it once it has been opened and closed: one Model whose reasoning
+/// effort is low or high.
+fn warm_model_catalog(application: &mut Application) {
+    let transition = invoke(application, SemanticCommandId::ModelList);
+    let ApplicationTransition::ListModels(request) = transition else {
+        panic!("the Model picker asks for the catalog, not {transition:?}");
+    };
+    let mut model = model_descriptor(
+        "codex",
+        "gpt-reasoning",
+        "Reasoning GPT",
+        true,
+        ModelAvailability::Available,
+    );
+    model.options = vec![ModelOptionDescriptor {
+        id: ModelOptionId::new("reasoning_effort"),
+        label: "Reasoning".to_owned(),
+        description: None,
+        role: ModelOptionRole::ReasoningEffort,
+        kind: ModelOptionKind::Select {
+            choices: ["low", "high"]
+                .into_iter()
+                .map(|effort| ModelOptionChoice {
+                    id: ModelOptionChoiceId::new(effort),
+                    label: format!("{}{}", effort[..1].to_uppercase(), &effort[1..]),
+                    description: None,
+                    availability: ModelAvailability::Available,
+                })
+                .collect(),
+            default: ModelOptionChoiceId::new("low"),
+        },
+    }];
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    display_name: "codex".to_owned(),
+                    models: vec![model],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("hold the Model Catalog");
+    key(application, KeyCode::Esc);
 }
 
 /// The Sidebar on screen, scoped to the current Workspace and answered with

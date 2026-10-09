@@ -59,6 +59,10 @@ pub(super) struct DirectoryBrowser {
     /// The directory each listing still awaited was asked for, so an answer
     /// to anything else — an earlier opening's request — moves nothing.
     awaiting: HashMap<DirectoryListingId, PathBuf>,
+    /// Why the reader's choice was refused before it reached the Server,
+    /// said inside the browser because the browser stands over the Landing
+    /// where a refusal is otherwise said.
+    refusal: Option<String>,
     sequence: u64,
     window: ListWindow,
 }
@@ -161,6 +165,7 @@ impl DirectoryBrowser {
         self.tree.clear();
         self.opened.clear();
         self.awaiting.clear();
+        self.refusal = None;
         std::mem::take(&mut self.provenance)
     }
 
@@ -183,6 +188,16 @@ impl DirectoryBrowser {
             Some(DirectoryEntries::Refused(reason)) => Some(reason),
             _ => None,
         }
+    }
+
+    /// Why the reader's choice was refused before it reached the Server.
+    pub(super) fn refusal(&self) -> Option<&str> {
+        self.refusal.as_deref()
+    }
+
+    /// Says `refusal` inside the browser until it closes.
+    pub(super) fn refuse(&mut self, refusal: String) {
+        self.refusal = Some(refusal);
     }
 
     pub(super) fn select_previous(&mut self) {

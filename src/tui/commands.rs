@@ -1293,14 +1293,13 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: None,
         keybinding: None,
     },
-    // Choosing asks the Server to resolve the directory, but it is the
-    // Workspace Picker's choice made from a tree, and like that choice it is
-    // never refused up front: whatever the Server answers, a refusal
-    // included, is said on the Landing the choice opens.
+    // Choosing asks the Outlook's Server to resolve the directory, as the
+    // Workspace Picker's choice does, so an Origin that has stopped answering
+    // refuses it as it refuses that choice.
     SemanticCommandDescriptor {
         id: SemanticCommandId::DirectoryBrowserChoose,
         title: "Choose Directory",
-        reach: SemanticReach::Client,
+        reach: SemanticReach::Origin,
         description: "Open the Landing in the Directory Browser's focused directory",
         slash: None,
         keybinding: None,

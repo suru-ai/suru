@@ -6938,9 +6938,10 @@ impl Application {
     }
 
     /// Commands that begin a Turn or retarget the Agent wait for an in-flight
-    /// Agent Selection update instead of racing it. Choosing a Workspace is one
-    /// of them: it opens the Landing, which takes over the Agent Selection from
-    /// the Session being left.
+    /// Agent Selection update instead of racing it. Choosing a Workspace, or a
+    /// directory in the Directory Browser, is one of them: it opens the
+    /// Landing, which takes over the Agent Selection from the Session being
+    /// left.
     fn defers_for_agent_selection(&self, command: &CommandId) -> bool {
         self.state.selection_update_pending()
             && matches!(
@@ -6955,6 +6956,7 @@ impl Application {
                             | SemanticCommandId::SessionNew
                             | SemanticCommandId::SessionSidekick
                             | SemanticCommandId::ModelOptionsApply
+                            | SemanticCommandId::DirectoryBrowserChoose
                     )
             )
     }
@@ -7086,9 +7088,14 @@ impl Application {
             .unreachable_reason(origin)
             .map(|reason| format!(" · {}", super::unreachable_reason::brief(reason)))
             .unwrap_or_default();
-        self.state.submission_error = Some(format!(
-            "{remote} is unreachable{why}; this waits until it answers"
-        ));
+        let refusal = format!("{remote} is unreachable{why}; this waits until it answers");
+        // The Directory Browser stands over the Landing and keeps the keys,
+        // so what it asked for is refused inside it, where the reader is
+        // looking; the Landing goes on saying it once the browser closes.
+        if self.state.directory_browser.is_open() {
+            self.state.directory_browser.refuse(refusal.clone());
+        }
+        self.state.submission_error = Some(refusal);
         true
     }
 
@@ -9575,6 +9582,7 @@ impl Application {
                 SemanticCommandId::SessionList
                     | SemanticCommandId::SessionNew
                     | SemanticCommandId::SessionSidekick
+                    | SemanticCommandId::DirectoryBrowserChoose
             )
         {
             return Ok(ApplicationTransition::Continue);

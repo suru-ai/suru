@@ -1935,8 +1935,9 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
 }
 
 /// The Directory Browser: the path field naming the tree's root, any refusal
-/// of the root beneath it, the tree itself, and the keys it answers. A tree
-/// wants height, so it stands taller than the other pickers.
+/// of the root or of the reader's choice beneath it, the tree itself, and the
+/// keys it answers. A tree wants height, so it stands taller than the other
+/// pickers.
 fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
     let browser = &state.directory_browser;
     let area = centered_rect(
@@ -1966,13 +1967,16 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
             ),
             theme.text.subdued,
         ));
-        if let Some(refusal) = browser.root_refusal()
-            && lines.len() < content_height
+        for refusal in [browser.root_refusal(), browser.refusal()]
+            .into_iter()
+            .flatten()
         {
-            lines.push(Line::styled(
-                truncate_to_width(&format!("Error: {refusal}"), content_width),
-                theme.feedback.error,
-            ));
+            if lines.len() < content_height {
+                lines.push(Line::styled(
+                    truncate_to_width(&format!("Error: {refusal}"), content_width),
+                    theme.feedback.error,
+                ));
+            }
         }
     }
     let footer_rows = usize::from(shows_footer);
