@@ -161,6 +161,7 @@ pub(super) enum SelectionSurface {
     Relay,
     Sessions,
     Workspaces,
+    DirectoryBrowser,
     Worktrees,
     Models,
     Themes,

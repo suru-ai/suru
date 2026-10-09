@@ -243,6 +243,17 @@ pub enum SemanticCommandId {
     TranscriptTurnToggle,
     TranscriptTurnsToggle,
     WorkspaceList,
+    /// Opens the Directory Browser over the Outlook's Server's directories,
+    /// rooted at the Landing's Execution Directory.
+    WorkspaceBrowse,
+    DirectoryBrowserPrevious,
+    DirectoryBrowserNext,
+    /// Opens the Directory Browser's focused row where it is closed, and
+    /// closes it where it is open.
+    DirectoryBrowserRowToggle,
+    DirectoryBrowserRowOpen,
+    DirectoryBrowserRowClose,
+    DirectoryBrowserClose,
     WorktreeRemove,
     WorktreeForceRemove,
     WorktreeList,
@@ -634,6 +645,13 @@ impl SemanticCommandId {
             Self::TranscriptTurnToggle => "transcript.turn.fold.toggle",
             Self::TranscriptTurnsToggle => "transcript.turns.toggle",
             Self::WorkspaceList => "workspace.list",
+            Self::WorkspaceBrowse => "workspace.browse",
+            Self::DirectoryBrowserPrevious => "directory-browser.previous",
+            Self::DirectoryBrowserNext => "directory-browser.next",
+            Self::DirectoryBrowserRowToggle => "directory-browser.row.toggle",
+            Self::DirectoryBrowserRowOpen => "directory-browser.row.open",
+            Self::DirectoryBrowserRowClose => "directory-browser.row.close",
+            Self::DirectoryBrowserClose => "directory-browser.close",
             Self::WorktreeRemove => "worktree.remove",
             Self::WorktreeForceRemove => "worktree.force_remove",
             Self::WorktreeList => "worktree.list",
@@ -1207,6 +1225,77 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             modifiers: KeyModifiers::NONE,
             label: "Ctrl+X W",
         }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorkspaceBrowse,
+        title: "Browse for a Workspace",
+        // Everything the browser lists is read from the Outlook's Server, so
+        // an Origin that has stopped answering refuses it like any other
+        // start.
+        reach: SemanticReach::Origin,
+        description: "Choose a directory of the Outlook's Server to work in from a tree of its directories",
+        slash: Some(SlashCommand {
+            name: "browse",
+            aliases: &[],
+            takes_text: false,
+        }),
+        keybinding: Some(SemanticKeybinding {
+            prefix: Some(LEADER_PREFIX),
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::NONE,
+            label: "Ctrl+X B",
+        }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::DirectoryBrowserPrevious,
+        title: "Directory Browser Previous",
+        reach: SemanticReach::Client,
+        description: "Move the Directory Browser's focus to the directory drawn above",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::DirectoryBrowserNext,
+        title: "Directory Browser Next",
+        reach: SemanticReach::Client,
+        description: "Move the Directory Browser's focus to the directory drawn below",
+        slash: None,
+        keybinding: None,
+    },
+    // Opening a row asks the Server for its children, but these stay with the
+    // Client: closing one asks nothing, and a listing the Server cannot give
+    // is said beneath the row it was asked for.
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::DirectoryBrowserRowToggle,
+        title: "Open or Close Directory",
+        reach: SemanticReach::Client,
+        description: "Open the Directory Browser's focused directory, or close it where it is open",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::DirectoryBrowserRowOpen,
+        title: "Open Directory",
+        reach: SemanticReach::Client,
+        description: "List the Directory Browser's focused directory beneath its row",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::DirectoryBrowserRowClose,
+        title: "Close Directory",
+        reach: SemanticReach::Client,
+        description: "Fold the Directory Browser's focused directory back to its row",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::DirectoryBrowserClose,
+        title: "Close Directory Browser",
+        reach: SemanticReach::Client,
+        description: "Dismiss the Directory Browser without choosing",
+        slash: None,
+        keybinding: None,
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::SessionDelete,

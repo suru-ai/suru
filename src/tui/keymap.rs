@@ -558,6 +558,34 @@ pub(super) fn command_for_workspace_picker_event(event: InputEvent) -> Option<Co
     }
 }
 
+/// The Directory Browser walks its tree with the keys every picker walks its
+/// rows with — the arrows, and Ctrl+P and Ctrl+N — while Space opens or
+/// closes the focused row, Right opens it, Left closes it, and Esc closes the
+/// browser. The pointer is not one of its ways in yet: a press inside it moves
+/// nothing, and one outside it is already an Escape by the time it gets here.
+pub(super) fn command_for_directory_browser_event(event: InputEvent) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let semantic = match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::DirectoryBrowserPrevious
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::DirectoryBrowserNext
+        }
+        (KeyCode::Char(' '), KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserRowToggle,
+        (KeyCode::Right, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserRowOpen,
+        (KeyCode::Left, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserRowClose,
+        (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserClose,
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(semantic))
+}
+
 /// The Description editor has the keys while it stands over the Workspace
 /// Picker: what the reader types or pastes is the Description, Backspace
 /// takes a character back, Ctrl+U empties it, Enter saves it, and Esc closes

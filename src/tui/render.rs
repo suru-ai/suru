@@ -33,6 +33,7 @@ use super::{
     composer::{ComposerBindings, ComposerKey, ComposerMemory},
     connect_overlay::LoginStep,
     context_overlay::{ContextOverlayView, ContextRow},
+    directory_browser::{DirectoryBrowserRow, DirectoryBrowserRowKind},
     icon_picker,
     keymap::binding_label,
     list_window::WindowEntry,
@@ -360,6 +361,9 @@ pub(super) fn render_with_slots(
             render_workspace_description_editor(frame, state, main, theme);
         }
     }
+    if state.directory_browser.is_open() && !state.reconnect_overlay_visible() {
+        render_directory_browser(frame, state, main, theme);
+    }
     if state.worktree_picker.open && !state.reconnect_overlay_visible() {
         render_worktree_picker(frame, state, main, theme);
     }
@@ -408,6 +412,7 @@ pub(super) fn render_with_slots(
         render_reconnect_overlay(frame, theme);
     } else if !state.session_picker.is_open()
         && !state.workspace_picker.is_open()
+        && !state.directory_browser.is_open()
         && !state.model_picker.is_open()
         && !state.approval_posture_picker.is_open()
         && !state.theme_picker.is_open()
@@ -1924,6 +1929,120 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
         " Workspaces ",
         theme,
     );
+}
+
+/// The Directory Browser: the path field naming the tree's root, any refusal
+/// of the root beneath it, the tree itself, and the keys it answers. A tree
+/// wants height, so it stands taller than the other pickers.
+fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
+    let browser = &state.directory_browser;
+    let area = centered_rect(
+        main,
+        main.width.saturating_sub(4).min(80),
+        main.height
+            .saturating_sub(2)
+            .max(4)
+            .min(main.height)
+            .min(24),
+    );
+    let content_width = usize::from(area.width.saturating_sub(2));
+    let content_height = usize::from(area.height.saturating_sub(2));
+    let mut lines = Vec::with_capacity(content_height);
+    let shows_field = content_height >= 3;
+    let shows_footer = content_height >= 2;
+    if shows_field {
+        // A path is read from its end, so a long one gives up its head.
+        const LABEL: &str = "Path: ";
+        lines.push(Line::styled(
+            format!(
+                "{LABEL}{}",
+                truncate_from_left_to_width(
+                    browser.field(),
+                    content_width.saturating_sub(LABEL.width())
+                )
+            ),
+            theme.text.subdued,
+        ));
+        if let Some(refusal) = browser.root_refusal()
+            && lines.len() < content_height
+        {
+            lines.push(Line::styled(
+                truncate_to_width(&format!("Error: {refusal}"), content_width),
+                theme.feedback.error,
+            ));
+        }
+    }
+    let footer_rows = usize::from(shows_footer);
+    let capacity = content_height.saturating_sub(lines.len() + footer_rows);
+    // The root goes by its name in the Server's own path syntax; every other
+    // row by the name the Server listed it under.
+    let root_name = state.workspace_name(&state.outlook, browser.root());
+    lines.extend(
+        browser
+            .visible_rows(capacity)
+            .iter()
+            .map(|row| directory_browser_line(row, &root_name, content_width, theme)),
+    );
+    if shows_footer && lines.len() < content_height {
+        // The footer holds the box's last line however much of the tree is
+        // open, so opening and closing rows never moves it.
+        lines.resize(content_height.saturating_sub(1), Line::default());
+        let footer = if content_width < usize::from(NARROW_TERMINAL_WIDTH) {
+            "↑↓ · Space · → · ← · Esc"
+        } else {
+            "↑↓ move · Space open/close · → open · ← close · Esc close"
+        };
+        lines.push(Line::styled(
+            truncate_to_width(footer, content_width),
+            theme.text.subdued,
+        ));
+    }
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::DirectoryBrowser,
+        area,
+        lines,
+        " Directory Browser ",
+        theme,
+    );
+}
+
+/// One Directory Browser row: the focus marker, the indent its depth gives
+/// it, and — for a directory — whether it is open, then its name; beneath an
+/// open directory, that it is being read or why it cannot be.
+fn directory_browser_line(
+    row: &DirectoryBrowserRow,
+    root_name: &str,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let indent = "  ".repeat(row.depth);
+    let (text, style) = match &row.kind {
+        DirectoryBrowserRowKind::Directory {
+            name,
+            opened,
+            focused,
+            ..
+        } => (
+            format!(
+                "{}{indent}{}{}",
+                if *focused { "› " } else { "  " },
+                if *opened { "▾ " } else { "▸ " },
+                name.as_deref().unwrap_or(root_name),
+            ),
+            if *focused {
+                theme.selection.focused
+            } else {
+                theme.text.primary
+            },
+        ),
+        DirectoryBrowserRowKind::Loading => (format!("  {indent}Loading…"), theme.text.subdued),
+        DirectoryBrowserRowKind::Refused(reason) => {
+            (format!("  {indent}Error: {reason}"), theme.feedback.error)
+        }
+    };
+    Line::styled(truncate_to_width(&text, width), style)
 }
 
 /// The focused Workspace's Description as the picker draws it beneath its

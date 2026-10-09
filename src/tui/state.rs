@@ -50,13 +50,16 @@ use super::{
     composer::{ComposerKey, ComposerMemory, SelectionMotion},
     connect_overlay::{ConnectOverlay, ConnectRequest, LoginStep},
     context_overlay::{ContextBreakdownRefusal, ContextOverlay},
+    directory_browser::{
+        DirectoryBrowser, DirectoryBrowserProvenance, DirectoryListingAsk, DirectoryListingId,
+    },
     icon_picker::{IconPicker, IconPickerTarget},
     keymap::{
         command_for_approval_posture_picker_event, command_for_aside_event,
         command_for_completion_event, command_for_connect_overlay_event,
-        command_for_context_overlay_event, command_for_icon_picker_event,
-        command_for_interrupt_confirmation_event, command_for_leader_event,
-        command_for_model_options_event, command_for_model_picker_event,
+        command_for_context_overlay_event, command_for_directory_browser_event,
+        command_for_icon_picker_event, command_for_interrupt_confirmation_event,
+        command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
         command_for_monitoring_subagent_view_event, command_for_numeric_editor_event,
         command_for_queued_prompt_event, command_for_relay_overlay_event,
         command_for_serve_overlay_event, command_for_session_picker_event,
@@ -718,6 +721,7 @@ pub struct TuiState {
     pub(super) theme_picker: ThemePicker,
     pub(super) session_picker: SessionPicker,
     pub(super) workspace_picker: WorkspacePicker,
+    pub(super) directory_browser: DirectoryBrowser,
     pub(super) subagent_picker: SubagentPicker,
     pub(super) icon_picker: IconPicker,
     /// Where the last frame drew the Session header's Icon span, so a press
@@ -1027,6 +1031,7 @@ impl TuiState {
             theme_picker: ThemePicker::default(),
             session_picker: SessionPicker::new(workspace.clone()),
             workspace_picker: WorkspacePicker::new(workspace.clone()),
+            directory_browser: DirectoryBrowser::default(),
             subagent_picker: SubagentPicker::default(),
             icon_picker: IconPicker::default(),
             header_icon_area: RefCell::new(None),
@@ -1326,6 +1331,9 @@ impl TuiState {
         self.sidebar.adopt_workspace(self.workspace.clone());
         self.session_picker.adopt_outlook(outlook.clone());
         self.workspace_picker.adopt_outlook(outlook.clone());
+        // What it lists is another Server's, and nothing it awaits from the
+        // one turned away from is an answer any longer.
+        self.directory_browser.close();
         if let Some(paths) = self.workspace_paths.get(&outlook) {
             self.workspace_picker.adopt_workspace_paths(paths.clone());
         }
@@ -3671,6 +3679,8 @@ impl TuiState {
             Some(SelectionSurface::Settings)
         } else if self.worktree_picker.open {
             Some(SelectionSurface::Worktrees)
+        } else if self.directory_browser.is_open() {
+            Some(SelectionSurface::DirectoryBrowser)
         } else if self.workspace_picker.description_editor_is_open() {
             Some(SelectionSurface::WorkspaceDescriptionEditor)
         } else if self.workspace_picker.menu_is_open() {
@@ -3722,6 +3732,7 @@ impl TuiState {
             || self.model_options.is_open()
             || self.session_picker.is_open()
             || self.workspace_picker.is_open()
+            || self.directory_browser.is_open()
             || self.worktree_picker.open
             || self.subagent_picker.is_open()
             || self.approvals.is_open(self.session_reference.as_ref())
@@ -4903,6 +4914,12 @@ pub enum ApplicationEvent {
         request_id: u64,
         result: std::result::Result<crate::protocol::ResolvedWorkspace, String>,
     },
+    /// The Outlook's Server's answer to the Directory Browser's listing
+    /// `listing_id`: the directory's children, or why it would not read them.
+    DirectoryListed {
+        listing_id: DirectoryListingId,
+        result: std::result::Result<crate::protocol::DirectoryListing, String>,
+    },
     /// What the host clipboard held when a paste read it.
     ClipboardRead {
         paste: PasteId,
@@ -5356,6 +5373,14 @@ pub enum ApplicationTransition {
     ResolveSidekickWorkspace {
         outlook: Outlook,
         request_id: u64,
+    },
+    /// Ask `outlook`'s Server for the children of the directory `request`
+    /// names, for the Directory Browser, answering as its listing
+    /// `listing_id`.
+    ListDirectory {
+        outlook: Outlook,
+        listing_id: DirectoryListingId,
+        request: crate::protocol::ListDirectoryRequest,
     },
 }
 
@@ -6260,6 +6285,12 @@ impl Application {
                         Ok(ApplicationTransition::Continue)
                     }
                 }
+            }
+            // An answer to a listing the browser no longer awaits — one an
+            // earlier opening asked for — moves nothing.
+            ApplicationEvent::DirectoryListed { listing_id, result } => {
+                self.state.directory_browser.load(listing_id, result);
+                Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::PromptAdmissionSucceeded { session, prompt_id } => {
                 if self
@@ -7657,6 +7688,54 @@ impl Application {
             _ => {}
         }
         ApplicationTransition::Continue
+    }
+
+    /// Handles the Directory Browser's commands while it is open; any other
+    /// command, or one arriving with the browser closed, leaves it alone.
+    fn handle_directory_browser_command(
+        &mut self,
+        command: SemanticCommandId,
+    ) -> ApplicationTransition {
+        let browser = &mut self.state.directory_browser;
+        if !browser.is_open() {
+            return ApplicationTransition::Continue;
+        }
+        let ask = match command {
+            SemanticCommandId::DirectoryBrowserPrevious => {
+                browser.select_previous();
+                None
+            }
+            SemanticCommandId::DirectoryBrowserNext => {
+                browser.select_next();
+                None
+            }
+            SemanticCommandId::DirectoryBrowserRowToggle => browser.toggle_focused(),
+            SemanticCommandId::DirectoryBrowserRowOpen => browser.open_focused(),
+            SemanticCommandId::DirectoryBrowserRowClose => {
+                browser.close_focused();
+                None
+            }
+            SemanticCommandId::DirectoryBrowserClose => {
+                // A browser opened standalone has nowhere to go back to, so
+                // Esc closes it outright.
+                let DirectoryBrowserProvenance::Standalone = browser.close();
+                None
+            }
+            _ => None,
+        };
+        ask.map_or(ApplicationTransition::Continue, |ask| {
+            self.list_directory(ask)
+        })
+    }
+
+    /// The listing the Directory Browser asks for, of the Server the Outlook
+    /// is turned toward.
+    fn list_directory(&self, ask: DirectoryListingAsk) -> ApplicationTransition {
+        ApplicationTransition::ListDirectory {
+            outlook: self.state.outlook.clone(),
+            listing_id: ask.listing_id,
+            request: ask.request,
+        }
     }
 
     /// Handles the Subagent Picker's commands; any other command leaves the
@@ -10100,6 +10179,29 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::ListSessions(request))
             }
+            // The browser starts where the Landing would begin a Session, on
+            // whichever Server the Outlook is turned toward.
+            SemanticCommandId::WorkspaceBrowse => {
+                let execution_directory = self
+                    .state
+                    .execution_directory
+                    .clone()
+                    .unwrap_or_else(|| self.state.workspace.path.clone());
+                let ask = self
+                    .state
+                    .directory_browser
+                    .open(execution_directory, DirectoryBrowserProvenance::Standalone);
+                self.state.command_mode = CommandMode::Composer;
+                Ok(self.list_directory(ask))
+            }
+            command @ (SemanticCommandId::DirectoryBrowserPrevious
+            | SemanticCommandId::DirectoryBrowserNext
+            | SemanticCommandId::DirectoryBrowserRowToggle
+            | SemanticCommandId::DirectoryBrowserRowOpen
+            | SemanticCommandId::DirectoryBrowserRowClose
+            | SemanticCommandId::DirectoryBrowserClose) => {
+                Ok(self.handle_directory_browser_command(command))
+            }
             SemanticCommandId::TranscriptFoldsToggle => {
                 self.state.toggle_fold_posture();
                 self.state.command_mode = CommandMode::Composer;
@@ -11174,6 +11276,9 @@ impl Application {
                 SelectionSurface::Settings => return command_for_settings_panel_event(event),
                 SelectionSurface::Worktrees => {
                     return super::keymap::command_for_worktree_picker_event(event);
+                }
+                SelectionSurface::DirectoryBrowser => {
+                    return command_for_directory_browser_event(event);
                 }
                 SelectionSurface::WorkspaceDescriptionEditor => {
                     return command_for_workspace_description_editor_event(event);

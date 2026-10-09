@@ -585,6 +585,9 @@ struct TaskChannels {
     /// What the Client's own Server answered about its Relays, and how each
     /// login followed there ended.
     relays: UnboundedSender<ApplicationEvent>,
+    /// What the Outlook's Server listed of each directory the Directory
+    /// Browser opened, or why it would not.
+    directories: UnboundedSender<ApplicationEvent>,
 }
 
 /// The run loop's mutable world: the Application it feeds, the client it sends
@@ -644,6 +647,7 @@ async fn run_loop(
     let (thumbnails, mut thumbnail_rx) = tokio::sync::mpsc::unbounded_channel();
     let (context_breakdowns, mut context_breakdown_rx) = tokio::sync::mpsc::unbounded_channel();
     let (relays, mut relay_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (directories, mut directory_rx) = tokio::sync::mpsc::unbounded_channel();
     let application = Application::new(workspace, terminal_facts);
     let application = match config_root {
         Some(config_root) => application.with_config_root(config_root),
@@ -670,6 +674,7 @@ async fn run_loop(
             thumbnails,
             context_breakdowns,
             relays,
+            directories,
         },
         reconnect_grace: Vec::new(),
         opening_loading_delay: None,
@@ -742,6 +747,7 @@ async fn run_loop(
             thumbnail = thumbnail_rx.recv() => run.receive_thumbnail(thumbnail)?,
             breakdown = context_breakdown_rx.recv() => run.receive_context_breakdown(breakdown)?,
             relay = relay_rx.recv() => run.receive_relay_answer(relay)?,
+            directory = directory_rx.recv() => run.receive_directory_listing(directory)?,
             input_event = input.next() => match input_event {
                 Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut(), &mut clipboard, &mut delivery)?,
                 Some(Err(error)) => return Err(error.into()),
@@ -968,6 +974,16 @@ impl RunLoop {
         answer: Option<ApplicationEvent>,
     ) -> Result<ControlFlow<Exit>> {
         let answer = answer.ok_or_else(|| anyhow!("Context Breakdown task channel stopped"))?;
+        self.needs_redraw = true;
+        let transition = self.application.handle_event(answer)?;
+        Ok(self.dispatch_transition(transition))
+    }
+
+    fn receive_directory_listing(
+        &mut self,
+        answer: Option<ApplicationEvent>,
+    ) -> Result<ControlFlow<Exit>> {
+        let answer = answer.ok_or_else(|| anyhow!("Directory listing task channel stopped"))?;
         self.needs_redraw = true;
         let transition = self.application.handle_event(answer)?;
         Ok(self.dispatch_transition(transition))
@@ -1591,6 +1607,18 @@ impl RunLoop {
             ApplicationTransition::CancelWorkspaceResolution(surface) => {
                 self.tasks.cancel_workspace_resolution(surface);
             }
+            ApplicationTransition::ListDirectory {
+                outlook,
+                listing_id,
+                request,
+            } => {
+                spawn_directory_listing(
+                    self.client.session_commands_for(outlook),
+                    listing_id,
+                    request,
+                    self.channels.directories.clone(),
+                );
+            }
             ApplicationTransition::CopyToClipboard(_) => {
                 unreachable!("clipboard output is handled before task dispatch")
             }
@@ -1779,7 +1807,8 @@ impl RunLoop {
             | ApplicationTransition::TurnOutlookAndViewAndAttach { .. }
             | ApplicationTransition::DetachSessionAndResolveWorkspace { .. }
             | ApplicationTransition::ResolveSidekickWorkspace { .. }
-            | ApplicationTransition::CancelWorkspaceResolution(_) => {
+            | ApplicationTransition::CancelWorkspaceResolution(_)
+            | ApplicationTransition::ListDirectory { .. } => {
                 unreachable!("managed events issue no other Session command");
             }
         }
@@ -3188,6 +3217,25 @@ fn spawn_attachment_check(
             .await
             .map_err(|error| format!("{error:#}"));
         let _ = answers.send(ApplicationEvent::AttachmentsChecked { check, result });
+    });
+}
+
+/// Asks the Server `commands` names for the children of the directory
+/// `request` names, answering as the Directory Browser's listing
+/// `listing_id`. Nothing aborts it: an answer the browser no longer awaits is
+/// told apart by its identity and moves nothing.
+fn spawn_directory_listing(
+    commands: SessionCommandClient,
+    listing_id: crate::tui::DirectoryListingId,
+    request: crate::protocol::ListDirectoryRequest,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let result = commands
+            .list_directory(request)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = answers.send(ApplicationEvent::DirectoryListed { listing_id, result });
     });
 }
 
@@ -6574,6 +6622,7 @@ mod ready_event_tests {
                 thumbnails: sender(),
                 context_breakdowns: sender(),
                 relays: sender(),
+                directories: sender(),
             },
             reconnect_grace: Vec::new(),
             opening_loading_delay: None,

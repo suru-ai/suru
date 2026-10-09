@@ -20,6 +20,7 @@ mod composer_lifecycle;
 mod connecting;
 mod content_width;
 mod context;
+mod directory_browser;
 mod hidden_subsessions;
 mod icon_picker;
 mod image_paste;
