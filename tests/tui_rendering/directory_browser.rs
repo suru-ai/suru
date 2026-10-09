@@ -1,6 +1,7 @@
 //! The Directory Browser: opening it by `/browse` or its chord at the
 //! Landing's Execution Directory, walking and opening its tree, the listings
-//! the Outlook's Server answers it with, and closing it.
+//! the Outlook's Server answers it with, choosing a directory to land in, and
+//! closing it.
 //!
 //! Every directory here is one the Client's own disk does not hold, so a row
 //! the tree draws can only have come from the Server's answer.
@@ -8,21 +9,26 @@
 use std::path::{Path, PathBuf};
 
 use crate::support::{
-    application_looking_at_studio, connected_application, fixture_instance_id, key, ready_health,
-    rendered_application_rows_at, rendered_row, studio_stops_answering, type_terminal_text,
-    workspace_resolution,
+    SIDEBAR_WIDE, application_looking_at_studio, connected_application, deliver_settings,
+    drawn_in_sidebar, enter_active_session, fixture_instance_id, invoke, key, listed_session,
+    ready_health, rendered_application_rows_at, rendered_row, selector_label, sidebar_column,
+    studio_stops_answering, type_terminal_text, workspace_resolution,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use std::time::Duration;
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        ChildDirectory, DirectoryListing, ExecutionDirectory, ListDirectoryRequest, Outlook,
-        ResolvedWorkspace,
+        CheckoutAssociation, CheckoutId, CheckoutKind, CheckoutRevision, CheckoutSummary,
+        ChildDirectory, DirectoryListing, EffectiveSettings, ExecutionDirectory,
+        ExecutionDirectoryStatus, ListDirectoryRequest, Outlook, Repository, RepositoryId,
+        RepositoryLocation, ResolveWorkspaceRequest, ResolvedWorkspace, SessionId, SessionListItem,
+        SessionStatus, SessionTimestamp, SidebarScope, SidebarSettings, SidebarVisibility,
+        SourceControlAvailability, SourceControlCapabilities, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, DirectoryListingId,
-        SemanticCommandId, TerminalFacts,
+        SemanticCommandId, TerminalFacts, WorkspaceResolutionSurface,
     },
 };
 
@@ -403,13 +409,9 @@ fn the_footer_names_the_keys_the_browser_answers() {
 
     let screen = rendered_application_rows_at(&application, WIDTH, HEIGHT);
     let footer = &screen[rendered_row(&screen, "Esc close")];
-    for named in ["↑↓", "Space", "→", "←", "Esc"] {
+    for named in ["↑↓", "Space", "→", "←", "Enter choose", "Esc"] {
         assert!(footer.contains(named), "{named} is named: {footer}");
     }
-    assert!(
-        !footer.contains("Enter"),
-        "Enter chooses nothing yet, so the footer does not offer it: {footer}"
-    );
 }
 
 #[test]
@@ -543,6 +545,324 @@ fn every_opening_begins_afresh_at_the_root() {
     );
 }
 
+/// Focus begins on the root, so Enter straight away chooses the directory
+/// the reader already stands in.
+#[test]
+fn enter_on_the_root_chooses_the_directory_the_tree_stands_on() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha"]);
+
+    let (_, _, request) = expect_choice(&key(&mut application, KeyCode::Enter));
+
+    assert_eq!(request.path, here);
+}
+
+/// Choosing acts as choosing in the Workspace Picker does: the browser is
+/// done with, the Landing opens at once naming the directory chosen while its
+/// Server works out where that is, and the answer lands the Landing in the
+/// directory's Workspace with the directory as its Execution Directory.
+#[test]
+fn enter_chooses_the_focused_directory_and_lands_there_once_the_server_answers() {
+    let here = directory(&["nowhere", "here"]);
+    let alpha = here.join("alpha");
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha", "beta"]);
+    key(&mut application, KeyCode::Down);
+
+    let choice = key(&mut application, KeyCode::Enter);
+
+    let (outlook, surface, request) = expect_choice(&choice);
+    assert_eq!(
+        outlook,
+        Outlook::Local,
+        "the Outlook's Server is asked where the directory chosen stands"
+    );
+    assert_eq!(
+        surface,
+        WorkspaceResolutionSurface::WorkspacePicker,
+        "and its answer is taken as the Workspace Picker's choice is"
+    );
+    assert_eq!(
+        request,
+        ResolveWorkspaceRequest {
+            checkout_id: None,
+            remembered_execution_directory: None,
+            workspace_id: None,
+            base: Some(here.clone()),
+            path: alpha.clone(),
+        },
+        "the directory chosen goes by the Server's own path, read from the Landing's \
+         Execution Directory"
+    );
+    let landing = rendered_application_rows_at(&application, WIDTH, HEIGHT).join("\n");
+    assert!(
+        !landing.contains("Path:"),
+        "the browser is done with: {landing}"
+    );
+    assert!(
+        landing.contains("Type a prompt"),
+        "the Landing stands in its place: {landing}"
+    );
+    assert!(
+        landing_location(&application).ends_with(&format!("alpha · {SPINNER}")),
+        "naming the directory chosen while its Server answers: {landing}"
+    );
+
+    resolve(
+        &mut application,
+        &choice,
+        Ok(ResolvedWorkspace::directory(alpha.clone())),
+    );
+
+    let location = landing_location(&application);
+    assert!(
+        location.ends_with("alpha") && !location.contains(SPINNER),
+        "the Landing stands in the directory's Workspace: {location}"
+    );
+    assert_eq!(
+        next_session_directory(&mut application),
+        alpha,
+        "and the next Session begins in the directory chosen"
+    );
+}
+
+/// A directory inside a Worktree is where the next Session works, in the
+/// Workspace of the Repository the Worktree belongs to: the Landing names
+/// that Workspace, the Worktree's Checkout State, and the directory's path
+/// within the Worktree.
+#[test]
+fn choosing_a_subdirectory_inside_a_worktree_makes_it_the_execution_directory() {
+    let main = directory(&["nowhere", "repo", "main"]);
+    let linked = directory(&["nowhere", "repo", "linked"]);
+    let source = linked.join("src");
+    let mut application = connected_application(&linked);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &linked, &["src"]);
+    key(&mut application, KeyCode::Down);
+
+    let choice = key(&mut application, KeyCode::Enter);
+    let (_, _, request) = expect_choice(&choice);
+    assert_eq!(request.path, source);
+
+    resolve(
+        &mut application,
+        &choice,
+        Ok(inside_linked_worktree(&main, &linked, &source)),
+    );
+
+    let location = landing_location(&application);
+    assert!(
+        location.ends_with(&format!(
+            "{} · feature/browse (worktree) · src",
+            main.display()
+        )),
+        "the Landing works in the subdirectory of the Worktree: {location}"
+    );
+    assert_eq!(next_session_directory(&mut application), source);
+}
+
+/// A bare Repository has no working copy for a Session to work in, so its
+/// root lands with the Worktree choice still owed, as it does when the
+/// Workspace Picker chooses one.
+#[test]
+fn choosing_a_bare_repository_root_lands_with_the_worktree_choice_still_owed() {
+    let here = directory(&["nowhere", "here"]);
+    let store = here.join("store.git");
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["store.git"]);
+    key(&mut application, KeyCode::Down);
+
+    let choice = key(&mut application, KeyCode::Enter);
+    let (_, _, request) = expect_choice(&choice);
+    assert_eq!(request.path, store);
+
+    resolve(&mut application, &choice, Ok(bare_repository(&store)));
+
+    let location = landing_location(&application);
+    assert!(
+        location.ends_with("store.git · Choose a working copy to start a Session"),
+        "{location}"
+    );
+    type_terminal_text(&mut application, "Keep this draft");
+    assert_eq!(
+        key(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "no Session begins until a working copy is chosen"
+    );
+    let landing = rendered_application_rows_at(&application, WIDTH, HEIGHT).join("\n");
+    assert!(landing.contains("Keep this draft"), "{landing}");
+}
+
+/// A refused choice moves nothing: the Landing it opened says why, goes back
+/// to naming the Workspace the client still works in, and the next Session
+/// begins where it would have before.
+#[test]
+fn a_refused_choice_is_said_on_the_landing_and_leaves_the_workspace_as_it_was() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha"]);
+    key(&mut application, KeyCode::Down);
+    let choice = key(&mut application, KeyCode::Enter);
+    type_terminal_text(&mut application, "Keep this draft");
+
+    assert_eq!(
+        resolve(
+            &mut application,
+            &choice,
+            Err("Permission denied".to_owned())
+        ),
+        ApplicationTransition::Continue,
+        "a refused choice asks nothing more of the Server"
+    );
+
+    let landing = rendered_application_rows_at(&application, WIDTH, HEIGHT).join("\n");
+    assert!(
+        landing.contains("Could not open the alpha Workspace: Permission denied"),
+        "the refusal stands on the Landing the reader is on: {landing}"
+    );
+    assert!(
+        !landing.contains("Path:"),
+        "the browser stays closed: {landing}"
+    );
+    assert!(landing.contains("Keep this draft"), "{landing}");
+    assert!(
+        landing_location(&application).ends_with("here"),
+        "the Landing names the Workspace the client still works in: {landing}"
+    );
+    assert_eq!(next_session_directory(&mut application), here);
+}
+
+/// Going to a fresh Landing lets go of a choice still resolving, as it lets
+/// go of the Workspace Picker's, so the answer arriving late leaves the
+/// reader where they went.
+#[test]
+fn a_late_answer_for_a_choice_let_go_of_moves_nothing() {
+    let here = directory(&["nowhere", "here"]);
+    let alpha = here.join("alpha");
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha"]);
+    key(&mut application, KeyCode::Down);
+    let choice = key(&mut application, KeyCode::Enter);
+    assert_eq!(
+        invoke(&mut application, SemanticCommandId::SessionNew),
+        ApplicationTransition::DetachSession
+    );
+    let before = rendered_application_rows_at(&application, WIDTH, HEIGHT);
+
+    assert_eq!(
+        resolve(
+            &mut application,
+            &choice,
+            Ok(ResolvedWorkspace::directory(alpha))
+        ),
+        ApplicationTransition::Continue
+    );
+
+    assert_eq!(
+        rendered_application_rows_at(&application, WIDTH, HEIGHT),
+        before,
+        "the fresh Landing stands exactly as it was"
+    );
+    assert_eq!(next_session_directory(&mut application), here);
+}
+
+/// The directory chosen last is the one the reader lands in, whichever
+/// answer the Server gives first.
+#[test]
+fn a_newer_choice_supersedes_a_directory_still_resolving() {
+    let here = directory(&["nowhere", "here"]);
+    let alpha = here.join("alpha");
+    let beta = here.join("beta");
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha", "beta"]);
+    key(&mut application, KeyCode::Down);
+    let first = key(&mut application, KeyCode::Enter);
+    let (_, listing_id, _) = browse_by_chord(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha", "beta"]);
+    key(&mut application, KeyCode::Down);
+    key(&mut application, KeyCode::Down);
+    let second = key(&mut application, KeyCode::Enter);
+
+    assert_eq!(
+        resolve(
+            &mut application,
+            &first,
+            Ok(ResolvedWorkspace::directory(alpha))
+        ),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        landing_location(&application).ends_with(&format!("beta · {SPINNER}")),
+        "the superseded answer does not pull the Landing back to the earlier choice"
+    );
+
+    resolve(
+        &mut application,
+        &second,
+        Ok(ResolvedWorkspace::directory(beta.clone())),
+    );
+    assert_eq!(next_session_directory(&mut application), beta);
+}
+
+/// Choosing from an open Session is plain navigation: the client stops
+/// watching the Session, which goes on working and stays listed, and the
+/// Sidebar goes on answering for the scope the reader gave it.
+#[test]
+fn choosing_leaves_the_open_session_working_and_the_sidebar_its_scope() {
+    let here = directory(&["nowhere", "here"]);
+    let alpha = here.join("alpha");
+    let mut application = connected_application(&here);
+    let (session_id, ..) = enter_active_session(&mut application, &here);
+    show_sidebar_scoped_to_current_workspace(
+        &mut application,
+        vec![working("Long-running work", session_id, &here)],
+    );
+    let scope = selector_label(&rendered_application_rows_at(
+        &application,
+        SIDEBAR_WIDE,
+        HEIGHT,
+    ));
+    let (_, listing_id, _) = browse_by_chord(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha"]);
+    key(&mut application, KeyCode::Down);
+
+    let choice = key(&mut application, KeyCode::Enter);
+    expect_choice(&choice);
+    resolve(
+        &mut application,
+        &choice,
+        Ok(ResolvedWorkspace::directory(alpha)),
+    );
+
+    let rows = rendered_application_rows_at(&application, SIDEBAR_WIDE, HEIGHT);
+    let frame = rows.join("\n");
+    assert!(
+        frame.contains("Type a prompt"),
+        "the Landing stands where the Session was: {frame}"
+    );
+    assert!(
+        drawn_in_sidebar(&rows, "Long-running work"),
+        "the Session left is still listed: {frame}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| sidebar_column(row).contains("Working")),
+        "and still working: {frame}"
+    );
+    assert_eq!(
+        selector_label(&rows),
+        scope,
+        "the Sidebar answers for the scope it did: {frame}"
+    );
+}
+
 /// A Landing in `workspace` whose Execution Directory is `subdirectory`, a
 /// directory beneath it, as the Server resolves the launch to.
 fn landing_in_subdirectory(workspace: &Path, subdirectory: &Path) -> Application {
@@ -568,6 +888,193 @@ fn landing_in_subdirectory(workspace: &Path, subdirectory: &Path) -> Application
         })
         .expect("resolve the Landing into a subdirectory of its Workspace");
     application
+}
+
+/// The Spinner's first frame, which is what a reading on its way shows.
+const SPINNER: char = '⠋';
+
+/// The Workspace resolution choosing asked for: the Outlook asked, the
+/// surface its answer is taken by, and the request.
+fn expect_choice(
+    transition: &ApplicationTransition,
+) -> (Outlook, WorkspaceResolutionSurface, ResolveWorkspaceRequest) {
+    let ApplicationTransition::DetachSessionAndResolveWorkspace { .. } = transition else {
+        panic!(
+            "choosing opens the Landing, letting go of whatever the client was on, and asks \
+             the Server to resolve the directory chosen, not {transition:?}"
+        );
+    };
+    let (outlook, surface, _, request) =
+        workspace_resolution(transition).expect("choosing asks for a Workspace resolution");
+    (outlook, surface, request)
+}
+
+/// The Server's answer to the resolution `choice` asked for.
+fn resolve(
+    application: &mut Application,
+    choice: &ApplicationTransition,
+    result: Result<ResolvedWorkspace, String>,
+) -> ApplicationTransition {
+    let (outlook, surface, request_id, _) =
+        workspace_resolution(choice).expect("choosing asks for a Workspace resolution");
+    application
+        .handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface,
+            request_id,
+            result,
+        })
+        .expect("deliver the Server's Workspace resolution")
+}
+
+/// Where a Prompt sent from the Landing begins its Session.
+fn next_session_directory(application: &mut Application) -> PathBuf {
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Begin here".to_owned(),
+        )))
+        .expect("write a Prompt");
+    let transition = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("send the Prompt");
+    let ApplicationTransition::CreateSession(request) = transition else {
+        panic!("a Prompt sent from the Landing begins a Session, not {transition:?}");
+    };
+    request.execution_directory.path
+}
+
+/// The line beneath the Landing's composer, which names the Workspace the
+/// Landing stands in and where in it the next Session works.
+fn landing_location(application: &Application) -> String {
+    let screen = rendered_application_rows_at(application, WIDTH, HEIGHT);
+    let composer_bottom = screen
+        .iter()
+        .position(|row| row.contains('└'))
+        .unwrap_or_else(|| panic!("the Landing draws its composer: {screen:#?}"));
+    screen[composer_bottom + 1].trim().to_owned()
+}
+
+/// What the Server resolves `directory` to, standing inside the linked
+/// Worktree at `linked` of the Repository whose main Worktree is at `main`:
+/// that Repository's Workspace, on the linked Worktree's branch.
+fn inside_linked_worktree(main: &Path, linked: &Path, directory: &Path) -> ResolvedWorkspace {
+    let metadata = main.join(".git");
+    let id = RepositoryId::from_metadata("git", &metadata);
+    let repository = Repository {
+        id: id.clone(),
+        system: "git".to_owned(),
+        metadata_directory: metadata,
+        location: RepositoryLocation::Main {
+            root: main.to_owned(),
+        },
+        availability: SourceControlAvailability::Available,
+        capabilities: SourceControlCapabilities::discovery_only(),
+    };
+    let checkouts = [
+        (main, CheckoutKind::Main, "main"),
+        (linked, CheckoutKind::Linked, "feature/browse"),
+    ]
+    .into_iter()
+    .map(|(root, kind, branch)| CheckoutSummary {
+        association: CheckoutAssociation {
+            recovery_revision: None,
+            reclaim: None,
+            id: CheckoutId::from_root(&id, root),
+            repository: id.clone(),
+            root: root.to_owned(),
+            kind,
+        },
+        revision: Some(CheckoutRevision::Branch {
+            name: branch.to_owned(),
+            commit: Some("1234567890abcdef".to_owned()),
+        }),
+        availability: SourceControlAvailability::Available,
+    })
+    .collect::<Vec<_>>();
+    ResolvedWorkspace {
+        execution_status: ExecutionDirectoryStatus::Available,
+        workspace: Workspace {
+            id: id.workspace_id(),
+            path: main.to_owned(),
+            repository: Some(Box::new(repository)),
+            source_control: SourceControlAvailability::Available,
+            icon: None,
+            description: None,
+        },
+        execution_directory: Some(ExecutionDirectory {
+            path: directory.to_owned(),
+        }),
+        checkout: Some(checkouts[1].association.clone()),
+        checkouts,
+    }
+}
+
+/// What the Server resolves a bare Repository's root to: its Workspace, with
+/// no working copy yet for a Session to work in.
+fn bare_repository(root: &Path) -> ResolvedWorkspace {
+    let repository = Repository {
+        id: RepositoryId::from_metadata("git", root),
+        system: "git".to_owned(),
+        metadata_directory: root.to_owned(),
+        location: RepositoryLocation::Bare {
+            root: root.to_owned(),
+        },
+        availability: SourceControlAvailability::Available,
+        capabilities: SourceControlCapabilities::discovery_only(),
+    };
+    ResolvedWorkspace {
+        execution_status: ExecutionDirectoryStatus::RequiresWorkingCopy,
+        workspace: Workspace {
+            id: repository.id.workspace_id(),
+            path: root.to_owned(),
+            repository: Some(Box::new(repository)),
+            source_control: SourceControlAvailability::Available,
+            icon: None,
+            description: None,
+        },
+        execution_directory: None,
+        checkout: None,
+        checkouts: Vec::new(),
+    }
+}
+
+/// The Sidebar on screen, scoped to the current Workspace and answered with
+/// `sessions`.
+fn show_sidebar_scoped_to_current_workspace(
+    application: &mut Application,
+    sessions: Vec<SessionListItem>,
+) {
+    let transition = deliver_settings(
+        application,
+        EffectiveSettings {
+            sidebar: SidebarSettings {
+                initial_visibility: SidebarVisibility::Shown,
+                initial_scope: SidebarScope::CurrentWorkspace,
+                ..SidebarSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+    );
+    let ApplicationTransition::ListSessions(request) = transition else {
+        panic!("a Sidebar coming into view asks for its Sessions, not {transition:?}");
+    };
+    application
+        .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+        .expect("hydrate the Sidebar");
+}
+
+/// A listed Session mid-Turn, its times read off the clock because a Sidebar
+/// shelves a Session by how long ago it last moved.
+fn working(title: &str, session_id: SessionId, workspace: &Path) -> SessionListItem {
+    let now = SessionTimestamp::now();
+    let SessionListItem::Readable(mut summary) =
+        listed_session(session_id, title, workspace, now.0, now.0)
+    else {
+        unreachable!("the fixture builds a readable Session");
+    };
+    summary.session.status = SessionStatus::Active;
+    summary.session.working_since = Some(SessionTimestamp(now.0.saturating_sub(90 * 1_000)));
+    SessionListItem::Readable(summary)
 }
 
 /// A directory rooted per platform, which no Client running these tests holds

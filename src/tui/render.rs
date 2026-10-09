@@ -1990,10 +1990,14 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
         // The footer holds the box's last line however much of the tree is
         // open, so opening and closing rows never moves it.
         lines.resize(content_height.saturating_sub(1), Line::default());
-        let footer = if content_width < usize::from(NARROW_TERMINAL_WIDTH) {
-            "↑↓ · Space · → · ← · Esc"
+        // Where the keys cannot each be told with what they do, they are
+        // named bare rather than some of them cut away.
+        const FOOTER: &str =
+            "↑↓ move · Space open/close · → open · ← close · Enter choose · Esc close";
+        let footer = if FOOTER.width() <= content_width {
+            FOOTER
         } else {
-            "↑↓ move · Space open/close · → open · ← close · Esc close"
+            "↑↓ · Space · → · ← · Enter · Esc"
         };
         lines.push(Line::styled(
             truncate_to_width(footer, content_width),

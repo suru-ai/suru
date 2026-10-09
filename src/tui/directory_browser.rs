@@ -7,7 +7,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::protocol::{ChildDirectory, DirectoryListing, ListDirectoryRequest};
+use crate::protocol::{
+    ChildDirectory, DirectoryListing, ListDirectoryRequest, ResolveWorkspaceRequest,
+};
 
 use super::list_window::{ListWindow, WindowEntry};
 
@@ -210,6 +212,25 @@ impl DirectoryBrowser {
     pub(super) fn close_focused(&mut self) {
         if !self.focused.is_root() {
             self.opened.remove(&self.focused);
+        }
+    }
+
+    /// Chooses the focused row, closing the browser since a choice is done
+    /// with it, and answers the Workspace resolution that lands the reader in
+    /// the row's directory: named by the Server's own path and read from the
+    /// Landing's Execution Directory, with no Workspace or remembered
+    /// directory beside it, because the directory chosen is itself where the
+    /// next Session works.
+    pub(super) fn choose_focused(&mut self) -> ResolveWorkspaceRequest {
+        let path = self.focused.directory().to_owned();
+        let base = self.base.clone();
+        self.close();
+        ResolveWorkspaceRequest {
+            checkout_id: None,
+            remembered_execution_directory: None,
+            workspace_id: None,
+            base: Some(base),
+            path,
         }
     }
 

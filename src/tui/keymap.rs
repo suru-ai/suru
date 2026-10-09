@@ -560,9 +560,10 @@ pub(super) fn command_for_workspace_picker_event(event: InputEvent) -> Option<Co
 
 /// The Directory Browser walks its tree with the keys every picker walks its
 /// rows with — the arrows, and Ctrl+P and Ctrl+N — while Space opens or
-/// closes the focused row, Right opens it, Left closes it, and Esc closes the
-/// browser. The pointer is not one of its ways in yet: a press inside it moves
-/// nothing, and one outside it is already an Escape by the time it gets here.
+/// closes the focused row, Right opens it, Left closes it, Enter chooses it,
+/// and Esc closes the browser. The pointer is not one of its ways in yet: a
+/// press inside it moves nothing, and one outside it is already an Escape by
+/// the time it gets here.
 pub(super) fn command_for_directory_browser_event(event: InputEvent) -> Option<CommandId> {
     let InputEvent::Key(key) = event else {
         return None;
@@ -580,6 +581,7 @@ pub(super) fn command_for_directory_browser_event(event: InputEvent) -> Option<C
         (KeyCode::Char(' '), KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserRowToggle,
         (KeyCode::Right, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserRowOpen,
         (KeyCode::Left, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserRowClose,
+        (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserChoose,
         (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserClose,
         _ => return None,
     };

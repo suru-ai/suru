@@ -253,6 +253,9 @@ pub enum SemanticCommandId {
     DirectoryBrowserRowToggle,
     DirectoryBrowserRowOpen,
     DirectoryBrowserRowClose,
+    /// Chooses the Directory Browser's focused row as where the next Session
+    /// works, as choosing a Workspace in the Workspace Picker does.
+    DirectoryBrowserChoose,
     DirectoryBrowserClose,
     WorktreeRemove,
     WorktreeForceRemove,
@@ -651,6 +654,7 @@ impl SemanticCommandId {
             Self::DirectoryBrowserRowToggle => "directory-browser.row.toggle",
             Self::DirectoryBrowserRowOpen => "directory-browser.row.open",
             Self::DirectoryBrowserRowClose => "directory-browser.row.close",
+            Self::DirectoryBrowserChoose => "directory-browser.choose",
             Self::DirectoryBrowserClose => "directory-browser.close",
             Self::WorktreeRemove => "worktree.remove",
             Self::WorktreeForceRemove => "worktree.force_remove",
@@ -1286,6 +1290,18 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Close Directory",
         reach: SemanticReach::Client,
         description: "Fold the Directory Browser's focused directory back to its row",
+        slash: None,
+        keybinding: None,
+    },
+    // Choosing asks the Server to resolve the directory, but it is the
+    // Workspace Picker's choice made from a tree, and like that choice it is
+    // never refused up front: whatever the Server answers, a refusal
+    // included, is said on the Landing the choice opens.
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::DirectoryBrowserChoose,
+        title: "Choose Directory",
+        reach: SemanticReach::Client,
+        description: "Open the Landing in the Directory Browser's focused directory",
         slash: None,
         keybinding: None,
     },

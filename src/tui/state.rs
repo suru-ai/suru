@@ -322,8 +322,9 @@ pub enum WorkspaceResolutionSurface {
     WorktreeList,
     WorktreeSelection,
     Outlook,
-    /// A Workspace chosen in the Workspace Picker, whose Landing the reader
-    /// already stands on while its Server answers.
+    /// A Workspace chosen in the Workspace Picker, or a directory chosen in
+    /// the Directory Browser, whose Landing the reader already stands on
+    /// while its Server answers.
     WorkspacePicker,
     /// `/sidekick`, which opens the Landing in the Sidekick Workspace once
     /// the Outlook's Server has answered with it.
@@ -538,8 +539,9 @@ pub struct TuiState {
     initial_context_resolved: bool,
     workspace_resolution_sequence: u64,
     pending_workspace_resolutions: HashMap<WorkspaceResolutionSurface, u64>,
-    /// The Workspace last chosen in the Workspace Picker, with the
-    /// resolution it was chosen as; see [`Self::resolving_workspace`].
+    /// The Workspace last chosen in the Workspace Picker, or the directory
+    /// last chosen in the Directory Browser, with the resolution it was
+    /// chosen as; see [`Self::resolving_workspace`].
     chosen_workspace: Option<(u64, Workspace)>,
     pub(super) identity: Option<ServerIdentity>,
     /// What each Origin's connection is presently recovering from, keyed by
@@ -1423,8 +1425,9 @@ impl TuiState {
     }
 
     /// The Workspace the Landing stands in before its Server has answered for
-    /// it: the one the reader chose in the Workspace Picker, for as long as
-    /// that choice is the one still awaited.
+    /// it: the one the reader chose in the Workspace Picker, or the directory
+    /// they chose in the Directory Browser, for as long as that choice is the
+    /// one still awaited.
     ///
     /// Only the Landing's naming of the Workspace moves at once, because its
     /// name is all the client knows of it. Everything else that reads where
@@ -7691,9 +7694,6 @@ impl Application {
             CommandId::SelectWorkspace => {
                 if let Some(workspace) = self.state.workspace_picker.offer_selected() {
                     self.state.workspace_picker.close();
-                    let ApplicationTransition::DetachSession = self.open_landing() else {
-                        unreachable!("opening the Landing lets go of the Session being left");
-                    };
                     let request = ResolveWorkspaceRequest {
                         checkout_id: None,
                         remembered_execution_directory: self
@@ -7706,20 +7706,37 @@ impl Application {
                         base: None,
                         path: workspace.path.clone(),
                     };
-                    let request_id = self
-                        .state
-                        .begin_workspace_resolution(WorkspaceResolutionSurface::WorkspacePicker);
-                    self.state.chosen_workspace = Some((request_id, workspace));
-                    return ApplicationTransition::DetachSessionAndResolveWorkspace {
-                        outlook: self.state.outlook.clone(),
-                        request_id,
-                        request,
-                    };
+                    return self.land_in_chosen_workspace(workspace, request);
                 }
             }
             _ => {}
         }
         ApplicationTransition::Continue
+    }
+
+    /// Opens the Landing in `workspace` at once, letting go of whatever the
+    /// client was on, and asks the Outlook's Server to resolve `request` for
+    /// it. The Workspace Picker and the Directory Browser both choose this
+    /// way, so the answer is taken as the Workspace Picker's: it fills in the
+    /// Landing beneath whatever the reader has begun writing, a refusal is
+    /// said there, and a newer route lets go of it.
+    fn land_in_chosen_workspace(
+        &mut self,
+        workspace: Workspace,
+        request: ResolveWorkspaceRequest,
+    ) -> ApplicationTransition {
+        let ApplicationTransition::DetachSession = self.open_landing() else {
+            unreachable!("opening the Landing lets go of the Session being left");
+        };
+        let request_id = self
+            .state
+            .begin_workspace_resolution(WorkspaceResolutionSurface::WorkspacePicker);
+        self.state.chosen_workspace = Some((request_id, workspace));
+        ApplicationTransition::DetachSessionAndResolveWorkspace {
+            outlook: self.state.outlook.clone(),
+            request_id,
+            request,
+        }
     }
 
     /// Handles the Directory Browser's commands while it is open; any other
@@ -7746,6 +7763,14 @@ impl Application {
             SemanticCommandId::DirectoryBrowserRowClose => {
                 browser.close_focused();
                 None
+            }
+            // Until the Server answers, all the client knows of where the
+            // reader chose is the directory itself, so that is what the
+            // Landing names while it waits.
+            SemanticCommandId::DirectoryBrowserChoose => {
+                let request = browser.choose_focused();
+                let directory = Workspace::directory(request.path.clone());
+                return self.land_in_chosen_workspace(directory, request);
             }
             SemanticCommandId::DirectoryBrowserClose => {
                 // A browser opened standalone has nowhere to go back to, so
@@ -10231,6 +10256,7 @@ impl Application {
             | SemanticCommandId::DirectoryBrowserRowToggle
             | SemanticCommandId::DirectoryBrowserRowOpen
             | SemanticCommandId::DirectoryBrowserRowClose
+            | SemanticCommandId::DirectoryBrowserChoose
             | SemanticCommandId::DirectoryBrowserClose) => {
                 Ok(self.handle_directory_browser_command(command))
             }
