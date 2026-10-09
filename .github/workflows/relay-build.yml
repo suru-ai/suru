@@ -8,6 +8,10 @@ name: Relay build
 # Relay tag. Otherwise — a PR touching the Relay, or a plain manual run — it keeps the archives as short-lived
 # workflow artifacts and builds the image from source without pushing it. Formatting, lints and tests run for the
 # whole workspace, the Relay included, in build.yml.
+#
+# A release attests the build provenance of each archive, the binary inside it, and the image, so
+# `gh attestation verify` traces any of them to the run and commit that built it; the image's attestation is pushed
+# to the registry beside it.
 
 on:
   pull_request:
@@ -49,6 +53,12 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+      # For attesting a release's archives: a Sigstore certificate from the run's OIDC token, and the attestation
+      # stored against the repository.
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -173,6 +183,16 @@ jobs:
             tar -czf "$FILE" "$STEM"
           fi
 
+      # Before attaching, so no archive is released unattested.
+      - name: Attest the build provenance
+        if: env.RELEASE_TAG != '' && steps.package.outcome == 'success'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          # The binary as well as its archive, so an installed binary can be verified without its archive.
+          subject-path: |
+            dist/${{ steps.archive.outputs.file }}
+            dist/${{ steps.archive.outputs.stem }}/suru-relay${{ matrix.exe }}
+
       - name: Attach to the release
         if: env.RELEASE_TAG != '' && steps.package.outcome == 'success'
         env:
@@ -200,6 +220,11 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # For attesting the image: a Sigstore certificate from the run's OIDC token, the attestation stored against the
+      # repository, and the record of where the image is stored.
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -217,11 +242,22 @@ jobs:
         id: existing
         run: |
           set -euo pipefail
-          image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/suru-relay:${RELEASE_TAG#suru-relay-v}
+          name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/suru-relay
+          version=${RELEASE_TAG#suru-relay-v}
+          image=$name:$version
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          if docker buildx imagetools inspect "$image" > /dev/null 2>&1; then
+          if digest=$(docker buildx imagetools inspect "$image" --format '{{json .Manifest}}' 2> /dev/null | jq -er .digest); then
             echo "::notice::$image exists already; not pushing it again."
             echo "skip=true" >> "$GITHUB_OUTPUT"
+            # An attempt that pushed the image may have failed to attest it; this one finishes the job.
+            if gh api "repos/$GH_REPO/attestations/$digest" --silent 2> /dev/null; then
+              echo "attested=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::notice::$image has no attestation yet; attesting it."
+              echo "digest=$digest" >> "$GITHUB_OUTPUT"
+            fi
             exit 0
           fi
           draft=$(gh api "repos/$GH_REPO/releases?per_page=100" --paginate \
@@ -245,24 +281,39 @@ jobs:
           done
 
       - name: Build and push the image
+        id: push
         if: steps.existing.outputs.skip != 'true'
+        env:
+          IMAGE: ${{ steps.existing.outputs.name }}
+          VERSION: ${{ steps.existing.outputs.version }}
         run: |
           set -euo pipefail
-          version=${RELEASE_TAG#suru-relay-v}
-          image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/suru-relay
           docker buildx create --use --name relay
           docker buildx build . \
+            --metadata-file "$RUNNER_TEMP/image-metadata.json" \
             --file crates/suru-relay/Dockerfile \
             --platform linux/amd64,linux/arm64 \
             --build-arg BINARY=release \
             --build-context binaries=dist/image \
             --label "org.opencontainers.image.title=Suru Relay" \
             --label "org.opencontainers.image.source=$SOURCE" \
-            --label "org.opencontainers.image.version=$version" \
+            --label "org.opencontainers.image.version=$VERSION" \
             --label "org.opencontainers.image.licenses=MIT" \
-            --tag "$image:$version" \
+            --tag "$IMAGE:$VERSION" \
             --push
-          docker run --rm "$image:$version" --version
+          docker run --rm "$IMAGE:$VERSION" --version
+          digest=$(jq -er '."containerimage.digest"' "$RUNNER_TEMP/image-metadata.json")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      # The multi-platform index is the subject, as the version's tag names it.
+      - name: Attest the image's build provenance
+        if: steps.existing.outputs.attested != 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.existing.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest || steps.existing.outputs.digest }}
+          subject-version: ${{ steps.existing.outputs.version }}
+          push-to-registry: true
 
   # Anything else builds the image from source, as an operator building it themselves does, and runs it.
   image:

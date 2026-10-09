@@ -25,6 +25,9 @@ Windows:
 irm https://raw.githubusercontent.com/suru-ai/suru/main/scripts/install.ps1 | iex
 ```
 
+Each release attests its archives' build provenance, and the binary's inside them, so you can check an installed
+binary was built by this repository's release workflow with `gh attestation verify ~/.local/bin/suru --repo suru-ai/suru`.
+
 To uninstall, delete the binary: `~/.local/bin/suru`, or `%LOCALAPPDATA%\Programs\suru\suru.exe` on Windows.
 
 ## Features

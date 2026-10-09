@@ -169,6 +169,11 @@ jobs:
     uses: ./.github/workflows/relay-build.yml
     with:
       tag: ${{ needs.prepare.outputs.tag }}
+    # Attesting the archives' and image's build provenance needs the run's OIDC token, leave to store attestations,
+    # and leave to record where the image is stored.
     permissions:
       contents: write
       packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write

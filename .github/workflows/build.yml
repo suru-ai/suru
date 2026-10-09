@@ -5,6 +5,9 @@ name: Build
 # tag's draft release instead, one per target as each finishes; a target already attached is not rebuilt, so
 # re-running failed jobs (or dispatching again with the same tag) finishes a partial release.
 #
+# A release attests each archive's build provenance, and the binary's inside it, before attaching it, so
+# `gh attestation verify <file> --repo suru-ai/suru` traces either to the run and commit that built it.
+#
 # Only a release signs and notarizes its macOS binary, so only a release reads the Apple secrets below;
 # scripts/macos-signing-wizard.sh walks a maintainer through creating them.
 
@@ -88,6 +91,12 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+      # For attesting a release's archives: a Sigstore certificate from the run's OIDC token, and the attestation
+      # stored against the repository.
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -348,8 +357,17 @@ jobs:
             tar -czf "$FILE" "$STEM"
           fi
 
-      # Unlike packaging, attaching waits on every step above, so a macOS binary that failed its signing or
-      # notarization is never released.
+      # Unlike packaging, attesting and attaching wait on every step above, so a macOS binary that failed its
+      # signing or notarization is never released. Attesting comes first, so no archive is released unattested.
+      - name: Attest the build provenance
+        if: env.RELEASE_TAG != '' && steps.existing.outputs.skip != 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          # The binary as well as its archive, so an installed binary can be verified without its archive.
+          subject-path: |
+            dist/${{ steps.archive.outputs.file }}
+            dist/${{ steps.archive.outputs.stem }}/suru${{ matrix.exe }}
+
       - name: Attach to the release
         if: env.RELEASE_TAG != '' && steps.existing.outputs.skip != 'true'
         env:

@@ -2,7 +2,7 @@ name: Release
 
 # Cuts the next release from main: bumps the version in Cargo.toml, pushes a `chore(release): vX.Y.Z` commit with
 # its tag, opens a draft release noting the Conventional Commits since the previous one, and builds every target
-# into it. Publishing the draft is left to a person; once published, the release is immutable.
+# into it, each attested. Publishing the draft is left to a person; once published, the release is immutable.
 #
 # Re-running failed jobs is safe throughout: a re-run resumes the version its first attempt pushed rather than
 # cutting another, and the build only rebuilds targets the draft is still missing.
@@ -135,5 +135,8 @@ jobs:
       APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
       APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
       APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+    # Attesting the archives' build provenance needs the run's OIDC token and leave to store attestations.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
