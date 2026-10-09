@@ -2011,6 +2011,7 @@ fn tab_into_a_link_then_left_walks_up_from_where_the_link_leads() {
                 name: "inner".to_owned(),
                 path: project.join("inner"),
                 source_control: DirectorySourceControl::Plain,
+                hidden: false,
             }],
         },
     );
@@ -2123,6 +2124,7 @@ fn the_path_field_takes_the_separator_of_the_server_whatever_this_client_runs_on
                     name: "project".to_owned(),
                     path: project.clone(),
                     source_control: DirectorySourceControl::Plain,
+                    hidden: false,
                 }],
             },
         );
@@ -2509,6 +2511,7 @@ fn answer_with(
                     name: (*name).to_owned(),
                     path: root.join(name),
                     source_control: source_control.clone(),
+                    hidden: false,
                 })
                 .collect(),
         },

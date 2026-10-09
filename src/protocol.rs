@@ -654,6 +654,11 @@ pub struct ChildDirectory {
     /// may not share.
     pub path: PathBuf,
     pub source_control: DirectorySourceControl,
+    /// Whether the directory is one a file manager leaves out until asked:
+    /// dot-named, or on Windows carrying the platform's hidden attribute. It
+    /// is listed either way, so a Client shows or hides it without asking
+    /// again.
+    pub hidden: bool,
 }
 
 /// What a listed directory is to source control, read by its Server from

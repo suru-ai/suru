@@ -15,7 +15,8 @@ use crate::protocol::{ChildDirectory, DirectoryListing};
 ///
 /// Every path crosses the wire as Unicode text, so a directory whose name
 /// is not Unicode can be neither named to a Client nor chosen by one; like a
-/// file, it is left out of the children.
+/// file, it is left out of the children. A hidden directory is not: it is
+/// listed in its place, flagged hidden, for the Client to leave out.
 pub(crate) fn list_directory(
     path: &Path,
     base: &Path,
@@ -45,6 +46,7 @@ pub(crate) fn list_directory(
             let name = entry.file_name().into_string().ok()?;
             let path = entry.path();
             Some(ChildDirectory {
+                hidden: name.starts_with('.') || carries_hidden_attribute(&entry),
                 source_control: listed_source_control(&path),
                 path,
                 name,
@@ -71,6 +73,24 @@ fn is_directory(entry: &std::fs::DirEntry) -> bool {
             || (kind.is_symlink()
                 && std::fs::metadata(entry.path()).is_ok_and(|meta| meta.is_dir()))
     })
+}
+
+/// Whether `entry` carries Windows' hidden attribute, which the directory's
+/// own listing already read, so asking costs nothing more.
+#[cfg(windows)]
+fn carries_hidden_attribute(entry: &std::fs::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
+    entry
+        .metadata()
+        .is_ok_and(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+}
+
+/// Elsewhere a directory is hidden by its name alone.
+#[cfg(not(windows))]
+fn carries_hidden_attribute(_entry: &std::fs::DirEntry) -> bool {
+    false
 }
 
 /// Names as a file manager orders them: case set aside, and a run of digits

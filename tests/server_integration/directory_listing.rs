@@ -207,6 +207,83 @@ async fn a_missing_path_and_a_file_are_refused_with_a_reason() {
     pair.shutdown().await;
 }
 
+/// A hidden directory is still listed, in its place among the others, and
+/// flagged hidden so the Directory Browser can leave it out itself without
+/// asking again: on every platform a dot-named one is hidden, and a name
+/// merely holding a dot is not.
+#[tokio::test]
+async fn a_dot_named_directory_is_listed_and_flagged_hidden() {
+    let pair = paired_servers("directory-listing-hidden").await;
+    let fixture = tempfile::tempdir().expect("create the directory to list");
+    for name in [".config", "dotted.name", "plain"] {
+        std::fs::create_dir(fixture.path().join(name)).expect("create a child directory");
+    }
+
+    for (way, client) in both_ways(&pair) {
+        let listing = listed(&client, fixture.path(), None).await;
+        assert_eq!(
+            hidden(&listing),
+            [(".config", true), ("dotted.name", false), ("plain", false)],
+            "{way}"
+        );
+    }
+    pair.shutdown().await;
+}
+
+/// Windows marks a directory hidden with an attribute rather than a name, and
+/// a directory carrying it is flagged hidden as a dot-named one is.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_directory_carrying_the_windows_hidden_attribute_is_flagged_hidden() {
+    let pair = paired_servers("directory-listing-hidden-attribute").await;
+    let fixture = tempfile::tempdir().expect("create the directory to list");
+    for name in ["marked", "unmarked"] {
+        std::fs::create_dir(fixture.path().join(name)).expect("create a child directory");
+    }
+    mark_hidden(&fixture.path().join("marked"));
+
+    for (way, client) in both_ways(&pair) {
+        let listing = listed(&client, fixture.path(), None).await;
+        assert_eq!(
+            hidden(&listing),
+            [("marked", true), ("unmarked", false)],
+            "{way}"
+        );
+    }
+    pair.shutdown().await;
+}
+
+fn hidden(listing: &DirectoryListing) -> Vec<(&str, bool)> {
+    listing
+        .children
+        .iter()
+        .map(|child| (child.name.as_str(), child.hidden))
+        .collect()
+}
+
+/// Sets the platform's hidden attribute on `path`, as Explorer's Hidden box
+/// or `attrib +h` does.
+#[cfg(windows)]
+fn mark_hidden(path: &Path) {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    let marked = unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN) };
+    assert_ne!(
+        marked,
+        0,
+        "mark {} hidden: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
 /// A directory whose permissions deny reading its entries. Windows denies
 /// reading through an access control list rather than a mode, so this is
 /// pinned where a mode can say it.
