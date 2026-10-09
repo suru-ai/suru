@@ -45,19 +45,51 @@ pub(super) struct DirectoryBrowser {
     /// listing it asks for is read from.
     base: PathBuf,
     /// What the Server has said of each directory the reader has opened, by
-    /// the path its row stands for: its children, that it is still being
-    /// read, or why it cannot be.
+    /// the Server's own path for it, which every row standing for it shares:
+    /// its children, that it is still being read, or why it cannot be.
     tree: HashMap<PathBuf, DirectoryEntries>,
-    /// The directories whose children are drawn beneath their rows.
-    opened: HashSet<PathBuf>,
-    /// The directory row focus stands on, held by path rather than by row so
-    /// a listing landing above it leaves the reader where they were.
-    focused: PathBuf,
+    /// The rows whose children are drawn beneath them.
+    opened: HashSet<RowKey>,
+    /// The row focus stands on, held by where it stands rather than by row
+    /// number, so a listing landing above it leaves the reader where they
+    /// were.
+    focused: RowKey,
     /// The directory each listing still awaited was asked for, so an answer
     /// to anything else — an earlier opening's request — moves nothing.
     awaiting: HashMap<DirectoryListingId, PathBuf>,
     sequence: u64,
     window: ListWindow,
+}
+
+/// Where a row stands in the tree: the directories from the root down to it,
+/// each by the path the Server spelled it at. A directory's path alone does
+/// not tell rows apart, because the Server reads a link where it leads and
+/// spells what it lists beneath that, so two open branches linking to one
+/// directory list it at one path beneath each.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub(super) struct RowKey(Vec<PathBuf>);
+
+impl RowKey {
+    fn root(directory: PathBuf) -> Self {
+        Self(vec![directory])
+    }
+
+    /// The row the Server's `directory` makes beneath this one.
+    fn child(&self, directory: &Path) -> Self {
+        let mut chain = self.0.clone();
+        chain.push(directory.to_owned());
+        Self(chain)
+    }
+
+    /// The directory the row stands for, by the Server's own path, which is
+    /// what a listing of it asks for.
+    fn directory(&self) -> &Path {
+        self.0.last().map_or(Path::new(""), PathBuf::as_path)
+    }
+
+    fn is_root(&self) -> bool {
+        self.0.len() == 1
+    }
 }
 
 /// What the Server has said of one directory's children.
@@ -83,7 +115,7 @@ pub(super) enum DirectoryBrowserRowKind {
         /// `None` for the root, which the frame names in the Server's own
         /// path syntax; every other row goes by the name the Server listed.
         name: Option<String>,
-        path: PathBuf,
+        key: RowKey,
         opened: bool,
         focused: bool,
     },
@@ -114,9 +146,9 @@ impl DirectoryBrowser {
         self.field = execution_directory.to_string_lossy().into_owned();
         self.root.clone_from(&execution_directory);
         self.base.clone_from(&execution_directory);
-        self.focused.clone_from(&execution_directory);
+        self.focused = RowKey::root(execution_directory);
         self.window.open();
-        self.open_directory(execution_directory)
+        self.open_row(self.focused.clone())
             .expect("a fresh tree has listed nothing yet")
     }
 
@@ -162,22 +194,21 @@ impl DirectoryBrowser {
     /// Opens the focused row where it is closed and closes it where it is
     /// open, answering the listing opening it asks for.
     pub(super) fn toggle_focused(&mut self) -> Option<DirectoryListingAsk> {
-        if self.opened.contains(&self.focused) {
-            self.opened.remove(&self.focused);
+        if self.opened.remove(&self.focused) {
             return None;
         }
-        self.open_directory(self.focused.clone())
+        self.open_row(self.focused.clone())
     }
 
     /// Opens the focused row, answering the listing that asks for.
     pub(super) fn open_focused(&mut self) -> Option<DirectoryListingAsk> {
-        self.open_directory(self.focused.clone())
+        self.open_row(self.focused.clone())
     }
 
     /// Closes the focused row, unless it is the root: Left there is to stand
     /// the tree on the root's parent rather than to fold the tree away.
     pub(super) fn close_focused(&mut self) {
-        if self.focused != self.root {
+        if !self.focused.is_root() {
             self.opened.remove(&self.focused);
         }
     }
@@ -226,11 +257,13 @@ impl DirectoryBrowser {
             .collect()
     }
 
-    /// Marks `directory` open and asks for its children, unless the Server
-    /// has listed them already or is reading them still. A directory it
-    /// refused is asked for again, since opening it is asking again.
-    fn open_directory(&mut self, directory: PathBuf) -> Option<DirectoryListingAsk> {
-        self.opened.insert(directory.clone());
+    /// Marks `row` open and asks for its directory's children, unless the
+    /// Server has listed them already or is reading them still — for this
+    /// row or another standing for the same directory. A directory it refused
+    /// is asked for again, since opening it is asking again.
+    fn open_row(&mut self, row: RowKey) -> Option<DirectoryListingAsk> {
+        let directory = row.directory().to_owned();
+        self.opened.insert(row);
         if matches!(
             self.tree.get(&directory),
             Some(DirectoryEntries::Listed(_) | DirectoryEntries::Loading)
@@ -252,59 +285,51 @@ impl DirectoryBrowser {
     }
 
     /// The tree projected from what the Server has said: the root first, then
-    /// every open directory's children beneath it, depth first.
+    /// every open row's children beneath it, depth first.
+    ///
+    /// Only an open row is descended into, and every row beneath one is a row
+    /// of its own, so a link leading back up the tree is walked only as far as
+    /// the reader keeps opening it.
     fn rows(&self) -> Vec<DirectoryBrowserRow> {
-        let mut rows = vec![self.directory_row(0, None, &self.root)];
-        let mut ancestry = vec![self.root.as_path()];
-        self.push_children(&self.root, 1, &mut ancestry, &mut rows);
+        let root = RowKey::root(self.root.clone());
+        let mut rows = vec![self.directory_row(0, None, root.clone())];
+        self.push_children(&root, 1, &mut rows);
         rows
     }
 
-    fn push_children<'a>(
-        &'a self,
-        directory: &Path,
-        depth: usize,
-        ancestry: &mut Vec<&'a Path>,
-        rows: &mut Vec<DirectoryBrowserRow>,
-    ) {
-        if !self.opened.contains(directory) {
+    fn push_children(&self, row: &RowKey, depth: usize, rows: &mut Vec<DirectoryBrowserRow>) {
+        if !self.opened.contains(row) {
             return;
         }
-        match self.tree.get(directory) {
+        match self.tree.get(row.directory()) {
             None | Some(DirectoryEntries::Loading) => rows.push(DirectoryBrowserRow {
                 depth,
                 kind: DirectoryBrowserRowKind::Loading,
             }),
             // The root's refusal is said by the path field instead.
-            Some(DirectoryEntries::Refused(_)) if directory == self.root => {}
+            Some(DirectoryEntries::Refused(_)) if row.is_root() => {}
             Some(DirectoryEntries::Refused(reason)) => rows.push(DirectoryBrowserRow {
                 depth,
                 kind: DirectoryBrowserRowKind::Refused(reason.clone()),
             }),
             Some(DirectoryEntries::Listed(children)) => {
                 for child in children {
-                    rows.push(self.directory_row(depth, Some(&child.name), &child.path));
-                    // A Server naming a directory among its own ancestors
-                    // would otherwise draw it beneath itself without end.
-                    if ancestry.contains(&child.path.as_path()) {
-                        continue;
-                    }
-                    ancestry.push(&child.path);
-                    self.push_children(&child.path, depth + 1, ancestry, rows);
-                    ancestry.pop();
+                    let child_row = row.child(&child.path);
+                    rows.push(self.directory_row(depth, Some(&child.name), child_row.clone()));
+                    self.push_children(&child_row, depth + 1, rows);
                 }
             }
         }
     }
 
-    fn directory_row(&self, depth: usize, name: Option<&str>, path: &Path) -> DirectoryBrowserRow {
+    fn directory_row(&self, depth: usize, name: Option<&str>, key: RowKey) -> DirectoryBrowserRow {
         DirectoryBrowserRow {
             depth,
             kind: DirectoryBrowserRowKind::Directory {
                 name: name.map(str::to_owned),
-                path: path.to_owned(),
-                opened: self.opened.contains(path),
-                focused: self.focused == path,
+                opened: self.opened.contains(&key),
+                focused: self.focused == key,
+                key,
             },
         }
     }
@@ -313,21 +338,21 @@ impl DirectoryBrowser {
     /// past either end; the lines beneath a directory still being read or
     /// refused are not rows to stand on.
     fn move_focus(&mut self, distance: isize) {
-        let directories = self
+        let mut directories = self
             .rows()
             .into_iter()
             .filter_map(|row| match row.kind {
-                DirectoryBrowserRowKind::Directory { path, .. } => Some(path),
+                DirectoryBrowserRowKind::Directory { key, .. } => Some(key),
                 _ => None,
             })
             .collect::<Vec<_>>();
         let current = directories
             .iter()
-            .position(|path| *path == self.focused)
+            .position(|key| *key == self.focused)
             .unwrap_or(0);
         let length = directories.len() as isize;
         let next = (current as isize + distance).rem_euclid(length) as usize;
-        self.focused.clone_from(&directories[next]);
+        self.focused = directories.swap_remove(next);
         self.window.reveal();
     }
 }

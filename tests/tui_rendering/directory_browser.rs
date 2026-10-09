@@ -8,26 +8,35 @@
 use std::path::{Path, PathBuf};
 
 use crate::support::{
-    application_looking_at_studio, connected_application, key, rendered_application_rows_at,
-    rendered_row, studio_stops_answering, type_terminal_text,
+    application_looking_at_studio, connected_application, fixture_instance_id, key, ready_health,
+    rendered_application_rows_at, rendered_row, studio_stops_answering, type_terminal_text,
+    workspace_resolution,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use std::time::Duration;
 use suru::{
-    protocol::{ChildDirectory, DirectoryListing, ListDirectoryRequest, Outlook},
+    managed_client::ManagedEvent,
+    protocol::{
+        ChildDirectory, DirectoryListing, ExecutionDirectory, ListDirectoryRequest, Outlook,
+        ResolvedWorkspace,
+    },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, DirectoryListingId,
-        SemanticCommandId,
+        SemanticCommandId, TerminalFacts,
     },
 };
 
 const WIDTH: u16 = 100;
 const HEIGHT: u16 = 30;
 
+/// The Landing here works in a subdirectory of its Workspace, so a browser
+/// rooted at the Workspace's root rather than where the Landing works would
+/// be told apart.
 #[test]
 fn the_browse_command_opens_the_browser_rooted_at_the_execution_directory() {
-    let here = directory(&["nowhere", "here"]);
-    let mut application = connected_application(&here);
+    let workspace = directory(&["nowhere", "repo"]);
+    let here = workspace.join("here");
+    let mut application = landing_in_subdirectory(&workspace, &here);
     type_terminal_text(&mut application, "/browse");
 
     let (outlook, _, request) = expect_listing(key(&mut application, KeyCode::Enter));
@@ -249,6 +258,94 @@ fn up_and_down_walk_the_drawn_directories_and_wrap_past_the_ends() {
     );
 }
 
+/// Two directories linking to one elsewhere both list its children, which
+/// the Server spells beneath where the link leads, so two open branches draw
+/// rows at one path. Each is a row of its own: focus stands on one at a time
+/// and walks on past both, and opening one opens that one alone.
+#[test]
+fn a_directory_two_open_branches_both_list_is_a_row_beneath_each() {
+    let here = directory(&["nowhere", "here"]);
+    let shared = directory(&["nowhere", "shared"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(
+        &mut application,
+        listing_id,
+        &here,
+        &["alpha", "beta", "gamma"],
+    );
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Char(' ')));
+    answer(&mut application, listing_id, &shared, &["inner"]);
+    key(&mut application, KeyCode::Down);
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Char(' ')));
+    answer(&mut application, listing_id, &shared, &["inner"]);
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ here",
+            "    ▾ alpha",
+            "      ▸ inner",
+            "›   ▾ beta",
+            "      ▸ inner",
+            "    ▸ gamma"
+        ]
+    );
+
+    key(&mut application, KeyCode::Down);
+    let rows = tree(&application);
+    assert_eq!(
+        rows.iter().filter(|row| row.starts_with('›')).count(),
+        1,
+        "focus stands on one row however many share its path: {rows:?}"
+    );
+    assert_eq!(
+        rows,
+        [
+            "  ▾ here",
+            "    ▾ alpha",
+            "      ▸ inner",
+            "    ▾ beta",
+            "›     ▸ inner",
+            "    ▸ gamma"
+        ]
+    );
+    key(&mut application, KeyCode::Down);
+    assert_eq!(
+        focused(&application),
+        "gamma",
+        "Down walks on past the second row at that path"
+    );
+
+    key(&mut application, KeyCode::Up);
+    let (_, listing_id, request) = expect_listing(key(&mut application, KeyCode::Char(' ')));
+    assert_eq!(
+        request.path,
+        shared.join("inner"),
+        "the Server is asked for the directory by its own path"
+    );
+    answer(
+        &mut application,
+        listing_id,
+        &shared.join("inner"),
+        &["deep"],
+    );
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ here",
+            "    ▾ alpha",
+            "      ▸ inner",
+            "    ▾ beta",
+            "›     ▾ inner",
+            "        ▸ deep",
+            "    ▸ gamma"
+        ],
+        "only the row opened is open"
+    );
+}
+
 #[test]
 fn a_directory_the_server_refuses_keeps_its_row_and_says_why_beneath_it() {
     let here = directory(&["nowhere", "here"]);
@@ -444,6 +541,33 @@ fn every_opening_begins_afresh_at_the_root() {
         tree(&application),
         ["› ▾ here", "    ▸ alpha", "    ▸ beta"]
     );
+}
+
+/// A Landing in `workspace` whose Execution Directory is `subdirectory`, a
+/// directory beneath it, as the Server resolves the launch to.
+fn landing_in_subdirectory(workspace: &Path, subdirectory: &Path) -> Application {
+    let mut application = Application::new(workspace, TerminalFacts::default());
+    let launch = application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(fixture_instance_id(), 42_424),
+        )))
+        .expect("connect the application");
+    let (outlook, surface, request_id, _) =
+        workspace_resolution(&launch).expect("connecting resolves where the client launched");
+    application
+        .handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface,
+            request_id,
+            result: Ok(ResolvedWorkspace {
+                execution_directory: Some(ExecutionDirectory {
+                    path: subdirectory.to_owned(),
+                }),
+                ..ResolvedWorkspace::directory(workspace.to_owned())
+            }),
+        })
+        .expect("resolve the Landing into a subdirectory of its Workspace");
+    application
 }
 
 /// A directory rooted per platform, which no Client running these tests holds
