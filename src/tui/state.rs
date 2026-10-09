@@ -3214,9 +3214,18 @@ impl TuiState {
         ))
     }
 
-    /// Answers one step of the wheel where the pointer stood: the Sidebar
-    /// takes every step over its own column, and the Transcript every other.
+    /// Answers one step of the wheel where the pointer stood: the Directory
+    /// Browser takes every step over its box, the Aside and the Sidebar every
+    /// step over their own columns, and the Transcript every other.
     fn wheel_at(&mut self, position: Position, direction: ScrollDirection) {
+        // Over the Directory Browser the wheel moves its tree, and never
+        // what the browser stands over.
+        if self
+            .directory_browser
+            .wheel_at(position, direction, WHEEL_SCROLL_ROWS)
+        {
+            return;
+        }
         // Over the Aside the wheel moves its Sections, and never the
         // Transcript beside them.
         if self.aside_is_present()
@@ -7302,6 +7311,21 @@ impl Application {
                     ApplicationTransition::Continue
                 }
             });
+        }
+        // The Directory Browser stands over the Workspace Picker and the
+        // Landing while it is up. A press on one of its rows puts focus there
+        // and opens or closes the row through the command Space invokes, and
+        // a second press on that row within the double-press interval
+        // chooses it through the command Enter invokes, so the choice waits
+        // and is refused exactly as Enter's is. A press anywhere else inside
+        // its box moves nothing; one outside it never reaches here, since
+        // `PointerClick` already turned it into the Escape that closes it.
+        if self.state.directory_browser.is_open() {
+            let repeats = self.state.last_click.is_some_and(|click| click.count >= 2);
+            return match self.state.directory_browser.press_at(position, repeats) {
+                Some(command) => self.invoke_semantic(command),
+                None => Ok(ApplicationTransition::Continue),
+            };
         }
         // The Description editor stands over the Workspace Picker and its
         // menu while it is up, and a press inside its box moves nothing — one

@@ -177,6 +177,8 @@ pub(super) fn render_with_slots(
     // The Workspace Picker's own rows are pointable on the same terms, so its
     // record of where they were drawn starts over with the frame too.
     state.workspace_picker.forget_frame();
+    // So are the Directory Browser's rows, and its box the wheel answers over.
+    state.directory_browser.forget_frame();
     *state.header_icon_area.borrow_mut() = None;
     // The Unreachable banner's "Try again" is pointable on the same terms, and
     // is only there on a frame that drew it.
@@ -2019,12 +2021,26 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
         current: &state.workspace.id,
         show_icons: state.settings().appearance.show_icons,
     };
-    lines.extend(
-        browser
-            .visible_rows(capacity)
-            .iter()
-            .map(|row| directory_browser_line(row, &root_name, &known, content_width, theme)),
-    );
+    // Each directory's row is recorded where it is drawn, so a press lands on
+    // the row under it however the window has been scrolled.
+    browser.record_area(area);
+    let content_x = area.x.saturating_add(1);
+    let row_columns =
+        content_x..content_x.saturating_add(u16::try_from(content_width).unwrap_or(u16::MAX));
+    let content_y = area.y.saturating_add(1);
+    for row in browser.visible_rows(capacity) {
+        if let DirectoryBrowserRowKind::Directory { key, .. } = &row.kind {
+            let line = content_y.saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+            browser.record_row(line, row_columns.clone(), key.clone());
+        }
+        lines.push(directory_browser_line(
+            &row,
+            &root_name,
+            &known,
+            content_width,
+            theme,
+        ));
+    }
     if shows_footer && lines.len() + footer_rows <= content_height {
         // The footer holds the box's last lines however much of the tree is
         // open, so opening and closing rows never moves it.

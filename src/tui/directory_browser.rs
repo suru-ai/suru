@@ -3,16 +3,24 @@
 //! the reader opens it, and never from the Client's own disk.
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
+    ops::Range,
     path::{Path, PathBuf},
 };
+
+use ratatui::layout::{Position, Rect};
 
 use crate::protocol::{
     DirectoryListing, DirectorySourceControl, ListDirectoryRequest, PathStyle,
     ResolveWorkspaceRequest,
 };
 
-use super::list_window::{ListWindow, WindowEntry};
+use super::{
+    commands::SemanticCommandId,
+    list_window::{ListWindow, WindowEntry, furthest_opening},
+    state::ScrollDirection,
+};
 
 /// One listing request the Directory Browser sent the Outlook's Server, told
 /// apart from every other so its answer reaches only the opening that asked
@@ -93,8 +101,32 @@ pub(super) struct DirectoryBrowser {
     /// reader's choice holds for the rest of the client run; it is no
     /// Setting.
     shows_hidden: bool,
+    /// The row the last press landed on, which a second press within the
+    /// double-press interval must land on too to choose it.
+    pressed: Option<RowKey>,
+    /// Where the last frame drew the browser, which the pointer resolves
+    /// against.
+    drawn: RefCell<DrawnBrowser>,
     sequence: u64,
     window: ListWindow,
+}
+
+/// Where a frame drew the browser: its box, which the wheel answers over,
+/// and the line each directory's row stands on, which a press answers on.
+/// Rows are projected afresh every frame, so each goes by where it stands in
+/// the tree rather than by its place among them.
+#[derive(Clone, Debug, Default)]
+struct DrawnBrowser {
+    area: Option<Rect>,
+    rows: Vec<DrawnRow>,
+}
+
+/// The line one directory's row was drawn on, across the box's content.
+#[derive(Clone, Debug)]
+struct DrawnRow {
+    line: u16,
+    columns: Range<u16>,
+    key: RowKey,
 }
 
 /// Where a row stands in the tree: the directories from the root down to it,
@@ -223,6 +255,7 @@ impl DirectoryBrowser {
         self.opened.clear();
         self.awaiting.clear();
         self.refusal = None;
+        self.pressed = None;
         std::mem::take(&mut self.provenance)
     }
 
@@ -423,6 +456,93 @@ impl DirectoryBrowser {
         self.window.reveal();
     }
 
+    /// Gives up the last frame's geometry, called as every frame begins, so
+    /// the pointer resolves only against what is on screen.
+    pub(super) fn forget_frame(&self) {
+        self.drawn.take();
+    }
+
+    /// Records the box the frame in force drew the browser in.
+    pub(super) fn record_area(&self, area: Rect) {
+        self.drawn.borrow_mut().area = Some(area);
+    }
+
+    /// Records the screen line the frame in force drew the directory row
+    /// `key` on, across `columns`.
+    pub(super) fn record_row(&self, line: u16, columns: Range<u16>, key: RowKey) {
+        self.drawn
+            .borrow_mut()
+            .rows
+            .push(DrawnRow { line, columns, key });
+    }
+
+    /// Answers a press at `position` with the command it asks for. A press
+    /// on a directory's row puts focus there and asks for the row to be
+    /// opened or closed, as Space does — or, where it `repeats` a press that
+    /// landed on that same row, to be chosen, as Enter does. A press
+    /// anywhere else asks for nothing: the path field has no cursor to place,
+    /// and the lines beneath a directory still being read or refused, like
+    /// the footer, are no rows to stand on.
+    ///
+    /// What was pressed was in view already, so the window holds.
+    pub(super) fn press_at(
+        &mut self,
+        position: Position,
+        repeats: bool,
+    ) -> Option<SemanticCommandId> {
+        if !self.open {
+            return None;
+        }
+        let pressed = self
+            .drawn
+            .borrow()
+            .rows
+            .iter()
+            .find(|row| row.line == position.y && row.columns.contains(&position.x))
+            .map(|row| row.key.clone());
+        let last = std::mem::replace(&mut self.pressed, pressed.clone());
+        let row = pressed?;
+        let command = if repeats && last.as_ref() == Some(&row) {
+            SemanticCommandId::DirectoryBrowserChoose
+        } else {
+            SemanticCommandId::DirectoryBrowserRowToggle
+        };
+        self.focused = row;
+        self.window.hold();
+        Some(command)
+    }
+
+    /// Moves the tree `lines` rows in `direction` where `position` is over
+    /// the box the last frame drew, answering whether it was. It stops at the
+    /// root and where the last row is drawn whole, and focus stays where it
+    /// stands, in view or not, because the wheel looks rather than chooses.
+    pub(super) fn wheel_at(
+        &mut self,
+        position: Position,
+        direction: ScrollDirection,
+        lines: usize,
+    ) -> bool {
+        if !self.open
+            || !self
+                .drawn
+                .borrow()
+                .area
+                .is_some_and(|area| area.contains(position))
+        {
+            return false;
+        }
+        let furthest = furthest_opening(&window_entries(&self.rows()), self.window.capacity());
+        let first = self.window.first();
+        let moved = match direction {
+            ScrollDirection::Up => first.saturating_sub(lines),
+            ScrollDirection::Down => first.saturating_add(lines).min(furthest),
+        };
+        if moved != first {
+            self.window.scroll_to(moved);
+        }
+        true
+    }
+
     /// Takes the Server's answer to `listing_id`, where it is one this
     /// opening still awaits, answering the listing it leads to asking for.
     /// The tree goes by the root the Server resolved its directory to, which
@@ -469,16 +589,7 @@ impl DirectoryBrowser {
     /// keep the focused row in view.
     pub(super) fn visible_rows(&self, capacity: usize) -> Vec<DirectoryBrowserRow> {
         let rows = self.rows();
-        let entries = rows
-            .iter()
-            .map(|row| {
-                if row.kind.is_directory() {
-                    WindowEntry::ROW
-                } else {
-                    WindowEntry::passive(1)
-                }
-            })
-            .collect::<Vec<_>>();
+        let entries = window_entries(&rows);
         let focus = rows.iter().position(|row| {
             matches!(
                 &row.kind,
@@ -885,6 +996,20 @@ impl DirectoryBrowser {
         self.focused = directories.swap_remove(next);
         self.window.reveal();
     }
+}
+
+/// The tree's rows as its window measures them: one line each, and only a
+/// directory's for focus to stand on.
+fn window_entries(rows: &[DirectoryBrowserRow]) -> Vec<WindowEntry> {
+    rows.iter()
+        .map(|row| {
+            if row.kind.is_directory() {
+                WindowEntry::ROW
+            } else {
+                WindowEntry::passive(1)
+            }
+        })
+        .collect()
 }
 
 /// Whether `name` names a directory by where it stands rather than by a name

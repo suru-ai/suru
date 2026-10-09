@@ -54,8 +54,8 @@ pub fn command_for_terminal_event(event: InputEvent) -> Option<CommandId> {
 /// The pointer, carried with the cell it stood on, because every gesture it
 /// makes is resolved against the frame's geometry rather than against whoever
 /// has the keys: a press lands on what is drawn under it, and the wheel moves
-/// whichever list it is over — the Sidebar's over the Sidebar, the Transcript
-/// anywhere else.
+/// whichever list it is over — the Directory Browser's tree over the browser,
+/// the Sidebar's over the Sidebar, the Transcript anywhere else.
 fn command_for_pointer(mouse: MouseEvent) -> Option<CommandId> {
     let position = Position::new(mouse.column, mouse.row);
     match mouse.kind {
@@ -573,9 +573,12 @@ pub(super) fn command_for_workspace_picker_event(event: InputEvent) -> Option<Co
 /// Escape before the letter is read as Alt all the same. Everything else the
 /// reader types or pastes goes to the end of the path field, which has no
 /// cursor for Left and Right to move: Backspace takes a character back, and
-/// Tab completes the field to the focused row. The pointer is not one of its
-/// ways in yet: a press inside it moves nothing, and one outside it is
-/// already an Escape by the time it gets here.
+/// Tab completes the field to the focused row. The pointer answers as it does
+/// everywhere else, resolved against where the frame drew the tree: a press
+/// on a row is a Space on it and a second one there an Enter, the wheel over
+/// the box moves the tree, and a press outside the box is already an Escape
+/// by the time it gets here. The browser offers no menu, so a right press
+/// reaches nothing, beneath it or otherwise.
 pub(super) fn command_for_directory_browser_event(event: InputEvent) -> Option<CommandId> {
     let key = match event {
         InputEvent::Key(key) => key,
@@ -584,6 +587,9 @@ pub(super) fn command_for_directory_browser_event(event: InputEvent) -> Option<C
                 SemanticCommandId::DirectoryBrowserPathInsert,
                 text,
             ));
+        }
+        InputEvent::Mouse(mouse) if mouse.kind != MouseEventKind::Down(MouseButton::Right) => {
+            return command_for_pointer(mouse);
         }
         _ => return None,
     };
