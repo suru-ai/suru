@@ -573,6 +573,107 @@ async fn the_root_says_what_it_is_to_source_control() {
     pair.shutdown().await;
 }
 
+/// A bare Repository is told by the shape Git requires of a Repository's
+/// metadata — a HEAD naming a ref or a commit, beside `objects` and `refs`
+/// directories — and by its own configuration not denying it is bare,
+/// whatever else that configuration carries. So a directory with only some
+/// of that shape is plain, as is a Repository's own metadata, whose
+/// configuration denies it even where it also includes another file, one
+/// whose configuration gives it a work tree elsewhere, and one denied by
+/// the configuration it has of its own where each Worktree may; and one
+/// with that shape but no configuration at all is bare, as Git takes it.
+#[tokio::test]
+async fn a_bare_repository_is_told_by_the_shape_git_requires_of_one() {
+    let pair = paired_servers("directory-listing-bare-shape").await;
+    let fixture = tempfile::tempdir().expect("create the directories to list");
+    let root = canonical(fixture.path());
+    let shaped = |name: &str, head: &str, directories: &[&str]| {
+        let directory = root.join(name);
+        for within in directories {
+            std::fs::create_dir_all(directory.join(within)).expect("shape the directory");
+        }
+        std::fs::create_dir_all(&directory).expect("create the directory");
+        std::fs::write(directory.join("HEAD"), head).expect("write the directory's HEAD");
+    };
+    shaped("head-only", "ref: refs/heads/main\n", &[]);
+    shaped(
+        "no-refs",
+        "ref: refs/heads/main\n",
+        &["objects", "reftable"],
+    );
+    shaped("no-objects", "ref: refs/heads/main\n", &["refs"]);
+    shaped(
+        "strange-head",
+        "neither a ref nor a commit\n",
+        &["objects", "refs"],
+    );
+    shaped(
+        "unconfigured",
+        "ref: refs/heads/main\n",
+        &["objects", "refs/heads"],
+    );
+    git(&root, &["init", "--bare", "-b", "main", "elsewhere.git"]);
+    git(
+        &root.join("elsewhere.git"),
+        &["config", "--unset", "core.bare"],
+    );
+    git(
+        &root.join("elsewhere.git"),
+        &["config", "core.worktree", "../elsewhere"],
+    );
+    git(&root, &["init", "--bare", "-b", "main", "own-config.git"]);
+    for setting in [
+        &["config", "--unset", "core.bare"][..],
+        &["config", "core.repositoryformatversion", "1"],
+        &["config", "extensions.worktreeConfig", "true"],
+        &["config", "--worktree", "core.bare", "false"],
+    ] {
+        git(&root.join("own-config.git"), setting);
+    }
+    committed_repository(&root.join("repository"));
+    include_another_file(&root.join("repository").join(".git").join("config"));
+
+    for (way, client) in both_ways(&pair) {
+        let listing = listed(&client, &root, None).await;
+        let read = listing
+            .children
+            .iter()
+            .map(|child| (child.name.as_str(), child.source_control.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read,
+            [
+                ("elsewhere.git", DirectorySourceControl::Plain),
+                ("head-only", DirectorySourceControl::Plain),
+                ("no-objects", DirectorySourceControl::Plain),
+                ("no-refs", DirectorySourceControl::Plain),
+                ("own-config.git", DirectorySourceControl::Plain),
+                (
+                    "repository",
+                    DirectorySourceControl::RepositoryRoot {
+                        revision: on("main")
+                    }
+                ),
+                ("strange-head", DirectorySourceControl::Plain),
+                ("unconfigured", DirectorySourceControl::BareRepository),
+            ],
+            "{way}"
+        );
+        let metadata = listed(&client, root.join("repository"), None).await;
+        let metadata = metadata
+            .children
+            .iter()
+            .find(|child| child.name == ".git")
+            .unwrap_or_else(|| panic!("{way}: the Repository's metadata is listed"));
+        assert_eq!(
+            metadata.source_control,
+            DirectorySourceControl::Plain,
+            "{way}"
+        );
+    }
+    pair.shutdown().await;
+}
+
 /// Several Repositories side by side, one with several linked Worktrees
 /// beside it and its branches packed away so no loose ref names them, are
 /// each read for themselves: HEAD alone names the branch each stands on.
@@ -692,11 +793,16 @@ impl SourceControlLayout {
         )
         .expect("spoil the Repository's HEAD");
         git(root, &["init", "--bare", "-b", "main", "bare.git"]);
+        reftable_bare_repository(&root.join("reftable.git"));
+        git(root, &["init", "--bare", "-b", "main", "including.git"]);
+        include_another_file(&root.join("including.git").join("config"));
+        committed_repository(&root.join("including"));
+        include_another_file(&root.join("including").join(".git").join("config"));
         std::fs::create_dir(root.join("plain")).expect("create a plain directory");
         Self { detached_commit }
     }
 
-    fn expected(&self) -> [(&'static str, DirectorySourceControl); 6] {
+    fn expected(&self) -> [(&'static str, DirectorySourceControl); 9] {
         [
             (
                 "main",
@@ -723,7 +829,62 @@ impl SourceControlLayout {
                 DirectorySourceControl::RepositoryRoot { revision: None },
             ),
             ("bare.git", DirectorySourceControl::BareRepository),
+            ("reftable.git", DirectorySourceControl::BareRepository),
+            ("including.git", DirectorySourceControl::BareRepository),
+            (
+                "including",
+                DirectorySourceControl::RepositoryRoot {
+                    revision: on("main"),
+                },
+            ),
             ("plain", DirectorySourceControl::Plain),
         ]
     }
+}
+
+/// A bare Repository keeping its refs in a reftable, made by Git where it
+/// can make one (Git 2.45 and later) and otherwise laid out by hand as such
+/// a Git lays one out: a HEAD naming a branch no ref file could hold beside
+/// `objects`, the `refs` Git recognizes any Repository by, holding a file
+/// where its branches would be, and the `reftable` that really holds them.
+fn reftable_bare_repository(directory: &Path) {
+    let made = std::process::Command::new("git")
+        .arg("init")
+        .args(["--bare", "--ref-format=reftable"])
+        .arg(directory)
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if made {
+        return;
+    }
+    for within in ["objects", "refs", "reftable"] {
+        std::fs::create_dir_all(directory.join(within)).expect("lay out the reftable Repository");
+    }
+    for (within, contents) in [
+        ("HEAD", "ref: refs/heads/.invalid\n"),
+        ("refs/heads", "this repository uses the reftable format\n"),
+        ("reftable/tables.list", ""),
+        (
+            "config",
+            "[core]\n\trepositoryformatversion = 1\n\tbare = true\n\
+             [extensions]\n\trefstorage = reftable\n",
+        ),
+    ] {
+        std::fs::write(directory.join(within), contents).expect("lay out the reftable Repository");
+    }
+}
+
+/// Has the configuration at `config` include another file, both outright
+/// and on a condition, as a user's `git config include.path` would.
+fn include_another_file(config: &Path) {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(config)
+        .and_then(|mut file| {
+            file.write_all(
+                b"[include]\n\tpath = other\n[includeIf \"gitdir:~/\"]\n\tpath = elsewhere\n",
+            )
+        })
+        .expect("include another file in the configuration");
 }

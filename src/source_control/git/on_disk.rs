@@ -9,7 +9,9 @@
 //! than a wrong answer. A listing alone spawns nothing, since it would cost a
 //! spawn per row, and reads only what [`listed_source_control`] names: a
 //! revision it cannot read there goes to the Client as unavailable, and a
-//! directory it cannot tell for a bare Repository as plain.
+//! bare Repository is told by its shape and what its configuration says of
+//! itself, so that neither refs kept in a reftable nor an include in the
+//! configuration keeps it from being marked bare.
 //!
 //! Two differences are deliberate. Git confirms that the object a branch
 //! names exists and peels it to a commit; this takes the object id as the
@@ -261,12 +263,15 @@ impl OnDisk {
 /// root costs a look at its `.git` — a read where that is a file — a look
 /// for its metadata's `commondir`, which tells a linked Worktree from a
 /// main one, and one read of its HEAD; a directory shaped like a
-/// Repository's own metadata costs its configuration, which says whether it
-/// is bare, and its HEAD; and any other directory a look or two.
+/// Repository's own metadata costs a look at that shape, its HEAD, and its
+/// configuration, which says whether it is bare, as [`listed_bare`] reads
+/// them; and any other directory a look or two.
 ///
 /// HEAD is read alone, never the refs it names, so a branch is named without
 /// the commit it stands at and a detached commit is taken at the width of
-/// either hash Git knows, without the configuration saying which.
+/// either hash Git knows, without the configuration saying which. A bare
+/// Repository carries no revision: it has no Worktree to stand on one, and
+/// its HEAD names only the branch a clone of it would start on.
 pub(in crate::source_control) fn listed_source_control(directory: &Path) -> DirectorySourceControl {
     if let Some(metadata) = metadata_directory(directory) {
         let revision = listed_head(&metadata);
@@ -279,16 +284,48 @@ pub(in crate::source_control) fn listed_source_control(directory: &Path) -> Dire
             DirectorySourceControl::RepositoryRoot { revision }
         };
     }
-    // Git, asked in a Repository with no Worktree, takes it for bare unless
-    // its configuration denies it.
-    let bare = Format::of(directory, directory).is_some_and(|format| {
-        format.bare != Some(false) && recognized_head(directory, &format).is_some()
-    });
-    if bare {
+    if listed_bare(directory) {
         DirectorySourceControl::BareRepository
     } else {
         DirectorySourceControl::Plain
     }
+}
+
+/// Whether Git, asked in `directory`, would take it for a bare Repository's
+/// metadata: shaped as Git requires metadata to be — a HEAD naming a ref or
+/// a commit, beside `objects` and `refs` directories, which a Repository
+/// keeping its refs in a reftable has too — with no configuration of its own
+/// denying it is bare or giving it a work tree elsewhere.
+///
+/// Unlike [`Format::of`], this judges neither the Repository's format nor
+/// how its refs are kept, since a listing reads no refs: the configuration
+/// is read for those two settings alone, and only as far as it says them
+/// itself. What a file it includes would say is left unsaid, as is all of a
+/// configuration that is missing or cannot be read in full, leaving its
+/// shape to decide; so one that says it is not bare only through an include
+/// is still marked bare.
+fn listed_bare(directory: &Path) -> bool {
+    let within = |name| std::fs::metadata(directory.join(name)).is_ok_and(|m| m.is_dir());
+    if !within("objects") || !within("refs") || !listed_recognized_head(directory) {
+        return false;
+    }
+    let read = |name| {
+        let mut config = Config::default();
+        config.read_own(&regular_file(&directory.join(name))??)?;
+        Some(config)
+    };
+    let Some(shared) = read("config") else {
+        return true;
+    };
+    // Where each Worktree may have configuration of its own, a bare
+    // Repository's settles its bareness after the shared file.
+    let own = shared
+        .worktree_config
+        .then(|| read("config.worktree"))
+        .flatten();
+    let bare = own.as_ref().and_then(|own| own.bare).or(shared.bare);
+    let work_tree = shared.work_tree || own.is_some_and(|own| own.work_tree);
+    bare != Some(false) && !work_tree
 }
 
 /// The revision a Worktree's HEAD names, read from that file alone: the
@@ -299,15 +336,7 @@ fn listed_head(metadata: &Path) -> Option<CheckoutRevision> {
     let head = regular_file(&metadata.join("HEAD"))??;
     let head = trim_end(&head);
     let Some(target) = head.strip_prefix(b"ref:") else {
-        let hex = head
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte));
-        let null = head.iter().all(|byte| *byte == b'0');
-        return (hex && !null && matches!(head.len(), 40 | 64)).then(|| {
-            CheckoutRevision::Detached {
-                commit: String::from_utf8_lossy(head).into_owned(),
-            }
-        });
+        return listed_commit(head).map(|commit| CheckoutRevision::Detached { commit });
     };
     let name = std::str::from_utf8(trim_start(target)).ok()?;
     let branch = name.strip_prefix("refs/heads/")?;
@@ -315,6 +344,31 @@ fn listed_head(metadata: &Path) -> Option<CheckoutRevision> {
         name: branch.to_owned(),
         commit: None,
     })
+}
+
+/// Whether Git would recognize `metadata` as metadata to run in by its
+/// HEAD, as [`recognized_head`] reads it but with a commit read as
+/// [`listed_commit`] reads one.
+fn listed_recognized_head(metadata: &Path) -> bool {
+    let Some(Some(head)) = regular_file(&metadata.join("HEAD")) else {
+        return false;
+    };
+    let head = trim_end(&head);
+    match head.strip_prefix(b"ref:") {
+        Some(target) => trim_start(target).starts_with(b"refs/"),
+        None => listed_commit(head).is_some(),
+    }
+}
+
+/// A whole object id in either hash Git knows, as a listing reads a commit
+/// from HEAD without the configuration saying which hash the Repository
+/// uses.
+fn listed_commit(id: &[u8]) -> Option<String> {
+    let hex = id
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte));
+    let null = id.iter().all(|byte| *byte == b'0');
+    (hex && !null && matches!(id.len(), 40 | 64)).then(|| String::from_utf8_lossy(id).into_owned())
 }
 
 /// Where a Worktree root keeps its own metadata: its `.git` directory, or
@@ -608,7 +662,8 @@ impl Format {
 
 /// The settings of a Repository's own configuration that decide how it is
 /// read. Reading declines a file Git would refuse to parse, and one whose
-/// settings could come from elsewhere: an include, or a continued line.
+/// settings could come from elsewhere: a continued line, or, unless only the
+/// file's own settings are asked for, an include.
 #[derive(Default)]
 struct Config {
     bare: Option<bool>,
@@ -616,9 +671,18 @@ struct Config {
     worktree_config: bool,
     version: Option<i64>,
     extensions: Vec<(String, Option<String>)>,
+    /// Whether the file includes another, whose settings it would carry.
+    includes: bool,
 }
 impl Config {
     fn read(&mut self, contents: &[u8]) -> Option<()> {
+        self.read_own(contents)?;
+        (!self.includes).then_some(())
+    }
+
+    /// Reads the settings `contents` gives itself, passing over any file it
+    /// includes.
+    fn read_own(&mut self, contents: &[u8]) -> Option<()> {
         let contents = std::str::from_utf8(contents).ok()?;
         let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
         // `None` before any section; `Some(None)` within one with a
@@ -628,8 +692,9 @@ impl Config {
             let line = line.strip_suffix('\r').unwrap_or(line);
             let mut rest = line.trim_start_matches([' ', '\t']);
             if let Some(header) = rest.strip_prefix('[') {
-                let (name, after) = section_header(header)?;
-                section = Some(name);
+                let (name, subsection, after) = section_header(header)?;
+                self.includes |= name == "include" || name == "includeif";
+                section = Some((!subsection).then_some(name));
                 // A setting may follow its header on the same line.
                 rest = after.trim_start_matches([' ', '\t']);
             }
@@ -699,10 +764,9 @@ impl Config {
     }
 }
 
-/// A section header after its `[`: the section's name where it has no
-/// subsection, and what follows the `]`. Includes are declined here, since
-/// they would carry settings from another file.
-fn section_header(header: &str) -> Option<(Option<String>, &str)> {
+/// A section header after its `[`: the section's name, lowercased, whether
+/// it has a subsection, and what follows the `]`.
+fn section_header(header: &str) -> Option<(String, bool, &str)> {
     let end = header
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
         .unwrap_or(header.len());
@@ -712,11 +776,11 @@ fn section_header(header: &str) -> Option<(Option<String>, &str)> {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if base.is_empty() || base == "include" || base == "includeif" {
+    if base.is_empty() {
         return None;
     }
     if let Some(rest) = rest.strip_prefix(']') {
-        return Some(((!name.contains('.')).then_some(base), rest));
+        return Some((base, name.contains('.'), rest));
     }
     // `[section "subsection"]`, its subsection quoted with escapes.
     let quoted = rest
@@ -729,7 +793,7 @@ fn section_header(header: &str) -> Option<(Option<String>, &str)> {
             '\\' => {
                 chars.next()?;
             }
-            '"' => return Some((None, quoted[index + 1..].strip_prefix(']')?)),
+            '"' => return Some((base, true, quoted[index + 1..].strip_prefix(']')?)),
             _ => {}
         }
     }

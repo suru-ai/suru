@@ -693,7 +693,9 @@ pub enum DirectorySourceControl {
     /// [`Self::RepositoryRoot`].
     LinkedWorktreeRoot { revision: Option<CheckoutRevision> },
     /// A bare Repository, which has no Worktree of its own: choosing it
-    /// leaves a Worktree still to choose.
+    /// leaves a Worktree still to choose. It carries no Checkout State,
+    /// having no Worktree to stand on one; its HEAD, which names only the
+    /// branch a clone of it would start on, is read only to recognize it.
     BareRepository,
 }
 
