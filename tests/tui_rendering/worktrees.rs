@@ -571,40 +571,21 @@ fn managed_worktrees_are_offered_by_their_leaf_name() {
     assert!(!rendered.contains(".suru-worktrees"), "{rendered}");
 }
 
+/// A Workspace whose Server answers with a directory below one of its
+/// Worktrees works there, so the Skills on offer are the ones read for that
+/// directory. The Worktree Selector offers Worktrees and nothing else.
 #[test]
-fn explicit_subdirectory_keeps_draft_and_updates_destination_skills_and_relative_path_base() {
+fn a_subdirectory_the_server_resolves_is_where_destination_skills_are_read() {
     let layout = Layout::new();
     let mut app = layout.app();
-    let transition = deliver_settings(
-        &mut app,
-        EffectiveSettings {
-            sidebar: SidebarSettings {
-                initial_visibility: SidebarVisibility::Shown,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    );
-    if let ApplicationTransition::ListSessions(request) = transition {
-        app.handle_event(ApplicationEvent::SessionsListed {
-            request,
-            sessions: vec![],
-        })
-        .unwrap();
-    }
-    // A directory below a Worktree is named in the Sidebar's path entry; the
-    // Worktree Selector offers Worktrees and nothing else.
-    crate::support::press_add_workspace(&mut app);
-    app.handle_terminal_event(InputEvent::Paste("../another directory".to_owned()))
-        .unwrap();
-    let transition = key(&mut app, KeyCode::Enter);
-    let ApplicationTransition::ResolveWorkspace { request, .. } = &transition else {
-        panic!("resolve explicit subdirectory")
-    };
-    assert_eq!(request.base, Some(layout.nested.clone()));
-    assert_eq!(request.path, PathBuf::from("../another directory"));
     let destination = layout.linked.join("another directory");
     std::fs::create_dir(&destination).unwrap();
+    let other = ResolvedWorkspace::directory(layout.main.parent().unwrap().join("other"));
+    let transition = pick_other_workspace(&mut app, &[layout.context.clone(), other.clone()]);
+    answer(&mut app, transition, other.clone());
+    // Back to the Repository, whose Server answers with the directory below
+    // its linked Worktree.
+    let transition = pick_other_workspace(&mut app, &[layout.context.clone(), other]);
     answer(&mut app, transition, layout.at(&destination));
     let request = SkillCatalogRequest {
         provider: ProviderId::new("codex"),
@@ -637,14 +618,6 @@ fn explicit_subdirectory_keeps_draft_and_updates_destination_skills_and_relative
         panic!("refresh destination Skills")
     };
     assert_eq!(request.execution_directory.path, destination);
-    key(&mut app, KeyCode::Esc);
-    crate::support::press_add_workspace(&mut app);
-    type_terminal_text(&mut app, "child");
-    let ApplicationTransition::ResolveWorkspace { request, .. } = key(&mut app, KeyCode::Enter)
-    else {
-        panic!("Sidebar resolves paths on owning Server")
-    };
-    assert_eq!(request.base, Some(destination));
 }
 
 #[test]

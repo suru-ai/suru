@@ -382,22 +382,11 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
                         )))
                         .unwrap();
                 }
-                application
-                    .handle_terminal_event(Event::Key(KeyEvent::new(
-                        KeyCode::Esc,
-                        KeyModifiers::NONE,
-                    )))
-                    .unwrap();
-                application
-                    .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-                        SemanticCommandId::SidebarToggle,
-                    )))
-                    .unwrap();
-                crate::support::press_add_workspace(&mut application);
-                crate::support::type_terminal_text(&mut application, path);
-                let ApplicationTransition::ResolveWorkspace {
+                // The Workspace chosen here becomes the one the client runs
+                // in, which the Sidebar's selector offers by the name the
+                // Remote's own path style gives it.
+                let ApplicationTransition::DetachSessionAndResolveWorkspace {
                     outlook,
-                    surface,
                     request_id,
                     request,
                 } = application
@@ -413,14 +402,38 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
                 application
                     .handle_event(ApplicationEvent::WorkspaceResolved {
                         outlook,
-                        surface,
+                        surface: suru::tui::WorkspaceResolutionSurface::WorkspacePicker,
                         request_id,
                         result: Ok(suru::protocol::ResolvedWorkspace::directory(request.path)),
                     })
                     .unwrap();
+                let ApplicationTransition::ListSessions(request) = application
+                    .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                        SemanticCommandId::SidebarToggle,
+                    )))
+                    .unwrap()
+                else {
+                    panic!("revealing the Sidebar asks for its Sessions")
+                };
+                application
+                    .handle_event(ApplicationEvent::SessionsListed {
+                        request,
+                        sessions: Vec::new(),
+                    })
+                    .unwrap();
+                application
+                    .handle_terminal_event(Event::Key(KeyEvent::new(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                    )))
+                    .unwrap();
                 let rows =
                     rendered_application_rows_at(&application, crate::support::SIDEBAR_WIDE, 30);
-                assert_eq!(crate::support::selector_label(&rows), format!("▸ {name}"));
+                assert!(
+                    rows.iter()
+                        .any(|row| crate::support::sidebar_column(row) == name),
+                    "the selector offers the Workspace as {name}: {rows:?}"
+                );
             }
         }
     }

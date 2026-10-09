@@ -5,10 +5,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::support::{
-    SIDEBAR_WIDE, add_workspace, answer_workspace_resolution, connected_application,
-    deliver_settings, drawn_in_sidebar, enter_active_session, fixture_instance_id,
-    noncanonical_spelling, ready_health, rendered_application_rows, rendered_application_rows_at,
-    rendered_row, selector_label, sidebar_column, type_terminal_text, workspace_dir,
+    SIDEBAR_WIDE, answer_workspace_resolution, connected_application, deliver_settings,
+    drawn_in_sidebar, enter_active_session, fixture_instance_id, noncanonical_spelling,
+    ready_health, rendered_application_rows, rendered_application_rows_at, rendered_row,
+    selector_label, sidebar_column, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -811,7 +811,7 @@ fn a_workspace_replaced_by_a_file_is_refused_without_moving_any_scope() {
     let refusal = rendered_application_rows_at(&application, SIDEBAR_WIDE, 20).join("\n");
     assert!(
         refusal.contains("Not a directory"),
-        "the Landing gives the path entry's corresponding refusal: {refusal}"
+        "the Landing says why the choice was refused: {refusal}"
     );
 
     type_terminal_text(&mut application, "$rev");
@@ -930,22 +930,41 @@ fn a_fresh_landing_lets_go_of_a_workspace_still_resolving() {
     );
 }
 
-/// A directory named at the Sidebar's entry is a Workspace asked for later
-/// than the one the Landing awaits, so it is the one the reader is left in,
-/// whichever of the two the Server answers first.
+/// A Workspace asked for anywhere else — here the Sidekick's — is asked for
+/// later than the one the Landing awaits, so it is the one the reader is left
+/// in, whichever of the two the Server answers first.
 #[test]
-fn a_directory_named_at_the_sidebar_supersedes_a_workspace_still_resolving() {
+fn a_workspace_asked_for_elsewhere_supersedes_one_still_resolving() {
     let root = workspace_dir();
     let atlas = workspace_in(root.path(), "atlas");
-    let notes = workspace_in(root.path(), "notes");
+    let sidekick = workspace_in(root.path(), "sidekick");
     let mut application = connected_application(root.path());
-    show_sidebar(&mut application, Vec::new());
 
     open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
     press(&mut application, KeyCode::Down);
     let resolution = choose_unanswered(&mut application);
 
-    add_workspace(&mut application, "notes");
+    let ApplicationTransition::ResolveSidekickWorkspace {
+        outlook,
+        request_id,
+    } = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionSidekick,
+        )))
+        .expect("ask for the Sidekick while the chosen Workspace resolves")
+    else {
+        panic!("/sidekick asks its Server for the Sidekick Workspace");
+    };
+    application
+        .handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface: suru::tui::WorkspaceResolutionSurface::Sidekick,
+            request_id,
+            result: Ok(suru::protocol::ResolvedWorkspace::directory(
+                sidekick.clone(),
+            )),
+        })
+        .expect("answer the Sidekick Workspace");
     assert_eq!(
         answer_workspace_resolution(&mut application, resolution),
         ApplicationTransition::Continue
@@ -959,8 +978,8 @@ fn a_directory_named_at_the_sidebar_supersedes_a_workspace_still_resolving() {
         panic!("a Landing submission creates a Session");
     };
     assert_eq!(
-        request.execution_directory.path, notes,
-        "the late answer to the picker did not move the reader off the directory named since"
+        request.execution_directory.path, sidekick,
+        "the late answer to the picker did not move the reader off the Workspace asked for since"
     );
 }
 
@@ -1048,41 +1067,6 @@ fn the_session_pickers_current_workspace_scope_comes_to_mean_the_chosen_workspac
         session_picker_scope(&mut application),
         SessionListScope::CurrentWorkspace((atlas).into()),
         "the picker's current-Workspace scope means the Workspace the reader chose"
-    );
-}
-
-/// A path typed at the Sidebar's entry is read from the Workspace the reader
-/// is working in, and after a switch that is the Workspace they chose.
-#[test]
-fn a_relative_path_at_the_sidebars_entry_reads_from_the_chosen_workspace() {
-    let root = workspace_dir();
-    let atlas = root.path().join("atlas");
-    let notes = atlas.join("notes");
-    std::fs::create_dir_all(&notes).expect("create the directories the reader moves between");
-    let mut application = connected_application(root.path());
-    show_sidebar(&mut application, Vec::new());
-
-    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
-    press(&mut application, KeyCode::Down);
-    choose(&mut application);
-
-    add_workspace(&mut application, "notes");
-
-    application
-        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
-            "Initial Prompt".to_owned(),
-        )))
-        .expect("type an initial Prompt");
-    let ApplicationTransition::CreateSession(request) = application
-        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
-        .expect("submit the initial Prompt")
-    else {
-        panic!("a Landing submission creates a Session");
-    };
-    assert_eq!(
-        request.execution_directory.path, notes,
-        "the relative path was read from the Workspace the reader chose in the picker, \
-         not from the one the client was launched in"
     );
 }
 
@@ -1826,20 +1810,22 @@ fn an_open_sessions_execution_context_is_independent_of_grouping_and_landing() {
         ApplicationTransition::RefreshSkills(request)
     );
     press(&mut application, KeyCode::Esc);
-    show_sidebar(&mut application, Vec::new());
-    crate::support::press_add_workspace(&mut application);
-    type_terminal_text(&mut application, "notes");
-    let ApplicationTransition::ResolveWorkspace { request, .. } = application
-        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionNew,
         )))
-        .unwrap()
+        .expect("leave the Session for the Landing");
+    type_terminal_text(&mut application, "Initial Prompt");
+    let ApplicationTransition::CreateSession(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("submit the initial Prompt")
     else {
-        panic!("relative path entry is interpreted by the owning Server");
+        panic!("a Landing submission creates a Session");
     };
-    assert_eq!(request.path, PathBuf::from("notes"));
-    assert_eq!(request.base, Some(landing));
+    assert_eq!(
+        request.execution_directory.path, landing,
+        "the Landing kept its own Execution Directory while the open Session worked in another"
+    );
 }
 
 /// Server discovery owns grouping; the Client retains the precise launch
