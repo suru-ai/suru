@@ -1088,6 +1088,27 @@ fn pressing_the_unavailable_marker_beneath_the_landing_composer_does_nothing() {
     }
 }
 
+/// A Checkout State that could not be read is marked unavailable where the
+/// Checkout State stands; that marker is not a choice, so a press on it does
+/// nothing, wherever the frame puts it.
+#[test]
+fn pressing_an_unavailable_checkout_state_beneath_the_landing_composer_does_nothing() {
+    let layout = Layout::new();
+    let mut unreadable = layout.context.clone();
+    unreadable.checkouts[1].availability = SourceControlAvailability::Unavailable {
+        reason: "HEAD could not be read".to_owned(),
+    };
+    for framing in FRAMINGS {
+        let mut app = layout.app_in(unreadable.clone());
+        (framing.arrange)(&mut app);
+        assert!(
+            press_moves_nothing(&mut app, framing.size, "[unavailable]"),
+            "{}",
+            framing.what
+        );
+    }
+}
+
 /// The Spinner a Workspace still resolving carries says its reading is on its
 /// way, which is not a choice, so a press on it does nothing, wherever the
 /// frame puts it.

@@ -4939,7 +4939,8 @@ impl ExecutionReading {
 /// pending Worktree intent into the Worktree Selector, and the subdirectory
 /// into the Directory Browser, which roots itself at the Execution Directory
 /// that subdirectory names. The separators, a Remote's name, the unavailable
-/// marker, and the Spinner of a resolution still in flight are not choices.
+/// markers an Execution Directory or a Checkout State that cannot be read
+/// wears, and the Spinner of a resolution still in flight are not choices.
 fn execution_readings(state: &TuiState, show_icons: bool, width: usize) -> Vec<ExecutionReading> {
     // A Workspace whose Server has yet to answer for it is named with the
     // Spinner a reading on its way carries, where its Checkout State will
@@ -4969,16 +4970,20 @@ fn execution_readings(state: &TuiState, show_icons: bool, width: usize) -> Vec<E
             }
             // What the next Session would begin on, said exactly as a
             // Sidebar row says it, and live: the catalog's reading
-            // stands in front of the one the resolution carried.
+            // stands in front of the one the resolution carried. One that
+            // could not be read is only marked so, which is not a choice.
             if let Some(checkout) = state
                 .execution_checkout_state()
-                .and_then(|checkout| checkout_state_context(checkout, show_icons))
+                .and_then(CheckoutStateReading::of)
             {
+                let context = checkout.context(show_icons);
                 trailing.push(ExecutionReading::inert(" · "));
-                trailing.push(ExecutionReading::pressable(
-                    checkout,
-                    SemanticCommandId::WorktreeList,
-                ));
+                trailing.push(match checkout.revision {
+                    Some(_) => {
+                        ExecutionReading::pressable(context, SemanticCommandId::WorktreeList)
+                    }
+                    None => ExecutionReading::inert(context),
+                });
             }
             if let Some(path) = state.execution_subdirectory() {
                 trailing.push(ExecutionReading::inert(" · "));
