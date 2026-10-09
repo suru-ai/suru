@@ -3451,28 +3451,190 @@ fn typing_a_drive_into_the_empty_path_field_roots_the_tree_there() {
     assert_eq!(tree(&application), [r"› ▾ D:\", "    ▸ Data"]);
 }
 
+/// Before the drive list has been reached an empty path field names the
+/// Execution Directory, as it does on any Server, though the Server has named
+/// the drive list as a drive's parent by then: clearing the field stands the
+/// tree back on the Execution Directory, which is listed already, so nothing
+/// is asked — the drive list least of all.
+#[test]
+fn before_the_drive_list_is_reached_an_empty_path_field_names_the_execution_directory() {
+    let mut application = browsing_on_windows(r"C:\Users\me", Some(r"C:\Users"), &["src"]);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Left));
+    answer_from_windows(
+        &mut application,
+        listing_id,
+        r"C:\Users",
+        Some(r"C:\"),
+        &["me", "you"],
+    );
+    key(&mut application, KeyCode::Up);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Left));
+    answer_from_windows(
+        &mut application,
+        listing_id,
+        r"C:\",
+        Some(DRIVE_LIST),
+        &["Users", "Windows"],
+    );
+    assert_eq!(path_field(&application), r"C:\");
+
+    for remaining in [r"C:", "C", ""] {
+        assert_eq!(
+            key(&mut application, KeyCode::Backspace),
+            ApplicationTransition::Continue,
+            "{remaining:?}: nothing is asked of the Server"
+        );
+        assert_eq!(path_field(&application), remaining);
+    }
+
+    assert_eq!(
+        tree(&application),
+        ["› ▾ me · [current]", "    ▸ src"],
+        "the tree stands on the Execution Directory, not the drive list"
+    );
+}
+
+/// Tab on the drive list completes the empty path field to the focused drive,
+/// standing the tree there once the Server reads it, as Tab does beneath any
+/// root; on the drive list's own row there is nothing to complete.
+#[test]
+fn tab_on_the_drive_list_completes_the_path_field_to_the_focused_drive() {
+    let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
+    key(&mut application, KeyCode::Up);
+    assert_eq!(focused(&application), "Drives");
+    assert_eq!(
+        key(&mut application, KeyCode::Tab),
+        ApplicationTransition::Continue,
+        "the drive list's row completes to nothing"
+    );
+    assert_eq!(path_field(&application), "");
+    for _ in [r"C:\", "Users", "Windows", r"D:\"] {
+        key(&mut application, KeyCode::Down);
+    }
+    assert_eq!(focused(&application), r"D:\");
+
+    let (_, listing_id, request) = expect_listing(key(&mut application, KeyCode::Tab));
+
+    assert_eq!(
+        request,
+        ListDirectoryRequest {
+            path: PathBuf::from(r"D:\"),
+            base: Some(PathBuf::from(r"C:\")),
+        }
+    );
+    assert_eq!(path_field(&application), r"D:\");
+    assert_eq!(beneath_path_field(&application), ["Loading…"]);
+    answer_from_windows(
+        &mut application,
+        listing_id,
+        r"D:\",
+        Some(DRIVE_LIST),
+        &["Data"],
+    );
+    assert_eq!(path_field(&application), r"D:\");
+    assert_eq!(tree(&application), [r"› ▾ D:\", "    ▸ Data"]);
+}
+
+/// The path field is empty while the drive list is the root, so Backspace
+/// has nothing to take back.
+#[test]
+fn backspace_on_the_empty_path_field_of_the_drive_list_does_nothing() {
+    let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
+    let rows = tree(&application);
+
+    assert_eq!(
+        key(&mut application, KeyCode::Backspace),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(path_field(&application), "");
+    assert_eq!(tree(&application), rows);
+}
+
+/// The pointer answers on the drive list's row as on any other row: a press
+/// closes or opens it as Space does. A double press chooses nothing, as Enter
+/// on it chooses nothing, leaving the browser open on the drive list.
+#[test]
+fn a_press_on_the_drive_list_s_row_opens_or_closes_it_and_a_double_press_chooses_nothing() {
+    let (mut application, clock) = pointing(drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]));
+
+    assert_eq!(
+        press_on(&mut application, "Drives"),
+        ApplicationTransition::Continue,
+        "closing a row asks nothing"
+    );
+    assert_eq!(tree(&application), ["› ▸ Drives"]);
+
+    wait(&clock, CLICK_INTERVAL);
+    assert_eq!(
+        press_on(&mut application, "Drives"),
+        ApplicationTransition::Continue,
+        "the double press chooses nothing"
+    );
+    assert_eq!(path_field(&application), "", "the browser stays open");
+    assert_eq!(tree(&application), ["› ▸ Drives"]);
+
+    wait(&clock, CLICK_INTERVAL + Duration::from_millis(1));
+    assert_eq!(
+        press_on(&mut application, "Drives"),
+        ApplicationTransition::Continue,
+        "the drives are listed already"
+    );
+    assert_eq!(
+        tree(&application),
+        [
+            "› ▾ Drives",
+            r"    ▾ C:\ · [current]",
+            "      ▸ Users",
+            "      ▸ Windows",
+            r"    ▸ D:\"
+        ],
+        "a single press past the interval opens the row again"
+    );
+}
+
 /// A Client turned toward a Remote on Windows, its Landing working at that
 /// Remote's `drive` and the browser open there, the drive listed with plain
 /// children by name and the drive list named as its parent.
 fn browsing_a_windows_drive(drive: &str, children: &[&str]) -> Application {
+    browsing_on_windows(drive, Some(DRIVE_LIST), children)
+}
+
+/// A Client turned toward a Remote on Windows, its Landing working at that
+/// Remote's `directory` and the browser open there, the directory listed with
+/// `parent` and plain children by name. The Remote has said its paths are
+/// Windows', so the Client names them as Windows does on every platform.
+fn browsing_on_windows(directory: &str, parent: Option<&str>, children: &[&str]) -> Application {
+    use suru::protocol::{
+        PathStyle, SessionCatalogRevision, SessionCatalogSnapshot, WorkspacePaths,
+    };
+
     let mut application = application_looking_at_studio();
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::SessionCatalogReconciled(SessionCatalogSnapshot {
+                workspace_paths: WorkspacePaths {
+                    home: None,
+                    style: PathStyle::Windows,
+                    sidekick_workspace: None,
+                },
+                revision: SessionCatalogRevision::INITIAL,
+                session_ids: Vec::new(),
+                checkout_states: Vec::new(),
+            }),
+        })
+        .expect("the Remote says its paths are Windows'");
     expect_listing(invoke(&mut application, SemanticCommandId::WorkspaceBrowse));
     let choice = key(&mut application, KeyCode::Enter);
     resolve(
         &mut application,
         &choice,
-        Ok(ResolvedWorkspace::directory(PathBuf::from(drive))),
+        Ok(ResolvedWorkspace::directory(PathBuf::from(directory))),
     );
     let (_, listing_id, request) =
         expect_listing(invoke(&mut application, SemanticCommandId::WorkspaceBrowse));
-    assert_eq!(request.path, Path::new(drive));
-    answer_from_windows(
-        &mut application,
-        listing_id,
-        drive,
-        Some(DRIVE_LIST),
-        children,
-    );
+    assert_eq!(request.path, Path::new(directory));
+    answer_from_windows(&mut application, listing_id, directory, parent, children);
     application
 }
 

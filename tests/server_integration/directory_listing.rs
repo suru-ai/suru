@@ -482,6 +482,42 @@ async fn a_drive_root_names_the_drive_list_as_its_parent_which_lists_every_drive
     pair.shutdown().await;
 }
 
+/// A drive root however it is spelled — its letter lowercase, its separator
+/// a forward slash, or behind the verbatim prefix — is the one drive root:
+/// the Server answers its own spelling of it, and the drive list as its
+/// parent, as for the spelling it gives itself.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_drive_root_however_spelled_names_the_drive_list_as_its_parent() {
+    let pair = paired_servers("directory-listing-drive-root-spellings").await;
+    let fixture = tempfile::tempdir().expect("create a directory on a drive");
+    let drive_root = filesystem_root(fixture.path());
+    let letter = drive_root
+        .to_string_lossy()
+        .chars()
+        .next()
+        .expect("a drive root begins with its letter");
+    let spellings = [
+        format!(r"{}:\", letter.to_ascii_lowercase()),
+        format!("{letter}:/"),
+        format!(r"\\?\{letter}:\"),
+    ];
+
+    for (way, client) in both_ways(&pair) {
+        let canonical = listed(&client, &drive_root, None).await;
+        for spelling in &spellings {
+            let listing = listed(&client, spelling, None).await;
+            assert_eq!(listing.root, canonical.root, "{way}: {spelling}");
+            assert_eq!(
+                listing.parent.as_deref(),
+                Some(Path::new(DRIVE_LIST)),
+                "{way}: {spelling}"
+            );
+        }
+    }
+    pair.shutdown().await;
+}
+
 /// What each child is to source control is read from Git's own metadata on
 /// the Server's disk: a Repository's main root and a linked Worktree's root
 /// carry the Checkout State their HEAD stands on — a branch, named alone
