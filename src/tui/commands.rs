@@ -1977,7 +1977,8 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         // the reader is on, so this is what Enter comes to there as well as on
         // a Session, and the account of the command names the rest of them.
         description: "Open the Session the Sidebar has selected, show more of the settled shelf, \
-                      retry an unreachable Remote, or act on the Workspace selector",
+                      retry an unreachable Remote, act on the Workspace selector, or open the \
+                      Landing from the new-Session affordance",
         slash: None,
         keybinding: None,
     },
@@ -2073,9 +2074,9 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::SidebarLeave,
         title: "Leave Sidebar",
         reach: SemanticReach::Client,
-        // Backing out of a path entry, a set of selector entries, or a search
-        // is an inner step of backing out of the Sidebar, so the account of the
-        // command says it takes one step rather than all of them.
+        // Backing out of a set of selector entries or a search is an inner
+        // step of backing out of the Sidebar, so the account of the command
+        // says it takes one step rather than all of them.
         description: "Back out of the Sidebar a step: close what is open, clear its search, \
                       or hand the keys back to the composer",
         slash: None,

@@ -1247,8 +1247,8 @@ fn command_from_scoped_bindings(
         .map(|binding| binding.command.clone())
 }
 
-/// Worktree navigation uses semantic actions. A directory below a Worktree is
-/// reached through the Sidebar's path entry rather than from here.
+/// Worktree navigation uses semantic actions, and offers Worktrees alone: a
+/// directory below a Worktree is not chosen from here.
 pub(super) fn command_for_worktree_picker_event(event: InputEvent) -> Option<CommandId> {
     let InputEvent::Key(key) = event else {
         return None;

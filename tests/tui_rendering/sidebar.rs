@@ -9,11 +9,13 @@ use std::{
 };
 
 use crate::support::{
-    ADD_WORKSPACE, SELECTOR_ROW, SIDEBAR_PRESS_HEIGHT as PRESS_HEIGHT, SIDEBAR_WIDE as WIDE,
-    add_workspace, connected_application, deliver_settings, drawn_in_sidebar, enter_active_session,
-    enter_session, failed_session_snapshot, fixture_instance_id, noncanonical_spelling,
-    press_add_workspace, rendered_application_buffer, rendered_application_rows_at, rendered_row,
-    selector_label, sidebar_column, text_on, text_position, type_terminal_text, workspace_dir,
+    NEW_SESSION, SELECTOR_ROW, SIDEBAR_PRESS_HEIGHT as PRESS_HEIGHT, SIDEBAR_WIDE as WIDE,
+    answer_workspace_resolution, application_looking_at_studio, connected_application,
+    deliver_settings, drawn_in_sidebar, enter_active_session, enter_session,
+    failed_session_snapshot, fixture_instance_id, noncanonical_spelling, press_new_session,
+    rendered_application_buffer, rendered_application_rows_at, rendered_row, selector_label,
+    sidebar_column, studio_stops_answering, text_on, text_position, type_terminal_text,
+    workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -3073,7 +3075,7 @@ fn the_arrows_pass_over_a_row_suru_cannot_read() {
 
     press_sidebar_key(&mut application, KeyCode::Up);
     assert!(
-        selected_sidebar_text(&application).contains(ADD_WORKSPACE),
+        selected_sidebar_text(&application).contains(NEW_SESSION),
         "moving off the top of the openable rows lands on the selector's line, stepping over \
          the damaged row above them"
     );
@@ -6861,34 +6863,6 @@ fn everywhere_searches_one_flat_tagged_list_then_a_workspace_returns_to_the_outl
 }
 
 #[test]
-fn resolving_a_workspace_from_everywhere_returns_to_the_outlooks_catalog_alone() {
-    let workspace = workspace_dir();
-    let added = workspace.path().join("notes");
-    std::fs::create_dir(&added).expect("create the Workspace the reader adds");
-    let mut application = sidebar_focused(workspace.path(), Vec::new());
-    let EverywhereListing { requests, .. } = choose_everywhere(
-        &mut application,
-        vec![remote("studio", RemoteStatus::Available)],
-    );
-    for request in requests {
-        application
-            .handle_event(ApplicationEvent::SessionsListed {
-                request,
-                sessions: Vec::new(),
-            })
-            .expect("finish the Everywhere listing");
-    }
-
-    assert_eq!(
-        add_workspace(&mut application, &added.to_string_lossy()),
-        ApplicationTransition::ReconcileCatalogOrigins {
-            catalog_origins: std::collections::HashSet::new(),
-            requests: Vec::new(),
-        }
-    );
-}
-
-#[test]
 fn reopening_everywhere_refreshes_the_remote_set_and_every_origin_listing() {
     let workspace = workspace_dir();
     let mut application = sidebar_focused(workspace.path(), Vec::new());
@@ -7551,15 +7525,13 @@ fn workspace_name(workspace: &Path) -> String {
         .into_owned()
 }
 
-// The add-Workspace affordance: the way into a directory the Sidebar has never
-// listed. It stands beside the selector, opens a path entry, and — when the
-// reader names a directory — moves the Workspace this client works in.
-
-/// What the path entry labels the line the reader types into.
-const WORKSPACE_ENTRY: &str = "Workspace:";
+// The new-Session affordance: the way to a fresh Landing from the Sidebar. It
+// stands beside the selector and opens the Landing in the current Workspace
+// exactly as `/new` does, whether the pointer presses it or Enter acts on it.
+// A directory the selector does not list is never reached from here.
 
 #[test]
-fn the_add_workspace_affordance_stands_beside_the_selector() {
+fn the_new_session_affordance_stands_beside_the_selector() {
     let workspace = workspace_dir();
     let application = sidebar_showing(
         workspace.path(),
@@ -7574,131 +7546,177 @@ fn the_add_workspace_affordance_stands_beside_the_selector() {
         "the selector keeps the left of its line: {line:?}"
     );
     assert!(
-        line.ends_with(ADD_WORKSPACE),
+        line.ends_with(NEW_SESSION),
         "and the affordance stands at the right of it: {line:?}"
     );
 }
 
-/// Acting on the affordance opens a path entry in place of the list: while it
-/// stands the reader is saying where to work rather than choosing what to
-/// open.
+/// Pressing the affordance is `/new` under the pointer: the client lets go of
+/// the Session it had open, and the main view becomes the very Landing the
+/// command opens.
 #[test]
-fn the_affordance_opens_a_path_entry_in_place_of_the_list() {
+fn pressing_the_new_session_affordance_opens_the_landing_as_new_does() {
     let workspace = workspace_dir();
-    let mut application = sidebar_showing(
-        workspace.path(),
-        vec![listed("Listed work", workspace.path(), 1, now())],
-    );
-
-    assert_eq!(
-        press_add_workspace(&mut application),
-        ApplicationTransition::Continue,
-        "opening the entry asks nothing of the server"
-    );
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let open = SessionId::new();
+    let sessions = vec![listed_as(open, BEING_READ, workspace.path(), 1)];
+    let mut pressed = reading_one(workspace.path(), open, sessions.clone());
+    let mut asked = reading_one(workspace.path(), open, sessions);
     assert!(
-        sidebar_column(&rows[2]).starts_with(WORKSPACE_ENTRY),
-        "the entry stands under the selector: {rows:?}"
-    );
-    assert!(
-        !drawn_in_sidebar(&rows, "Listed work"),
-        "and the list stands down behind it: {rows:?}"
-    );
-}
-
-/// The entry takes the keys with it: a reader who asked for it is asking to
-/// type into it, whether they asked with the pointer or with Enter.
-#[test]
-fn the_path_entry_takes_what_the_reader_types_rather_than_the_composer() {
-    let workspace = workspace_dir();
-    let mut application = sidebar_showing(workspace.path(), Vec::new());
-    press_add_workspace(&mut application);
-
-    type_terminal_text(&mut application, "notes");
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    assert_eq!(
-        sidebar_column(&rows[2]),
-        format!("{WORKSPACE_ENTRY} notes"),
-        "what they typed is in the entry: {rows:?}"
-    );
-    assert!(
-        !rows
-            .iter()
-            .any(|row| row.chars().skip(32).collect::<String>().contains("notes")),
-        "and none of it reached the composer beside it: {rows:?}"
-    );
-}
-
-/// The whole of the criterion: a directory the reader names becomes the
-/// Workspace this client works in, and the selector narrows to it.
-#[test]
-fn a_directory_the_reader_names_becomes_the_workspace_the_selector_narrows_to() {
-    let workspace = workspace_dir();
-    let added = workspace.path().join("notes");
-    std::fs::create_dir(&added).expect("create the directory the reader adds");
-    let mut application = sidebar_showing(
-        workspace.path(),
-        vec![listed("Listed work", workspace.path(), 1, now())],
+        main_view(&pressed).contains(ALREADY_ON_SCREEN),
+        "a Session is open in the main view to begin with"
     );
 
-    add_workspace(&mut application, &added.to_string_lossy());
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    assert!(
-        selector_label(&rows) == "▸ notes",
-        "the selector narrows to the Workspace the reader added: {rows:?}"
-    );
-    assert!(
-        !drawn_in_sidebar(&rows, "Listed work"),
-        "which is a Workspace with no work in it yet: {rows:?}"
-    );
-    assert!(
-        !sidebar_column(&rows[2]).starts_with(WORKSPACE_ENTRY),
-        "and the entry is done with: {rows:?}"
-    );
-}
-
-/// The Workspace the reader added is where their next Session is rooted, which
-/// is the whole reason for naming it.
-#[test]
-fn the_workspace_the_reader_added_roots_the_sessions_they_make_next() {
-    let workspace = workspace_dir();
-    let added = workspace.path().join("notes");
-    std::fs::create_dir(&added).expect("create the directory the reader adds");
-    let mut application = sidebar_showing(workspace.path(), Vec::new());
-
-    add_workspace(&mut application, &added.to_string_lossy());
-
-    application
-        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
-            "Initial Prompt".to_owned(),
+    let by_command = asked
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionNew,
         )))
-        .expect("type an initial Prompt");
-    let ApplicationTransition::CreateSession(request) = application
-        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
-        .expect("submit the initial Prompt")
-    else {
-        panic!("a Landing submission creates a Session");
-    };
+        .expect("open the Landing by `/new`");
+    assert_eq!(by_command, ApplicationTransition::DetachSession);
     assert_eq!(
-        request.execution_directory.path,
-        suru::paths::canonical(&added).expect("canonicalize the directory the reader added"),
-        "the Session is rooted in the Workspace the reader added, read the way the server \
-         reads it: the server canonicalizes what it roots a Session at and what it narrows a \
-         listing by, and a client holding some other spelling would narrow past its own work"
+        press_new_session(&mut pressed),
+        by_command,
+        "the press answers exactly as the command does"
+    );
+
+    let main = main_view(&pressed);
+    assert!(
+        !main.contains(ALREADY_ON_SCREEN),
+        "the Session left behind is no longer drawn: {main}"
+    );
+    assert_eq!(
+        main,
+        main_view(&asked),
+        "the Landing the press opened is the one `/new` opens"
     );
 }
 
-/// The Workspace this client runs in is one of the selector's entries, so
-/// moving it moves the entry too — and the added Workspace is reachable from
-/// the selector afterwards.
+/// Enter on the affordance while the Sidebar holds the keys opens the same
+/// Landing, and the reader is done choosing: the keys go to the Landing's
+/// composer, where the Prompt they opened it for is written.
 #[test]
-fn the_workspace_the_reader_added_stands_among_the_selectors_entries() {
+fn enter_on_the_new_session_affordance_opens_the_landing_and_hands_its_composer_the_keys() {
     let workspace = workspace_dir();
-    let added = workspace.path().join("notes");
-    std::fs::create_dir(&added).expect("create the directory the reader adds");
+    let open = SessionId::new();
+    let sessions = vec![listed_as(open, BEING_READ, workspace.path(), 1)];
+    let mut application = reading_one(workspace.path(), open, sessions.clone());
+    enter_the_sidebar(&mut application, sessions);
+
+    // Entering seeds row focus on the open Session's row, the first of the
+    // list, and the affordance stands just above it.
+    press_sidebar_key(&mut application, KeyCode::Up);
+    assert_eq!(
+        selected_sidebar_text(&application).trim(),
+        NEW_SESSION.to_string(),
+        "the arrows reach the affordance between the selector and the list"
+    );
+
+    assert_eq!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::DetachSession,
+        "Enter answers as `/new` does"
+    );
+    let main = main_view(&application);
+    assert!(
+        !main.contains(ALREADY_ON_SCREEN),
+        "the Landing stands where the Session was: {main}"
+    );
+
+    type_terminal_text(&mut application, "Begin");
+    let main = main_view(&application);
+    assert!(
+        main.contains("Begin"),
+        "what the reader types next is a Prompt in the Landing's composer: {main}"
+    );
+    assert!(
+        selected_sidebar_text(&application).is_empty(),
+        "and nothing in the column claims the keys any more"
+    );
+}
+
+/// The Sidebar names no directories: neither Enter nor a press on the
+/// affordance opens a path entry, the list stands where it stood, and nothing
+/// the reader types afterwards is taken as a path.
+#[test]
+fn no_path_entry_opens_from_the_sidebar_by_any_key_or_press() {
+    for gesture in ["Enter", "a press"] {
+        let workspace = workspace_dir();
+        let mut application = sidebar_focused(
+            workspace.path(),
+            vec![listed("Listed work", workspace.path(), 1, now())],
+        );
+
+        let transition = if gesture == "Enter" {
+            // Opening the Sidebar with no Session open leaves row focus on the
+            // selector, and the affordance is the next stop.
+            press_sidebar_key(&mut application, KeyCode::Down);
+            press_sidebar_key(&mut application, KeyCode::Enter)
+        } else {
+            press_new_session(&mut application)
+        };
+        assert_eq!(
+            transition,
+            ApplicationTransition::DetachSession,
+            "{gesture} on the affordance opens the Landing and resolves no path"
+        );
+        type_terminal_text(&mut application, "notes");
+
+        let rows = rendered_application_rows_at(&application, WIDE, 20);
+        assert!(
+            !drawn_in_sidebar(&rows, "Workspace:") && !drawn_in_sidebar(&rows, "notes"),
+            "after {gesture} no path entry is drawn, nor anything typed into one: {rows:?}"
+        );
+        assert!(
+            drawn_in_sidebar(&rows, "Listed work"),
+            "after {gesture} the list stands where it stood: {rows:?}"
+        );
+        assert!(
+            main_view(&application).contains("notes"),
+            "after {gesture} what the reader typed is a Prompt in the composer: {rows:?}"
+        );
+    }
+}
+
+/// The affordance invokes `/new` itself rather than something like it, so an
+/// Outlook whose Remote has stopped answering refuses it as it refuses the
+/// command, saying so where the reader can see it.
+#[test]
+fn the_new_session_affordance_is_refused_like_new_while_the_outlook_is_unreachable() {
+    let mut application = application_looking_at_studio();
+    let request = expect_sidebar_listing(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SidebarToggle,
+            )))
+            .expect("reveal the Sidebar"),
+    );
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: Vec::new(),
+        })
+        .expect("hydrate the Sidebar");
+    studio_stops_answering(&mut application, 1, Duration::from_secs(5));
+
+    assert_eq!(
+        press_new_session(&mut application),
+        ApplicationTransition::Continue,
+        "nothing is begun on a Remote that does not answer"
+    );
+    let screen = rendered_application_rows_at(&application, WIDE, 20).join("\n");
+    assert!(
+        screen.contains("studio is unreachable"),
+        "the refusal names the Remote where the reader can see it: {screen}"
+    );
+}
+
+/// The Workspace this client works in is one of the selector's entries,
+/// whether or not there is work there yet, so moving it — as choosing in the
+/// Workspace Picker does — moves the entry with it.
+#[test]
+fn the_workspace_the_reader_moved_to_stands_among_the_selectors_entries() {
+    let workspace = workspace_dir();
+    let notes = workspace.path().join("notes");
+    std::fs::create_dir(&notes).expect("create the Workspace the reader moves to");
     let mut application = sidebar_showing(
         workspace.path(),
         vec![listed(
@@ -7709,7 +7727,22 @@ fn the_workspace_the_reader_added_stands_among_the_selectors_entries() {
         )],
     );
 
-    add_workspace(&mut application, &added.to_string_lossy());
+    let listing = expect_workspace_picker_listing(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::WorkspaceList,
+            )))
+            .expect("open the Workspace Picker"),
+    );
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request: listing,
+            sessions: vec![listed("Notes work", &notes, 2, now())],
+        })
+        .expect("hydrate the Workspace Picker");
+    press_sidebar_key(&mut application, KeyCode::Down);
+    let chosen = press_sidebar_key(&mut application, KeyCode::Enter);
+    answer_workspace_resolution(&mut application, chosen);
     press_line(&mut application, MouseButton::Left, "▸ ");
 
     assert_eq!(
@@ -7720,426 +7753,8 @@ fn the_workspace_the_reader_added_stands_among_the_selectors_entries() {
             "notes".to_owned(),
             "suru".to_owned(),
         ],
-        "the Workspace the reader added is where the client now runs, and the \
+        "the Workspace the reader moved to is where the client now runs, and the \
          one it ran in before has no work to keep it on the list"
-    );
-}
-
-/// A path naming nothing is refused where the reader can see it, and the
-/// Sidebar goes on answering for the Workspace it was answering for.
-#[test]
-fn a_path_naming_no_directory_is_refused_inline_and_moves_nothing() {
-    let workspace = workspace_dir();
-    let mut application = sidebar_showing(
-        workspace.path(),
-        vec![listed("Listed work", workspace.path(), 1, now())],
-    );
-
-    let transition = add_workspace(
-        &mut application,
-        &workspace.path().join("absent").to_string_lossy(),
-    );
-
-    assert_eq!(
-        transition,
-        ApplicationTransition::Continue,
-        "a refused path asks nothing of the server"
-    );
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    assert_eq!(
-        sidebar_column(&rows[3]),
-        "No directory there",
-        "the refusal stands under the entry: {rows:?}"
-    );
-    assert!(
-        sidebar_column(&rows[2]).starts_with(WORKSPACE_ENTRY),
-        "the entry stands open for them to correct: {rows:?}"
-    );
-    assert!(
-        selector_label(&rows) == format!("▸ {ALL_WORKSPACES}"),
-        "and the scope is where it was: {rows:?}"
-    );
-}
-
-/// A path naming something other than a directory is refused for what it is:
-/// a Workspace is rooted at a directory, and a file is not one.
-#[test]
-fn a_path_naming_a_file_is_refused_as_something_other_than_a_directory() {
-    let workspace = workspace_dir();
-    let file = workspace.path().join("notes.md");
-    std::fs::write(&file, "not a directory").expect("write the file the reader names");
-    let mut application = sidebar_showing(workspace.path(), Vec::new());
-
-    add_workspace(&mut application, &file.to_string_lossy());
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    assert_eq!(
-        sidebar_column(&rows[3]),
-        "Not a directory",
-        "the refusal says what the path named: {rows:?}"
-    );
-}
-
-#[test]
-fn an_empty_path_is_refused_rather_than_taken() {
-    let workspace = workspace_dir();
-    let mut application = sidebar_showing(workspace.path(), Vec::new());
-
-    add_workspace(&mut application, "");
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    assert_eq!(
-        sidebar_column(&rows[3]),
-        "Name a directory",
-        "the reader is asked for the path they have not given: {rows:?}"
-    );
-}
-
-/// A refusal is about the path that was offered, so the next letter typed
-/// takes it away rather than leaving it standing over a path it never read.
-#[test]
-fn typing_after_a_refusal_takes_the_refusal_away() {
-    let workspace = workspace_dir();
-    let mut application = sidebar_showing(workspace.path(), Vec::new());
-    add_workspace(&mut application, "");
-
-    type_terminal_text(&mut application, "n");
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    assert_eq!(
-        sidebar_column(&rows[3]),
-        "",
-        "the refusal is done with: {rows:?}"
-    );
-}
-
-/// Esc backs the reader out one step at a time, and the entry they opened is
-/// the innermost of them.
-#[test]
-fn esc_gives_up_the_path_entry_and_leaves_the_workspace_where_it_was() {
-    let workspace = workspace_dir();
-    let added = workspace.path().join("notes");
-    std::fs::create_dir(&added).expect("create a directory the reader does not take");
-    let mut application = sidebar_showing(
-        workspace.path(),
-        vec![listed("Listed work", workspace.path(), 1, now())],
-    );
-    press_add_workspace(&mut application);
-    type_terminal_text(&mut application, &added.to_string_lossy());
-
-    press_sidebar_key(&mut application, KeyCode::Esc);
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    assert!(
-        selector_label(&rows) == format!("▸ {ALL_WORKSPACES}"),
-        "the scope is where it was: {rows:?}"
-    );
-    assert!(
-        drawn_in_sidebar(&rows, "Listed work"),
-        "and the list the entry stood in front of is back: {rows:?}"
-    );
-}
-
-#[test]
-fn esc_cancels_a_workspace_resolution_still_in_flight() {
-    let workspace = workspace_dir();
-    let added = workspace.path().join("notes");
-    std::fs::create_dir(&added).expect("create a directory the reader does not take");
-    let mut application = sidebar_showing(
-        workspace.path(),
-        vec![listed("Listed work", workspace.path(), 1, now())],
-    );
-    press_add_workspace(&mut application);
-    type_terminal_text(&mut application, &added.to_string_lossy());
-    let ApplicationTransition::ResolveWorkspace {
-        outlook,
-        surface,
-        request_id,
-        ..
-    } = press_sidebar_key(&mut application, KeyCode::Enter)
-    else {
-        panic!("offering the Sidebar path asks its Server to resolve it");
-    };
-
-    assert_eq!(
-        press_sidebar_key(&mut application, KeyCode::Esc),
-        ApplicationTransition::CancelWorkspaceResolution(
-            suru::tui::WorkspaceResolutionSurface::Sidebar,
-        )
-    );
-    application
-        .handle_event(ApplicationEvent::WorkspaceResolved {
-            outlook,
-            surface,
-            request_id,
-            result: Ok(suru::protocol::ResolvedWorkspace::directory(added)),
-        })
-        .expect("deliver the result that lost the cancellation race");
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    assert_eq!(selector_label(&rows), format!("▸ {ALL_WORKSPACES}"));
-    assert!(drawn_in_sidebar(&rows, "Listed work"));
-}
-
-#[test]
-fn editing_the_path_cancels_the_resolution_for_its_old_spelling() {
-    let workspace = workspace_dir();
-    let mut application = sidebar_showing(workspace.path(), Vec::new());
-    press_add_workspace(&mut application);
-    type_terminal_text(&mut application, "first");
-    let ApplicationTransition::ResolveWorkspace {
-        outlook,
-        surface,
-        request_id,
-        ..
-    } = press_sidebar_key(&mut application, KeyCode::Enter)
-    else {
-        panic!("offering the Sidebar path asks its Server to resolve it");
-    };
-
-    assert_eq!(
-        application
-            .handle_event(ApplicationEvent::Command(CommandId::InsertSidebarText(
-                "-corrected".to_owned(),
-            )))
-            .expect("correct the path while its first spelling resolves"),
-        ApplicationTransition::CancelWorkspaceResolution(
-            suru::tui::WorkspaceResolutionSurface::Sidebar,
-        )
-    );
-    application
-        .handle_event(ApplicationEvent::WorkspaceResolved {
-            outlook,
-            surface,
-            request_id,
-            result: Err("old spelling failed".to_owned()),
-        })
-        .expect("deliver the stale refusal");
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    assert!(sidebar_column(&rows[2]).contains("first-corrected"));
-    assert!(!rows.iter().any(|row| row.contains("old spelling failed")));
-}
-
-#[test]
-fn hiding_the_sidebar_cancels_its_workspace_resolution() {
-    let workspace = workspace_dir();
-    let added = workspace.path().join("notes");
-    std::fs::create_dir(&added).expect("create a directory the reader abandons");
-    let mut application = sidebar_showing(workspace.path(), Vec::new());
-    press_add_workspace(&mut application);
-    type_terminal_text(&mut application, &added.to_string_lossy());
-    let ApplicationTransition::ResolveWorkspace {
-        outlook,
-        surface,
-        request_id,
-        ..
-    } = press_sidebar_key(&mut application, KeyCode::Enter)
-    else {
-        panic!("offering the Sidebar path asks its Server to resolve it");
-    };
-
-    assert_eq!(
-        press_toggle(&mut application),
-        ApplicationTransition::CancelWorkspaceResolution(
-            suru::tui::WorkspaceResolutionSurface::Sidebar,
-        )
-    );
-    application
-        .handle_event(ApplicationEvent::WorkspaceResolved {
-            outlook,
-            surface,
-            request_id,
-            result: Ok(suru::protocol::ResolvedWorkspace::directory(added.clone())),
-        })
-        .expect("deliver the result that lost the hide race");
-    let ApplicationTransition::ListSessions(request) = application
-        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            SemanticCommandId::SessionList,
-        )))
-        .expect("open the Session picker")
-    else {
-        panic!("opening the Session picker asks for its Sessions");
-    };
-    assert_ne!(
-        request.scope(),
-        &SessionListScope::CurrentWorkspace((added).into())
-    );
-}
-
-/// The arrows reach the affordance as they reach the selector beside it: the
-/// Sidebar is drivable from the keyboard alone.
-#[test]
-fn the_arrows_reach_the_affordance_beside_the_selector() {
-    let workspace = workspace_dir();
-    let mut application = sidebar_focused(
-        workspace.path(),
-        vec![listed("Listed work", workspace.path(), 1, now())],
-    );
-
-    step_onto_the_list(&mut application);
-    press_sidebar_key(&mut application, KeyCode::Up);
-
-    assert_eq!(
-        selected_sidebar_text(&application).trim(),
-        ADD_WORKSPACE.to_string(),
-        "the affordance stands between the list and the selector it shares a line with"
-    );
-    press_sidebar_key(&mut application, KeyCode::Enter);
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    assert!(
-        sidebar_column(&rows[2]).starts_with(WORKSPACE_ENTRY),
-        "which Enter opens the path entry from: {rows:?}"
-    );
-}
-
-/// A path the reader gives relative is read from the Workspace they are
-/// working in rather than from wherever the process happened to be started,
-/// which is the same reading on every platform.
-#[test]
-fn a_relative_path_is_read_from_the_workspace_the_client_is_in() {
-    let workspace = workspace_dir();
-    std::fs::create_dir(workspace.path().join("notes")).expect("create the directory named");
-    let mut application = sidebar_showing(workspace.path(), Vec::new());
-
-    add_workspace(&mut application, "notes");
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    assert!(
-        selector_label(&rows) == "▸ notes",
-        "the path is read from where the reader works: {rows:?}"
-    );
-}
-
-/// Naming a Workspace is done from the Sidebar, but the work in it is written
-/// in the composer, so the keys go back the moment the Workspace is taken.
-#[test]
-fn taking_a_workspace_hands_the_keys_back_to_the_composer() {
-    let workspace = workspace_dir();
-    let added = workspace.path().join("notes");
-    std::fs::create_dir(&added).expect("create the directory the reader adds");
-    let mut application = sidebar_showing(workspace.path(), Vec::new());
-
-    add_workspace(&mut application, &added.to_string_lossy());
-    type_terminal_text(&mut application, "Begin");
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    let composer = rendered_row(&rows, "Begin");
-    assert!(
-        rows[composer].find("Begin").expect("the Prompt is drawn") > 31,
-        "what they type next is a Prompt in the composer: {:?}",
-        rows[composer]
-    );
-}
-
-/// The selector compares its scope against the Workspaces the server reports,
-/// which are canonical. A client narrowed to some other spelling of the same
-/// directory would hide the very Sessions it had just rooted there.
-#[test]
-fn the_workspace_taken_is_the_directory_read_the_way_the_server_reads_it() {
-    let workspace = workspace_dir();
-    let added = workspace.path().join("notes");
-    std::fs::create_dir(&added).expect("create the directory the reader adds");
-    let canonical = suru::paths::canonical(&added).expect("canonicalize it");
-    std::fs::create_dir(workspace.path().join("suru")).expect("create a Workspace beside it");
-    let mut application = sidebar_showing(workspace.path(), Vec::new());
-
-    // Spelled the long way round, by way of the Workspace next door.
-    add_workspace(
-        &mut application,
-        &workspace
-            .path()
-            .join("suru")
-            .join("..")
-            .join("notes")
-            .to_string_lossy(),
-    );
-
-    application
-        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
-            "Initial Prompt".to_owned(),
-        )))
-        .expect("type an initial Prompt");
-    let ApplicationTransition::CreateSession(request) = application
-        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
-        .expect("submit the initial Prompt")
-    else {
-        panic!("a Landing submission creates a Session");
-    };
-    assert_eq!(
-        request.execution_directory.path, canonical,
-        "the spelling the reader typed is not what is taken"
-    );
-
-    // And the Sidebar goes on drawing the work the server reports there, which
-    // it reports under the canonical Workspace.
-    let listing = reopen_the_sidebar(&mut application);
-    application
-        .handle_event(ApplicationEvent::SessionsListed {
-            request: listing,
-            sessions: vec![listed("Rooted work", &canonical, 1, now())],
-        })
-        .expect("hydrate the Sidebar");
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    assert!(
-        drawn_in_sidebar(&rows, "Rooted work"),
-        "the narrowed Sidebar lists the work rooted in the Workspace it narrowed to: {rows:?}"
-    );
-}
-
-/// A reader who opened the entry by pointing has to be able to be done with it
-/// the same way, so the line that opened it goes on answering the pointer.
-#[test]
-fn a_press_on_the_line_that_opened_the_entry_gives_it_up() {
-    let workspace = workspace_dir();
-    let mut application = sidebar_showing(
-        workspace.path(),
-        vec![listed("Listed work", workspace.path(), 1, now())],
-    );
-    press_add_workspace(&mut application);
-
-    assert_eq!(
-        press_add_workspace(&mut application),
-        ApplicationTransition::Continue,
-        "pointing at the affordance twice asks nothing of the server"
-    );
-
-    let rows = rendered_application_rows_at(&application, WIDE, 20);
-    assert!(
-        !sidebar_column(&rows[2]).starts_with(WORKSPACE_ENTRY),
-        "the entry is put away: {rows:?}"
-    );
-    assert!(
-        drawn_in_sidebar(&rows, "Listed work"),
-        "and the list it stood in front of is back: {rows:?}"
-    );
-}
-
-/// The Workspace the reader added is the client's, not the Sidebar's: the
-/// session picker narrows to "where I am" too, and where they are has moved.
-#[test]
-fn the_session_picker_narrows_to_the_workspace_the_reader_added() {
-    let workspace = workspace_dir();
-    let added = workspace.path().join("notes");
-    std::fs::create_dir(&added).expect("create the directory the reader adds");
-    let canonical = suru::paths::canonical(&added).expect("canonicalize it");
-    let mut application = sidebar_showing(workspace.path(), Vec::new());
-
-    add_workspace(&mut application, &added.to_string_lossy());
-
-    let opened = application
-        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
-            SemanticCommandId::SessionList,
-        )))
-        .expect("open the session picker");
-    let ApplicationTransition::ListSessions(request) = opened else {
-        panic!("opening the picker asks for its Sessions, not {opened:?}");
-    };
-    assert_eq!(
-        request.scope(),
-        &SessionListScope::CurrentWorkspace((canonical).into()),
-        "the picker asks for the Workspace the reader now works in"
     );
 }
 
@@ -10519,31 +10134,6 @@ fn the_wheel_answers_to_the_pointer_while_the_sidebar_has_the_keys() {
             "Search: row"
         ),
         "the keys are still the Sidebar's"
-    );
-}
-
-#[test]
-fn the_wheel_over_the_sidebar_does_nothing_while_a_path_entry_stands() {
-    let workspace = workspace_dir();
-    let mut application = sidebar_showing(workspace.path(), eight_listed(workspace.path()));
-    open_long_session(&mut application, workspace.path());
-    press_add_workspace(&mut application);
-    let sidebar_before = sidebar_rows(&application);
-    let main_before = main_view(&application);
-
-    wheel_at(&mut application, MouseEventKind::ScrollUp, SIDEBAR_CELL, 8);
-
-    assert_eq!(sidebar_rows(&application), sidebar_before);
-    assert_eq!(
-        main_view(&application),
-        main_before,
-        "a wheel over the Sidebar never falls through to the Transcript"
-    );
-
-    press_sidebar_key(&mut application, KeyCode::Esc);
-    assert!(
-        drawn_in_sidebar(&sidebar_rows(&application), "Row 1"),
-        "the list behind the entry was never moved"
     );
 }
 

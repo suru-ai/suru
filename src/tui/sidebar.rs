@@ -1,20 +1,13 @@
 //! The Sidebar: the collapsible column beside the main view listing Sessions.
 
-use std::{
-    cell::RefCell,
-    cmp::Reverse,
-    collections::HashSet,
-    ops::Range,
-    path::{Path, PathBuf},
-};
+use std::{cell::RefCell, cmp::Reverse, collections::HashSet, ops::Range, path::Path};
 
 use ratatui::layout::Position;
 
 use crate::protocol::{
-    AutoSettle, EffectiveSettings, Outlook, Remote, ResolveWorkspaceRequest, SessionId,
-    SessionListItem, SessionReference, SessionStandingInputs as ListedStandingInputs,
-    SessionTimestamp, SidebarScope as InitialSidebarScope, SidebarVisibility, StandingReading,
-    WorkspaceId,
+    AutoSettle, EffectiveSettings, Outlook, Remote, SessionId, SessionListItem, SessionReference,
+    SessionStandingInputs as ListedStandingInputs, SessionTimestamp,
+    SidebarScope as InitialSidebarScope, SidebarVisibility, StandingReading, WorkspaceId,
 };
 
 use super::{
@@ -41,13 +34,10 @@ const EVERYWHERE: &str = "Everywhere";
 /// scope entry draws.
 const SCOPE_ENTRY_FOLDER_GLYPH: char = '\u{ea83}';
 
-/// The affordance beside the selector, opening the path entry a reader names a
-/// Workspace in. It shares the selector's line, so it is drawn — and pressed —
-/// within its own columns of it.
-pub(super) const ADD_WORKSPACE: &str = " + ";
-
-/// What the path entry says when the reader offers it nothing.
-const NAME_A_DIRECTORY: &str = "Name a directory";
+/// The new-Session affordance beside the selector, which opens the Landing in
+/// the current Workspace exactly as `/new` does. It shares the selector's line,
+/// so it is drawn — and pressed — within its own columns of it.
+pub(super) const NEW_SESSION: &str = " + ";
 
 /// The population the Sidebar draws: every reachable Origin, every Workspace
 /// on the Outlook, or one Workspace on it.
@@ -122,7 +112,6 @@ impl SidebarListingScope {
 /// the Aside on the right. Everything else here is what the Sidebar lists.
 #[derive(Clone, Debug)]
 pub(super) struct Sidebar {
-    execution_directory: Option<PathBuf>,
     /// The column the Sidebar stands in. Whether the reader is driving the
     /// Sidebar rather than the composer is the column's claim on the keys:
     /// opening it themselves is what claims them; Esc, the toggle, and the
@@ -147,11 +136,6 @@ pub(super) struct Sidebar {
     /// are the list: the reader is choosing a Workspace rather than a Session,
     /// so both shelves stand down as they do under a query.
     selector_open: bool,
-    /// The path entry the affordance beside the selector opened, where one is
-    /// open. It stands in place of the list for the same reason the selector's
-    /// entries do — a reader saying where to work is not choosing what to open
-    /// — and it takes what they type, because a path is not a query.
-    workspace_entry: Option<WorkspaceEntry>,
     listing: SessionListing,
     /// The Origins participating in Everywhere, local first and followed by
     /// each paired non-terminal Remote in the order the local Server named it.
@@ -261,8 +245,8 @@ const SETTLED_SHELF_BATCH: usize = 25;
 /// Session, named by its id so the focus follows the work rather than the row
 /// it happened to be drawn on. The rest are the Sidebar's own affordances,
 /// which stand for no Session at all: the settled shelf's next batch, the Workspace
-/// selector above the list, and — while that stands open — one of the
-/// Workspaces it offers.
+/// selector above the list, the new-Session affordance beside it, and — while
+/// the selector stands open — one of the Workspaces it offers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SidebarFocus {
     /// The Workspace selector's own row, which stands above the list rather
@@ -270,30 +254,12 @@ enum SidebarFocus {
     Selector,
     /// One entry of the open selector, named by the scope it stands for.
     Scope(SidebarListingScope),
-    /// The affordance beside the selector, which Enter opens a path entry from
-    /// rather than attaching anything.
-    AddWorkspace,
+    /// The new-Session affordance beside the selector, which Enter opens the
+    /// Landing from rather than attaching anything.
+    NewSession,
     Session(SessionReference),
     Unreachable(Outlook),
     ShowMore,
-}
-
-/// The path a reader is naming a Workspace by, and how the last one they
-/// offered was refused.
-#[derive(Clone, Debug, Default)]
-struct WorkspaceEntry {
-    path: String,
-    /// Why the path they last offered was refused, and `None` before they have
-    /// offered one — or once they have typed anything since, because a refusal
-    /// is about the path it read rather than about the entry it stands under.
-    rejection: Option<String>,
-}
-
-/// The path entry as a frame draws it.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct SidebarWorkspaceEntryView<'a> {
-    pub(super) path: &'a str,
-    pub(super) rejection: Option<&'a str>,
 }
 
 /// One Session as the Sidebar draws it. The shelf it stands on decides its
@@ -451,10 +417,10 @@ pub(super) struct SidebarSelectorView {
     /// Whether the entries stand open beneath it.
     pub(super) open: bool,
     pub(super) focused: bool,
-    /// Whether the reader is on the add-Workspace affordance beside it, which
+    /// Whether the reader is on the new-Session affordance beside it, which
     /// shares the selector's line and is highlighted within its own columns of
     /// it.
-    pub(super) adding: bool,
+    pub(super) new_session_focused: bool,
 }
 
 /// The affordance closing a settled shelf with rows still under it.
@@ -583,7 +549,7 @@ pub(super) enum SidebarTarget {
     ShowMore,
     Selector,
     Scope(SidebarListingScope),
-    AddWorkspace,
+    NewSession,
 }
 
 /// The context menu as one frame drew it: the columns its box holds and where
@@ -652,14 +618,14 @@ pub(super) enum SidebarPress {
 
 /// What acting on the row the reader is on came to. Most rows stand for a
 /// Session and are attached; the rest are the Sidebar's own affordances, which
-/// it answers itself — except the one that names a Workspace, which is the
-/// client's to take rather than the Sidebar's.
+/// it answers itself — except the new-Session affordance, whose Landing is the
+/// client's to open rather than the Sidebar's.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[must_use]
 pub(super) enum SidebarActivation {
     /// The Sidebar answered it itself: the shelf opened further, the selector
-    /// opened or narrowed, a path was refused, or the reader was already on
-    /// the Session they asked for.
+    /// opened or narrowed, or the reader was already on the Session they asked
+    /// for.
     Answered,
     ListEverywhereRemotes,
     /// Narrowing from Everywhere changes which catalog streams the Client
@@ -674,10 +640,9 @@ pub(super) enum SidebarActivation {
         /// Origin turned toward to open it is furnished from.
         context: Box<crate::protocol::ResolvedWorkspace>,
     },
-    /// The reader named a directory to work in. It is the client's current
-    /// Workspace from here: the root of the Sessions they make next, and what
-    /// current-Workspace scope comes to mean.
-    ResolveWorkspace(ResolveWorkspaceRequest),
+    /// The reader asked for a fresh Landing in the current Workspace, which
+    /// the client opens by the very command `/new` invokes.
+    NewSession,
 }
 
 /// The items a Sidebar row's context menu offers. A recovering Remote offers
@@ -846,7 +811,6 @@ impl Sidebar {
     pub(super) fn new(current_workspace: impl Into<crate::protocol::Workspace>) -> Self {
         let current_workspace = current_workspace.into();
         Self {
-            execution_directory: Some(current_workspace.path.clone()),
             // Down until the initial-visibility Setting raises it. A Sidebar with no
             // Settings in hand has not spoken to a server either, so it has
             // nothing to list.
@@ -856,7 +820,6 @@ impl Sidebar {
             hide_subsessions: false,
             scope: SidebarListingScope::AllWorkspaces,
             selector_open: false,
-            workspace_entry: None,
             listing: SessionListing::scoped(
                 SessionListSurface::Sidebar,
                 current_workspace,
@@ -970,17 +933,12 @@ impl Sidebar {
     }
 
     /// Backs the reader out of the Sidebar one step at a time, which is what
-    /// Esc asks for. A path entry standing open is the innermost step, given up
-    /// with the path in it; the selector's entries are the next, being the
-    /// newest thing left that the reader opened; a query in hand is the next
-    /// after that, given up so
-    /// they go on driving the whole list they are back to. Only from there do
-    /// the keys go to the composer, leaving the Sidebar standing — done
+    /// Esc asks for. The selector's entries are the innermost step, being the
+    /// newest thing the reader opened; a query in hand is the next, given up
+    /// so they go on driving the whole list they are back to. Only from there
+    /// do the keys go to the composer, leaving the Sidebar standing — done
     /// choosing, not done looking.
     pub(super) fn leave(&mut self) {
-        if self.workspace_entry.take().is_some() {
-            return;
-        }
         if self.selector_open {
             self.close_selector();
             return;
@@ -997,41 +955,22 @@ impl Sidebar {
         &self.query
     }
 
-    /// Takes what the reader typed into the line they are typing into: the
-    /// path entry where one stands open, and the search box otherwise —
-    /// narrowing the list to the Sessions whose Titles carry it.
+    /// Takes what the reader typed into the search box, narrowing the list to
+    /// the Sessions whose Titles carry it.
     pub(super) fn insert(&mut self, text: &str) {
-        if let Some(entry) = self.path_being_typed() {
-            entry.path.push_str(text);
-            return;
-        }
         let before = self.focus_order_before_change();
         self.query.push_str(text);
         self.window.open();
         self.keep_focus_drawn(&before);
     }
 
-    /// Takes that line back a character, widening the results to match where
-    /// it is the query.
+    /// Takes the search box back a character, widening the results to match.
     pub(super) fn delete_backward(&mut self) {
-        if let Some(entry) = self.path_being_typed() {
-            entry.path.pop();
-            return;
-        }
         let before = self.focus_order_before_change();
         if self.query.pop().is_some() {
             self.window.open();
         }
         self.keep_focus_drawn(&before);
-    }
-
-    /// The path entry to type into, where one stands open — with whatever it
-    /// last refused given up, because a refusal is about the path it read and
-    /// the reader is changing that path.
-    fn path_being_typed(&mut self) -> Option<&mut WorkspaceEntry> {
-        let entry = self.workspace_entry.as_mut()?;
-        entry.rejection = None;
-        Some(entry)
     }
 
     /// Gives up the query and the results with it, putting the reader back on
@@ -1057,9 +996,6 @@ impl Sidebar {
     pub(super) fn hand_back_keys(&mut self) {
         self.column.hand_back_keys();
         self.menu = None;
-        // A path entry is a line the reader was typing into, and they have
-        // stopped typing.
-        self.workspace_entry = None;
         self.close_selector();
         self.clear_query();
         // Last, because putting the selector's entries away and giving up the
@@ -1102,10 +1038,9 @@ impl Sidebar {
     /// because a wheel over the Sidebar never reaches the Transcript beside
     /// it.
     ///
-    /// The list moves only where it is what the reader is looking at: a path
-    /// entry stands in place of it, and a menu is opened on rows that must
-    /// not move out from under it, so while either stands the step is spent
-    /// on nothing.
+    /// The list moves only where it is what the reader is looking at: a menu
+    /// is opened on rows that must not move out from under it, so while one
+    /// stands the step is spent on nothing.
     pub(super) fn wheel_at(
         &mut self,
         position: Position,
@@ -1115,7 +1050,7 @@ impl Sidebar {
         if !self.geometry.borrow().covers(position) {
             return false;
         }
-        if self.workspace_entry.is_none() && !self.menu_is_open() {
+        if !self.menu_is_open() {
             self.wheel(direction, lines);
         }
         true
@@ -1146,30 +1081,11 @@ impl Sidebar {
     /// whatever it was covering. Otherwise the press lands on a row, which
     /// takes row focus and is opened, or on one of the Sidebar's own
     /// affordances — the settled shelf's next batch, the Workspace selector,
-    /// one of the Workspaces it offers, or the affordance beside it that opens
-    /// a path entry. Every one of them is what Enter already
-    /// does from that row, so the press mints no behavior of its own: it says
-    /// which row, by a position only this frame can know, and the command does
-    /// the rest.
+    /// one of the Workspaces it offers, or the new-Session affordance beside
+    /// it. Every one of them is what Enter already does from that row, so the
+    /// press mints no behavior of its own: it says which row, by a position
+    /// only this frame can know, and the command does the rest.
     pub(super) fn press_at(&mut self, position: Position) -> SidebarPress {
-        // A path entry standing open is what the reader is doing, so a press on
-        // the line that opened it is a press to be done with it — the
-        // affordance because pointing at it twice is asking to be back where
-        // they started, and the selector beside it because reaching for the
-        // other control puts this one away. Either way the press is spent
-        // there: they are out of the entry, and what they do next is theirs to
-        // point at. The rest of the column draws nothing pressable while the
-        // entry stands, so nothing else can be pointed at anyway.
-        if self.workspace_entry.is_some() {
-            let hit = self.geometry.borrow().hit(position);
-            return match hit {
-                Some(SidebarTarget::Selector | SidebarTarget::AddWorkspace) => {
-                    self.workspace_entry = None;
-                    SidebarPress::Answered
-                }
-                _ => SidebarPress::Elsewhere,
-            };
-        }
         if self.menu_is_open() {
             let item = self.geometry.borrow().menu_hit(position);
             return match item {
@@ -1414,7 +1330,7 @@ impl Sidebar {
             SidebarTarget::ShowMore => SidebarFocus::ShowMore,
             SidebarTarget::Selector => SidebarFocus::Selector,
             SidebarTarget::Scope(scope) => SidebarFocus::Scope(scope),
-            SidebarTarget::AddWorkspace => SidebarFocus::AddWorkspace,
+            SidebarTarget::NewSession => SidebarFocus::NewSession,
         });
     }
 
@@ -1424,9 +1340,8 @@ impl Sidebar {
     /// the reader would come back to a mark a pointer left rather than to the
     /// Session they have open.
     ///
-    /// A press that takes the keys — the affordance opening a path entry is
-    /// the one such — keeps what it set, because by then the reader is
-    /// driving the Sidebar after all.
+    /// A press on a Sidebar that does have the keys keeps what it set, because
+    /// the reader is driving the Sidebar and the press only moved them.
     fn release_borrowed_focus(&mut self) {
         if !self.column.claims_keys() {
             self.focus = None;
@@ -1469,7 +1384,6 @@ impl Sidebar {
             // it is where the reader works rather than a look they were
             // taking.
             self.menu = None;
-            self.workspace_entry = None;
             self.close_selector();
             self.clear_query();
             self.window.open();
@@ -1960,19 +1874,16 @@ impl Sidebar {
     /// Acts on the row the reader is on, reporting the Session to attach where
     /// that is what the row asks for.
     ///
-    /// A path entry standing open is what Enter acts on first, whatever row the
-    /// reader came to it from: it is the line they are typing into, and
-    /// offering the path is the only thing acting on it can mean.
-    ///
     /// Standing on one of the Sidebar's own affordances it acts on that
     /// instead, and there is nothing to attach: the settled shelf's row brings
     /// up more of the shelf, the selector opens its entries, an entry narrows
-    /// the Sidebar to the Workspace it names, and the affordance beside the
-    /// selector opens the path entry. Nor is there anything to attach when the
-    /// row stands for a Session Suru could not read, or for the Session already
-    /// open — in which case Enter means only that the reader is done choosing,
-    /// and the composer takes the keys back. An unreachable Remote row retries
-    /// that Origin immediately and remains until a fresh snapshot arrives.
+    /// the Sidebar to the Workspace it names, and the new-Session affordance
+    /// beside the selector asks for the Landing `/new` opens. Nor is there
+    /// anything to attach when the row stands for a Session Suru could not
+    /// read, or for the Session already open — in which case Enter means only
+    /// that the reader is done choosing, and the composer takes the keys back.
+    /// An unreachable Remote row retries that Origin immediately and remains
+    /// until a fresh snapshot arrives.
     pub(super) fn activate(
         &mut self,
         open: Option<&SessionReference>,
@@ -1991,9 +1902,6 @@ impl Sidebar {
         open: Option<&SessionReference>,
         retry_open: bool,
     ) -> SidebarActivation {
-        if self.workspace_entry.is_some() {
-            return self.offer_workspace();
-        }
         let Some(focus) = self.focus.clone() else {
             return SidebarActivation::Answered;
         };
@@ -2025,9 +1933,12 @@ impl Sidebar {
                 }
                 return SidebarActivation::Answered;
             }
-            SidebarFocus::AddWorkspace => {
-                self.open_workspace_entry();
-                return SidebarActivation::Answered;
+            // The reader is done choosing: the Landing is where the Prompt
+            // they asked for it to write is written, so its composer takes
+            // the keys as an opened Session's does.
+            SidebarFocus::NewSession => {
+                self.hand_back_keys();
+                return SidebarActivation::NewSession;
             }
         };
         if !self.is_readable(&wanted) {
@@ -2054,102 +1965,15 @@ impl Sidebar {
         }
     }
 
-    /// Opens the path entry the affordance stands for.
-    ///
-    /// The selector's entries are put away: naming a Workspace and choosing
-    /// between the ones already known are two answers to the same question, and
-    /// only one of them is being asked. The keys come with it, however the
-    /// reader asked — a pointer as readily as Enter — because an entry nobody
-    /// can type into is no entry at all.
-    fn open_workspace_entry(&mut self) {
-        self.close_selector();
-        self.column.take_keys();
-        self.focus = Some(SidebarFocus::AddWorkspace);
-        self.workspace_entry = Some(WorkspaceEntry::default());
-    }
-
-    /// Reads the path the reader offered.
-    ///
-    /// A path given relative is read from the Workspace they are working in
-    /// rather than from wherever the process happened to be started, and an
-    /// absolute one replaces it outright — which is one reading of a path on
-    /// every platform, rather than a POSIX one dressed up as a general rule.
-    ///
-    /// What is taken is the canonical path rather than the spelling: the server
-    /// canonicalizes the Workspace it roots a Session at and the Workspace it
-    /// narrows a listing by, and this scope is compared against what comes back
-    /// from that listing. A client holding some other spelling of the same
-    /// directory would narrow to a Workspace none of its own Sessions matched
-    /// and offer the reader two selector entries of the same name — and would
-    /// do it on Windows always, where the canonical form carries a prefix no
-    /// reader types.
-    ///
-    /// Only a directory is taken: a Workspace is rooted at one, so a path
-    /// standing at a file or at nothing is refused where the reader can see it
-    /// and the entry stands open for them to correct. Nothing else moves — the
-    /// scope, the shelves, and the Sessions in them are as they were.
-    fn offer_workspace(&mut self) -> SidebarActivation {
-        let Some(entry) = self.workspace_entry.as_ref() else {
-            return SidebarActivation::Answered;
-        };
-        let named = entry.path.trim();
-        if named.is_empty() {
-            return self.refuse_workspace(NAME_A_DIRECTORY);
-        }
-        SidebarActivation::ResolveWorkspace(ResolveWorkspaceRequest {
-            checkout_id: None,
-            remembered_execution_directory: None,
-            workspace_id: None,
-            base: self.execution_directory.clone(),
-            path: PathBuf::from(named),
-        })
-    }
-
-    /// Draws the refusal under the entry, leaving it open on the path that
-    /// earned it.
-    fn refuse_workspace(&mut self, rejection: impl Into<String>) -> SidebarActivation {
-        if let Some(entry) = &mut self.workspace_entry {
-            entry.rejection = Some(rejection.into());
-        }
-        SidebarActivation::Answered
-    }
-
-    pub(super) fn accept_workspace(
-        &mut self,
-        workspace: impl Into<crate::protocol::Workspace>,
-    ) -> SidebarActivation {
-        let workspace = workspace.into();
-        let left_everywhere = self.scope == SidebarListingScope::Everywhere;
-        self.hand_back_keys();
-        self.adopt_workspace(workspace.clone());
-        self.narrow_to_workspace(workspace);
-        if left_everywhere {
-            SidebarActivation::CatalogOriginsChanged
-        } else {
-            SidebarActivation::Answered
-        }
-    }
-
-    pub(super) fn fail_workspace_resolution(&mut self, error: String) {
-        let _ = self.refuse_workspace(error);
-    }
-
     /// Takes the Workspace this client has moved to, however it moved.
     ///
     /// Only what "where I am" means moves with it: the selector's entries and
     /// a scope narrowed to the current Workspace are derived from the
     /// listing's reading of it. The scope the reader chose is left exactly
     /// where they put it — switching Workspaces is navigation, and narrowing
-    /// the column is a view they configured — so re-pointing it is the
-    /// separate act [`Self::narrow_to_workspace`] is for.
-    pub(super) fn adopt_execution_directory(&mut self, execution_directory: Option<PathBuf>) {
-        self.execution_directory = execution_directory;
-    }
-
+    /// the column is a view they configured.
     pub(super) fn adopt_workspace(&mut self, workspace: impl Into<crate::protocol::Workspace>) {
-        let workspace = workspace.into();
-        self.execution_directory = Some(workspace.path.clone());
-        self.listing.adopt_current_workspace(workspace);
+        self.listing.adopt_current_workspace(workspace.into());
     }
 
     /// Turns the column toward another Outlook. The rows it already holds for
@@ -2165,7 +1989,6 @@ impl Sidebar {
         self.attaching = None;
         self.deleting = None;
         self.menu = None;
-        self.workspace_entry = None;
         self.awaiting_dispatch.clear();
         self.everywhere_remote_dispatch_pending = false;
         self.pending_everywhere_remotes = None;
@@ -2217,33 +2040,6 @@ impl Sidebar {
             return;
         }
         self.revisit_origin_on_show();
-    }
-
-    /// Narrows the Sidebar to the Workspace the reader named at its own path
-    /// entry, which is the one switch that re-points the column with it: a
-    /// reader who has just said where they work, in the Sidebar, is saying
-    /// which work they mean. The settled shelf opens on its first rows again
-    /// as it does under any other narrowing, and nothing is asked of the
-    /// server — the listing is the whole body of work either way.
-    ///
-    /// Nothing is left marked. Taking the Workspace handed the keys back to
-    /// the composer, and row focus went with them: what the column says now is
-    /// which Session is open and which Workspace it is narrowed to, neither of
-    /// which is a claim about where Enter would land.
-    pub(super) fn narrow_to_workspace(&mut self, workspace: impl Into<crate::protocol::Workspace>) {
-        let workspace = workspace.into();
-        self.choose_scope(SidebarListingScope::Workspace(workspace));
-    }
-
-    /// The path entry as a frame draws it, and `None` where there is none to
-    /// draw.
-    pub(super) fn workspace_entry(&self) -> Option<SidebarWorkspaceEntryView<'_>> {
-        self.workspace_entry
-            .as_ref()
-            .map(|entry| SidebarWorkspaceEntryView {
-                path: &entry.path,
-                rejection: entry.rejection.as_deref(),
-            })
     }
 
     /// Brings up the next of the settled shelf. Where that was the whole of
@@ -2318,7 +2114,7 @@ impl Sidebar {
                 .label(name),
             open: self.selector_open,
             focused: self.focus == Some(SidebarFocus::Selector),
-            adding: self.focus == Some(SidebarFocus::AddWorkspace),
+            new_session_focused: self.focus == Some(SidebarFocus::NewSession),
         }
     }
 
@@ -2522,23 +2318,14 @@ impl Sidebar {
 
     /// The Sidebar's body top to bottom: the active Sessions, recovering
     /// Remotes, then the divider and as much of the settled shelf as is on show
-    /// — or, while the reader is searching, the results in place of both;
+    /// — or, while the reader is searching, the results in place of both; and
     /// while they are choosing a Workspace, the selector's own entries in
-    /// place of everything; and while they are naming one, nothing at all.
+    /// place of everything.
     ///
     /// Everything the Sidebar has to say about what stands where is said here
     /// and nowhere else, so the rows the frame draws and the rows the arrows
     /// walk can never disagree.
     fn body(&self) -> Vec<BodyEntry<'_>> {
-        // A path entry stands in place of the whole list, for the same reason
-        // the selector's entries do and more so: a reader saying where to work
-        // is not choosing what to open, and what they type is a path rather
-        // than a query the list could answer. Standing for no rows also stands
-        // the tick down, because [`Self::shows_live_work`] reads this body: a
-        // column drawing no work has none to animate.
-        if self.workspace_entry.is_some() {
-            return Vec::new();
-        }
         // The entries stand in place of both shelves, as the results of a query
         // do: a reader choosing where to look is not choosing what to open.
         if self.selector_open {
@@ -2786,12 +2573,6 @@ impl Sidebar {
     /// reader is inside the control rather than on it, and Esc is the way back
     /// out.
     fn focusable(&self) -> Vec<SidebarFocus> {
-        // A path entry is the one thing a reader with one open is doing, so the
-        // affordance that opened it is the one place they can be: the arrows
-        // have nowhere to walk while they are saying where to work.
-        if self.workspace_entry.is_some() {
-            return vec![SidebarFocus::AddWorkspace];
-        }
         let rows = self.body().into_iter().filter_map(|entry| match entry {
             BodyEntry::Session(row, _) => row
                 .readable()
@@ -2804,7 +2585,7 @@ impl Sidebar {
         if self.selector_open {
             return rows.collect();
         }
-        [SidebarFocus::Selector, SidebarFocus::AddWorkspace]
+        [SidebarFocus::Selector, SidebarFocus::NewSession]
             .into_iter()
             .chain(rows)
             .collect()
@@ -3145,7 +2926,7 @@ fn nearest_surviving(
 fn first_row(focusable: &[SidebarFocus]) -> Option<SidebarFocus> {
     focusable
         .iter()
-        .find(|entry| !matches!(entry, SidebarFocus::Selector | SidebarFocus::AddWorkspace))
+        .find(|entry| !matches!(entry, SidebarFocus::Selector | SidebarFocus::NewSession))
         .cloned()
 }
 
@@ -4144,7 +3925,7 @@ mod tests {
     }
 
     #[test]
-    fn the_wheel_is_spent_on_nothing_while_a_menu_or_a_path_entry_stands() {
+    fn the_wheel_is_spent_on_nothing_while_a_menu_stands() {
         let wanted = SessionReference::new(Outlook::Local, SessionId::new());
         let mut shelf = set_aside_shelf(12);
         identify(&mut shelf, 0, wanted.session_id);
@@ -4175,20 +3956,6 @@ mod tests {
             "but the rows stay under the menu opened on them"
         );
         assert!(sidebar.menu_is_open());
-
-        sidebar.close_menu();
-        sidebar.open_workspace_entry();
-        assert!(sidebar.wheel_at(
-            Position::new(4, 3),
-            ScrollDirection::Down,
-            WHEEL_SCROLL_ROWS
-        ));
-        sidebar.leave();
-        assert_eq!(
-            drawn_within(&sidebar, 5),
-            opening,
-            "nor does a wheel over a path entry move the list standing behind it"
-        );
     }
 
     #[test]

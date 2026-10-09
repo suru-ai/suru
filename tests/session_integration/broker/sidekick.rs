@@ -991,7 +991,7 @@ async fn beneath_a_repository_the_sidekick_workspace_keeps_a_directory_workspace
     assert_eq!(resolved.workspace.id, WorkspaceId::directory(&directory));
     assert_eq!(resolved.workspace.path, directory);
 
-    let path_entry = reqwest::Client::new()
+    let named = reqwest::Client::new()
         .post(format!("{}/v1/workspaces/resolve", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&ResolveWorkspaceRequest {
@@ -1010,7 +1010,7 @@ async fn beneath_a_repository_the_sidekick_workspace_keeps_a_directory_workspace
         .await
         .expect("decode the resolution");
     assert_eq!(
-        path_entry.workspace.id, resolved.workspace.id,
+        named.workspace.id, resolved.workspace.id,
         "naming the directory resolves the same Workspace"
     );
 

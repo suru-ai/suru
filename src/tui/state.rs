@@ -81,7 +81,6 @@ use super::{
     serve_overlay::{ServeOverlay, ServeRequest, ServeWays},
     session_picker::{SessionPicker, SessionPickerListing},
     settings_panel::{AvailabilityRead, SettingsPanel},
-    side_column::ToggleStep,
     sidebar::{Sidebar, SidebarActivation, SidebarPress},
     slots::RenderSlots,
     subagent_picker::{SubagentPicker, working_subagents},
@@ -323,7 +322,6 @@ pub enum WorkspaceResolutionSurface {
     /// A Workspace chosen in the Workspace Picker, whose Landing the reader
     /// already stands on while its Server answers.
     WorkspacePicker,
-    Sidebar,
     /// `/sidekick`, which opens the Landing in the Sidekick Workspace once
     /// the Outlook's Server has answered with it.
     Sidekick,
@@ -1061,18 +1059,16 @@ impl TuiState {
     }
 
     /// Takes the Workspace this client works in, which the reader moved by
-    /// choosing one in the Workspace Picker or by naming a directory in the
-    /// Sidebar.
+    /// choosing one in the Workspace Picker.
     ///
     /// It is where the Sessions they make next are rooted, the Workspace the
-    /// Skill Catalog answers for, what current-Workspace scope comes to mean,
-    /// and the base a relative path is read from, so every surface holding a
-    /// reading of it is given the new one here rather than being left to
-    /// answer for a Workspace the reader has left.
+    /// Skill Catalog answers for, and what current-Workspace scope comes to
+    /// mean, so every surface holding a reading of it is given the new one
+    /// here rather than being left to answer for a Workspace the reader has
+    /// left.
     ///
     /// Adoption is all this is. The Sidebar's own scope is the reader's to
-    /// choose, and the path entry re-points it separately, so nothing here
-    /// rearranges a column they configured.
+    /// choose, so nothing here rearranges a column they configured.
     fn adopt_context(&mut self, context: crate::protocol::ResolvedWorkspace) {
         if self.workspace.id != context.workspace.id
             || self.execution_directory.as_ref()
@@ -1105,8 +1101,6 @@ impl TuiState {
         self.workspace_picker
             .adopt_workspace(context.workspace.clone());
         self.sidebar.adopt_workspace(context.workspace);
-        self.sidebar
-            .adopt_execution_directory(self.execution_directory.clone());
         self.sync_composer_completion();
     }
 
@@ -1330,8 +1324,6 @@ impl TuiState {
         self.workspace_picker
             .adopt_workspace(self.workspace.clone());
         self.sidebar.adopt_workspace(self.workspace.clone());
-        self.sidebar
-            .adopt_execution_directory(self.execution_directory.clone());
         self.session_picker.adopt_outlook(outlook.clone());
         self.workspace_picker.adopt_outlook(outlook.clone());
         if let Some(paths) = self.workspace_paths.get(&outlook) {
@@ -1422,8 +1414,8 @@ impl TuiState {
     /// Only the Landing's naming of the Workspace moves at once, because its
     /// name is all the client knows of it. Everything else that reads where
     /// the client works — its Execution Directory and Worktree, the Skill
-    /// Catalog, current-Workspace scope, the base a relative path is read
-    /// from — stays with the context last resolved until the answer adopts
+    /// Catalog, current-Workspace scope — stays with the context last resolved
+    /// until the answer adopts
     /// the chosen one in full, and nothing acts on the chosen one before
     /// then: the Landing begins no Session and offers no Worktree in a place
     /// the Server has yet to say.
@@ -5026,8 +5018,7 @@ pub enum CommandId {
     ActivateCompletion(CompletionMode),
     InsertSessionSearch(String),
     DeleteSessionSearchBackward,
-    /// What the reader typed into the line the Sidebar has them typing into:
-    /// its search box, or the path entry standing open over it.
+    /// What the reader typed into the Sidebar's search box.
     InsertSidebarText(String),
     DeleteSidebarTextBackward,
     SelectPreviousSession,
@@ -6233,27 +6224,6 @@ impl Application {
                                 Ok(ApplicationTransition::Continue)
                             }
                             WorkspaceResolutionSurface::Sidekick => Ok(self.open_landing()),
-                            WorkspaceResolutionSurface::Sidebar => {
-                                let activation =
-                                    self.state.sidebar.accept_workspace(workspace.workspace);
-                                self.state.sidebar.adopt_execution_directory(
-                                    self.state.execution_directory.clone(),
-                                );
-                                match activation {
-                                    SidebarActivation::CatalogOriginsChanged => {
-                                        Ok(ApplicationTransition::ReconcileCatalogOrigins {
-                                            catalog_origins: self.state.catalog_origins(),
-                                            requests: Vec::new(),
-                                        })
-                                    }
-                                    SidebarActivation::Answered => {
-                                        Ok(ApplicationTransition::Continue)
-                                    }
-                                    activation => unreachable!(
-                                        "accepting a resolved Sidebar Workspace cannot yield {activation:?}"
-                                    ),
-                                }
-                            }
                         }
                     }
                     Err(error) => {
@@ -6285,9 +6255,6 @@ impl Application {
                                     self.state.workspace_name(&self.state.outlook, &chosen.path);
                                 self.state.submission_error =
                                     Some(format!("Could not open the {name} Workspace: {error}"));
-                            }
-                            WorkspaceResolutionSurface::Sidebar => {
-                                self.state.sidebar.fail_workspace_resolution(error);
                             }
                         }
                         Ok(ApplicationTransition::Continue)
@@ -7392,19 +7359,7 @@ impl Application {
     fn answer_sidebar_press(&mut self, press: SidebarPress) -> Result<ApplicationTransition> {
         match press {
             SidebarPress::Invoke(invocation) => self.invoke_semantic(invocation),
-            SidebarPress::Answered => {
-                let cancelled = self
-                    .state
-                    .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
-                Ok(if cancelled {
-                    ApplicationTransition::CancelWorkspaceResolution(
-                        WorkspaceResolutionSurface::Sidebar,
-                    )
-                } else {
-                    ApplicationTransition::Continue
-                })
-            }
-            SidebarPress::Elsewhere => Ok(ApplicationTransition::Continue),
+            SidebarPress::Answered | SidebarPress::Elsewhere => Ok(ApplicationTransition::Continue),
         }
     }
 
@@ -7849,28 +7804,15 @@ impl Application {
         ApplicationTransition::Continue
     }
 
-    /// Handles what the reader typed into the Sidebar; any other command leaves
-    /// the line they are typing into alone. A Sidebar the reader has closed takes
-    /// no typing, for the same reason it takes no arrows.
+    /// Handles what the reader typed into the Sidebar's search box; any other
+    /// command leaves it alone. A Sidebar the reader has closed takes no
+    /// typing, for the same reason it takes no arrows.
     fn handle_sidebar_text_command(&mut self, command: CommandId) -> ApplicationTransition {
         if self.state.sidebar.is_revealed() {
-            let edits = matches!(
-                &command,
-                CommandId::InsertSidebarText(_) | CommandId::DeleteSidebarTextBackward
-            );
-            let cancelled = edits
-                && self
-                    .state
-                    .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
             match command {
                 CommandId::InsertSidebarText(text) => self.state.sidebar.insert(&text),
                 CommandId::DeleteSidebarTextBackward => self.state.sidebar.delete_backward(),
                 _ => {}
-            }
-            if cancelled {
-                return ApplicationTransition::CancelWorkspaceResolution(
-                    WorkspaceResolutionSurface::Sidebar,
-                );
             }
         }
         ApplicationTransition::Continue
@@ -7879,82 +7821,68 @@ impl Application {
     /// Handles the Sidebar commands routed here; any other command leaves the
     /// Sidebar alone. A Sidebar the reader has closed is not one they are
     /// driving, so nothing routed here acts on a list nobody can see.
-    fn handle_sidebar_command(&mut self, command: SemanticCommandId) -> ApplicationTransition {
+    fn handle_sidebar_command(
+        &mut self,
+        command: SemanticCommandId,
+    ) -> Result<ApplicationTransition> {
         if !self.state.sidebar.is_revealed() {
-            return ApplicationTransition::Continue;
+            return Ok(ApplicationTransition::Continue);
         }
         match command {
             SemanticCommandId::SidebarPrevious => self.state.sidebar.focus_previous(),
             SemanticCommandId::SidebarNext => self.state.sidebar.focus_next(),
-            SemanticCommandId::SidebarLeave => {
-                let cancelled = self
-                    .state
-                    .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
-                self.state.sidebar.leave();
-                if cancelled {
-                    return ApplicationTransition::CancelWorkspaceResolution(
-                        WorkspaceResolutionSurface::Sidebar,
-                    );
-                }
-            }
+            SemanticCommandId::SidebarLeave => self.state.sidebar.leave(),
             SemanticCommandId::SidebarAttach => {
                 let open = self.state.route.clone();
                 let retry_open = self.state.open_session_can_retry();
-                return match self.state.sidebar.activate(open.as_ref(), retry_open) {
-                    SidebarActivation::Answered => ApplicationTransition::Continue,
-                    SidebarActivation::ListEverywhereRemotes => {
-                        ApplicationTransition::ListEverywhereRemotes(
-                            self.state
-                                .sidebar
-                                .take_everywhere_remote_request()
-                                .expect("choosing Everywhere queues its Remote discovery"),
-                        )
-                    }
-                    SidebarActivation::CatalogOriginsChanged => {
-                        ApplicationTransition::ReconcileCatalogOrigins {
-                            catalog_origins: self.state.catalog_origins(),
-                            requests: Vec::new(),
+                return Ok(
+                    match self.state.sidebar.activate(open.as_ref(), retry_open) {
+                        SidebarActivation::Answered => ApplicationTransition::Continue,
+                        SidebarActivation::ListEverywhereRemotes => {
+                            ApplicationTransition::ListEverywhereRemotes(
+                                self.state
+                                    .sidebar
+                                    .take_everywhere_remote_request()
+                                    .expect("choosing Everywhere queues its Remote discovery"),
+                            )
                         }
-                    }
-                    // The `[unreachable]` row's offer is the banner's, on the
-                    // same terms: a login where one is needed, else a retry.
-                    SidebarActivation::RetryOrigin(outlook) => self.retry_origin(outlook),
-                    // Enter and a press both arrive here, so both open the
-                    // Session the same way: the route moves now and the
-                    // attach follows it.
-                    SidebarActivation::Attach { session, context } => {
-                        if session.origin == self.state.outlook {
-                            self.state.open_session_route(session.clone());
-                            ApplicationTransition::ViewAndAttachSession(session)
-                        } else {
-                            self.state
-                                .turn_outlook_for_session(session.clone(), *context);
-                            ApplicationTransition::TurnOutlookAndViewAndAttach {
+                        SidebarActivation::CatalogOriginsChanged => {
+                            ApplicationTransition::ReconcileCatalogOrigins {
                                 catalog_origins: self.state.catalog_origins(),
-                                session,
+                                requests: Vec::new(),
                             }
                         }
-                    }
-                    // The path entry is a local act inside the Sidebar as
-                    // well as a switch, so it does both: the client moves, and
-                    // the column the reader typed into narrows to what they
-                    // just said they meant.
-                    SidebarActivation::ResolveWorkspace(request) => {
-                        let request_id = self
-                            .state
-                            .begin_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
-                        ApplicationTransition::ResolveWorkspace {
-                            outlook: self.state.outlook.clone(),
-                            surface: WorkspaceResolutionSurface::Sidebar,
-                            request_id,
-                            request,
+                        // The `[unreachable]` row's offer is the banner's, on the
+                        // same terms: a login where one is needed, else a retry.
+                        SidebarActivation::RetryOrigin(outlook) => self.retry_origin(outlook),
+                        // Enter and a press both arrive here, so both open the
+                        // Session the same way: the route moves now and the
+                        // attach follows it.
+                        SidebarActivation::Attach { session, context } => {
+                            if session.origin == self.state.outlook {
+                                self.state.open_session_route(session.clone());
+                                ApplicationTransition::ViewAndAttachSession(session)
+                            } else {
+                                self.state
+                                    .turn_outlook_for_session(session.clone(), *context);
+                                ApplicationTransition::TurnOutlookAndViewAndAttach {
+                                    catalog_origins: self.state.catalog_origins(),
+                                    session,
+                                }
+                            }
                         }
-                    }
-                };
+                        // The new-Session affordance stands for `/new`, so it
+                        // invokes that very command, refused as it is wherever the
+                        // Outlook cannot be reached.
+                        SidebarActivation::NewSession => {
+                            return self.invoke_semantic(SemanticCommandId::SessionNew);
+                        }
+                    },
+                );
             }
             _ => {}
         }
-        ApplicationTransition::Continue
+        Ok(ApplicationTransition::Continue)
     }
 
     fn handle_sidebar_width_command(
@@ -10402,7 +10330,7 @@ impl Application {
             command @ (SemanticCommandId::SidebarPrevious
             | SemanticCommandId::SidebarNext
             | SemanticCommandId::SidebarAttach
-            | SemanticCommandId::SidebarLeave) => Ok(self.handle_sidebar_command(command)),
+            | SemanticCommandId::SidebarLeave) => self.handle_sidebar_command(command),
             command @ (SemanticCommandId::SidebarWiden
             | SemanticCommandId::SidebarNarrow
             | SemanticCommandId::SidebarWidthSet { .. }
@@ -10471,23 +10399,12 @@ impl Application {
                 }
             }
             SemanticCommandId::SidebarToggle => {
-                // Reaching a Sidebar already on screen takes nothing from it;
-                // showing or hiding it gives up a path the reader had offered.
-                let cancelled = self.state.sidebar.column().toggle_step() != ToggleStep::TakeKeys
-                    && self
-                        .state
-                        .cancel_workspace_resolution(WorkspaceResolutionSurface::Sidebar);
                 let open = self.state.sidebar_highlight();
                 self.state.sidebar.toggle(open.as_ref());
                 if self.state.sidebar.column().claims_keys() {
                     self.state.aside.hand_back_keys();
                 }
                 self.state.command_mode = CommandMode::Composer;
-                if cancelled {
-                    return Ok(ApplicationTransition::CancelWorkspaceResolution(
-                        WorkspaceResolutionSurface::Sidebar,
-                    ));
-                }
                 Ok(self.take_session_listing_transition())
             }
             SemanticCommandId::RemoteRetry => Ok(match invocation.subject {

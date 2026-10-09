@@ -47,9 +47,9 @@ use super::{
     shimmer,
     side_column::{self, SideColumn},
     sidebar::{
-        self, ADD_WORKSPACE, SessionStanding, Sidebar, SidebarEntry, SidebarMenuGeometry,
+        self, NEW_SESSION, SessionStanding, Sidebar, SidebarEntry, SidebarMenuGeometry,
         SidebarMenuItem, SidebarRow, SidebarScopeEntry, SidebarSelectorView, SidebarShelf,
-        SidebarShowMore, SidebarSpan, SidebarTarget, SidebarUnreachable, SidebarWorkspaceEntryView,
+        SidebarShowMore, SidebarSpan, SidebarTarget, SidebarUnreachable,
     },
     slots::{
         ApplicationNoticeSlotContext, LandingFooterSlotContext, PromptContextSlotContext,
@@ -3812,7 +3812,7 @@ fn sidebar_lines(
     // insets, so the spans run out to the rule rather than to the content.
     let split = content
         .right()
-        .saturating_sub(u16::try_from(ADD_WORKSPACE.width()).unwrap_or_default());
+        .saturating_sub(u16::try_from(NEW_SESSION.width()).unwrap_or_default());
     let mut rows = vec![
         SidebarSpan {
             rows: selector_rows.clone(),
@@ -3822,17 +3822,9 @@ fn sidebar_lines(
         SidebarSpan {
             rows: selector_rows,
             columns: Some(split..content.right().saturating_add(1)),
-            target: SidebarTarget::AddWorkspace,
+            target: SidebarTarget::NewSession,
         },
     ];
-    // A path entry stands in place of the list, so nothing below the selector's
-    // line is pressable while it stands — but the line itself goes on answering
-    // the pointer, because a reader who opened the entry by pointing has to be
-    // able to be done with it the same way.
-    if let Some(entry) = state.sidebar.workspace_entry() {
-        lines.extend(sidebar_workspace_entry_lines(&entry, width, theme));
-        return (lines, rows, Vec::new());
-    }
     let capacity = usize::from(content.height).saturating_sub(lines.len());
     let entries =
         state
@@ -4041,8 +4033,8 @@ fn sidebar_unreachable_lines(
 /// The Workspace selector: what the Sidebar is narrowed to, with the affordance
 /// that opens its entries — the same one the settings panel opens a row's
 /// choices with, because it is the same gesture on the same kind of list — and,
-/// at the right of the line, the affordance that opens a path entry for a
-/// Workspace the Sidebar has never listed.
+/// at the right of the line, the new-Session affordance that opens the Landing
+/// in the current Workspace.
 ///
 /// The two share the line and are highlighted apart, each within its own
 /// columns, because the reader is on one or the other and the frame has to say
@@ -4057,44 +4049,17 @@ fn sidebar_selector_line(
     Line::from(vec![
         sidebar_plain_span(
             &format!("{affordance}{}", selector.label),
-            width.saturating_sub(ADD_WORKSPACE.width()),
+            width.saturating_sub(NEW_SESSION.width()),
             sidebar_focus_style(selector.focused, driving, theme),
             theme.text.subdued,
         ),
         sidebar_plain_span(
-            ADD_WORKSPACE,
-            ADD_WORKSPACE.width(),
-            sidebar_focus_style(selector.adding, driving, theme),
+            NEW_SESSION,
+            NEW_SESSION.width(),
+            sidebar_focus_style(selector.new_session_focused, driving, theme),
             theme.text.subdued,
         ),
     ])
-}
-
-/// The path entry the add-Workspace affordance opens, standing in place of the
-/// list.
-///
-/// It is drawn as the search box is — a label and what the reader has typed,
-/// held to its end so the part of a long path that says which directory it is
-/// stays in view — with what their last path was refused for beneath it.
-fn sidebar_workspace_entry_lines(
-    entry: &SidebarWorkspaceEntryView<'_>,
-    width: usize,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    const LABEL: &str = "Workspace: ";
-    let mut lines = vec![Line::from(vec![
-        Span::styled(LABEL, theme.text.subdued),
-        Span::styled(
-            tail_to_width(entry.path, width.saturating_sub(LABEL.width())),
-            theme.text.primary,
-        ),
-    ])];
-    lines.extend(
-        entry.rejection.map(|rejection| {
-            Line::styled(truncate_to_width(rejection, width), theme.feedback.error)
-        }),
-    );
-    lines
 }
 
 /// One Workspace the open selector offers, stepped in past the affordance that

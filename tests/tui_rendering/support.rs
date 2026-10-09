@@ -300,9 +300,9 @@ pub fn open_at(port: u16) -> suru::protocol::ListenerState {
 }
 
 // The Sidebar as a rendering test reads it: the column's own geometry, what its
-// selector says, and the path entry the add-Workspace affordance opens. Every
-// test that reads a Sidebar shares these, because the geometry is the frame's
-// rather than any one area's.
+// selector says, and the new-Session affordance beside it. Every test that
+// reads a Sidebar shares these, because the geometry is the frame's rather
+// than any one area's.
 
 /// Wide enough for the Sidebar and a main view both.
 pub const SIDEBAR_WIDE: u16 = 100;
@@ -310,13 +310,13 @@ pub const SIDEBAR_WIDE: u16 = 100;
 /// Tall enough that the rows a press lands on are drawn.
 pub const SIDEBAR_PRESS_HEIGHT: u16 = 20;
 
-/// The screen row the selector and its add-Workspace affordance share, which
-/// is the line under the Sidebar's search box.
+/// The screen row the selector and its new-Session affordance share, which is
+/// the line under the Sidebar's search box.
 pub const SELECTOR_ROW: u16 = 1;
 
-/// What the add-Workspace affordance is drawn as, beside the selector on its
-/// own line.
-pub const ADD_WORKSPACE: char = '+';
+/// What the new-Session affordance is drawn as, beside the selector on its own
+/// line.
+pub const NEW_SESSION: char = '+';
 
 /// The Sidebar's own columns of one rendered row, trimmed of the padding that
 /// holds them apart from the main view beside them.
@@ -333,22 +333,22 @@ pub fn drawn_in_sidebar(rows: &[String], needle: &str) -> bool {
 }
 
 /// What the selector says, read off the label region of the line it shares
-/// with the add-Workspace affordance.
+/// with the new-Session affordance.
 pub fn selector_label(rows: &[String]) -> String {
     sidebar_column(&rows[usize::from(SELECTOR_ROW)])
-        .trim_end_matches(ADD_WORKSPACE)
+        .trim_end_matches(NEW_SESSION)
         .trim_end()
         .to_owned()
 }
 
-/// Opens the path entry the way a pointer does: a press on the affordance at
-/// the right of the selector's own line, read off the frame so it lands where
-/// the reader would point.
-pub fn press_add_workspace(application: &mut Application) -> ApplicationTransition {
+/// Presses the new-Session affordance the way a pointer does: at the right of
+/// the selector's own line, read off the frame so it lands where the reader
+/// would point.
+pub fn press_new_session(application: &mut Application) -> ApplicationTransition {
     let rows = rendered_application_rows_at(application, SIDEBAR_WIDE, SIDEBAR_PRESS_HEIGHT);
     let column = rows[usize::from(SELECTOR_ROW)]
         .chars()
-        .position(|character| character == ADD_WORKSPACE)
+        .position(|character| character == NEW_SESSION)
         .expect("the affordance is drawn beside the selector");
     click_mouse(
         application,
@@ -359,21 +359,7 @@ pub fn press_add_workspace(application: &mut Application) -> ApplicationTransiti
             modifiers: KeyModifiers::NONE,
         },
     )
-    .expect("press the add-Workspace affordance")
-}
-
-/// Names a Workspace the way a reader does: open the path entry, type the
-/// path, and offer it.
-pub fn add_workspace(application: &mut Application, path: &str) -> ApplicationTransition {
-    press_add_workspace(application);
-    type_terminal_text(application, path);
-    let transition = application
-        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::NONE,
-        )))
-        .expect("offer the path the reader typed");
-    answer_workspace_resolution(application, transition)
+    .expect("press the new-Session affordance")
 }
 
 /// The Workspace resolution `transition` asks of a Server, if it asks one:
