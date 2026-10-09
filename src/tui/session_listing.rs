@@ -893,11 +893,7 @@ impl SessionListing {
     /// derives. The Workspace this client works in, having no Session of its
     /// own to date it, comes last where the listing does not already name it.
     pub(super) fn workspaces(&self) -> Vec<crate::protocol::Workspace> {
-        let mut workspaces = crate::protocol::distinct_workspaces(
-            self.sessions()
-                .iter()
-                .filter_map(|session| session.workspace()),
-        );
+        let mut workspaces = self.listed_workspaces();
         if !workspaces
             .iter()
             .any(|known| known.id == self.current_workspace.id)
@@ -905,6 +901,17 @@ impl SessionListing {
             workspaces.push(self.current_workspace.clone());
         }
         workspaces
+    }
+
+    /// The Workspaces the Sessions this listing holds for the Origin in view
+    /// are rooted in, each once, newest work first: what the Server's answers
+    /// have said, short of the one this client works in.
+    pub(super) fn listed_workspaces(&self) -> Vec<crate::protocol::Workspace> {
+        crate::protocol::distinct_workspaces(
+            self.sessions()
+                .iter()
+                .filter_map(|session| session.workspace()),
+        )
     }
 
     pub(super) fn contains(&self, reference: &SessionReference) -> bool {

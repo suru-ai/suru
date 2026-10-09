@@ -2022,7 +2022,7 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
         state.workspace_name(&state.outlook, browser.root())
     };
     let known = KnownWorkspaces {
-        workspaces: state.sidebar.workspaces(),
+        workspaces: state.known_workspaces(),
         current: &state.workspace.id,
         show_icons: state.settings().appearance.show_icons,
     };
@@ -2085,7 +2085,7 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
 /// What the Client knows of the Outlook's Workspaces, which the Directory
 /// Browser lays over what the Server read of each directory.
 struct KnownWorkspaces<'a> {
-    /// As the Sidebar's listing knows them, the current one among them.
+    /// As the Client's listings know them, the current one among them.
     workspaces: Vec<crate::protocol::Workspace>,
     current: &'a crate::protocol::WorkspaceId,
     show_icons: bool,

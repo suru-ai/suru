@@ -1549,6 +1549,92 @@ fn a_directory_that_is_one_of_the_outlook_s_workspaces_wears_its_icon() {
     );
 }
 
+/// A Workspace the Workspace Picker's listing knows is one of the Outlook's
+/// Workspaces as much as one the Sidebar's knows: with the Sidebar hidden
+/// from the start, so it never lists, a browser the picker opens draws each
+/// Workspace the picker just drew wearing its Icon, and marks only the
+/// current one current. What either listing knows is the Outlook's own, so
+/// turning toward another Server leaves it behind.
+#[test]
+fn a_workspace_the_workspace_picker_listed_wears_its_icon_while_the_sidebar_is_hidden() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let mut settings = EffectiveSettings::default();
+    settings.appearance.show_icons = true;
+    settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    let transition = deliver_settings(&mut application, settings);
+    assert!(
+        !matches!(transition, ApplicationTransition::ListSessions(_)),
+        "a hidden Sidebar asks for no Sessions: {transition:?}"
+    );
+    let ApplicationTransition::ListSessions(request) =
+        invoke(&mut application, SemanticCommandId::WorkspaceList)
+    else {
+        panic!("the Workspace Picker asks for its Sessions");
+    };
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![
+                session_in(&here, Some("dev-python")),
+                session_in(&here.join("iconed"), Some("dev-rust")),
+            ],
+        })
+        .expect("list the Workspace Picker's Sessions");
+    let children = [
+        ("iconed", repository_root(branch("main"))),
+        ("plain", DirectorySourceControl::Plain),
+    ];
+
+    let (_, listing_id, _) = expect_listing(chord(
+        &mut application,
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+    ));
+    answer_with(
+        &mut application,
+        listing_id,
+        &here,
+        &DirectorySourceControl::Plain,
+        &children,
+    );
+
+    assert_eq!(
+        tree(&application),
+        [
+            format!("› ▾ {PYTHON} here · [current]"),
+            format!("    ▸ {RUST} iconed · {BRANCH} main"),
+            format!("    ▸ {FOLDER} plain"),
+        ]
+    );
+
+    crate::connecting::turn_to_studio(&mut application);
+    let (outlook, listing_id, _) =
+        expect_listing(invoke(&mut application, SemanticCommandId::WorkspaceBrowse));
+    assert_eq!(outlook, Outlook::Remote("studio".to_owned()));
+    answer_with(
+        &mut application,
+        listing_id,
+        &here,
+        &DirectorySourceControl::Plain,
+        &children,
+    );
+
+    let toward_studio = tree(&application);
+    assert_eq!(
+        toward_studio[1..],
+        [
+            format!("    ▸ {REPOSITORY} iconed · {BRANCH} main"),
+            format!("    ▸ {FOLDER} plain"),
+        ],
+        "the same directory on another Server is no Workspace this client knows there"
+    );
+    assert!(
+        !toward_studio[0].contains(PYTHON) && !toward_studio[0].contains("[current]"),
+        "{toward_studio:?}"
+    );
+}
+
 /// The Workspace the Landing is in is marked current wherever its directory
 /// stands in the tree, as the Workspace Picker marks it, in words whether
 /// or not Icons are shown; its Icon stands beside it like any Workspace's.

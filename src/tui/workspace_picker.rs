@@ -457,6 +457,13 @@ impl WorkspacePicker {
             .set_workspace_description_origin(outlook, workspace_id, description);
     }
 
+    /// The Outlook's Workspaces the picker's listing has heard of from its
+    /// Server: every one its Sessions are rooted in, for as long as it holds
+    /// that listing — open, or standing aside for the Directory Browser.
+    pub(super) fn listed_workspaces(&self) -> Vec<crate::protocol::Workspace> {
+        self.listing.listed_workspaces()
+    }
+
     /// Whether a listing the server answered with would move anything the
     /// picker draws.
     ///

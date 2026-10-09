@@ -1732,6 +1732,24 @@ impl TuiState {
         self.paths_for(&self.outlook)?.subdirectory(path, root)
     }
 
+    /// The Outlook's Workspaces as this client knows them, each once: every
+    /// one a listing it holds there has heard of from the Server — the
+    /// Sidebar's, and the Workspace Picker's while it holds one — then the
+    /// one it works in. A hidden Sidebar never lists, so a picker's answer
+    /// may be all the client knows; and each listing reads the Outlook in
+    /// view alone, so turning toward another Server leaves the last one's
+    /// behind.
+    pub(super) fn known_workspaces(&self) -> Vec<Workspace> {
+        let sidebar = self.sidebar.listed_workspaces();
+        let picker = self.workspace_picker.listed_workspaces();
+        crate::protocol::distinct_workspaces(
+            sidebar
+                .iter()
+                .chain(&picker)
+                .chain(std::iter::once(&self.workspace)),
+        )
+    }
+
     /// The path facts a path of this Origin's is spelled by: the ones its own
     /// Server answered with, or — for the Client's own Server alone, which
     /// runs on this very machine — the ones this machine has. A Remote that

@@ -2124,11 +2124,11 @@ impl Sidebar {
         }
     }
 
-    /// The Outlook's Workspaces as the Sidebar's listing knows them, which is
-    /// what its selector offers: every one its Sessions are rooted in, and
-    /// the one the client works in.
-    pub(super) fn workspaces(&self) -> Vec<crate::protocol::Workspace> {
-        self.listing.workspaces()
+    /// The Outlook's Workspaces the Sidebar's listing has heard of from its
+    /// Server: every one its Sessions are rooted in. A Sidebar that has never
+    /// listed has heard of none.
+    pub(super) fn listed_workspaces(&self) -> Vec<crate::protocol::Workspace> {
+        self.listing.listed_workspaces()
     }
 
     /// Whether the Sidebar is answering for one Workspace rather than for the
