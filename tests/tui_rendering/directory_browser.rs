@@ -1005,7 +1005,8 @@ const PYTHON: char = '\u{e73c}';
 /// A Repository's main root and a linked Worktree's root show the branch
 /// each stands on as a Sidebar row draws it: the main Worktree left implicit
 /// and a linked one told apart, by its glyph while Icons are shown and in
-/// words while they are not.
+/// words while they are not, when the Repository glyph gives way to
+/// `[repository]` too.
 #[test]
 fn a_worktree_root_shows_the_branch_it_stands_on_as_a_sidebar_row_draws_it() {
     let here = directory(&["nowhere", "here"]);
@@ -1016,7 +1017,10 @@ fn a_worktree_root_shows_the_branch_it_stands_on_as_a_sidebar_row_draws_it() {
 
     assert_eq!(
         tree_drawn(&here, Icons::Hidden, Vec::new(), &children)[1..],
-        ["    ▸ linked · topic (worktree)", "    ▸ main · main"]
+        [
+            "    ▸ linked · [repository] · topic (worktree)",
+            "    ▸ main · [repository] · main",
+        ]
     );
     assert_eq!(
         tree_drawn(&here, Icons::Shown, Vec::new(), &children)[1..],
@@ -1040,7 +1044,10 @@ fn a_root_at_a_detached_commit_shows_the_commit_as_a_sidebar_row_draws_it() {
 
     assert_eq!(
         tree_drawn(&here, Icons::Hidden, Vec::new(), &children)[1..],
-        ["    ▸ detached · 0123456", "    ▸ linked · 0123456"],
+        [
+            "    ▸ detached · [repository] · 0123456",
+            "    ▸ linked · [repository] · 0123456",
+        ],
         "a detached head names its commit, short, wherever its Worktree is"
     );
     assert_eq!(
@@ -1062,7 +1069,10 @@ fn a_root_whose_checkout_state_the_server_could_not_read_is_marked_unavailable()
 
     assert_eq!(
         tree_drawn(&here, Icons::Hidden, Vec::new(), &children)[1..],
-        ["    ▸ linked · [unavailable]", "    ▸ main · [unavailable]"]
+        [
+            "    ▸ linked · [repository] · [unavailable]",
+            "    ▸ main · [repository] · [unavailable]",
+        ]
     );
     assert_eq!(
         tree_drawn(&here, Icons::Shown, Vec::new(), &children)[1..],
@@ -1084,7 +1094,7 @@ fn a_bare_repository_is_marked_as_such() {
 
     assert_eq!(
         tree_drawn(&here, Icons::Hidden, Vec::new(), &children)[1..],
-        ["    ▸ bare.git · [bare]", "    ▸ plain"]
+        ["    ▸ bare.git · [repository] · [bare]", "    ▸ plain"]
     );
     assert_eq!(
         tree_drawn(&here, Icons::Shown, Vec::new(), &children)[1..],
@@ -1096,9 +1106,9 @@ fn a_bare_repository_is_marked_as_such() {
 }
 
 /// A directory that is already one of the Outlook's Workspaces, as the
-/// Sidebar's listing knows them, wears that Workspace's Icon; one with none
-/// is drawn as any other directory is, and no Icon is drawn while Icons are
-/// hidden, as the Workspace Picker draws its rows.
+/// Sidebar's listing knows them, wears that Workspace's Icon, which gives
+/// way to `[workspace]` while Icons are hidden; one with no Icon is drawn as
+/// any other directory is.
 #[test]
 fn a_directory_that_is_one_of_the_outlook_s_workspaces_wears_its_icon() {
     let here = directory(&["nowhere", "here"]);
@@ -1122,7 +1132,11 @@ fn a_directory_that_is_one_of_the_outlook_s_workspaces_wears_its_icon() {
     );
     assert_eq!(
         tree_drawn(&here, Icons::Hidden, sessions, &children)[1..],
-        ["    ▸ iconed", "    ▸ iconless", "    ▸ unknown"]
+        [
+            "    ▸ iconed · [workspace]",
+            "    ▸ iconless",
+            "    ▸ unknown"
+        ]
     );
 }
 
@@ -1143,7 +1157,11 @@ fn the_current_workspace_is_marked_current_as_the_workspace_picker_marks_it() {
 
     assert_eq!(
         tree_drawn(&here, Icons::Hidden, sessions.clone(), &children),
-        ["› ▾ here · [current]", "    ▸ other · main", "    ▸ plain"],
+        [
+            "› ▾ here · [workspace] · [current]",
+            "    ▸ other · [workspace] · main",
+            "    ▸ plain",
+        ],
         "only the current Workspace is marked current, not every Workspace"
     );
     assert_eq!(
@@ -1157,8 +1175,8 @@ fn the_current_workspace_is_marked_current_as_the_workspace_picker_marks_it() {
 }
 
 /// A Workspace's Icon stands where a Repository's glyph would, and the
-/// Repository glyph where the folder's would; while Icons are hidden none of
-/// them is drawn, and what each row says in words still tells them apart.
+/// Repository glyph where the folder's would; while Icons are hidden each
+/// gives way to its word by the same precedence, and the folder's to none.
 #[test]
 fn a_workspace_icon_stands_before_a_repository_glyph_and_that_before_the_folder() {
     let here = directory(&["nowhere", "here"]);
@@ -1185,10 +1203,10 @@ fn a_workspace_icon_stands_before_a_repository_glyph_and_that_before_the_folder(
     assert_eq!(
         tree_drawn(&here, Icons::Hidden, sessions, &children)[1..],
         [
-            "    ▸ iconed-repository · main",
-            "    ▸ iconless-repository · main",
+            "    ▸ iconed-repository · [workspace] · main",
+            "    ▸ iconless-repository · [repository] · main",
             "    ▸ plain",
-            "    ▸ repository · main",
+            "    ▸ repository · [repository] · main",
         ]
     );
 }
@@ -1216,7 +1234,7 @@ fn the_root_row_shows_what_the_server_read_of_it() {
 
     assert_eq!(
         at_main(repository_root(branch("main")), Icons::Hidden),
-        "› ▾ main · [current] · main"
+        "› ▾ main · [repository] · [current] · main"
     );
     assert_eq!(
         at_main(repository_root(branch("main")), Icons::Shown),
@@ -1224,7 +1242,7 @@ fn the_root_row_shows_what_the_server_read_of_it() {
     );
     assert_eq!(
         at_main(repository_root(None), Icons::Hidden),
-        "› ▾ main · [current] · [unavailable]"
+        "› ▾ main · [repository] · [current] · [unavailable]"
     );
     assert_eq!(
         at_main(repository_root(None), Icons::Shown),
@@ -1243,7 +1261,10 @@ fn the_root_row_shows_what_the_server_read_of_it() {
         )[0]
         .clone()
     };
-    assert_eq!(at_linked(Icons::Hidden), "› ▾ linked · topic (worktree)");
+    assert_eq!(
+        at_linked(Icons::Hidden),
+        "› ▾ linked · [repository] · topic (worktree)"
+    );
     assert_eq!(
         at_linked(Icons::Shown),
         format!("› ▾ {REPOSITORY} linked · {WORKTREE} topic")
@@ -1260,7 +1281,10 @@ fn the_root_row_shows_what_the_server_read_of_it() {
         )[0]
         .clone()
     };
-    assert_eq!(at_bare(Icons::Hidden), "› ▾ bare.git · [current] · [bare]");
+    assert_eq!(
+        at_bare(Icons::Hidden),
+        "› ▾ bare.git · [repository] · [current] · [bare]"
+    );
     assert_eq!(
         at_bare(Icons::Shown),
         format!("› ▾ {REPOSITORY} bare.git · [current] · [bare]")

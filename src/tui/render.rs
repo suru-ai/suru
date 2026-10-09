@@ -2091,13 +2091,16 @@ fn directory_browser_line(
     Line::styled(truncate_to_width(&text, width), style)
 }
 
-/// A `directory`'s row after its `lead`: its glyph while Icons are shown —
-/// its Workspace's Icon where it is one of the Outlook's Workspaces with one,
-/// a Repository's glyph where it is a Repository's root or a bare
-/// Repository, and the folder's otherwise — then its name; whether it is the
-/// current Workspace, said as the Workspace Picker says it; and what the
-/// Server read of it: a bare Repository marked as such, or a Worktree root's
-/// Checkout State drawn as a Sidebar row draws it in the columns left.
+/// A `directory`'s row after its `lead`: its glyph — its Workspace's Icon
+/// where it is one of the Outlook's Workspaces with one, a Repository's
+/// glyph where it is a Repository's root or a bare Repository, and the
+/// folder's otherwise — then its name. While Icons are hidden the glyph
+/// gives way to a word after the name, `[workspace]` or `[repository]` by
+/// the same precedence; the folder's says nothing a directory does not
+/// already, and leaves none. Then whether it is the current Workspace, said
+/// as the Workspace Picker says it; and what the Server read of it: a bare
+/// Repository marked as such, or a Worktree root's Checkout State drawn as a
+/// Sidebar row draws it in the columns left.
 fn directory_browser_row_text(
     lead: &str,
     name: &str,
@@ -2110,15 +2113,21 @@ fn directory_browser_row_text(
     let workspace = known.at(directory);
     let compact = width < usize::from(NARROW_TERMINAL_WIDTH);
     let separator = if compact { " " } else { " · " };
-    let repository_glyph = match source_control {
-        None | Some(DirectorySourceControl::Plain) => NF_COD_FOLDER,
-        Some(_) => NF_COD_REPO,
-    };
-    let glyph = workspace
+    let icon = workspace
         .and_then(|workspace| workspace.icon.as_deref())
-        .and_then(crate::icon_catalog::glyph)
-        .unwrap_or(repository_glyph);
+        .and_then(crate::icon_catalog::glyph);
+    let (glyph, word) = match (icon, source_control) {
+        (Some(icon), _) => (icon, Some("[workspace]")),
+        (None, None | Some(DirectorySourceControl::Plain)) => (NF_COD_FOLDER, None),
+        (None, Some(_)) => (NF_COD_REPO, Some("[repository]")),
+    };
     let mut text = format!("{lead}{}", icon_label(known.show_icons, glyph, name));
+    if !known.show_icons
+        && let Some(word) = word
+    {
+        text.push_str(separator);
+        text.push_str(word);
+    }
     if workspace.is_some_and(|workspace| &workspace.id == known.current) {
         text.push_str(separator);
         text.push_str(current_workspace_mark(compact));
