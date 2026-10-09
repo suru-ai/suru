@@ -55,8 +55,9 @@ pub(super) struct WorkspacePicker {
     /// wrote even after they closed the editor on it.
     submitted_description: Option<DescriptionEditor>,
     /// Where the last frame drew each row, recorded at draw time and resolved
-    /// against a right press the same way [`super::icon_picker::IconPicker`]
-    /// records its own cells.
+    /// against a press the same way [`super::icon_picker::IconPicker`]
+    /// records its own cells: a left press chooses the row (see
+    /// [`Self::row_hit`]) and a right one opens its menu.
     row_geometry: RefCell<Vec<WorkspacePickerRowGeometry>>,
     /// Where the last frame drew the row menu's items, so a press inside its
     /// box resolves to the item drawn under it.
@@ -801,8 +802,8 @@ impl WorkspacePicker {
         *self.menu_geometry.borrow_mut() = None;
     }
 
-    /// Records where the frame in force drew one row, so a right press over
-    /// it can open that row's own menu.
+    /// Records where the frame in force drew one row, so a left press over it
+    /// can choose it and a right press open that row's own menu.
     pub(super) fn record_row(
         &self,
         row: u16,
@@ -818,6 +819,24 @@ impl WorkspacePicker {
                 workspace_id,
                 origin,
             });
+    }
+
+    /// Puts the reader on the row drawn at `position`, answering whether a
+    /// row the picker still offers is drawn there — so a press chooses the
+    /// row it landed on through the same path Enter takes.
+    pub(super) fn row_hit(&mut self, position: Position) -> bool {
+        let Some((_, workspace_id)) = self.hit_row(position) else {
+            return false;
+        };
+        if !self
+            .offered()
+            .iter()
+            .any(|workspace| workspace.id == workspace_id)
+        {
+            return false;
+        }
+        self.selected = Some(workspace_id);
+        true
     }
 
     fn hit_row(&self, position: Position) -> Option<(Outlook, WorkspaceId)> {

@@ -7292,6 +7292,18 @@ impl Application {
             }
             return Ok(ApplicationTransition::Continue);
         }
+        // The Workspace Picker itself answers next: a press on one of its rows
+        // chooses the Workspace it names — the same command Enter invokes —
+        // and one anywhere else inside its box moves nothing, never reaching
+        // what the picker covers. A press outside the box never reaches here,
+        // since `PointerClick` already turned it into the Escape that closes
+        // the picker.
+        if self.state.workspace_picker.is_open() {
+            if self.state.workspace_picker.row_hit(position) {
+                return Ok(self.handle_workspace_picker_command(CommandId::SelectWorkspace));
+            }
+            return Ok(ApplicationTransition::Continue);
+        }
         // The Subagent Picker stands over everything below while it is up, so
         // it answers first: a press on one of its rows opens the Subagent the
         // row names — the same command Enter invokes — and a press anywhere

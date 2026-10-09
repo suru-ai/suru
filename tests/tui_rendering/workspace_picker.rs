@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use crate::support::{
     SIDEBAR_WIDE, answer_workspace_resolution, connected_application, deliver_settings,
     drawn_in_sidebar, enter_active_session, fixture_instance_id, noncanonical_spelling,
-    ready_health, rendered_application_rows, rendered_application_rows_at, rendered_row,
-    selector_label, sidebar_column, type_terminal_text, workspace_dir,
+    ready_health, rendered_application_buffer, rendered_application_rows,
+    rendered_application_rows_at, rendered_row, selector_label, sidebar_column, text_position,
+    type_terminal_text, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -504,31 +505,87 @@ fn a_refused_listing_is_reported_in_the_picker() {
     );
 }
 
-/// The picker's rows answer a pointer the way the session picker's rows do:
-/// a press over the list is not a way to choose, so it moves nothing and
-/// leaves the picker standing.
+/// A left press on a row chooses the Workspace it names exactly as Enter on
+/// that row does: the same request goes to its Server, and the same Landing
+/// stands in the picker's place before and after the answer.
 #[test]
-fn a_press_over_the_rows_moves_nothing() {
+fn a_left_press_on_a_row_chooses_it_exactly_as_enter_does() {
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
+
+    let mut keyed = connected_application(&here);
+    open_picker_with(&mut keyed, vec![rooted("Newer", &atlas, 30)]);
+    press(&mut keyed, KeyCode::Down);
+    let entered = choose_unanswered(&mut keyed);
+
+    let mut pointed = connected_application(&here);
+    open_picker_with(&mut pointed, vec![rooted("Newer", &atlas, 30)]);
+    assert_eq!(
+        selected_row(&pointed),
+        "here",
+        "the press lands on a row the reader is not on"
+    );
+    let pressed = press_row(&mut pointed, MouseButton::Left, "atlas");
+
+    assert!(
+        matches!(
+            pressed,
+            ApplicationTransition::DetachSessionAndResolveWorkspace { .. }
+        ),
+        "{pressed:?}"
+    );
+    assert_eq!(pressed, entered, "the press asks what Enter asks");
+    assert_eq!(
+        rendered_application_rows_at(&pointed, 120, 20),
+        rendered_application_rows_at(&keyed, 120, 20),
+        "and the same Landing stands in the picker's place"
+    );
+
+    answer_workspace_resolution(&mut keyed, entered);
+    answer_workspace_resolution(&mut pointed, pressed);
+    assert_eq!(
+        rendered_application_rows_at(&pointed, 120, 20),
+        rendered_application_rows_at(&keyed, 120, 20),
+        "and the same Landing once the Server has answered"
+    );
+}
+
+/// A right press on a row still opens that row's own menu rather than
+/// choosing it, leaving the picker standing beneath the menu.
+#[test]
+fn a_right_press_on_a_row_still_opens_its_menu() {
     let here = workspace(&["work", "here"]);
     let ledger = workspace(&["work", "ledger"]);
     let mut application = connected_application(&here);
-
     open_picker_with(&mut application, vec![rooted("Older", &ledger, 10)]);
-    let before = rendered_application_rows(&application);
-    let row = rendered_row(&before, "ledger");
 
-    super::support::click_mouse(
-        &mut application,
-        MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 20,
-            row: row.try_into().expect("the row fits terminal coordinates"),
-            modifiers: KeyModifiers::NONE,
-        },
-    )
-    .expect("press over a Workspace row");
+    assert_eq!(
+        press_row(&mut application, MouseButton::Right, "ledger"),
+        ApplicationTransition::Continue,
+        "nothing is chosen"
+    );
 
-    assert_eq!(rendered_application_rows(&application), before);
+    let drawn = rendered_application_rows_at(&application, 120, 20).join("\n");
+    assert!(drawn.contains("Edit description"), "{drawn}");
+    assert!(drawn.contains(" Workspaces "), "{drawn}");
+}
+
+/// A press inside the picker that lands on no row — its search line — chooses
+/// nothing and leaves the picker standing.
+#[test]
+fn a_press_inside_the_picker_off_its_rows_moves_nothing() {
+    let here = workspace(&["work", "here"]);
+    let ledger = workspace(&["work", "ledger"]);
+    let mut application = connected_application(&here);
+    open_picker_with(&mut application, vec![rooted("Older", &ledger, 10)]);
+    let before = rendered_application_rows_at(&application, 120, 20);
+
+    assert_eq!(
+        press_row(&mut application, MouseButton::Left, "Search:"),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(rendered_application_rows_at(&application, 120, 20), before);
 }
 
 /// The whole of the switch: Enter on a row takes the reader out of the picker
@@ -1602,6 +1659,27 @@ fn session_picker_scope(application: &mut Application) -> SessionListScope {
     };
     assert_eq!(request.surface(), SessionListSurface::SessionPicker);
     request.scope().clone()
+}
+
+/// Presses `button` on the first cell of `needle` as the frame draws it, so
+/// the press lands where the reader would point.
+fn press_row(
+    application: &mut Application,
+    button: MouseButton,
+    needle: &str,
+) -> ApplicationTransition {
+    let buffer = rendered_application_buffer(application, 120, 20);
+    let (column, row) = text_position(&buffer, needle);
+    super::support::click_mouse(
+        application,
+        MouseEvent {
+            kind: MouseEventKind::Down(button),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    )
+    .expect("press over the Workspace Picker")
 }
 
 fn press(application: &mut Application, code: KeyCode) {
