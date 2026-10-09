@@ -613,7 +613,7 @@ pub struct ResolveWorkspaceRequest {
 /// A directory a Client asks its Outlook Server to list for the Directory
 /// Browser. A relative path is read from `base`, or from the Server process's
 /// current directory when no base is supplied, and one beginning with `~` from
-/// the Server's home.
+/// the Server's home; on Windows the empty path is the [`DRIVE_LIST`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListDirectoryRequest {
@@ -622,6 +622,16 @@ pub struct ListDirectoryRequest {
     pub base: Option<PathBuf>,
 }
 
+/// The path a Windows Server's drive list goes by: the empty path, which no
+/// directory is ever spelled as, so a path field naming it names nothing.
+/// A drive root's [`DirectoryListing`] names it as the root's parent, and a
+/// [`ListDirectoryRequest`] for it is answered with the drive list itself —
+/// parentless, its children the drives the Server can see — rather than with
+/// the base an empty relative path would otherwise name. Only a Windows
+/// Server has drives, so no other names it, and asking another for it lists
+/// the base.
+pub const DRIVE_LIST: &str = "";
+
 /// One directory of a Server as the Directory Browser reads it: the root the
 /// asked-for path resolved to, the root's parent, and the directories directly
 /// within the root in the order the browser lists them. Only what can be
@@ -629,11 +639,16 @@ pub struct ListDirectoryRequest {
 /// Unicode, since every path here crosses the wire as Unicode text and such a
 /// directory could be neither named nor chosen. A root whose own path is not
 /// Unicode is refused rather than listed.
+///
+/// On Windows a [`DRIVE_LIST`] stands above every drive root: a drive root's
+/// parent is that path, and its listing has the path as its root, no parent,
+/// and a child for each drive, named and spelled as its root, such as `C:\`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DirectoryListing {
     pub root: PathBuf,
-    /// Absent where the root is the filesystem's own, or a drive's on Windows.
+    /// Absent where the root is the filesystem's own or a Windows Server's
+    /// drive list; a drive root's on Windows is the [`DRIVE_LIST`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<PathBuf>,
     /// What the root itself is to source control, read as each child's is.

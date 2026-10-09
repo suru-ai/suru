@@ -5,7 +5,10 @@ use super::*;
 use std::path::{Path, PathBuf};
 use suru::{
     managed_client::OutlookClient,
-    protocol::{CheckoutRevision, DirectoryListing, DirectorySourceControl, ListDirectoryRequest},
+    protocol::{
+        CheckoutRevision, DRIVE_LIST, DirectoryListing, DirectorySourceControl,
+        ListDirectoryRequest,
+    },
 };
 
 /// The Serving Server asked as a Client's own Outlook, and the same Server
@@ -381,31 +384,100 @@ async fn a_directory_whose_name_is_not_unicode_is_left_out_and_refused_as_a_root
     pair.shutdown().await;
 }
 
-/// The root of the filesystem the fixtures live on: `/` on Unix, and on
-/// Windows the drive root the temporary directory stands under.
+/// The root of the filesystem the fixtures live on.
+fn filesystem_root(fixture: &Path) -> PathBuf {
+    canonical(fixture)
+        .ancestors()
+        .last()
+        .expect("a path has a root")
+        .to_owned()
+}
+
+/// Off Windows there are no drives, so the filesystem's root has no parent
+/// and no drive list is offered: the path the drive list goes by is read as
+/// any empty relative path is, naming the base.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn the_filesystem_root_answers_with_no_parent() {
     let pair = paired_servers("directory-listing-filesystem-root").await;
     let fixture = tempfile::tempdir().expect("create a directory on the filesystem");
-    let filesystem_root = canonical(fixture.path())
-        .ancestors()
-        .last()
-        .expect("a path has a root")
-        .to_owned();
-    if cfg!(windows) {
-        assert!(
-            filesystem_root.to_string_lossy().ends_with(":\\"),
-            "a drive root, not {}",
-            filesystem_root.display()
-        );
-    } else {
-        assert_eq!(filesystem_root, Path::new("/"));
-    }
+    let filesystem_root = filesystem_root(fixture.path());
+    assert_eq!(filesystem_root, Path::new("/"));
 
     for (way, client) in both_ways(&pair) {
         let listing = listed(&client, &filesystem_root, None).await;
         assert_eq!(listing.root, filesystem_root, "{way}");
         assert_eq!(listing.parent, None, "{way}");
+
+        let base = listed(&client, DRIVE_LIST, Some(fixture.path())).await;
+        assert_eq!(base.root, canonical(fixture.path()), "{way}");
+    }
+    pair.shutdown().await;
+}
+
+/// On Windows a drive root's parent is the drive list: asked for, it answers
+/// with no parent of its own and a child for each drive the Server can see,
+/// named and spelled as that drive's root, among them the drive the fixtures
+/// live on and the system's own.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_drive_root_names_the_drive_list_as_its_parent_which_lists_every_drive() {
+    use suru::protocol::ChildDirectory;
+
+    let pair = paired_servers("directory-listing-drive-list").await;
+    let fixture = tempfile::tempdir().expect("create a directory on a drive");
+    let drive_root = filesystem_root(fixture.path());
+    assert!(
+        drive_root.to_string_lossy().ends_with(":\\"),
+        "a drive root, not {}",
+        drive_root.display()
+    );
+    let system_drive = std::env::var("SystemDrive").expect("Windows names its system drive");
+    let drive = |root: String| ChildDirectory {
+        name: root.clone(),
+        path: PathBuf::from(root),
+        source_control: DirectorySourceControl::Plain,
+        hidden: false,
+    };
+
+    for (way, client) in both_ways(&pair) {
+        let listing = listed(&client, &drive_root, None).await;
+        assert_eq!(listing.root, drive_root, "{way}");
+        assert_eq!(
+            listing.parent.as_deref(),
+            Some(Path::new(DRIVE_LIST)),
+            "{way}: a drive's parent is the drive list"
+        );
+
+        let drives = listed(&client, DRIVE_LIST, Some(fixture.path())).await;
+        assert_eq!(drives.root, Path::new(DRIVE_LIST), "{way}");
+        assert_eq!(
+            drives.parent, None,
+            "{way}: nothing stands above the drive list"
+        );
+        assert_eq!(
+            drives.source_control,
+            DirectorySourceControl::Plain,
+            "{way}"
+        );
+        for root in [
+            drive_root.to_string_lossy().into_owned(),
+            format!("{system_drive}\\"),
+        ] {
+            assert!(
+                drives.children.contains(&drive(root.clone())),
+                "{way}: {root} is among {:?}",
+                drives.children
+            );
+        }
+        assert!(
+            drives
+                .children
+                .windows(2)
+                .all(|adjacent| adjacent[0].name < adjacent[1].name),
+            "{way}: the drives come in the order of their letters: {:?}",
+            drives.children
+        );
     }
     pair.shutdown().await;
 }

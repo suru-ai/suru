@@ -1,9 +1,15 @@
 //! One directory of the owning Server read for the Directory Browser.
 
-use std::{cmp::Ordering, io, path::Path};
+use std::{
+    cmp::Ordering,
+    io,
+    path::{Path, PathBuf},
+};
 
 use super::git::listed_source_control;
 use crate::protocol::{ChildDirectory, DirectoryListing};
+#[cfg(windows)]
+use crate::protocol::{DRIVE_LIST, DirectorySourceControl};
 
 /// The directory `path` names, listed: read from `base` when relative and
 /// from `home` when it begins with `~`, resolved to its root, and answered
@@ -17,11 +23,19 @@ use crate::protocol::{ChildDirectory, DirectoryListing};
 /// is not Unicode can be neither named to a Client nor chosen by one; like a
 /// file, it is left out of the children. A hidden directory is not: it is
 /// listed in its place, flagged hidden, for the Client to leave out.
+///
+/// On Windows a drive root's parent is the drive list, which goes by
+/// [`DRIVE_LIST`](crate::protocol::DRIVE_LIST): that path is answered with
+/// the drive list rather than read from `base`.
 pub(crate) fn list_directory(
     path: &Path,
     base: &Path,
     home: Option<&Path>,
 ) -> Result<DirectoryListing, String> {
+    #[cfg(windows)]
+    if path.as_os_str() == DRIVE_LIST {
+        return list_drives();
+    }
     let named = match path.strip_prefix("~") {
         Ok(beneath_home) => home
             .ok_or("The Server's home is unknown")?
@@ -55,9 +69,74 @@ pub(crate) fn list_directory(
         .collect::<Vec<_>>();
     children.sort_by(|left, right| natural_order(&left.name, &right.name));
     Ok(DirectoryListing {
-        parent: root.parent().map(Path::to_owned),
+        parent: parent(&root),
         source_control: listed_source_control(&root),
         root,
+        children,
+    })
+}
+
+/// The directory above `root`, which above a drive on Windows is the drive
+/// list.
+#[cfg(windows)]
+fn parent(root: &Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+
+    let mut components = root.components();
+    let is_drive_root = matches!(
+        components.next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+    ) && components.next() == Some(Component::RootDir)
+        && components.next().is_none();
+    root.parent()
+        .map(Path::to_owned)
+        .or_else(|| is_drive_root.then(|| PathBuf::from(DRIVE_LIST)))
+}
+
+/// The directory above `root`; the filesystem's own root has none.
+#[cfg(not(windows))]
+fn parent(root: &Path) -> Option<PathBuf> {
+    root.parent().map(Path::to_owned)
+}
+
+/// The drive list: parentless, with a child for each drive this Server can
+/// see, named and spelled as the drive's root, in the order of their
+/// letters. A drive is listed whether or not it can be read now — a drive
+/// with no disc in it, or a network drive out of reach — since reading each
+/// could keep the reader waiting on the slowest, and opening one says why it
+/// cannot be read as any directory does. Nor is a drive read for what it is
+/// to source control, for the same reason.
+#[cfg(windows)]
+fn list_drives() -> Result<DirectoryListing, String> {
+    use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+
+    // SAFETY: GetLogicalDrives takes nothing and answers a bitmask of the
+    // drives present, bit 0 for A.
+    let drives = unsafe { GetLogicalDrives() };
+    if drives == 0 {
+        return Err(format!(
+            "Could not read the drives: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let children = (b'A'..=b'Z')
+        .enumerate()
+        .filter(|(bit, _)| drives & (1 << bit) != 0)
+        .map(|(_, letter)| {
+            let root = format!("{}:\\", char::from(letter));
+            ChildDirectory {
+                path: PathBuf::from(&root),
+                name: root,
+                source_control: DirectorySourceControl::Plain,
+                hidden: false,
+            }
+        })
+        .collect();
+    Ok(DirectoryListing {
+        root: PathBuf::from(DRIVE_LIST),
+        parent: None,
+        source_control: DirectorySourceControl::Plain,
         children,
     })
 }
