@@ -543,6 +543,7 @@ impl<'a> Renderer<'a> {
                             offset += span.content.len();
                         }
                         offset += 1;
+                        super::hyperlink::link_bare_urls(&mut line.spans);
                         line
                     })
                     .collect::<Vec<_>>();
@@ -584,6 +585,7 @@ impl<'a> Renderer<'a> {
                 if let Some(table) = &mut self.table
                     && let Some(mut cell) = table.current_cell.take()
                 {
+                    super::hyperlink::link_bare_urls(&mut cell.spans);
                     cell.boundary = self.source.clone();
                     if let Some(row) = &mut table.current_row {
                         row.cells.push(cell);
@@ -757,7 +759,9 @@ impl<'a> Renderer<'a> {
 
     fn flush_line(&mut self) {
         if !self.current.is_empty() {
-            let line = StyledLine::from(std::mem::take(&mut self.current));
+            let mut spans = std::mem::take(&mut self.current);
+            super::hyperlink::link_bare_urls(&mut spans);
+            let line = StyledLine::from(spans);
             self.emit_line(line);
         }
     }
@@ -1929,6 +1933,31 @@ pub(super) mod tests {
                 .contains(Modifier::UNDERLINED)
         );
         assert!(span(" (https://example.test)").chrome);
+    }
+
+    #[test]
+    fn bare_urls_link_whole_in_prose_tables_and_code() {
+        let theme = Theme::system();
+        let url = "https://example.test/a_b*c?x=1&y=2";
+        let lines = super::render(
+            "Open https://example.test/a_b*c?x=1&amp;y=2.\n\n\
+             | site |\n| --- |\n| https://example.test/a_b*c?x=1&amp;y=2 |\n\n\
+             ```\ncurl https://example.test/a_b*c?x=1&y=2\n```",
+            &theme,
+            80,
+        );
+        let linked = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .filter(|span| span.target.as_deref() == Some(url))
+                    .map(|span| span.content.as_str())
+                    .collect::<String>()
+            })
+            .filter(|linked| !linked.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(linked, [url, url, url], "{:?}", line_texts(&lines));
     }
 
     #[test]

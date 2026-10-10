@@ -5840,6 +5840,7 @@ fn push_prefixed_lines_with_indent(
             style,
         )];
         spans.push(StyledSpan::text(line, style));
+        super::hyperlink::link_bare_urls(&mut spans);
         lines.push(StyledLine::from(spans));
     }
 }
@@ -5900,6 +5901,7 @@ fn push_styled_prefixed_lines(
                 if !line_has_content {
                     spans.push(StyledSpan::text("", base_style));
                 }
+                super::hyperlink::link_bare_urls(&mut spans);
                 projection
                     .lines
                     .push(StyledLine::from(std::mem::take(&mut spans)));
@@ -5910,6 +5912,7 @@ fn push_styled_prefixed_lines(
         }
     }
     if line_has_content {
+        super::hyperlink::link_bare_urls(&mut spans);
         projection.lines.push(StyledLine::from(spans));
     }
 }
@@ -8464,6 +8467,62 @@ mod tests {
             None,
             "message gutter is not a link"
         );
+    }
+
+    #[test]
+    fn a_wrapped_bare_url_opens_whole_from_every_row() {
+        let url = "https://github.com/example/repository/pull/12345/files";
+        for content in [format!("See {url} for it"), format!("See `{url}` for it")] {
+            let snapshot = transcript_snapshot(vec![Entry::Message(agent_message(&content))]);
+            for hyperlinks in [false, true] {
+                let cache = TranscriptCache::default();
+                let folds = TranscriptFolds::default();
+                let groups = TranscriptGroups::default();
+                let turns = TranscriptTurnFolds::default();
+                let view = cache.view_with_hyperlinks(
+                    0,
+                    &snapshot,
+                    &[],
+                    TranscriptDisclosure {
+                        folds: &folds,
+                        groups: &groups,
+                        turns: &turns,
+                        visibility: SHOWING_EVERY_KIND,
+                        grouping: Grouping::Off,
+                    },
+                    &AttachmentPreviews::default(),
+                    &Theme::system(),
+                    30,
+                    hyperlinks,
+                );
+                let window = view.window(0, view.row_count());
+                assert_eq!(
+                    row_text(&window.rows),
+                    [
+                        "  See",
+                        "  https://github.com/example/r",
+                        "  epository/pull/12345/files",
+                        "  for it",
+                    ],
+                    "{content}"
+                );
+                assert_eq!(
+                    window
+                        .hyperlinks
+                        .iter()
+                        .map(|link| (link.row, link.column, link.width, link.target.as_str()))
+                        .collect::<Vec<_>>(),
+                    [(1, 2, 28, url), (2, 2, 26, url)],
+                    "{content}"
+                );
+                assert_eq!(view.hyperlink_at(2, 27).as_deref(), Some(url));
+                assert_eq!(
+                    view.hyperlink_at(3, 3),
+                    None,
+                    "trailing prose is not a link"
+                );
+            }
+        }
     }
 
     #[test]

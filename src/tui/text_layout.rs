@@ -340,6 +340,18 @@ impl StyledSpan {
     pub(super) fn width(&self) -> usize {
         self.content.width()
     }
+
+    /// The part of the span between two byte offsets into its content,
+    /// keeping its style, chrome, and target and slicing its source along.
+    pub(super) fn slice(&self, range: Range<usize>) -> Self {
+        Self {
+            content: self.content[range.clone()].to_owned(),
+            style: self.style,
+            chrome: self.chrome,
+            source: self.source.as_ref().map(|source| source.slice(range)),
+            target: self.target.clone(),
+        }
+    }
 }
 
 /// A projected line: the spans it draws, and whether it continues a line the
@@ -401,16 +413,7 @@ impl StyledLine {
             let start = range.start.max(span_range.start);
             let end = range.end.min(span_range.end);
             if start < end {
-                spans.push(StyledSpan {
-                    content: span.content[start - span_range.start..end - span_range.start]
-                        .to_owned(),
-                    style: span.style,
-                    chrome: span.chrome,
-                    source: span.source.as_ref().map(|source| {
-                        source.slice(start - span_range.start..end - span_range.start)
-                    }),
-                    target: span.target.clone(),
-                });
+                spans.push(span.slice(start - span_range.start..end - span_range.start));
             }
         }
         Self {
