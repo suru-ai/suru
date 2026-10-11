@@ -1097,10 +1097,10 @@ async fn removing_a_relay_that_takes_connections_and_says_nothing_waits_only_its
         .expect("remove a Relay that never answers");
     assert!(!removal.acknowledged);
     assert!(server.client.list_relays().await.unwrap().relays.is_empty());
-    assert!(
-        silent.opened_connections() > 0,
-        "the Server asked the Relay"
-    );
+    // The Server's connect completes in the kernel's backlog before the
+    // route's accept loop counts it, and a Relay that answers nothing gives
+    // the removal no reason to wait for that count, so wait for it here.
+    silent.wait_for_opened_connections(1).await;
 
     server.shutdown().await;
 }
