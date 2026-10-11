@@ -2942,8 +2942,9 @@ async fn checks_github_answers_only_so_many_of_at_a_time_come_to_every_account_i
     }
     stub.membership("acme", 11, Some("active"));
     stub.membership("acme", 12, Some("active"));
-    // Refused, the Relay holds off asking for the rest of a pass.
-    stub.script().retry_after = 2;
+    // Refused, the Relay holds off asking for the rest of a pass, however
+    // slowly the pass goes on.
+    stub.script().retry_after = 50;
     let directory = tempfile::tempdir().unwrap();
     let relay = start_relay_admitting(
         &directory,
@@ -2961,17 +2962,17 @@ async fn checks_github_answers_only_so_many_of_at_a_time_come_to_every_account_i
         );
     }
 
-    // GitHub answers who is a member once each time the test lets it, and
-    // the second member leaves the organization.
+    // GitHub answers who is a member once each time the test lets it.
     stub.script().membership_quota = Some(0);
-    stub.membership("acme", 12, None);
-    asked_about_memberships(&stub, 3).await;
-    stub.script().memberships_answered.clear();
-    for _ in 0..3 {
-        // One answer, taken by the first Account a pass asks about, and a
-        // refusal of the next, after which the pass asks nothing more.
-        let refused = stub.script().memberships_refused;
-        stub.script().membership_quota = Some(1);
+    // One answer, taken by the first Account a pass asks about, and a
+    // refusal of the next, after which the pass asks nothing more: the
+    // member answered for last.
+    let answer_once = || async {
+        let refused = {
+            let mut script = stub.script();
+            script.membership_quota = Some(1);
+            script.memberships_refused
+        };
         timeout(DEADLINE, async {
             while stub.script().membership_quota != Some(0)
                 || stub.script().memberships_refused == refused
@@ -2981,13 +2982,22 @@ async fn checks_github_answers_only_so_many_of_at_a_time_come_to_every_account_i
         })
         .await
         .expect("the Relay asks GitHub again");
-        if stub
-            .script()
-            .memberships_answered
-            .last()
-            .map(String::as_str)
-            == Some("twelve")
-        {
+        stub.script().memberships_answered.last().cloned()
+    };
+    // A pass under way as the answers ran out may have been answered for the
+    // first member and refused for the second, so the next begins at the
+    // second; once the second is answered for, the next begins at the first.
+    timeout(DEADLINE, async {
+        while answer_once().await.as_deref() != Some("twelve") {}
+    })
+    .await
+    .expect("the Relay comes round to the second member");
+
+    // The second member leaves the organization.
+    stub.membership("acme", 12, None);
+    stub.script().memberships_answered.clear();
+    for _ in 0..3 {
+        if answer_once().await.as_deref() == Some("twelve") {
             break;
         }
     }
