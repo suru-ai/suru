@@ -339,8 +339,10 @@ impl DirectoryBrowser {
     }
 
     /// Opens the focused row where it is closed and closes it where it is
-    /// open, answering the listing opening it asks for.
+    /// open, answering the listing opening it asks for. Neither steps focus
+    /// in, so a step Right left waiting on a row being read is let go of.
     pub(super) fn toggle_focused(&mut self) -> Option<DirectoryListingAsk> {
+        self.entering = None;
         if self.opened.remove(&self.focused) {
             return None;
         }
@@ -651,6 +653,7 @@ impl DirectoryBrowser {
             (Asked::Directory(directory), Ok(listing)) => {
                 let root = listing.root.clone();
                 self.adopt(Some(&directory), listing);
+                let entering = self.entering_listed(&directory);
                 let listed = if directory == self.root {
                     let listed = (root != self.root).then(|| self.reroot(root)).flatten();
                     self.settle_focus();
@@ -658,13 +661,24 @@ impl DirectoryBrowser {
                 } else {
                     None
                 };
-                self.enter_listed(&directory);
+                // A root goes by where the Server read it, which a step
+                // waiting on it follows there.
+                let entering = entering.map(|row| {
+                    if row.is_root() {
+                        RowKey::root(self.root.clone())
+                    } else {
+                        row
+                    }
+                });
+                if let Some(row) = entering.filter(|row| *row == self.focused) {
+                    self.step_into(&row);
+                }
                 listed
             }
             (Asked::Directory(directory), Err(reason)) => {
                 self.tree
                     .insert(directory.clone(), DirectoryEntries::Refused(reason));
-                self.enter_listed(&directory);
+                self.entering_listed(&directory);
                 None
             }
             (Asked::Root(spelling), Ok(listing)) => {
@@ -1129,15 +1143,12 @@ impl DirectoryBrowser {
     }
 
     /// Takes the Server's answer for `directory` as the end of the wait on a
-    /// row Right opened while it was read, stepping focus in where it still
-    /// stands on that row.
-    fn enter_listed(&mut self, directory: &Path) {
-        let Some(row) = self.entering.take_if(|row| row.directory() == directory) else {
-            return;
-        };
-        if row == self.focused {
-            self.step_into(&row);
-        }
+    /// row Right opened while it was read, answering that row where focus
+    /// still stands on it.
+    fn entering_listed(&mut self, directory: &Path) -> Option<RowKey> {
+        self.entering
+            .take_if(|row| row.directory() == directory)
+            .filter(|row| *row == self.focused)
     }
 }
 

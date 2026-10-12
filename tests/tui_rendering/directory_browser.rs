@@ -389,6 +389,82 @@ fn focus_moved_while_a_row_is_read_stays_where_the_reader_put_it() {
     );
 }
 
+/// Space and the pointer open and close without stepping in, so closing a
+/// row Right left being read lets go of the step, and opening it again that
+/// way leaves focus on it when the listing lands.
+#[test]
+fn closing_a_row_right_left_being_read_lets_go_of_the_step_into_it() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha", "beta"]);
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
+    key(&mut application, KeyCode::Char(' '));
+    assert_eq!(
+        key(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::Continue,
+        "the row is still being read, so reopening it asks nothing"
+    );
+
+    answer(
+        &mut application,
+        listing_id,
+        &here.join("alpha"),
+        &["inner"],
+    );
+
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ here · [current]",
+            "›   ▾ alpha",
+            "      ▸ inner",
+            "    ▸ beta"
+        ]
+    );
+}
+
+/// Right on a root still being read waits for it through the Server's
+/// reading it where a link leads, which stands the tree on that directory
+/// rather than the link: the reader has not moved, so focus steps in.
+#[test]
+fn right_on_a_root_being_read_steps_in_once_it_is_read_where_its_link_leads() {
+    let here = directory(&["nowhere", "here"]);
+    let link = here.join("link");
+    let project = directory(&["nowhere", "target", "project"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["link"]);
+    type_path(&mut application, "l");
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Tab));
+    assert_eq!(tree(&application), ["› ▾ link", "    Loading…"]);
+
+    assert_eq!(
+        key(&mut application, KeyCode::Right),
+        ApplicationTransition::Continue,
+        "the root is being read already"
+    );
+    answer_listing(
+        &mut application,
+        listing_id,
+        DirectoryListing {
+            root: project.clone(),
+            parent: project.parent().map(Path::to_owned),
+            source_control: DirectorySourceControl::Plain,
+            children: vec![ChildDirectory {
+                name: "inner".to_owned(),
+                path: project.join("inner"),
+                source_control: DirectorySourceControl::Plain,
+                hidden: false,
+            }],
+        },
+    );
+
+    assert_eq!(tree(&application), ["  ▾ project", "›   ▸ inner"]);
+    assert_eq!(path_field(&application), spelled(&link));
+}
+
 /// With nothing drawn beneath a row — an empty directory, one the Server
 /// refused, or one holding only hidden directories — Right opens it and focus
 /// stays on it.
