@@ -3,7 +3,8 @@
 //! that Root, so it is listed before any Session has begun there (ADR 0051).
 //! Plain directories, hidden ones, anything deeper, a linked Worktree of a
 //! Repository elsewhere, the Sidekick Workspace, the Root itself and any
-//! Root within it are left alone. Discovery runs at start, when the Roots
+//! Root within it are left alone, and so is everything within Suru's own
+//! data directory named as a Root. Discovery runs at start, when the Roots
 //! change, and whenever Workspaces are listed, reusing a scan only as old as
 //! the Server's memo allows, which these Servers shorten to nothing or
 //! lengthen past any test.
@@ -380,14 +381,20 @@ async fn a_repository_cloned_by_hand_after_start_is_listed_at_the_next_listing()
     server.shutdown().await.expect("shut down server");
 }
 
-/// The Sidekick Workspace is never discovered, even made a Repository
-/// directly within a Root: it is listed as itself and nothing else is
-/// presented at its directory.
+/// Suru's own data directory named as a Workspace Root is ignored, so the
+/// Sidekick Workspace, kept directly within it, is never within a Root:
+/// neither it, though made a Repository, nor a Repository put directly
+/// beside it is discovered, and nothing but the Sidekick Workspace is
+/// presented within the data directory. The Root named beside it is
+/// discovered all the same.
 #[tokio::test]
-async fn the_sidekick_workspace_is_never_discovered() {
-    const CHANNEL: &str = "workspace-discovery-sidekick";
+async fn a_root_naming_suru_s_own_data_directory_is_ignored() {
+    const CHANNEL: &str = "workspace-discovery-data-directory";
     let home = tempfile::tempdir().expect("create a home");
     let home = canonical(home.path());
+    let projects = home.join("projects");
+    let ledger = projects.join("ledger");
+    repository(&ledger);
     let (config, server) = server_with_roots(&home, CHANNEL, &[], Duration::ZERO).await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
     let sidekick = client
@@ -396,22 +403,33 @@ async fn the_sidekick_workspace_is_never_discovered() {
         .expect("make the Sidekick Workspace")
         .workspace;
     repository(&sidekick.path);
+    let data = canonical(config.data_dir());
+    let atlas = data.join("atlas");
+    repository(&atlas);
     client
         .mutate_setting(SettingMutation::WorkspaceRoots {
-            value: Some(vec![spelled(&canonical(config.data_dir())).to_owned()]),
+            value: Some(vec![
+                spelled(&data).to_owned(),
+                spelled(&projects).to_owned(),
+            ]),
         })
         .await
-        .expect("name the directory the Sidekick Workspace is in as a Root");
+        .expect("name the data directory as a Root beside another");
 
-    let at_sidekick = listed(&client)
-        .await
-        .into_iter()
-        .filter(|workspace| workspace.path == sidekick.path)
-        .map(|workspace| workspace.id)
-        .collect::<Vec<_>>();
+    let listing = listed(&client).await;
     assert!(
-        at_sidekick.iter().all(|id| *id == sidekick.id),
-        "nothing but the Sidekick Workspace is presented at its directory: {at_sidekick:?}"
+        listing
+            .iter()
+            .filter(|workspace| workspace.path.starts_with(&data))
+            .all(|workspace| workspace.id == sidekick.id),
+        "nothing but the Sidekick Workspace is presented within the data directory: {listing:?}"
+    );
+    assert!(
+        listing
+            .iter()
+            .any(|workspace| located(workspace)
+                == (repository_id(&ledger.join(".git")), ledger.clone())),
+        "the Root named beside it is discovered: {listing:?}"
     );
 
     drop(client);

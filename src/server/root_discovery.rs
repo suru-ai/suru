@@ -22,9 +22,11 @@
 //! be presented at one is dropped, unless a Session belongs to it. Roots are
 //! told apart as directories (see [`super::root_directories`]); one that
 //! cannot be resolved is told by its writing alone, so a Root on a mount
-//! gone quiet holds back no other Root's discoveries. Discovery derives no
-//! Icon and no Description: the first Session begun in a discovered
-//! Workspace derives them as it would anywhere.
+//! gone quiet holds back no other Root's discoveries. A Root naming Suru's
+//! own data directory, where the Sidekick Workspace is kept, is ignored, the
+//! Log saying why, so the Sidekick Workspace is never within a Root.
+//! Discovery derives no Icon and no Description: the first Session begun in
+//! a discovered Workspace derives them as it would anywhere.
 //!
 //! Each Root is scanned on its own, on a task of its own, and everything a
 //! scan reads from the filesystem or source control is read apart, on a
@@ -411,6 +413,8 @@ pub(crate) struct RegistryScan {
     source_control: SourceControlService,
     /// The directory a Root beginning with `~` is read beneath.
     home: Option<PathBuf>,
+    /// Suru's own data directory, read canonically, which no Root may be.
+    data_root: Option<PathBuf>,
     /// The longest a scan waits on the other Roots being resolved.
     wait: Duration,
     reads: ReadsApart,
@@ -435,12 +439,14 @@ impl RegistryScan {
         sessions: SessionStore,
         source_control: SourceControlService,
         home: Option<PathBuf>,
+        data_root: Option<PathBuf>,
         wait: Duration,
     ) -> Self {
         Self {
             sessions,
             source_control,
             home,
+            data_root,
             wait,
             reads: ReadsApart::new("suru-root-discovery-read", READS_AT_ONCE),
             resolutions: ReadsApart::new("suru-root-discovery-resolution", RESOLUTIONS_AT_ONCE),
@@ -452,7 +458,7 @@ impl RegistryScan {
 impl RootScan for RegistryScan {
     /// Enters what is directly within `root` in the Registry, as the module
     /// says. A Root that cannot be read is skipped, saying why in the Log,
-    /// and never made.
+    /// and never made; so is one naming Suru's own data directory.
     async fn scan(&self, root: &str, commit: &Commit) {
         let began = std::time::Instant::now();
         let Some(directory) = expand(root, self.home.as_deref()) else {
@@ -490,6 +496,14 @@ impl RootScan for RegistryScan {
                 return;
             }
         };
+        if self.data_root.as_ref() == Some(&resolved) {
+            tracing::warn!(
+                root,
+                "a Workspace Root may not be Suru's own data directory, so it is ignored and \
+                 nothing within it was discovered"
+            );
+            return;
+        }
         let others = root_directories::resolve(
             &self.resolutions,
             self.home.as_deref(),

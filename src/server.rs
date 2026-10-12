@@ -1572,6 +1572,7 @@ async fn start(
             sessions.clone(),
             source_control.clone(),
             config.home_dir(),
+            Some(sidekick_workspace.data_root().to_owned()),
             timings.root_discovery_wait,
         )),
         {
@@ -1586,6 +1587,7 @@ async fn start(
     let registry_standing = registry_standing::RegistryStanding::new(
         sessions.clone(),
         config.home_dir(),
+        Some(sidekick_workspace.data_root().to_owned()),
         timings.root_discovery_wait,
     );
     // Persisted grouping is served at once; discovery regroups Sessions behind

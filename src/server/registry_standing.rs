@@ -28,12 +28,14 @@
 //! that spelling, though: what was discovered under it goes at once,
 //! whether or not it can be resolved, unless a Root still named is spelled
 //! or written as it, resolves where it does, or is named in that very
-//! change and cannot be told from it, as the Root respelled may be. Only
-//! Roots the Config Document names whole — before a change and after it
-//! alike — take anything away, since those a document left that could not
-//! be read whole are no word of the user's. The Roots are held still while
-//! either decides (see [`RootsHeld`]), and the step at start takes nothing
-//! away where Settings were put in force anew since it read them.
+//! change and cannot be told from it, as the Root respelled may be. A Root
+//! naming Suru's own data directory is no Root in force, so what was
+//! discovered under it goes too. Only Roots the Config Document names whole
+//! — before a change and after it alike — take anything away, since those a
+//! document left that could not be read whole are no word of the user's.
+//! The Roots are held still while either decides (see [`RootsHeld`]), and
+//! the step at start takes nothing away where Settings were put in force
+//! anew since it read them.
 //!
 //! Every directory is read apart, on a thread of its own (see
 //! [`super::reads_apart`]), so one on a mount gone quiet holds up neither
@@ -99,6 +101,9 @@ struct Standing {
     sessions: SessionStore,
     /// The directory a Root beginning with `~` names a directory beneath.
     home: Option<PathBuf>,
+    /// Suru's own data directory, read canonically, which no Root in force
+    /// names.
+    data_root: Option<PathBuf>,
     probe: Probe,
     reads: ReadsApart,
     /// The longest anything waits on the readings.
@@ -111,19 +116,26 @@ struct Standing {
 }
 
 impl RegistryStanding {
-    pub(crate) fn new(sessions: SessionStore, home: Option<PathBuf>, wait: Duration) -> Self {
-        Self::with_probe(sessions, home, wait, Arc::new(read_standing))
+    pub(crate) fn new(
+        sessions: SessionStore,
+        home: Option<PathBuf>,
+        data_root: Option<PathBuf>,
+        wait: Duration,
+    ) -> Self {
+        Self::with_probe(sessions, home, data_root, wait, Arc::new(read_standing))
     }
 
     fn with_probe(
         sessions: SessionStore,
         home: Option<PathBuf>,
+        data_root: Option<PathBuf>,
         wait: Duration,
         probe: Probe,
     ) -> Self {
         Self(Arc::new(Standing {
             sessions,
             home,
+            data_root,
             probe,
             reads: ReadsApart::new("suru-workspace-standing-read", READS_AT_ONCE),
             wait,
@@ -344,7 +356,8 @@ impl RegistryStanding {
     /// everything, and is told again at the next start or change of the
     /// Roots — unless the change from `before` took it away by its
     /// spelling, which only a Root it named anew and cannot tell from it,
-    /// as the Root respelled may be, keeps.
+    /// as the Root respelled may be, keeps. A Root naming Suru's own data
+    /// directory is none of the Roots in force.
     async fn forget_unnamed(
         &self,
         roots: &[String],
@@ -362,6 +375,16 @@ impl RegistryStanding {
             roots.iter().chain(&recorded),
         )
         .await;
+        let in_force = roots
+            .iter()
+            .filter(|root| {
+                !self
+                    .0
+                    .data_root
+                    .as_deref()
+                    .is_some_and(|data_root| named[*root].names(data_root))
+            })
+            .collect::<Vec<_>>();
         let taken_away = |root: &String| {
             before.is_some_and(|before| before.contains(root) && !roots.contains(root))
         };
@@ -369,9 +392,9 @@ impl RegistryStanding {
         let unrooted = recorded
             .iter()
             .filter(|root| {
-                roots
+                in_force
                     .iter()
-                    .all(|kept| match named[*root].likeness(&named[kept]) {
+                    .all(|kept| match named[*root].likeness(&named[*kept]) {
                         Likeness::Same => false,
                         Likeness::Different => true,
                         Likeness::Untold => taken_away(root) && !named_anew(kept),
@@ -562,6 +585,7 @@ mod tests {
         let standing = RegistryStanding::with_probe(
             sessions.clone(),
             None,
+            None,
             Duration::from_millis(20),
             Arc::new({
                 let (gate, readings, stalled) = (gate.clone(), readings.clone(), stalled.clone());
@@ -632,6 +656,7 @@ mod tests {
         let standing = RegistryStanding::with_probe(
             registry.sessions.clone(),
             None,
+            None,
             SURELY,
             Arc::new({
                 let (gate, readings) = (gate.clone(), readings.clone());
@@ -696,6 +721,7 @@ mod tests {
         let readings = Arc::new(AtomicUsize::new(0));
         let standing = RegistryStanding::with_probe(
             registry.sessions.clone(),
+            None,
             None,
             SURELY,
             Arc::new({
@@ -777,6 +803,7 @@ mod tests {
         let standing = RegistryStanding::with_probe(
             registry.sessions.clone(),
             None,
+            None,
             wait,
             Arc::new({
                 let (turnstile, readings) = (turnstile.clone(), readings.clone());
@@ -853,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn settings_put_in_force_while_the_step_at_start_decides_leave_it_taking_nothing() {
         let (registry, atlas) = discovered_under_b().await;
-        let standing = RegistryStanding::new(registry.sessions.clone(), None, SURELY);
+        let standing = RegistryStanding::new(registry.sessions.clone(), None, None, SURELY);
         let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         standing
@@ -897,7 +924,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_change_of_the_roots_waits_for_the_step_at_start_to_decide() {
         let (registry, _) = discovered_under_b().await;
-        let standing = RegistryStanding::new(registry.sessions.clone(), None, SURELY);
+        let standing = RegistryStanding::new(registry.sessions.clone(), None, None, SURELY);
         let change = Arc::new(Mutex::new(None::<std::thread::JoinHandle<Vec<PathBuf>>>));
         let runtime = tokio::runtime::Handle::current();
 
@@ -952,7 +979,7 @@ mod tests {
     #[tokio::test]
     async fn a_root_taken_away_by_its_spelling_takes_what_it_held_but_where_it_may_be_respelled() {
         let (registry, atlas) = discovered_under_b().await;
-        let standing = RegistryStanding::new(registry.sessions.clone(), None, SURELY);
+        let standing = RegistryStanding::new(registry.sessions.clone(), None, None, SURELY);
         let spell = |components: &[&str]| absolute(components).display().to_string();
         let (kept, respelled) = (spell(&["nowhere", "kept"]), spell(&["nowhere", "b"]));
 
@@ -978,6 +1005,43 @@ mod tests {
             Vec::<PathBuf>::new(),
             "while one named before as well does not"
         );
+    }
+
+    /// A Root naming Suru's own data directory is none of the Roots in
+    /// force, so what was discovered under it is dropped, though it is
+    /// still named.
+    #[tokio::test]
+    async fn a_root_naming_the_data_directory_keeps_nothing_discovered_under_it() {
+        let data = tempfile::tempdir().expect("create a data directory");
+        let data = crate::paths::canonical(data.path()).expect("read it canonically");
+        let root = data.display().to_string();
+        let atlas = data.join("atlas");
+        let registry = Registry::of(
+            [(
+                WorkspaceId::directory(&atlas),
+                StoredWorkspace {
+                    path: Some(atlas.clone()),
+                    presentation: Some(WorkspacePresentation::Directory),
+                    ..StoredWorkspace::known_by(WorkspaceProvenance::Discovered {
+                        root: root.clone(),
+                    })
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .await;
+        let standing =
+            RegistryStanding::new(registry.sessions.clone(), None, Some(data.clone()), SURELY);
+
+        standing
+            .roots_at_start(ScriptedRoots {
+                read: Some(move || Some(vec![root])),
+                moved: Arc::default(),
+            })
+            .await;
+
+        assert_eq!(listed(&registry.sessions), Vec::<PathBuf>::new());
     }
 
     #[test]

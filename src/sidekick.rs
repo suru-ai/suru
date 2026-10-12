@@ -63,6 +63,12 @@ impl SidekickWorkspace {
         })
     }
 
+    /// Suru's own data directory, read canonically, which the Sidekick
+    /// Workspace is made directly within.
+    pub(crate) fn data_root(&self) -> &Path {
+        &self.data_root
+    }
+
     /// The Sidekick Workspace's directory as every Workspace's directory is
     /// read — canonically, the whole of it, so a symlink names what it points
     /// at and a name the filesystem keeps in another case reads as it keeps it
