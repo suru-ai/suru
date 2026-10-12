@@ -601,26 +601,37 @@ fn named_by(url: &str) -> Result<&str, CloneRefusal> {
     })
 }
 
-/// Where a Clone named `name` goes — directly within the Root `named`
-/// names among `roots`, or the only one — and whether something stands
-/// there already, the Root read by `read` apart (see [`ReadsApart`]), so a
-/// Root on a mount gone quiet holds up none of the Server's own threads,
-/// and holds one of its own however often it is Cloned into again; the
-/// destination is judged by `judged` in the same read apart, so what it
-/// reads of the filesystem is bound by the same deadline. `None` where the
-/// reading has not answered by `deadline`, or one begun earlier still has
-/// not.
-#[allow(clippy::too_many_arguments)]
-async fn placed(
-    reads: &ReadsApart,
-    deadline: tokio::time::Instant,
+/// Where a Clone is asked to go: the Workspace Roots configured, the one it
+/// names where it names one, the directory it makes within it, and the
+/// home a Root beginning with `~` lies beneath.
+struct Placement {
     roots: Vec<String>,
     named: Option<String>,
     name: String,
     home: Option<PathBuf>,
+}
+
+/// Where the Clone `placement` asks for goes — directly within the Root it
+/// names, or the only one — and whether something stands there already,
+/// the Root read by `read` apart (see [`ReadsApart`]), so a Root on a mount
+/// gone quiet holds up none of the Server's own threads, and holds one of
+/// its own however often it is Cloned into again; the destination is judged
+/// by `judged` in the same read apart, so what it reads of the filesystem
+/// is bound by the same deadline. `None` where the reading has not answered
+/// by `deadline`, or one begun earlier still has not.
+async fn placed(
+    reads: &ReadsApart,
+    deadline: tokio::time::Instant,
+    placement: Placement,
     read: impl FnOnce(&str, Option<&Path>) -> Result<PathBuf, CloneRefusal> + Send + 'static,
     judged: impl FnOnce(&Path) -> Result<(), CloneRefusal> + Send + 'static,
 ) -> Option<Result<(PathBuf, bool), CloneRefusal>> {
+    let Placement {
+        roots,
+        named,
+        name,
+        home,
+    } = placement;
     // No Root, or several and none named, is refused without reading one.
     let asked = match (&named, roots.as_slice()) {
         (Some(named), _) => named.clone(),
@@ -729,10 +740,12 @@ impl SessionOperations {
         let Some(placed) = placed(
             &self.cloning.reads,
             deadline,
-            roots,
-            request.root.clone(),
-            name,
-            self.cloning.home.clone(),
+            Placement {
+                roots,
+                named: request.root.clone(),
+                name,
+                home: self.cloning.home.clone(),
+            },
             readable_root,
             move |destination| {
                 kept_from_sidekick_workspace(&sidekick_workspace, destination, from_a_peer)
@@ -972,6 +985,17 @@ impl SessionOperations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Clone named `name` asked to go within the only Workspace Root,
+    /// `root`, rooted as this platform roots paths.
+    fn placement(root: &str, name: &str) -> Placement {
+        Placement {
+            roots: vec![rooted(root)],
+            named: None,
+            name: name.to_owned(),
+            home: None,
+        }
+    }
 
     /// A path rooted as this platform roots one.
     fn rooted(path: &str) -> String {
@@ -1267,10 +1291,7 @@ mod tests {
         let placing = placed(
             &reads,
             tokio::time::Instant::now() + Duration::from_millis(50),
-            vec![rooted("unplugged")],
-            None,
-            "atlas".to_owned(),
-            None,
+            placement("unplugged", "atlas"),
             quiet,
             |_: &Path| Ok(()),
         );
@@ -1295,10 +1316,7 @@ mod tests {
         let again = placed(
             &reads,
             tokio::time::Instant::now() + Duration::from_secs(60 * 60),
-            vec![rooted("unplugged")],
-            None,
-            "charts".to_owned(),
-            None,
+            placement("unplugged", "charts"),
             |_: &str, _: Option<&Path>| {
                 panic!("a Root whose read is outstanding is not read again")
             },
@@ -1314,10 +1332,7 @@ mod tests {
         let answering = placed(
             &reads,
             tokio::time::Instant::now() + Duration::from_secs(30),
-            vec![rooted("projects")],
-            None,
-            "atlas".to_owned(),
-            None,
+            placement("projects", "atlas"),
             |root: &str, _home: Option<&Path>| Ok(PathBuf::from(root)),
             |_: &Path| Ok(()),
         );
@@ -1341,10 +1356,7 @@ mod tests {
         let placing = placed(
             &reads,
             tokio::time::Instant::now() + Duration::from_millis(50),
-            vec![rooted("projects")],
-            None,
-            "atlas".to_owned(),
-            None,
+            placement("projects", "atlas"),
             |root: &str, _home: Option<&Path>| Ok(PathBuf::from(root)),
             move |_: &Path| {
                 let _ = released.recv();
@@ -1365,10 +1377,7 @@ mod tests {
             placed(
                 &reads,
                 tokio::time::Instant::now() + Duration::from_secs(30),
-                vec![rooted("archive")],
-                None,
-                "sidekick".to_owned(),
-                None,
+                placement("archive", "sidekick"),
                 |root: &str, _home: Option<&Path>| Ok(PathBuf::from(root)),
                 |destination: &Path| {
                     Err(CloneRefusal::SidekickWorkspacePlace {
