@@ -809,9 +809,10 @@ async fn an_existing_destination_is_refused_naming_the_workspace_there() {
 
 /// No Clone takes the place the Sidekick Workspace is kept in, though a
 /// Workspace Root names the data directory it is kept in, in whatever case
-/// its name is spelled: a filesystem that does not tell case apart takes any
-/// of them for that very directory, which is to stay outside source control.
-/// The Sidekick Workspace is left as it was.
+/// its name is spelled — a filesystem that does not tell case apart takes
+/// any of them for that very directory, which is to stay outside source
+/// control — since that directory is no Root a Clone may go in at all. The
+/// Sidekick Workspace is left as it was.
 #[tokio::test]
 async fn no_clone_takes_the_sidekick_workspaces_place_however_its_name_is_spelled() {
     const CHANNEL: &str = "sidekick-clone-sidekick-place";
@@ -845,10 +846,11 @@ async fn no_clone_takes_the_sidekick_workspaces_place_however_its_name_is_spelle
             )
             .await,
             format!(
-                "`{}` is where the Sidekick Workspace is kept, in whatever case its name is \
-                 spelled, and no Clone may take its place, so nothing was cloned; give another \
-                 `name`.",
-                spelled(&data.join(name))
+                "`{}` names Suru's own data directory, where the Sidekick Workspace is kept, \
+                 which is not a Root a Clone may go in, so nothing was cloned; Clone into another \
+                 of this server's Workspace Roots, or ask the user to name a directory of their \
+                 own in the workspace.roots Setting.",
+                spelled(&data)
             ),
             "{name:?} names the Sidekick Workspace's place"
         );
@@ -1071,6 +1073,105 @@ async fn only_a_sidekick_is_offered_clone_workspace_and_told_the_roots_that_boun
         json!("The Broker offers no Tool named `clone_workspace`")
     );
     assert!(contents(&projects).is_empty(), "and nothing is cloned");
+
+    hosted.server.shutdown().await.expect("shut down server");
+}
+
+/// Suru's own data directory, where the Sidekick Workspace is kept, is no
+/// Root a Clone may go in, however the Roots spell it. A Sidekick is not told
+/// of it among the Roots that bound its Clones. A Clone naming it as `root`,
+/// as the Setting spells it or as the directory it is, is refused saying it
+/// is not a Root a Clone may go in. One naming no Root goes in the only other
+/// Root rather than being asked which, and where it is the only Root, a
+/// Clone is refused so. Nothing is cloned into it.
+#[tokio::test]
+async fn suru_s_own_data_directory_is_no_root_a_clone_may_go_in() {
+    const CHANNEL: &str = "sidekick-clone-data-root";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let (_projects, projects) = directory();
+    let (_elsewhere, elsewhere) = directory();
+    let origin = bare_repository(&elsewhere, "atlas");
+    // As the Server is configured, not as the filesystem resolves it.
+    let data = ServerConfig::new(state_dir.path(), CHANNEL)
+        .expect("configure the Server")
+        .data_dir()
+        .to_owned();
+    name_roots(config_dir.path(), &[spelled(&data), spelled(&projects)]);
+    let mut hosted = host_providers(state_dir.path(), CHANNEL, Some(config_dir.path())).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let workspace = sidekick_directory(&descriptor).await;
+    let (_sidekick_id, handoff, _provider) = start_session(
+        &descriptor,
+        &mut hosted.claude,
+        &workspace,
+        default_selection(&claude_models()),
+    )
+    .await;
+    let mut sidekick = McpClient::handed(&handoff);
+    sidekick.initialize().await;
+    let note = handoff.instruction_note(|tool| format!("mcp__suru__{tool}"));
+    assert!(
+        note.contains(&serde_json::to_string(&[spelled(&projects)]).expect("the Roots as JSON")),
+        "a Sidekick is told the Roots its Clones may go in, and that one alone: {note}"
+    );
+    let data_root = suru::paths::canonical(&data).expect("read the data directory canonically");
+    let refusal = |root: &Path| {
+        format!(
+            "`{}` names Suru's own data directory, where the Sidekick Workspace is kept, which \
+             is not a Root a Clone may go in, so nothing was cloned; Clone into another of this \
+             server's Workspace Roots, or ask the user to name a directory of their own in the \
+             workspace.roots Setting.",
+            spelled(root)
+        )
+    };
+
+    for root in [&data, &data_root] {
+        assert_eq!(
+            refused(
+                &mut sidekick,
+                "clone_workspace",
+                json!({ "repository_url": origin, "root": root }),
+            )
+            .await,
+            refusal(root),
+            "{}",
+            root.display()
+        );
+    }
+    let atlas = projects.join("atlas");
+    assert_eq!(
+        acted(
+            &mut sidekick,
+            "clone_workspace",
+            json!({ "repository_url": origin }),
+        )
+        .await,
+        cloned_row(&atlas, Value::Null, Value::Null),
+        "a Clone naming no Root goes in the only one it may"
+    );
+
+    mutate_setting(
+        &descriptor,
+        SettingMutation::WorkspaceRoots {
+            value: Some(vec![spelled(&data).to_owned()]),
+        },
+    )
+    .await;
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            "clone_workspace",
+            json!({ "repository_url": origin, "name": "charts" }),
+        )
+        .await,
+        refusal(&data),
+        "where it is the only Root, a Clone is refused"
+    );
+    assert!(
+        !data.join("atlas").exists() && !data.join("charts").exists(),
+        "nothing is cloned into Suru's own data directory"
+    );
 
     hosted.server.shutdown().await.expect("shut down server");
 }

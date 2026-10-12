@@ -28,6 +28,7 @@ use crate::{
     memories::{MemoryIndex, MemoryStore},
     protocol::{Session, SessionId, SettingsSnapshot},
     provider::ProviderSubagentId,
+    server::operations::CloneRoots,
     sessions::SessionStore,
     sidekick::SidekickWorkspace,
 };
@@ -126,7 +127,8 @@ pub struct BrokerHandoff {
     /// token was minted, and nothing for any other Agent.
     memories: MemoryIndex,
     /// The Workspace Roots a Sidekick's Clones are bound to, as the user had
-    /// named them when the token was minted, and none for any other Agent.
+    /// named them when the token was minted — but one naming Suru's own data
+    /// directory, which no Clone goes in — and none for any other Agent.
     roots: Vec<String>,
 }
 
@@ -251,6 +253,9 @@ pub(crate) struct BrokerAccess {
     sidekick: SidekickWorkspace,
     /// Where a Sidekick's handoff reads what it begins knowing of Memories.
     memories: MemoryStore,
+    /// How a Sidekick's handoff tells the Workspace Roots its Clones may go
+    /// in from those they may not.
+    clone_roots: CloneRoots,
     live: Arc<Mutex<LiveTokens>>,
 }
 
@@ -277,8 +282,17 @@ impl BrokerAccess {
             settings,
             sidekick,
             memories,
+            clone_roots: CloneRoots::new(None, None, std::time::Duration::ZERO),
             live: Arc::default(),
         }
+    }
+
+    /// Has a Sidekick's handoff name only the Workspace Roots its Clones may
+    /// go in, as `clone_roots` tells them: never one naming Suru's own data
+    /// directory.
+    pub(crate) fn with_clone_roots(mut self, clone_roots: CloneRoots) -> Self {
+        self.clone_roots = clone_roots;
+        self
     }
 
     /// Whether the user has left the Broker on.
@@ -299,10 +313,13 @@ impl BrokerAccess {
         let session_id = session.id;
         let role = BrokerRole::of(session, &self.sidekick);
         let (memories, roots) = match role {
-            BrokerRole::Sidekick => (
-                self.memory_index().await,
-                self.settings.borrow().settings.workspace.roots.clone(),
-            ),
+            BrokerRole::Sidekick => {
+                let roots = self.settings.borrow().settings.workspace.roots.clone();
+                (
+                    self.memory_index().await,
+                    self.clone_roots.open_to_clones(roots).await,
+                )
+            }
             BrokerRole::Agent => (MemoryIndex::default(), Vec::new()),
         };
         let token = BrokerToken::mint();

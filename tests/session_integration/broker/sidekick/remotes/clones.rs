@@ -376,10 +376,11 @@ fn in_any_case(name: &str) -> String {
 /// A Remote whose data directory is named a Workspace Root before it has
 /// made its Sidekick Workspace takes no Clone where that Workspace would be
 /// made, in whatever case its name is spelled, nor spelled with the Kelvin
-/// sign a filesystem that composes characters reads as `K`: a filesystem
+/// sign a filesystem that composes characters reads as `K` — a filesystem
 /// that does not tell case apart takes any of them for that very directory,
 /// so the Sidekick Workspace would be made of what a Peer's Sidekick filled
-/// it with. Nothing is cloned there.
+/// it with — since its data directory is no Root a Clone may go in at all.
+/// Nothing is cloned there.
 #[tokio::test]
 async fn a_remote_takes_no_clone_where_its_sidekick_workspace_would_be_made_however_spelled() {
     let mut pair = paired(
@@ -411,10 +412,11 @@ async fn a_remote_takes_no_clone_where_its_sidekick_workspace_would_be_made_howe
             )
             .await,
             format!(
-                "The Remote `{REMOTE}` refused it: `{}` is where the Sidekick Workspace is kept, \
-                 in whatever case its name is spelled, and no Clone may take its place, so \
-                 nothing was cloned; give another `name`.",
-                spelled(&data.join(name))
+                "The Remote `{REMOTE}` refused it: `{}` names Suru's own data directory, where \
+                 the Sidekick Workspace is kept, which is not a Root a Clone may go in, so \
+                 nothing was cloned; Clone into another of this server's Workspace Roots, or ask \
+                 the user to name a directory of their own in the workspace.roots Setting.",
+                spelled(&data)
             ),
             "{name:?} names the Sidekick Workspace's place"
         );

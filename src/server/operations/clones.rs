@@ -12,7 +12,12 @@
 //! spelled — a filesystem that does not tell case apart takes any spelling
 //! for that very directory, made or yet to be — nor the place a symlink its
 //! user relocated it by leads to before anything is there; judged as the
-//! Root is read, within the Clone's deadline.
+//! Root is read, within the Clone's deadline. Nor does a Clone go in a Root
+//! naming Suru's own data directory, where the Sidekick Workspace is kept,
+//! however the Root is spelled: told apart as every Root is told from a
+//! directory, it is passed over as no Root a Clone may go in, and refused
+//! where named or where it is the only one — and so is a Root read as that
+//! directory only once the Clone reads it.
 //!
 //! The Clone itself is source control's ([`SourceControlService::clone_repository`]),
 //! bounded by this Server's own timeout, and leaves nothing behind where it
@@ -69,6 +74,7 @@ use crate::{
     },
     server::{
         reads_apart::{NotRead, ReadsApart},
+        root_directories,
         root_discovery::{self, expand},
     },
     sidekick::SidekickWorkspace,
@@ -86,25 +92,69 @@ const ROOT_READS_AT_ONCE: usize = 8;
 /// past the Clone's deadline, since the clone has landed whatever the time.
 const LANDED_READ_WITHIN: Duration = Duration::from_secs(5);
 
-/// What a Clone takes that is this Server's own: the home a Workspace Root
-/// beginning with `~` lies beneath, how long a Clone may run, the reads
-/// apart a Root is read by, and the Clones run on tasks of their own.
+/// What a Clone takes that is this Server's own: how its Workspace Roots
+/// are read, how long a Clone may run, and the Clones run on tasks of their
+/// own.
 #[derive(Clone)]
 pub(crate) struct WorkspaceCloning {
-    home: Option<PathBuf>,
+    roots: CloneRoots,
     timeout: Duration,
-    reads: Arc<ReadsApart>,
     detached: DetachedClones,
 }
 
 impl WorkspaceCloning {
-    pub(crate) fn new(home: Option<PathBuf>, timeout: Duration, detached: DetachedClones) -> Self {
+    pub(crate) fn new(roots: CloneRoots, timeout: Duration, detached: DetachedClones) -> Self {
         Self {
-            home,
+            roots,
             timeout,
-            reads: Arc::new(ReadsApart::new("suru-clone-root-read", ROOT_READS_AT_ONCE)),
             detached,
         }
+    }
+}
+
+/// How the Workspace Roots a Clone may go in are read: the home a Root
+/// beginning with `~` lies beneath; Suru's own data directory, read
+/// canonically, where the Sidekick Workspace is kept and which is never a
+/// Root a Clone may go in; the reads apart every Root is read by, so one on
+/// a mount gone quiet holds up none of the Server's own threads; and the
+/// longest the Roots are waited on to be told apart.
+#[derive(Clone)]
+pub(crate) struct CloneRoots {
+    home: Option<PathBuf>,
+    data_root: Option<PathBuf>,
+    reads: Arc<ReadsApart>,
+    wait: Duration,
+}
+
+impl CloneRoots {
+    pub(crate) fn new(home: Option<PathBuf>, data_root: Option<PathBuf>, wait: Duration) -> Self {
+        Self {
+            home,
+            data_root,
+            reads: Arc::new(ReadsApart::new("suru-clone-root-read", ROOT_READS_AT_ONCE)),
+            wait,
+        }
+    }
+
+    /// The Roots among `roots` a Clone may go in — every one but those
+    /// naming Suru's own data directory — as a Sidekick is told them.
+    pub(crate) async fn open_to_clones(&self, roots: Vec<String>) -> Vec<String> {
+        self.told(roots, self.wait).await.0
+    }
+
+    /// `roots`, each in the Setting's order, told apart as those a Clone may
+    /// go in and those naming Suru's own data directory, as every Root is
+    /// told from a directory (see [`root_directories`]): written as it, or
+    /// resolving to it where reading the Root answers within `wait`.
+    async fn told(&self, roots: Vec<String>, wait: Duration) -> (Vec<String>, Vec<String>) {
+        let Some(data_root) = &self.data_root else {
+            return (roots, Vec::new());
+        };
+        let named =
+            root_directories::resolve(&self.reads, self.home.as_deref(), wait, roots.iter()).await;
+        roots
+            .into_iter()
+            .partition(|root| !named[root].names(data_root))
     }
 }
 
@@ -173,6 +223,10 @@ pub(crate) enum CloneRefusal {
     UnknownRoot { named: String, roots: Vec<String> },
     /// The Root cannot be read, as `reason` says.
     UnreadableRoot { root: String, reason: String },
+    /// The Root the Clone would go in, `root` as the Setting or the Clone
+    /// spells it, names Suru's own data directory, where the Sidekick
+    /// Workspace is kept, which is never a Root a Clone may go in.
+    DataRoot { root: String },
     /// The name given is not one plain directory name.
     NotPlainName { name: String },
     /// The name given — or, where `url` is named, the one the Repository
@@ -255,6 +309,13 @@ impl fmt::Display for CloneRefusal {
                 formatter,
                 "The Workspace Root `{root}` cannot be read ({reason}), so nothing was cloned; \
                  Suru never makes a Workspace Root, so ask the user to make it or to name another."
+            ),
+            Self::DataRoot { root } => write!(
+                formatter,
+                "`{root}` names Suru's own data directory, where the Sidekick Workspace is kept, \
+                 which is not a Root a Clone may go in, so nothing was cloned; Clone into another \
+                 of this server's Workspace Roots, or ask the user to name a directory of their \
+                 own in the workspace.roots Setting."
             ),
             Self::NotPlainName { name } => write!(
                 formatter,
@@ -395,6 +456,7 @@ impl CloneRefusal {
             | Self::RootUnnamed { .. }
             | Self::UnknownRoot { .. }
             | Self::UnreadableRoot { .. }
+            | Self::DataRoot { .. }
             | Self::NotPlainName { .. }
             | Self::HiddenName { .. }
             | Self::NoNameInUrl { .. }
@@ -676,18 +738,24 @@ fn named_by(url: &str) -> Result<&str, CloneRefusal> {
     })
 }
 
-/// Where a Clone is asked to go: the Workspace Roots configured, the one it
-/// names where it names one, the directory it makes within it, and the
-/// home a Root beginning with `~` lies beneath.
+/// Where a Clone is asked to go: the Workspace Roots configured that a
+/// Clone may go in, those naming Suru's own data directory, which none may,
+/// the one it names where it names one, the directory it makes within it,
+/// the home a Root beginning with `~` lies beneath, and the data directory,
+/// read canonically.
 struct Placement {
     roots: Vec<String>,
+    data_roots: Vec<String>,
     named: Option<String>,
     name: String,
     home: Option<PathBuf>,
+    data_root: Option<PathBuf>,
 }
 
 /// Where the Clone `placement` asks for goes — directly within the Root it
-/// names, or the only one — and whether something stands there already,
+/// names, or the only one, never one naming Suru's own data directory,
+/// however it is spelled or comes to be read — and whether something stands
+/// there already,
 /// the Root read by `read` apart (see [`ReadsApart`]), so a Root on a mount
 /// gone quiet holds up none of the Server's own threads, and holds one of
 /// its own however often it is Cloned into again; the destination is judged
@@ -703,21 +771,42 @@ async fn placed(
 ) -> Option<Result<(PathBuf, bool), CloneRefusal>> {
     let Placement {
         roots,
+        data_roots,
         named,
         name,
         home,
+        data_root,
     } = placement;
     // No Root, or several and none named, is refused without reading one.
-    let asked = match (&named, roots.as_slice()) {
-        (Some(named), _) => named.clone(),
-        (None, [only]) => only.clone(),
-        (None, _) => {
+    let asked = match (&named, roots.as_slice(), data_roots.as_slice()) {
+        (Some(named), _, _) => named.clone(),
+        (None, [only], _) => only.clone(),
+        (None, [], [data_root, ..]) => {
+            return Some(Err(CloneRefusal::DataRoot {
+                root: data_root.clone(),
+            }));
+        }
+        (None, _, _) => {
             return Some(chosen_root(&roots, None, home.as_deref()).map(|_| unreachable!()));
         }
     };
     let placing = reads.read(Path::new(&asked), move || async move {
+        if let Some(named) = named.as_deref()
+            && chosen_root(&data_roots, Some(named), home.as_deref()).is_ok()
+        {
+            return Err(CloneRefusal::DataRoot {
+                root: named.to_owned(),
+            });
+        }
         let root = chosen_root(&roots, named.as_deref(), home.as_deref())?;
-        let destination = read(root, home.as_deref())?.join(name);
+        let directory = read(root, home.as_deref())?;
+        // A Root not told from the data directory in time is told now.
+        if data_root.as_ref() == Some(&directory) {
+            return Err(CloneRefusal::DataRoot {
+                root: root.to_owned(),
+            });
+        }
+        let destination = directory.join(name);
         judged(&destination)?;
         let occupied = std::fs::symlink_metadata(&destination).is_ok();
         Ok((destination, occupied))
@@ -806,7 +895,7 @@ impl SessionOperations {
         // the clone, and removing what a Clone that failed made.
         let deadline = tokio::time::Instant::now() + self.cloning.timeout;
         let url = request.repository_url.as_str();
-        let roots = self.settings.borrow().settings.workspace.roots.clone();
+        let configured = self.settings.borrow().settings.workspace.roots.clone();
         let name = match &request.name {
             Some(name) => workspace_name(name)?,
             None => named_by(url)?,
@@ -814,14 +903,20 @@ impl SessionOperations {
         .to_owned();
         let sidekick_workspace = self.sidekick_workspace.clone();
         let from_a_peer = matches!(author, Author::PeerSidekick { .. });
+        let telling = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(self.cloning.roots.wait);
+        let (roots, data_roots) = self.cloning.roots.told(configured, telling).await;
         let Some(placed) = placed(
-            &self.cloning.reads,
+            &self.cloning.roots.reads,
             deadline,
             Placement {
                 roots,
+                data_roots,
                 named: request.root.clone(),
                 name,
-                home: self.cloning.home.clone(),
+                home: self.cloning.roots.home.clone(),
+                data_root: self.cloning.roots.data_root.clone(),
             },
             readable_root,
             move |destination| {
@@ -962,7 +1057,7 @@ impl SessionOperations {
             let source_control = operations.source_control.clone();
             let reading = destination.clone();
             let workspace = self::landed(
-                &operations.cloning.reads,
+                &operations.cloning.roots.reads,
                 &destination,
                 known,
                 LANDED_READ_WITHIN,
@@ -1134,7 +1229,7 @@ impl SessionOperations {
                 let source_control = self.source_control.clone();
                 let reading = destination.clone();
                 read_within(
-                    &self.cloning.reads,
+                    &self.cloning.roots.reads,
                     &destination,
                     deadline.saturating_duration_since(tokio::time::Instant::now()),
                     move || async move { source_control.workspace_rooted_at(&reading).await },
@@ -1171,9 +1266,11 @@ mod tests {
     fn placement(root: &str, name: &str) -> Placement {
         Placement {
             roots: vec![rooted(root)],
+            data_roots: Vec::new(),
             named: None,
             name: name.to_owned(),
             home: None,
+            data_root: None,
         }
     }
 
@@ -1640,6 +1737,90 @@ mod tests {
             Some(Err(CloneRefusal::SidekickWorkspacePlace {
                 destination: archive.join("sidekick"),
             }))
+        );
+    }
+
+    /// No Clone goes in a Root naming Suru's own data directory, where the
+    /// Sidekick Workspace is kept: one told apart as naming it is refused
+    /// when named, and where it is the only Root configured, and passed over
+    /// otherwise, so the only other Root takes a Clone naming none; and one
+    /// not told apart in time is refused once it is read as that directory.
+    #[tokio::test]
+    async fn no_clone_goes_in_a_root_naming_suru_s_own_data_directory() {
+        let reads = ReadsApart::new("suru-clone-root-read", 4);
+        let (data, projects) = (rooted("suru/data"), rooted("projects"));
+        let data_root = PathBuf::from(&data);
+        let deadline = || tokio::time::Instant::now() + Duration::from_secs(30);
+        let placing =
+            |roots: &[&String], data_roots: &[&String], named: Option<&String>| Placement {
+                roots: roots.iter().map(|root| (*root).clone()).collect(),
+                data_roots: data_roots.iter().map(|root| (*root).clone()).collect(),
+                named: named.cloned(),
+                name: "atlas".to_owned(),
+                home: None,
+                data_root: Some(data_root.clone()),
+            };
+        let read = |root: &str, _home: Option<&Path>| Ok(PathBuf::from(root));
+        let refused = |root: &String| Some(Err(CloneRefusal::DataRoot { root: root.clone() }));
+
+        assert_eq!(
+            placed(
+                &reads,
+                deadline(),
+                placing(&[], &[&data], None),
+                read,
+                |_: &Path| Ok(())
+            )
+            .await,
+            refused(&data),
+            "the only Root configured takes no Clone"
+        );
+        assert_eq!(
+            placed(
+                &reads,
+                deadline(),
+                placing(&[&projects], &[&data], Some(&data)),
+                read,
+                |_: &Path| Ok(())
+            )
+            .await,
+            refused(&data),
+            "nor one naming it"
+        );
+        assert_eq!(
+            placed(
+                &reads,
+                deadline(),
+                placing(&[&projects], &[&data], None),
+                read,
+                |_: &Path| Ok(())
+            )
+            .await,
+            Some(Ok((PathBuf::from(&projects).join("atlas"), false))),
+            "and the only other Root takes a Clone naming none"
+        );
+        let quiet = rooted("link-to-data");
+        assert_eq!(
+            placed(
+                &reads,
+                deadline(),
+                placing(&[&quiet], &[], None),
+                move |_: &str, _: Option<&Path>| Ok(PathBuf::from(rooted("suru/data"))),
+                |_: &Path| Ok(())
+            )
+            .await,
+            refused(&quiet),
+            "a Root read as that directory only once the Clone reads it is refused then"
+        );
+        assert_eq!(
+            CloneRefusal::DataRoot {
+                root: "~/.local/share/suru".to_owned(),
+            }
+            .to_string(),
+            "`~/.local/share/suru` names Suru's own data directory, where the Sidekick Workspace \
+             is kept, which is not a Root a Clone may go in, so nothing was cloned; Clone into \
+             another of this server's Workspace Roots, or ask the user to name a directory of \
+             their own in the workspace.roots Setting."
         );
     }
 

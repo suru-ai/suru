@@ -1672,6 +1672,14 @@ async fn start(
     );
     let runtimes = Arc::new(runtimes);
     let skill_catalog = SkillCatalogService::new(runtimes.clone(), settings.subscribe());
+    // The Workspace Roots a Clone may go in are told apart from Suru's own
+    // data directory, which is none, alike for a Clone and for what a
+    // Sidekick is told of them.
+    let clone_roots = operations::CloneRoots::new(
+        config.home_dir(),
+        Some(sidekick_workspace.data_root().to_owned()),
+        timings.root_discovery_wait,
+    );
     // The Broker lives on this same loopback listener, and its endpoint is
     // handed only to Provider starts: never written into the runtime
     // descriptor, whose token grants the whole API (ADR 0034). Whether a
@@ -1682,7 +1690,8 @@ async fn start(
         settings.subscribe(),
         sidekick_workspace.clone(),
         memories.clone(),
-    );
+    )
+    .with_clone_roots(clone_roots.clone());
     let providers = ProviderOrchestrator::new(
         runtimes.as_ref().clone(),
         sessions.clone(),
@@ -1736,7 +1745,7 @@ async fn start(
         Arc::new(hosted_providers),
         timings.checkout_skill_timeout,
         operations::WorkspaceCloning::new(
-            config.home_dir(),
+            clone_roots,
             timings.workspace_clone_timeout,
             detached_clones.clone(),
         ),
