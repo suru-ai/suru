@@ -52,7 +52,7 @@ use super::{
 };
 use crate::{
     protocol::{WorkspaceId, WorkspaceUnavailability},
-    sessions::SessionStore,
+    sessions::{SessionStore, Sighting},
 };
 
 /// How many directories are read at once.
@@ -147,20 +147,25 @@ impl RegistryStanding {
         {
             return progress.clone();
         }
-        let entries = self.0.sessions.presented_entries();
+        let (since, entries) = self.0.sessions.presented_entries();
         let (sender, progress) = watch::channel(Progress {
             unread: entries.iter().map(|(id, _)| id.clone()).collect(),
             ..Progress::default()
         });
         *in_flight = Some(progress.clone());
-        tokio::spawn(self.clone().read(entries, sender));
+        tokio::spawn(self.clone().read(since, entries, sender));
         progress
     }
 
-    /// Reads where each of `entries` is presented, taking what each reading
-    /// finds as it answers, until every one has or the bound on waiting has
-    /// passed.
-    async fn read(self, entries: Vec<(WorkspaceId, PathBuf)>, progress: watch::Sender<Progress>) {
+    /// Reads where each of `entries`, taken at `since`, is presented, taking
+    /// what each reading finds as it answers, until every one has or the
+    /// bound on waiting has passed.
+    async fn read(
+        self,
+        since: Sighting,
+        entries: Vec<(WorkspaceId, PathBuf)>,
+        progress: watch::Sender<Progress>,
+    ) {
         let mut presented = BTreeMap::<PathBuf, Vec<WorkspaceId>>::new();
         for (id, path) in entries {
             presented.entry(path).or_default().push(id);
@@ -180,7 +185,7 @@ impl RegistryStanding {
         .buffer_unordered(CONCURRENT_READINGS)
         .for_each(|(directory, read)| {
             for id in &presented[&directory] {
-                let why = self.standing(id, &directory, &read);
+                let why = self.standing(id, &directory, since, &read);
                 progress.send_modify(|progress| {
                     progress.unread.remove(id);
                     if let Some(why) = why {
@@ -204,13 +209,15 @@ impl RegistryStanding {
         });
     }
 
-    /// Why the entry `id` presented at `path` cannot be opened, as `read`
-    /// found it, dropping it where it is gone and no Session belongs to it;
-    /// `None` where it can be opened, or no longer stands there.
+    /// Why the entry `id` presented at `path` cannot be opened, as `read`,
+    /// begun after `since`, found it, dropping it where it is gone and
+    /// neither seen since nor a Session's; `None` where it can be opened, or
+    /// no longer stands as read.
     fn standing(
         &self,
         id: &WorkspaceId,
         path: &Path,
+        since: Sighting,
         read: &Result<Reading, NotRead>,
     ) -> Option<WorkspaceUnavailability> {
         match read {
@@ -218,7 +225,7 @@ impl RegistryStanding {
             Ok(Reading::Gone) => self
                 .0
                 .sessions
-                .forget_gone(id, path)
+                .forget_gone(id, path, since)
                 .then_some(WorkspaceUnavailability::Gone),
             Ok(Reading::Unreadable(why)) => Some(*why),
             Err(NotRead::Outstanding) => Some(WorkspaceUnavailability::Unanswered),
@@ -604,6 +611,73 @@ mod tests {
             listed(sessions),
             [readable],
             "once its directory answers that it is gone, the entry follows the disk"
+        );
+    }
+
+    /// A reading that found a directory gone drops nothing seen there since
+    /// it began: here the Repository is moved away and read gone, then
+    /// moved back and discovered again before that reading is taken. A
+    /// reading begun after it was last seen still drops it.
+    #[tokio::test]
+    async fn a_reading_that_found_a_directory_gone_drops_nothing_seen_there_since_it_began() {
+        let atlas = absolute(&["work", "atlas"]);
+        let registry = Registry::holding(&[&atlas]).await;
+        let gate = Arc::new(Gate::default());
+        let held = OpensOnDrop(gate.clone());
+        let readings = Arc::new(AtomicUsize::new(0));
+        let standing = RegistryStanding::with_probe(
+            registry.sessions.clone(),
+            None,
+            SURELY,
+            Arc::new({
+                let (gate, readings) = (gate.clone(), readings.clone());
+                move |_: &Path| {
+                    readings.fetch_add(1, Ordering::SeqCst);
+                    gate.wait();
+                    Reading::Gone
+                }
+            }),
+        );
+
+        let listing = tokio::spawn({
+            let standing = standing.clone();
+            async move { standing.check().await }
+        });
+        tokio::time::timeout(SURELY, async {
+            while readings.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the directory is read");
+        registry.sessions.enter_discovered(
+            &crate::protocol::Workspace::directory(atlas.clone()),
+            &atlas,
+            "~/work",
+        );
+        drop(held);
+
+        assert_eq!(
+            tokio::time::timeout(SURELY, listing)
+                .await
+                .expect("the listing answers once the reading does")
+                .expect("the listing runs to its end"),
+            HashMap::new(),
+            "the entry seen since the reading began is listed as it was seen"
+        );
+        assert_eq!(
+            listed(&registry.sessions),
+            std::slice::from_ref(&atlas),
+            "and kept"
+        );
+
+        tokio::time::timeout(SURELY, standing.check())
+            .await
+            .expect("a later listing answers");
+        assert_eq!(
+            listed(&registry.sessions),
+            Vec::<PathBuf>::new(),
+            "a reading begun after it was last seen drops it"
         );
     }
 

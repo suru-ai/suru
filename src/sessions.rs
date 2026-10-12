@@ -72,6 +72,7 @@ mod watches;
 mod workspace_description;
 mod workspace_icon;
 mod workspaces;
+pub(crate) use workspaces::Sighting;
 
 pub(crate) use brokered::{
     BrokeredReadError, BrokeredResumeError, BrokeredSpawn, BrokeredSpawnCap, BrokeredSpawnError,
@@ -178,6 +179,11 @@ struct SessionStoreState {
     /// Session creation, regrouped by discovery, or restored from a Session's
     /// own stored metadata.
     workspaces: HashMap<WorkspaceId, StoredWorkspace>,
+    /// When each Registry entry was last seen, by the count of sightings
+    /// [`SessionStore::enter_workspace`] keeps, so a reading of the disk
+    /// begun before one is never taken over it (see
+    /// [`SessionStore::forget_gone`]).
+    sightings: workspaces::Sightings,
     /// Where the store says a Report is waiting for a Session, once
     /// Provider orchestration has asked to hear of it: the Session the Report
     /// is for, whose Agent the orchestrator then delivers it to (see
@@ -419,6 +425,7 @@ impl SessionStore {
             resumable_preparations: resumable_preparations.into_iter().collect(),
             posture_generations: HashMap::new(),
             workspaces,
+            sightings: Default::default(),
             report_notices: None,
         };
         // A history still waiting in storage has nothing a save could be

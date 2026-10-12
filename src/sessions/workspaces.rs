@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use super::{SessionStore, SessionStoreState};
 use crate::{
@@ -55,6 +58,43 @@ fn presented_repository(
             rename_branch: unread(),
         },
     })
+}
+
+/// When each Registry entry was last seen: a Session resolved there,
+/// discovery finding it, or someone describing it.
+#[derive(Default)]
+pub(super) struct Sightings {
+    /// How many sightings there have been.
+    count: u64,
+    /// The sighting each entry was last seen at.
+    last: HashMap<WorkspaceId, u64>,
+}
+
+/// A moment as the Registry counts sightings: everything seen at it or
+/// before, and nothing after.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Sighting(u64);
+
+impl Sightings {
+    fn see(&mut self, workspace_id: &WorkspaceId) {
+        self.count += 1;
+        self.last.insert(workspace_id.clone(), self.count);
+    }
+
+    fn now(&self) -> Sighting {
+        Sighting(self.count)
+    }
+
+    /// Whether `workspace_id` has been seen since `since`.
+    fn seen_since(&self, workspace_id: &WorkspaceId, since: Sighting) -> bool {
+        self.last
+            .get(workspace_id)
+            .is_some_and(|&last| last > since.0)
+    }
+
+    fn forget(&mut self, workspace_id: &WorkspaceId) {
+        self.last.remove(workspace_id);
+    }
 }
 
 impl SessionStoreState {
@@ -197,6 +237,7 @@ impl SessionStore {
         presented: Option<&Workspace>,
         provenance: WorkspaceProvenance,
     ) -> &'state mut StoredWorkspace {
+        state.sightings.see(workspace_id);
         let stored = state
             .workspaces
             .entry(workspace_id.clone())
@@ -258,6 +299,7 @@ impl SessionStore {
             let Some(retired) = state.workspaces.remove(&retired_id) else {
                 continue;
             };
+            state.sightings.forget(&retired_id);
             tracing::info!(
                 superseded = %retired_id.0,
                 workspace = %workspace.id.0,
@@ -332,35 +374,43 @@ impl SessionStore {
     }
 
     /// Every entry the Registry holds a path for, by its identity and the
-    /// path it is presented at: where each is read for its standing.
-    pub(crate) fn presented_entries(&self) -> Vec<(WorkspaceId, PathBuf)> {
-        self.state
-            .lock()
-            .unwrap()
+    /// path it is presented at — where each is read for its standing — and
+    /// the moment they were taken, which a reading of them began after.
+    pub(crate) fn presented_entries(&self) -> (Sighting, Vec<(WorkspaceId, PathBuf)>) {
+        let state = self.state.lock().unwrap();
+        let entries = state
             .workspaces
             .iter()
             .filter_map(|(id, stored)| Some((id.clone(), stored.path.clone()?)))
-            .collect()
+            .collect();
+        (state.sightings.now(), entries)
     }
 
-    /// Drops the entry `workspace_id` names, found gone from `path` while
-    /// the directory holding it could be read, its Icon and Description
-    /// with it — unless a Session belongs to it, which keeps it. One that
-    /// has since been presented elsewhere is left alone. Answers whether the
-    /// entry stands at `path` still.
-    pub(crate) fn forget_gone(&self, workspace_id: &WorkspaceId, path: &Path) -> bool {
+    /// Drops the entry `workspace_id` names, found gone from `path` by a
+    /// reading begun after `since` while the directory holding it could be
+    /// read, its Icon and Description with it — unless a Session belongs to
+    /// it, which keeps it. One seen since that reading began, or presented
+    /// elsewhere since, is left alone, since the reading no longer says what
+    /// is there. Answers whether the entry stands gone at `path` still.
+    pub(crate) fn forget_gone(
+        &self,
+        workspace_id: &WorkspaceId,
+        path: &Path,
+        since: Sighting,
+    ) -> bool {
         let mut state = self.state.lock().unwrap();
         let presented_there = state
             .workspaces
             .get(workspace_id)
             .is_some_and(|stored| stored.path.as_deref() == Some(path));
-        if !presented_there {
+        if !presented_there || state.sightings.seen_since(workspace_id, since) {
             return false;
         }
         if state.grouped_besides(workspace_id, None) {
             return true;
         }
         state.workspaces.remove(workspace_id);
+        state.sightings.forget(workspace_id);
         tracing::info!(
             workspace = %workspace_id.0,
             path = %path.display(),
@@ -418,6 +468,7 @@ impl SessionStore {
                 continue;
             }
             state.workspaces.remove(&workspace_id);
+            state.sightings.forget(&workspace_id);
             tracing::info!(
                 workspace = %workspace_id.0,
                 "a Workspace Registry entry was dropped with the Workspace Root it was discovered \
