@@ -35,12 +35,12 @@ use crate::build_identity;
 use crate::errands::{DEFAULT_ERRAND_TIMEOUT, ErrandRunner};
 use crate::model_catalog::{CatalogMemory, ModelCatalogService};
 use crate::protocol::{
-    AUTHOR_HEADER, Activity, AdmitPromptRequest, AgentSelection, Author, CompactSessionRequest,
-    CreateSessionRequest, InterruptOutcome, IssueInviteRequest, LifecycleState,
-    ListDirectoryRequest, ListenerState, MODEL_CATALOG_EVENT, Message, MessageId, MessageRole,
-    MessageStatus, ModelCatalog, PROMPT_ADMISSION_HEADER, PROTOCOL_VERSION, Peer, ProviderId,
-    RELAYS_EVENT, RedeemInviteRequest, RelayListing, Remote, ResolveWorkspaceRequest,
-    RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SERVING_LISTENER_EVENT,
+    AUTHOR_HEADER, Activity, AdmitPromptRequest, AgentSelection, Author, CloneWorkspaceRequest,
+    ClonedWorkspace, CompactSessionRequest, CreateSessionRequest, InterruptOutcome,
+    IssueInviteRequest, LifecycleState, ListDirectoryRequest, ListenerState, MODEL_CATALOG_EVENT,
+    Message, MessageId, MessageRole, MessageStatus, ModelCatalog, PROMPT_ADMISSION_HEADER,
+    PROTOCOL_VERSION, Peer, ProviderId, RELAYS_EVENT, RedeemInviteRequest, RelayListing, Remote,
+    ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SERVING_LISTENER_EVENT,
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_ERROR_CODE_HEADER,
     SESSION_READING_PATH, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
     SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT,
@@ -79,8 +79,8 @@ mod root_discovery;
 mod signals;
 
 use operations::{
-    AgentSelectionRefusal, AnswerRefusal, DescriptionRefusal, InterruptRefusal, PromptRefusal,
-    SessionOperations, SettingChanged, SettleRefusal,
+    AgentSelectionRefusal, AnswerRefusal, CloneRefusal, DescriptionRefusal, InterruptRefusal,
+    PromptRefusal, SessionOperations, SettingChanged, SettleRefusal,
 };
 
 pub use crate::clock::{ManualClock, ServerClock};
@@ -1847,6 +1847,7 @@ async fn start(
             "/v1/workspaces/description",
             post(set_workspace_description),
         )
+        .route("/v1/workspaces/clone", post(clone_workspace))
         .route("/v1/workspaces/sidekick", post(resolve_sidekick_workspace))
         .route("/v1/checkouts/prepare", post(prepare_checkout))
         .route(
@@ -4159,6 +4160,55 @@ async fn set_workspace_description(State(state): State<AppState>, request: Reque
             SessionErrorCode::SidekickWorkspaceSession,
             refusal.to_string(),
         ),
+    }
+}
+
+/// Clones a Repository URL directly within one of this Server's Workspace
+/// Roots for a Sidekick on a Peer, by the very operation this Server's own
+/// Sidekick's `clone_workspace` Clones by — this Server's own Roots, and
+/// every rule its own Clone keeps — and answers the Workspace made, with the
+/// paths it is spelled in, or the refusal in this Server's own words. A Clone
+/// is a Sidekick's act, so a Client's request, which names no one, is
+/// refused; and one a Peer asks is seen through though the Peer stops
+/// listening, since it may have been done all the same once it was asked.
+async fn clone_workspace(State(state): State<AppState>, request: Request) -> Response {
+    let author = match act_author(&state, request.headers()) {
+        Ok(Some(author)) => author,
+        Ok(None) => {
+            return session_error_response(
+                StatusCode::FORBIDDEN,
+                SessionErrorCode::InvalidCommand,
+                "A Clone is a Sidekick's act, so a Client's request for one is refused; a \
+                 Sidekick on this machine or on a Peer Clones through clone_workspace.",
+            );
+        }
+        Err(response) => return response,
+    };
+    let request =
+        match decode_session_command::<CloneWorkspaceRequest>(&state, request, "Clone").await {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+    let operations = state.operations.clone();
+    let cloning = tokio::spawn(async move { operations.clone_workspace(&request, &author).await });
+    match cloning.await {
+        // Spelled as this Server's Workspace listing spells its paths.
+        Ok(Ok(workspace)) => Json(ClonedWorkspace {
+            workspace_paths: crate::protocol::WorkspacePaths::discover(),
+            workspace,
+        })
+        .into_response(),
+        Ok(Err(refusal @ CloneRefusal::SidekickWorkspace { .. })) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::SidekickWorkspaceSession,
+            refusal.to_string(),
+        ),
+        Ok(Err(refusal)) => session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::CloneRefused,
+            refusal.to_string(),
+        ),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

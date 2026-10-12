@@ -1354,6 +1354,92 @@ fn a_servers_workspace_listing_carries_the_paths_its_workspaces_are_spelled_in()
     );
 }
 
+/// A Clone a Sidekick asks of a Remote crosses the Pairing as what its own
+/// `clone_workspace` takes, a Root, a name or a branch it names none of left
+/// out, and nothing else; the Remote answers with the Workspace it made and
+/// the paths it is spelled in, so the Peer names it in that Server's own
+/// syntax, or refuses it by a code of its own.
+#[test]
+fn a_clone_asked_of_a_remote_and_its_answer_cross_the_pairing() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 103,
+            "a Clone is carried to a Remote over the Pairing"
+        );
+    }
+    use suru::protocol::{
+        CloneWorkspaceRequest, ClonedWorkspace, PathStyle, WorkspaceId, WorkspacePaths,
+    };
+    let bare = CloneWorkspaceRequest {
+        repository_url: "https://example.com/org/atlas.git".to_owned(),
+        root: None,
+        name: None,
+        branch: None,
+    };
+    let encoded = serde_json::to_value(&bare).expect("encode a Clone");
+    assert_eq!(
+        encoded,
+        json!({ "repository_url": "https://example.com/org/atlas.git" })
+    );
+    assert_eq!(
+        serde_json::from_value::<CloneWorkspaceRequest>(encoded).expect("decode a Clone"),
+        bare
+    );
+    let named = CloneWorkspaceRequest {
+        root: Some("~/src".to_owned()),
+        name: Some("charts".to_owned()),
+        branch: Some("main".to_owned()),
+        ..bare
+    };
+    let encoded = serde_json::to_value(&named).expect("encode a Clone");
+    assert_eq!(
+        encoded,
+        json!({
+            "repository_url": "https://example.com/org/atlas.git",
+            "root": "~/src",
+            "name": "charts",
+            "branch": "main",
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<CloneWorkspaceRequest>(encoded).expect("decode a Clone"),
+        named
+    );
+    assert!(
+        serde_json::from_value::<CloneWorkspaceRequest>(json!({
+            "repository_url": "https://example.com/org/atlas.git",
+            "depth": 1,
+        }))
+        .is_err(),
+        "a Clone takes nothing it does not know"
+    );
+
+    let cloned = ClonedWorkspace {
+        workspace_paths: WorkspacePaths {
+            home: None,
+            style: PathStyle::Windows,
+            sidekick_workspace: None,
+        },
+        workspace: Workspace {
+            id: WorkspaceId("git:atlas".to_owned()),
+            ..Workspace::directory(PathBuf::from(r"C:\src\atlas"))
+        },
+    };
+    let encoded = serde_json::to_value(&cloned).expect("encode a Cloned Workspace");
+    assert_eq!(
+        encoded,
+        json!({
+            "workspace_paths": { "home": null, "style": "windows" },
+            "workspace": cloned.workspace,
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<ClonedWorkspace>(encoded).expect("decode a Cloned Workspace"),
+        cloned
+    );
+    assert_eq!(SessionErrorCode::CloneRefused.wire_name(), "clone_refused");
+}
+
 #[test]
 fn a_session_its_server_cannot_read_is_refused_by_a_code_of_its_own() {
     const {

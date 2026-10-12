@@ -18,6 +18,19 @@
 //! waiting on that no longer than a listing would; the Log records what was
 //! Cloned where, the URL's credential aside.
 //!
+//! A Clone is a Workspace act, so a Sidekick may ask it of a Remote: its own
+//! Server carries it there through the Pairing as the act of a Sidekick on
+//! this Peer, as it carries a Workspace's Description (ADR 0044), and the
+//! Remote Clones it by this very operation — within its own Roots, by every
+//! rule here — answering the Workspace made with the paths it is spelled in,
+//! or its refusal in its own words. Only a Sidekick Clones, so a Remote
+//! Clones for nothing but a Sidekick on a Peer, which it keeps out of its own
+//! Sidekick Workspace as it does from every act there. Such a Clone has its
+//! Icon and Description derived on the Remote, at the Agent its Landing
+//! begins a Session with where none is named, as a Session that Sidekick
+//! began there would be; and since a Clone takes as long as Git does, the
+//! Remote is given as long to answer as one may take.
+//!
 //! [`SourceControlService::clone_repository`]: crate::source_control::SourceControlService::clone_repository
 
 use std::{
@@ -27,9 +40,17 @@ use std::{
     time::Duration,
 };
 
-use super::SessionOperations;
+use axum::http::Method;
+
+use super::{
+    SessionOperations,
+    origins::{RemoteActRefusal, WORKSPACES_PATH},
+};
 use crate::{
-    protocol::{SessionId, SourceControlCapability, Workspace, WorkspaceId},
+    protocol::{
+        ActId, Author, CloneWorkspaceRequest, ClonedWorkspace, SourceControlCapability, Workspace,
+        WorkspaceId,
+    },
     server::{
         reads_apart::{NotRead, ReadsApart},
         root_discovery::expand,
@@ -68,17 +89,6 @@ impl WorkspaceCloning {
     }
 }
 
-/// A Clone asked for: the Repository URL, the Workspace Root it goes in
-/// where one is named, the directory to make there where one is named, and
-/// the branch to check out where one is named.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CloneRequest {
-    pub(crate) repository_url: String,
-    pub(crate) root: Option<String>,
-    pub(crate) name: Option<String>,
-    pub(crate) branch: Option<String>,
-}
-
 /// Why a Clone was refused, in words a Sidekick can pass on.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CloneRefusal {
@@ -100,6 +110,10 @@ pub(crate) enum CloneRefusal {
         destination: PathBuf,
         workspace: Option<WorkspaceId>,
     },
+    /// A Sidekick on a Peer asked for a Clone whose destination lies within
+    /// this Server's own Sidekick Workspace, which a Remote keeps to itself
+    /// (ADR 0044).
+    SidekickWorkspace { destination: PathBuf },
     /// This Server's source control does not Clone, as `reason` says.
     Unsupported { reason: String },
     /// Git failed the Clone, in its own words, and nothing was left behind.
@@ -188,6 +202,12 @@ impl fmt::Display for CloneRefusal {
                  beside it.",
                 destination.display()
             ),
+            Self::SidekickWorkspace { destination } => write!(
+                formatter,
+                "`{}` lies within the Sidekick Workspace, which a Sidekick on another machine may \
+                 not Clone into, so nothing was cloned.",
+                destination.display()
+            ),
             Self::Unsupported { reason } => write!(
                 formatter,
                 "This server's source control cannot Clone a Repository URL ({reason}), so \
@@ -265,6 +285,7 @@ impl CloneRefusal {
             | Self::UnreadableRoot { .. }
             | Self::NotPlainName { .. }
             | Self::NoNameInUrl { .. }
+            | Self::SidekickWorkspace { .. }
             | Self::Unsupported { .. } => None,
         }
     }
@@ -278,6 +299,21 @@ fn listed(roots: &[String]) -> String {
         .map(|root| format!("`{root}`"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The Sidekick a Clone is done for, as the Log names it: one of this
+/// Server's by its Session, or one on a Peer by that Peer's name and key.
+struct Cloner<'a>(&'a Author);
+
+impl fmt::Display for Cloner<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Author::Sidekick { session_id, .. } => write!(formatter, "{session_id}"),
+            Author::PeerSidekick {
+                peer, fingerprint, ..
+            } => write!(formatter, "a Sidekick on the Peer `{peer}` ({fingerprint})"),
+        }
+    }
 }
 
 /// A timeout in the plainest whole unit that spells it.
@@ -550,19 +586,21 @@ where
 
 impl SessionOperations {
     /// Clones the Repository `request` names directly within the Workspace
-    /// Root it names, or the only one configured, for the Sidekick whose
-    /// Session is `on_behalf_of`, and answers the Workspace made there as
-    /// this Server's Workspace listing gives it — once its Registry entry is
-    /// written, the Errand deriving its Icon and Description is begun, and
-    /// discovery of the Roots is asked for again. Refuses, saying why and
-    /// having made nothing, where no Root is there to take the Clone, where
-    /// its Root cannot be read, where its name is no plain directory name,
-    /// where something stands at its destination already, and where Git
-    /// fails it or it outlasts this Server's bound on one.
+    /// Root it names, or the only one configured, for the Sidekick `author`
+    /// names — this Server's own, or one on a Peer — and answers the
+    /// Workspace made there as this Server's Workspace listing gives it —
+    /// once its Registry entry is written, the Errand deriving its Icon and
+    /// Description is begun, and discovery of the Roots is asked for again.
+    /// Refuses, saying why and having made nothing, where no Root is there to
+    /// take the Clone, where its Root cannot be read, where its name is no
+    /// plain directory name, where something stands at its destination
+    /// already, where a Sidekick on a Peer would Clone into this Server's own
+    /// Sidekick Workspace, and where Git fails it or it outlasts this
+    /// Server's bound on one.
     pub(crate) async fn clone_workspace(
         &self,
-        request: &CloneRequest,
-        on_behalf_of: SessionId,
+        request: &CloneWorkspaceRequest,
+        author: &Author,
     ) -> Result<Workspace, CloneRefusal> {
         // One bound for the whole of it: reading the Root, cloning, naming
         // the clone, and removing what a Clone that failed made.
@@ -592,6 +630,11 @@ impl SessionOperations {
             });
         };
         let (destination, occupied) = placed?;
+        if matches!(author, Author::PeerSidekick { .. })
+            && self.sidekick_workspace.contains(&destination)
+        {
+            return Err(CloneRefusal::SidekickWorkspace { destination });
+        }
         if occupied {
             return Err(self.occupied(destination, deadline).await);
         }
@@ -642,7 +685,7 @@ impl SessionOperations {
                     tracing::info!(
                         repository_url = %without_credentials(url),
                         destination = %destination.display(),
-                        sidekick = %on_behalf_of,
+                        sidekick = %Cloner(author),
                         "a Clone of a Repository URL into a Workspace Root {outcome}"
                     );
                 }
@@ -661,9 +704,15 @@ impl SessionOperations {
         .await;
         let workspace = self.sessions.enter_cloned(&workspace, &destination);
         drop(landing);
+        // A Sidekick on a Peer has no Session here: its Clone's Errand runs
+        // at the Agent a Session it began here naming none would run at.
+        let provider = match author.sidekick_session() {
+            Some(sidekick) => self.sessions.provider(sidekick),
+            None => self.landing_selection().map(|selection| selection.provider),
+        };
         self.derivation.derive_cloned_workspace(
-            on_behalf_of,
-            self.sessions.provider(on_behalf_of),
+            Cloner(author),
+            provider,
             &workspace,
             destination.clone(),
         );
@@ -672,7 +721,7 @@ impl SessionOperations {
             repository_url = %without_credentials(url),
             destination = %destination.display(),
             workspace_id = %workspace.id.0,
-            sidekick = %on_behalf_of,
+            sidekick = %Cloner(author),
             "a Sidekick Cloned a Repository URL into a Workspace Root"
         );
         Ok(self
@@ -681,6 +730,37 @@ impl SessionOperations {
             .into_iter()
             .find(|listed| listed.id == workspace.id)
             .unwrap_or(workspace))
+    }
+
+    /// Clones the Repository `request` names on the Remote `name` for
+    /// `author`, carried there through the Pairing as the act of a Sidekick
+    /// on this Peer, and answers the Workspace the Remote made with the paths
+    /// it is spelled in. The Remote Clones it by [`Self::clone_workspace`],
+    /// as its own Sidekick's Clone is done, and refuses it in its own words.
+    /// A Clone takes as long as Git does, so the Remote is given as long to
+    /// answer as one may take there — the bound on a Clone and on reading
+    /// what landed, which no Setting changes, so the Remote's are this
+    /// Server's own — and then as long as any act is given.
+    pub(crate) async fn clone_remote_workspace(
+        &self,
+        name: &str,
+        request: &CloneWorkspaceRequest,
+        author: Author,
+    ) -> Result<ClonedWorkspace, RemoteActRefusal> {
+        let remotes = self
+            .remotes
+            .answering_within(self.cloning.timeout + LANDED_READ_WITHIN + self.remotes.timeout());
+        remotes
+            .act(
+                name,
+                Method::POST,
+                &format!("{WORKSPACES_PATH}/clone"),
+                Some(request),
+                &author,
+                ActId::new(),
+            )
+            .await?
+            .read()
     }
 
     /// The refusal of a Clone to `destination`, where something already

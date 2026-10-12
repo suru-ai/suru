@@ -94,6 +94,15 @@ impl RemoteReach {
         }
     }
 
+    /// This reach, giving each Remote `timeout` to answer instead: for an
+    /// act that takes as long as the work it asks for does.
+    pub(super) fn answering_within(&self, timeout: Duration) -> Self {
+        Self {
+            timeout,
+            ..self.clone()
+        }
+    }
+
     /// The Remotes this Server is paired with, in the order paired.
     fn paired(&self) -> Vec<Remote> {
         self.serving.list_remotes()
@@ -653,6 +662,12 @@ impl SilentRemote {
     /// Whether its name was paired anew, to another key, while it was asked.
     pub(crate) fn is_repaired(&self) -> bool {
         matches!(self.silence, Silence::Repaired)
+    }
+
+    /// Whether it speaks another version of the protocol Servers speak to
+    /// each other, so it understands nothing this Server asks of it.
+    pub(crate) fn speaks_another_protocol(&self) -> bool {
+        matches!(self.silence, Silence::ProtocolMismatch)
     }
 
     /// Whether an act asked of the Remote may have been done there all the

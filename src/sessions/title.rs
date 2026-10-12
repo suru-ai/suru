@@ -363,17 +363,17 @@ impl Derivation {
         });
     }
 
-    /// Forks the Workspace Errand alone for `workspace`, which a Sidekick
-    /// has just Cloned to `execution_directory` on behalf of the Session
-    /// `on_behalf_of`, using `provider`, and returns at once — so the new
-    /// Workspace has its Icon and Description derived as the first Session
-    /// begun there would have them: governed by the same Setting, which
-    /// follows the Sidekick's own Provider unless it pins another or turns
-    /// derivation off, run in the Workspace itself, and asked only where it
-    /// still lacks either.
+    /// Forks the Workspace Errand alone for `workspace`, which the Sidekick
+    /// `on_behalf_of` names has just Cloned to `execution_directory`, and
+    /// returns at once — so the new Workspace has its Icon and Description
+    /// derived as the first Session begun there would have them: governed by
+    /// the same Setting, which follows `provider` — the Sidekick's own, or
+    /// for a Sidekick on a Peer the one a Session it began here would run on
+    /// — unless it pins another or turns derivation off, run in the
+    /// Workspace itself, and asked only where it still lacks either.
     pub(crate) fn derive_cloned_workspace(
         &self,
-        on_behalf_of: SessionId,
+        on_behalf_of: impl std::fmt::Display,
         provider: Option<ProviderId>,
         workspace: &Workspace,
         execution_directory: std::path::PathBuf,
@@ -449,22 +449,25 @@ impl Derivation {
     }
 
     /// Where this derivation's Errands go, as the Setting in force decides,
-    /// and `None` where they go nowhere. Read before anything is spawned, so a
-    /// Setting turning derivation off costs no task and no Provider call.
-    fn errand_at(&self, session_id: SessionId, provider: Option<ProviderId>) -> Option<ErrandAt> {
+    /// and `None` where they go nowhere — for what `asked_for` names, the
+    /// Session or the Sidekick it is derived for. Read before anything is
+    /// spawned, so a Setting turning derivation off costs no task and no
+    /// Provider call.
+    fn errand_at(
+        &self,
+        asked_for: impl std::fmt::Display,
+        provider: Option<ProviderId>,
+    ) -> Option<ErrandAt> {
         match &self.settings.borrow().settings.derivation.errand {
             DerivationErrand::Off => {
-                tracing::debug!(%session_id, "no Errand: derivation is turned off");
+                tracing::debug!(%asked_for, "no Errand: derivation is turned off");
                 None
             }
             DerivationErrand::Pinned(selection) => Some(ErrandAt::Selection(selection.clone())),
             DerivationErrand::FollowSession => match provider {
                 Some(provider) => Some(ErrandAt::Provider(provider)),
                 None => {
-                    tracing::debug!(
-                        %session_id,
-                        "no Errand: the Session has selected no Provider"
-                    );
+                    tracing::debug!(%asked_for, "no Errand: no Provider is selected for it");
                     None
                 }
             },

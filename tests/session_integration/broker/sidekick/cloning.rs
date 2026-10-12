@@ -8,7 +8,8 @@
 //! where its Root cannot be read, where its name is no plain directory name,
 //! where something stands at its destination already, where Git fails, and
 //! where it outlasts the Server's bound on one; a Clone Git began and did
-//! not finish leaves nothing behind. Only a Sidekick is offered the Tool.
+//! not finish leaves nothing behind. Only a Sidekick is offered the Tool. A
+//! Clone on a Remote is covered with the Remotes, in `remotes::clones`.
 //!
 //! Each test acts as the MCP client a Sidekick's harness is, Clones a bare
 //! Repository made beside the Roots — named by its path, rooted as the
@@ -40,12 +41,12 @@ use crate::{
 const BY_CLONE: &str = "\"cloned\"";
 
 /// A path as a Workspace Root, a Repository URL or a refusal spells it.
-fn spelled(path: &Path) -> &str {
+pub(super) fn spelled(path: &Path) -> &str {
     path.to_str().expect("the fixture's path is UTF-8")
 }
 
 /// A directory of the test's own, and its path as the Server reads it.
-fn directory() -> (tempfile::TempDir, PathBuf) {
+pub(super) fn directory() -> (tempfile::TempDir, PathBuf) {
     let made = tempfile::tempdir().expect("create a directory");
     let path = suru::paths::canonical(made.path()).expect("read the directory canonically");
     (made, path)
@@ -63,7 +64,7 @@ fn name_roots(config_dir: &Path, roots: &[&str]) {
 /// A bare Repository at `within`/`name`.git, as the server a Repository URL
 /// names would hold it: one commit on `main` carrying a README, and a branch
 /// `charts` besides. Answers its path.
-fn bare_repository(within: &Path, name: &str) -> PathBuf {
+pub(super) fn bare_repository(within: &Path, name: &str) -> PathBuf {
     let work = within.join(format!("{name}-work"));
     std::fs::create_dir_all(&work).expect("create the working copy");
     git(&work, &["init", "-b", "main"]);
@@ -83,7 +84,7 @@ fn bare_repository(within: &Path, name: &str) -> PathBuf {
 }
 
 /// The README a Repository [`bare_repository`] makes as `name` carries.
-fn readme(name: &str) -> String {
+pub(super) fn readme(name: &str) -> String {
     format!("# {name}\n\nWhere the {name} is charted.\n")
 }
 
@@ -98,7 +99,7 @@ fn file_url(path: &Path) -> String {
 }
 
 /// What Git prints, trimmed, for `args` run in `directory`.
-fn git_says(directory: &Path, args: &[&str]) -> String {
+pub(super) fn git_says(directory: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(directory)
@@ -114,7 +115,7 @@ fn git_says(directory: &Path, args: &[&str]) -> String {
 }
 
 /// The identity of the Repository whose main root is `clone`.
-fn repository_id(clone: &Path) -> WorkspaceId {
+pub(super) fn repository_id(clone: &Path) -> WorkspaceId {
     RepositoryId::from_metadata("git", &clone.join(".git")).workspace_id()
 }
 
@@ -142,7 +143,7 @@ async fn list_workspaces(client: &mut McpClient) -> Vec<Value> {
 }
 
 /// The names of what stands directly within `directory`, sorted.
-fn contents(directory: &Path) -> Vec<String> {
+pub(super) fn contents(directory: &Path) -> Vec<String> {
     let mut names = std::fs::read_dir(directory)
         .expect("read the directory")
         .map(|entry| {
@@ -172,7 +173,7 @@ async fn emptied(directory: &Path) {
 /// Everything logged on this test's thread — where the Server it hosts runs
 /// — at `level` and above, kept as it is written.
 #[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+pub(super) struct Captured(Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for Captured {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -188,7 +189,7 @@ impl std::io::Write for Captured {
 impl Captured {
     /// Captures what is logged on this thread at `level` and above for as
     /// long as the answer is held.
-    fn install(&self, level: tracing::Level) -> tracing::subscriber::DefaultGuard {
+    pub(super) fn install(&self, level: tracing::Level) -> tracing::subscriber::DefaultGuard {
         let writer = self.clone();
         tracing::subscriber::set_default(
             tracing_subscriber::fmt()
@@ -199,7 +200,7 @@ impl Captured {
         )
     }
 
-    fn logged(&self) -> String {
+    pub(super) fn logged(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
 }
@@ -353,8 +354,9 @@ async fn a_cloned_workspace_has_its_icon_and_description_derived_at_once() {
 /// With several Workspace Roots configured, a Clone names the one it goes in
 /// — as the Setting spells it, or as the directory it names — and one naming
 /// none of them, or naming none at all, is refused naming every Root
-/// configured. A Clone on a Remote is not yet understood, and is refused.
-/// Nothing a refusal answers is cloned anywhere.
+/// configured. A Clone naming a Remote this server is not paired with goes
+/// nowhere, never into this server's Roots in its stead. Nothing a refusal
+/// answers is cloned anywhere.
 #[tokio::test]
 async fn with_several_roots_a_clone_names_its_root_and_is_refused_one_that_is_none_of_them() {
     const CHANNEL: &str = "sidekick-clone-several-roots";
@@ -404,8 +406,9 @@ async fn with_several_roots_a_clone_names_its_root_and_is_refused_one_that_is_no
             json!({ "repository_url": url, "root": projects, "origin": "workstation" }),
         )
         .await,
-        "clone_workspace does not yet understand a Clone on a Remote, so nothing was cloned on \
-         `workstation`; leave `origin` out to Clone within this server's Workspace Roots."
+        "Suru is paired with no Remote named `workstation`; list_remotes names the Remotes it is \
+         paired with, and leaving `origin` out reaches this server.",
+        "a Clone naming a Remote goes there or nowhere, never into this server's Roots"
     );
     assert!(
         contents(&projects).is_empty() && contents(&archive).is_empty(),

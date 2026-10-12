@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 102;
+pub const PROTOCOL_VERSION: u32 = 103;
 mod attachment;
 mod reading;
 mod relay;
@@ -4930,6 +4930,38 @@ pub struct SetWorkspaceDescriptionRequest {
     pub description: String,
 }
 
+/// A Clone a Sidekick on a Peer asks of a Serving Server, as
+/// `POST /v1/workspaces/clone` takes it: the Repository URL to Clone from,
+/// the Workspace Root it goes in where it names one, the directory to make
+/// there where it names one, and the branch to check out where it names one —
+/// what that Server's own Sidekick's `clone_workspace` takes, and nothing
+/// else. The Server Clones it as its own Sidekick's Clone is done, by its own
+/// Roots and its own rules, and refuses it — by
+/// [`SessionErrorCode::CloneRefused`], or the Sidekick Workspace's own code —
+/// in its own words.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloneWorkspaceRequest {
+    pub repository_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// What a Clone a Peer's Sidekick asked for answers: the Workspace made, as
+/// the Server's own Workspace listing gives it, with the paths it is spelled
+/// in, so the Peer names it in the owning Server's own syntax as a listing
+/// lets it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClonedWorkspace {
+    pub workspace_paths: WorkspacePaths,
+    pub workspace: Workspace,
+}
+
 /// Every Workspace a Server knows, as `GET /v1/workspaces` answers — a
 /// Peer's request included — with the paths they are spelled in, so a reader
 /// on another machine names each in the owning Server's own syntax, as the
@@ -5051,6 +5083,10 @@ pub enum SessionErrorCode {
     /// An act a Sidekick sent named a Session of the Sidekick Workspace, on
     /// which no Sidekick acts.
     SidekickWorkspaceSession,
+    /// A Clone of a Repository URL was refused, as its message says: no
+    /// Workspace Root took it, something stood where it would go, or Git
+    /// failed it or ran out of time, leaving nothing behind.
+    CloneRefused,
     AgentSelectionOperationConflict,
     AgentSelectionProviderConflict,
     InvalidSkillInvocation,

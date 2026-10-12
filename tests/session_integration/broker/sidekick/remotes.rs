@@ -40,6 +40,7 @@ use super::*;
 use crate::server_support::observed_tcp_proxy::ObservedTcpProxy;
 
 mod acts;
+mod clones;
 mod kept_apart;
 mod pairings;
 mod readings;
@@ -233,13 +234,26 @@ struct HeldDiscovery {
 }
 
 impl HeldGit {
-    /// Holds the next discovery of `directory`: what says it has been
-    /// reached, and what lets it go on.
+    /// Holds the next discovery of `directory` — one not made yet, such as
+    /// where a Clone will go, as it will be read once it is: what says it
+    /// has been reached, and what lets it go on.
     fn hold_discovery_of(&self, directory: &Path) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (reached, reaching) = oneshot::channel();
         let (release, released) = oneshot::channel();
+        let directory = suru::paths::canonical(directory).unwrap_or_else(|_| {
+            let parent = directory
+                .parent()
+                .expect("a directory to be made has a parent");
+            suru::paths::canonical(parent)
+                .expect("read the directory's parent canonically")
+                .join(
+                    directory
+                        .file_name()
+                        .expect("a directory to be made is named"),
+                )
+        });
         let held = HeldDiscovery {
-            directory: suru::paths::canonical(directory).expect("read the directory canonically"),
+            directory,
             reached,
             release: released,
         };

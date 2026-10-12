@@ -87,6 +87,12 @@ impl SidekickWorkspace {
             == self.directory()
     }
 
+    /// Whether `path`, read canonically, lies within the Sidekick
+    /// Workspace's directory, or is that directory.
+    pub(crate) fn contains(&self, path: &Path) -> bool {
+        path.starts_with(self.directory())
+    }
+
     /// Whether `workspace` is the Sidekick Workspace.
     pub(crate) fn holds(&self, workspace: &Workspace) -> bool {
         self.is_named_by(&workspace.id)

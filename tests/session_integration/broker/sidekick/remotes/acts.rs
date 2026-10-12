@@ -27,7 +27,7 @@ use crate::broker::sidekick_acts::{SIDEKICK_WORKSPACE_REFUSAL, acted, refused};
 
 /// The one Peer the Remote `remote` describes is paired with: the
 /// Sidekick's own Server, as the Remote knows it.
-async fn the_peer(remote: &RuntimeDescriptor) -> Peer {
+pub(super) async fn the_peer(remote: &RuntimeDescriptor) -> Peer {
     let peers: Vec<Peer> = reqwest::Client::new()
         .get(format!("{}/v1/pairing/peers", remote.base_url))
         .bearer_auth(&remote.token)
