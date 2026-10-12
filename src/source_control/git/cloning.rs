@@ -1046,8 +1046,10 @@ mod tests {
 
         let (finished_tx, finished) = mpsc::channel();
         let finished_tx = Finished(finished_tx);
+        let (release, released) = mpsc::channel::<()>();
         let suffix = move || {
             let _ = &finished_tx;
+            let _ = released.recv();
             "unreceived".to_owned()
         };
         let mut reserving = Box::pin(Staged::reserve(&destination, "atlas", suffix));
@@ -1057,6 +1059,7 @@ mod tests {
                 .is_err(),
             "the reservation is under way on a thread of its own"
         );
+        release.send(()).unwrap();
         finished
             .recv_timeout(SURELY)
             .expect("the reservation hands over what it made");
@@ -1205,7 +1208,8 @@ mod tests {
             rename,
             ..GitSourceControl::default()
         });
-        let timeout = Duration::from_secs(1);
+        // Ample for Git to clone a Repository of one commit from beside it.
+        let timeout = Duration::from_secs(2);
         let started = tokio::time::Instant::now();
         let cloning = tokio::spawn({
             let (adapter, destination) = (adapter.clone(), destination.clone());
