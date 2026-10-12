@@ -109,6 +109,85 @@ pub enum CloneFailure {
     StillLanding,
 }
 
+/// A directory a Clone is made in, as its Server records it: where it is,
+/// and the Server run whose Clone made it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagingRecord {
+    pub directory: PathBuf,
+    pub run: String,
+}
+
+/// Where a Server records the directories its Clones are made in: each
+/// before it is made, and forgotten once it is gone, so that what a Clone of
+/// a run that died left behind is found again at the next start, and
+/// nothing a Clone did not make ever is. Every call blocks, so each is made
+/// on a thread of its own.
+pub trait StagingRecords: Send + Sync {
+    /// Records `record`'s directory as made by its run's Clone.
+    fn record(&self, record: &StagingRecord) -> Result<(), String>;
+    /// Forgets `directory`, once nothing of a Clone is left there.
+    fn forget(&self, directory: &Path) -> Result<(), String>;
+    /// Every directory recorded and not yet forgotten.
+    fn recorded(&self) -> Result<Vec<StagingRecord>, String>;
+}
+
+/// What one Server run's Clones make their directories under: the run,
+/// which each marks what it makes with, and the records each is kept in.
+#[derive(Clone)]
+pub struct CloneStaging {
+    run: String,
+    records: Arc<dyn StagingRecords>,
+}
+
+impl CloneStaging {
+    /// A run of its own, recording in `records`.
+    pub fn new(records: Arc<dyn StagingRecords>) -> Self {
+        Self {
+            run: uuid::Uuid::new_v4().to_string(),
+            records,
+        }
+    }
+
+    /// A run of its own, recording in memory alone, so nothing a Clone of
+    /// it leaves behind is found again by another: for a host that keeps
+    /// nothing, and for a test.
+    pub fn in_memory() -> Self {
+        Self::new(Arc::new(RecordedInMemory::default()))
+    }
+}
+
+/// Staging records kept for as long as the process lives.
+#[derive(Default)]
+struct RecordedInMemory(Mutex<HashMap<PathBuf, String>>);
+
+impl StagingRecords for RecordedInMemory {
+    fn record(&self, record: &StagingRecord) -> Result<(), String> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(record.directory.clone(), record.run.clone());
+        Ok(())
+    }
+
+    fn forget(&self, directory: &Path) -> Result<(), String> {
+        self.0.lock().unwrap().remove(directory);
+        Ok(())
+    }
+
+    fn recorded(&self) -> Result<Vec<StagingRecord>, String> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(directory, run)| StagingRecord {
+                directory: directory.clone(),
+                run: run.clone(),
+            })
+            .collect())
+    }
+}
+
 #[async_trait]
 pub trait PreparationObserver: Send + Sync {
     async fn checkpoint(
@@ -212,10 +291,12 @@ pub trait SourceControl: Send + Sync {
     /// giving it its name — or removing it where it cannot have one — is
     /// seen through on its own whatever the time, and whatever becomes of
     /// whoever awaits it; a call whose timeout passes meanwhile answers
-    /// [`CloneFailure::StillLanding`]. A Clone that fails leaves nothing
-    /// behind once it answers; what one stopped at its deadline, or
-    /// abandoned, began is removed on its own, and what a Server that died
-    /// meanwhile left is removed at the next start by
+    /// [`CloneFailure::StillLanding`]. Whatever the Clone makes on its way
+    /// is recorded in `staging`, under its run, before it is made, and
+    /// forgotten once it is gone. A Clone that fails leaves nothing behind
+    /// once it answers; what one stopped at its deadline, or abandoned,
+    /// began is removed on its own, and what a Server that died meanwhile
+    /// left is removed at the next start by
     /// [`SourceControl::sweep_abandoned_clones`].
     async fn clone_repository(
         &self,
@@ -223,17 +304,20 @@ pub trait SourceControl: Send + Sync {
         destination: &Path,
         branch: Option<&str>,
         timeout: std::time::Duration,
+        staging: &CloneStaging,
     ) -> Result<Workspace, CloneFailure>;
     /// Waits until everything Clones have left to see through on their own
     /// — naming a whole clone, removing one that cannot be named or was
     /// abandoned — is done: what a stopping Server waits on, a bounded
     /// while, before it lets go.
     async fn settle_clones(&self);
-    /// Removes from `root`, a Workspace Root, what Clones of a Server run no
-    /// longer alive left there mid-way, and nothing else: run at a Server's
-    /// start, as the backstop to [`SourceControl::settle_clones`] for a
-    /// Server that died or was cut off before its Clones settled.
-    async fn sweep_abandoned_clones(&self, root: &Path);
+    /// Removes what Clones of a Server run no longer alive recorded in
+    /// `staging`'s records and left mid-way, and nothing else — nothing
+    /// unrecorded, however it is named — forgetting each record nothing of
+    /// a Clone stands at any longer: run at a Server's start, as the
+    /// backstop to [`SourceControl::settle_clones`] for a Server that died
+    /// or was cut off before its Clones settled.
+    async fn sweep_abandoned_clones(&self, staging: &CloneStaging);
     /// Rename the branch a fresh preparation created for a Managed Worktree
     /// to the first of [`naming::numbered`] `proposal` — a fragment already
     /// shaped by [`naming::proposed_fragment`] — that no other branch holds,
@@ -357,6 +441,9 @@ pub(crate) struct SourceControlService {
     /// The directory Suru owns outside source control, which is a directory
     /// Workspace of its own whatever Repository encloses it.
     sidekick: Option<crate::sidekick::SidekickWorkspace>,
+    /// The run this Server's Clones mark what they make with, and where they
+    /// record it.
+    clone_staging: CloneStaging,
 }
 
 impl SourceControlService {
@@ -373,7 +460,15 @@ impl SourceControlService {
             mutations: Default::default(),
             incarnations: Default::default(),
             sidekick: None,
+            clone_staging: CloneStaging::in_memory(),
         }
+    }
+
+    /// Has this Server's Clones record what they make in `staging`'s
+    /// records, under its run, so the next start finds what one left.
+    pub(crate) fn with_clone_staging(mut self, staging: CloneStaging) -> Self {
+        self.clone_staging = staging;
+        self
     }
 
     /// Reads `sidekick`'s directory as a directory Workspace of its own
@@ -751,14 +846,17 @@ impl SourceControlService {
     pub(crate) async fn settle_clones(&self) {
         self.adapter.settle_clones().await;
     }
-    /// Removes from `root` what Clones of a dead Server run left there; see
+    /// Removes what Clones of a dead Server run recorded and left; see
     /// [`SourceControl::sweep_abandoned_clones`].
-    pub(crate) async fn sweep_abandoned_clones(&self, root: &Path) {
-        self.adapter.sweep_abandoned_clones(root).await;
+    pub(crate) async fn sweep_abandoned_clones(&self) {
+        self.adapter
+            .sweep_abandoned_clones(&self.clone_staging)
+            .await;
     }
     /// Clones `url` into `destination` as [`SourceControl::clone_repository`]
-    /// does. The Repository made there is not remembered, so it joins no
-    /// checkout observation until a Session works in it.
+    /// does, recording what it makes as this Server's. The Repository made
+    /// there is not remembered, so it joins no checkout observation until a
+    /// Session works in it.
     pub(crate) async fn clone_repository(
         &self,
         url: &str,
@@ -767,7 +865,7 @@ impl SourceControlService {
         timeout: std::time::Duration,
     ) -> Result<Workspace, CloneFailure> {
         self.adapter
-            .clone_repository(url, destination, branch, timeout)
+            .clone_repository(url, destination, branch, timeout, &self.clone_staging)
             .await
     }
     pub(crate) async fn list_checkouts(
@@ -1167,11 +1265,12 @@ mod tests {
             _destination: &Path,
             _branch: Option<&str>,
             _timeout: std::time::Duration,
+            _staging: &CloneStaging,
         ) -> Result<Workspace, CloneFailure> {
             Err(CloneFailure::Failed(STANDS_IN.to_owned()))
         }
         async fn settle_clones(&self) {}
-        async fn sweep_abandoned_clones(&self, _root: &Path) {}
+        async fn sweep_abandoned_clones(&self, _staging: &CloneStaging) {}
         async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
             let mut resolved = ResolvedWorkspace::directory(directory.to_owned());
             if directory == self.metadata {
@@ -1225,11 +1324,12 @@ mod tests {
             _destination: &Path,
             _branch: Option<&str>,
             _timeout: std::time::Duration,
+            _staging: &CloneStaging,
         ) -> Result<Workspace, CloneFailure> {
             Err(CloneFailure::Failed(STANDS_IN.to_owned()))
         }
         async fn settle_clones(&self) {}
-        async fn sweep_abandoned_clones(&self, _root: &Path) {}
+        async fn sweep_abandoned_clones(&self, _staging: &CloneStaging) {}
         async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
             *self
                 .readings

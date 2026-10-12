@@ -28,6 +28,7 @@ use crate::{
 };
 
 mod attachment_table;
+mod clone_staging_table;
 mod memory_table;
 mod rows;
 mod unsaved;
@@ -46,7 +47,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20261012000000";
+const CURRENT_SCHEMA_VERSION: &str = "20261013000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {

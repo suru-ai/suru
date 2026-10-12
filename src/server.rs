@@ -1553,6 +1553,9 @@ async fn start(
     // Memories are read and written where a Sidekick asks for them, never
     // loaded here: they are no Session's, so nothing about one is hydrated.
     let memories = crate::memories::MemoryStore::new(repository.clone());
+    // What this run's Clones make is recorded beside everything else, so
+    // what one left when its Server died is what the next start removes.
+    let clone_staging = crate::source_control::CloneStaging::new(Arc::new(repository.clone()));
     let (storage_writer, storage) = StorageWriter::spawn(repository);
     let preparations = crate::source_control::PreparationStore::new(config.data_dir());
     let sessions = SessionStore::new(
@@ -1564,7 +1567,8 @@ async fn start(
     .with_settings(settings.subscribe())
     .with_sidekicks(sidekick_workspace.clone(), sidekick_acts);
     let source_control = crate::source_control::SourceControlService::new(source_control)
-        .with_sidekick_workspace(sidekick_workspace.clone());
+        .with_sidekick_workspace(sidekick_workspace.clone())
+        .with_clone_staging(clone_staging);
     let (clones_for_shutdown, clone_settle) =
         (source_control.clone(), timings.workspace_clone_settle);
     let root_discovery = root_discovery::RootDiscovery::new(
@@ -1608,8 +1612,6 @@ async fn start(
         let registry_standing = registry_standing.clone();
         let roots_in_force = settings.subscribe();
         let mut shutdown = provider_shutdown_rx.clone();
-        let roots = settings.subscribe();
-        let home = config.home_dir();
         let sweep_within = timings.root_discovery_wait;
         tokio::spawn(async move {
             tokio::select! {
@@ -1621,24 +1623,16 @@ async fn start(
                     if let Err(error) = sessions.discover_workspaces(&source_control).await {
                         tracing::error!("Workspace discovery failed: {error:#}");
                     }
-                    // What Clones of a run that died left in the Roots is
+                    // What Clones of a run that died recorded and left is
                     // removed before the Roots are first discovered, waited
                     // on no longer than discovery is.
-                    let roots = roots.borrow().settings.workspace.roots.clone();
-                    let sweeps = roots
-                        .iter()
-                        .filter_map(|root| root_discovery::expand(root, home.as_deref()))
-                        .map(|root| {
-                            let source_control = source_control.clone();
-                            async move { source_control.sweep_abandoned_clones(&root).await }
-                        });
-                    if tokio::time::timeout(sweep_within, futures_util::future::join_all(sweeps))
+                    if tokio::time::timeout(sweep_within, source_control.sweep_abandoned_clones())
                         .await
                         .is_err()
                     {
                         tracing::debug!(
-                            "a Workspace Root was still being swept of abandoned Clones as \
-                             discovery began"
+                            "what Clones of a Server no longer running left was still being \
+                             removed as discovery began"
                         );
                     }
                     registry_standing.roots_at_start(roots_in_force).await;

@@ -6,16 +6,19 @@
 //! Git makes the clone out of sight, within a hidden staging directory
 //! beside its destination, which discovery passes over and nobody mistakes
 //! for a Workspace. That directory is made by the Clone itself before Git
-//! runs, and from the moment it is made it has an owner that removes it
-//! unless the clone within is named: a name something already holds is
+//! runs, recorded as its Server run's before it is made and forgotten once
+//! it is gone, and from the moment it is made it has an owner that removes
+//! it unless the clone within is named: a name something already holds is
 //! passed over for another, and nothing the Clone removes was ever anyone
-//! else's. It holds a marker naming this Server run, locked for as long as
+//! else's. It holds a marker naming its Server run, locked for as long as
 //! the Clone lives, so that what a Server that died mid-Clone left behind
-//! is told from what a live one is making, and removed at the next start.
-//! The clone takes its destination's name only once it is whole, by the
-//! platform's own rename that refuses to replace anything — another Clone
-//! of the same name among it — so a Root never holds a half-made Workspace,
-//! even while one is being made.
+//! is told from what a live one is making, and removed at the next start:
+//! that, and only that — a directory the Server recorded, still marked as
+//! the run that recorded it — never one merely named or marked as a Clone
+//! names and marks its own. The clone takes its destination's name only
+//! once it is whole, by the platform's own rename that refuses to replace
+//! anything — another Clone of the same name among it — so a Root never
+//! holds a half-made Workspace, even while one is being made.
 //!
 //! The Clone's timeout bounds the call. Once Git has made the clone whole,
 //! one task sees naming it through, or — where it cannot be named —
@@ -34,7 +37,7 @@ use std::{
 use fs2::FileExt as _;
 
 use super::*;
-use crate::source_control::CloneFailure;
+use crate::source_control::{CloneFailure, CloneStaging, StagingRecord};
 
 /// How many more times removing or naming what a Clone made is tried once it
 /// has failed, and how long apart: a Git stopped at its deadline may still be
@@ -69,14 +72,12 @@ const CLONED: &str = "clone";
 /// unless a host or a test watches it.
 pub(super) type Rename = Arc<dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync>;
 
-/// What one Server run's Clones share: how a whole clone takes its name,
-/// what they have under way on their own, and the run their staging is
-/// marked with.
+/// What the Clones made through one adapter share: how a whole clone takes
+/// its name, and what they have under way on their own.
 #[derive(Clone)]
 pub(super) struct Cloning {
     pub(super) rename: Rename,
     landings: Landings,
-    run: String,
 }
 
 impl Default for Cloning {
@@ -84,7 +85,6 @@ impl Default for Cloning {
         Self {
             rename: Arc::new(rename_new),
             landings: Landings::default(),
-            run: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -95,13 +95,14 @@ impl Cloning {
     pub(super) async fn settled(&self) {
         self.landings.settled().await;
     }
+}
 
-    /// Removes from `root` what Clones of a Server run no longer alive left
-    /// there, on a thread of its own; see [`sweep`].
-    pub(super) async fn sweep(&self, root: &Path) {
-        let (root, run) = (root.to_owned(), self.run.clone());
-        let _ = tokio::task::spawn_blocking(move || sweep(&root, &run)).await;
-    }
+/// Removes what Clones of a Server run no longer alive recorded in
+/// `staging`'s records and left behind, on a thread of its own; see
+/// [`sweep`].
+pub(super) async fn sweep_abandoned(staging: &CloneStaging) {
+    let staging = staging.clone();
+    let _ = tokio::task::spawn_blocking(move || sweep(&staging)).await;
 }
 
 /// What a Server run's Clones have under way on their own — naming a whole
@@ -138,14 +139,16 @@ impl Drop for Underway {
 }
 
 impl GitSourceControl {
-    /// Clones `url` into `destination`, as
-    /// [`SourceControl::clone_repository`] describes.
+    /// Clones `url` into `destination`, recording what it makes in
+    /// `staging`'s records, as [`SourceControl::clone_repository`]
+    /// describes.
     pub(super) async fn clone_into(
         &self,
         url: &str,
         destination: &Path,
         branch: Option<&str>,
         timeout: Duration,
+        staging: &CloneStaging,
     ) -> Result<Workspace, CloneFailure> {
         let deadline = tokio::time::Instant::now() + timeout;
         let (Some(parent), Some(name)) = (
@@ -159,7 +162,7 @@ impl GitSourceControl {
         };
         let staged = match tokio::time::timeout_at(
             deadline,
-            Staged::reserve(destination, name, random_suffix, &self.cloning),
+            Staged::reserve(destination, name, random_suffix, &self.cloning, staging),
         )
         .await
         {
@@ -328,37 +331,45 @@ fn is_staging_name(name: &str) -> bool {
 /// is named or it is gone: dropped before then — as where whoever awaited
 /// it goes away, Git with it, or its deadline passes — it is removed on its
 /// own, counted among what Clones have under way, or at once where no
-/// runtime is there to run that.
+/// runtime is there to run that. Once it is gone its record is forgotten;
+/// one that cannot be removed stays recorded, for the next start to remove.
 struct Staged {
     staging: Option<PathBuf>,
     /// The marker within it, held open and locked while the Clone lives.
     marker: Option<std::fs::File>,
     landings: Landings,
+    /// Where it is recorded, until it is gone.
+    records: CloneStaging,
 }
 
 impl Staged {
     /// Makes a hidden directory beside `destination` for a Clone of `name`
     /// to be made in, named by the first of `suffix`'s answers that nothing
     /// holds yet, unless something already stands at `destination`, and
-    /// marks it as `cloning`'s run's. Made on a thread of its own, so a Root
-    /// that does not answer holds up no one, and owned from the moment it
-    /// is made: what is handed over is the guard itself, so one made after
-    /// whoever asked for it went away is removed as its guard is dropped.
+    /// records and marks it as `staging`'s run's. Made on a thread of its
+    /// own, so a Root that does not answer holds up no one, and owned from
+    /// the moment it is made: what is handed over is the guard itself, so
+    /// one made after whoever asked for it went away is removed as its
+    /// guard is dropped.
     async fn reserve(
         destination: &Path,
         name: &str,
         mut suffix: impl FnMut() -> String + Send + 'static,
         cloning: &Cloning,
+        staging: &CloneStaging,
     ) -> Result<Self, CloneFailure> {
         let (reserved, reservation) = tokio::sync::oneshot::channel();
         let (destination, name) = (destination.to_owned(), name.to_owned());
-        let (run, landings) = (cloning.run.clone(), cloning.landings.clone());
+        let (landings, records) = (cloning.landings.clone(), staging.clone());
         tokio::task::spawn_blocking(move || {
             let made =
-                reserve_now(&destination, &name, &mut suffix, &run).map(|(staging, marker)| Self {
-                    staging: Some(staging),
-                    marker: Some(marker),
-                    landings,
+                reserve_now(&destination, &name, &mut suffix, &records).map(|(staging, marker)| {
+                    Self {
+                        staging: Some(staging),
+                        marker: Some(marker),
+                        landings,
+                        records,
+                    }
                 });
             // A guard nobody receives is dropped with the send's answer.
             let _ = reserved.send(made);
@@ -413,11 +424,12 @@ impl Staged {
         }
     }
 
-    /// Removes what is staged, holding it as the Clone's until removing it
-    /// has finished, so a removal abandoned midway is finished on its own.
+    /// Removes what is staged, and forgets its record once it is gone,
+    /// holding it as the Clone's until removing it has finished, so a
+    /// removal abandoned midway is finished on its own.
     async fn remove(mut self) -> std::io::Result<()> {
         self.marker = None;
-        let removed = remove_partial(self.path()).await;
+        let removed = dismantle(self.path(), &self.records).await;
         self.staging = None;
         removed
     }
@@ -429,12 +441,13 @@ impl Drop for Staged {
         let Some(staging) = self.staging.take() else {
             return;
         };
+        let records = self.records.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 let underway = self.landings.begin();
                 runtime.spawn(async move {
                     let _underway = underway;
-                    if let Err(error) = remove_partial(&staging).await {
+                    if let Err(error) = dismantle(&staging, &records).await {
                         tracing::warn!(
                             staging = %staging.display(),
                             "what an abandoned Clone left behind could not be removed: {error}"
@@ -442,26 +455,28 @@ impl Drop for Staged {
                     }
                 });
             }
-            Err(_) => {
-                if let Err(error) = remove_tree(&staging) {
-                    tracing::warn!(
-                        staging = %staging.display(),
-                        "what an abandoned Clone left behind could not be removed: {error}"
-                    );
-                }
-            }
+            Err(_) => match remove_if_there(&staging) {
+                Ok(()) => forget(&records, &staging),
+                Err(error) => tracing::warn!(
+                    staging = %staging.display(),
+                    "what an abandoned Clone left behind could not be removed: {error}"
+                ),
+            },
         }
     }
 }
 
 /// Makes the directory a Clone of `name` to `destination` is made in, as
-/// [`Staged::reserve`] describes, and its marker naming `run`, locked;
-/// answers where it is and the marker.
+/// [`Staged::reserve`] describes — recorded in `staging`'s records before
+/// it is made, so a Server that dies at any moment after leaves nothing its
+/// next start does not know of — and its marker naming `staging`'s run,
+/// locked; answers where it is and the marker. A name passed over leaves no
+/// record.
 fn reserve_now(
     destination: &Path,
     name: &str,
     suffix: &mut impl FnMut() -> String,
-    run: &str,
+    staging: &CloneStaging,
 ) -> Result<(PathBuf, std::fs::File), CloneFailure> {
     if std::fs::symlink_metadata(destination).is_ok() {
         return Err(CloneFailure::Occupied);
@@ -472,32 +487,47 @@ fn reserve_now(
             destination.display()
         )));
     };
-    let unmade = |error: std::io::Error| {
+    let unmade = |error: &dyn std::fmt::Display| {
         CloneFailure::Failed(format!(
             "Could not make a directory to Clone into beside `{}`: {error}",
             destination.display()
         ))
     };
     for _ in 0..RESERVATIONS {
-        let staging = parent.join(staging_name(name, &suffix()));
-        match std::fs::create_dir(&staging) {
+        let directory = parent.join(staging_name(name, &suffix()));
+        if std::fs::symlink_metadata(&directory).is_ok() {
+            continue;
+        }
+        let record = StagingRecord {
+            directory: directory.clone(),
+            run: staging.run.clone(),
+        };
+        staging
+            .records
+            .record(&record)
+            .map_err(|error| unmade(&format!("recording it failed: {error}")))?;
+        match std::fs::create_dir(&directory) {
             Ok(()) => {
-                return match mark(&staging, run) {
-                    Ok(marker) => Ok((staging, marker)),
+                return match mark(&directory, &staging.run) {
+                    Ok(marker) => Ok((directory, marker)),
                     Err(error) => {
-                        let _ = remove_tree(&staging);
-                        Err(unmade(error))
+                        if remove_if_there(&directory).is_ok() {
+                            forget(staging, &directory);
+                        }
+                        Err(unmade(&error))
                     }
                 };
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(unmade(error)),
+            Err(error) => {
+                // Nothing there is this Clone's.
+                forget(staging, &directory);
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(unmade(&error));
+                }
+            }
         }
     }
-    Err(CloneFailure::Failed(format!(
-        "Could not make a directory to Clone into beside `{}`: every name tried was taken",
-        destination.display()
-    )))
+    Err(unmade(&"every name tried was taken"))
 }
 
 /// Marks `staging` as a Clone of the Server run `run`'s: a marker naming
@@ -515,64 +545,129 @@ fn mark(staging: &Path, run: &str) -> std::io::Result<std::fs::File> {
     Ok(marker)
 }
 
-/// Removes from `root` every staging directory a Clone of a Server run no
-/// longer alive left there, and nothing else: a hidden directory directly
-/// within it, named as a Clone names its staging, holding a marker no live
-/// Clone holds locked, which names a run other than `run`. A marker naming
-/// no run may be one a Clone is still making, and is left alone.
-fn sweep(root: &Path, run: &str) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
+/// Forgets `staging` in `records`, once nothing of a Clone is left there.
+/// Blocks.
+fn forget(records: &CloneStaging, staging: &Path) {
+    if let Err(error) = records.records.forget(staging) {
+        tracing::warn!(
+            staging = %staging.display(),
+            "what a Clone made is gone, but its record could not be forgotten: {error}"
+        );
+    }
+}
+
+/// Removes every directory a Clone of a Server run no longer alive recorded
+/// in `staging`'s records and left behind, and nothing else, forgetting
+/// each record once nothing of a Clone stands at it: a directory not
+/// recorded is never touched, however it is named or marked, and one
+/// recorded is removed only where [`left`] finds it abandoned. This very
+/// run's records are its own Clones', under way, and left alone.
+fn sweep(staging: &CloneStaging) {
+    let recorded = match staging.records.recorded() {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            tracing::warn!(
+                "what Clones of a Server no longer running made could not be read: {error}"
+            );
+            return;
+        }
     };
-    for entry in entries.flatten() {
-        let named = entry.file_name();
-        let Some(name) = named.to_str() else {
-            continue;
-        };
-        if !is_staging_name(name) || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+    for record in recorded {
+        if record.run == staging.run {
             continue;
         }
-        let staging = entry.path();
-        if !abandoned(&staging, run) {
-            continue;
-        }
-        match remove_tree(&staging) {
-            Ok(()) => tracing::info!(
-                staging = %staging.display(),
-                "removed what a Clone of a Server no longer running left behind"
-            ),
-            Err(error) => tracing::warn!(
-                staging = %staging.display(),
-                "what a Clone of a Server no longer running left behind could not be removed: \
-                 {error}"
-            ),
+        let directory = &record.directory;
+        match left(&record) {
+            Left::Abandoned => match remove_tree(directory) {
+                Ok(()) => {
+                    tracing::info!(
+                        staging = %directory.display(),
+                        "removed what a Clone of a Server no longer running left behind"
+                    );
+                    forget(staging, directory);
+                }
+                Err(error) => tracing::warn!(
+                    staging = %directory.display(),
+                    "what a Clone of a Server no longer running left behind could not be \
+                     removed: {error}"
+                ),
+            },
+            Left::Nothing => forget(staging, directory),
+            Left::Unknown => {}
         }
     }
 }
 
-/// Whether `staging` was left by a Clone no longer alive of a run other
-/// than `run`: its marker can be locked, so no live Clone holds it, and
-/// names a run, another than `run`.
-fn abandoned(staging: &Path, run: &str) -> bool {
+/// What a sweep finds of a directory a Clone recorded.
+#[derive(Debug, Eq, PartialEq)]
+enum Left {
+    /// The Clone's staging, still marked as the run that recorded it, which
+    /// no live Clone holds: to be removed.
+    Abandoned,
+    /// Nothing of the Clone's: the directory is gone, or what stands there
+    /// is no staging of that run's — not named as a Clone names its
+    /// staging, no directory, or not marked as that run's, which is left as
+    /// it is. The record is done with either way.
+    Nothing,
+    /// What cannot be told yet: the directory holding it cannot be read, as
+    /// on a drive not mounted, or a live Clone holds its marker. The record
+    /// stands, for the next start.
+    Unknown,
+}
+
+/// What the Clone recorded as `record` left behind, as [`Left`] tells it:
+/// abandoned only where the directory recorded is named as a Clone names its
+/// staging and holds a marker no live Clone holds locked, naming the run
+/// that recorded it.
+fn left(record: &StagingRecord) -> Left {
+    let staging = &record.directory;
+    if !staging
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_staging_name)
+    {
+        return Left::Nothing;
+    }
+    match std::fs::symlink_metadata(staging) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Left::Nothing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let holder_read = staging
+                .parent()
+                .is_some_and(|parent| std::fs::read_dir(parent).is_ok());
+            return if holder_read {
+                Left::Nothing
+            } else {
+                Left::Unknown
+            };
+        }
+        Err(_) => return Left::Unknown,
+    }
     let marker = staging.join(MARKER);
-    if !std::fs::symlink_metadata(&marker).is_ok_and(|metadata| metadata.is_file()) {
-        return false;
+    match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Left::Nothing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Left::Nothing,
+        Err(_) => return Left::Unknown,
     }
     let Ok(mut marker) = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(&marker)
     else {
-        return false;
+        return Left::Unknown;
     };
     if marker.try_lock_exclusive().is_err() {
-        return false;
+        return Left::Unknown;
     }
     let mut named = String::new();
     let read = marker.read_to_string(&mut named);
     let _ = fs2::FileExt::unlock(&marker);
-    let named = named.trim();
-    read.is_ok() && !named.is_empty() && named != run
+    match read {
+        Ok(_) if named.trim() == record.run => Left::Abandoned,
+        Ok(_) => Left::Nothing,
+        Err(_) => Left::Unknown,
+    }
 }
 
 /// Renames the directory `from` to `to` where nothing stands at `to`, and
@@ -926,14 +1021,25 @@ fn said(output: &Output) -> String {
 /// there is nothing to remove.
 async fn remove_partial(staging: &Path) -> std::io::Result<()> {
     let staging = staging.to_owned();
-    persistently(
-        move || match remove_tree(&staging) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            removed => removed,
-        },
-        |_| false,
-    )
-    .await
+    persistently(move || remove_if_there(&staging), |_| false).await
+}
+
+/// Removes the staging directory `staging` as [`remove_partial`] does, and
+/// once it is gone forgets it in `records`; one that cannot be removed stays
+/// recorded, for the next start to remove.
+async fn dismantle(staging: &Path, records: &CloneStaging) -> std::io::Result<()> {
+    remove_partial(staging).await?;
+    let (staging, records) = (staging.to_owned(), records.clone());
+    let _ = tokio::task::spawn_blocking(move || forget(&records, &staging)).await;
+    Ok(())
+}
+
+/// Removes the directory tree at `path`, where anything stands there.
+fn remove_if_there(path: &Path) -> std::io::Result<()> {
+    match remove_tree(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        removed => removed,
+    }
 }
 
 /// Runs `act` on a thread of its own until it succeeds, trying it again a
@@ -1113,6 +1219,39 @@ mod tests {
         }
     }
 
+    /// A run named `run`, recording in memory alone.
+    fn run_named(run: &str) -> CloneStaging {
+        CloneStaging {
+            run: run.to_owned(),
+            ..CloneStaging::in_memory()
+        }
+    }
+
+    /// The directories `staging`'s records hold, sorted.
+    fn recorded(staging: &CloneStaging) -> Vec<PathBuf> {
+        let mut recorded = staging
+            .records
+            .recorded()
+            .unwrap()
+            .into_iter()
+            .map(|record| record.directory)
+            .collect::<Vec<_>>();
+        recorded.sort();
+        recorded
+    }
+
+    /// Waits until `staging`'s records hold nothing, as a removal on a task
+    /// of its own leaves them once it is done.
+    async fn all_forgotten(staging: &CloneStaging) {
+        tokio::time::timeout(SURELY, async {
+            while !recorded(staging).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("everything recorded is forgotten: {:?}", recorded(staging)));
+    }
+
     /// The hidden directories directly within `directory`.
     fn staging_within(directory: &Path) -> Vec<PathBuf> {
         std::fs::read_dir(directory)
@@ -1264,10 +1403,11 @@ mod tests {
         );
     }
 
-    /// A Clone is made only in a directory it made itself: a hidden name
-    /// something already holds is passed over, and what holds it is never
-    /// touched — not when the Clone is made, nor when what it made is
-    /// removed.
+    /// A Clone is made only in a directory it made itself, recorded as its
+    /// run's while it stands and forgotten once it is gone: a hidden name
+    /// something already holds is passed over, unrecorded, and what holds it
+    /// is never touched — not when the Clone is made, nor when what it made
+    /// is removed.
     #[tokio::test]
     async fn a_clone_is_made_only_in_a_directory_of_its_own() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1275,12 +1415,14 @@ mod tests {
         let taken = temporary.path().join(staging_name("atlas", "taken"));
         std::fs::create_dir(&taken).unwrap();
         std::fs::write(taken.join("notes.txt"), "Mine.").unwrap();
+        let run = run_named("this run");
 
         let staged = Staged::reserve(
             &destination,
             "atlas",
             suffixes(&["taken", "free"]),
             &Cloning::default(),
+            &run,
         )
         .await
         .unwrap();
@@ -1294,8 +1436,17 @@ mod tests {
             [MARKER],
             "a staging directory holds its marker and nothing else until Git clones into it"
         );
+        assert_eq!(
+            run.records.recorded().unwrap(),
+            [StagingRecord {
+                directory: staging.clone(),
+                run: "this run".to_owned(),
+            }],
+            "the directory made is recorded as its run's, and the name passed over is not"
+        );
         staged.remove().await.unwrap();
         assert!(!staging.exists());
+        assert!(recorded(&run).is_empty(), "and forgotten once removed");
         assert_eq!(
             std::fs::read_to_string(taken.join("notes.txt")).unwrap(),
             "Mine.",
@@ -1307,18 +1458,66 @@ mod tests {
             "atlas",
             suffixes(&["free"]),
             &Cloning::default(),
+            &run,
         )
         .await
         .unwrap();
         drop(staged);
         gone(&staging).await;
+        all_forgotten(&run).await;
         assert!(taken.join("notes.txt").exists());
 
         std::fs::create_dir(&destination).unwrap();
         assert!(matches!(
-            Staged::reserve(&destination, "atlas", suffixes(&[]), &Cloning::default()).await,
+            Staged::reserve(
+                &destination,
+                "atlas",
+                suffixes(&[]),
+                &Cloning::default(),
+                &run
+            )
+            .await,
             Err(CloneFailure::Occupied)
         ));
+        assert!(recorded(&run).is_empty());
+    }
+
+    /// A staging directory whose record cannot be written is never made, so
+    /// none is ever made that the next start would not know of.
+    #[tokio::test]
+    async fn a_staging_directory_that_cannot_be_recorded_is_never_made() {
+        struct Unrecording;
+        impl crate::source_control::StagingRecords for Unrecording {
+            fn record(&self, _record: &StagingRecord) -> Result<(), String> {
+                Err("the records cannot be written".to_owned())
+            }
+            fn forget(&self, _directory: &Path) -> Result<(), String> {
+                Ok(())
+            }
+            fn recorded(&self) -> Result<Vec<StagingRecord>, String> {
+                Ok(Vec::new())
+            }
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("atlas");
+        let unrecording = CloneStaging::new(Arc::new(Unrecording));
+
+        let Err(CloneFailure::Failed(said)) = Staged::reserve(
+            &destination,
+            "atlas",
+            suffixes(&["unmade"]),
+            &Cloning::default(),
+            &unrecording,
+        )
+        .await
+        else {
+            panic!("a directory that cannot be recorded refuses the Clone");
+        };
+        assert!(
+            said.contains("recording it failed: the records cannot be written"),
+            "{said}"
+        );
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 0);
     }
 
     /// A staging directory has its owner from the moment it is made: the
@@ -1347,8 +1546,14 @@ mod tests {
             let _ = released.recv();
             "unreceived".to_owned()
         };
-        let cloning = Cloning::default();
-        let mut reserving = Box::pin(Staged::reserve(&destination, "atlas", suffix, &cloning));
+        let (cloning, run) = (Cloning::default(), run_named("this run"));
+        let mut reserving = Box::pin(Staged::reserve(
+            &destination,
+            "atlas",
+            suffix,
+            &cloning,
+            &run,
+        ));
         assert!(
             tokio::time::timeout(Duration::ZERO, &mut reserving)
                 .await
@@ -1363,6 +1568,7 @@ mod tests {
         assert!(unreceived.exists(), "made, and sent, but not yet received");
         drop(reserving);
         gone(&unreceived).await;
+        all_forgotten(&run).await;
 
         let (began, begun) = mpsc::channel();
         let (release, released) = mpsc::channel::<()>();
@@ -1376,7 +1582,16 @@ mod tests {
         };
         let reserving = tokio::spawn({
             let destination = destination.clone();
-            async move { Staged::reserve(&destination, "atlas", suffix, &Cloning::default()).await }
+            async move {
+                Staged::reserve(
+                    &destination,
+                    "atlas",
+                    suffix,
+                    &Cloning::default(),
+                    &CloneStaging::in_memory(),
+                )
+                .await
+            }
         });
         tokio::time::timeout(SURELY, async {
             while begun.try_recv().is_err() {
@@ -1407,6 +1622,7 @@ mod tests {
             "atlas",
             suffixes(&["one"]),
             &Cloning::default(),
+            &CloneStaging::in_memory(),
         )
         .await
         .unwrap();
@@ -1435,6 +1651,7 @@ mod tests {
             "atlas",
             suffixes(&["two"]),
             &Cloning::default(),
+            &CloneStaging::in_memory(),
         )
         .await
         .unwrap();
@@ -1514,14 +1731,16 @@ mod tests {
         let destination = projects.join("atlas");
         let (holding, rename) = held(rename_new);
         let adapter = Arc::new(renaming(rename));
+        let run = run_named("this run");
         // Ample for Git to clone a Repository of one commit from beside it.
         let timeout = Duration::from_secs(2);
         let started = tokio::time::Instant::now();
         let cloning = tokio::spawn({
-            let (adapter, destination) = (adapter.clone(), destination.clone());
+            let (adapter, destination, run) = (adapter.clone(), destination.clone(), run.clone());
             let origin = origin.to_str().unwrap().to_owned();
             async move {
-                GitSourceControl::clone_into(&adapter, &origin, &destination, None, timeout).await
+                GitSourceControl::clone_into(&adapter, &origin, &destination, None, timeout, &run)
+                    .await
             }
         });
         holding.begun().await;
@@ -1544,6 +1763,11 @@ mod tests {
         assert_eq!(staging.len(), 1, "the whole clone waits to take its name");
         assert!(staging[0].join(CLONED).join("README.md").exists());
         assert!(!destination.exists());
+        assert_eq!(
+            recorded(&run),
+            staging,
+            "its staging recorded all the while"
+        );
 
         let settling = tokio::spawn({
             let adapter = adapter.clone();
@@ -1570,91 +1794,156 @@ mod tests {
             "the owner landed the clone whole after the Clone answered"
         );
         assert!(staging_within(&projects).is_empty());
+        assert!(recorded(&run).is_empty(), "and forgotten once it is gone");
     }
 
-    /// A staging directory is marked as this run's, its marker locked while
-    /// the Clone lives, so a sweep never takes it for abandoned.
+    /// A staging directory is recorded and marked as its run's, its marker
+    /// locked while the Clone lives, so a sweep — even one of another run
+    /// reading the same records — never takes it for abandoned, and keeps
+    /// its record.
     #[tokio::test]
     async fn a_staging_directory_is_marked_as_its_runs_and_held_while_its_clone_lives() {
         let temporary = tempfile::tempdir().unwrap();
         let destination = temporary.path().join("atlas");
-        let cloning = Cloning::default();
-        let staged = Staged::reserve(&destination, "atlas", suffixes(&["0123abcd"]), &cloning)
-            .await
-            .unwrap();
+        let (cloning, run) = (Cloning::default(), run_named("this run"));
+        let staged = Staged::reserve(
+            &destination,
+            "atlas",
+            suffixes(&["0123abcd"]),
+            &cloning,
+            &run,
+        )
+        .await
+        .unwrap();
         let staging = staged.path().to_owned();
         assert!(is_staging_name(
             staging.file_name().unwrap().to_str().unwrap()
         ));
+        assert_eq!(
+            std::fs::read_to_string(staging.join(MARKER)).unwrap(),
+            "this run"
+        );
         let marker = std::fs::File::open(staging.join(MARKER)).unwrap();
         assert!(
             marker.try_lock_exclusive().is_err(),
             "the marker is held while the Clone lives"
         );
         drop(marker);
-        sweep(temporary.path(), "another run");
-        assert!(
-            staging.exists(),
-            "a sweep leaves a live Clone's staging alone"
-        );
+        for sweeping in [
+            run.clone(),
+            CloneStaging {
+                run: "another run".to_owned(),
+                ..run.clone()
+            },
+        ] {
+            sweep(&sweeping);
+            assert!(
+                staging.exists(),
+                "a sweep leaves a live Clone's staging alone"
+            );
+            assert_eq!(
+                recorded(&run),
+                std::slice::from_ref(&staging),
+                "and its record"
+            );
+        }
 
         staged.remove().await.unwrap();
         assert!(!staging.exists());
+        assert!(recorded(&run).is_empty());
     }
 
-    /// A sweep removes what a Clone of a Server run no longer alive left —
-    /// a staging directory named as a Clone names one, its marker unheld and
-    /// naming another run — and nothing else: no other hidden directory, no
-    /// directory so named without a marker or with one naming no run, none
-    /// whose marker is held, and none of this very run's.
+    /// A sweep removes what a Clone of a Server run no longer alive recorded
+    /// and left — a directory it recorded, named as a Clone names its
+    /// staging, its marker unheld and naming the run that recorded it — and
+    /// nothing else: never a directory it did not record, however it is
+    /// named and marked, as a completed clone given such a name and holding
+    /// such a marker might be; nor one recorded but marked as another run's,
+    /// unmarked, or named otherwise; nor one whose marker is held, nor one of
+    /// this very run's. It forgets every record nothing of its Clone answers
+    /// to any longer, and keeps those it cannot yet tell: held, or within a
+    /// directory that cannot be read.
     #[test]
-    fn a_sweep_removes_what_a_dead_runs_clones_left_and_nothing_else() {
+    fn a_sweep_removes_only_what_a_dead_runs_clones_recorded_and_left() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
-        let left = |name: &str, marked: Option<&str>| {
+        let run = run_named("this run");
+        let left = |name: &str, marked: Option<&str>, recorded_as: Option<&str>| {
             let staging = root.join(name);
             std::fs::create_dir_all(staging.join(CLONED)).unwrap();
             std::fs::write(staging.join(CLONED).join("README.md"), "# atlas").unwrap();
-            if let Some(run) = marked {
-                std::fs::write(staging.join(MARKER), run).unwrap();
+            if let Some(marked) = marked {
+                std::fs::write(staging.join(MARKER), marked).unwrap();
+            }
+            if let Some(recorded_as) = recorded_as {
+                run.records
+                    .record(&StagingRecord {
+                        directory: staging.clone(),
+                        run: recorded_as.to_owned(),
+                    })
+                    .unwrap();
             }
             staging
         };
-        let abandoned = left(".atlas.suru-clone-0123abcd", Some("a dead run"));
-        let notes = left(".notes", Some("a dead run"));
-        let unmarked = left(".maps.suru-clone-89abcdef", None);
-        let unnamed_run = left(".charts.suru-clone-00000000", Some(""));
-        let ours = left(".logs.suru-clone-11111111", Some("this run"));
-        let misnamed = left(".notes.suru-clone-4567CDEF", Some("a dead run"));
-        let visible = left("atlas.suru-clone-0123abcd", Some("a dead run"));
-        let held = left(".held.suru-clone-22222222", Some("a live run"));
+        let abandoned = left(
+            ".atlas.suru-clone-0123abcd",
+            Some("a dead run"),
+            Some("a dead run"),
+        );
+        let unrecorded = left(".maps.suru-clone-89abcdef", Some("a dead run"), None);
+        let remarked = left(
+            ".charts.suru-clone-00000000",
+            Some("another run"),
+            Some("a dead run"),
+        );
+        let unmarked = left(".logs.suru-clone-44444444", None, Some("a dead run"));
+        let renamed = left("atlas", Some("a dead run"), Some("a dead run"));
+        let ours = left(
+            ".notes.suru-clone-11111111",
+            Some("this run"),
+            Some("this run"),
+        );
+        let held = left(
+            ".held.suru-clone-22222222",
+            Some("a dead run"),
+            Some("a dead run"),
+        );
         let holder = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(held.join(MARKER))
             .unwrap();
         holder.lock_exclusive().unwrap();
+        let gone = root.join(".gone.suru-clone-33333333");
+        let unmounted = root.join("unmounted").join(".atlas.suru-clone-55555555");
+        for directory in [&gone, &unmounted] {
+            run.records
+                .record(&StagingRecord {
+                    directory: directory.clone(),
+                    run: "a dead run".to_owned(),
+                })
+                .unwrap();
+        }
 
-        sweep(root, "this run");
+        sweep(&run);
         assert!(
             !abandoned.exists(),
-            "what a dead run's Clone left is removed"
+            "what a dead run's Clone recorded and left is removed"
         );
-        for survivor in [
-            &notes,
-            &unmarked,
-            &unnamed_run,
-            &ours,
-            &misnamed,
-            &visible,
-            &held,
-        ] {
+        for survivor in [&unrecorded, &remarked, &unmarked, &renamed, &ours, &held] {
             assert!(
                 survivor.join(CLONED).join("README.md").exists(),
                 "{} is left as it was",
                 survivor.display()
             );
         }
+        let mut kept = vec![held.clone(), ours.clone(), unmounted.clone()];
+        kept.sort();
+        assert_eq!(
+            recorded(&run),
+            kept,
+            "only what cannot yet be told, and this run's own, stays recorded"
+        );
         drop(holder);
     }
 
@@ -1708,7 +1997,15 @@ mod tests {
             let (adapter, destination) = (adapter.clone(), destination.clone());
             let origin = origin.to_str().unwrap().to_owned();
             async move {
-                GitSourceControl::clone_into(&adapter, &origin, &destination, None, SURELY).await
+                GitSourceControl::clone_into(
+                    &adapter,
+                    &origin,
+                    &destination,
+                    None,
+                    SURELY,
+                    &CloneStaging::in_memory(),
+                )
+                .await
             }
         });
         holding.begun().await;
@@ -1737,7 +2034,17 @@ mod tests {
         let cloning = tokio::spawn({
             let (adapter, refused) = (adapter.clone(), refused.clone());
             let origin = origin.to_str().unwrap().to_owned();
-            async move { GitSourceControl::clone_into(&adapter, &origin, &refused, None, SURELY).await }
+            async move {
+                GitSourceControl::clone_into(
+                    &adapter,
+                    &origin,
+                    &refused,
+                    None,
+                    SURELY,
+                    &CloneStaging::in_memory(),
+                )
+                .await
+            }
         });
         holding.begun().await;
         let staging = staging_within(&projects);
@@ -1785,6 +2092,7 @@ mod tests {
             "atlas",
             suffixes(&["held"]),
             &Cloning::default(),
+            &CloneStaging::in_memory(),
         )
         .await
         .unwrap();

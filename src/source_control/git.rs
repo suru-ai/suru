@@ -71,9 +71,8 @@ pub struct GitSourceControl {
     /// Worktree root no longer looks like the one Git confirmed.
     validated_roots: Mutex<HashMap<CheckoutId, ValidatedRoot>>,
     on_disk: on_disk::OnDisk,
-    /// What this Server run's Clones share: how a whole clone takes its
-    /// name, what they have under way on their own, and the run they mark
-    /// their staging with.
+    /// What the Clones made through this share: how a whole clone takes
+    /// its name, and what they have under way on their own.
     cloning: cloning::Cloning,
     /// What every Git command is run with in its environment beside the
     /// Server's own, as though the Server had been started with it.
@@ -971,16 +970,18 @@ impl SourceControl for GitSourceControl {
         destination: &Path,
         branch: Option<&str>,
         timeout: Duration,
+        staging: &super::CloneStaging,
     ) -> Result<Workspace, super::CloneFailure> {
-        self.clone_into(url, destination, branch, timeout).await
+        self.clone_into(url, destination, branch, timeout, staging)
+            .await
     }
 
     async fn settle_clones(&self) {
         self.cloning.settled().await;
     }
 
-    async fn sweep_abandoned_clones(&self, root: &Path) {
-        self.cloning.sweep(root).await;
+    async fn sweep_abandoned_clones(&self, staging: &super::CloneStaging) {
+        cloning::sweep_abandoned(staging).await;
     }
 
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {

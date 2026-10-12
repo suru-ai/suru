@@ -5,7 +5,7 @@ use std::{
 };
 use suru::{
     protocol::*,
-    source_control::{CloneFailure, GitSourceControl, SourceControl},
+    source_control::{CloneFailure, CloneStaging, GitSourceControl, SourceControl},
 };
 
 fn git(directory: &Path, args: &[&str]) {
@@ -968,6 +968,26 @@ fn bare_origin(within: &Path) -> PathBuf {
 /// any does, so only a Clone left waiting on a prompt reaches it.
 const UNREACHED: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Clones `url` into `destination` through `adapter`, as a Server's Clone is
+/// made but recording what it makes in memory alone.
+async fn clone_landed(
+    adapter: &GitSourceControl,
+    url: &str,
+    destination: &Path,
+    branch: Option<&str>,
+    timeout: std::time::Duration,
+) -> Result<suru::protocol::Workspace, CloneFailure> {
+    adapter
+        .clone_repository(
+            url,
+            destination,
+            branch,
+            timeout,
+            &CloneStaging::in_memory(),
+        )
+        .await
+}
+
 #[tokio::test]
 async fn a_clone_answers_the_workspace_it_made_as_discovery_names_it() {
     let (_temporary, root) = root();
@@ -982,10 +1002,15 @@ async fn a_clone_answers_the_workspace_it_made_as_discovery_names_it() {
         "Git reports that it Clones"
     );
 
-    let cloned = adapter
-        .clone_repository(origin.to_str().unwrap(), &destination, None, UNREACHED)
-        .await
-        .unwrap();
+    let cloned = clone_landed(
+        &adapter,
+        origin.to_str().unwrap(),
+        &destination,
+        None,
+        UNREACHED,
+    )
+    .await
+    .unwrap();
     let discovered = adapter.discover(&destination).await.workspace;
     assert_eq!(
         (&cloned.id, &cloned.path),
@@ -1013,9 +1038,14 @@ async fn a_clone_never_touches_what_stands_at_its_destination() {
     let adapter = GitSourceControl::default();
 
     assert_eq!(
-        adapter
-            .clone_repository(origin.to_str().unwrap(), &destination, None, UNREACHED)
-            .await,
+        clone_landed(
+            &adapter,
+            origin.to_str().unwrap(),
+            &destination,
+            None,
+            UNREACHED
+        )
+        .await,
         Err(CloneFailure::Occupied)
     );
     assert_eq!(
@@ -1033,23 +1063,28 @@ async fn a_failed_clone_answers_in_gits_words_and_leaves_nothing_at_its_destinat
     let adapter = GitSourceControl::default();
 
     let missing = root.join("missing.git");
-    let Err(CloneFailure::Failed(said)) = adapter
-        .clone_repository(missing.to_str().unwrap(), &destination, None, UNREACHED)
-        .await
+    let Err(CloneFailure::Failed(said)) = clone_landed(
+        &adapter,
+        missing.to_str().unwrap(),
+        &destination,
+        None,
+        UNREACHED,
+    )
+    .await
     else {
         panic!("a Repository URL naming nothing fails the Clone");
     };
     assert!(said.starts_with("fatal: "), "Git's own words: {said}");
     assert!(!destination.exists(), "nothing is left at the destination");
 
-    let Err(CloneFailure::Failed(said)) = adapter
-        .clone_repository(
-            origin.to_str().unwrap(),
-            &destination,
-            Some("nowhere"),
-            UNREACHED,
-        )
-        .await
+    let Err(CloneFailure::Failed(said)) = clone_landed(
+        &adapter,
+        origin.to_str().unwrap(),
+        &destination,
+        Some("nowhere"),
+        UNREACHED,
+    )
+    .await
     else {
         panic!("a branch the Repository lacks fails the Clone");
     };
@@ -1078,14 +1113,14 @@ async fn a_clone_outlasting_its_timeout_is_stopped_and_leaves_nothing_at_its_des
     let adapter = GitSourceControl::default();
 
     assert_eq!(
-        adapter
-            .clone_repository(
-                &url,
-                &destination,
-                None,
-                std::time::Duration::from_millis(300)
-            )
-            .await,
+        clone_landed(
+            &adapter,
+            &url,
+            &destination,
+            None,
+            std::time::Duration::from_millis(300)
+        )
+        .await,
         Err(CloneFailure::TimedOut)
     );
     assert!(!destination.exists(), "nothing is left at the destination");
@@ -1127,9 +1162,7 @@ async fn a_clone_needing_a_credential_git_cannot_find_fails_at_once() {
     std::fs::write(&configuration, "").unwrap();
     let adapter = GitSourceControl::default().with_configuration_file(&configuration);
 
-    let failure = adapter
-        .clone_repository(&url, &destination, None, UNREACHED)
-        .await;
+    let failure = clone_landed(&adapter, &url, &destination, None, UNREACHED).await;
     let Err(CloneFailure::Failed(said)) = failure else {
         panic!("a credential Git cannot find fails the Clone at once: {failure:?}");
     };
@@ -1175,7 +1208,7 @@ async fn a_clone_is_made_out_of_sight_and_one_abandoned_leaves_nothing_behind() 
     let adapter = GitSourceControl::default();
 
     {
-        let cloning = adapter.clone_repository(&url, &destination, None, UNREACHED);
+        let cloning = clone_landed(&adapter, &url, &destination, None, UNREACHED);
         tokio::pin!(cloning);
         let seen = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
@@ -1258,14 +1291,14 @@ async fn a_clone_through_an_ssh_the_user_names_asks_nothing_either() {
         let adapter = GitSourceControl::default().with_configuration_file(&configuration);
         let destination = root.join("atlas");
 
-        let failure = adapter
-            .clone_repository(
-                "ssh://git@example.invalid/atlas.git",
-                &destination,
-                None,
-                std::time::Duration::from_secs(30),
-            )
-            .await;
+        let failure = clone_landed(
+            &adapter,
+            "ssh://git@example.invalid/atlas.git",
+            &destination,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
         let Err(CloneFailure::Failed(said)) = failure else {
             panic!("{name} {options} fails the Clone at once: {failure:?}");
         };
@@ -1301,17 +1334,17 @@ async fn a_clone_runs_no_command_a_repository_url_spells_out() {
     let ran = root.join("ran");
     let destination = root.join("atlas");
 
-    let failure = adapter
-        .clone_repository(
-            &format!(
-                "ext::sh -c touch% {}",
-                ran.to_str().unwrap().replace('\\', "/")
-            ),
-            &destination,
-            None,
-            UNREACHED,
-        )
-        .await;
+    let failure = clone_landed(
+        &adapter,
+        &format!(
+            "ext::sh -c touch% {}",
+            ran.to_str().unwrap().replace('\\', "/")
+        ),
+        &destination,
+        None,
+        UNREACHED,
+    )
+    .await;
     let Err(CloneFailure::Failed(said)) = failure else {
         panic!("an ext:: URL is refused: {failure:?}");
     };

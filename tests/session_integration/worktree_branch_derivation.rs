@@ -155,16 +155,17 @@ impl SourceControl for WitnessedGit {
         destination: &Path,
         branch: Option<&str>,
         timeout: std::time::Duration,
+        staging: &suru::source_control::CloneStaging,
     ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
         self.git
-            .clone_repository(url, destination, branch, timeout)
+            .clone_repository(url, destination, branch, timeout, staging)
             .await
     }
     async fn settle_clones(&self) {
         self.git.settle_clones().await;
     }
-    async fn sweep_abandoned_clones(&self, root: &Path) {
-        self.git.sweep_abandoned_clones(root).await;
+    async fn sweep_abandoned_clones(&self, staging: &suru::source_control::CloneStaging) {
+        self.git.sweep_abandoned_clones(staging).await;
     }
     async fn rename_branch(
         &self,

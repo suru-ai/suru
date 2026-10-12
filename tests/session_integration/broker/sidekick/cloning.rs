@@ -34,7 +34,7 @@ use crate::{
     broker::sidekick_acts::{acted, refused},
     repositories::git,
     workspace_discovery::AS_LONG_AS_IT_TAKES,
-    workspace_registry::{entries_on_disk, repository},
+    workspace_registry::{database, entries_on_disk, repository},
 };
 
 /// How the Registry spells a Workspace a Sidekick Cloned.
@@ -168,6 +168,44 @@ async fn emptied(directory: &Path) {
     })
     .await
     .unwrap_or_else(|_| panic!("nothing is left in {}", directory.display()));
+}
+
+/// One directory a Clone is made in, as the Server records it.
+#[derive(diesel::QueryableByName)]
+struct StagingRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    directory: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    run: String,
+}
+
+/// The directories Clones are made in that the Server `config` names has
+/// recorded and not yet forgotten, each with the run that recorded it,
+/// sorted.
+fn staging_recorded(config: &ServerConfig) -> Vec<(PathBuf, String)> {
+    use diesel::RunQueryDsl as _;
+
+    let mut recorded = diesel::sql_query("SELECT directory, run FROM clone_staging")
+        .load::<StagingRow>(&mut database(config))
+        .expect("read what the Server recorded of its Clones")
+        .into_iter()
+        .map(|row| (PathBuf::from(row.directory), row.run))
+        .collect::<Vec<_>>();
+    recorded.sort_unstable();
+    recorded
+}
+
+/// Records `directory` in the stopped Server `config` names as one a Clone
+/// of the run `run` made, as a Server that died while that Clone was under
+/// way left it.
+fn record_staging(config: &ServerConfig, directory: &Path, run: &str) {
+    use diesel::RunQueryDsl as _;
+
+    diesel::sql_query("INSERT INTO clone_staging (directory, run) VALUES (?, ?)")
+        .bind::<diesel::sql_types::Text, _>(spelled(directory))
+        .bind::<diesel::sql_types::Text, _>(run)
+        .execute(&mut database(config))
+        .expect("record what a Clone made");
 }
 
 /// Everything logged on this test's thread — where the Server it hosts runs
@@ -1344,41 +1382,60 @@ async fn a_clone_still_landing_at_its_bound_is_refused_saying_so_and_lands_and_i
     assert!(left.is_empty(), "nothing staged is left: {left:?}");
 }
 
-/// What a Clone of a Server that died mid-way left in a Workspace Root — a
-/// staging directory named as a Clone names one, holding the marker of a
-/// run no longer alive — is removed when a Server next starts, and nothing
-/// else is: not another hidden directory, though it hold such a marker, nor
-/// a directory so named without one.
+/// What a Clone of a Server that died mid-way recorded and left in a
+/// Workspace Root — a staging directory it recorded, still holding the
+/// marker of the run that recorded it — is removed when a Server next
+/// starts, its record with it, and nothing else is: not a directory named
+/// and marked just as a Clone names and marks its own that no Clone recorded
+/// — as a completed Workspace given such a name might be — nor one recorded
+/// but marked as another run's, nor another hidden directory.
 #[tokio::test]
-async fn what_a_dead_servers_clone_left_in_a_root_is_removed_at_the_next_start() {
+async fn what_a_dead_servers_clone_recorded_and_left_in_a_root_is_removed_at_the_next_start() {
     const CHANNEL: &str = "sidekick-clone-swept";
+    /// The run of the Server that died.
+    const GONE: &str = "a run long gone";
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
     let (_projects, projects) = directory();
     name_roots(config_dir.path(), &[spelled(&projects)]);
-    let left = |name: &str, marked: bool| {
+    let timings = || {
+        ServerTimings::default()
+            .with_broker_wait_second(WAIT_SECOND)
+            .with_broker_wait_progress_interval(WAIT_PROGRESS_EVERY)
+            .with_root_discovery_wait(AS_LONG_AS_IT_TAKES)
+    };
+    // The Server that died had made its storage before it did.
+    let hosted = host_providers_with_timings(
+        state_dir.path(),
+        CHANNEL,
+        Some(config_dir.path()),
+        timings(),
+    )
+    .await;
+    hosted.server.shutdown().await.expect("shut down server");
+    let config =
+        ServerConfig::new(state_dir.path(), CHANNEL).expect("configure the stopped Server");
+    let left = |name: &str, marked: &str, recorded: bool| {
         let staging = projects.join(name);
         std::fs::create_dir_all(staging.join("clone")).expect("make what was left");
         std::fs::write(staging.join("clone").join("README.md"), readme("atlas"))
             .expect("write what was left");
-        if marked {
-            std::fs::write(staging.join("suru-clone"), "a run long gone")
-                .expect("mark what was left");
+        std::fs::write(staging.join("suru-clone"), marked).expect("mark what was left");
+        if recorded {
+            record_staging(&config, &staging, GONE);
         }
         staging
     };
-    let abandoned = left(".atlas.suru-clone-0123abcd", true);
-    let notes = left(".notes", true);
-    let unmarked = left(".maps.suru-clone-89abcdef", false);
+    let abandoned = left(".atlas.suru-clone-0123abcd", GONE, true);
+    let unrecorded = left(".maps.suru-clone-89abcdef", GONE, false);
+    let remarked = left(".charts.suru-clone-00112233", "another run", true);
+    let notes = left(".notes", GONE, false);
 
     let hosted = host_providers_with_timings(
         state_dir.path(),
         CHANNEL,
         Some(config_dir.path()),
-        ServerTimings::default()
-            .with_broker_wait_second(WAIT_SECOND)
-            .with_broker_wait_progress_interval(WAIT_PROGRESS_EVERY)
-            .with_root_discovery_wait(AS_LONG_AS_IT_TAKES),
+        timings(),
     )
     .await;
     timeout(
@@ -1390,9 +1447,9 @@ async fn what_a_dead_servers_clone_left_in_a_root_is_removed_at_the_next_start()
 
     assert!(
         !abandoned.exists(),
-        "what the dead run's Clone left is removed"
+        "what the dead run's Clone recorded and left is removed"
     );
-    for survivor in [&notes, &unmarked] {
+    for survivor in [&unrecorded, &remarked, &notes] {
         assert!(
             survivor.join("clone").join("README.md").exists(),
             "{} is left as it was",
@@ -1401,4 +1458,9 @@ async fn what_a_dead_servers_clone_left_in_a_root_is_removed_at_the_next_start()
     }
 
     hosted.server.shutdown().await.expect("shut down server");
+    assert_eq!(
+        staging_recorded(&config),
+        [],
+        "what was removed, and what was never the Clone's, is no longer recorded"
+    );
 }
