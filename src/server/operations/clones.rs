@@ -247,8 +247,9 @@ fn expand(root: &str, home: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// The Workspace Root among `roots` a Clone goes in: the one `named` names,
-/// as the Setting spells it or as the directory it names, or the only one
-/// where it names none.
+/// as the Setting spells it or as the directory it names — however either
+/// spells that directory, so long as it can be read — or the only one where
+/// it names none.
 fn chosen_root<'r>(
     roots: &'r [String],
     named: Option<&str>,
@@ -262,13 +263,25 @@ fn chosen_root<'r>(
         }),
         (_, Some(named)) => {
             let directory = expand(named, home);
-            roots
-                .iter()
-                .find(|root| {
-                    root.as_str() == named
-                        || directory
-                            .as_ref()
-                            .is_some_and(|directory| expand(root, home).as_ref() == Some(directory))
+            let read = || {
+                directory
+                    .as_ref()
+                    .and_then(|directory| crate::paths::canonical(directory).ok())
+            };
+            let spelled_alike = roots.iter().find(|root| {
+                root.as_str() == named
+                    || directory
+                        .as_ref()
+                        .is_some_and(|directory| expand(root, home).as_ref() == Some(directory))
+            });
+            spelled_alike
+                .or_else(|| {
+                    let read = read()?;
+                    roots.iter().find(|root| {
+                        expand(root, home)
+                            .and_then(|root| crate::paths::canonical(root).ok())
+                            .is_some_and(|root| root == read)
+                    })
                 })
                 .map(String::as_str)
                 .ok_or_else(|| CloneRefusal::UnknownRoot {
@@ -296,7 +309,7 @@ fn readable_root(root: &str, home: Option<&Path>) -> Result<PathBuf, CloneRefusa
 /// `name`, where it is one plain directory name: something besides space,
 /// naming one directory within whatever directory it is joined to — never
 /// `.` or `..` — and holding no separator any platform reads, nor a drive's
-/// colon, so that it names the same one directory on every platform.
+/// colon, so that on no platform does it name a directory anywhere else.
 fn plain_name(name: &str) -> Result<&str, CloneRefusal> {
     let mut components = Path::new(name).components();
     let plain = !name.trim().is_empty()
@@ -346,7 +359,8 @@ impl SessionOperations {
     ) -> Result<Workspace, CloneRefusal> {
         let roots = self.settings.borrow().settings.workspace.roots.clone();
         let home = self.cloning.home.clone();
-        let root = chosen_root(&roots, request.root.as_deref(), home.as_deref())?.to_owned();
+        let named = request.root.clone();
+        let asked = named.clone().unwrap_or_else(|| roots.join(", "));
         let name = match &request.name {
             Some(name) => plain_name(name)?,
             None => named_by(&request.repository_url)?,
@@ -354,16 +368,16 @@ impl SessionOperations {
         .to_owned();
         // A Root on a mount gone quiet may hold up whoever reads it, which
         // is never one of the Server's own threads.
-        let reading = root.clone();
         let (destination, occupied) = tokio::task::spawn_blocking(move || {
-            let destination = readable_root(&reading, home.as_deref())?.join(name);
+            let root = chosen_root(&roots, named.as_deref(), home.as_deref())?;
+            let destination = readable_root(root, home.as_deref())?.join(name);
             let occupied = std::fs::symlink_metadata(&destination).is_ok();
             Ok((destination, occupied))
         })
         .await
         .unwrap_or_else(|error| {
             Err(CloneRefusal::UnreadableRoot {
-                root,
+                root: asked,
                 reason: error.to_string(),
             })
         })?;
@@ -601,6 +615,35 @@ mod tests {
             chosen_root(&roots, Some("~/src"), None),
             Ok("~/src"),
             "a Root is named by its spelling where no home is known"
+        );
+    }
+
+    /// A Root is named by the directory it names however either spells it,
+    /// where that directory can be read: the path a listing gives, read
+    /// canonically, names a Root the Setting spells another way.
+    #[test]
+    fn a_root_is_named_by_the_directory_it_names_however_spelled() {
+        let temporary = tempfile::tempdir().unwrap();
+        let projects = temporary.path().join("projects");
+        std::fs::create_dir(&projects).unwrap();
+        let roundabout = temporary
+            .path()
+            .join("projects")
+            .join("..")
+            .join("projects");
+        let roots = vec![roundabout.to_str().unwrap().to_owned(), "~/src".to_owned()];
+        let read = crate::paths::canonical(&projects).unwrap();
+        assert_eq!(
+            chosen_root(&roots, read.to_str(), None),
+            Ok(roots[0].as_str())
+        );
+        let missing = temporary.path().join("missing");
+        assert_eq!(
+            chosen_root(&roots, missing.to_str(), None),
+            Err(CloneRefusal::UnknownRoot {
+                named: missing.to_str().unwrap().to_owned(),
+                roots: roots.clone(),
+            })
         );
     }
 

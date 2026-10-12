@@ -23,8 +23,8 @@ const UNASKING_SSH: &str = "ssh -o BatchMode=yes";
 /// letting go of what it held, and on Windows a file just written may be
 /// held a moment longer by whatever reads it, so what Git made can be
 /// neither removed nor renamed until then.
-const RETRIES: u32 = 20;
-const RETRY: Duration = Duration::from_millis(50);
+const RETRIES: u32 = 30;
+const RETRY: Duration = Duration::from_millis(100);
 
 impl GitSourceControl {
     /// Clones `url` into `destination`, as
