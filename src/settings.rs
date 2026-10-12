@@ -6,8 +6,9 @@
 //! Documents (depth one today; project-level documents later are additive)
 //! into one [`SettingsSnapshot`] and never lets a configuration problem stop
 //! the server: a file that fails to parse is ignored whole, an unknown or
-//! mistyped key is ignored alone, and every ignore becomes a diagnostic
-//! naming the file, the key path, and the reason.
+//! mistyped key is ignored alone, an entry a list Setting does not take is
+//! ignored alone while the rest of the list stands, and every ignore becomes a
+//! diagnostic naming the file, the key path, and the reason.
 //!
 //! The schema also spells every value in force as a Config Document would,
 //! takes a value spelled so back as a typed pin, and has every Setting declare
@@ -214,8 +215,9 @@ pub struct SettingDescriptor {
     /// The mutation that takes this Setting's pin out of the Config Document,
     /// so the built-in default resumes.
     pub reset: SettingMutation,
-    /// Writes a pinned JSON value into the typed field it governs, or reports
-    /// that the value is not one of the accepted ones.
+    /// Writes a pinned JSON value into the typed field it governs, and reports
+    /// whether it took the value whole, took it without entries it ignored, or
+    /// refused it as none of the accepted ones.
     apply: fn(&mut EffectiveSettings, &Value) -> Applied,
 }
 
@@ -2583,24 +2585,23 @@ fn apply_key(
         return;
     }
     if let Some(descriptor) = SCHEMA.iter().find(|descriptor| descriptor.key == key) {
-        let ignored = match (descriptor.apply)(&mut snapshot.settings, value) {
-            Applied::Refused => vec![format!(
-                "ignored because its value is not {}",
-                descriptor.expected()
-            )],
+        let (pins, ignored) = match (descriptor.apply)(&mut snapshot.settings, value) {
+            Applied::Whole => (true, Vec::new()),
             // A list holding an entry the Setting does not take still pins
             // the rest of it, each entry ignored alone named by its own
             // diagnostic.
-            applied => {
-                if !snapshot.pinned.contains(&key) {
-                    snapshot.pinned.push(key.clone());
-                }
-                match applied {
-                    Applied::Partly(ignored) => ignored,
-                    Applied::Whole | Applied::Refused => Vec::new(),
-                }
-            }
+            Applied::Partly(ignored) => (true, ignored),
+            Applied::Refused => (
+                false,
+                vec![format!(
+                    "ignored because its value is not {}",
+                    descriptor.expected()
+                )],
+            ),
         };
+        if pins && !snapshot.pinned.contains(&key) {
+            snapshot.pinned.push(key.clone());
+        }
         snapshot
             .diagnostics
             .extend(ignored.into_iter().map(|message| SettingsDiagnostic {
