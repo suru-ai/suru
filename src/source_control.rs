@@ -103,10 +103,41 @@ pub enum CloneFailure {
     /// The Clone failed, or was stopped once its timeout passed, and what it
     /// left at its destination could not be removed, as this says.
     LeftBehind(String),
-    /// The clone was whole, but still taking its destination's name when
-    /// the timeout passed: it may yet land there, and where it cannot,
-    /// nothing will be left.
-    StillLanding,
+}
+
+/// A whole clone taking its destination's name, which an owner of its own
+/// sees through — naming it, or removing it where it cannot be named —
+/// whatever becomes of whoever holds this, or of whoever asked for the
+/// Clone: what it comes to is the Workspace made at the destination, as the
+/// Clone knows it, or why it could not be named there.
+pub struct CloneLanding(
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Workspace, CloneFailure>> + Send>>,
+);
+
+impl CloneLanding {
+    /// The landing `landing` comes to.
+    pub fn new(
+        landing: impl std::future::Future<Output = Result<Workspace, CloneFailure>> + Send + 'static,
+    ) -> Self {
+        Self(Box::pin(landing))
+    }
+}
+
+impl std::future::Future for CloneLanding {
+    type Output = Result<Workspace, CloneFailure>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.0.as_mut().poll(context)
+    }
+}
+
+impl std::fmt::Debug for CloneLanding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CloneLanding")
+    }
 }
 
 /// A directory a Clone is made in, as its Server records it: where it is,
@@ -287,17 +318,16 @@ pub trait SourceControl: Send + Sync {
     /// the Clone is whole, so no half-made one is ever taken for a
     /// Workspace, and nothing standing there is ever replaced: anything
     /// already there, or come to stand there meanwhile, refuses it and is
-    /// left as it was. `timeout` bounds the call. Once the clone is whole,
-    /// giving it its name — or removing it where it cannot have one — is
-    /// seen through on its own whatever the time, and whatever becomes of
-    /// whoever awaits it; a call whose timeout passes meanwhile answers
-    /// [`CloneFailure::StillLanding`]. Whatever the Clone makes on its way
-    /// is recorded in `staging`, under its run, before it is made, and
-    /// forgotten once it is gone. A Clone that fails leaves nothing behind
-    /// once it answers; what one stopped at its deadline, or abandoned,
-    /// began is removed on its own, and what a Server that died meanwhile
-    /// left is removed at the next start by
-    /// [`SourceControl::sweep_abandoned_clones`].
+    /// left as it was. `timeout` bounds making the clone, and the call
+    /// answers once it is whole, with its [`CloneLanding`]: giving it its
+    /// name — or removing it where it cannot have one — is seen through on
+    /// its own whatever the time, and whatever becomes of whoever awaits
+    /// it. Whatever the Clone makes on its way is recorded in `staging`,
+    /// under its run, before it is made, and forgotten once it is gone. A
+    /// Clone that fails leaves nothing behind once it answers; what one
+    /// stopped at its deadline, or abandoned, began is removed on its own,
+    /// and what a Server that died meanwhile left is removed at the next
+    /// start by [`SourceControl::sweep_abandoned_clones`].
     async fn clone_repository(
         &self,
         url: &str,
@@ -305,7 +335,7 @@ pub trait SourceControl: Send + Sync {
         branch: Option<&str>,
         timeout: std::time::Duration,
         staging: &CloneStaging,
-    ) -> Result<Workspace, CloneFailure>;
+    ) -> Result<CloneLanding, CloneFailure>;
     /// Waits until everything Clones have left to see through on their own
     /// — naming a whole clone, removing one that cannot be named or was
     /// abandoned — is done: what a stopping Server waits on, a bounded
@@ -863,7 +893,7 @@ impl SourceControlService {
         destination: &Path,
         branch: Option<&str>,
         timeout: std::time::Duration,
-    ) -> Result<Workspace, CloneFailure> {
+    ) -> Result<CloneLanding, CloneFailure> {
         self.adapter
             .clone_repository(url, destination, branch, timeout, &self.clone_staging)
             .await
@@ -1266,7 +1296,7 @@ mod tests {
             _branch: Option<&str>,
             _timeout: std::time::Duration,
             _staging: &CloneStaging,
-        ) -> Result<Workspace, CloneFailure> {
+        ) -> Result<CloneLanding, CloneFailure> {
             Err(CloneFailure::Failed(STANDS_IN.to_owned()))
         }
         async fn settle_clones(&self) {}
@@ -1325,7 +1355,7 @@ mod tests {
             _branch: Option<&str>,
             _timeout: std::time::Duration,
             _staging: &CloneStaging,
-        ) -> Result<Workspace, CloneFailure> {
+        ) -> Result<CloneLanding, CloneFailure> {
             Err(CloneFailure::Failed(STANDS_IN.to_owned()))
         }
         async fn settle_clones(&self) {}

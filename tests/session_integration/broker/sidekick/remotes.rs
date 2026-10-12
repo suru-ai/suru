@@ -220,11 +220,11 @@ impl Serving {
 /// its next discovery of one directory: the first thing the Remote does with
 /// a request naming that directory, so where nothing else names it, the test
 /// learns the moment such a request has reached the Remote, and decides when
-/// it goes on.
-#[derive(Default)]
+/// it goes on. It may hold a whole clone as it takes its name likewise.
 struct HeldGit {
     git: GitSourceControl,
     held: std::sync::Mutex<Option<HeldDiscovery>>,
+    naming: Arc<std::sync::Mutex<Option<HeldNaming>>>,
 }
 
 struct HeldDiscovery {
@@ -233,7 +233,75 @@ struct HeldDiscovery {
     release: oneshot::Receiver<()>,
 }
 
+/// A whole clone held as it takes its name at `destination`, on the thread
+/// it is named on.
+struct HeldNaming {
+    destination: PathBuf,
+    reached: oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl Default for HeldGit {
+    fn default() -> Self {
+        let naming = Arc::<std::sync::Mutex<Option<HeldNaming>>>::default();
+        let git = GitSourceControl::default().with_naming_observer({
+            let naming = naming.clone();
+            move |destination: &Path| {
+                let held = {
+                    let mut naming = naming.lock().unwrap();
+                    if naming
+                        .as_ref()
+                        .is_some_and(|held| held.destination == destination)
+                    {
+                        naming.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(held) = held {
+                    let _ = held.reached.send(());
+                    let _ = held.release.recv();
+                }
+            }
+        });
+        Self {
+            git,
+            held: std::sync::Mutex::default(),
+            naming,
+        }
+    }
+}
+
 impl HeldGit {
+    /// Holds the next whole clone that takes its name at `destination`, as
+    /// it is about to: what says it has been reached, and what lets it go on.
+    fn hold_naming_of(
+        &self,
+        destination: &Path,
+    ) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, reaching) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let parent = destination
+            .parent()
+            .expect("a directory to be made has a parent");
+        let held = HeldNaming {
+            destination: suru::paths::canonical(parent)
+                .expect("read the directory's parent canonically")
+                .join(
+                    destination
+                        .file_name()
+                        .expect("a directory to be made is named"),
+                ),
+            reached,
+            release: released,
+        };
+        assert!(
+            self.naming.lock().unwrap().replace(held).is_none(),
+            "one naming is held at a time"
+        );
+        (reaching, release)
+    }
+
     /// Holds the next discovery of `directory` — one not made yet, such as
     /// where a Clone will go, as it will be read once it is: what says it
     /// has been reached, and what lets it go on.
@@ -277,7 +345,7 @@ impl SourceControl for HeldGit {
         branch: Option<&str>,
         timeout: std::time::Duration,
         staging: &suru::source_control::CloneStaging,
-    ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
+    ) -> Result<suru::source_control::CloneLanding, suru::source_control::CloneFailure> {
         self.git
             .clone_repository(url, destination, branch, timeout, staging)
             .await

@@ -1278,13 +1278,19 @@ fn gated_git() -> (
 
 /// A Clone whose clone is whole but still taking its name when the
 /// Server's bound on a Clone passes is refused then, saying the clone may
-/// yet land and will then be listed — rather than holding the call past its
-/// bound — and the clone lands once its naming goes on, and is listed as
-/// discovery finds it. A Server stopping while a Clone is still landing
-/// waits for it before it lets go.
+/// yet land and will then be listed as Cloned — rather than holding the call
+/// past its bound — and once its naming goes on it lands and is settled as
+/// any Clone that lands is, though no one waits on it any longer: entered in
+/// the Registry as Cloned, its Icon and Description derived at once, and
+/// recorded in the Log. What it is made in is recorded in the Server's
+/// storage while it is under way, and forgotten once it is gone. A Server
+/// stopping while a Clone is still landing waits for it to land and be
+/// settled before it lets go.
 #[tokio::test]
 async fn a_clone_still_landing_at_its_bound_is_refused_saying_so_and_lands_and_is_listed_after() {
     const CHANNEL: &str = "sidekick-clone-still-landing";
+    let log = Captured::default();
+    let _log = log.install(tracing::Level::INFO);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
     let (_projects, projects) = directory();
@@ -1292,6 +1298,7 @@ async fn a_clone_still_landing_at_its_bound_is_refused_saying_so_and_lands_and_i
     let atlas_origin = bare_repository(&elsewhere, "atlas");
     let charts_origin = bare_repository(&elsewhere, "charts");
     name_roots(config_dir.path(), &[spelled(&projects)]);
+    let config = ServerConfig::new(state_dir.path(), CHANNEL).expect("configure the Server");
     let (git, landings, release) = gated_git();
     let mut hosted = host_providers_with_source_control(
         state_dir.path(),
@@ -1314,7 +1321,8 @@ async fn a_clone_still_landing_at_its_bound_is_refused_saying_so_and_lands_and_i
         format!(
             "The Clone of `{}` did not finish within 2 seconds: the whole clone was still taking \
              its name, `{}`, so it may yet land there, and will then be listed among this \
-             server's Workspaces; if it cannot, nothing will be left of it.",
+             server's Workspaces as Cloned, its Icon and Description derived; if it cannot, \
+             nothing will be left of it.",
             spelled(origin),
             spelled(destination)
         )
@@ -1336,18 +1344,54 @@ async fn a_clone_still_landing_at_its_bound_is_refused_saying_so_and_lands_and_i
         "the clone was whole, held as it took its name"
     );
     assert!(!atlas.exists());
+    let staged = contents(&projects);
+    assert!(
+        staged.len() == 1 && staged[0].starts_with(".atlas."),
+        "the clone is made out of sight: {staged:?}"
+    );
+    assert_eq!(
+        staging_recorded(&config)
+            .into_iter()
+            .map(|(directory, _)| directory)
+            .collect::<Vec<_>>(),
+        [projects.join(&staged[0])],
+        "what the clone is made in is recorded while it is under way"
+    );
     release.send(()).expect("let the clone take its name");
-    let landed = cloned_row(&atlas, Value::Null, Value::Null);
+    let errand = next_workspace_errand(&mut hosted.claude).await;
+    assert_eq!(
+        errand.execution_directory(),
+        atlas,
+        "the Clone that landed with no one waiting has its Icon and Description derived"
+    );
+    errand.succeed(json!({
+        "icon": "dev-rust",
+        "description": "Where the atlas is charted.",
+    }));
+    let landed = cloned_row(
+        &atlas,
+        json!({ "text": "Where the atlas is charted.", "set": false }),
+        json!("dev-rust"),
+    );
     timeout(PROGRESS_DEADLINE, async {
         while !list_workspaces(&mut sidekick).await.contains(&landed) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the clone lands, and a later listing finds it");
+    .expect("the clone lands, is listed, and wears what was derived for it");
     assert_eq!(
         std::fs::read_to_string(atlas.join("README.md")).expect("the clone landed whole"),
         readme("atlas")
+    );
+    let logged = log.logged();
+    assert!(
+        logged
+            .lines()
+            .any(|line| line.contains(spelled(&atlas_origin))
+                && line.contains(spelled(&atlas))
+                && line.contains("Cloned")),
+        "the Log records the Clone that landed, with its URL and destination: {logged}"
     );
 
     let charts = projects.join("charts");
@@ -1380,6 +1424,24 @@ async fn a_clone_still_landing_at_its_bound_is_refused_saying_so_and_lands_and_i
     let mut left = contents(&projects);
     left.retain(|name| name.starts_with('.'));
     assert!(left.is_empty(), "nothing staged is left: {left:?}");
+    let entries = entries_on_disk(&config);
+    assert_eq!(
+        (
+            entries.get(&repository_id(&atlas)),
+            entries.get(&repository_id(&charts)),
+        ),
+        (
+            Some(&(Some(atlas.clone()), BY_CLONE.to_owned())),
+            Some(&(Some(charts.clone()), BY_CLONE.to_owned())),
+        ),
+        "each Clone that landed after its bound is entered as Cloned, the one that landed as \
+         the Server stopped among them: {entries:?}"
+    );
+    assert_eq!(
+        staging_recorded(&config),
+        [],
+        "nothing is recorded of what is gone"
+    );
 }
 
 /// What a Clone of a Server that died mid-way recorded and left in a

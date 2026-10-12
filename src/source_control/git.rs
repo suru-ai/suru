@@ -971,7 +971,7 @@ impl SourceControl for GitSourceControl {
         branch: Option<&str>,
         timeout: Duration,
         staging: &super::CloneStaging,
-    ) -> Result<Workspace, super::CloneFailure> {
+    ) -> Result<super::CloneLanding, super::CloneFailure> {
         self.clone_into(url, destination, branch, timeout, staging)
             .await
     }

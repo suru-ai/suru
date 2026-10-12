@@ -548,7 +548,8 @@ async fn session_creation_rejects_execution_directory_that_changed_since_discove
             _branch: Option<&str>,
             _timeout: std::time::Duration,
             _staging: &suru::source_control::CloneStaging,
-        ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
+        ) -> Result<suru::source_control::CloneLanding, suru::source_control::CloneFailure>
+        {
             Err(suru::source_control::CloneFailure::Failed(
                 "This stand-in reads directories and Clones nothing".to_owned(),
             ))
@@ -744,7 +745,8 @@ async fn a_failed_worktree_listing_retires_nothing_it_could_not_speak_for() {
             branch: Option<&str>,
             timeout: std::time::Duration,
             staging: &suru::source_control::CloneStaging,
-        ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
+        ) -> Result<suru::source_control::CloneLanding, suru::source_control::CloneFailure>
+        {
             self.git
                 .clone_repository(url, destination, branch, timeout, staging)
                 .await

@@ -16,14 +16,17 @@
 //!
 //! The Clone itself is source control's ([`SourceControlService::clone_repository`]),
 //! bounded by this Server's own timeout, and leaves nothing behind where it
-//! fails or runs out of time. One that lands is read apart, within a bound
-//! of its own, and entered in the Workspace Registry as Cloned — as read,
-//! or as the Clone knew it where the reading does not answer in time, and
-//! no scan of the Roots happening upon it first takes it for discovered —
-//! has its Icon and Description derived at once, as the
-//! first Session begun there would, and has the Roots discovered afresh,
-//! waiting on that no longer than a listing would; the Log records what was
-//! Cloned where, the URL's credential aside.
+//! fails or runs out of time. One whose clone is whole is settled on a task
+//! of its own once it lands, whether or not whoever asked for it is still
+//! waiting — as where the bound passed while the clone was still taking its
+//! name — and counted among the Clones run apart, so a stopping Server waits
+//! on it: it is read apart, within a bound of its own, and entered in the
+//! Workspace Registry as Cloned — as read, or as the Clone knew it where the
+//! reading does not answer in time, and no scan of the Roots happening upon
+//! it first takes it for discovered — has its Icon and Description derived
+//! at once, as the first Session begun there would, and has the Roots
+//! discovered afresh, waiting on that no longer than a listing would; the
+//! Log records what was Cloned where, the URL's credential aside.
 //!
 //! A Clone is a Workspace act, so a Sidekick may ask it of a Remote: its own
 //! Server carries it there through the Pairing as the act of a Sidekick on
@@ -40,7 +43,8 @@
 //! a Clone through on a task of its own, whatever becomes of the Peer's
 //! request, until it begins to stop: that stops the Clone as an abandoned
 //! one is stopped, and the stop waits a while for it to let go of what it
-//! began before the Remote lets go.
+//! began, and for a clone already whole to land and be settled, before the
+//! Remote lets go.
 //!
 //! [`SourceControlService::clone_repository`]: crate::source_control::SourceControlService::clone_repository
 
@@ -52,7 +56,7 @@ use std::{
 };
 
 use axum::http::Method;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use super::{
     SessionOperations,
@@ -65,10 +69,10 @@ use crate::{
     },
     server::{
         reads_apart::{NotRead, ReadsApart},
-        root_discovery::expand,
+        root_discovery::{self, expand},
     },
     sidekick::SidekickWorkspace,
-    source_control::{CloneFailure, without_credentials},
+    source_control::{CloneFailure, CloneLanding, without_credentials},
 };
 
 /// The most reads a Clone makes apart — of Workspace Roots, and of what
@@ -104,10 +108,13 @@ impl WorkspaceCloning {
     }
 }
 
-/// The Clones Sidekicks on Peers ask of this Server, each run on a task of
-/// its own, so it is seen through however its Peer fares, until this Server
-/// begins to stop, which stops every one: counted while they run, so a
-/// stopping Server can wait until each has let go of what it began.
+/// The work of Clones run on tasks of its own, counted while it runs, so a
+/// stopping Server can wait until each piece has let go of what it began:
+/// the Clones Sidekicks on Peers ask of this Server, seen through however
+/// their Peer fares until this Server begins to stop, which stops every one;
+/// and the settling of every Clone that lands, which goes on however whoever
+/// asked for it fares, and which a stop cuts short only of discovering the
+/// Roots afresh.
 #[derive(Clone)]
 pub(crate) struct DetachedClones {
     /// Whether this Server has begun to stop.
@@ -116,7 +123,8 @@ pub(crate) struct DetachedClones {
 }
 
 impl DetachedClones {
-    /// Clones run apart until `stopping` says this Server has begun to stop.
+    /// Clones run apart until `stopping` says this Server has begun to stop,
+    /// and settled apart.
     pub(crate) fn new(stopping: watch::Receiver<bool>) -> Self {
         Self {
             stopping,
@@ -125,8 +133,9 @@ impl DetachedClones {
     }
 
     /// Waits until none is running: what a stopping Server waits on, once
-    /// its stop has stopped every one, before it waits on what they left to
-    /// see through (see [`SourceControlService::settle_clones`]).
+    /// its stop has stopped every Clone a Peer asked for, before it waits on
+    /// what they left to see through (see
+    /// [`SourceControlService::settle_clones`]).
     ///
     /// [`SourceControlService::settle_clones`]: crate::source_control::SourceControlService::settle_clones
     pub(crate) async fn stopped(&self) {
@@ -144,7 +153,7 @@ impl DetachedClones {
     }
 }
 
-/// One Clone running apart.
+/// One Clone, or one Clone's settling, running apart.
 struct RunningClone(Arc<watch::Sender<usize>>);
 
 impl Drop for RunningClone {
@@ -212,7 +221,7 @@ pub(crate) enum CloneRefusal {
     },
     /// The clone was whole but still taking its name at `destination` when
     /// the Server's bound on a Clone passed: it may yet land there, and is
-    /// then listed as discovery finds it.
+    /// then entered as Cloned and settled as any Clone that lands.
     StillLanding {
         url: String,
         destination: PathBuf,
@@ -346,7 +355,8 @@ impl fmt::Display for CloneRefusal {
                 formatter,
                 "The Clone of `{url}` did not finish within {}: the whole clone was still taking \
                  its name, `{}`, so it may yet land there, and will then be listed among this \
-                 server's Workspaces; if it cannot, nothing will be left of it.",
+                 server's Workspaces as Cloned, its Icon and Description derived; if it cannot, \
+                 nothing will be left of it.",
                 spelled(*timeout),
                 destination.display()
             ),
@@ -441,6 +451,28 @@ impl fmt::Display for Cloner<'_> {
             } => write!(formatter, "a Sidekick on the Peer `{peer}` ({fingerprint})"),
         }
     }
+}
+
+/// Logs `refusal` of the Clone of `url` to `destination` for `author`,
+/// where it came of running the Clone, saying nothing of the URL's
+/// credential or Git's words.
+fn logged(refusal: &CloneRefusal, url: &str, destination: &Path, author: &Author) {
+    if let Some(outcome) = refusal.outcome() {
+        tracing::info!(
+            repository_url = %without_credentials(url),
+            destination = %destination.display(),
+            sidekick = %Cloner(author),
+            "a Clone of a Repository URL into a Workspace Root {outcome}"
+        );
+    }
+}
+
+/// A Clone whose clone is whole and naming at `destination`: what settling
+/// it once it lands needs of it.
+struct Landed {
+    url: String,
+    destination: PathBuf,
+    author: Author,
 }
 
 /// A timeout in the plainest whole unit that spells it.
@@ -754,15 +786,17 @@ impl SessionOperations {
     /// Clones the Repository `request` names directly within the Workspace
     /// Root it names, or the only one configured, for the Sidekick `author`
     /// names — this Server's own, or one on a Peer — and answers the
-    /// Workspace made there as this Server's Workspace listing gives it —
-    /// once its Registry entry is written, the Errand deriving its Icon and
-    /// Description is begun, and discovery of the Roots is asked for again.
-    /// Refuses, saying why and having made nothing, where no Root is there to
-    /// take the Clone, where its Root cannot be read, where its name is no
-    /// plain directory name or a hidden one, where it would take the Sidekick
+    /// Workspace made there as this Server's Workspace listing gives it,
+    /// once the Clone is settled (see [`Self::settle_clone`]). Refuses,
+    /// saying why and having made nothing, where no Root is there to take
+    /// the Clone, where its Root cannot be read, where its name is no plain
+    /// directory name or a hidden one, where it would take the Sidekick
     /// Workspace's place — or, for a Sidekick on a Peer, go anywhere within
     /// it — where something stands at its destination already, and where Git
-    /// fails it or it outlasts this Server's bound on one.
+    /// fails it or it outlasts this Server's bound on one. One whose clone is
+    /// whole but still taking its name when that bound passes is refused
+    /// then, saying it may yet land, and is settled all the same once it
+    /// does.
     pub(crate) async fn clone_workspace(
         &self,
         request: &CloneWorkspaceRequest,
@@ -812,8 +846,8 @@ impl SessionOperations {
             return Err(CloneRefusal::Unsupported { reason });
         }
         // No scan enters the clone as discovered between its taking its name
-        // and the Clone entering it as Cloned.
-        let landing = self.root_discovery.landing(&destination);
+        // and its settling entering it as Cloned.
+        let held = self.root_discovery.landing(&destination);
         let cloned = self
             .source_control
             .clone_repository(
@@ -823,81 +857,184 @@ impl SessionOperations {
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await;
-        let known = match cloned {
-            Ok(known) => known,
+        let landing = match cloned {
+            Ok(landing) => landing,
             Err(failure) => {
-                let refusal = match failure {
-                    CloneFailure::Occupied => self.occupied(destination.clone(), deadline).await,
-                    CloneFailure::Failed(said) => CloneRefusal::Failed {
-                        url: url.to_owned(),
-                        destination: destination.clone(),
-                        said,
-                    },
-                    CloneFailure::LeftBehind(said) => CloneRefusal::LeftBehind {
-                        url: url.to_owned(),
-                        destination: destination.clone(),
-                        said,
-                    },
-                    CloneFailure::TimedOut => CloneRefusal::TimedOut {
-                        url: url.to_owned(),
-                        destination: Some(destination.clone()),
-                        timeout: self.cloning.timeout,
-                    },
-                    CloneFailure::StillLanding => CloneRefusal::StillLanding {
-                        url: url.to_owned(),
-                        destination: destination.clone(),
-                        timeout: self.cloning.timeout,
-                    },
-                };
-                if let Some(outcome) = refusal.outcome() {
-                    tracing::info!(
-                        repository_url = %without_credentials(url),
-                        destination = %destination.display(),
-                        sidekick = %Cloner(author),
-                        "a Clone of a Repository URL into a Workspace Root {outcome}"
-                    );
-                }
-                return Err(refusal);
+                return Err(self
+                    .clone_failed(failure, url, &destination, author, deadline)
+                    .await);
             }
         };
-        let source_control = self.source_control.clone();
-        let reading = destination.clone();
-        let workspace = landed(
-            &self.cloning.reads,
-            &destination,
-            known,
-            LANDED_READ_WITHIN,
-            move || async move { source_control.read_unremembered(&reading).await },
-        )
-        .await;
-        let workspace = self.sessions.enter_cloned(&workspace, &destination);
-        drop(landing);
-        // A Sidekick on a Peer has no Session here: its Clone's Errand runs
-        // at the Agent a Session it began here naming none would run at.
-        let provider = match author.sidekick_session() {
-            Some(sidekick) => self.sessions.provider(sidekick),
-            None => self.landing_selection().map(|selection| selection.provider),
+        let (landed, landed_in_time) = oneshot::channel();
+        let settling = self.settle_clone(
+            landing,
+            landed,
+            held,
+            Landed {
+                url: url.to_owned(),
+                destination: destination.clone(),
+                author: author.clone(),
+            },
+        );
+        // Landed, or not to land: the settling answers which. Still landing
+        // at the deadline: refused now, and settled all the same.
+        if tokio::time::timeout_at(deadline, landed_in_time)
+            .await
+            .is_err()
+        {
+            let refusal = CloneRefusal::StillLanding {
+                url: url.to_owned(),
+                destination: destination.clone(),
+                timeout: self.cloning.timeout,
+            };
+            logged(&refusal, url, &destination, author);
+            return Err(refusal);
+        }
+        let settled = match settling.await {
+            Ok(settled) => settled,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            // Only a runtime going away cancels it.
+            Err(_) => {
+                return Err(CloneRefusal::Stopped {
+                    url: url.to_owned(),
+                });
+            }
         };
-        self.derivation.derive_cloned_workspace(
-            Cloner(author),
-            provider,
-            &workspace,
-            destination.clone(),
-        );
-        self.rediscover_after_clone().await;
-        tracing::info!(
-            repository_url = %without_credentials(url),
-            destination = %destination.display(),
-            workspace_id = %workspace.id.0,
-            sidekick = %Cloner(author),
-            "a Sidekick Cloned a Repository URL into a Workspace Root"
-        );
-        Ok(self
-            .registered_workspace_listing()
-            .workspaces
-            .into_iter()
-            .find(|listed| listed.id == workspace.id)
-            .unwrap_or(workspace))
+        match settled {
+            Ok(workspace) => Ok(self
+                .registered_workspace_listing()
+                .workspaces
+                .into_iter()
+                .find(|listed| listed.id == workspace.id)
+                .unwrap_or(workspace)),
+            Err(failure) => Err(self
+                .clone_failed(failure, url, &destination, author, deadline)
+                .await),
+        }
+    }
+
+    /// Settles the Clone whose whole clone `landing` is naming at its
+    /// destination, as `clone` describes it, on a task of its own, so it is
+    /// settled whenever the clone lands, whether or not whoever asked for
+    /// the Clone is still waiting: counted among the Clones run apart, so a
+    /// stopping Server waits on it a while before it lets go. Once the clone
+    /// has landed — said on `landed` — its Workspace is read apart, within a
+    /// bound of its own, and entered in the Workspace Registry as Cloned —
+    /// as read, or as the Clone knew it where the reading does not answer in
+    /// time — and `held`, which kept every scan of the Roots from taking it
+    /// for discovered meanwhile, is let go; the Errand deriving its Icon and
+    /// Description is begun, as the first Session begun there would begin
+    /// it; the Roots are discovered afresh, unless this Server has begun to
+    /// stop; and the Log records what was Cloned where, the URL's credential
+    /// aside. Answers the Workspace entered, or why the clone could not land.
+    fn settle_clone(
+        &self,
+        landing: CloneLanding,
+        landed: oneshot::Sender<()>,
+        held: root_discovery::Landing,
+        clone: Landed,
+    ) -> tokio::task::JoinHandle<Result<Workspace, CloneFailure>> {
+        let settling = self.cloning.detached.begin();
+        let operations = self.clone();
+        tokio::spawn(async move {
+            let _settling = settling;
+            let Landed {
+                url,
+                destination,
+                author,
+            } = clone;
+            let known = match landing.await {
+                Ok(known) => known,
+                Err(failure) => {
+                    if landed.is_closed() {
+                        tracing::info!(
+                            repository_url = %without_credentials(&url),
+                            destination = %destination.display(),
+                            sidekick = %Cloner(&author),
+                            "a Clone of a Repository URL into a Workspace Root that was still \
+                             landing when its time ran out could not land"
+                        );
+                    }
+                    return Err(failure);
+                }
+            };
+            let _ = landed.send(());
+            let source_control = operations.source_control.clone();
+            let reading = destination.clone();
+            let workspace = self::landed(
+                &operations.cloning.reads,
+                &destination,
+                known,
+                LANDED_READ_WITHIN,
+                move || async move { source_control.read_unremembered(&reading).await },
+            )
+            .await;
+            let workspace = operations.sessions.enter_cloned(&workspace, &destination);
+            drop(held);
+            // A Sidekick on a Peer has no Session here: its Clone's Errand
+            // runs at the Agent a Session it began here naming none would
+            // run at.
+            let provider = match author.sidekick_session() {
+                Some(sidekick) => operations.sessions.provider(sidekick),
+                None => operations
+                    .landing_selection()
+                    .map(|selection| selection.provider),
+            };
+            operations.derivation.derive_cloned_workspace(
+                Cloner(&author),
+                provider,
+                &workspace,
+                destination.clone(),
+            );
+            let mut stopping = operations.cloning.detached.stopping.clone();
+            tokio::select! {
+                biased;
+                () = crate::provider::wait_for_shutdown(&mut stopping) => {}
+                () = operations.rediscover_after_clone() => {}
+            }
+            tracing::info!(
+                repository_url = %without_credentials(&url),
+                destination = %destination.display(),
+                workspace_id = %workspace.id.0,
+                sidekick = %Cloner(&author),
+                "a Sidekick Cloned a Repository URL into a Workspace Root"
+            );
+            Ok(workspace)
+        })
+    }
+
+    /// The refusal of the Clone of `url` to `destination` for `author` that
+    /// failed as `failure`, logged where it came of running the Clone. What
+    /// stands at the destination, where something does, is read no later
+    /// than `deadline`.
+    async fn clone_failed(
+        &self,
+        failure: CloneFailure,
+        url: &str,
+        destination: &Path,
+        author: &Author,
+        deadline: tokio::time::Instant,
+    ) -> CloneRefusal {
+        let refusal = match failure {
+            CloneFailure::Occupied => self.occupied(destination.to_owned(), deadline).await,
+            CloneFailure::Failed(said) => CloneRefusal::Failed {
+                url: url.to_owned(),
+                destination: destination.to_owned(),
+                said,
+            },
+            CloneFailure::LeftBehind(said) => CloneRefusal::LeftBehind {
+                url: url.to_owned(),
+                destination: destination.to_owned(),
+                said,
+            },
+            CloneFailure::TimedOut => CloneRefusal::TimedOut {
+                url: url.to_owned(),
+                destination: Some(destination.to_owned()),
+                timeout: self.cloning.timeout,
+            },
+        };
+        logged(&refusal, url, destination, author);
+        refusal
     }
 
     /// Clones as [`Self::clone_workspace`] does, for the Sidekick on a Peer
@@ -907,8 +1044,8 @@ impl SessionOperations {
     /// abandoned Clone is stopped: Git ends, and what it began is removed on
     /// its own, among what every Clone leaves to see through, which the
     /// stopping Server waits on; a clone already whole may land all the
-    /// same, to be found as discovery finds one. A Clone asked for once the
-    /// stop has begun is stopped before it begins.
+    /// same, and is settled as every Clone that lands is. A Clone asked for
+    /// once the stop has begun is stopped before it begins.
     pub(crate) async fn clone_workspace_detached(
         &self,
         request: CloneWorkspaceRequest,

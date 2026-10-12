@@ -435,7 +435,7 @@ impl SourceControl for DelayedAvailableObservation {
         branch: Option<&str>,
         timeout: std::time::Duration,
         staging: &suru::source_control::CloneStaging,
-    ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
+    ) -> Result<suru::source_control::CloneLanding, suru::source_control::CloneFailure> {
         self.git
             .clone_repository(url, destination, branch, timeout, staging)
             .await
@@ -509,7 +509,7 @@ impl SourceControl for ObservationDuringRemoval {
         branch: Option<&str>,
         timeout: std::time::Duration,
         staging: &suru::source_control::CloneStaging,
-    ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
+    ) -> Result<suru::source_control::CloneLanding, suru::source_control::CloneFailure> {
         self.git
             .clone_repository(url, destination, branch, timeout, staging)
             .await
@@ -1004,7 +1004,7 @@ impl SourceControl for PauseEagerRemoval {
         branch: Option<&str>,
         timeout: std::time::Duration,
         staging: &suru::source_control::CloneStaging,
-    ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
+    ) -> Result<suru::source_control::CloneLanding, suru::source_control::CloneFailure> {
         self.git
             .clone_repository(url, destination, branch, timeout, staging)
             .await
@@ -1066,7 +1066,7 @@ impl SourceControl for CountReclaimCandidates {
         branch: Option<&str>,
         timeout: std::time::Duration,
         staging: &suru::source_control::CloneStaging,
-    ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
+    ) -> Result<suru::source_control::CloneLanding, suru::source_control::CloneFailure> {
         self.git
             .clone_repository(url, destination, branch, timeout, staging)
             .await
@@ -1125,7 +1125,7 @@ impl SourceControl for PauseAfterCandidateObservation {
         branch: Option<&str>,
         timeout: std::time::Duration,
         staging: &suru::source_control::CloneStaging,
-    ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
+    ) -> Result<suru::source_control::CloneLanding, suru::source_control::CloneFailure> {
         self.git
             .clone_repository(url, destination, branch, timeout, staging)
             .await
@@ -1918,7 +1918,7 @@ impl SourceControl for SilentDirectory {
         branch: Option<&str>,
         timeout: std::time::Duration,
         staging: &suru::source_control::CloneStaging,
-    ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
+    ) -> Result<suru::source_control::CloneLanding, suru::source_control::CloneFailure> {
         self.git
             .clone_repository(url, destination, branch, timeout, staging)
             .await
@@ -2363,7 +2363,7 @@ impl SourceControl for FailFirstPreparationRetirement {
         branch: Option<&str>,
         timeout: std::time::Duration,
         staging: &suru::source_control::CloneStaging,
-    ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
+    ) -> Result<suru::source_control::CloneLanding, suru::source_control::CloneFailure> {
         self.git
             .clone_repository(url, destination, branch, timeout, staging)
             .await
@@ -2433,7 +2433,7 @@ impl SourceControl for FailFirstReclaim {
         branch: Option<&str>,
         timeout: std::time::Duration,
         staging: &suru::source_control::CloneStaging,
-    ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
+    ) -> Result<suru::source_control::CloneLanding, suru::source_control::CloneFailure> {
         self.git
             .clone_repository(url, destination, branch, timeout, staging)
             .await

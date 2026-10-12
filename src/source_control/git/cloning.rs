@@ -20,15 +20,16 @@
 //! anything — another Clone of the same name among it — so a Root never
 //! holds a half-made Workspace, even while one is being made.
 //!
-//! The Clone's timeout bounds the call. Once Git has made the clone whole,
+//! The Clone's timeout bounds making the clone. Once Git has made it whole,
 //! one task sees naming it through, or — where it cannot be named —
 //! removing it, and nothing else touches it meanwhile, whatever becomes of
-//! whoever awaited the Clone; a call whose timeout passes before it is done
-//! answers that the clone may yet land. What a Clone that fails leaves is
-//! removed before it answers, as long as its deadline allows; what one
-//! stopped at its deadline, or abandoned while Git ran, leaves is removed on
-//! its own. All a Server run's Clones have under way on their own is
-//! counted, so a stopping Server waits on it a while before it lets go.
+//! whoever awaited the Clone: the Clone answers at once with that landing,
+//! for whoever asked for it to wait on as long as they choose. What a Clone
+//! that fails leaves is removed before it answers, as long as its deadline
+//! allows; what one stopped at its deadline, or abandoned while Git ran,
+//! leaves is removed on its own. All a Server run's Clones have under way
+//! on their own is counted, so a stopping Server waits on it a while before
+//! it lets go.
 use std::{
     io::{Read as _, Write as _},
     sync::Arc,
@@ -37,7 +38,7 @@ use std::{
 use fs2::FileExt as _;
 
 use super::*;
-use crate::source_control::{CloneFailure, CloneStaging, StagingRecord};
+use crate::source_control::{CloneFailure, CloneLanding, CloneStaging, StagingRecord};
 
 /// How many more times removing or naming what a Clone made is tried once it
 /// has failed, and how long apart: a Git stopped at its deadline may still be
@@ -149,7 +150,7 @@ impl GitSourceControl {
         branch: Option<&str>,
         timeout: Duration,
         staging: &CloneStaging,
-    ) -> Result<Workspace, CloneFailure> {
+    ) -> Result<CloneLanding, CloneFailure> {
         let deadline = tokio::time::Instant::now() + timeout;
         let (Some(parent), Some(name)) = (
             destination.parent(),
@@ -192,24 +193,23 @@ impl GitSourceControl {
         let failure = match self.run(parent, &args, left, None, &environment).await {
             Ok(output) if output.status.success() => {
                 // Whole now: named, or removed where it cannot be, by a task
-                // of its own that nothing cuts short, which the call waits on
-                // no longer than its deadline.
+                // of its own that nothing cuts short, whose landing is the
+                // answer.
                 let underway = self.cloning.landings.begin();
                 let rename = self.cloning.rename.clone();
-                let landing = tokio::spawn({
-                    let destination = destination.to_owned();
-                    async move {
-                        let _underway = underway;
-                        staged.land(destination, rename).await
-                    }
+                let destination = destination.to_owned();
+                let landing = tokio::spawn(async move {
+                    let _underway = underway;
+                    staged.land(destination.clone(), rename).await?;
+                    Ok(cloned_workspace(&destination))
                 });
-                return match tokio::time::timeout_at(deadline, landing).await {
-                    Ok(Ok(landed)) => landed.map(|()| cloned_workspace(destination)),
-                    Ok(Err(error)) => Err(CloneFailure::Failed(format!(
-                        "Giving the clone its name failed: {error}"
-                    ))),
-                    Err(_) => Err(CloneFailure::StillLanding),
-                };
+                return Ok(CloneLanding::new(async move {
+                    landing.await.unwrap_or_else(|error| {
+                        Err(CloneFailure::Failed(format!(
+                            "Giving the clone its name failed: {error}"
+                        )))
+                    })
+                }));
             }
             Ok(output) => CloneFailure::Failed(said(&output)),
             // What Git began goes with its staging, removed on its own, so
@@ -1715,14 +1715,15 @@ mod tests {
         assert!(to.join("README.md").exists() && !from.exists());
     }
 
-    /// A Clone whose deadline passes while its whole clone is still taking
-    /// its name — a rename held up, as a slow filesystem holds one — answers
-    /// at its deadline that the clone may yet land, rather than holding the
-    /// call past its bound; the owner sees the naming through meanwhile,
-    /// touching nothing, and lands the clone once the rename goes on, which
-    /// settling the Clones waits for.
+    /// A Clone answers once its clone is whole, with its landing, rather
+    /// than waiting on the clone to take its name — a rename held up, as a
+    /// slow filesystem holds one, holds no one — and the owner sees the
+    /// naming through meanwhile, touching nothing, the staging recorded all
+    /// the while; once the rename goes on the clone lands whole, the landing
+    /// comes to the Workspace made there, and its staging is removed and
+    /// forgotten. Settling the Clones waits for all of it.
     #[tokio::test]
-    async fn a_clone_still_landing_at_its_deadline_says_so_and_lands_after() {
+    async fn a_whole_clone_is_answered_at_once_and_landed_by_its_owner() {
         let temporary = tempfile::tempdir().unwrap();
         let root = crate::paths::canonical(temporary.path()).unwrap();
         let origin = origin(&root);
@@ -1732,33 +1733,22 @@ mod tests {
         let (holding, rename) = held(rename_new);
         let adapter = Arc::new(renaming(rename));
         let run = run_named("this run");
-        // Ample for Git to clone a Repository of one commit from beside it.
-        let timeout = Duration::from_secs(2);
-        let started = tokio::time::Instant::now();
-        let cloning = tokio::spawn({
-            let (adapter, destination, run) = (adapter.clone(), destination.clone(), run.clone());
-            let origin = origin.to_str().unwrap().to_owned();
-            async move {
-                GitSourceControl::clone_into(&adapter, &origin, &destination, None, timeout, &run)
-                    .await
-            }
-        });
-        holding.begun().await;
 
-        assert!(
-            matches!(
-                tokio::time::timeout(SURELY, cloning)
-                    .await
-                    .expect("the Clone answers")
-                    .unwrap(),
-                Err(CloneFailure::StillLanding)
+        let landing = tokio::time::timeout(
+            SURELY,
+            GitSourceControl::clone_into(
+                &adapter,
+                origin.to_str().unwrap(),
+                &destination,
+                None,
+                SURELY,
+                &run,
             ),
-            "the Clone answers that its clone may yet land"
-        );
-        assert!(
-            started.elapsed() < timeout + Duration::from_secs(1),
-            "and answers at its deadline"
-        );
+        )
+        .await
+        .expect("the Clone answers once its clone is whole")
+        .expect("the clone is whole");
+        holding.begun().await;
         let staging = staging_within(&projects);
         assert_eq!(staging.len(), 1, "the whole clone waits to take its name");
         assert!(staging[0].join(CLONED).join("README.md").exists());
@@ -1784,6 +1774,12 @@ mod tests {
             "the Clones are not settled while one is still landing"
         );
         holding.release.send(()).unwrap();
+        let landed = tokio::time::timeout(SURELY, landing)
+            .await
+            .expect("the landing comes to what it lands")
+            .expect("the clone lands");
+        assert_eq!(landed.path, destination);
+        assert_eq!(landed.id, cloned_workspace(&destination).id);
         tokio::time::timeout(SURELY, settling)
             .await
             .expect("the Clones settle once it has landed")
@@ -1791,10 +1787,10 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(destination.join("README.md")).unwrap(),
             "# atlas\n",
-            "the owner landed the clone whole after the Clone answered"
+            "the owner landed the clone whole"
         );
         assert!(staging_within(&projects).is_empty());
-        assert!(recorded(&run).is_empty(), "and forgotten once it is gone");
+        assert!(recorded(&run).is_empty(), "and forgot its staging");
     }
 
     /// A staging directory is recorded and marked as its run's, its marker
@@ -1978,10 +1974,10 @@ mod tests {
         );
     }
 
-    /// A Clone abandoned while its whole clone takes its name — whoever
-    /// awaited it gone — still sees the naming through, removing nothing
-    /// meanwhile; and one whose clone cannot take its name has it removed
-    /// only once the rename has answered.
+    /// A landing let go of while its whole clone takes its name — whoever
+    /// awaited it gone — is still seen through by its owner, which removes
+    /// nothing meanwhile; and one whose clone cannot take its name has it
+    /// removed only once the rename has answered, and comes to saying so.
     #[tokio::test]
     async fn naming_a_clone_is_seen_through_by_one_owner_whatever_becomes_of_its_caller() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1989,31 +1985,17 @@ mod tests {
         let origin = origin(&root);
         let projects = root.join("projects");
         std::fs::create_dir(&projects).unwrap();
+        let run = CloneStaging::in_memory();
 
         let destination = projects.join("atlas");
         let (holding, rename) = held(rename_new);
-        let adapter = Arc::new(renaming(rename));
-        let cloning = tokio::spawn({
-            let (adapter, destination) = (adapter.clone(), destination.clone());
-            let origin = origin.to_str().unwrap().to_owned();
-            async move {
-                GitSourceControl::clone_into(
-                    &adapter,
-                    &origin,
-                    &destination,
-                    None,
-                    SURELY,
-                    &CloneStaging::in_memory(),
-                )
-                .await
-            }
-        });
+        let adapter = renaming(rename);
+        let landing = adapter
+            .clone_into(origin.to_str().unwrap(), &destination, None, SURELY, &run)
+            .await
+            .expect("the clone is whole");
         holding.begun().await;
-        cloning.abort();
-        assert!(
-            cloning.await.is_err(),
-            "whoever awaited the Clone goes away"
-        );
+        drop(landing);
         let staging = staging_within(&projects);
         assert_eq!(staging.len(), 1);
         assert!(
@@ -2027,35 +2009,23 @@ mod tests {
             "# atlas\n",
             "the clone landed whole"
         );
+        all_forgotten(&run).await;
 
         let refused = projects.join("refused");
         let (holding, rename) = held(|_, _| Err(std::io::ErrorKind::AlreadyExists.into()));
-        let adapter = Arc::new(renaming(rename));
-        let cloning = tokio::spawn({
-            let (adapter, refused) = (adapter.clone(), refused.clone());
-            let origin = origin.to_str().unwrap().to_owned();
-            async move {
-                GitSourceControl::clone_into(
-                    &adapter,
-                    &origin,
-                    &refused,
-                    None,
-                    SURELY,
-                    &CloneStaging::in_memory(),
-                )
-                .await
-            }
-        });
+        let adapter = renaming(rename);
+        let landing = adapter
+            .clone_into(origin.to_str().unwrap(), &refused, None, SURELY, &run)
+            .await
+            .expect("the clone is whole");
         holding.begun().await;
         let staging = staging_within(&projects);
         assert_eq!(staging.len(), 1);
         assert!(staging[0].join(CLONED).join("README.md").exists());
         holding.release.send(()).unwrap();
-        assert!(matches!(
-            cloning.await.unwrap(),
-            Err(CloneFailure::Occupied)
-        ));
+        assert!(matches!(landing.await, Err(CloneFailure::Occupied)));
         assert!(staging_within(&projects).is_empty() && !refused.exists());
+        assert!(recorded(&run).is_empty());
     }
 
     #[tokio::test]

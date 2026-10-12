@@ -716,3 +716,93 @@ async fn a_remote_stopping_mid_clone_stops_git_and_removes_what_it_began_before_
         .await
         .expect("shut down the Sidekick's own Server");
 }
+
+/// A Remote that begins to stop while a Clone a Peer's Sidekick asked of it
+/// is whole and still taking its name sees it land before it lets go — the
+/// stop cutting short the Clone run apart for the Peer, but not the clone's
+/// landing — and settles it as every Clone that lands is settled, whether or
+/// not anyone still waits on it: entered in its Workspace Registry as
+/// Cloned, never left for discovery to find.
+#[tokio::test]
+async fn a_remote_stopping_while_a_clone_lands_settles_it_as_cloned_before_it_lets_go() {
+    let mut pair = paired("sidekick-remote-clone-landing", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let (_there, there) = directory();
+    let (_elsewhere, elsewhere) = directory();
+    let origin = bare_repository(&elsewhere, "atlas");
+    name_roots(&remote, &[&there]).await;
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+
+    let atlas = there.join("atlas");
+    let (reached, release) = pair.remote.git.hold_naming_of(&atlas);
+    let cloning = tokio::spawn(async move {
+        sidekick
+            .call_tool(
+                "clone_workspace",
+                json!({ "repository_url": origin, "origin": REMOTE }),
+            )
+            .await
+    });
+    timeout(PROGRESS_DEADLINE, reached)
+        .await
+        .expect("the Remote's clone is whole")
+        .expect("the clone comes to take its name");
+    assert!(!atlas.exists());
+
+    let Paired { own, remote, .. } = pair;
+    let Serving {
+        server,
+        config,
+        _directories,
+        ..
+    } = remote;
+    let serving = server.serving_address().expect("the Remote is Serving");
+    let stopping = tokio::spawn(server.shutdown());
+    // The Remote stops the Clones it runs apart for its Peers as soon as it
+    // no longer Serves them, so the clone lands only once that stop has cut
+    // the Clone short.
+    timeout(PROGRESS_DEADLINE, async {
+        // A port closed on loopback may take a while to refuse a connection,
+        // as on Windows, while one open takes it at once.
+        while matches!(
+            timeout(
+                Duration::from_millis(50),
+                tokio::net::TcpStream::connect(serving)
+            )
+            .await,
+            Ok(Ok(_))
+        ) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the Remote stops Serving");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    release.send(()).expect("let the clone take its name");
+    timeout(PROGRESS_DEADLINE, stopping)
+        .await
+        .expect("the Remote stops")
+        .expect("the stop runs to its end")
+        .expect("shut down the Remote");
+    assert_eq!(
+        std::fs::read_to_string(atlas.join("README.md")).expect("the clone landed whole"),
+        readme("atlas"),
+        "the clone landed before the Remote let go"
+    );
+    assert_eq!(
+        contents(&there),
+        ["atlas"],
+        "nothing staged is left beside it"
+    );
+    assert_eq!(
+        entries_on_disk(&config).remove(&repository_id(&atlas)),
+        Some((Some(atlas.clone()), BY_CLONE.to_owned())),
+        "the Remote settled the Clone that landed as it stopped, entering it as Cloned"
+    );
+
+    cloning.abort();
+    own.shutdown()
+        .await
+        .expect("shut down the Sidekick's own Server");
+}

@@ -969,7 +969,8 @@ fn bare_origin(within: &Path) -> PathBuf {
 const UNREACHED: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Clones `url` into `destination` through `adapter`, as a Server's Clone is
-/// made but recording what it makes in memory alone.
+/// made but recording what it makes in memory alone, and answers what the
+/// Clone comes to once its clone has landed.
 async fn clone_landed(
     adapter: &GitSourceControl,
     url: &str,
@@ -985,6 +986,7 @@ async fn clone_landed(
             timeout,
             &CloneStaging::in_memory(),
         )
+        .await?
         .await
 }
 
