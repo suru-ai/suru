@@ -495,7 +495,7 @@ impl SessionOperations {
         };
         let (destination, occupied) = placed?;
         if occupied {
-            return Err(self.occupied(destination).await);
+            return Err(self.occupied(destination, deadline).await);
         }
         if let SourceControlCapability::Unsupported { reason } =
             self.source_control.clone_capability()
@@ -515,7 +515,7 @@ impl SessionOperations {
             Ok(cloned) => cloned,
             Err(failure) => {
                 let refusal = match failure {
-                    CloneFailure::Occupied => self.occupied(destination.clone()).await,
+                    CloneFailure::Occupied => self.occupied(destination.clone(), deadline).await,
                     CloneFailure::Failed(said) => CloneRefusal::Failed {
                         url: url.to_owned(),
                         destination: destination.clone(),
@@ -570,8 +570,9 @@ impl SessionOperations {
     /// stands: naming the Workspace there where it is one — one this
     /// Server's Registry presents there, or one source control finds rooted
     /// there that it has not yet been told of: a Repository presented there,
-    /// or a Worktree of one presented elsewhere.
-    async fn occupied(&self, destination: PathBuf) -> CloneRefusal {
+    /// or a Worktree of one presented elsewhere. Source control is asked no
+    /// later than `deadline`, past which what stands there goes unnamed.
+    async fn occupied(&self, destination: PathBuf, deadline: tokio::time::Instant) -> CloneRefusal {
         let registered = self
             .sessions
             .listed_workspaces()
@@ -580,7 +581,13 @@ impl SessionOperations {
             .map(|workspace| workspace.id);
         let workspace = match registered {
             Some(workspace) => Some(workspace),
-            None => self.source_control.workspace_rooted_at(&destination).await,
+            None => tokio::time::timeout_at(
+                deadline,
+                self.source_control.workspace_rooted_at(&destination),
+            )
+            .await
+            .ok()
+            .flatten(),
         };
         CloneRefusal::Occupied {
             destination,
