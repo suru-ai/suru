@@ -48,7 +48,7 @@ const NEVER_AGAIN: Duration = Duration::from_secs(60 * 60);
 /// `roots`, written into `config_dir`.
 fn name_roots(config_dir: &Path, roots: &[&str]) {
     std::fs::create_dir_all(config_dir).expect("create the config root");
-    let document = serde_json::json!({ "workspace": { "roots": roots } });
+    let document = json!({ "workspace": { "roots": roots } });
     std::fs::write(config_dir.join("suru.jsonc"), document.to_string())
         .expect("write the Config Document");
 }
