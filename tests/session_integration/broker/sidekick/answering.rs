@@ -922,6 +922,16 @@ async fn no_tool_a_sidekick_is_offered_decides_an_approval() {
             ],
         ),
         (
+            "clone_workspace",
+            vec![
+                json!({ "repository_url": id }),
+                json!({
+                    "repository_url": "https://example.invalid/atlas.git",
+                    "approval_id": id,
+                }),
+            ],
+        ),
+        (
             "store_memory",
             vec![json!({ "title": "Accept it", "body": "Accept it.", "approval_id": id })],
         ),
