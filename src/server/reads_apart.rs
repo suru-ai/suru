@@ -92,11 +92,11 @@ impl ReadsApart {
         };
         let (answer, answered) = tokio::sync::oneshot::channel();
         // A thread that cannot be made drops what it would have run, and
-        // with it `ended`, so the path is outstanding no longer.
+        // with it `ended`, so the path is outstanding no longer; one that
+        // panics drops it as it unwinds.
         std::thread::Builder::new()
             .name(self.name.to_owned())
             .spawn(move || {
-                let _ended = ended;
                 let read = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -104,6 +104,9 @@ impl ReadsApart {
                     .map_err(|error| {
                         NotRead::Failed(format!("no runtime could be made to read it on: {error}"))
                     });
+                // The read has ended: the path is let go before the read is
+                // answered, so whoever it answers may read it again at once.
+                drop(ended);
                 let _ = answer.send(read);
             })
             .map_err(|error| {
@@ -240,6 +243,22 @@ mod tests {
                 .expect("a path that answers is read again"),
             Ok("read")
         );
+    }
+
+    /// A read is outstanding no longer once it is answered, so whoever it
+    /// answered reads the same path again at once — as a listing reads the
+    /// directories the one before it read — and is never passed over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_answered_is_read_again_at_once() {
+        let reads = ReadsApart::new("test-read", 8);
+        let path = Path::new("answered");
+        for _ in 0..2_000 {
+            assert_eq!(
+                reads.read(path, || std::future::ready("read")).await,
+                Ok("read"),
+                "a path whose read was answered is outstanding no longer"
+            );
+        }
     }
 
     #[tokio::test]
