@@ -32,6 +32,11 @@ use crate::protocol::{Session, Workspace, WorkspaceId};
 /// The directory beneath the data root that the Sidekick Workspace is.
 const DIRECTORY: &str = "sidekick";
 
+/// How many symlinks one after another a relocation of the Sidekick
+/// Workspace is followed through before it is taken to lead nowhere, as a
+/// platform gives up on a path leading through as many.
+const RELOCATION_HOPS: usize = 40;
+
 /// The Icon the Sidekick Workspace is named beside wherever it has none of
 /// its own: a standing default rather than a stored one, so it is never
 /// derived and a user's own choice still replaces it.
@@ -90,28 +95,73 @@ impl SidekickWorkspace {
     /// Whether `destination` — a directory whose parent is read
     /// canonically, though it need not be there itself — is where the
     /// Sidekick Workspace is kept, or would be made: its very directory, read
-    /// canonically where something stands there, or an entry directly
-    /// beneath the data root named as it is in any case. A filesystem that
-    /// does not tell case apart — Windows' and macOS's, as they come — takes
-    /// such a name for the Sidekick Workspace's own, and one that composes
-    /// characters may take the Kelvin sign for `K`, which leaves only case
-    /// between it and `k`; so a name is read in any case on every platform,
-    /// and nothing named so is taken for any other directory. Reads the
-    /// filesystem, so a caller that must not wait on it reads it apart.
+    /// canonically where something stands there; its entry directly beneath
+    /// the data root; or, where the user relocated it by a symlink to a place
+    /// nothing is at yet, that place (see [`Self::relocated_to`]). A
+    /// filesystem that does not tell case apart — Windows' and macOS's, as
+    /// they come — takes another case of a name for the same one, and one
+    /// that composes characters may take the Kelvin sign for `K`, which
+    /// leaves only case between it and `k`; so a name is read in any case on
+    /// every platform, and nothing named so is taken for any other
+    /// directory. Reads the filesystem, so a caller that must not wait on it
+    /// reads it apart.
     pub(crate) fn is_kept_at(&self, destination: &Path) -> bool {
-        let named_so = destination.parent() == Some(self.data_root.as_path())
-            && destination
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| in_any_case(name) == DIRECTORY);
-        named_so || crate::paths::canonical(destination).is_ok_and(|read| read == self.directory())
+        is_named_as(destination, &self.root)
+            || crate::paths::canonical(destination).is_ok_and(|read| read == self.directory())
+            || self
+                .relocated_to()
+                .is_some_and(|place| is_named_as(destination, &place))
     }
 
     /// Whether `path`, read canonically, lies within the Sidekick
-    /// Workspace's directory. Reads the filesystem, as [`Self::is_kept_at`]
+    /// Workspace's directory, or within the place it was relocated to where
+    /// nothing is there yet. Reads the filesystem, as [`Self::is_kept_at`]
     /// does.
     pub(crate) fn encloses(&self, path: &Path) -> bool {
         path.starts_with(self.directory())
+            || self
+                .relocated_to()
+                .is_some_and(|place| path.starts_with(place))
+    }
+
+    /// Where the Sidekick Workspace would appear, where its entry beneath
+    /// the data root is a symlink — the user's relocation of it — leading to
+    /// nothing there yet: the place it leads to, its parent read
+    /// canonically and its last part as the link spells it, followed
+    /// through each further symlink standing there; or, where a place's
+    /// parent cannot be read at all, the place as the link spells it, which
+    /// only that very spelling can make. `None` where the entry is no
+    /// symlink, or leads somewhere there, which [`Self::directory`] reads.
+    /// Each link is read as a link, never through, so one leading nowhere is
+    /// read too.
+    fn relocated_to(&self) -> Option<PathBuf> {
+        let mut entry = self.root.clone();
+        for _ in 0..RELOCATION_HOPS {
+            if !std::fs::symlink_metadata(&entry)
+                .ok()?
+                .file_type()
+                .is_symlink()
+            {
+                return None;
+            }
+            // A relative link leads from the directory it stands in.
+            let leads_to = entry.parent()?.join(std::fs::read_link(&entry).ok()?);
+            if crate::paths::canonical(&leads_to).is_ok() {
+                return None;
+            }
+            let (Some(parent), Some(name)) = (leads_to.parent(), leads_to.file_name()) else {
+                return Some(leads_to);
+            };
+            let Ok(parent) = crate::paths::canonical(parent) else {
+                return Some(leads_to);
+            };
+            let place = parent.join(name);
+            if !std::fs::symlink_metadata(&place).is_ok_and(|read| read.file_type().is_symlink()) {
+                return Some(place);
+            }
+            entry = place;
+        }
+        None
     }
 
     /// Whether `workspace` is the Sidekick Workspace.
@@ -130,6 +180,19 @@ impl SidekickWorkspace {
     pub(crate) fn is_sidekicks(&self, session: &Session) -> bool {
         !session.is_subagent() && self.holds(&session.workspace)
     }
+}
+
+/// Whether `destination` names the very entry `place` does: within the same
+/// parent, by a name alike in any case.
+fn is_named_as(destination: &Path, place: &Path) -> bool {
+    destination.parent() == place.parent()
+        && match (destination.file_name(), place.file_name()) {
+            (Some(named), Some(placed)) => match (named.to_str(), placed.to_str()) {
+                (Some(named), Some(placed)) => in_any_case(named) == in_any_case(placed),
+                _ => named == placed,
+            },
+            _ => false,
+        }
 }
 
 /// `name` as it reads in any case: upper-cased, then lower-cased, so a
@@ -185,6 +248,66 @@ mod tests {
     #[test]
     fn the_sidekick_workspaces_icon_is_one_the_icon_catalog_carries() {
         assert!(crate::icon_catalog::glyph(ICON).is_some());
+    }
+
+    /// A Sidekick Workspace relocated by a symlink to a place not there yet
+    /// is kept at that place — in any case, followed through further
+    /// symlinks, however relative each is — so nothing made there becomes
+    /// it, and what lies within it once it is there is enclosed by it; where
+    /// even the place's parent cannot be read, only the very spelling the
+    /// link gives is taken for it. Windows is left out: making a symlink
+    /// there takes a privilege a test cannot count on, though links are read
+    /// there alike.
+    #[cfg(unix)]
+    #[test]
+    fn a_sidekick_workspace_relocated_to_nothing_yet_is_kept_where_its_symlink_leads() {
+        use std::os::unix::fs::symlink;
+
+        let data = tempfile::tempdir().expect("create a data root");
+        let sidekick = SidekickWorkspace::beside(data.path()).expect("read the data root");
+        let entry = crate::paths::canonical(data.path())
+            .expect("read the data root")
+            .join("sidekick");
+        let elsewhere = tempfile::tempdir().expect("create a directory elsewhere");
+        let projects = crate::paths::canonical(elsewhere.path()).expect("read the directory");
+        let relocate = |to: &Path| {
+            let _ = std::fs::remove_file(&entry);
+            symlink(to, &entry).expect("relocate the Sidekick Workspace");
+        };
+
+        relocate(&projects.join("helper"));
+        for name in ["helper", "HELPER"] {
+            assert!(sidekick.is_kept_at(&projects.join(name)), "{name:?}");
+        }
+        assert!(!sidekick.is_kept_at(&projects.join("atlas")));
+        assert!(!sidekick.encloses(&projects.join("atlas")));
+
+        std::fs::create_dir(projects.join("archive")).expect("create a directory");
+        symlink("archive/kept", projects.join("link")).expect("link onward");
+        relocate(&projects.join("link"));
+        assert!(
+            sidekick.is_kept_at(&projects.join("archive").join("kept")),
+            "followed through a further, relative, symlink"
+        );
+
+        relocate(Path::new("relocated"));
+        assert!(
+            sidekick.is_kept_at(&entry.with_file_name("relocated")),
+            "a relative link leads from the data root"
+        );
+
+        let unreadable = projects.join("gone").join("helper");
+        relocate(&unreadable);
+        assert!(
+            sidekick.is_kept_at(&unreadable),
+            "where the place cannot be read, the very spelling the link gives"
+        );
+        assert!(!sidekick.is_kept_at(&projects.join("helper")));
+
+        relocate(&projects.join("helper"));
+        std::fs::create_dir(projects.join("helper")).expect("make the place");
+        assert!(sidekick.is_kept_at(&projects.join("helper")));
+        assert!(sidekick.encloses(&projects.join("helper").join("atlas")));
     }
 
     #[test]

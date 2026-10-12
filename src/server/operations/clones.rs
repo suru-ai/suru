@@ -9,8 +9,9 @@
 //! Nor does any Clone take the place the Sidekick Workspace is kept in,
 //! which stays outside source control, however the case of its name is
 //! spelled — a filesystem that does not tell case apart takes any spelling
-//! for that very directory, made or yet to be — judged as the Root is read,
-//! within the Clone's deadline.
+//! for that very directory, made or yet to be — nor the place a symlink its
+//! user relocated it by leads to before anything is there; judged as the
+//! Root is read, within the Clone's deadline.
 //!
 //! The Clone itself is source control's ([`SourceControlService::clone_repository`]),
 //! bounded by this Server's own timeout, and leaves nothing behind where it

@@ -410,6 +410,58 @@ async fn a_remote_takes_no_clone_where_its_sidekick_workspace_would_be_made_howe
     pair.shutdown().await;
 }
 
+/// A Remote whose Sidekick Workspace its user relocated by a symlink to a
+/// place not there yet — a directory since moved, say — takes no Clone at
+/// that place, in whatever case it is spelled, though it lies within one of
+/// its Roots: the next Sidekick there would work in what a Peer's Sidekick
+/// filled it with. A Clone anywhere else in the Root goes ahead. Windows is
+/// left out: making a symlink there takes a privilege a test cannot count
+/// on, though links are read there alike.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_remote_takes_no_clone_where_its_relocated_sidekick_workspace_would_appear() {
+    let mut pair = paired("sidekick-remote-clone-relocated", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let data = suru::paths::canonical(pair.remote.config.data_dir())
+        .expect("read the Remote's data directory canonically");
+    let (_there, there) = directory();
+    let (_elsewhere, elsewhere) = directory();
+    let origin = bare_repository(&elsewhere, "atlas");
+    std::os::unix::fs::symlink(there.join("helper"), data.join("sidekick"))
+        .expect("relocate the Remote's Sidekick Workspace");
+    name_roots(&remote, &[&there]).await;
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+
+    for name in ["helper", "HELPER"] {
+        assert_eq!(
+            refused(
+                &mut sidekick,
+                "clone_workspace",
+                json!({ "repository_url": origin, "origin": REMOTE, "name": name }),
+            )
+            .await,
+            format!(
+                "The Remote `{REMOTE}` refused it: `{}` is where the Sidekick Workspace is kept, \
+                 in whatever case its name is spelled, and no Clone may take its place, so \
+                 nothing was cloned; give another `name`.",
+                spelled(&there.join(name))
+            ),
+            "{name:?} names where the relocated Sidekick Workspace would appear"
+        );
+    }
+    assert!(contents(&there).is_empty(), "nothing is cloned there");
+    acted(
+        &mut sidekick,
+        "clone_workspace",
+        json!({ "repository_url": origin, "origin": REMOTE }),
+    )
+    .await;
+    assert_eq!(contents(&there), ["atlas"], "a Clone elsewhere goes ahead");
+
+    pair.shutdown().await;
+}
+
 /// A Clone on a Remote that cannot be reached is refused saying so; on one
 /// speaking a version of the protocol without the Clone, saying it does not
 /// understand one. Either way nothing was cloned there, and nothing is kept
