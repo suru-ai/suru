@@ -13,7 +13,10 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -575,17 +578,20 @@ impl Drop for OpensOnDrop {
 
 /// Stands in for Git, but for every directory within `stalled`, whose
 /// reading blocks the thread it is read on until the test opens `gate` — as
-/// a filesystem probe of a network mount gone quiet does.
+/// a filesystem probe of a network mount gone quiet does — counting each
+/// such reading begun in `stalled_readings`.
 struct StallsWithin {
     git: GitSourceControl,
     stalled: PathBuf,
     gate: Arc<Gate>,
+    stalled_readings: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
 impl SourceControl for StallsWithin {
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         if directory.starts_with(&self.stalled) {
+            self.stalled_readings.fetch_add(1, Ordering::SeqCst);
             self.gate.wait();
         }
         self.git.discover(directory).await
@@ -596,8 +602,10 @@ impl SourceControl for StallsWithin {
 /// a change of the Roots — taking it away included — nor a listing, past
 /// the Server's bound on waiting for discovery, even where the Server runs
 /// on one thread: each answers, the listing from the Registry as it stands.
-/// The Root named beside it goes on being discovered on its own, a
-/// Repository cloned into it later included.
+/// However often the Roots change, the directory within it that does not
+/// answer is read once while that read is outstanding, rather than once
+/// more for each scan. The Root named beside it goes on being discovered on
+/// its own, a Repository cloned into it later included.
 #[tokio::test(flavor = "current_thread")]
 async fn a_root_whose_reading_stalls_holds_back_no_change_of_the_roots_and_no_listing() {
     const CHANNEL: &str = "workspace-discovery-stalled-root";
@@ -613,6 +621,7 @@ async fn a_root_whose_reading_stalls_holds_back_no_change_of_the_roots_and_no_li
     name_roots(&home.join("config"), &[]);
     let gate = Arc::new(Gate::default());
     let stall = OpensOnDrop(gate.clone());
+    let stalled_readings = Arc::new(AtomicUsize::new(0));
     let server = server::spawn_with_source_control(
         ServerConfig::new(home.join("state"), CHANNEL)
             .expect("configure")
@@ -626,6 +635,7 @@ async fn a_root_whose_reading_stalls_holds_back_no_change_of_the_roots_and_no_li
             git: GitSourceControl::new("git"),
             stalled: stalled.clone(),
             gate,
+            stalled_readings: stalled_readings.clone(),
         }),
     )
     .await
@@ -654,6 +664,24 @@ async fn a_root_whose_reading_stalls_holds_back_no_change_of_the_roots_and_no_li
     .await
     .expect("naming a Root whose reading stalls answers")
     .expect("name the stalled Root beside another");
+    timeout(PROGRESS_DEADLINE, async {
+        while stalled_readings.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the directory within the stalled Root is read");
+    let (stalled_root, projects_root) = (stalled.as_path(), projects.as_path());
+    for roots in [[projects_root, stalled_root], [stalled_root, projects_root]]
+        .iter()
+        .cycle()
+        .take(6)
+    {
+        timeout(PROGRESS_DEADLINE, client.mutate_setting(name(roots)))
+            .await
+            .expect("changing the Roots again answers")
+            .expect("change the Roots again");
+    }
     let listing = timeout(PROGRESS_DEADLINE, listed(&client))
         .await
         .expect("a listing answers while the stalled Root's scan blocks its thread");
@@ -678,6 +706,12 @@ async fn a_root_whose_reading_stalls_holds_back_no_change_of_the_roots_and_no_li
     })
     .await
     .expect("a clone made later in the Root beside the stalled one is discovered too");
+    assert_eq!(
+        stalled_readings.load(Ordering::SeqCst),
+        1,
+        "the directory that does not answer is read once while that read is outstanding, \
+         however often the Roots change"
+    );
 
     timeout(PROGRESS_DEADLINE, client.mutate_setting(name(&[&projects])))
         .await

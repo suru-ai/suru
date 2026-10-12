@@ -21,9 +21,13 @@
 //! a discovered Workspace derives them as it would anywhere.
 //!
 //! Each Root is scanned on its own, on a task of its own, and everything a
-//! scan reads from the filesystem or source control is read on a blocking
-//! thread, so a Root on a mount gone quiet holds up neither the others nor
-//! the Server: nothing that asks for a scan waits on it for longer than
+//! scan reads from the filesystem or source control is read apart, on a
+//! thread of its own (see [`super::reads_apart`]), so a Root on a mount gone
+//! quiet holds up neither the others nor the Server. A directory whose read
+//! has not ended is passed over by every later scan until it does, so it
+//! holds one thread however often the Roots change, and a scan passing it
+//! over goes on to finish. Nothing that asks for a scan waits on it for
+//! longer than
 //! [`super::ServerTimings::root_discovery_wait`], answering from the
 //! Registry as it stands, and a slow scan shows in what is listed later.
 //! Every Root is scanned afresh at start and whenever the Roots change,
@@ -46,6 +50,7 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, future::join_all, stream};
 use tokio::sync::watch;
 
+use super::reads_apart::ReadsApart;
 use crate::{
     protocol::{RepositoryLocation, ResolvedWorkspace, Workspace},
     provider::wait_for_shutdown,
@@ -332,15 +337,24 @@ impl RootDiscovery {
 
 /// The scan the Server runs: every Repository root directly within a Root,
 /// entered in the Registry. The Root is listed, and each child read through
-/// source control, on a blocking thread, so a filesystem that stops
-/// answering holds a thread of the blocking pool rather than one the
-/// Server's tasks run on.
+/// source control, apart (see [`ReadsApart`]), so a filesystem that stops
+/// answering holds a thread of discovery's own rather than one the Server
+/// runs anything else on, and no more of them at once than
+/// [`READS_AT_ONCE`].
 pub(crate) struct RegistryScan {
     sessions: SessionStore,
     source_control: SourceControlService,
     /// The directory a Root beginning with `~` is read beneath.
     home: Option<PathBuf>,
+    reads: ReadsApart,
 }
+
+/// The most reads of Roots and of the directories within them outstanding
+/// at once, across every Root: room for several Roots scanned together,
+/// each reading [`CONCURRENT_READINGS`] directories at a time, while
+/// directories that never answer hold no more threads than this. A read
+/// past it is passed over until a later scan.
+const READS_AT_ONCE: usize = 64;
 
 impl RegistryScan {
     pub(crate) fn new(
@@ -352,6 +366,7 @@ impl RegistryScan {
             sessions,
             source_control,
             home,
+            reads: ReadsApart::new("suru-root-discovery-read", READS_AT_ONCE),
         }
     }
 }
@@ -371,41 +386,55 @@ impl RootScan for RegistryScan {
             );
             return;
         };
-        let children =
-            match tokio::task::spawn_blocking(move || child_directories(&directory)).await {
-                Ok(Ok(children)) => children,
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        root,
-                        %error,
-                        "a Workspace Root could not be read, so nothing within it was discovered"
-                    );
-                    return;
-                }
-                Err(error) => {
-                    tracing::error!(root, %error, "reading a Workspace Root did not finish");
-                    return;
-                }
-            };
-        let runtime = tokio::runtime::Handle::current();
-        let mut readings = stream::iter(children.into_iter().map(|child| {
+        let listed = directory.clone();
+        let children = match self
+            .reads
+            .read(
+                &directory,
+                move || async move { child_directories(&listed) },
+            )
+            .await
+        {
+            Ok(Ok(children)) => children,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    root,
+                    %error,
+                    "a Workspace Root could not be read, so nothing within it was discovered"
+                );
+                return;
+            }
+            Err(not_read) => {
+                tracing::debug!(
+                    root,
+                    %not_read,
+                    "a Workspace Root was passed over, so nothing within it was discovered"
+                );
+                return;
+            }
+        };
+        let mut readings = stream::iter(children.into_iter().map(|child| async move {
             let source_control = self.source_control.clone();
-            let runtime = runtime.clone();
-            tokio::task::spawn_blocking(move || {
-                let reading = runtime.block_on(source_control.read_unremembered(&child));
-                (child, reading)
-            })
+            let read = child.clone();
+            let reading = self
+                .reads
+                .read(&child, move || async move {
+                    source_control.read_unremembered(&read).await
+                })
+                .await;
+            (child, reading)
         }))
         .buffer_unordered(CONCURRENT_READINGS);
         let mut discovered = 0usize;
-        while let Some(read) = readings.next().await {
-            let (child, reading) = match read {
-                Ok(read) => read,
-                Err(error) => {
-                    tracing::error!(
+        while let Some((child, reading)) = readings.next().await {
+            let reading = match reading {
+                Ok(reading) => reading,
+                Err(not_read) => {
+                    tracing::debug!(
                         root,
-                        %error,
-                        "reading a directory within a Workspace Root did not finish"
+                        directory = %child.display(),
+                        %not_read,
+                        "a directory within a Workspace Root was passed over"
                     );
                     continue;
                 }
