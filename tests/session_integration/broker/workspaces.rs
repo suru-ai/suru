@@ -352,3 +352,75 @@ async fn an_agent_lists_the_repositories_discovered_within_the_workspace_roots()
 
     hosted.server.shutdown().await.expect("shut down server");
 }
+
+/// A row says why its Workspace cannot be opened, as `"unavailable"`, where
+/// its directory cannot be read now — here gone, though a Session belongs to
+/// it — and leaves it out for every other, in the very rows an Agent and a
+/// Sidekick read alike; each is told so in the Tool's description.
+#[tokio::test]
+async fn a_row_says_why_its_workspace_cannot_be_opened_for_an_agent_as_for_a_sidekick() {
+    const CHANNEL: &str = "agent-unavailable-workspace-listing";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut hosted = host_providers(state_dir.path(), CHANNEL, None).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let (_sidekick_id, mut sidekick, _sidekick_provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    let workspace = hosted.workspace.path().to_owned();
+    let (agent_id, handoff, _agent_provider) = start_session(
+        &descriptor,
+        &mut hosted.codex,
+        &workspace,
+        default_selection(&codex_models()),
+    )
+    .await;
+    let agent_workspace = read_session(&descriptor, agent_id).await.session.workspace;
+    let mut agent = McpClient::handed(&handoff);
+    agent.initialize().await;
+    let notes = tempfile::tempdir().expect("create the notes Workspace");
+    let notes_workspace = quiet_session(&descriptor, notes.path(), "Keep the notes")
+        .await
+        .session
+        .workspace;
+
+    notes
+        .close()
+        .expect("delete the notes Workspace's directory");
+
+    let rows = listed_workspaces(&mut agent).await;
+    let mut unavailable = row(&notes_workspace, Value::Null, Value::Null);
+    unavailable["unavailable"] = json!("its directory is gone");
+    assert!(
+        rows.contains(&unavailable),
+        "the row of a Workspace whose directory is gone says why it cannot be opened: {rows:?}"
+    );
+    let own = rows
+        .iter()
+        .find(|row| row["workspace_id"] == json!(agent_workspace.id))
+        .unwrap_or_else(|| panic!("the Agent's own Workspace is listed: {rows:?}"));
+    assert!(
+        own.get("unavailable").is_none(),
+        "a Workspace whose directory can be read says nothing of it: {own}"
+    );
+    assert_eq!(
+        rows,
+        listed_workspaces(&mut sidekick).await,
+        "a Sidekick reads the very rows an Agent does"
+    );
+    for (client, caller) in [(&mut agent, "an Agent"), (&mut sidekick, "a Sidekick")] {
+        let listed = client.request("tools/list", json!({})).await;
+        let described = listed["tools"]
+            .as_array()
+            .expect("tools/list lists Tools")
+            .iter()
+            .find(|tool| tool["name"] == json!("list_workspaces"))
+            .and_then(|tool| tool["description"].as_str())
+            .unwrap_or_else(|| panic!("{caller} is offered list_workspaces: {listed}"))
+            .to_owned();
+        assert!(
+            described.contains("\"unavailable\""),
+            "{caller} is told a row may say it cannot be opened: {described}"
+        );
+    }
+
+    hosted.server.shutdown().await.expect("shut down server");
+}

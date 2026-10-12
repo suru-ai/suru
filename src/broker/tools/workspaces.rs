@@ -22,7 +22,8 @@
 //! and every one described before any Session did — and lists them from the
 //! Registry alone. The listing names each as a compact row: its identity,
 //! its name, its presented root's path, its Description and whether that was
-//! set rather than derived, and its Icon's name. A directory a Client merely
+//! set rather than derived, its Icon's name, and — where its directory
+//! cannot be read now — why it cannot be opened. A directory a Client merely
 //! stands in, which its Server was never told of, is no Workspace the Server
 //! knows, and is not listed.
 //!
@@ -65,7 +66,7 @@ use super::{
 use crate::{
     protocol::{
         Outlook, SetWorkspaceDescriptionRequest, Workspace, WorkspaceDescription, WorkspaceId,
-        WorkspacePaths, one_line_description,
+        WorkspacePaths, WorkspaceUnavailability, one_line_description,
     },
     server::operations::{CloneRequest, Origins, Refusal, RemoteActRefusal},
 };
@@ -101,8 +102,11 @@ macro_rules! list_workspaces_description {
             $path_used,
             "; \"description\", what it is for, as {\"text\": \"...\", \"set\": \
              true} where the user or a Sidekick set it, \"set\": false where Suru \
-             derived it, or null where it has none; and \"icon\", the name of its \
-             Icon in Suru's Icon Catalog, or null. ",
+             derived it, or null where it has none; \"icon\", the name of its Icon \
+             in Suru's Icon Catalog, or null; and, only where Suru cannot read its \
+             directory now, \"unavailable\", saying why in plain words — its \
+             directory gone, or it or the directory holding it unreadable, as on a \
+             drive not mounted — so no work can begin there until it can be read. ",
             $then,
         )
     };
@@ -421,6 +425,10 @@ struct ListedWorkspace {
     /// The Icon Catalog's name for its Icon, never the glyph: a name is what
     /// an Agent can read.
     icon: Option<String>,
+    /// Why it cannot be opened now, where its Server could not read its
+    /// directory as it listed it, and nothing for one that can be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable: Option<&'static str>,
 }
 
 /// What `set_workspace_description` answers: the Workspace it described,
@@ -450,6 +458,7 @@ fn listed_workspace(
         workspace_id: workspace.id,
         description: workspace.description,
         icon: workspace.icon,
+        unavailable: workspace.unavailable.map(WorkspaceUnavailability::reason),
     }
 }
 
