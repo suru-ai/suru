@@ -174,7 +174,11 @@ pub(super) fn list_workspaces_schema(role: BrokerRole) -> Value {
 /// The Servers a call of `list_workspaces` by an Agent that is `role` to the
 /// Broker lists: for a Sidekick, those its `origin` names; for any other
 /// Agent, which is told of no Remote, this server alone — an `origin` it
-/// gives, whatever it names, refused saying so.
+/// gives, whatever it names, refused saying so and to call again without
+/// one. A Sidekick's native Codex Subagent is shown the Sidekick's schema,
+/// `origin` and all, since Codex names the calling thread on a call but not
+/// on `tools/list` (`docs/validation/0408-subagent-mcp-attribution.md`), so
+/// the refusal says the `origin` is refused to it, not to every caller.
 fn listed_origins(
     role: BrokerRole,
     arguments: &Map<String, Value>,
@@ -188,8 +192,8 @@ fn listed_origins(
         BrokerRole::Agent => {
             if arguments.contains_key("origin") {
                 return Err(ToolRefusal::new(format!(
-                    "{} answers this Suru server's Workspaces alone, so it takes no `origin`; \
-                     call it again without one.",
+                    "{} answers you with this Suru server's Workspaces alone, so it takes no \
+                     `origin` from you; call it again without `origin`.",
                     tool.name()
                 )));
             }
@@ -778,8 +782,8 @@ mod tests {
             assert_eq!(
                 listed(BrokerRole::Agent, json!({ "origin": origin })),
                 Err(ToolRefusal::new(
-                    "list_workspaces answers this Suru server's Workspaces alone, so it takes no \
-                     `origin`; call it again without one."
+                    "list_workspaces answers you with this Suru server's Workspaces alone, so it \
+                     takes no `origin` from you; call it again without `origin`."
                 )),
                 "{origin}"
             );

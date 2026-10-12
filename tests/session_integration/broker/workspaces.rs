@@ -23,8 +23,9 @@ use crate::broker::{
 
 /// What an Agent other than a Sidekick is told when it asks for any Server's
 /// Workspaces but its own.
-const THIS_SERVER_ALONE: &str = "list_workspaces answers this Suru server's Workspaces alone, so \
-                                 it takes no `origin`; call it again without one.";
+const THIS_SERVER_ALONE: &str = "list_workspaces answers you with this Suru server's Workspaces \
+                                 alone, so it takes no `origin` from you; call it again without \
+                                 `origin`.";
 
 /// `list_workspaces`' rows as `client` is answered them.
 async fn listed_workspaces(client: &mut McpClient) -> Vec<Value> {
@@ -172,6 +173,13 @@ async fn an_agent_reads_its_own_servers_workspaces_and_is_refused_any_other_serv
 /// native Subagent makes in its own name, under the Sidekick's token, is
 /// answered as any other Agent's is — refused an `origin` the Sidekick itself
 /// may give.
+///
+/// Codex names the calling thread on each call but not on `tools/list`, so a
+/// native Subagent sharing a Sidekick's token is listed the Sidekick's Tools
+/// and schemas, `list_workspaces`' `origin` among them
+/// (`docs/validation/0408-subagent-mcp-attribution.md`). One that gives an
+/// `origin` as that schema allows is told to call again without it, and that
+/// next call is answered.
 #[tokio::test]
 async fn a_subagent_of_any_agent_brokered_or_native_reads_this_servers_workspaces_alone() {
     const ROOT_THREAD: &str = "019a0e25-60f7-sidekick-thread";
@@ -228,6 +236,32 @@ async fn a_subagent_of_any_agent_brokered_or_native_reads_this_servers_workspace
         "sessionId": ROOT_THREAD,
     }));
     native.initialize().await;
+    let listed = native.request("tools/list", json!({})).await;
+    let listing = listed["tools"]
+        .as_array()
+        .expect("tools/list lists Tools")
+        .iter()
+        .find(|tool| tool["name"] == json!("list_workspaces"))
+        .unwrap_or_else(|| panic!("a native Subagent is offered list_workspaces: {listed}"));
+    assert!(
+        listing["inputSchema"]["properties"]["origin"].is_object(),
+        "a list names no thread, so it is the token's Session's — the Sidekick's: {listing}"
+    );
+    assert_eq!(
+        refused(
+            &mut native,
+            "list_workspaces",
+            json!({ "origin": "everywhere" })
+        )
+        .await,
+        THIS_SERVER_ALONE,
+        "a native Subagent following that schema is told to call again without `origin`"
+    );
+    let rows = listed_workspaces(&mut native).await;
+    assert!(
+        !rows.is_empty() && rows.iter().all(|row| row.get("origin").is_none()),
+        "and the call it makes next is answered this server's Workspaces: {rows:?}"
+    );
     assert_lists_this_servers_workspaces_alone(&mut native, "a Sidekick's native Subagent").await;
     acted(
         &mut sidekick,

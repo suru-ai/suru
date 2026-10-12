@@ -125,3 +125,21 @@ calls carried the parent's token. Every call's `_meta` also had `callId`,
   names the Subagent, and pairing it with the permission request or
   `tool.execution_start` would be the correlation ADR 0035 refused. Fallback:
   none needed; the token's Session is the path.
+- **`tools/list` stays at the token's Session for every harness (#540).** Only a
+  call names its thread. Codex sets `threadId` and `sessionId` on a
+  `tools/call`'s `_meta` (`with_mcp_tool_call_ids_meta` in
+  `codex-rs/core/src/mcp_tool_call.rs`), but a `tools/list` carries only the W3C
+  trace context `traced_pagination` adds (`codex-rs/rmcp-client/src/trace_context.rs`).
+  A native child opens its own MCP session (`capture-session-2` above) with its
+  parent's headers, token and all, so nothing names it before its first call. This was read from the Codex source at
+  `references/codex` `8f195c9` (2026-09-27), not captured. Claude's and
+  Copilot's Subagents share the parent's connection and its listing, and their
+  calls stay with the token's Session too, so what they are listed and how
+  their calls are answered agree. A native Codex Subagent of a Sidekick is
+  therefore listed the Sidekick's Tools and schemas, while its calls are
+  answered as its own Session's. A call of one of the Sidekick's own Tools is
+  refused as a call of a Tool the Broker does not have. `list_workspaces` is
+  offered to it, but the Sidekick's schema for it offers `origin`, which only
+  a Sidekick may give, so an `origin` it gives is refused in words telling it
+  to call again without `origin`. Fallback: none needed; the call that follows
+  is answered.
