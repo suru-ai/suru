@@ -279,6 +279,24 @@ async fn host_providers_timed(
     config_dir: Option<&Path>,
     wait_second: Duration,
 ) -> HostedProviders {
+    host_providers_with_timings(
+        state_dir,
+        channel,
+        config_dir,
+        ServerTimings::default()
+            .with_broker_wait_second(wait_second)
+            .with_broker_wait_progress_interval(WAIT_PROGRESS_EVERY),
+    )
+    .await
+}
+
+/// [`host_providers`] on a Server keeping `timings`.
+async fn host_providers_with_timings(
+    state_dir: &Path,
+    channel: &str,
+    config_dir: Option<&Path>,
+    timings: ServerTimings,
+) -> HostedProviders {
     let (claude_runtime, claude) =
         ControlledProvider::with_provider(ProviderId::new("claude"), claude_models());
     let (codex_runtime, codex) =
@@ -299,9 +317,7 @@ async fn host_providers_timed(
             codex_runtime.clone(),
             copilot_runtime.clone(),
         ],
-        ServerTimings::default()
-            .with_broker_wait_second(wait_second)
-            .with_broker_wait_progress_interval(WAIT_PROGRESS_EVERY),
+        timings,
     )
     .await
     .expect("spawn server");

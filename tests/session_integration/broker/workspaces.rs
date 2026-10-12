@@ -11,6 +11,8 @@
 //! Each test acts as the MCP client a Provider harness is, as the rest of the
 //! Broker suite does, and asserts on what the Broker answers it.
 
+use suru::protocol::RepositoryId;
+
 use super::*;
 use crate::broker::{
     sidekick::{
@@ -20,6 +22,7 @@ use crate::broker::{
     },
     sidekick_acts::{acted, refused},
 };
+use crate::repositories::git;
 
 /// What an Agent other than a Sidekick is told when it asks for any Server's
 /// Workspaces but its own.
@@ -271,5 +274,79 @@ async fn a_subagent_of_any_agent_brokered_or_native_reads_this_servers_workspace
     .await;
 
     drop(brokered_start);
+    hosted.server.shutdown().await.expect("shut down server");
+}
+
+/// An Agent's `list_workspaces` lists each Repository discovered directly
+/// within a Workspace Root as any other row, before any Session has begun
+/// there — and one cloned by hand into a Root after the Server started at
+/// the very next call, without a restart.
+#[tokio::test]
+async fn an_agent_lists_the_repositories_discovered_within_the_workspace_roots() {
+    const CHANNEL: &str = "agent-discovered-workspace-listing";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let projects = tempfile::tempdir().expect("create the Workspace Root");
+    let projects = suru::paths::canonical(projects.path()).expect("read the Root canonically");
+    let atlas = projects.join("atlas");
+    std::fs::create_dir(&atlas).expect("create the atlas Repository");
+    git(&atlas, &["init", "-b", "main"]);
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        json!({ "workspace": { "roots": [projects] } }).to_string(),
+    )
+    .expect("name the Workspace Root");
+    let mut hosted = host_providers_with_timings(
+        state_dir.path(),
+        CHANNEL,
+        Some(config_dir.path()),
+        ServerTimings::default().with_root_discovery_memo(Duration::ZERO),
+    )
+    .await;
+    let descriptor = hosted.server.descriptor().clone();
+    let workspace = hosted.workspace.path().to_owned();
+    let (_agent, handoff, _agent_provider) = start_session(
+        &descriptor,
+        &mut hosted.codex,
+        &workspace,
+        default_selection(&codex_models()),
+    )
+    .await;
+    let mut agent = McpClient::handed(&handoff);
+    agent.initialize().await;
+    let discovered = |repository: &Path| {
+        json!({
+            "workspace_id": RepositoryId::from_metadata("git", &repository.join(".git"))
+                .workspace_id(),
+            "name": repository.file_name().expect("a Repository's directory has a name")
+                .to_string_lossy(),
+            "path": repository,
+            "description": null,
+            "icon": null,
+        })
+    };
+
+    let rows = listed_workspaces(&mut agent).await;
+    assert!(
+        rows.contains(&discovered(&atlas)),
+        "the Repository within the Root is listed though no Session began there: {rows:?}"
+    );
+
+    let copy = projects.join("atlas-copy");
+    git(
+        &projects,
+        &[
+            "clone",
+            "--quiet",
+            atlas.to_str().expect("the fixture's path is UTF-8"),
+            copy.to_str().expect("the fixture's path is UTF-8"),
+        ],
+    );
+    let rows = listed_workspaces(&mut agent).await;
+    assert!(
+        rows.contains(&discovered(&atlas)) && rows.contains(&discovered(&copy)),
+        "the clone made by hand since is listed at the next call: {rows:?}"
+    );
+
     hosted.server.shutdown().await.expect("shut down server");
 }
