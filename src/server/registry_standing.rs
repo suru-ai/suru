@@ -25,20 +25,26 @@
 //!
 //! Every directory is read apart, on a thread of its own (see
 //! [`super::reads_apart`]), so one on a mount gone quiet holds up neither
-//! the rest nor the Server, and nothing waits on the readings longer than
-//! [`super::ServerTimings::root_discovery_wait`]. An entry whose reading has
-//! not answered by then — or whose reading begun earlier is still
-//! outstanding — is listed as unavailable and never dropped.
+//! the rest nor the Server, and what each reading finds is taken as it
+//! answers. One check reads at a time, on a task of its own, and every
+//! listing asking meanwhile joins it rather than reading again; none waits
+//! on it longer than [`super::ServerTimings::root_discovery_wait`] from
+//! when it asked, and the check itself gives up on its readings once that
+//! long has passed since it began. An entry whose reading has not answered
+//! by then — or whose reading begun earlier is still outstanding — is
+//! listed as unavailable and never dropped; one entered since the check
+//! began is no part of it, and is listed as it is.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use futures_util::{StreamExt, stream};
+use tokio::sync::watch;
 
 use super::{
     reads_apart::{NotRead, ReadsApart},
@@ -85,10 +91,9 @@ struct Standing {
     reads: ReadsApart,
     /// The longest anything waits on the readings.
     wait: Duration,
-    /// One check at a time, so two listings at once never find each other's
-    /// reading of a directory outstanding and take it for one that does not
-    /// answer.
-    checking: tokio::sync::Mutex<()>,
+    /// How far the check begun last has come, which every listing asking
+    /// while it reads joins.
+    in_flight: Mutex<Option<watch::Receiver<Progress>>>,
     /// One change of the Roots taken in at a time, the one at start among
     /// them, so none decides on Roots another has changed since.
     roots_changing: tokio::sync::Mutex<()>,
@@ -111,49 +116,92 @@ impl RegistryStanding {
             probe,
             reads: ReadsApart::new("suru-workspace-standing-read", READS_AT_ONCE),
             wait,
-            checking: tokio::sync::Mutex::new(()),
+            in_flight: Mutex::new(None),
             roots_changing: tokio::sync::Mutex::new(()),
         }))
     }
 
     /// Drops what the disk no longer holds, as the module says, and answers
     /// why each entry left that cannot be opened now cannot be, by its
-    /// identity.
+    /// identity: as the check still reading finds, or one begun now, once
+    /// it has read every entry or the bound on waiting has passed since
+    /// this asked, whichever is sooner.
     pub(crate) async fn check(&self) -> HashMap<WorkspaceId, WorkspaceUnavailability> {
-        let _one_at_a_time = self.0.checking.lock().await;
+        let deadline = tokio::time::Instant::now() + self.0.wait;
+        let mut progress = self.join_or_begin();
+        let ended = tokio::time::timeout_at(deadline, progress.wait_for(|progress| progress.ended))
+            .await
+            .is_ok();
+        if !ended {
+            tracing::debug!("answered before every Workspace Registry entry was read");
+        }
+        progress.borrow().unavailable()
+    }
+
+    /// The check still reading, or one begun now where none is.
+    fn join_or_begin(&self) -> watch::Receiver<Progress> {
+        let mut in_flight = self.0.in_flight.lock().unwrap();
+        if let Some(progress) = in_flight
+            .as_ref()
+            .filter(|progress| !progress.borrow().ended)
+        {
+            return progress.clone();
+        }
         let entries = self.0.sessions.presented_entries();
-        let directories = entries
-            .iter()
-            .map(|(_, path)| path.clone())
-            .collect::<BTreeSet<_>>();
-        let mut read = HashMap::new();
+        let (sender, progress) = watch::channel(Progress {
+            unread: entries.iter().map(|(id, _)| id.clone()).collect(),
+            ..Progress::default()
+        });
+        *in_flight = Some(progress.clone());
+        tokio::spawn(self.clone().read(entries, sender));
+        progress
+    }
+
+    /// Reads where each of `entries` is presented, taking what each reading
+    /// finds as it answers, until every one has or the bound on waiting has
+    /// passed.
+    async fn read(self, entries: Vec<(WorkspaceId, PathBuf)>, progress: watch::Sender<Progress>) {
+        let mut presented = BTreeMap::<PathBuf, Vec<WorkspaceId>>::new();
+        for (id, path) in entries {
+            presented.entry(path).or_default().push(id);
+        }
+        let directories = presented.keys().cloned().collect::<Vec<_>>();
         let readings = stream::iter(directories.into_iter().map(|directory| {
             let probe = self.0.probe.clone();
             let reading = directory.clone();
+            let reads = &self.0.reads;
             async move {
-                let read = self
-                    .0
-                    .reads
+                let read = reads
                     .read(&directory, move || async move { probe(&reading) })
                     .await;
                 (directory, read)
             }
         }))
         .buffer_unordered(CONCURRENT_READINGS)
-        .for_each(|(directory, reading)| {
-            read.insert(directory, reading);
+        .for_each(|(directory, read)| {
+            for id in &presented[&directory] {
+                let why = self.standing(id, &directory, &read);
+                progress.send_modify(|progress| {
+                    progress.unread.remove(id);
+                    if let Some(why) = why {
+                        progress.unavailable.insert(id.clone(), why);
+                    }
+                });
+            }
             std::future::ready(())
         });
         if tokio::time::timeout(self.0.wait, readings).await.is_err() {
-            tracing::debug!("answered before every Workspace Registry entry was read");
+            tracing::debug!("gave up on reading every Workspace Registry entry");
         }
-        entries
-            .into_iter()
-            .filter_map(|(id, path)| {
-                let why = self.standing(&id, &path, read.get(&path))?;
-                Some((id, why))
-            })
-            .collect()
+        progress.send_modify(|progress| {
+            let unread = std::mem::take(&mut progress.unread);
+            progress.unavailable.extend(
+                unread
+                    .into_iter()
+                    .map(|id| (id, WorkspaceUnavailability::Unanswered)),
+            );
+            progress.ended = true;
+        });
     }
 
     /// Why the entry `id` presented at `path` cannot be opened, as `read`
@@ -163,20 +211,20 @@ impl RegistryStanding {
         &self,
         id: &WorkspaceId,
         path: &Path,
-        read: Option<&Result<Reading, NotRead>>,
+        read: &Result<Reading, NotRead>,
     ) -> Option<WorkspaceUnavailability> {
         match read {
-            Some(Ok(Reading::Readable)) => None,
-            Some(Ok(Reading::Gone)) => self
+            Ok(Reading::Readable) => None,
+            Ok(Reading::Gone) => self
                 .0
                 .sessions
                 .forget_gone(id, path)
                 .then_some(WorkspaceUnavailability::Gone),
-            Some(Ok(Reading::Unreadable(why))) => Some(*why),
-            None | Some(Err(NotRead::Outstanding)) => Some(WorkspaceUnavailability::Unanswered),
+            Ok(Reading::Unreadable(why)) => Some(*why),
+            Err(NotRead::Outstanding) => Some(WorkspaceUnavailability::Unanswered),
             // No thread could be made to read it on, or too many readings
             // that never answered hold theirs: it has not answered either.
-            Some(Err(not_read)) => {
+            Err(not_read) => {
                 tracing::debug!(
                     workspace = %id.0,
                     path = %path.display(),
@@ -305,6 +353,31 @@ impl RegistryStanding {
     }
 }
 
+/// How far one check has come, as every listing joining it reads it.
+#[derive(Default)]
+struct Progress {
+    /// The entries it reads whose reading has not yet been taken.
+    unread: HashSet<WorkspaceId>,
+    /// Why each entry read so far cannot be opened.
+    unavailable: HashMap<WorkspaceId, WorkspaceUnavailability>,
+    /// Whether it has ended, every entry it reads read or given up on.
+    ended: bool,
+}
+
+impl Progress {
+    /// Why each entry cannot be opened as far as the check has come: one
+    /// whose reading has not been taken has not answered in time.
+    fn unavailable(&self) -> HashMap<WorkspaceId, WorkspaceUnavailability> {
+        let mut unavailable = self.unavailable.clone();
+        unavailable.extend(
+            self.unread
+                .iter()
+                .map(|id| (id.clone(), WorkspaceUnavailability::Unanswered)),
+        );
+        unavailable
+    }
+}
+
 /// The directory a Workspace Root names, as far as it could be told.
 struct NamedDirectory {
     /// The Root as the Setting spells it.
@@ -422,6 +495,34 @@ mod tests {
         )
     }
 
+    /// A Registry holding an entry presented at each of `paths`, with the
+    /// storage it writes to, which lasts as long as it does.
+    struct Registry {
+        sessions: SessionStore,
+        _writer: StorageWriter,
+        _data_dir: tempfile::TempDir,
+    }
+
+    impl Registry {
+        async fn holding(paths: &[&Path]) -> Self {
+            let data_dir = tempfile::tempdir().expect("create a data directory");
+            let repository = StorageRepository::open(data_dir.path())
+                .await
+                .expect("open the Server's storage");
+            let (writer, storage) = StorageWriter::spawn(repository);
+            Self {
+                sessions: SessionStore::new(
+                    Default::default(),
+                    storage,
+                    Vec::new(),
+                    paths.iter().map(|path| entry(path)).collect(),
+                ),
+                _writer: writer,
+                _data_dir: data_dir,
+            }
+        }
+    }
+
     /// The paths the Registry lists.
     fn listed(sessions: &SessionStore) -> Vec<PathBuf> {
         let mut listed = sessions
@@ -440,19 +541,10 @@ mod tests {
     /// beside it is read and listed on its own.
     #[tokio::test]
     async fn an_entry_whose_directory_does_not_answer_is_unavailable_and_never_dropped() {
-        let data_dir = tempfile::tempdir().expect("create a data directory");
-        let repository = StorageRepository::open(data_dir.path())
-            .await
-            .expect("open the Server's storage");
-        let (_writer, storage) = StorageWriter::spawn(repository);
         let stalled = absolute(&["mnt", "quiet", "atlas"]);
         let readable = absolute(&["work", "ledger"]);
-        let sessions = SessionStore::new(
-            Default::default(),
-            storage,
-            Vec::new(),
-            [entry(&stalled), entry(&readable)].into_iter().collect(),
-        );
+        let registry = Registry::holding(&[&stalled, &readable]).await;
+        let sessions = &registry.sessions;
         let gate = Arc::new(Gate::default());
         let held = OpensOnDrop(gate.clone());
         let readings = Arc::new(AtomicUsize::new(0));
@@ -489,7 +581,7 @@ mod tests {
                 "only the entry whose directory does not answer is unavailable"
             );
             assert_eq!(
-                listed(&sessions),
+                listed(sessions),
                 [stalled.clone(), readable.clone()],
                 "and it is never dropped"
             );
@@ -509,10 +601,131 @@ mod tests {
         .await
         .expect("the directory answers in time once it is let go");
         assert_eq!(
-            listed(&sessions),
+            listed(sessions),
             [readable],
             "once its directory answers that it is gone, the entry follows the disk"
         );
+    }
+
+    /// Listings asking while a check reads join it rather than reading
+    /// again, so each directory is read once however many ask at once.
+    #[tokio::test]
+    async fn listings_asking_at_once_join_one_check_and_read_each_directory_once() {
+        let atlas = absolute(&["work", "atlas"]);
+        let registry = Registry::holding(&[&atlas]).await;
+        let gate = Arc::new(Gate::default());
+        let _held = OpensOnDrop(gate.clone());
+        let readings = Arc::new(AtomicUsize::new(0));
+        let standing = RegistryStanding::with_probe(
+            registry.sessions.clone(),
+            None,
+            SURELY,
+            Arc::new({
+                let (gate, readings) = (gate.clone(), readings.clone());
+                move |_: &Path| {
+                    readings.fetch_add(1, Ordering::SeqCst);
+                    gate.wait();
+                    Reading::Readable
+                }
+            }),
+        );
+
+        let listings = futures_util::future::join_all((0..5).map(|_| standing.check()));
+        let answer = async {
+            while readings.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            gate.open();
+        };
+        let (answered, ()) = tokio::time::timeout(SURELY, async { tokio::join!(listings, answer) })
+            .await
+            .expect("every listing answers once the directory does");
+
+        assert!(
+            answered.iter().all(HashMap::is_empty),
+            "each listing is answered what the one reading found: {answered:?}"
+        );
+        assert_eq!(
+            readings.load(Ordering::SeqCst),
+            1,
+            "the directory is read once for them all"
+        );
+    }
+
+    /// Lets the readings that wait on it through one at a time, in the order
+    /// they began, and every one once dropped.
+    #[derive(Default)]
+    struct Turnstile {
+        let_through: Mutex<usize>,
+        moved: Condvar,
+    }
+
+    impl Turnstile {
+        /// Waits until the `nth` reading, counting from one, is let through.
+        fn pass(&self, nth: usize) {
+            let mut let_through = self.let_through.lock().unwrap();
+            while *let_through < nth {
+                let_through = self.moved.wait(let_through).unwrap();
+            }
+        }
+
+        fn let_one_through(&self) {
+            *self.let_through.lock().unwrap() += 1;
+            self.moved.notify_all();
+        }
+    }
+
+    struct LetsAllThroughOnDrop(Arc<Turnstile>);
+
+    impl Drop for LetsAllThroughOnDrop {
+        fn drop(&mut self) {
+            *self.0.let_through.lock().unwrap() = usize::MAX;
+            self.0.moved.notify_all();
+        }
+    }
+
+    /// However many listings ask at once, none waits on the readings longer
+    /// than its bound from when it asked, queueing included: here the one
+    /// reading the directory gets answers just inside the bound, and any
+    /// reading after it would not answer at all.
+    #[tokio::test(start_paused = true)]
+    async fn no_listing_waits_longer_than_its_bound_however_many_ask_at_once() {
+        let atlas = absolute(&["work", "atlas"]);
+        let registry = Registry::holding(&[&atlas]).await;
+        let turnstile = Arc::new(Turnstile::default());
+        let _held = LetsAllThroughOnDrop(turnstile.clone());
+        let readings = Arc::new(AtomicUsize::new(0));
+        let wait = Duration::from_secs(1);
+        let standing = RegistryStanding::with_probe(
+            registry.sessions.clone(),
+            None,
+            wait,
+            Arc::new({
+                let (turnstile, readings) = (turnstile.clone(), readings.clone());
+                move |_: &Path| {
+                    turnstile.pass(readings.fetch_add(1, Ordering::SeqCst) + 1);
+                    Reading::Readable
+                }
+            }),
+        );
+
+        let listings = tokio::spawn({
+            let standing = standing.clone();
+            async move {
+                futures_util::future::join_all((0..10).map(|_| async {
+                    let asked = tokio::time::Instant::now();
+                    standing.check().await;
+                    asked.elapsed()
+                }))
+                .await
+            }
+        });
+        tokio::time::sleep(wait * 9 / 10).await;
+        turnstile.let_one_through();
+
+        for waited in listings.await.expect("the listings run to their end") {
+            assert!(waited <= wait, "a listing waited {waited:?}, past {wait:?}");
+        }
     }
 
     #[test]
