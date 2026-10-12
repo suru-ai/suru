@@ -542,28 +542,63 @@ async fn no_errand_is_asked_for_a_discovered_workspace_until_a_session_begins_th
     server.shutdown().await.expect("shut down server");
 }
 
+/// Holds every thread that waits on it until it is opened.
+#[derive(Default)]
+struct Gate {
+    open: std::sync::Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+impl Gate {
+    fn wait(&self) {
+        let mut open = self.open.lock().expect("the gate is never poisoned");
+        while !*open {
+            open = self.opened.wait(open).expect("the gate is never poisoned");
+        }
+    }
+
+    fn open(&self) {
+        *self.open.lock().expect("the gate is never poisoned") = true;
+        self.opened.notify_all();
+    }
+}
+
+/// Opens its gate once dropped, so no thread is left held when a test ends,
+/// whether or not it ends well.
+struct OpensOnDrop(Arc<Gate>);
+
+impl Drop for OpensOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
 /// Stands in for Git, but for every directory within `stalled`, whose
-/// reading never finishes, as a Root on a network mount gone quiet.
+/// reading blocks the thread it is read on until the test opens `gate` — as
+/// a filesystem probe of a network mount gone quiet does.
 struct StallsWithin {
     git: GitSourceControl,
     stalled: PathBuf,
+    gate: Arc<Gate>,
 }
 
 #[async_trait::async_trait]
 impl SourceControl for StallsWithin {
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         if directory.starts_with(&self.stalled) {
-            std::future::pending::<()>().await;
+            self.gate.wait();
         }
         self.git.discover(directory).await
     }
 }
 
-/// A Root whose reading stalls holds back neither a change of the Roots —
-/// taking it away included — nor a listing, past the Server's bound on
-/// waiting for discovery: each answers, the listing from the Registry as it
-/// stands, and a Root named in its place is discovered all the same.
-#[tokio::test]
+/// A Root whose reading blocks the thread it is read on holds back neither
+/// a change of the Roots — taking it away included — nor a listing, past
+/// the Server's bound on waiting for discovery, even where the Server runs
+/// on one thread: each answers, the listing from the Registry as it stands.
+/// The Root named beside it goes on being discovered on its own, a
+/// Repository cloned into it later included.
+#[tokio::test(flavor = "current_thread")]
 async fn a_root_whose_reading_stalls_holds_back_no_change_of_the_roots_and_no_listing() {
     const CHANNEL: &str = "workspace-discovery-stalled-root";
     let home = tempfile::tempdir().expect("create a home");
@@ -576,6 +611,8 @@ async fn a_root_whose_reading_stalls_holds_back_no_change_of_the_roots_and_no_li
     let notes = home.join("notes");
     std::fs::create_dir(&notes).expect("create the notes directory");
     name_roots(&home.join("config"), &[]);
+    let gate = Arc::new(Gate::default());
+    let stall = OpensOnDrop(gate.clone());
     let server = server::spawn_with_source_control(
         ServerConfig::new(home.join("state"), CHANNEL)
             .expect("configure")
@@ -588,6 +625,7 @@ async fn a_root_whose_reading_stalls_holds_back_no_change_of_the_roots_and_no_li
         Arc::new(StallsWithin {
             git: GitSourceControl::new("git"),
             stalled: stalled.clone(),
+            gate,
         }),
     )
     .await
@@ -602,34 +640,57 @@ async fn a_root_whose_reading_stalls_holds_back_no_change_of_the_roots_and_no_li
     let name = |roots: &[&Path]| SettingMutation::WorkspaceRoots {
         value: Some(roots.iter().map(|root| spelled(root).to_owned()).collect()),
     };
+    let listed_at = async |path: &Path| {
+        listed(&client)
+            .await
+            .iter()
+            .any(|workspace| workspace.path == path)
+    };
 
-    timeout(PROGRESS_DEADLINE, client.mutate_setting(name(&[&stalled])))
-        .await
-        .expect("naming a Root whose reading stalls answers")
-        .expect("name the stalled Root");
+    timeout(
+        PROGRESS_DEADLINE,
+        client.mutate_setting(name(&[&stalled, &projects])),
+    )
+    .await
+    .expect("naming a Root whose reading stalls answers")
+    .expect("name the stalled Root beside another");
     let listing = timeout(PROGRESS_DEADLINE, listed(&client))
         .await
-        .expect("a listing answers while the scan stalls");
-    assert_eq!(
-        listing.iter().map(located).collect::<Vec<_>>(),
-        [located(&noted)],
-        "the listing answers with what the Registry holds"
+        .expect("a listing answers while the stalled Root's scan blocks its thread");
+    assert!(
+        listing
+            .iter()
+            .any(|workspace| located(workspace) == located(&noted)),
+        "the listing answers with what the Registry holds: {listing:?}"
     );
+    timeout(PROGRESS_DEADLINE, async {
+        while !listed_at(&atlas).await {}
+    })
+    .await
+    .expect("the Root beside the stalled one is discovered");
+    let copy = projects.join("atlas-copy");
+    git(
+        &projects,
+        &["clone", "--quiet", spelled(&atlas), spelled(&copy)],
+    );
+    timeout(PROGRESS_DEADLINE, async {
+        while !listed_at(&copy).await {}
+    })
+    .await
+    .expect("a clone made later in the Root beside the stalled one is discovered too");
 
     timeout(PROGRESS_DEADLINE, client.mutate_setting(name(&[&projects])))
         .await
-        .expect("replacing the Root whose reading stalls answers")
-        .expect("name another Root in its place");
-    timeout(PROGRESS_DEADLINE, async {
-        while !listed(&client)
+        .expect("taking the stalled Root away answers")
+        .expect("take the stalled Root away");
+    assert!(
+        timeout(PROGRESS_DEADLINE, listed_at(&copy))
             .await
-            .iter()
-            .any(|workspace| workspace.path == atlas)
-        {}
-    })
-    .await
-    .expect("the Root named in place of the stalled one is discovered");
+            .expect("a listing answers once the stalled Root is gone"),
+        "what was discovered stays listed"
+    );
 
+    drop(stall);
     drop(client);
     server.shutdown().await.expect("shut down server");
 }

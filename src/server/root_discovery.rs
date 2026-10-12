@@ -20,9 +20,10 @@
 //! Discovery derives no Icon and no Description: the first Session begun in
 //! a discovered Workspace derives them as it would anywhere.
 //!
-//! Each Root is scanned on its own, on a task of its own, so a Root on a
-//! mount gone quiet holds up neither the others nor what asks for a scan:
-//! nothing that asks for one waits on it for longer than
+//! Each Root is scanned on its own, on a task of its own, and everything a
+//! scan reads from the filesystem or source control is read on a blocking
+//! thread, so a Root on a mount gone quiet holds up neither the others nor
+//! the Server: nothing that asks for a scan waits on it for longer than
 //! [`super::ServerTimings::root_discovery_wait`], answering from the
 //! Registry as it stands, and a slow scan shows in what is listed later.
 //! Every Root is scanned afresh at start and whenever the Roots change,
@@ -330,7 +331,10 @@ impl RootDiscovery {
 }
 
 /// The scan the Server runs: every Repository root directly within a Root,
-/// entered in the Registry.
+/// entered in the Registry. The Root is listed, and each child read through
+/// source control, on a blocking thread, so a filesystem that stops
+/// answering holds a thread of the blocking pool rather than one the
+/// Server's tasks run on.
 pub(crate) struct RegistryScan {
     sessions: SessionStore,
     source_control: SourceControlService,
@@ -383,13 +387,29 @@ impl RootScan for RegistryScan {
                     return;
                 }
             };
-        let mut readings = stream::iter(children.into_iter().map(|child| async move {
-            let reading = self.source_control.read_unremembered(&child).await;
-            (child, reading)
+        let runtime = tokio::runtime::Handle::current();
+        let mut readings = stream::iter(children.into_iter().map(|child| {
+            let source_control = self.source_control.clone();
+            let runtime = runtime.clone();
+            tokio::task::spawn_blocking(move || {
+                let reading = runtime.block_on(source_control.read_unremembered(&child));
+                (child, reading)
+            })
         }))
         .buffer_unordered(CONCURRENT_READINGS);
         let mut discovered = 0usize;
-        while let Some((child, reading)) = readings.next().await {
+        while let Some(read) = readings.next().await {
+            let (child, reading) = match read {
+                Ok(read) => read,
+                Err(error) => {
+                    tracing::error!(
+                        root,
+                        %error,
+                        "reading a directory within a Workspace Root did not finish"
+                    );
+                    continue;
+                }
+            };
             if let Some(workspace) = rooted_at(&child, reading)
                 && commit.while_current(|| {
                     self.sessions.enter_discovered(&workspace, &child, root);

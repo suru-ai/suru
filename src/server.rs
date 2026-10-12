@@ -818,9 +818,13 @@ impl SessionEventSink {
 
 impl RunningServer {
     /// Startup Workspace discovery runs behind readiness. Resolves once every
-    /// persisted Session has been regrouped and the Workspace Roots have
-    /// been discovered — or `root_discovery_wait` has passed waiting on
-    /// them — or discovery was abandoned.
+    /// persisted Session has been regrouped and the startup scan of the
+    /// Workspace Roots has finished or been waited on for
+    /// `root_discovery_wait`, whichever comes first — so a Root still being
+    /// scanned may go on being discovered after this resolves — or once
+    /// discovery was abandoned for shutdown. The first Reclaim pass waits on
+    /// the same signal, so it waits for the regrouping in full but for the
+    /// Roots no longer than that bound.
     pub async fn workspace_discovery_settled(&self) {
         let mut discovery = self.workspace_discovery.clone();
         let _ = discovery.wait_for(|settled| *settled).await;
