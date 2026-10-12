@@ -168,7 +168,7 @@ impl SettingsAdoption {
             let before = self.snapshot.borrow();
             (
                 before.settings.workspace.roots.clone(),
-                crate::settings::workspace_roots_named_whole(&before).is_some(),
+                crate::settings::workspace_roots_named_whole(&before).map(<[String]>::to_vec),
             )
         };
         // The edit is filesystem work, and the CST handles it parses the
@@ -205,10 +205,10 @@ impl SettingsAdoption {
             // Only Roots the user named whole, before and after alike, say
             // that one was taken away: those a document left that could not
             // be read whole say nothing.
-            if named_whole_before
+            if let Some(before) = &named_whole_before
                 && let Some(after) = crate::settings::workspace_roots_named_whole(&snapshot)
             {
-                registry_standing.roots_changed(&held, after).await;
+                registry_standing.roots_changed(&held, before, after).await;
             }
             Some(ticket)
         };

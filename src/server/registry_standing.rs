@@ -23,15 +23,17 @@
 //! `~/projects` spelled out in full takes nothing away; and a Root that
 //! cannot be told apart from those in force — nothing there, as for a link
 //! on a drive not mounted, which may lead where one of them names — takes
-//! nothing away until it can be. What was discovered under one taken away
-//! while its drive is gone stays listed as unavailable until the drive is
-//! back, and the next start or change of the Roots then tells it apart and
-//! takes it away. Only Roots the Config Document names whole — before a
-//! change and after it alike — take anything away, since those a document
-//! left that could not be read whole are no word of the user's. The Roots
-//! are held still while either decides (see [`RootsHeld`]), and the step at
-//! start takes nothing away where Settings were put in force anew since it
-//! read them.
+//! nothing away until it can be, at the next start or change of the Roots.
+//! A change that takes a Root away by its spelling is the user's word on
+//! that spelling, though: what was discovered under it goes at once,
+//! whether or not it can be resolved, unless a Root still named is spelled
+//! or written as it, resolves where it does, or is named in that very
+//! change and cannot be told from it, as the Root respelled may be. Only
+//! Roots the Config Document names whole — before a change and after it
+//! alike — take anything away, since those a document left that could not
+//! be read whole are no word of the user's. The Roots are held still while
+//! either decides (see [`RootsHeld`]), and the step at start takes nothing
+//! away where Settings were put in force anew since it read them.
 //!
 //! Every directory is read apart, on a thread of its own (see
 //! [`super::reads_apart`]), so one on a mount gone quiet holds up neither
@@ -294,10 +296,16 @@ impl RegistryStanding {
     }
 
     /// Drops what was discovered under a Workspace Root the Roots `after`
-    /// surely do not name, as the module says: once the Roots have changed
-    /// to `after`, while `_held` holds them still.
-    pub(crate) async fn roots_changed(&self, _held: &RootsHeld<'_>, after: &[String]) {
-        self.forget_unnamed(after, || true).await;
+    /// surely do not name, or that this change took away by its spelling,
+    /// as the module says: once the Roots have changed from `before` to
+    /// `after`, while `_held` holds them still.
+    pub(crate) async fn roots_changed(
+        &self,
+        _held: &RootsHeld<'_>,
+        before: &[String],
+        after: &[String],
+    ) {
+        self.forget_unnamed(after, Some(before), || true).await;
     }
 
     /// Drops what was discovered under a Workspace Root that the Roots in
@@ -326,7 +334,7 @@ impl RegistryStanding {
             }
             !moved
         };
-        self.forget_unnamed(&roots, still).await;
+        self.forget_unnamed(&roots, None, still).await;
     }
 
     /// Drops what was discovered under a Root that `roots`, the Roots in
@@ -334,9 +342,15 @@ impl RegistryStanding {
     /// that, that they are what the user named. A Root an entry was
     /// discovered under that cannot be told apart from them keeps
     /// everything, and is told again at the next start or change of the
-    /// Roots: one taken away while its drive is not mounted is taken away
-    /// once the drive is back.
-    async fn forget_unnamed(&self, roots: &[String], still: impl Fn() -> bool) {
+    /// Roots — unless the change from `before` took it away by its
+    /// spelling, which only a Root it named anew and cannot tell from it,
+    /// as the Root respelled may be, keeps.
+    async fn forget_unnamed(
+        &self,
+        roots: &[String],
+        before: Option<&[String]>,
+        still: impl Fn() -> bool,
+    ) {
         let recorded = self.0.sessions.discovered_roots();
         if recorded.is_empty() {
             return;
@@ -348,12 +362,20 @@ impl RegistryStanding {
             roots.iter().chain(&recorded),
         )
         .await;
+        let taken_away = |root: &String| {
+            before.is_some_and(|before| before.contains(root) && !roots.contains(root))
+        };
+        let named_anew = |root: &String| before.is_some_and(|before| !before.contains(root));
         let unrooted = recorded
             .iter()
             .filter(|root| {
                 roots
                     .iter()
-                    .all(|kept| named[*root].likeness(&named[kept]) == Likeness::Different)
+                    .all(|kept| match named[*root].likeness(&named[kept]) {
+                        Likeness::Same => false,
+                        Likeness::Different => true,
+                        Likeness::Untold => taken_away(root) && !named_anew(kept),
+                    })
             })
             .cloned()
             .collect::<HashSet<_>>();
@@ -891,7 +913,9 @@ mod tests {
                                 // What the Registry held as the change put `~/b`
                                 // back in force.
                                 let listed_then = listed(&sessions);
-                                standing.roots_changed(&held, &["~/b".to_owned()]).await;
+                                standing
+                                    .roots_changed(&held, &[], &["~/b".to_owned()])
+                                    .await;
                                 listed_then
                             })
                         });
@@ -916,6 +940,43 @@ mod tests {
             Vec::<PathBuf>::new(),
             "the step at start had taken away what it decided to before the change put its \
              Roots in force"
+        );
+    }
+
+    /// A change taking a Root away by its spelling takes what was discovered
+    /// under it, though it cannot be told apart from the Roots still named —
+    /// unless the change named one anew that it cannot be told from, as the
+    /// Root respelled may be. Here `~/b` names a home this Server does not
+    /// know, and every other Root names nothing there, so nothing tells
+    /// any of them apart.
+    #[tokio::test]
+    async fn a_root_taken_away_by_its_spelling_takes_what_it_held_but_where_it_may_be_respelled() {
+        let (registry, atlas) = discovered_under_b().await;
+        let standing = RegistryStanding::new(registry.sessions.clone(), None, SURELY);
+        let spell = |components: &[&str]| absolute(components).display().to_string();
+        let (kept, respelled) = (spell(&["nowhere", "kept"]), spell(&["nowhere", "b"]));
+
+        let held = standing.hold_roots().await;
+        standing
+            .roots_changed(
+                &held,
+                &["~/b".to_owned(), kept.clone()],
+                &[kept.clone(), respelled.clone()],
+            )
+            .await;
+        assert_eq!(
+            listed(&registry.sessions),
+            std::slice::from_ref(&atlas),
+            "a Root named anew that cannot be told from the one taken away keeps what it held"
+        );
+
+        standing
+            .roots_changed(&held, &["~/b".to_owned(), kept.clone()], &[kept])
+            .await;
+        assert_eq!(
+            listed(&registry.sessions),
+            Vec::<PathBuf>::new(),
+            "while one named before as well does not"
         );
     }
 
