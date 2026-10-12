@@ -1534,10 +1534,13 @@ async fn start(
             source_control.clone(),
             config.home_dir(),
         )),
-        settings.subscribe(),
+        {
+            let settings = settings.subscribe();
+            Arc::new(move || settings.borrow().settings.workspace.roots.clone())
+        },
         timings.root_discovery_memo,
         timings.root_discovery_wait,
-        timings.clock.clone(),
+        root_discovery::Monotonic::real(),
         provider_shutdown_rx.clone(),
     );
     // Persisted grouping is served at once; discovery regroups Sessions behind
