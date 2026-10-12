@@ -530,11 +530,13 @@ fn logged(refusal: &CloneRefusal, url: &str, destination: &Path, author: &Author
 }
 
 /// A Clone whose clone is whole and naming at `destination`: what settling
-/// it once it lands needs of it.
+/// it once it lands needs of it, and its place among the Clones run apart,
+/// held from before it ran until it is settled.
 struct Landed {
     url: String,
     destination: PathBuf,
     author: Author,
+    counted: RunningClone,
 }
 
 /// A timeout in the plainest whole unit that spells it.
@@ -941,8 +943,12 @@ impl SessionOperations {
             return Err(CloneRefusal::Unsupported { reason });
         }
         // No scan enters the clone as discovered between its taking its name
-        // and its settling entering it as Cloned.
+        // and its settling entering it as Cloned; and the Clone is counted
+        // among those run apart from before it runs, so a stopping Server
+        // never finds nothing under way between the clone's landing and its
+        // settling.
         let held = self.root_discovery.landing(&destination);
+        let counted = self.cloning.detached.begin();
         let cloned = self
             .source_control
             .clone_repository(
@@ -969,6 +975,7 @@ impl SessionOperations {
                 url: url.to_owned(),
                 destination: destination.clone(),
                 author: author.clone(),
+                counted,
             },
         );
         // Landed, or not to land: the settling answers which. Still landing
@@ -1011,8 +1018,8 @@ impl SessionOperations {
     /// Settles the Clone whose whole clone `landing` is naming at its
     /// destination, as `clone` describes it, on a task of its own, so it is
     /// settled whenever the clone lands, whether or not whoever asked for
-    /// the Clone is still waiting: counted among the Clones run apart, so a
-    /// stopping Server waits on it a while before it lets go. Once the clone
+    /// the Clone is still waiting: counted, as `clone` is, among the Clones
+    /// run apart, so a stopping Server waits on it a while before it lets go. Once the clone
     /// has landed — said on `landed` — its Workspace is read apart, within a
     /// bound of its own, and entered in the Workspace Registry as Cloned —
     /// as read, or as the Clone knew it where the reading does not answer in
@@ -1029,14 +1036,13 @@ impl SessionOperations {
         held: root_discovery::Landing,
         clone: Landed,
     ) -> tokio::task::JoinHandle<Result<Workspace, CloneFailure>> {
-        let settling = self.cloning.detached.begin();
         let operations = self.clone();
         tokio::spawn(async move {
-            let _settling = settling;
             let Landed {
                 url,
                 destination,
                 author,
+                counted: _counted,
             } = clone;
             let known = match landing.await {
                 Ok(known) => known,
