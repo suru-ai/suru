@@ -9687,15 +9687,29 @@ impl Application {
                     | SemanticCommandId::SettingsNumericDeleteBackward
                     | SemanticCommandId::SettingsNumericApply
                     | SemanticCommandId::SettingsNumericCancel
-                    | SemanticCommandId::SettingsListPrevious
-                    | SemanticCommandId::SettingsListNext
-                    | SemanticCommandId::SettingsListInsert
-                    | SemanticCommandId::SettingsListDeleteBackward
-                    | SemanticCommandId::SettingsListRemove
-                    | SemanticCommandId::SettingsListSave
-                    | SemanticCommandId::SettingsListCancel
             )
         {
+            return Ok(ApplicationTransition::Continue);
+        }
+        // The list editor takes a command only while it holds the keys, read
+        // off the one surface terminal input is routed to, so no overlay
+        // standing over it — a picker the panel opened, or any other — lets
+        // an edit, a cancel or a save reach a draft the reader cannot see.
+        if matches!(
+            command,
+            SemanticCommandId::SettingsListPrevious
+                | SemanticCommandId::SettingsListNext
+                | SemanticCommandId::SettingsListInsert
+                | SemanticCommandId::SettingsListDeleteBackward
+                | SemanticCommandId::SettingsListRemove
+                | SemanticCommandId::SettingsListSave
+                | SemanticCommandId::SettingsListCancel
+        ) && !matches!(
+            self.state.surface_above_interventions(),
+            Some(SurfaceAboveInterventions::Selection(
+                SelectionSurface::ListEditor
+            ))
+        ) {
             return Ok(ApplicationTransition::Continue);
         }
         match command {

@@ -971,6 +971,48 @@ fn a_list_editor_closes_with_its_panel_and_takes_no_input_while_another_overlay_
         "the editor took no input while another overlay hid it"
     );
 
+    // Any overlay standing over the editor holds the keys, not only a picker
+    // the panel itself opens: the Serving overlay comes up over it too.
+    open_workspace_roots_editor(&mut application);
+    assert!(
+        matches!(
+            invoke(
+                &mut application,
+                CommandId::InvokeSemantic(SemanticCommandId::ServeOpen)
+            ),
+            ApplicationTransition::BeginServing { .. }
+        ),
+        "the Serving overlay opens over the editor"
+    );
+    for command in [
+        CommandId::InvokeSemanticText(SemanticCommandId::SettingsListInsert, "~/hidden".to_owned()),
+        CommandId::InvokeSemantic(SemanticCommandId::SettingsListNext),
+        CommandId::InvokeSemantic(SemanticCommandId::SettingsListRemove),
+        CommandId::InvokeSemantic(SemanticCommandId::SettingsListCancel),
+    ] {
+        invoke(&mut application, command);
+    }
+    assert_eq!(
+        invoke(
+            &mut application,
+            CommandId::InvokeSemantic(SemanticCommandId::SettingsListSave)
+        ),
+        ApplicationTransition::Continue,
+        "an editor beneath the Serving overlay saves nothing"
+    );
+    invoke(
+        &mut application,
+        CommandId::InvokeSemantic(SemanticCommandId::ServeClose),
+    );
+    type_terminal_text(&mut application, "~/src");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+            value: Some(vec!["~/src".to_owned()]),
+        }),
+        "neither an edit nor a cancel reached the editor while the Serving overlay hid it"
+    );
+
     open_workspace_roots_editor(&mut application);
     invoke(
         &mut application,
