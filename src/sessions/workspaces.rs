@@ -373,6 +373,33 @@ impl SessionStore {
         }
     }
 
+    /// Drops the entry `workspace_id`, which discovery under the Workspace
+    /// Root `root` found presented at a Workspace Root, where it is known by
+    /// discovery under that Root and no Session belongs to it, its Icon and
+    /// Description with it: a Root is never a Workspace. Every entry known
+    /// otherwise is left alone.
+    pub(crate) fn forget_discovered(&self, workspace_id: &WorkspaceId, root: &str) {
+        let mut state = self.state.lock().unwrap();
+        let discovered_there = state.workspaces.get(workspace_id).is_some_and(|stored| {
+            matches!(
+                &stored.provenance,
+                WorkspaceProvenance::Discovered { root: under } if under == root
+            )
+        });
+        if !discovered_there || state.grouped_besides(workspace_id, None) {
+            return;
+        }
+        state.workspaces.remove(workspace_id);
+        state.sightings.forget(workspace_id);
+        tracing::info!(
+            workspace = %workspace_id.0,
+            root,
+            "a Workspace Registry entry discovered under a Workspace Root was dropped, since it is \
+             presented at a Workspace Root"
+        );
+        self.storage.forget_workspace(workspace_id.clone());
+    }
+
     /// Every entry the Registry holds a path for, by its identity and the
     /// path it is presented at — where each is read for its standing — and
     /// the moment they were taken, which a reading of them began after.

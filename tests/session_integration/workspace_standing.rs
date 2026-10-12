@@ -65,7 +65,7 @@ async fn description_at(client: &ManagedClient, path: &Path) -> Option<Workspace
 
 /// Deletes the Session `session_id` once it has stopped working, which a
 /// Session whose Provider fails it does at once.
-async fn delete_once_settled(client: &ManagedClient, session_id: SessionId) {
+pub(super) async fn delete_once_settled(client: &ManagedClient, session_id: SessionId) {
     timeout(PROGRESS_DEADLINE, async {
         while client
             .read_session(session_id)

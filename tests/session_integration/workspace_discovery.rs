@@ -2,10 +2,11 @@
 //! or bare — is entered in the Workspace Registry, known by discovery under
 //! that Root, so it is listed before any Session has begun there (ADR 0051).
 //! Plain directories, hidden ones, anything deeper, a linked Worktree of a
-//! Repository elsewhere, the Sidekick Workspace and the Root itself are left
-//! alone. Discovery runs at start, when the Roots change, and whenever
-//! Workspaces are listed, reusing a scan only as old as the Server's memo
-//! allows, which these Servers shorten to nothing or lengthen past any test.
+//! Repository elsewhere, the Sidekick Workspace, the Root itself and any
+//! Root within it are left alone. Discovery runs at start, when the Roots
+//! change, and whenever Workspaces are listed, reusing a scan only as old as
+//! the Server's memo allows, which these Servers shorten to nothing or
+//! lengthen past any test.
 //!
 //! Each test drives the Server as a Client does, with real Git Repositories
 //! in a temporary Root, and asserts on what the Client's Workspace listing
@@ -44,6 +45,7 @@ use crate::{
         BY_SESSION, canonical, connected_client, entries_on_disk, landing_workspace, listed,
         quiet_request, repository, set,
     },
+    workspace_standing::delete_once_settled,
 };
 
 /// A memo no test outlasts: every listing after the first reuses its scan.
@@ -414,6 +416,106 @@ async fn the_sidekick_workspace_is_never_discovered() {
 
     drop(client);
     server.shutdown().await.expect("shut down server");
+}
+
+/// A Root standing directly within another is a Root and never a
+/// Workspace, however it is spelled: the other Root's scan enters it as
+/// nothing, though it is a Repository, nor counts a linked Worktree of it
+/// beside it for it, while the Repositories within it are discovered as
+/// its own. One entered before it was named a Root is dropped once it is —
+/// unless a Session belongs to it, which keeps it until none does.
+#[tokio::test]
+async fn a_root_within_another_root_is_a_root_and_never_a_workspace() {
+    const CHANNEL: &str = "workspace-discovery-nested-roots";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    let maps = atlas.join("maps");
+    repository(&maps);
+    git(
+        &atlas,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "topic",
+            spelled(&projects.join("topic")),
+        ],
+    );
+    let ledger = projects.join("ledger");
+    repository(&ledger);
+    let books = ledger.join("books");
+    repository(&books);
+    let (config, server) =
+        server_with_roots(&home, CHANNEL, &[spelled(&projects)], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let located_sorted = async || {
+        let mut located = listed(&client)
+            .await
+            .iter()
+            .map(located)
+            .collect::<Vec<_>>();
+        located.sort_by(|(_, left), (_, right)| left.cmp(right));
+        located
+    };
+    let (atlas_id, ledger_id) = (
+        repository_id(&atlas.join(".git")),
+        repository_id(&ledger.join(".git")),
+    );
+    assert_eq!(
+        located_sorted().await,
+        [
+            (atlas_id.clone(), atlas.clone()),
+            (ledger_id.clone(), ledger.clone()),
+        ],
+        "each Repository directly within the Root is discovered while it is no Root itself"
+    );
+    let balanced = client
+        .create_session(quiet_request(&ledger, "Balance the ledger"))
+        .await
+        .expect("begin a Session in a discovered Repository")
+        .session;
+
+    client
+        .mutate_setting(SettingMutation::WorkspaceRoots {
+            value: Some(vec![
+                spelled(&projects).to_owned(),
+                format!("~{0}projects{0}atlas{0}", std::path::MAIN_SEPARATOR),
+                spelled(&ledger).to_owned(),
+            ]),
+        })
+        .await
+        .expect("name the Repositories within the Root as Roots of their own");
+
+    let books_id = repository_id(&books.join(".git"));
+    let maps_id = repository_id(&maps.join(".git"));
+    assert_eq!(
+        located_sorted().await,
+        [
+            (maps_id.clone(), maps.clone()),
+            (ledger_id.clone(), ledger.clone()),
+            (books_id.clone(), books.clone()),
+        ],
+        "a Root within another is no Workspace, but one a Session belongs to is kept, and the \
+         Repositories within each are discovered as its own"
+    );
+
+    delete_once_settled(&client, balanced.id).await;
+    assert_eq!(
+        located_sorted().await,
+        [(maps_id, maps.clone()), (books_id, books.clone())],
+        "once no Session belongs to it, the Root's entry is dropped too"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    let entries = entries_on_disk(&config);
+    assert!(
+        !entries.contains_key(&atlas_id) && !entries.contains_key(&ledger_id),
+        "and dropped from disk: {entries:?}"
+    );
 }
 
 /// A directory described before it became a Repository is superseded there

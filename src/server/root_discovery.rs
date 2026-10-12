@@ -4,21 +4,27 @@
 //! that Root, so it is listed before any Session has begun there.
 //!
 //! Only a Root's immediate children are read, and of those only the ones
-//! that are not hidden and that stand directly within the Root once read
-//! as the Server reads paths: a link is kept where it names another
-//! directory directly within the Root, and left alone where it names the
-//! Root itself or anywhere else, since a Repository reached only through a
-//! link is not directly within the Root. Nothing deeper is read, so a nested
-//! or vendored Repository stays out of the Registry. Each child is read
-//! through source control discovery, which reads the Sidekick Workspace as a
-//! directory of its own whatever it holds, and is kept only where it is the
-//! root its Repository is presented by: a plain directory, a directory
-//! within a Repository — as every child of a Root that is itself a
-//! Repository is — and a linked Worktree of a Repository presented elsewhere
-//! are each left alone, so the Root itself never becomes a Workspace and a
-//! linked Worktree counts for its Repository's Workspace alone (ADR 0023).
-//! Discovery derives no Icon and no Description: the first Session begun in
-//! a discovered Workspace derives them as it would anywhere.
+//! that are not hidden and that stand directly within the Root once read as
+//! the Server reads paths: a link is kept where it names another directory
+//! directly within the Root, and left alone where it names the Root itself
+//! or anywhere else, since a Repository reached only through a link is not
+//! directly within the Root. Nothing deeper is read, so a nested or vendored
+//! Repository stays out of the Registry. Each child is read through source
+//! control discovery, which reads the Sidekick Workspace as a directory of
+//! its own whatever it holds, and is kept only where it is the root its
+//! Repository is presented by: a plain directory, a directory within a
+//! Repository — as every child of a Root that is itself a Repository is —
+//! and a linked Worktree of a Repository presented elsewhere are each left
+//! alone, so a linked Worktree counts for its Repository's Workspace alone
+//! (ADR 0023). A Workspace presented at a Workspace Root — this one, or
+//! another named within it — is never entered, so a Root is never a
+//! Workspace, and an entry discovered under this Root that has since come to
+//! be presented at one is dropped, unless a Session belongs to it. Roots are
+//! told apart as directories (see [`super::root_directories`]); one that
+//! cannot be resolved is told by its writing alone, so a Root on a mount
+//! gone quiet holds back no other Root's discoveries. Discovery derives no
+//! Icon and no Description: the first Session begun in a discovered
+//! Workspace derives them as it would anywhere.
 //!
 //! Each Root is scanned on its own, on a task of its own, and everything a
 //! scan reads from the filesystem or source control is read apart, on a
@@ -50,7 +56,7 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, future::join_all, stream};
 use tokio::sync::watch;
 
-use super::reads_apart::ReadsApart;
+use super::{reads_apart::ReadsApart, root_directories};
 use crate::{
     protocol::{RepositoryLocation, ResolvedWorkspace, Workspace},
     provider::wait_for_shutdown,
@@ -185,10 +191,19 @@ struct Awaited {
 pub(crate) struct Commit {
     discovery: RootDiscovery,
     root: String,
+    /// Every Root followed as the scan began, its own among them.
+    roots: Arc<[String]>,
     generation: u64,
 }
 
 impl Commit {
+    /// Every Root followed as this scan began, its own among them: those in
+    /// force for as long as it is current, since a change of them begins
+    /// every scan afresh.
+    pub(crate) fn roots(&self) -> &[String] {
+        &self.roots
+    }
+
     /// Runs `enter`, for what this scan found at `directory`, while this
     /// scan is still its Root's current one and no Clone is landing at
     /// `directory`, answering whether it ran.
@@ -259,6 +274,7 @@ impl RootDiscovery {
         let ticket = {
             let mut state = self.0.state.lock().unwrap();
             let roots = self.follow(&mut state);
+            let followed = Arc::<[String]>::from(roots.as_slice());
             let now = self.0.clock.now();
             let mut awaited = Vec::new();
             for root in roots {
@@ -273,7 +289,7 @@ impl RootDiscovery {
                 {
                     continue;
                 }
-                awaited.push(self.begin(&mut state, root));
+                awaited.push(self.begin(&mut state, root, &followed));
             }
             Ticket(awaited)
         };
@@ -286,10 +302,11 @@ impl RootDiscovery {
     pub(crate) fn rediscover(&self) -> Ticket {
         let mut state = self.0.state.lock().unwrap();
         let roots = self.follow(&mut state);
+        let followed = Arc::<[String]>::from(roots.as_slice());
         Ticket(
             roots
                 .into_iter()
-                .map(|root| self.begin(&mut state, root))
+                .map(|root| self.begin(&mut state, root, &followed))
                 .collect(),
         )
     }
@@ -337,9 +354,9 @@ impl RootDiscovery {
         roots
     }
 
-    /// Begins a scan of `root` on a task of its own, superseding any of it
-    /// still running.
-    fn begin(&self, state: &mut State, root: String) -> Awaited {
+    /// Begins a scan of `root`, one of the Roots followed, on a task of its
+    /// own, superseding any of it still running.
+    fn begin(&self, state: &mut State, root: String, followed: &Arc<[String]>) -> Awaited {
         state.generation += 1;
         let generation = state.generation;
         let scans = state.roots.entry(root.clone()).or_insert_with(Scans::new);
@@ -350,6 +367,7 @@ impl RootDiscovery {
         let commit = Commit {
             discovery: self.clone(),
             root,
+            roots: followed.clone(),
             generation,
         };
         let scan = self.0.scan.clone();
@@ -384,17 +402,21 @@ impl RootDiscovery {
 }
 
 /// The scan the Server runs: every Repository root directly within a Root,
-/// entered in the Registry. The Root is listed, and each child read through
-/// source control, apart (see [`ReadsApart`]), so a filesystem that stops
+/// entered in the Registry. The Root is listed, each child read through source control, and the other Roots
+/// resolved, apart (see [`ReadsApart`]), so a filesystem that stops
 /// answering holds a thread of discovery's own rather than one the Server
-/// runs anything else on, and no more of them at once than
-/// [`READS_AT_ONCE`].
+/// runs anything else on, and no more of them at once than [`READS_AT_ONCE`].
 pub(crate) struct RegistryScan {
     sessions: SessionStore,
     source_control: SourceControlService,
     /// The directory a Root beginning with `~` is read beneath.
     home: Option<PathBuf>,
+    /// The longest a scan waits on the other Roots being resolved.
+    wait: Duration,
     reads: ReadsApart,
+    /// The other Roots' resolutions, apart from `reads` so none is passed
+    /// over for a read of the same Root its own scan has outstanding.
+    resolutions: ReadsApart,
 }
 
 /// The most reads of Roots and of the directories within them outstanding
@@ -404,26 +426,33 @@ pub(crate) struct RegistryScan {
 /// past it is passed over until a later scan.
 const READS_AT_ONCE: usize = 64;
 
+/// The most resolutions of the other Roots outstanding at once, across
+/// every scan: a Root past it is told by its writing alone.
+const RESOLUTIONS_AT_ONCE: usize = 16;
+
 impl RegistryScan {
     pub(crate) fn new(
         sessions: SessionStore,
         source_control: SourceControlService,
         home: Option<PathBuf>,
+        wait: Duration,
     ) -> Self {
         Self {
             sessions,
             source_control,
             home,
+            wait,
             reads: ReadsApart::new("suru-root-discovery-read", READS_AT_ONCE),
+            resolutions: ReadsApart::new("suru-root-discovery-resolution", RESOLUTIONS_AT_ONCE),
         }
     }
 }
 
 #[async_trait]
 impl RootScan for RegistryScan {
-    /// Enters every Repository root directly within `root` in the Registry.
-    /// A Root that cannot be read is skipped, saying why in the Log, and
-    /// never made.
+    /// Enters what is directly within `root` in the Registry, as the module
+    /// says. A Root that cannot be read is skipped, saying why in the Log,
+    /// and never made.
     async fn scan(&self, root: &str, commit: &Commit) {
         let began = std::time::Instant::now();
         let Some(directory) = expand(root, self.home.as_deref()) else {
@@ -435,7 +464,7 @@ impl RootScan for RegistryScan {
             return;
         };
         let listed = directory.clone();
-        let children = match self
+        let (resolved, children) = match self
             .reads
             .read(
                 &directory,
@@ -443,7 +472,7 @@ impl RootScan for RegistryScan {
             )
             .await
         {
-            Ok(Ok(children)) => children,
+            Ok(Ok(read)) => read,
             Ok(Err(error)) => {
                 tracing::warn!(
                     root,
@@ -460,6 +489,16 @@ impl RootScan for RegistryScan {
                 );
                 return;
             }
+        };
+        let others = root_directories::resolve(
+            &self.resolutions,
+            self.home.as_deref(),
+            self.wait,
+            commit.roots().iter().filter(|other| *other != root),
+        )
+        .await;
+        let at_a_root = |presented: &Path| {
+            presented == resolved || others.values().any(|other| other.names(presented))
         };
         let mut readings = stream::iter(children.into_iter().map(|child| async move {
             let source_control = self.source_control.clone();
@@ -497,9 +536,15 @@ impl RootScan for RegistryScan {
                 if let Some(read) = reading.workspace.repository.as_deref() {
                     self.source_control.learn_main_checkout(read);
                 }
-                if let Some(workspace) = rooted_at(&child, reading) {
-                    self.sessions.enter_discovered(&workspace, &child, root);
-                    entered = true;
+                match rooted_at(&child, reading) {
+                    Some(workspace) if at_a_root(&workspace.path) => {
+                        self.sessions.forget_discovered(&workspace.id, root);
+                    }
+                    Some(workspace) => {
+                        self.sessions.enter_discovered(&workspace, &child, root);
+                        entered = true;
+                    }
+                    None => {}
                 }
             });
             if entered {
@@ -527,16 +572,16 @@ pub(super) fn expand(root: &str, home: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
-/// The directories directly within `root` that discovery reads, each as the
-/// Server reads paths: every child that is a directory standing directly
-/// within the Root once read so — a link counting as the directory it names,
-/// where that is another directly within the Root, and as nothing where it
-/// names the Root itself or anywhere else — but those that are hidden and
-/// those whose names are not Unicode, which no Workspace can be presented
-/// by.
-fn child_directories(root: &Path) -> io::Result<Vec<PathBuf>> {
+/// The directory `root` leads to, read canonically, and the directories
+/// directly within it that discovery reads, each as the Server reads paths:
+/// every child that is a directory standing directly within the Root once
+/// read so — a link counting as the directory it names, where that is
+/// another directly within the Root, and as nothing where it names the Root
+/// itself or anywhere else — but those that are hidden and those whose names
+/// are not Unicode, which no Workspace can be presented by.
+fn child_directories(root: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
     let root = crate::paths::canonical(root)?;
-    Ok(std::fs::read_dir(&root)?
+    let children = std::fs::read_dir(&root)?
         .flatten()
         .filter(is_directory)
         .filter(|entry| {
@@ -547,7 +592,8 @@ fn child_directories(root: &Path) -> io::Result<Vec<PathBuf>> {
         })
         .filter_map(|entry| crate::paths::canonical(entry.path()).ok())
         .filter(|child| child.parent() == Some(root.as_path()))
-        .collect())
+        .collect();
+    Ok((root, children))
 }
 
 /// The Workspace `reading` found, where `directory` is the root its
@@ -985,7 +1031,7 @@ mod tests {
         }
         std::fs::write(root.join("README.md"), "Projects").expect("write a file");
 
-        let mut children = child_directories(&root).expect("read the Root");
+        let (_, mut children) = child_directories(&root).expect("read the Root");
         children.sort();
 
         assert_eq!(
@@ -1012,7 +1058,7 @@ mod tests {
         link(&root.join("atlas"), "alias");
 
         assert_eq!(
-            child_directories(&root).expect("read the Root"),
+            child_directories(&root).expect("read the Root").1,
             [root.join("atlas"), root.join("atlas")],
             "a link to another directory directly within the Root reads as that directory; one \
              to the Root itself, to anywhere else, or to anything deeper is left alone"

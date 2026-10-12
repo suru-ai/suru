@@ -75,6 +75,7 @@ mod reads_apart;
 mod reclaim;
 mod registry_standing;
 mod relays;
+mod root_directories;
 mod root_discovery;
 mod signals;
 
@@ -1571,6 +1572,7 @@ async fn start(
             sessions.clone(),
             source_control.clone(),
             config.home_dir(),
+            timings.root_discovery_wait,
         )),
         {
             let settings = settings.subscribe();
