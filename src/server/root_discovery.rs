@@ -117,8 +117,8 @@ impl RootDiscovery {
             let Some(directory) = expand(root, self.home.as_deref()) else {
                 tracing::warn!(
                     root,
-                    "a Workspace Root beginning with ~ names no home this Server knows, \
-                     so nothing within it was discovered"
+                    "a Workspace Root beginning with ~ names a home this Server does not \
+                     know, so nothing within it was discovered"
                 );
                 continue;
             };
@@ -151,7 +151,7 @@ impl RootDiscovery {
                 }
             }
         }
-        tracing::info!(
+        tracing::debug!(
             roots = roots.len(),
             discovered,
             elapsed_ms = began.elapsed().as_millis(),
