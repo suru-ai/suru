@@ -4198,7 +4198,10 @@ async fn clone_workspace(State(state): State<AppState>, request: Request) -> Res
             workspace,
         })
         .into_response(),
-        Ok(Err(refusal @ CloneRefusal::SidekickWorkspace { .. })) => session_error_response(
+        Ok(Err(
+            refusal @ (CloneRefusal::SidekickWorkspace { .. }
+            | CloneRefusal::SidekickWorkspacePlace { .. }),
+        )) => session_error_response(
             StatusCode::CONFLICT,
             SessionErrorCode::SidekickWorkspaceSession,
             refusal.to_string(),

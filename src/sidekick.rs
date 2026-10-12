@@ -87,9 +87,30 @@ impl SidekickWorkspace {
             == self.directory()
     }
 
+    /// Whether `destination` — a directory whose parent is read
+    /// canonically, though it need not be there itself — is where the
+    /// Sidekick Workspace is kept, or would be made: its very directory, read
+    /// canonically where something stands there, or an entry directly
+    /// beneath the data root named as it is in any case. A filesystem that
+    /// does not tell case apart — Windows' and macOS's, as they come — takes
+    /// such a name for the Sidekick Workspace's own, and one that composes
+    /// characters may take the Kelvin sign for `K`, which leaves only case
+    /// between it and `k`; so a name is read in any case on every platform,
+    /// and nothing named so is taken for any other directory. Reads the
+    /// filesystem, so a caller that must not wait on it reads it apart.
+    pub(crate) fn is_kept_at(&self, destination: &Path) -> bool {
+        let named_so = destination.parent() == Some(self.data_root.as_path())
+            && destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| in_any_case(name) == DIRECTORY);
+        named_so || crate::paths::canonical(destination).is_ok_and(|read| read == self.directory())
+    }
+
     /// Whether `path`, read canonically, lies within the Sidekick
-    /// Workspace's directory, or is that directory.
-    pub(crate) fn contains(&self, path: &Path) -> bool {
+    /// Workspace's directory. Reads the filesystem, as [`Self::is_kept_at`]
+    /// does.
+    pub(crate) fn encloses(&self, path: &Path) -> bool {
         path.starts_with(self.directory())
     }
 
@@ -111,9 +132,55 @@ impl SidekickWorkspace {
     }
 }
 
+/// `name` as it reads in any case: upper-cased, then lower-cased, so a
+/// letter that upper-cases to an ASCII one — the long s, the dotless i — or
+/// lower-cases to one — the Kelvin sign — reads as that letter does.
+fn in_any_case(name: &str) -> String {
+    name.to_uppercase().to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where the Sidekick Workspace is kept, or would be made, is told by
+    /// its name in any case — the Kelvin sign and the long s among the
+    /// letters that read as ASCII ones — whether or not it has been made,
+    /// and only directly beneath the data root; once it is made, its very
+    /// directory is told however it is reached, and what lies within it is
+    /// enclosed by it.
+    #[test]
+    fn the_sidekick_workspaces_place_is_told_by_its_name_in_any_case() {
+        let data = tempfile::tempdir().expect("create a data root");
+        let sidekick = SidekickWorkspace::beside(data.path()).expect("read the data root");
+        let data = crate::paths::canonical(data.path()).expect("read the data root");
+        for name in [
+            "sidekick",
+            "SIDEKICK",
+            "SideKick",
+            "sidekic\u{212A}",
+            "\u{17F}idekick",
+            "s\u{131}dekick",
+        ] {
+            assert!(sidekick.is_kept_at(&data.join(name)), "{name:?}");
+        }
+        for elsewhere in [
+            data.join("sidekicks"),
+            data.join("other").join("sidekick"),
+            data.join("sidekick").join("atlas"),
+        ] {
+            assert!(!sidekick.is_kept_at(&elsewhere), "{}", elsewhere.display());
+        }
+
+        let made = sidekick.ensure().expect("make it");
+        std::fs::create_dir(data.join("other")).expect("create a waypoint");
+        assert!(
+            sidekick.is_kept_at(&data.join("other").join("..").join("sidekick")),
+            "its very directory is told however it is reached"
+        );
+        assert!(sidekick.encloses(&made.join("atlas")));
+        assert!(!sidekick.encloses(&data.join("atlas")));
+    }
 
     #[test]
     fn the_sidekick_workspaces_icon_is_one_the_icon_catalog_carries() {

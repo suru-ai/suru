@@ -702,6 +702,60 @@ async fn an_existing_destination_is_refused_naming_the_workspace_there() {
     hosted.server.shutdown().await.expect("shut down server");
 }
 
+/// No Clone takes the place the Sidekick Workspace is kept in, though a
+/// Workspace Root names the data directory it is kept in, in whatever case
+/// its name is spelled: a filesystem that does not tell case apart takes any
+/// of them for that very directory, which is to stay outside source control.
+/// The Sidekick Workspace is left as it was.
+#[tokio::test]
+async fn no_clone_takes_the_sidekick_workspaces_place_however_its_name_is_spelled() {
+    const CHANNEL: &str = "sidekick-clone-sidekick-place";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let (_elsewhere, elsewhere) = directory();
+    let origin = bare_repository(&elsewhere, "atlas");
+    let mut hosted = host_providers(state_dir.path(), CHANNEL, Some(config_dir.path())).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let (_sidekick_id, mut sidekick, _provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    let kept = sidekick_directory(&descriptor).await;
+    let data = kept
+        .parent()
+        .expect("the Sidekick Workspace is kept within the data directory")
+        .to_owned();
+    mutate_setting(
+        &descriptor,
+        SettingMutation::WorkspaceRoots {
+            value: Some(vec![spelled(&data).to_owned()]),
+        },
+    )
+    .await;
+
+    for name in ["SIDEKICK", "sidekick"] {
+        assert_eq!(
+            refused(
+                &mut sidekick,
+                "clone_workspace",
+                json!({ "repository_url": origin, "name": name }),
+            )
+            .await,
+            format!(
+                "`{}` is where the Sidekick Workspace is kept, in whatever case its name is \
+                 spelled, and no Clone may take its place, so nothing was cloned; give another \
+                 `name`.",
+                spelled(&data.join(name))
+            ),
+            "{name:?} names the Sidekick Workspace's place"
+        );
+    }
+    assert!(
+        !kept.join(".git").exists() && !kept.join("README.md").exists(),
+        "the Sidekick Workspace is left as it was"
+    );
+
+    hosted.server.shutdown().await.expect("shut down server");
+}
+
 /// A Clone Git cannot make is refused in Git's own words — a Repository URL
 /// naming nothing, or a branch the Repository does not have — and leaves
 /// nothing at its destination.

@@ -202,12 +202,14 @@ configured; when the Root cannot be read, since Suru never makes one; when \
 where the Clone would go, naming the Workspace there by its workspace_id \
 where it is one; when Git fails, in Git's own words; when it does not finish \
 within the time the server allows a Clone, well within the time a call may \
-take; and when it would go within a Remote's own Sidekick Workspace, which \
-refuses you as yours refuses its Peers. A Clone Git began and could not \
-finish leaves nothing behind. A Remote that does not answer, or does not \
-understand a Clone, refuses it, and nothing is kept to Clone there later; \
-one whose answer was lost once it took the Clone may have made it all the \
-same, so list its Workspaces before asking again.";
+take; when it would take the place a Sidekick Workspace is kept in, in any \
+case, which stays outside source control; and when it would go within a \
+Remote's own Sidekick Workspace, which refuses you as yours refuses its \
+Peers. A Clone Git began and could not finish leaves nothing behind. A \
+Remote that does not answer, or does not understand a Clone, refuses it, \
+and nothing is kept to Clone there later; one whose answer was lost once it \
+took the Clone may have made it all the same, so list its Workspaces before \
+asking again.";
 
 /// What `list_workspaces` takes: the Servers whose Workspaces to list.
 const LIST_TAKES: [&str; 1] = ["origin"];
@@ -1138,6 +1140,7 @@ mod tests {
             "as list_remotes gives it",
             "a Remote's in its own words",
             "a Remote's own Sidekick Workspace",
+            "the place a Sidekick Workspace is kept in",
             "does not understand a Clone",
             "nothing is kept to Clone there later",
             "list its Workspaces before asking again",

@@ -349,6 +349,67 @@ async fn a_remote_refuses_a_clone_by_its_own_roots_and_rules_in_its_own_words() 
     pair.shutdown().await;
 }
 
+/// `name` read in any case, as a filesystem that does not tell case apart
+/// reads it.
+fn in_any_case(name: &str) -> String {
+    name.to_uppercase().to_lowercase()
+}
+
+/// A Remote whose data directory is named a Workspace Root before it has
+/// made its Sidekick Workspace takes no Clone where that Workspace would be
+/// made, in whatever case its name is spelled, nor spelled with the Kelvin
+/// sign a filesystem that composes characters reads as `K`: a filesystem
+/// that does not tell case apart takes any of them for that very directory,
+/// so the Sidekick Workspace would be made of what a Peer's Sidekick filled
+/// it with. Nothing is cloned there.
+#[tokio::test]
+async fn a_remote_takes_no_clone_where_its_sidekick_workspace_would_be_made_however_spelled() {
+    let mut pair = paired(
+        "sidekick-remote-clone-sidekick-place",
+        ServerTimings::default(),
+    )
+    .await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let data = suru::paths::canonical(pair.remote.config.data_dir())
+        .expect("read the Remote's data directory canonically");
+    assert!(
+        contents(&data)
+            .iter()
+            .all(|entry| in_any_case(entry) != "sidekick"),
+        "the Remote has made no Sidekick Workspace yet"
+    );
+    let (_elsewhere, elsewhere) = directory();
+    let origin = bare_repository(&elsewhere, "atlas");
+    name_roots(&remote, &[&data]).await;
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+
+    for name in ["SIDEKICK", "Sidekick", "sidekic\u{212A}", "sidekick"] {
+        assert_eq!(
+            refused(
+                &mut sidekick,
+                "clone_workspace",
+                json!({ "repository_url": origin, "origin": REMOTE, "name": name }),
+            )
+            .await,
+            format!(
+                "The Remote `{REMOTE}` refused it: `{}` is where the Sidekick Workspace is kept, \
+                 in whatever case its name is spelled, and no Clone may take its place, so \
+                 nothing was cloned; give another `name`.",
+                spelled(&data.join(name))
+            ),
+            "{name:?} names the Sidekick Workspace's place"
+        );
+    }
+    let left = contents(&data);
+    assert!(
+        left.iter().all(|entry| in_any_case(entry) != "sidekick"),
+        "nothing is cloned where the Sidekick Workspace would be made: {left:?}"
+    );
+
+    pair.shutdown().await;
+}
+
 /// A Clone on a Remote that cannot be reached is refused saying so; on one
 /// speaking a version of the protocol without the Clone, saying it does not
 /// understand one. Either way nothing was cloned there, and nothing is kept

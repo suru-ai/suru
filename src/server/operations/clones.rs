@@ -6,6 +6,11 @@
 //! the one its Repository URL ends in. A Root is never made for it, so one
 //! that cannot be read refuses it, and whatever already stands where it
 //! would go refuses it too, named as the Workspace it is where it is one.
+//! Nor does any Clone take the place the Sidekick Workspace is kept in,
+//! which stays outside source control, however the case of its name is
+//! spelled — a filesystem that does not tell case apart takes any spelling
+//! for that very directory, made or yet to be — judged as the Root is read,
+//! within the Clone's deadline.
 //!
 //! The Clone itself is source control's ([`SourceControlService::clone_repository`]),
 //! bounded by this Server's own timeout, and leaves nothing behind where it
@@ -55,6 +60,7 @@ use crate::{
         reads_apart::{NotRead, ReadsApart},
         root_discovery::expand,
     },
+    sidekick::SidekickWorkspace,
     source_control::{CloneFailure, without_credentials},
 };
 
@@ -110,6 +116,10 @@ pub(crate) enum CloneRefusal {
         destination: PathBuf,
         workspace: Option<WorkspaceId>,
     },
+    /// The destination is where the Sidekick Workspace is kept, or would be
+    /// made, however the case of its name is spelled: a directory outside
+    /// source control, which no Clone may take.
+    SidekickWorkspacePlace { destination: PathBuf },
     /// A Sidekick on a Peer asked for a Clone whose destination lies within
     /// this Server's own Sidekick Workspace, which a Remote keeps to itself
     /// (ADR 0044).
@@ -202,6 +212,13 @@ impl fmt::Display for CloneRefusal {
                  beside it.",
                 destination.display()
             ),
+            Self::SidekickWorkspacePlace { destination } => write!(
+                formatter,
+                "`{}` is where the Sidekick Workspace is kept, in whatever case its name is \
+                 spelled, and no Clone may take its place, so nothing was cloned; give another \
+                 `name`.",
+                destination.display()
+            ),
             Self::SidekickWorkspace { destination } => write!(
                 formatter,
                 "`{}` lies within the Sidekick Workspace, which a Sidekick on another machine may \
@@ -285,6 +302,7 @@ impl CloneRefusal {
             | Self::UnreadableRoot { .. }
             | Self::NotPlainName { .. }
             | Self::NoNameInUrl { .. }
+            | Self::SidekickWorkspacePlace { .. }
             | Self::SidekickWorkspace { .. }
             | Self::Unsupported { .. } => None,
         }
@@ -299,6 +317,29 @@ fn listed(roots: &[String]) -> String {
         .map(|root| format!("`{root}`"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Refuses a Clone to `destination` where the Sidekick Workspace is kept, or
+/// would be made, whoever asks for it, since it is to stay outside source
+/// control; and, for a Sidekick on a Peer, `from_a_peer`, anywhere within
+/// it, which a Remote keeps to itself. Reads the filesystem, so it is run
+/// apart, within the Clone's deadline, as the Root is read.
+fn kept_from_sidekick_workspace(
+    sidekick_workspace: &SidekickWorkspace,
+    destination: &Path,
+    from_a_peer: bool,
+) -> Result<(), CloneRefusal> {
+    if sidekick_workspace.is_kept_at(destination) {
+        return Err(CloneRefusal::SidekickWorkspacePlace {
+            destination: destination.to_owned(),
+        });
+    }
+    if from_a_peer && sidekick_workspace.encloses(destination) {
+        return Err(CloneRefusal::SidekickWorkspace {
+            destination: destination.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// The Sidekick a Clone is done for, as the Log names it: one of this
@@ -498,9 +539,12 @@ fn named_by(url: &str) -> Result<&str, CloneRefusal> {
 /// names among `roots`, or the only one — and whether something stands
 /// there already, the Root read by `read` apart (see [`ReadsApart`]), so a
 /// Root on a mount gone quiet holds up none of the Server's own threads,
-/// and holds one of its own however often it is Cloned into again. `None`
-/// where the reading has not answered by `deadline`, or one begun earlier
-/// still has not.
+/// and holds one of its own however often it is Cloned into again; the
+/// destination is judged by `judged` in the same read apart, so what it
+/// reads of the filesystem is bound by the same deadline. `None` where the
+/// reading has not answered by `deadline`, or one begun earlier still has
+/// not.
+#[allow(clippy::too_many_arguments)]
 async fn placed(
     reads: &ReadsApart,
     deadline: tokio::time::Instant,
@@ -509,6 +553,7 @@ async fn placed(
     name: String,
     home: Option<PathBuf>,
     read: impl FnOnce(&str, Option<&Path>) -> Result<PathBuf, CloneRefusal> + Send + 'static,
+    judged: impl FnOnce(&Path) -> Result<(), CloneRefusal> + Send + 'static,
 ) -> Option<Result<(PathBuf, bool), CloneRefusal>> {
     // No Root, or several and none named, is refused without reading one.
     let asked = match (&named, roots.as_slice()) {
@@ -521,6 +566,7 @@ async fn placed(
     let placing = reads.read(Path::new(&asked), move || async move {
         let root = chosen_root(&roots, named.as_deref(), home.as_deref())?;
         let destination = read(root, home.as_deref())?.join(name);
+        judged(&destination)?;
         let occupied = std::fs::symlink_metadata(&destination).is_ok();
         Ok((destination, occupied))
     });
@@ -593,10 +639,10 @@ impl SessionOperations {
     /// Description is begun, and discovery of the Roots is asked for again.
     /// Refuses, saying why and having made nothing, where no Root is there to
     /// take the Clone, where its Root cannot be read, where its name is no
-    /// plain directory name, where something stands at its destination
-    /// already, where a Sidekick on a Peer would Clone into this Server's own
-    /// Sidekick Workspace, and where Git fails it or it outlasts this
-    /// Server's bound on one.
+    /// plain directory name, where it would take the Sidekick Workspace's
+    /// place — or, for a Sidekick on a Peer, go anywhere within it — where
+    /// something stands at its destination already, and where Git fails it
+    /// or it outlasts this Server's bound on one.
     pub(crate) async fn clone_workspace(
         &self,
         request: &CloneWorkspaceRequest,
@@ -612,6 +658,8 @@ impl SessionOperations {
             None => named_by(url)?,
         }
         .to_owned();
+        let sidekick_workspace = self.sidekick_workspace.clone();
+        let from_a_peer = matches!(author, Author::PeerSidekick { .. });
         let Some(placed) = placed(
             &self.cloning.reads,
             deadline,
@@ -620,6 +668,9 @@ impl SessionOperations {
             name,
             self.cloning.home.clone(),
             readable_root,
+            move |destination| {
+                kept_from_sidekick_workspace(&sidekick_workspace, destination, from_a_peer)
+            },
         )
         .await
         else {
@@ -630,11 +681,6 @@ impl SessionOperations {
             });
         };
         let (destination, occupied) = placed?;
-        if matches!(author, Author::PeerSidekick { .. })
-            && self.sidekick_workspace.contains(&destination)
-        {
-            return Err(CloneRefusal::SidekickWorkspace { destination });
-        }
         if occupied {
             return Err(self.occupied(destination, deadline).await);
         }
@@ -1114,6 +1160,7 @@ mod tests {
             "atlas".to_owned(),
             None,
             quiet,
+            |_: &Path| Ok(()),
         );
         assert!(
             tokio::time::timeout(Duration::from_secs(30), placing)
@@ -1143,6 +1190,7 @@ mod tests {
             |_: &str, _: Option<&Path>| {
                 panic!("a Root whose read is outstanding is not read again")
             },
+            |_: &Path| panic!("a Root whose read is outstanding is not read again"),
         );
         assert!(
             tokio::time::timeout(Duration::from_secs(30), again)
@@ -1159,6 +1207,7 @@ mod tests {
             "atlas".to_owned(),
             None,
             |root: &str, _home: Option<&Path>| Ok(PathBuf::from(root)),
+            |_: &Path| Ok(()),
         );
         assert_eq!(
             answering.await,
@@ -1166,6 +1215,60 @@ mod tests {
             "a Root that answers places the Clone directly within it"
         );
         drop(release);
+    }
+
+    /// What judging a destination reads of the filesystem — where the
+    /// Sidekick Workspace is, say, behind a symlink into a mount gone quiet —
+    /// is read apart with the Root, so it holds a Clone no longer than its
+    /// deadline and holds up none of the Server's own threads; and what it
+    /// refuses is the Clone's answer.
+    #[tokio::test]
+    async fn judging_a_destination_holds_a_clone_no_longer_than_its_deadline() {
+        let reads = ReadsApart::new("suru-clone-root-read", 2);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let placing = placed(
+            &reads,
+            tokio::time::Instant::now() + Duration::from_millis(50),
+            vec![rooted("projects")],
+            None,
+            "atlas".to_owned(),
+            None,
+            |root: &str, _home: Option<&Path>| Ok(PathBuf::from(root)),
+            move |_: &Path| {
+                let _ = released.recv();
+                Ok(())
+            },
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), placing)
+                .await
+                .expect("placing a Clone answers by its deadline")
+                .is_none(),
+            "and says it ran out of time"
+        );
+        drop(release);
+
+        let archive = PathBuf::from(rooted("archive"));
+        assert_eq!(
+            placed(
+                &reads,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+                vec![rooted("archive")],
+                None,
+                "sidekick".to_owned(),
+                None,
+                |root: &str, _home: Option<&Path>| Ok(PathBuf::from(root)),
+                |destination: &Path| {
+                    Err(CloneRefusal::SidekickWorkspacePlace {
+                        destination: destination.to_owned(),
+                    })
+                },
+            )
+            .await,
+            Some(Err(CloneRefusal::SidekickWorkspacePlace {
+                destination: archive.join("sidekick"),
+            }))
+        );
     }
 
     /// The Workspace a Clone just landed is read apart within a bound of its
