@@ -39,9 +39,6 @@ pub(crate) fn recovery_for_branch_outcome(
     Ok(recovery)
 }
 
-/// Why a system that does not Clone refuses to.
-const CLONING_UNSUPPORTED: &str = "Cloning a Repository URL is unsupported";
-
 /// `url` with the credential it may carry — the user information before the
 /// host of a URL spelled with a scheme — put out of sight, as the Log spells
 /// a Repository URL. An address of any other form, such as `git@host:path`
@@ -193,32 +190,29 @@ pub trait SourceControl: Send + Sync {
     }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace;
     /// Whether this system Clones a Repository URL into a new directory, as
-    /// [`SourceControl::clone_repository`] does. A system that does not keeps
-    /// the default, which says so.
-    fn clone_capability(&self) -> crate::protocol::SourceControlCapability {
-        crate::protocol::SourceControlCapability::Unsupported {
-            reason: CLONING_UNSUPPORTED.to_owned(),
-        }
-    }
+    /// [`SourceControl::clone_repository`] does. Every system says, as every
+    /// one reads directories, so one that cannot Clone says why here and in
+    /// what [`SourceControl::clone_repository`] answers.
+    fn clone_capability(&self) -> crate::protocol::SourceControlCapability;
     /// Clone the Repository `url` names into `destination`, a directory not
     /// there yet whose parent is, checking out `branch` or the Repository's
     /// default, and answer the Workspace made there as discovery reads it.
     /// The Clone is the system's ordinary one, and asks no one anything: a
     /// credential it cannot find fails it at once. Nothing stands at
     /// `destination` until the Clone is whole, so no half-made one is ever
-    /// taken for a Workspace. Anything already standing at `destination`
-    /// refuses it and is left as it was; a Clone that fails, is still
-    /// running once `timeout` has passed, or is abandoned leaves nothing
-    /// behind.
+    /// taken for a Workspace, and nothing standing there is ever replaced:
+    /// anything already there, or come to stand there meanwhile, refuses it
+    /// and is left as it was. `timeout` bounds the whole of it but reading
+    /// the Workspace once it has its name. A Clone that fails leaves nothing
+    /// behind once it answers; what one stopped at its deadline, or
+    /// abandoned, began is removed on a task of its own.
     async fn clone_repository(
         &self,
-        _url: &str,
-        _destination: &Path,
-        _branch: Option<&str>,
-        _timeout: std::time::Duration,
-    ) -> Result<ResolvedWorkspace, CloneFailure> {
-        Err(CloneFailure::Failed(CLONING_UNSUPPORTED.to_owned()))
-    }
+        url: &str,
+        destination: &Path,
+        branch: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<ResolvedWorkspace, CloneFailure>;
     /// Rename the branch a fresh preparation created for a Managed Worktree
     /// to the first of [`naming::numbered`] `proposal` — a fragment already
     /// shaped by [`naming::proposed_fragment`] — that no other branch holds,
@@ -1117,6 +1111,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Why the stand-ins here Clone nothing.
+    const STANDS_IN: &str = "This stand-in reads Repositories it is told of and Clones nothing";
+
     /// Knows one Repository by its metadata directory and nothing else.
     struct MetadataOnly {
         metadata: PathBuf,
@@ -1125,6 +1122,22 @@ mod tests {
 
     #[async_trait]
     impl SourceControl for MetadataOnly {
+        // Knows Repositories only by what it is told, with nothing to Clone
+        // from or into.
+        fn clone_capability(&self) -> crate::protocol::SourceControlCapability {
+            crate::protocol::SourceControlCapability::Unsupported {
+                reason: STANDS_IN.to_owned(),
+            }
+        }
+        async fn clone_repository(
+            &self,
+            _url: &str,
+            _destination: &Path,
+            _branch: Option<&str>,
+            _timeout: std::time::Duration,
+        ) -> Result<ResolvedWorkspace, CloneFailure> {
+            Err(CloneFailure::Failed(STANDS_IN.to_owned()))
+        }
         async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
             let mut resolved = ResolvedWorkspace::directory(directory.to_owned());
             if directory == self.metadata {
@@ -1165,6 +1178,22 @@ mod tests {
 
     #[async_trait]
     impl SourceControl for Counting {
+        // Knows Repositories only by what it is told, with nothing to Clone
+        // from or into.
+        fn clone_capability(&self) -> crate::protocol::SourceControlCapability {
+            crate::protocol::SourceControlCapability::Unsupported {
+                reason: STANDS_IN.to_owned(),
+            }
+        }
+        async fn clone_repository(
+            &self,
+            _url: &str,
+            _destination: &Path,
+            _branch: Option<&str>,
+            _timeout: std::time::Duration,
+        ) -> Result<ResolvedWorkspace, CloneFailure> {
+            Err(CloneFailure::Failed(STANDS_IN.to_owned()))
+        }
         async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
             *self
                 .readings

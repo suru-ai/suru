@@ -425,6 +425,20 @@ struct DelayedAvailableObservation {
 
 #[async_trait::async_trait]
 impl SourceControl for DelayedAvailableObservation {
+    fn clone_capability(&self) -> suru::protocol::SourceControlCapability {
+        self.git.clone_capability()
+    }
+    async fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        branch: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<suru::protocol::ResolvedWorkspace, suru::source_control::CloneFailure> {
+        self.git
+            .clone_repository(url, destination, branch, timeout)
+            .await
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         self.git.discover(directory).await
     }
@@ -478,6 +492,20 @@ struct ObservationDuringRemoval {
 
 #[async_trait::async_trait]
 impl SourceControl for ObservationDuringRemoval {
+    fn clone_capability(&self) -> suru::protocol::SourceControlCapability {
+        self.git.clone_capability()
+    }
+    async fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        branch: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<suru::protocol::ResolvedWorkspace, suru::source_control::CloneFailure> {
+        self.git
+            .clone_repository(url, destination, branch, timeout)
+            .await
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         self.git.discover(directory).await
     }
@@ -952,6 +980,20 @@ struct PauseEagerRemoval {
 
 #[async_trait::async_trait]
 impl SourceControl for PauseEagerRemoval {
+    fn clone_capability(&self) -> suru::protocol::SourceControlCapability {
+        self.git.clone_capability()
+    }
+    async fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        branch: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<suru::protocol::ResolvedWorkspace, suru::source_control::CloneFailure> {
+        self.git
+            .clone_repository(url, destination, branch, timeout)
+            .await
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         self.git.discover(directory).await
     }
@@ -993,6 +1035,20 @@ struct CountReclaimCandidates {
 
 #[async_trait::async_trait]
 impl SourceControl for CountReclaimCandidates {
+    fn clone_capability(&self) -> suru::protocol::SourceControlCapability {
+        self.git.clone_capability()
+    }
+    async fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        branch: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<suru::protocol::ResolvedWorkspace, suru::source_control::CloneFailure> {
+        self.git
+            .clone_repository(url, destination, branch, timeout)
+            .await
+    }
     async fn reclaim_candidate_observed(&self, _target: &CheckoutRemovalTarget) {
         self.candidates.fetch_add(1, Ordering::SeqCst);
     }
@@ -1031,6 +1087,20 @@ impl SourceControl for CountReclaimCandidates {
 
 #[async_trait::async_trait]
 impl SourceControl for PauseAfterCandidateObservation {
+    fn clone_capability(&self) -> suru::protocol::SourceControlCapability {
+        self.git.clone_capability()
+    }
+    async fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        branch: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<suru::protocol::ResolvedWorkspace, suru::source_control::CloneFailure> {
+        self.git
+            .clone_repository(url, destination, branch, timeout)
+            .await
+    }
     async fn reclaim_candidate_observed(&self, _target: &CheckoutRemovalTarget) {
         if !self.paused.swap(true, Ordering::SeqCst) {
             self.inspected.notify_one();
@@ -1803,6 +1873,20 @@ impl SilentDirectory {
 
 #[async_trait::async_trait]
 impl SourceControl for SilentDirectory {
+    fn clone_capability(&self) -> suru::protocol::SourceControlCapability {
+        self.git.clone_capability()
+    }
+    async fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        branch: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<suru::protocol::ResolvedWorkspace, suru::source_control::CloneFailure> {
+        self.git
+            .clone_repository(url, destination, branch, timeout)
+            .await
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         *self
             .readings
@@ -2227,6 +2311,20 @@ struct FailFirstPreparationRetirement {
 
 #[async_trait::async_trait]
 impl SourceControl for FailFirstPreparationRetirement {
+    fn clone_capability(&self) -> suru::protocol::SourceControlCapability {
+        self.git.clone_capability()
+    }
+    async fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        branch: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<suru::protocol::ResolvedWorkspace, suru::source_control::CloneFailure> {
+        self.git
+            .clone_repository(url, destination, branch, timeout)
+            .await
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         self.git.discover(directory).await
     }
@@ -2276,6 +2374,20 @@ impl SourceControl for FailFirstPreparationRetirement {
 
 #[async_trait::async_trait]
 impl SourceControl for FailFirstReclaim {
+    fn clone_capability(&self) -> suru::protocol::SourceControlCapability {
+        self.git.clone_capability()
+    }
+    async fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        branch: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<suru::protocol::ResolvedWorkspace, suru::source_control::CloneFailure> {
+        self.git
+            .clone_repository(url, destination, branch, timeout)
+            .await
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         self.git.discover(directory).await
     }

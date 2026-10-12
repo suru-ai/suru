@@ -253,6 +253,20 @@ impl HeldGit {
 
 #[async_trait::async_trait]
 impl SourceControl for HeldGit {
+    fn clone_capability(&self) -> suru::protocol::SourceControlCapability {
+        self.git.clone_capability()
+    }
+    async fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        branch: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<suru::protocol::ResolvedWorkspace, suru::source_control::CloneFailure> {
+        self.git
+            .clone_repository(url, destination, branch, timeout)
+            .await
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         let discovering = suru::paths::canonical(directory).unwrap_or_else(|_| directory.into());
         let held = {

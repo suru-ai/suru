@@ -534,6 +534,24 @@ async fn session_creation_rejects_execution_directory_that_changed_since_discove
         async fn discover(&self, _directory: &Path) -> ResolvedWorkspace {
             ResolvedWorkspace::directory(self.0.clone())
         }
+        // Reads every directory as one it remembers, with no Repository to
+        // Clone from or into.
+        fn clone_capability(&self) -> suru::protocol::SourceControlCapability {
+            suru::protocol::SourceControlCapability::Unsupported {
+                reason: "This stand-in reads directories and Clones nothing".to_owned(),
+            }
+        }
+        async fn clone_repository(
+            &self,
+            _url: &str,
+            _destination: &Path,
+            _branch: Option<&str>,
+            _timeout: std::time::Duration,
+        ) -> Result<ResolvedWorkspace, suru::source_control::CloneFailure> {
+            Err(suru::source_control::CloneFailure::Failed(
+                "This stand-in reads directories and Clones nothing".to_owned(),
+            ))
+        }
     }
     let temporary = tempfile::tempdir().unwrap();
     let root = canonical(temporary.path());
@@ -713,6 +731,20 @@ async fn a_failed_worktree_listing_retires_nothing_it_could_not_speak_for() {
     }
     #[async_trait::async_trait]
     impl suru::source_control::SourceControl for FailingListing {
+        fn clone_capability(&self) -> suru::protocol::SourceControlCapability {
+            self.git.clone_capability()
+        }
+        async fn clone_repository(
+            &self,
+            url: &str,
+            destination: &Path,
+            branch: Option<&str>,
+            timeout: std::time::Duration,
+        ) -> Result<suru::protocol::ResolvedWorkspace, suru::source_control::CloneFailure> {
+            self.git
+                .clone_repository(url, destination, branch, timeout)
+                .await
+        }
         async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
             self.git.discover(directory).await
         }
