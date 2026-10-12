@@ -1300,6 +1300,15 @@ pub struct WorktreeSettings {
     pub auto_reclaim: AutoReclaim,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSettings {
+    /// The Workspace Roots: the directories the user's work lives in, each
+    /// spelled as they named it — an absolute path, or one beginning with `~`
+    /// — whether or not anything is there.
+    pub roots: Vec<String>,
+}
+
 impl AutoSettle {
     pub const MINIMUM_IDLE_DAYS: u64 = 1;
 
@@ -1892,6 +1901,7 @@ pub struct EffectiveSettings {
     pub aside: AsideSettings,
     pub sidekick: SidekickSettings,
     pub worktree: WorktreeSettings,
+    pub workspace: WorkspaceSettings,
     pub provider: ProviderSettings,
     pub serving: ServingSettings,
     pub broker: BrokerSettings,
@@ -2118,6 +2128,11 @@ pub enum SettingMutation {
     },
     WorktreeAutoReclaim {
         value: Option<AutoReclaim>,
+    },
+    /// Pins the whole list of Workspace Roots at once, so adding, editing and
+    /// removing Roots is one change.
+    WorkspaceRoots {
+        value: Option<Vec<String>>,
     },
     ProviderCodexEnabled {
         value: Option<bool>,

@@ -76,6 +76,7 @@ const ASIDE_INITIAL_VISIBILITY: &str = "aside.initialVisibility";
 const ASIDE_INITIAL_WIDTH: &str = "aside.initialWidth";
 const SIDEKICK_HIDE_SUBSESSIONS: &str = "sidekick.hideSubsessions";
 const WORKTREE_AUTO_RECLAIM: &str = "worktree.autoReclaim";
+const WORKSPACE_ROOTS: &str = "workspace.roots";
 const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
 const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary";
 const PROVIDER_CODEX_APPROVAL_POLICY: &str = "provider.codex.approvalPolicy";
@@ -215,7 +216,21 @@ pub struct SettingDescriptor {
     pub reset: SettingMutation,
     /// Writes a pinned JSON value into the typed field it governs, or reports
     /// that the value is not one of the accepted ones.
-    apply: fn(&mut EffectiveSettings, &Value) -> bool,
+    apply: fn(&mut EffectiveSettings, &Value) -> Applied,
+}
+
+/// What a Setting made of a value a Config Document pins.
+#[derive(Debug, Eq, PartialEq)]
+enum Applied {
+    /// The value is in force, whole.
+    Whole,
+    /// The value is in force without the entries of it the Setting ignored,
+    /// each alone, as a list Setting ignores an entry it does not accept: why
+    /// each was ignored, naming it, in the words a diagnostic gives.
+    Partly(Vec<String>),
+    /// The value is none the Setting accepts, which leaves its typed field as
+    /// it was.
+    Refused,
 }
 
 /// What a Setting accepts. Almost every Setting is Fixed: a set of compile-time
@@ -276,6 +291,11 @@ pub enum SettingChoiceSurface {
         current: fn(&EffectiveSettings) -> String,
         pin: fn(String) -> SettingMutation,
     },
+    /// A list editor whose rows the reader adds, edits and removes, saved as
+    /// one pin of the whole list. Like the numeric editor it is declared whole
+    /// by the Setting, so the panel hosts it for any Setting holding a list of
+    /// strings.
+    TextList(TextListSettingChoice),
 }
 
 /// Everything a reusable numeric editor needs to edit one Setting. Callers
@@ -324,6 +344,126 @@ impl NumericSettingChoice {
         (self.spell)(value)
     }
 }
+
+/// Everything a reusable list editor needs to edit one Setting holding a list
+/// of strings. The editor keeps rows of text and hands back the whole list,
+/// which becomes one typed mutation or names the first entry the Setting
+/// refuses; which typed field the list belongs to, and what one entry must be,
+/// stay behind this interface. The loader holds a Config Document's list to
+/// the same rule, so the editor and the document can never disagree about an
+/// entry.
+#[derive(Clone, Copy, Debug)]
+pub struct TextListSettingChoice {
+    label: &'static str,
+    placeholder: &'static str,
+    /// What every entry must be, in words that follow "is not".
+    entry: &'static str,
+    admits: fn(&str) -> bool,
+    seed: fn(&EffectiveSettings) -> Vec<String>,
+    pin: fn(Vec<String>) -> SettingMutation,
+}
+
+/// An entry a list Setting refuses: where it stands in the list, and why,
+/// naming it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefusedEntry {
+    pub index: usize,
+    pub reason: String,
+}
+
+impl TextListSettingChoice {
+    pub const fn new(
+        label: &'static str,
+        placeholder: &'static str,
+        entry: &'static str,
+        admits: fn(&str) -> bool,
+        seed: fn(&EffectiveSettings) -> Vec<String>,
+        pin: fn(Vec<String>) -> SettingMutation,
+    ) -> Self {
+        Self {
+            label,
+            placeholder,
+            entry,
+            admits,
+            seed,
+            pin,
+        }
+    }
+
+    /// What the list holds, for the editor's heading.
+    pub fn label(self) -> &'static str {
+        self.label
+    }
+
+    /// What the row a reader adds an entry at reads before they type.
+    pub fn placeholder(self) -> &'static str {
+        self.placeholder
+    }
+
+    /// The entries in force, which the editor opens on.
+    pub fn seed(self, settings: &EffectiveSettings) -> Vec<String> {
+        (self.seed)(settings)
+    }
+
+    /// The one mutation pinning `entries` whole, or the first of them the
+    /// Setting refuses, so nothing is pinned until every entry is one it takes.
+    pub fn accept(self, entries: Vec<String>) -> Result<SettingMutation, RefusedEntry> {
+        match entries.iter().position(|entry| !(self.admits)(entry)) {
+            Some(index) => Err(RefusedEntry {
+                index,
+                reason: format!("\"{}\" is not {}", entries[index], self.entry),
+            }),
+            None => Ok((self.pin)(entries)),
+        }
+    }
+
+    /// Writes the entries of a list a Config Document pins that the Setting
+    /// takes, ignoring each other entry alone and saying why, naming it as the
+    /// document spells it. A value that is no list at all is refused whole.
+    fn apply(self, value: &Value, write: impl FnOnce(Vec<String>)) -> Applied {
+        let Value::Array(entries) = value else {
+            return Applied::Refused;
+        };
+        let mut ignored = Vec::new();
+        let taken = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Value::String(text) if (self.admits)(text) => Some(text.clone()),
+                refused => {
+                    ignored.push(format!(
+                        "ignored the entry {refused} because it is not {}",
+                        self.entry
+                    ));
+                    None
+                }
+            })
+            .collect();
+        write(taken);
+        if ignored.is_empty() {
+            Applied::Whole
+        } else {
+            Applied::Partly(ignored)
+        }
+    }
+}
+
+/// Whether `root` names one directory on this machine however Suru's working
+/// directory moves: absolute, as this platform judges a path — a drive-rooted
+/// one on Windows — or beginning with `~`, for the user's home. Whether
+/// anything is there is no part of it, so a Root on an unplugged drive keeps
+/// its place.
+fn admits_workspace_root(root: &str) -> bool {
+    root.starts_with('~') || Path::new(root).is_absolute()
+}
+
+const WORKSPACE_ROOTS_LIST: TextListSettingChoice = TextListSettingChoice::new(
+    "Directories your work lives in",
+    "add a Root",
+    "an absolute path or a path beginning with ~",
+    admits_workspace_root,
+    |settings| settings.workspace.roots.clone(),
+    |roots| SettingMutation::WorkspaceRoots { value: Some(roots) },
+);
 
 fn spell_session_content_width(maximum: u64) -> String {
     format!("max {maximum} columns")
@@ -656,7 +796,8 @@ impl SettingDescriptor {
     /// says what it accepts instead.
     pub fn pin(&self, value: &Value) -> Option<SettingMutation> {
         let mut accepted = EffectiveSettings::default();
-        (self.apply)(&mut accepted, value).then(|| in_force(&self.reset, &accepted))
+        ((self.apply)(&mut accepted, value) == Applied::Whole)
+            .then(|| in_force(&self.reset, &accepted))
     }
 
     fn effective_index(&self, settings: &EffectiveSettings) -> Option<usize> {
@@ -780,6 +921,9 @@ fn in_force(mutation: &SettingMutation, settings: &EffectiveSettings) -> Setting
         }
         SettingMutation::WorktreeAutoReclaim { .. } => SettingMutation::WorktreeAutoReclaim {
             value: Some(settings.worktree.auto_reclaim),
+        },
+        SettingMutation::WorkspaceRoots { .. } => SettingMutation::WorkspaceRoots {
+            value: Some(settings.workspace.roots.clone()),
         },
         SettingMutation::ProviderCodexEnabled { .. } => SettingMutation::ProviderCodexEnabled {
             value: Some(settings.provider.codex.enabled),
@@ -1268,10 +1412,10 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         reset: SettingMutation::SidebarInitialWidth { value: None },
         apply: |settings, value| {
             let Some(width) = side_column_width(value) else {
-                return false;
+                return Applied::Refused;
             };
             settings.sidebar.initial_width = width;
-            true
+            Applied::Whole
         },
     },
     SettingDescriptor {
@@ -1407,10 +1551,10 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         reset: SettingMutation::AsideInitialWidth { value: None },
         apply: |settings, value| {
             let Some(width) = side_column_width(value) else {
-                return false;
+                return Applied::Refused;
             };
             settings.aside.initial_width = width;
-            true
+            Applied::Whole
         },
     },
     // Each Provider's Enablement is ordered immediately before that Provider's
@@ -1470,6 +1614,29 @@ pub const SCHEMA: &[SettingDescriptor] = &[
             apply_value(value, |auto_reclaim| {
                 settings.worktree.auto_reclaim = auto_reclaim;
             })
+        },
+    },
+    SettingDescriptor {
+        key: WORKSPACE_ROOTS,
+        label: "Workspace Roots",
+        description: "The directories your work lives in, each an absolute path or one beginning with ~",
+        group: SettingGroup::SourceControl,
+        scope: SettingScope::Server,
+        sidekick: SidekickAccess::ReadOnly {
+            why: "the Workspace Roots bound where a Sidekick may write",
+        },
+        values: SettingValues::Open {
+            named: &[],
+            accepts: "a list of absolute paths or paths beginning with ~",
+            spell: |settings| match settings.workspace.roots.as_slice() {
+                [] => "none".to_owned(),
+                roots => roots.join(", "),
+            },
+            chosen_at: Some(SettingChoiceSurface::TextList(WORKSPACE_ROOTS_LIST)),
+        },
+        reset: SettingMutation::WorkspaceRoots { value: None },
+        apply: |settings, value| {
+            WORKSPACE_ROOTS_LIST.apply(value, |roots| settings.workspace.roots = roots)
         },
     },
     SettingDescriptor {
@@ -1882,10 +2049,10 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         reset: SettingMutation::BrokerMaxDepth { value: None },
         apply: |settings, value| {
             let Some(depth) = broker_cap(value) else {
-                return false;
+                return Applied::Refused;
             };
             settings.broker.max_depth = depth;
-            true
+            Applied::Whole
         },
     },
     SettingDescriptor {
@@ -1909,10 +2076,10 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         reset: SettingMutation::BrokerMaxConcurrentSubagents { value: None },
         apply: |settings, value| {
             let Some(count) = broker_cap(value) else {
-                return false;
+                return Applied::Refused;
             };
             settings.broker.max_concurrent_subagents = count;
-            true
+            Applied::Whole
         },
     },
 ];
@@ -1944,13 +2111,13 @@ pub fn provider_settings(provider: &ProviderId) -> Vec<&'static SettingDescripto
         .collect()
 }
 
-fn apply_value<T: serde::de::DeserializeOwned>(value: &Value, write: impl FnOnce(T)) -> bool {
+fn apply_value<T: serde::de::DeserializeOwned>(value: &Value, write: impl FnOnce(T)) -> Applied {
     match serde_json::from_value(value.clone()) {
         Ok(value) => {
             write(value);
-            true
+            Applied::Whole
         }
-        Err(_) => false,
+        Err(_) => Applied::Refused,
     }
 }
 
@@ -2102,6 +2269,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
             (SIDEKICK_HIDE_SUBSESSIONS, pinned(value))
         }
         SettingMutation::WorktreeAutoReclaim { value } => (WORKTREE_AUTO_RECLAIM, pinned(value)),
+        SettingMutation::WorkspaceRoots { value } => (WORKSPACE_ROOTS, pinned(value)),
         SettingMutation::ProviderCodexEnabled { value } => (PROVIDER_CODEX_ENABLED, pinned(value)),
         SettingMutation::ProviderCodexReasoningSummary { value } => {
             (PROVIDER_CODEX_REASONING_SUMMARY, pinned(value))
@@ -2415,18 +2583,32 @@ fn apply_key(
         return;
     }
     if let Some(descriptor) = SCHEMA.iter().find(|descriptor| descriptor.key == key) {
-        if (descriptor.apply)(&mut snapshot.settings, value) {
-            if !snapshot.pinned.contains(&key) {
-                snapshot.pinned.push(key);
+        let ignored = match (descriptor.apply)(&mut snapshot.settings, value) {
+            Applied::Refused => vec![format!(
+                "ignored because its value is not {}",
+                descriptor.expected()
+            )],
+            // A list holding an entry the Setting does not take still pins
+            // the rest of it, each entry ignored alone named by its own
+            // diagnostic.
+            applied => {
+                if !snapshot.pinned.contains(&key) {
+                    snapshot.pinned.push(key.clone());
+                }
+                match applied {
+                    Applied::Partly(ignored) => ignored,
+                    Applied::Whole | Applied::Refused => Vec::new(),
+                }
             }
-        } else {
-            snapshot.diagnostics.push(SettingsDiagnostic {
+        };
+        snapshot
+            .diagnostics
+            .extend(ignored.into_iter().map(|message| SettingsDiagnostic {
                 severity: SettingsDiagnosticSeverity::Warning,
                 file: path.to_path_buf(),
-                key: Some(key),
-                message: format!("ignored because its value is not {}", descriptor.expected()),
-            });
-        }
+                key: Some(key.clone()),
+                message,
+            }));
         return;
     }
     let is_group = SCHEMA
@@ -2554,7 +2736,8 @@ mod tests {
             for choice in descriptor.values.named() {
                 let mut settings = EffectiveSettings::default();
                 assert!(
-                    (descriptor.apply)(&mut settings, &pinned_value(&choice.mutation())),
+                    (descriptor.apply)(&mut settings, &pinned_value(&choice.mutation()))
+                        == Applied::Whole,
                     "{} rejects its own choice {:?}",
                     descriptor.key,
                     choice.value
@@ -2594,7 +2777,8 @@ mod tests {
                     .next_choice(&settings)
                     .expect("a Setting always offers somewhere to step");
                 assert!(
-                    (descriptor.apply)(&mut settings, &pinned_value(&next.mutation())),
+                    (descriptor.apply)(&mut settings, &pinned_value(&next.mutation()))
+                        == Applied::Whole,
                     "{} rejects the choice it stepped to",
                     descriptor.key
                 );
@@ -2656,6 +2840,8 @@ mod tests {
                 // `false`, unquoted, because that is what the reader must type.
                 "one of \"release\" or \"manual\"".to_owned(),
                 "one of \"off\" or a whole number of days, at least 1".to_owned(),
+                // A list names what each of its entries must be.
+                "a list of absolute paths or paths beginning with ~".to_owned(),
                 "one of true or false".to_owned(),
                 "one of \"auto\", \"concise\", \"detailed\", or \"none\"".to_owned(),
                 "one of \"untrusted\", \"on-request\", or \"never\"".to_owned(),
@@ -2707,7 +2893,10 @@ mod tests {
         );
 
         let mutation = choice.accept("275").expect("a millisecond delay is valid");
-        assert!((descriptor.apply)(&mut settings, &pinned_value(&mutation)));
+        assert_eq!(
+            (descriptor.apply)(&mut settings, &pinned_value(&mutation)),
+            Applied::Whole
+        );
         assert_eq!(
             settings.transcript.command_auto_expand,
             CommandAutoExpand::AfterMillis(275)
@@ -2792,10 +2981,10 @@ mod tests {
             None,
             "a Setting holding one of its named values opens the picker on nothing in particular"
         );
-        assert!((descriptor.apply)(
-            &mut settings,
-            &pinned_value(&pin(chosen.clone()))
-        ));
+        assert_eq!(
+            (descriptor.apply)(&mut settings, &pinned_value(&pin(chosen.clone()))),
+            Applied::Whole
+        );
 
         assert_eq!(
             settings.derivation.errand,
@@ -2847,8 +3036,9 @@ mod tests {
                 "{} must leave its Provider on unless the user says otherwise",
                 descriptor.key
             );
-            assert!(
+            assert_eq!(
                 (descriptor.apply)(&mut settings, &Value::Bool(false)),
+                Applied::Whole,
                 "{} must accept a JSON boolean",
                 descriptor.key
             );
@@ -2897,7 +3087,10 @@ mod tests {
                     choice.value
                 );
                 let mut settings = defaults.clone();
-                assert!((descriptor.apply)(&mut settings, &choice.pinned_value()));
+                assert_eq!(
+                    (descriptor.apply)(&mut settings, &choice.pinned_value()),
+                    Applied::Whole
+                );
                 assert_eq!(
                     descriptor.value(&settings),
                     choice.pinned_value(),
@@ -3120,6 +3313,7 @@ mod tests {
             declaring(|access| matches!(access, SidekickAccess::ReadOnly { .. })),
             [
                 "worktree.autoReclaim",
+                "workspace.roots",
                 "provider.codex.approvalPolicy",
                 "provider.codex.sandboxMode",
                 "provider.copilot.permissions",
@@ -3128,7 +3322,7 @@ mod tests {
         );
         assert_eq!(
             declaring(|access| access == SidekickAccess::ReadAndChange).len(),
-            SCHEMA.len() - 9
+            SCHEMA.len() - 10
         );
         for descriptor in SCHEMA {
             if let SidekickAccess::ReadOnly { why } = descriptor.sidekick {
@@ -3139,6 +3333,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The Workspace Roots' list editor, read off the Setting itself.
+    fn workspace_roots_list() -> TextListSettingChoice {
+        let Some(SettingChoiceSurface::TextList(list)) = setting(WORKSPACE_ROOTS).chosen_at()
+        else {
+            panic!("the Workspace Roots are chosen at the list editor");
+        };
+        list
+    }
+
+    /// A Workspace Root names one directory on this machine: absolute as the
+    /// platform under test judges a path — drive-rooted on Windows, where a
+    /// POSIX path is relative — or beginning with `~`. Nothing need be there.
+    #[test]
+    fn a_workspace_root_is_absolute_or_begins_with_a_tilde_and_need_not_exist() {
+        let list = workspace_roots_list();
+        let admitted = ["~", "~/src", "~\\src", ABSOLUTE_ROOT, NOWHERE_ROOT];
+        assert_eq!(
+            list.accept(admitted.map(str::to_owned).to_vec()),
+            Ok(SettingMutation::WorkspaceRoots {
+                value: Some(admitted.map(str::to_owned).to_vec()),
+            }),
+            "every one of them is pinned, whole, by one mutation"
+        );
+        for relative in [
+            "projects",
+            "./projects",
+            "../work",
+            "",
+            " ",
+            RELATIVE_ELSEWHERE,
+        ] {
+            assert_eq!(
+                list.accept(vec!["~/src".to_owned(), relative.to_owned()]),
+                Err(RefusedEntry {
+                    index: 1,
+                    reason: format!(
+                        "\"{relative}\" is not an absolute path or a path beginning with ~"
+                    ),
+                }),
+                "{relative:?} is refused, by name"
+            );
+        }
+    }
+
+    /// A Config Document's list is held to the editor's own rule, each entry
+    /// it refuses ignored alone, naming it as the document spells it.
+    #[test]
+    fn a_documents_workspace_roots_are_held_to_the_editors_rule_entry_by_entry() {
+        let descriptor = setting(WORKSPACE_ROOTS);
+        let mut settings = EffectiveSettings::default();
+        assert_eq!(
+            (descriptor.apply)(
+                &mut settings,
+                &serde_json::json!(["~/src", "projects", ABSOLUTE_ROOT, null])
+            ),
+            Applied::Partly(vec![
+                "ignored the entry \"projects\" because it is not an absolute path or a path \
+                 beginning with ~"
+                    .to_owned(),
+                "ignored the entry null because it is not an absolute path or a path beginning \
+                 with ~"
+                    .to_owned(),
+            ])
+        );
+        assert_eq!(settings.workspace.roots, ["~/src", ABSOLUTE_ROOT]);
+        assert_eq!(
+            descriptor.pin(&serde_json::json!(["~/src", "projects"])),
+            None,
+            "a list with an entry the Setting refuses pins nothing for a Sidekick"
+        );
+        assert_eq!(
+            descriptor.spelling(&settings).as_deref(),
+            Some(format!("~/src, {ABSOLUTE_ROOT}").as_str())
+        );
+        assert_eq!(
+            descriptor
+                .spelling(&EffectiveSettings::default())
+                .as_deref(),
+            Some("none")
+        );
     }
 
     #[test]
@@ -3167,6 +3443,24 @@ mod tests {
     const XDG_CONFIG_HOME: &str = "/home/user/.xdg";
     #[cfg(not(windows))]
     const HOME_DIR: &str = "/home/user";
+
+    /// Workspace Roots rooted for the platform under test, one on a drive
+    /// that is not there: a Root need not exist.
+    #[cfg(windows)]
+    const ABSOLUTE_ROOT: &str = r"C:\Users\user\src";
+    #[cfg(windows)]
+    const NOWHERE_ROOT: &str = r"Q:\unplugged\work";
+    #[cfg(not(windows))]
+    const ABSOLUTE_ROOT: &str = "/home/user/src";
+    #[cfg(not(windows))]
+    const NOWHERE_ROOT: &str = "/Volumes/unplugged/work";
+
+    /// A path absolute on the other platforms but not this one: Windows reads
+    /// a path with no drive as relative, and POSIX a drive-rooted one.
+    #[cfg(windows)]
+    const RELATIVE_ELSEWHERE: &str = "/home/user/src";
+    #[cfg(not(windows))]
+    const RELATIVE_ELSEWHERE: &str = r"C:\Users\user\src";
 
     #[test]
     fn suru_config_dir_overrides_every_other_config_root() {

@@ -1458,6 +1458,220 @@ async fn auto_reclaim_rejects_values_below_one_with_the_usual_diagnostic() {
     server.shutdown().await.expect("shut down server");
 }
 
+/// A Workspace Root rooted the way the platform under test roots an absolute
+/// path: a POSIX `/srv/work` is relative to Windows, which is given a
+/// drive-rooted one instead. Nothing is there, since a Root need not exist.
+#[cfg(windows)]
+const ABSOLUTE_ROOT: &str = r"D:\work";
+#[cfg(not(windows))]
+const ABSOLUTE_ROOT: &str = "/srv/work";
+
+/// `text` as a Config Document spells a string, which escapes a Windows
+/// path's backslashes.
+fn json_string(text: &str) -> String {
+    serde_json::to_string(text).expect("a string always serializes")
+}
+
+/// Why each Workspace Root a Config Document names that is neither absolute
+/// nor begins with `~` is ignored.
+const NOT_A_ROOT: &str = "because it is not an absolute path or a path beginning with ~";
+
+#[tokio::test]
+async fn workspace_roots_pin_from_a_document_round_trip_whole_and_reach_every_client() {
+    assert!(
+        suru::protocol::EffectiveSettings::default()
+            .workspace
+            .roots
+            .is_empty(),
+        "no Workspace Root is named until the user names one"
+    );
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let named = format!("[\"~/src\",   {}]", json_string(ABSOLUTE_ROOT));
+    let original = format!(
+        concat!(
+            "{{\n",
+            "  // Where my work lives.\n",
+            "  \"workspace\": {{ \"roots\": {} }},\n",
+            "  \"transcript\": {{ \"reasoningVisibility\": \"shown\" }},\n",
+            "}}\n",
+        ),
+        named
+    );
+    std::fs::write(config_dir.path().join("suru.jsonc"), &original).expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-workspace-roots")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    let (mut editor, opening) = attach(state_dir.path(), "settings-workspace-roots").await;
+    let (mut onlooker, _) = attach(state_dir.path(), "settings-workspace-roots").await;
+
+    assert_eq!(opening.settings.workspace.roots, ["~/src", ABSOLUTE_ROOT]);
+    assert_eq!(
+        opening.pinned,
+        ["transcript.reasoningVisibility", "workspace.roots"]
+    );
+    assert_eq!(opening.diagnostics, []);
+
+    // One mutation carries the whole list: a Root taken away, one kept, and
+    // one added, in the order the user put them.
+    let answered = editor
+        .mutate_setting(SettingMutation::WorkspaceRoots {
+            value: Some(vec![ABSOLUTE_ROOT.to_owned(), "~/notes".to_owned()]),
+        })
+        .await
+        .expect("name the Workspace Roots");
+    assert_eq!(
+        answered.settings.workspace.roots,
+        [ABSOLUTE_ROOT, "~/notes"]
+    );
+    assert_eq!(answered.diagnostics, []);
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, answered);
+    }
+    assert_eq!(
+        config_document(config_dir.path()),
+        original.replace(
+            &named,
+            &format!("[{}, \"~/notes\"]", json_string(ABSOLUTE_ROOT))
+        ),
+        "only the Roots' bytes change"
+    );
+
+    let reset = editor
+        .mutate_setting(SettingMutation::WorkspaceRoots { value: None })
+        .await
+        .expect("take the Workspace Roots out of the document");
+    assert!(reset.settings.workspace.roots.is_empty());
+    assert_eq!(reset.pinned, ["transcript.reasoningVisibility"]);
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, reset);
+    }
+    let document = config_document(config_dir.path());
+    assert!(
+        !document.contains("roots") && document.contains("\"reasoningVisibility\": \"shown\""),
+        "the reset takes the Roots alone out: {document}"
+    );
+
+    drop(editor);
+    drop(onlooker);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_workspace_root_neither_absolute_nor_beginning_with_a_tilde_is_ignored_alone_naming_it() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        format!(
+            r#"{{
+                "workspace": {{ "roots": ["~/src", "projects", "", {}, 7, "~"] }},
+                "transcript": {{ "reasoningVisibility": "shown" }}
+            }}"#,
+            json_string(ABSOLUTE_ROOT)
+        ),
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-workspace-roots-invalid")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (client, snapshot) = attach(state_dir.path(), "settings-workspace-roots-invalid").await;
+    assert_eq!(
+        snapshot.settings.workspace.roots,
+        ["~/src", ABSOLUTE_ROOT, "~"],
+        "every other Root stands, a drive-rooted one on Windows among them"
+    );
+    assert_eq!(
+        snapshot.settings.transcript.reasoning_visibility,
+        ReasoningVisibility::Shown
+    );
+    assert_eq!(
+        snapshot.pinned,
+        ["transcript.reasoningVisibility", "workspace.roots"]
+    );
+    let refusals = snapshot
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            assert_eq!(diagnostic.severity, SettingsDiagnosticSeverity::Warning);
+            assert_eq!(diagnostic.file, config_dir.path().join("suru.jsonc"));
+            assert_eq!(diagnostic.key.as_deref(), Some("workspace.roots"));
+            diagnostic.message.as_str()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        refusals,
+        [
+            format!("ignored the entry \"projects\" {NOT_A_ROOT}"),
+            format!("ignored the entry \"\" {NOT_A_ROOT}"),
+            format!("ignored the entry 7 {NOT_A_ROOT}"),
+        ],
+        "each refusal names the entry it ignored"
+    );
+
+    // A Client's own mutation is held to the same rule once it lands.
+    let answered = client
+        .mutate_setting(SettingMutation::WorkspaceRoots {
+            value: Some(vec!["~/src".to_owned(), "work/projects".to_owned()]),
+        })
+        .await
+        .expect("name a relative Root among the Workspace Roots");
+    assert_eq!(answered.settings.workspace.roots, ["~/src"]);
+    let [diagnostic] = answered.diagnostics.as_slice() else {
+        panic!("expected one diagnostic: {:?}", answered.diagnostics);
+    };
+    assert_eq!(
+        diagnostic.message,
+        format!("ignored the entry \"work/projects\" {NOT_A_ROOT}")
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn workspace_roots_that_are_not_a_list_are_ignored_saying_what_the_setting_accepts() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{ "workspace": { "roots": "~/src" } }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-workspace-roots-scalar")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let snapshot = attach(state_dir.path(), "settings-workspace-roots-scalar")
+        .await
+        .1;
+    assert!(snapshot.settings.workspace.roots.is_empty());
+    assert!(snapshot.pinned.is_empty());
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one diagnostic: {:?}", snapshot.diagnostics);
+    };
+    assert_eq!(diagnostic.key.as_deref(), Some("workspace.roots"));
+    assert_eq!(
+        diagnostic.message,
+        "ignored because its value is not a list of absolute paths or paths beginning with ~"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
 #[tokio::test]
 async fn invalid_auto_settle_pins_are_ignored_individually_with_diagnostics() {
     for (case, invalid) in [

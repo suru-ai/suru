@@ -10852,6 +10852,9 @@ impl Application {
                                 .open(&current, pin, &self.theme_catalog);
                             self.resolve_theme();
                         }
+                        // The list editor arrives with the panel's next
+                        // surface; until then the row opens nothing.
+                        SettingChoiceSurface::TextList(_) => {}
                     }
                 }
                 None
