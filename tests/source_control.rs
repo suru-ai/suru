@@ -1243,6 +1243,121 @@ async fn a_clone_is_made_out_of_sight_and_one_abandoned_leaves_nothing_behind() 
     held.abort();
 }
 
+/// Staging records the runs of one Server share, as its storage keeps them
+/// from one run to the next.
+#[cfg(unix)]
+#[derive(Default)]
+struct SharedRecords(std::sync::Mutex<Vec<suru::source_control::StagingRecord>>);
+
+#[cfg(unix)]
+impl suru::source_control::StagingRecords for SharedRecords {
+    fn record(&self, record: &suru::source_control::StagingRecord) -> Result<(), String> {
+        let mut records = self.0.lock().unwrap();
+        records.retain(|kept| kept.directory != record.directory);
+        records.push(record.clone());
+        Ok(())
+    }
+
+    fn forget(&self, directory: &Path) -> Result<(), String> {
+        self.0
+            .lock()
+            .unwrap()
+            .retain(|kept| kept.directory != directory);
+        Ok(())
+    }
+
+    fn recorded(&self) -> Result<Vec<suru::source_control::StagingRecord>, String> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+}
+
+/// A Clone abandoned while the Root it is made in is gone — moved away
+/// here, as a drive no longer mounted takes one — removes nothing it cannot
+/// tell is gone, and forgets nothing: what it made comes back with the
+/// Root, still recorded, and the first start once it is back removes it.
+/// Windows refuses to move a directory a process works in, or holds a file
+/// within open, so this runs elsewhere; the unit tests cover the removal
+/// itself on every platform.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_clone_whose_root_goes_away_midway_is_removed_by_the_first_start_once_it_is_back() {
+    use suru::source_control::StagingRecords as _;
+
+    let (_temporary, root) = root();
+    let projects = root.join("projects");
+    std::fs::create_dir(&projects).unwrap();
+    let destination = projects.join("atlas");
+    let away = root.join("away");
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "git://127.0.0.1:{}/atlas.git",
+        silent.local_addr().unwrap().port()
+    );
+    let held = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((connection, _)) = silent.accept().await {
+            held.push(connection);
+        }
+    });
+    let records = std::sync::Arc::new(SharedRecords::default());
+    let run = CloneStaging::new(records.clone());
+    let adapter = GitSourceControl::default();
+
+    {
+        let cloning = adapter.clone_repository(&url, &destination, None, UNREACHED, &run);
+        tokio::pin!(cloning);
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                tokio::select! {
+                    finished = &mut cloning => panic!("the Clone waits on its silent server: {finished:?}"),
+                    () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
+                        let begun = names_within(&projects)
+                            .first()
+                            .is_some_and(|staging| projects.join(staging).join("clone").exists());
+                        if begun {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("Git begins the Clone");
+        std::fs::rename(&projects, &away).unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(60), adapter.settle_clones())
+        .await
+        .expect("the abandoned Clone's removal settles");
+    let staging = names_within(&away);
+    assert_eq!(
+        staging.len(),
+        1,
+        "nothing is removed that cannot be told gone: {staging:?}"
+    );
+    assert_eq!(
+        records
+            .recorded()
+            .unwrap()
+            .into_iter()
+            .map(|record| record.directory)
+            .collect::<Vec<_>>(),
+        [projects.join(&staging[0])],
+        "nor forgotten"
+    );
+
+    std::fs::rename(&away, &projects).unwrap();
+    adapter
+        .sweep_abandoned_clones(&CloneStaging::new(records.clone()))
+        .await;
+    assert_eq!(
+        names_within(&projects),
+        Vec::<String>::new(),
+        "the first start once the Root is back removes it"
+    );
+    assert!(records.recorded().unwrap().is_empty(), "and forgets it");
+    held.abort();
+}
+
 /// An ssh the user names of their own is still told to ask nothing, first,
 /// so the Clone fails at once in its words rather than waiting out its
 /// timeout: one run under a name Git does not know, as a wrapper is, and

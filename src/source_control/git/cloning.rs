@@ -7,18 +7,21 @@
 //! beside its destination, which discovery passes over and nobody mistakes
 //! for a Workspace. That directory is made by the Clone itself before Git
 //! runs, recorded as its Server run's before it is made and forgotten once
-//! it is gone, and from the moment it is made it has an owner that removes
-//! it unless the clone within is named: a name something already holds is
-//! passed over for another, and nothing the Clone removes was ever anyone
-//! else's. It holds a marker naming its Server run, locked for as long as
-//! the Clone lives, so that what a Server that died mid-Clone left behind
-//! is told from what a live one is making, and removed at the next start:
-//! that, and only that — a directory the Server recorded, still marked as
-//! the run that recorded it — never one merely named or marked as a Clone
-//! names and marks its own. The clone takes its destination's name only
-//! once it is whole, by the platform's own rename that refuses to replace
-//! anything — another Clone of the same name among it — so a Root never
-//! holds a half-made Workspace, even while one is being made.
+//! it is known to be gone — not found where the directory holding it can
+//! be read, since beneath one that cannot, as on a drive no longer mounted,
+//! it may yet come back — and from the moment it is made it has an owner
+//! that removes it unless the clone within is named: a name something
+//! already holds is passed over for another, and nothing the Clone removes
+//! was ever anyone else's. It holds a marker naming its Server run, locked
+//! for as long as the Clone lives, so that what a Server that died
+//! mid-Clone left behind is told from what a live one is making, and
+//! removed at the next start: that, and only that — a directory the Server
+//! recorded, still marked as the run that recorded it — never one merely
+//! named or marked as a Clone names and marks its own. The clone takes its
+//! destination's name only once it is whole, by the platform's own rename
+//! that refuses to replace anything — another Clone of the same name among
+//! it — so a Root never holds a half-made Workspace, even while one is
+//! being made.
 //!
 //! The Clone's timeout bounds making the clone. Once Git has made it whole,
 //! one task sees naming it through, or — where it cannot be named —
@@ -331,8 +334,9 @@ fn is_staging_name(name: &str) -> bool {
 /// is named or it is gone: dropped before then — as where whoever awaited
 /// it goes away, Git with it, or its deadline passes — it is removed on its
 /// own, counted among what Clones have under way, or at once where no
-/// runtime is there to run that. Once it is gone its record is forgotten;
-/// one that cannot be removed stays recorded, for the next start to remove.
+/// runtime is there to run that. Once it is known to be gone its record is
+/// forgotten; one that cannot be removed, or told gone, stays recorded, for
+/// the next start to remove.
 struct Staged {
     staging: Option<PathBuf>,
     /// The marker within it, held open and locked while the Clone lives.
@@ -632,13 +636,9 @@ fn left(record: &StagingRecord) -> Left {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => return Left::Nothing,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let holder_read = staging
-                .parent()
-                .is_some_and(|parent| std::fs::read_dir(parent).is_ok());
-            return if holder_read {
-                Left::Nothing
-            } else {
-                Left::Unknown
+            return match holder_read(staging) {
+                Ok(()) => Left::Nothing,
+                Err(_) => Left::Unknown,
             };
         }
         Err(_) => return Left::Unknown,
@@ -1018,15 +1018,20 @@ fn said(output: &Output) -> String {
 }
 
 /// Removes what a Clone that did not finish left at `staging`; nothing
-/// there is nothing to remove.
+/// there is nothing to remove, where that can be told at all — where it
+/// cannot, as [`Untold`] says, it is not tried again.
 async fn remove_partial(staging: &Path) -> std::io::Result<()> {
     let staging = staging.to_owned();
-    persistently(move || remove_if_there(&staging), |_| false).await
+    persistently(
+        move || remove_if_there(&staging),
+        |error| error.get_ref().is_some_and(|said| said.is::<Untold>()),
+    )
+    .await
 }
 
 /// Removes the staging directory `staging` as [`remove_partial`] does, and
-/// once it is gone forgets it in `records`; one that cannot be removed stays
-/// recorded, for the next start to remove.
+/// once it is known to be gone forgets it in `records`; one that cannot be
+/// removed, or told gone, stays recorded, for the next start to remove.
 async fn dismantle(staging: &Path, records: &CloneStaging) -> std::io::Result<()> {
     remove_partial(staging).await?;
     let (staging, records) = (staging.to_owned(), records.clone());
@@ -1034,12 +1039,50 @@ async fn dismantle(staging: &Path, records: &CloneStaging) -> std::io::Result<()
     Ok(())
 }
 
-/// Removes the directory tree at `path`, where anything stands there.
+/// Removes the directory tree at `path`, where anything stands there. One
+/// not found is gone only where the directory holding it can be read:
+/// beneath one that cannot — on a drive no longer mounted, or moved away —
+/// it is not found either, yet may come back with it, so removing it fails
+/// as [`Untold`].
 fn remove_if_there(path: &Path) -> std::io::Result<()> {
     match remove_tree(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match holder_read(path) {
+            Err(unread) => Err(std::io::Error::new(unread.kind(), Untold(unread))),
+            Ok(()) => match std::fs::symlink_metadata(path) {
+                Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                // Still there: what went missing was within it.
+                _ => Err(error),
+            },
+        },
         removed => removed,
     }
+}
+
+/// Why a staging directory not found is not taken for gone: the directory
+/// holding it cannot be read, as this error says, so it may yet come back.
+#[derive(Debug)]
+struct Untold(std::io::Error);
+
+impl std::fmt::Display for Untold {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the directory holding it cannot be read, so it stays recorded for the Server's \
+             next start to remove: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Untold {}
+
+/// Reads the directory holding `path`, so that `path` not found there is
+/// known to be gone.
+fn holder_read(path: &Path) -> std::io::Result<()> {
+    let holder = path
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    std::fs::read_dir(holder).map(drop)
 }
 
 /// Runs `act` on a thread of its own until it succeeds, trying it again a
@@ -2087,5 +2130,68 @@ mod tests {
         assert!(staging.exists());
         std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o755)).unwrap();
         gone(&staging).await;
+    }
+
+    /// A staging directory found not to be there is taken for gone only
+    /// where the directory holding it can be read: beneath one moved away —
+    /// as a Root on a drive no longer mounted is — it is not found either,
+    /// yet comes back with it. Removing it then fails, at once, and its
+    /// record stands, so the first start once it is back removes it; one
+    /// gone from a directory that can be read is forgotten.
+    #[tokio::test]
+    async fn a_staging_directory_whose_holder_cannot_be_read_stays_recorded_until_it_can() {
+        let temporary = tempfile::tempdir().unwrap();
+        let projects = temporary.path().join("projects");
+        let staging = projects.join(staging_name("atlas", "0123abcd"));
+        std::fs::create_dir_all(staging.join(CLONED)).unwrap();
+        std::fs::write(staging.join(CLONED).join("README.md"), "# atlas").unwrap();
+        drop(mark(&staging, "a run").unwrap());
+        let run = run_named("a run");
+        run.records
+            .record(&StagingRecord {
+                directory: staging.clone(),
+                run: "a run".to_owned(),
+            })
+            .unwrap();
+        let away = temporary.path().join("away");
+        std::fs::rename(&projects, &away).unwrap();
+
+        assert!(
+            dismantle(&staging, &run).await.is_err(),
+            "what cannot be told gone is not taken for removed"
+        );
+        assert_eq!(
+            recorded(&run),
+            std::slice::from_ref(&staging),
+            "it stays recorded"
+        );
+        assert!(
+            away.join(staging.file_name().unwrap())
+                .join(CLONED)
+                .join("README.md")
+                .exists()
+        );
+
+        std::fs::rename(&away, &projects).unwrap();
+        sweep(&CloneStaging {
+            run: "the next run".to_owned(),
+            ..run.clone()
+        });
+        assert!(
+            !staging.exists(),
+            "the next start removes it once it is back"
+        );
+        assert!(recorded(&run).is_empty());
+
+        run.records
+            .record(&StagingRecord {
+                directory: staging.clone(),
+                run: "a run".to_owned(),
+            })
+            .unwrap();
+        dismantle(&staging, &run)
+            .await
+            .expect("one gone from a directory that can be read is gone");
+        assert!(recorded(&run).is_empty(), "and forgotten");
     }
 }
