@@ -1946,8 +1946,16 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
             .iter()
             .enumerate()
             .map(|(index, row)| {
+                // A Workspace its Server cannot read now is greyed, beside
+                // the mark that says so.
+                let unavailable = matches!(
+                    &row.kind,
+                    WorkspacePickerRowKind::Workspace(workspace) if workspace.unavailable.is_some()
+                );
                 let style = if row.selected {
                     theme.selection.focused
+                } else if unavailable {
+                    theme.text.subdued
                 } else {
                     theme.text.primary
                 };
@@ -2484,6 +2492,9 @@ fn workspace_picker_row_text(
     if row.current {
         fields.push(current_workspace_mark(compact).to_owned());
     }
+    if row.unavailable.is_some() {
+        fields.push(unavailable_workspace_mark(compact).to_owned());
+    }
     let label = state.workspace_label(&state.outlook, &row.path);
     let path_budget = width
         .saturating_sub(marker.width())
@@ -2499,6 +2510,12 @@ fn workspace_picker_row_text(
 /// listed: in words, or by its letter alone where a row is narrow.
 const fn current_workspace_mark(compact: bool) -> &'static str {
     if compact { "C" } else { "[current]" }
+}
+
+/// What marks a Workspace its Server cannot read now, so cannot be opened:
+/// in words, or by a sign alone where a row is narrow.
+const fn unavailable_workspace_mark(compact: bool) -> &'static str {
+    if compact { "!" } else { "[unavailable]" }
 }
 
 /// The Icon Picker: a Workspace-Picker-style overlay whose rows are a grid of

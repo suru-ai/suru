@@ -7796,6 +7796,11 @@ impl Application {
                 Some(WorkspacePickerChoice::Browse) => {
                     return self.invoke_semantic(SemanticCommandId::WorkspaceBrowse);
                 }
+                // A Workspace its Server cannot read now opens nothing; the
+                // picker stays on it, saying why.
+                Some(WorkspacePickerChoice::Refused(refusal)) => {
+                    self.state.workspace_picker.refuse(refusal);
+                }
                 Some(WorkspacePickerChoice::Workspace(workspace)) => {
                     self.state.workspace_picker.close();
                     let request = ResolveWorkspaceRequest {

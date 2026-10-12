@@ -27,7 +27,7 @@ use suru::{
         Session, SessionId, SessionListItem, SessionStatus, SessionSummary, SessionTimestamp,
         SidebarSettings, SidebarVisibility, SkillCatalog, SkillCatalogCapabilities,
         SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery,
-        Workspace,
+        Workspace, WorkspaceUnavailability,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, DirectoryListingId,
@@ -271,6 +271,85 @@ fn a_repository_discovered_within_a_root_is_offered_and_opens_the_landing_in_it(
     assert!(
         !drawn_in_sidebar(&frame, "atlas"),
         "and shows nothing of a Workspace no Session works in: {frame:?}"
+    );
+}
+
+/// A Workspace its Server lists as unavailable — one whose directory, or the
+/// directory holding it, cannot be read now — is marked so in its row, in
+/// words where the row is wide and by a sign where it is narrow, while every
+/// other row is not.
+#[test]
+fn an_unavailable_workspace_is_marked_in_its_row() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["drive", "atlas"]);
+    let mut application = connected_application(&here);
+
+    open_picker_with(
+        &mut application,
+        vec![
+            registered(&here),
+            unavailable(&atlas, WorkspaceUnavailability::HolderUnreadable),
+        ],
+    );
+
+    let rows = picker_rows(&application);
+    let marked = rows
+        .iter()
+        .filter(|row| row.contains("[unavailable]"))
+        .collect::<Vec<_>>();
+    assert_eq!(marked.len(), 1, "one row is marked: {rows:?}");
+    assert!(
+        marked[0].contains("atlas"),
+        "the unavailable Workspace's row is marked: {rows:?}"
+    );
+    let narrow = picker_rows_at(&application, 44, 15);
+    let atlas_row = narrow
+        .iter()
+        .find(|row| row.contains("atlas"))
+        .unwrap_or_else(|| panic!("the unavailable Workspace is offered: {narrow:?}"));
+    assert!(
+        atlas_row.contains("atlas !"),
+        "a narrow row marks it by a sign: {narrow:?}"
+    );
+}
+
+/// Choosing an unavailable Workspace opens nothing: the picker stays open on
+/// it, saying why it cannot be opened, and asks its Server nothing.
+#[test]
+fn choosing_an_unavailable_workspace_is_refused_saying_why() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["drive", "atlas"]);
+    let mut application = connected_application(&here);
+    open_picker_with(
+        &mut application,
+        vec![
+            registered(&here),
+            unavailable(&atlas, WorkspaceUnavailability::HolderUnreadable),
+        ],
+    );
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "atlas");
+
+    assert_eq!(
+        choose_unanswered(&mut application),
+        ApplicationTransition::Continue,
+        "choosing it asks the Server nothing"
+    );
+
+    let frame = rendered_application_rows_at(&application, 100, 20).join("\n");
+    assert!(
+        frame.contains("atlas cannot be opened: the directory holding it cannot be read"),
+        "the picker says why: {frame}"
+    );
+    assert_eq!(
+        selected_row(&application),
+        "atlas",
+        "the picker stays open on the Workspace the reader chose: {frame}"
+    );
+    assert_eq!(
+        session_picker_scope(&mut application),
+        SessionListScope::CurrentWorkspace(here.into()),
+        "nothing moved"
     );
 }
 
@@ -2196,6 +2275,15 @@ fn narrowable_workspaces() -> Vec<Workspace> {
 /// directory `path`.
 fn registered(path: &Path) -> Workspace {
     Workspace::directory(path.to_owned())
+}
+
+/// The Workspace the Server's Workspace Registry lists for the plain
+/// directory `path` while it cannot be opened, for the reason `why`.
+fn unavailable(path: &Path, why: WorkspaceUnavailability) -> Workspace {
+    Workspace {
+        unavailable: Some(why),
+        ..Workspace::directory(path.to_owned())
+    }
 }
 
 /// A Repository whose main root is `root`, as its Server lists one it

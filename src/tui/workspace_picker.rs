@@ -12,7 +12,7 @@ use ratatui::layout::Position;
 
 use crate::protocol::{
     MAX_WORKSPACE_DESCRIPTION_CHARS, Outlook, Workspace, WorkspaceDescription, WorkspaceId,
-    WorkspacePaths, description_too_long, one_line_description,
+    WorkspacePaths, WorkspaceUnavailability, description_too_long, one_line_description,
 };
 
 use super::{
@@ -203,6 +203,9 @@ pub(super) enum WorkspacePickerChoice {
     Browse,
     /// Lands in the Workspace the row names.
     Workspace(crate::protocol::Workspace),
+    /// Opens nothing, the Workspace the row names being one its Server
+    /// cannot read now, and says why.
+    Refused(String),
 }
 
 /// One row of the picker as a frame draws it.
@@ -251,6 +254,10 @@ pub(super) struct WorkspaceRow {
     /// The Workspace's Description, as the listing carries it — `None` for
     /// one with none, which the picker draws as readily as one with.
     pub(super) description: Option<String>,
+    /// Why the Workspace cannot be opened now, as its Server listed it —
+    /// `None` for one that can be — which marks its row, and which choosing
+    /// it is refused with.
+    pub(super) unavailable: Option<WorkspaceUnavailability>,
 }
 
 /// One Workspace Picker row's own context menu: the target it names, what it
@@ -587,17 +594,26 @@ impl WorkspacePicker {
 
     /// What choosing the row the reader is on does: open the Directory
     /// Browser from the Browse row, or land in the Workspace a Workspace row
-    /// names. There is nothing to choose while the listing is on its way: no
-    /// row is marked, so Enter names nothing rather than naming whatever
-    /// would stand first.
+    /// names — unless its Server listed it as one it cannot read now, which
+    /// is refused saying why. There is nothing to choose while the listing
+    /// is on its way: no row is marked, so Enter names nothing rather than
+    /// naming whatever would stand first.
     pub(super) fn offer_selected(&self) -> Option<WorkspacePickerChoice> {
         match self.selected.as_ref()? {
             Offer::Browse => self
                 .offers_browse()
                 .then_some(WorkspacePickerChoice::Browse),
-            Offer::Workspace(_) => self
-                .selected_workspace()
-                .map(WorkspacePickerChoice::Workspace),
+            Offer::Workspace(_) => {
+                let workspace = self.selected_workspace()?;
+                Some(match workspace.unavailable {
+                    Some(why) => WorkspacePickerChoice::Refused(format!(
+                        "{} cannot be opened: {}",
+                        self.paths().workspace_name(&workspace),
+                        why.reason()
+                    )),
+                    None => WorkspacePickerChoice::Workspace(workspace),
+                })
+            }
         }
     }
 
@@ -649,6 +665,7 @@ impl WorkspacePicker {
                     workspace_id: workspace.id,
                     origin: origin.clone(),
                     description: workspace.description.map(|description| description.text),
+                    unavailable: workspace.unavailable,
                 }),
             });
         browse.into_iter().chain(workspaces).collect()
