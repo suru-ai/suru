@@ -551,7 +551,6 @@ async fn a_server_started_on_a_config_document_it_cannot_read_keeps_every_discov
     ] {
         write_config_document(&home, document);
         let (_, server) = server_beneath(&home, CHANNEL, Duration::ZERO).await;
-        server.workspace_discovery_settled().await;
         let client = connected_client(&home.join("state"), CHANNEL).await;
         assert_eq!(
             standings(&client).await,
@@ -598,7 +597,6 @@ async fn a_root_taken_away_while_the_server_was_stopped_is_taken_away_at_start()
     server.shutdown().await.expect("shut down server");
 
     let (_, restarted) = server_with_roots(&home, CHANNEL, &[], Duration::ZERO).await;
-    restarted.workspace_discovery_settled().await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
     assert_eq!(
         standings(&client).await,
@@ -658,7 +656,6 @@ async fn a_root_spelled_another_way_is_the_same_root() {
     server.shutdown().await.expect("shut down server");
 
     let (_, restarted) = server_with_roots(&home, CHANNEL, &["~/projects/"], Duration::ZERO).await;
-    restarted.workspace_discovery_settled().await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
     assert_eq!(
         description_at(&client, &atlas).await,
@@ -838,7 +835,6 @@ async fn a_server_started_on_a_config_root_it_cannot_search_keeps_every_discover
         return;
     }
     let (_, restarted) = server_beneath(&home, CHANNEL, Duration::ZERO).await;
-    restarted.workspace_discovery_settled().await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
     assert_eq!(
         standings(&client).await,
@@ -897,7 +893,6 @@ async fn a_root_respelled_as_where_its_link_led_while_its_drive_is_gone_takes_no
         }
         let (_, restarted) =
             server_with_roots(&home, CHANNEL, &[spelled(&projects)], Duration::ZERO).await;
-        restarted.workspace_discovery_settled().await;
         let client = connected_client(&home.join("state"), CHANNEL).await;
         assert_eq!(
             standings(&client).await,

@@ -87,7 +87,12 @@ pub(super) async fn server_with_roots(
 }
 
 /// A Server beneath `home`, as [`server_with_roots`] makes one, reading
-/// whatever Config Document its config root holds.
+/// whatever Config Document its config root holds, once its discovery at
+/// start has settled: a listing asked before then may begin a scan that
+/// discovery at start supersedes, and is answered by a scan that passed
+/// over what the superseded one was still reading, and anything described
+/// before then may be entered as known by its Description rather than by
+/// its Root.
 pub(super) async fn server_beneath(
     home: &Path,
     channel: &str,
@@ -107,6 +112,7 @@ pub(super) async fn server_beneath(
     )
     .await
     .expect("spawn server");
+    server.workspace_discovery_settled().await;
     (config, server)
 }
 
@@ -282,7 +288,6 @@ async fn discovery_at_start_enters_each_repository_known_by_the_root_it_was_foun
     server.shutdown().await.expect("shut down server");
 
     let (_, restarted) = server_with_roots(&home, CHANNEL, &["~/projects"], NEVER_AGAIN).await;
-    restarted.workspace_discovery_settled().await;
     restarted.shutdown().await.expect("shut down server");
 
     let entries = entries_on_disk(&config);
