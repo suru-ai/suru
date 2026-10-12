@@ -1,6 +1,9 @@
 //! Automatic Reclaim of unused Managed Worktrees.
 
-use super::ServerTimings;
+use super::{
+    ServerTimings,
+    reads_apart::{NotRead, ReadsApart},
+};
 use crate::{
     protocol::{
         AutoReclaim, CheckoutAssociation, CheckoutBranchOutcome, CheckoutKind, CheckoutReclaim,
@@ -12,8 +15,7 @@ use crate::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
@@ -647,58 +649,56 @@ impl Reclaimer {
 }
 
 /// How a Reclaim pass reads the Repository a Workspace Registry entry
-/// names: on a thread of its own, where a directory that does not answer —
-/// a network filesystem gone silent, say — blocks that thread alone and
-/// neither the Server's executor nor its blocking pool, and for no longer
-/// than `timeout`, after which the pass goes on without it. A read still
-/// outstanding from an earlier pass is not begun again, so an entry that
-/// never answers holds one thread rather than one more each pass.
+/// names: apart, where a directory that does not answer — a network
+/// filesystem gone silent, say — blocks one thread of its own and neither
+/// the Server's executor nor its blocking pool (see [`ReadsApart`]), and for
+/// no longer than `timeout`, after which the pass goes on without it. A read
+/// still outstanding from an earlier pass is not begun again, so an entry
+/// that never answers holds one thread rather than one more each pass.
 struct RegistryReads {
     /// See [`ServerTimings::worktree_reclaim_registry_read_timeout`].
     timeout: Duration,
-    outstanding: Arc<Mutex<HashSet<PathBuf>>>,
+    reads: ReadsApart,
 }
 
 impl RegistryReads {
     fn new(timeout: Duration) -> Self {
         Self {
             timeout,
-            outstanding: Default::default(),
+            reads: ReadsApart::new("suru-reclaim-registry-read", usize::MAX),
         }
     }
 
+    /// The Repository `path` is read as now, where it reads as one and
+    /// source control could read it. It is read without being remembered,
+    /// so a Repository found this way joins no checkout observation.
     async fn read(&self, source_control: &SourceControlService, path: &Path) -> Option<Repository> {
-        if !self.outstanding.lock().unwrap().insert(path.to_owned()) {
-            tracing::debug!(
-                repository = %path.display(),
-                "Managed Worktree Reclaim is still reading a Workspace Registry entry from an earlier pass"
-            );
-            return None;
-        }
-        let outstanding = OutstandingRead {
-            reads: self.outstanding.clone(),
-            path: path.to_owned(),
-        };
         let source_control = source_control.clone();
-        let (answer, answered) = tokio::sync::oneshot::channel();
-        let reader = std::thread::Builder::new()
-            .name("suru-reclaim-registry-read".to_owned())
-            .spawn(move || {
-                let _ = answer.send(read_on_own_runtime(&source_control, &outstanding.path));
-            });
-        if let Err(error) = reader {
-            tracing::warn!(
-                repository = %path.display(),
-                "Managed Worktree Reclaim could not read a Workspace Registry entry; will retry: {error}"
-            );
-            return None;
-        }
-        match tokio::time::timeout(self.timeout, answered).await {
+        let entry = path.to_owned();
+        let read = self.reads.read(path, move || async move {
+            source_control
+                .read_unremembered(&entry)
+                .await
+                .workspace
+                .repository
+                .filter(|repository| {
+                    repository.availability == SourceControlAvailability::Available
+                })
+                .map(|repository| *repository)
+        });
+        match tokio::time::timeout(self.timeout, read).await {
             Ok(Ok(repository)) => repository,
-            Ok(Err(_)) => {
+            Ok(Err(NotRead::Outstanding)) => {
+                tracing::debug!(
+                    repository = %path.display(),
+                    "Managed Worktree Reclaim is still reading a Workspace Registry entry from an earlier pass"
+                );
+                None
+            }
+            Ok(Err(not_read)) => {
                 tracing::warn!(
                     repository = %path.display(),
-                    "Managed Worktree Reclaim could not read a Workspace Registry entry; will retry: its reader ended without answering"
+                    "Managed Worktree Reclaim could not read a Workspace Registry entry; will retry: {not_read}"
                 );
                 None
             }
@@ -710,47 +710,6 @@ impl RegistryReads {
                 );
                 None
             }
-        }
-    }
-}
-
-/// The Repository `path` is read as now, where it reads as one and source
-/// control could read it, on a runtime of the calling thread's own, so a
-/// read that never answers leans on nothing of the Server's and keeps no
-/// runtime from shutting down. It is read without being remembered, so a
-/// Repository found this way joins no checkout observation.
-fn read_on_own_runtime(source_control: &SourceControlService, path: &Path) -> Option<Repository> {
-    match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime
-            .block_on(source_control.read_unremembered(path))
-            .workspace
-            .repository
-            .filter(|repository| repository.availability == SourceControlAvailability::Available)
-            .map(|repository| *repository),
-        Err(error) => {
-            tracing::warn!(
-                repository = %path.display(),
-                "Managed Worktree Reclaim could not read a Workspace Registry entry; will retry: {error}"
-            );
-            None
-        }
-    }
-}
-
-/// One entry's read, outstanding until the thread reading it lets it go,
-/// however that thread ends.
-struct OutstandingRead {
-    reads: Arc<Mutex<HashSet<PathBuf>>>,
-    path: PathBuf,
-}
-
-impl Drop for OutstandingRead {
-    fn drop(&mut self) {
-        if let Ok(mut reads) = self.reads.lock() {
-            reads.remove(&self.path);
         }
     }
 }
