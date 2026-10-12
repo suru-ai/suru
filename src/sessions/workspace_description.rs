@@ -107,7 +107,7 @@ impl SessionStore {
     /// kept on one line clears the Description instead, making it derivable
     /// again. Refuses text longer than [`MAX_WORKSPACE_DESCRIPTION_CHARS`] as
     /// kept, and a Workspace this server cannot tell is its own: one it has
-    /// grouped a Session under or holds a row for is, and so is one the
+    /// grouped a Session under or holds an entry for is, and so is one the
     /// server's own resolution of where it is presented — `resolved`, where
     /// the caller resolved one — names. Answers with the Description the
     /// Workspace now carries.
@@ -141,7 +141,7 @@ impl SessionStore {
     }
 
     /// Whether this server can tell a Workspace is its own without resolving
-    /// anything: it groups a Session under it, or holds a row for it.
+    /// anything: it groups a Session under it, or holds an entry for it.
     pub(crate) fn knows_workspace(&self, workspace_id: &WorkspaceId) -> bool {
         self.state
             .lock()

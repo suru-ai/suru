@@ -483,13 +483,13 @@ pub struct Workspace {
     /// in many enums that would otherwise all be sized to it.
     pub repository: Option<Box<Repository>>,
     pub source_control: SourceControlAvailability,
-    /// The Workspace's Icon, as the `workspaces` table holds it: absent until
-    /// a derivation lands one for good. It rides every copy of a Workspace —
-    /// discovery, a listed Session, an open Session's own — because the table
-    /// is its one source of truth (see the **Icon** glossary entry and ADR
-    /// 0027 for why there is no broader Workspace registry beside it).
+    /// The Workspace's Icon, as its Workspace Registry entry holds it: absent
+    /// until a derivation lands one for good. It rides every copy of a
+    /// Workspace — discovery, a listed Session, an open Session's own —
+    /// because the Registry is its one source of truth (see the **Icon** and
+    /// **Workspace Registry** glossary entries).
     pub icon: Option<String>,
-    /// The Workspace's Description, as the same `workspaces` table holds it:
+    /// The Workspace's Description, as the same Registry entry holds it:
     /// absent until a derivation lands one or someone sets one, and carried
     /// on every copy of a Workspace for the same reason its Icon is.
     pub description: Option<WorkspaceDescription>,
@@ -4896,9 +4896,8 @@ pub struct SetWorkspaceDescriptionRequest {
 /// Peer's request included — with the paths they are spelled in, so a reader
 /// on another machine names each in the owning Server's own syntax, as the
 /// Session catalog's snapshot lets it name the Workspaces Sessions work in.
-/// The Workspaces are those its Sessions work in, most recently worked in
-/// first, then those it holds a Description or Icon for though no Session
-/// works there, by path.
+/// The Workspaces are its Workspace Registry's entries: those its Sessions
+/// work in, most recently worked in first, then the rest, by path.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceListing {

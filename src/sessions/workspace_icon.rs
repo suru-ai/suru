@@ -213,7 +213,8 @@ enum IconLanding {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SetWorkspaceIconError {
     /// This server groups no Session under the named Workspace and holds no
-    /// durable row for it either — there is nothing here to set an Icon on.
+    /// Registry entry for it either — there is nothing here to set an Icon
+    /// on.
     WorkspaceNotFound,
     /// The named Icon does not resolve in the Icon Catalog.
     UnknownIcon,
@@ -239,9 +240,8 @@ impl SessionStore {
     /// Fills a Workspace's Icon, but only where it still has none: the same
     /// fill-an-absence guard as a Session's own derived Icon
     /// ([`super::title::SessionStore::replace_derived_title`]), applied here
-    /// to state a Workspace owns for itself — nothing broader exists, since
-    /// ADR 0027 keeps no registry of Repositories. Answers `true` where the
-    /// Icon lands.
+    /// to state a Workspace owns for itself in its Registry entry. Answers
+    /// `true` where the Icon lands.
     pub(crate) fn commit_workspace_icon(&self, workspace_id: &WorkspaceId, icon: String) -> bool {
         self.land_workspace_icon(workspace_id, icon, IconLanding::FillAbsence)
     }
@@ -252,8 +252,8 @@ impl SessionStore {
     /// only ever filling an absence the way derivation does. Refuses a name
     /// the Icon Catalog does not carry, and refuses a Workspace this server
     /// does not know at all: one with no Session presently grouped under it
-    /// and no durable row of its own, which is the only way this server could
-    /// ever have heard of it.
+    /// and no Registry entry of its own, which is the only way this server
+    /// could ever have heard of it.
     pub(crate) fn set_workspace_icon(
         &self,
         workspace_id: &WorkspaceId,
@@ -386,7 +386,7 @@ impl SessionStoreState {
 
     /// Where a Workspace is presented now: at `presented_at`, where the
     /// caller resolved it there, or else as a Session working in it presents
-    /// it, or else as its row last recorded — or nowhere this server can say.
+    /// it, or else as its entry last recorded — or nowhere this server can say.
     pub(super) fn presented_path(
         &self,
         workspace_id: &WorkspaceId,

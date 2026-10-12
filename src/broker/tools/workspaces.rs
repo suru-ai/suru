@@ -16,10 +16,10 @@
 //! them — is refused saying the Tool answers this server's Workspaces alone.
 //! It is offered no Tool that describes a Workspace or begins work in one.
 //!
-//! A Server knows a Workspace a Session works in — the one a Client's
-//! Workspace Picker offers for each listed Session — and one it holds a
-//! Description or Icon for though no Session works there. The listing names
-//! each as a compact row: its identity, its name, its presented root's path,
+//! A Server knows each Workspace its Workspace Registry holds an entry for —
+//! every one a Session has begun in, whether or not one works there still,
+//! and every one described before any Session did — and lists them from the
+//! Registry alone. The listing names each as a compact row: its identity, its name, its presented root's path,
 //! its Description and whether that was set rather than derived, and its
 //! Icon's name. A directory a Client merely stands in, which its Server was
 //! never told of, is no Workspace the Server knows, and is not listed.
@@ -76,8 +76,9 @@ macro_rules! list_workspaces_description {
              directories the user works in — so you ",
             $purpose,
             ", as compact rows: first those the user's Sessions work in, most \
-             recently worked in first, then those Suru holds a Description or Icon \
-             for though no Session works there, by path. ",
+             recently worked in first, then those Suru knows though no Session \
+             works there now, because one once did or someone described it, by \
+             path. ",
             $takes,
             " Answers with JSON of the shape {\"workspaces\": [row, ...]}. Each \
              row has \"workspace_id\", the Workspace's identity; ",

@@ -50,7 +50,7 @@ impl SessionOperations {
     /// Sets the Description of the Workspace `workspace_id` to `text`, or
     /// clears it where `text` is blank, for `author` — the user where it
     /// names no one — answering the Description it carries now. A Workspace
-    /// this server knows of no Session or row for is taken as the one its
+    /// this server knows of no Session or entry for is taken as the one its
     /// resolution of `presented_at` names, where it names `workspace_id`. A
     /// Sidekick on a Peer is refused this Server's own Sidekick Workspace.
     pub(crate) async fn describe_workspace(

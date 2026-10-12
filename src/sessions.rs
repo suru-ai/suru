@@ -165,15 +165,16 @@ struct SessionStoreState {
     /// in the public snapshot. Provider actors do not survive restoration, so
     /// restored Sessions begin a fresh local generation sequence.
     posture_generations: HashMap<SessionId, u64>,
-    /// Every Workspace's Icon and Description this server knows of, seeded
-    /// from the durable `workspaces` table at startup and kept current by
+    /// The Workspace Registry: an entry for every Workspace this server has
+    /// known, seeded from the durable `workspaces` table at startup, made
+    /// wherever a Workspace is first seen (see
+    /// [`SessionStore::enter_workspace`]), and kept current by
     /// [`SessionStore::commit_workspace_icon`],
     /// [`SessionStore::commit_workspace_description`], and their user-facing
-    /// counterparts. This is the table's whole in-memory reading —
-    /// deliberately no registry of Workspaces or their Repositories, of which
-    /// ADR 0027 keeps none — and it is
-    /// what every `Workspace` copy this store hands out is authoritatively
-    /// read against (see [`dress_workspace`]), whether resolved fresh at
+    /// counterparts. It is what the Server's Workspace listing reads (see
+    /// [`SessionStore::listed_workspaces`]), and what every `Workspace` copy
+    /// this store hands out is authoritatively read against for its Icon and
+    /// Description (see [`dress_workspace`]), whether resolved fresh at
     /// Session creation, regrouped by discovery, or restored from a Session's
     /// own stored metadata.
     workspaces: HashMap<WorkspaceId, StoredWorkspace>,
