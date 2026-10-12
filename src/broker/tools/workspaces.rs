@@ -185,31 +185,32 @@ or the path of a Repository on the machine of the server Cloning it; \
 \"root\", the Workspace Root to Clone into, spelled as the workspace.roots \
 Setting names it or as the directory it names, which may be left out where \
 exactly one Root is configured and must be given where several are; \
-\"name\", the directory to make within the Root, one plain directory name and \
-never a path, the URL's last segment without \".git\" unless given; \
-\"branch\", the branch to check out, the Repository's default unless given; \
-and \"origin\", the name of a Remote, as list_remotes gives it, to Clone \
-there instead — within that Remote's own Workspace Roots, which \"root\" then \
-names, and by its own rules — answered with the row as that Remote lists it, \
-carrying its name as \"origin\" and its path as that server writes paths; \
-leave it out to Clone on this server. The Clone is Git's ordinary one, \
-neither shallow nor recursing into submodules, and asks no one for anything: \
-a credential Git cannot find fails it at once. It is refused, saying why — a \
-Remote's in its own words — when no Workspace Root is configured; when \
-\"root\" is left out while several are, or names none of them, naming those \
-configured; when the Root cannot be read, since Suru never makes one; when \
-\"name\" is not one plain directory name; when something already stands \
-where the Clone would go, naming the Workspace there by its workspace_id \
-where it is one; when Git fails, in Git's own words; when it does not finish \
-within the time the server allows a Clone, well within the time a call may \
-take; when it would take the place a Sidekick Workspace is kept in, in any \
-case, which stays outside source control; and when it would go within a \
-Remote's own Sidekick Workspace, which refuses you as yours refuses its \
-Peers. A Clone Git began and could not finish leaves nothing behind. A \
-Remote that does not answer, or does not understand a Clone, refuses it, \
-and nothing is kept to Clone there later; one whose answer was lost once it \
-took the Clone may have made it all the same, so list its Workspaces before \
-asking again.";
+\"name\", the directory to make within the Root, one plain directory name, \
+never a path nor beginning with a dot, the URL's last segment without \
+\".git\" unless given; \"branch\", the branch to check out, the Repository's \
+default unless given; and \"origin\", the name of a Remote, as list_remotes \
+gives it, to Clone there instead — within that Remote's own Workspace Roots, \
+which \"root\" then names, and by its own rules — answered with the row as \
+that Remote lists it, carrying its name as \"origin\" and its path as that \
+server writes paths; leave it out to Clone on this server. The Clone is \
+Git's ordinary one, neither shallow nor recursing into submodules, and asks \
+no one for anything: a credential Git cannot find fails it at once. It is \
+refused, saying why — a Remote's in its own words — when no Workspace Root \
+is configured; when \"root\" is left out while several are, or names none of \
+them, naming those configured; when the Root cannot be read, since Suru \
+never makes one; when \"name\" is not one plain directory name, or it or the \
+name the URL ends in begins with a dot, since a Workspace's name may not be \
+hidden; when something already stands where the Clone would go, naming the \
+Workspace there by its workspace_id where it is one; when Git fails, in \
+Git's own words; when it does not finish within the time the server allows a \
+Clone, well within the time a call may take; when it would take the place a \
+Sidekick Workspace is kept in, in any case, which stays outside source \
+control; and when it would go within a Remote's own Sidekick Workspace, \
+which refuses you as yours refuses its Peers. A Clone Git began and could \
+not finish leaves nothing behind. A Remote that does not answer, or does not \
+understand a Clone, refuses it, and nothing is kept to Clone there later; \
+one whose answer was lost once it took the Clone may have made it all the \
+same, so list its Workspaces before asking again.";
 
 /// What `list_workspaces` takes: the Servers whose Workspaces to list.
 const LIST_TAKES: [&str; 1] = ["origin"];
@@ -237,7 +238,8 @@ pub(super) fn clone_workspace_schema() -> Value {
             "name": {
                 "type": "string",
                 "description": "The directory to make within the Root: one plain directory \
-                    name, never a path. The URL's last segment without .git unless given.",
+                    name, never a path nor beginning with a dot. The URL's last segment without \
+                    .git unless given.",
             },
             "branch": {
                 "type": "string",
@@ -1132,6 +1134,7 @@ mod tests {
             "naming those configured",
             "when the Root cannot be read",
             "not one plain directory name",
+            "may not be hidden",
             "naming the Workspace there by its workspace_id",
             "in Git's own words",
             "does not finish within",

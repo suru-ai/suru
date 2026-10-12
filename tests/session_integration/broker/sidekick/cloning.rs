@@ -587,6 +587,73 @@ async fn a_name_must_be_one_plain_directory_name_and_a_branch_is_checked_out() {
     hosted.server.shutdown().await.expect("shut down server");
 }
 
+/// A Workspace a Clone makes may not be hidden: a `name` beginning with a
+/// dot is refused — among them one spelled as a Clone spells the directory
+/// it makes its own out of sight, for a Repository that even carries a
+/// marker as a Clone's own does — and so is the name a Repository URL ends
+/// in, where none is given and that one begins with a dot. Nothing is made.
+/// Discovery passes over a hidden directory, so a Workspace there could
+/// never be listed as discovered.
+#[tokio::test]
+async fn a_clone_may_not_make_a_hidden_workspace_however_it_is_named() {
+    const CHANNEL: &str = "sidekick-clone-hidden";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let (_projects, projects) = directory();
+    let (_elsewhere, elsewhere) = directory();
+    let origin = bare_repository(&elsewhere, "atlas");
+    let work = elsewhere.join("atlas-work");
+    std::fs::write(work.join("suru-clone"), "a run long gone").expect("write a marker");
+    git(&work, &["add", "suru-clone"]);
+    git(
+        &work,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "marked"],
+    );
+    git(&work, &["push", "--quiet", spelled(&origin), "main"]);
+    let hidden = bare_repository(&elsewhere, ".charts");
+    name_roots(config_dir.path(), &[spelled(&projects)]);
+    let mut hosted = host_providers(state_dir.path(), CHANNEL, Some(config_dir.path())).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let (_sidekick_id, mut sidekick, _provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+
+    for name in [".atlas.suru-clone-deadbeef", ".atlas"] {
+        assert_eq!(
+            refused(
+                &mut sidekick,
+                "clone_workspace",
+                json!({ "repository_url": origin, "name": name }),
+            )
+            .await,
+            format!(
+                "`{name}` begins with a dot, and a Workspace's name may not be hidden, so \
+                 nothing was cloned; give `name` as one that does not begin with a dot."
+            ),
+            "{name:?}"
+        );
+    }
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            "clone_workspace",
+            json!({ "repository_url": hidden }),
+        )
+        .await,
+        format!(
+            "The Repository URL `{}` ends in `.charts`, which begins with a dot, and a \
+             Workspace's name may not be hidden, so nothing was cloned; give one that does not \
+             begin with a dot as `name`.",
+            spelled(&hidden)
+        )
+    );
+    assert!(
+        contents(&projects).is_empty(),
+        "nothing is made in the Root"
+    );
+
+    hosted.server.shutdown().await.expect("shut down server");
+}
+
 /// Whatever already stands where a Clone would go refuses it and is left as
 /// it was: a Workspace there is named by its workspace_id — one the Server
 /// knows, a Repository it has not yet been told of, and a Worktree of a

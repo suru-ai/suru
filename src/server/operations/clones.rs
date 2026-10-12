@@ -3,7 +3,8 @@
 //! Workspace Root it names — as the Setting naming the Roots spells it, or
 //! as the directory it names — or the only one configured, and nowhere else:
 //! under the name it gives, which must be one plain directory name, or else
-//! the one its Repository URL ends in. A Root is never made for it, so one
+//! the one its Repository URL ends in — never a hidden one, beginning with a
+//! dot, which discovery passes over. A Root is never made for it, so one
 //! that cannot be read refuses it, and whatever already stands where it
 //! would go refuses it too, named as the Workspace it is where it is one.
 //! Nor does any Clone take the place the Sidekick Workspace is kept in,
@@ -165,6 +166,10 @@ pub(crate) enum CloneRefusal {
     UnreadableRoot { root: String, reason: String },
     /// The name given is not one plain directory name.
     NotPlainName { name: String },
+    /// The name given — or, where `url` is named, the one the Repository
+    /// URL ends in — begins with a dot, as a hidden directory's does, which
+    /// discovery passes over and a Clone makes its own out of sight under.
+    HiddenName { name: String, url: Option<String> },
     /// No name was given, and the Repository URL ends in none.
     NoNameInUrl { url: String },
     /// Something already stands at the destination: the Workspace named
@@ -246,6 +251,20 @@ impl fmt::Display for CloneRefusal {
                 formatter,
                 "`{name}` is not one plain directory name, so nothing was cloned; give `name` as \
                  the name of one directory to make within the Workspace Root, with no path in it."
+            ),
+            Self::HiddenName { name, url: None } => write!(
+                formatter,
+                "`{name}` begins with a dot, and a Workspace's name may not be hidden, so nothing \
+                 was cloned; give `name` as one that does not begin with a dot."
+            ),
+            Self::HiddenName {
+                name,
+                url: Some(url),
+            } => write!(
+                formatter,
+                "The Repository URL `{url}` ends in `{name}`, which begins with a dot, and a \
+                 Workspace's name may not be hidden, so nothing was cloned; give one that does \
+                 not begin with a dot as `name`."
             ),
             Self::NoNameInUrl { url } => write!(
                 formatter,
@@ -367,6 +386,7 @@ impl CloneRefusal {
             | Self::UnknownRoot { .. }
             | Self::UnreadableRoot { .. }
             | Self::NotPlainName { .. }
+            | Self::HiddenName { .. }
             | Self::NoNameInUrl { .. }
             | Self::SidekickWorkspacePlace { .. }
             | Self::SidekickWorkspace { .. }
@@ -530,6 +550,22 @@ fn plain_name(name: &str) -> Result<&str, CloneRefusal> {
     }
 }
 
+/// `name`, where it may name the Workspace a Clone makes: one plain
+/// directory name (see [`plain_name`]) that does not begin with a dot. A
+/// hidden directory is one discovery passes over, so a Workspace there would
+/// never be listed as discovered; and a Clone makes its own out of sight
+/// under such a name, which no Workspace it makes may take.
+fn workspace_name(name: &str) -> Result<&str, CloneRefusal> {
+    let name = plain_name(name)?;
+    if name.starts_with('.') {
+        return Err(CloneRefusal::HiddenName {
+            name: name.to_owned(),
+            url: None,
+        });
+    }
+    Ok(name)
+}
+
 /// Whether `name` is one Windows reserves for a device — `CON`, `PRN`,
 /// `AUX`, `NUL`, `CONIN$`, `CONOUT$`, and `COM` or `LPT` with one digit, a
 /// superscript one among them — in any case, and whatever follows its first
@@ -587,7 +623,8 @@ fn repository_path(url: &str) -> &str {
 /// The directory name a Clone of the Repository `url` names takes where it
 /// is given none, as Git names one: the last segment of the path it names
 /// its Repository by (see [`repository_path`]), without `.git` — never
-/// anything of its user, password or host.
+/// anything of its user, password or host — where that may name a
+/// Workspace (see [`workspace_name`]).
 fn named_by(url: &str) -> Result<&str, CloneRefusal> {
     let path = repository_path(url);
     let trimmed = path.trim_end_matches(['/', '\\']);
@@ -596,8 +633,14 @@ fn named_by(url: &str) -> Result<&str, CloneRefusal> {
         .or_else(|| trimmed.strip_suffix("\\.git"))
         .unwrap_or(trimmed);
     let last = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
-    plain_name(last.strip_suffix(".git").unwrap_or(last)).map_err(|_| CloneRefusal::NoNameInUrl {
-        url: url.to_owned(),
+    workspace_name(last.strip_suffix(".git").unwrap_or(last)).map_err(|refused| match refused {
+        CloneRefusal::HiddenName { name, .. } => CloneRefusal::HiddenName {
+            name,
+            url: Some(url.to_owned()),
+        },
+        _ => CloneRefusal::NoNameInUrl {
+            url: url.to_owned(),
+        },
     })
 }
 
@@ -716,10 +759,10 @@ impl SessionOperations {
     /// Description is begun, and discovery of the Roots is asked for again.
     /// Refuses, saying why and having made nothing, where no Root is there to
     /// take the Clone, where its Root cannot be read, where its name is no
-    /// plain directory name, where it would take the Sidekick Workspace's
-    /// place — or, for a Sidekick on a Peer, go anywhere within it — where
-    /// something stands at its destination already, and where Git fails it
-    /// or it outlasts this Server's bound on one.
+    /// plain directory name or a hidden one, where it would take the Sidekick
+    /// Workspace's place — or, for a Sidekick on a Peer, go anywhere within
+    /// it — where something stands at its destination already, and where Git
+    /// fails it or it outlasts this Server's bound on one.
     pub(crate) async fn clone_workspace(
         &self,
         request: &CloneWorkspaceRequest,
@@ -731,7 +774,7 @@ impl SessionOperations {
         let url = request.repository_url.as_str();
         let roots = self.settings.borrow().settings.workspace.roots.clone();
         let name = match &request.name {
-            Some(name) => plain_name(name)?,
+            Some(name) => workspace_name(name)?,
             None => named_by(url)?,
         }
         .to_owned();
@@ -1153,6 +1196,77 @@ mod tests {
                 "{name:?}"
             );
         }
+    }
+
+    /// A Workspace a Clone makes may not be hidden, whether it is named so
+    /// or its Repository URL ends so: discovery passes over a hidden
+    /// directory, and a Clone makes its own out of sight under such a name
+    /// — one spelled as a Clone's staging is spelled among them — which no
+    /// Workspace may take. Every other plain name is one a Workspace may
+    /// have.
+    #[test]
+    fn a_workspace_a_clone_makes_may_not_be_hidden() {
+        for name in [".atlas", ".atlas.suru-clone-deadbeef", ".git", "..atlas"] {
+            assert_eq!(
+                workspace_name(name),
+                Err(CloneRefusal::HiddenName {
+                    name: name.to_owned(),
+                    url: None,
+                }),
+                "{name:?}"
+            );
+        }
+        for name in ["atlas", "atlas.suru-clone-deadbeef", "atlas.git", "a.b"] {
+            assert_eq!(workspace_name(name), Ok(name));
+        }
+        assert_eq!(
+            workspace_name(".."),
+            Err(CloneRefusal::NotPlainName {
+                name: "..".to_owned()
+            }),
+            "a name that is no plain directory name is refused as that first"
+        );
+
+        for (url, name) in [
+            ("https://github.com/org/.atlas.git", ".atlas"),
+            (
+                "https://github.com/org/.atlas.suru-clone-deadbeef",
+                ".atlas.suru-clone-deadbeef",
+            ),
+            (
+                "git@github.com:org/.atlas.suru-clone-deadbeef.git",
+                ".atlas.suru-clone-deadbeef",
+            ),
+            ("/srv/git/.hidden/", ".hidden"),
+        ] {
+            assert_eq!(
+                named_by(url),
+                Err(CloneRefusal::HiddenName {
+                    name: name.to_owned(),
+                    url: Some(url.to_owned()),
+                }),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            CloneRefusal::HiddenName {
+                name: ".atlas.suru-clone-deadbeef".to_owned(),
+                url: None,
+            }
+            .to_string(),
+            "`.atlas.suru-clone-deadbeef` begins with a dot, and a Workspace's name may not be \
+             hidden, so nothing was cloned; give `name` as one that does not begin with a dot."
+        );
+        assert_eq!(
+            CloneRefusal::HiddenName {
+                name: ".atlas".to_owned(),
+                url: Some("https://github.com/org/.atlas.git".to_owned()),
+            }
+            .to_string(),
+            "The Repository URL `https://github.com/org/.atlas.git` ends in `.atlas`, which \
+             begins with a dot, and a Workspace's name may not be hidden, so nothing was cloned; \
+             give one that does not begin with a dot as `name`."
+        );
     }
 
     #[test]

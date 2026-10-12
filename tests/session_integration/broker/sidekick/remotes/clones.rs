@@ -288,6 +288,24 @@ async fn a_remote_refuses_a_clone_by_its_own_roots_and_rules_in_its_own_words() 
         ),
         "a Root of the Sidekick's own Server is none of the Remote's"
     );
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            "clone_workspace",
+            json!({
+                "repository_url": origin,
+                "origin": REMOTE,
+                "name": ".atlas.suru-clone-deadbeef",
+            }),
+        )
+        .await,
+        format!(
+            "The Remote `{REMOTE}` refused it: `.atlas.suru-clone-deadbeef` begins with a dot, and \
+             a Workspace's name may not be hidden, so nothing was cloned; give `name` as one that \
+             does not begin with a dot."
+        ),
+        "a Peer's Sidekick may make no hidden Workspace on the Remote"
+    );
     assert!(
         contents(&here).is_empty() && contents(&there).is_empty(),
         "nothing refused is cloned anywhere"
