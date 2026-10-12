@@ -4,17 +4,21 @@
 //! that Root, so it is listed before any Session has begun there.
 //!
 //! Only a Root's immediate children are read, and of those only the ones
-//! that are not hidden; nothing deeper is, so a nested or vendored
-//! Repository stays out of the Registry. Each child is read through source
-//! control discovery, which reads the Sidekick Workspace as a directory of
-//! its own whatever it holds, and is kept only where it is the root its
-//! Repository is presented by: a plain directory, a directory within a
-//! Repository — as every child of a Root that is itself a Repository is —
-//! and a linked Worktree of a Repository presented elsewhere are each left
-//! alone, so the Root itself never becomes a Workspace and a linked Worktree
-//! counts for its Repository's Workspace alone (ADR 0023). Discovery derives
-//! no Icon and no Description: the first Session begun in a discovered
-//! Workspace derives them as it would anywhere.
+//! that are not hidden and that stand directly within the Root once read
+//! as the Server reads paths: a link is kept where it names another
+//! directory directly within the Root, and left alone where it names the
+//! Root itself or anywhere else, since a Repository reached only through a
+//! link is not directly within the Root. Nothing deeper is read, so a nested
+//! or vendored Repository stays out of the Registry. Each child is read
+//! through source control discovery, which reads the Sidekick Workspace as a
+//! directory of its own whatever it holds, and is kept only where it is the
+//! root its Repository is presented by: a plain directory, a directory
+//! within a Repository — as every child of a Root that is itself a
+//! Repository is — and a linked Worktree of a Repository presented elsewhere
+//! are each left alone, so the Root itself never becomes a Workspace and a
+//! linked Worktree counts for its Repository's Workspace alone (ADR 0023).
+//! Discovery derives no Icon and no Description: the first Session begun in
+//! a discovered Workspace derives them as it would anywhere.
 //!
 //! It runs at start and when the Roots change, and whenever Workspaces are
 //! listed, where a scan of the same Roots no older than the memo
@@ -173,9 +177,12 @@ fn expand(root: &str, home: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// The directories directly within `root` that discovery reads, each as the
-/// Server reads paths: every child that is a directory, a symlink counting
-/// as what it names, but those that are hidden and those whose names are not
-/// Unicode, which no Workspace can be presented by.
+/// Server reads paths: every child that is a directory standing directly
+/// within the Root once read so — a link counting as the directory it names,
+/// where that is another directly within the Root, and as nothing where it
+/// names the Root itself or anywhere else — but those that are hidden and
+/// those whose names are not Unicode, which no Workspace can be presented
+/// by.
 fn child_directories(root: &Path) -> io::Result<Vec<PathBuf>> {
     let root = crate::paths::canonical(root)?;
     Ok(std::fs::read_dir(&root)?
@@ -188,6 +195,7 @@ fn child_directories(root: &Path) -> io::Result<Vec<PathBuf>> {
                 .is_some_and(|name| !is_hidden(name, entry))
         })
         .filter_map(|entry| crate::paths::canonical(entry.path()).ok())
+        .filter(|child| child.parent() == Some(root.as_path()))
         .collect())
 }
 
@@ -218,29 +226,45 @@ mod tests {
     }
 
     #[test]
-    fn a_roots_children_are_its_directories_but_the_hidden_ones() {
+    fn a_roots_children_are_the_directories_directly_within_it_but_the_hidden_ones() {
         let root = tempfile::tempdir().expect("create a Root");
         let root = crate::paths::canonical(root.path()).expect("read the Root canonically");
         for directory in ["atlas", "ledger", ".tooling", "notes/deeper"] {
             std::fs::create_dir_all(root.join(directory)).expect("create a child directory");
         }
         std::fs::write(root.join("README.md"), "Projects").expect("write a file");
-        let elsewhere = tempfile::tempdir().expect("create a directory elsewhere");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(elsewhere.path(), root.join("linked"))
-            .expect("link a directory elsewhere into the Root");
 
         let mut children = child_directories(&root).expect("read the Root");
         children.sort();
 
-        let mut expected = vec![root.join("atlas"), root.join("ledger"), root.join("notes")];
-        #[cfg(unix)]
-        expected.push(crate::paths::canonical(elsewhere.path()).expect("read it canonically"));
-        expected.sort();
         assert_eq!(
-            children, expected,
-            "each directory directly within the Root, a link read as what it names, but neither \
-             a hidden directory, a file, nor anything deeper"
+            children,
+            [root.join("atlas"), root.join("ledger"), root.join("notes")],
+            "each directory directly within the Root, but neither a hidden directory, a file, \
+             nor anything deeper"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_counts_only_where_it_names_another_directory_directly_within_the_root() {
+        let root = tempfile::tempdir().expect("create a Root");
+        let root = crate::paths::canonical(root.path()).expect("read the Root canonically");
+        std::fs::create_dir_all(root.join("atlas").join("deeper")).expect("create a child");
+        let elsewhere = tempfile::tempdir().expect("create a directory elsewhere");
+        let link = |target: &Path, name: &str| {
+            std::os::unix::fs::symlink(target, root.join(name)).expect("link into the Root");
+        };
+        link(Path::new("."), "self");
+        link(elsewhere.path(), "elsewhere");
+        link(&root.join("atlas").join("deeper"), "deeper");
+        link(&root.join("atlas"), "alias");
+
+        assert_eq!(
+            child_directories(&root).expect("read the Root"),
+            [root.join("atlas"), root.join("atlas")],
+            "a link to another directory directly within the Root reads as that directory; one \
+             to the Root itself, to anywhere else, or to anything deeper is left alone"
         );
     }
 

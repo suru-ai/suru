@@ -128,9 +128,11 @@ async fn a_repository_directly_within_a_root_is_listed_before_any_session_begins
 
 /// Of a Root's contents, only the Repository roots directly within it are
 /// discovered, main or bare: a plain directory, a Repository two levels
-/// down, a hidden Repository, and a linked Worktree of a Repository
-/// presented elsewhere are each left alone, and so is the Root itself, which
-/// is a Repository here, so every plain directory within it is the Root's.
+/// down, a hidden Repository, a linked Worktree of a Repository presented
+/// elsewhere, and — where links are made — a link to a Repository elsewhere
+/// are each left alone, and so is the Root itself, which is a Repository
+/// here, so every plain directory within it, and a link to it, is the
+/// Root's.
 #[tokio::test]
 async fn only_the_repository_roots_directly_within_a_root_are_discovered_main_or_bare() {
     const CHANNEL: &str = "workspace-discovery-shapes";
@@ -161,6 +163,12 @@ async fn only_the_repository_roots_directly_within_a_root_are_discovered_main_or
             spelled(&projects.join("topic")),
         ],
     );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(".", projects.join("self")).expect("link the Root to itself");
+        std::os::unix::fs::symlink(&elsewhere, projects.join("alias"))
+            .expect("link a Repository elsewhere into the Root");
+    }
     let (_, server) =
         server_with_roots(&home, CHANNEL, &[spelled(&projects)], Duration::ZERO).await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
