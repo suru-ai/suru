@@ -1721,6 +1721,9 @@ async fn start(
         source_control.clone(),
         preparations.clone(),
     );
+    // A Clone a Sidekick on a Peer asked for runs apart from its request,
+    // until the stop begins, and the stop then waits for it to let go.
+    let detached_clones = operations::DetachedClones::new(provider_shutdown_rx.clone());
     let operations = SessionOperations::new(
         sessions.clone(),
         providers.clone(),
@@ -1734,7 +1737,11 @@ async fn start(
         settings.subscribe(),
         Arc::new(hosted_providers),
         timings.checkout_skill_timeout,
-        operations::WorkspaceCloning::new(config.home_dir(), timings.workspace_clone_timeout),
+        operations::WorkspaceCloning::new(
+            config.home_dir(),
+            timings.workspace_clone_timeout,
+            detached_clones.clone(),
+        ),
         sidekick_workspace.clone(),
         operations::RemoteReach::new(
             serving.clone(),
@@ -1982,10 +1989,15 @@ async fn start(
                     .await
                     .context("Provider shutdown task panicked");
                 // A Clone the requests just drained left landing, or
-                // removing what it made, is seen through a while yet.
-                if tokio::time::timeout(clone_settle, clones_for_shutdown.settle_clones())
-                    .await
-                    .is_err()
+                // removing what it made, is seen through a while yet — once
+                // every Clone run apart for a Peer, stopped as the stop
+                // began, has let go of what it began.
+                if tokio::time::timeout(clone_settle, async {
+                    detached_clones.stopped().await;
+                    clones_for_shutdown.settle_clones().await;
+                })
+                .await
+                .is_err()
                 {
                     tracing::warn!(
                         "a Clone was still landing as the server stopped; what it leaves is \
@@ -4170,7 +4182,9 @@ async fn set_workspace_description(State(state): State<AppState>, request: Reque
 /// paths it is spelled in, or the refusal in this Server's own words. A Clone
 /// is a Sidekick's act, so a Client's request, which names no one, is
 /// refused; and one a Peer asks is seen through though the Peer stops
-/// listening, since it may have been done all the same once it was asked.
+/// listening, since it may have been done all the same once it was asked,
+/// until this Server begins to stop, which stops it (see
+/// `SessionOperations::clone_workspace_detached`).
 async fn clone_workspace(State(state): State<AppState>, request: Request) -> Response {
     let author = match act_author(&state, request.headers()) {
         Ok(Some(author)) => author,
@@ -4189,29 +4203,35 @@ async fn clone_workspace(State(state): State<AppState>, request: Request) -> Res
             Ok(request) => request,
             Err(response) => return response,
         };
-    let operations = state.operations.clone();
-    let cloning = tokio::spawn(async move { operations.clone_workspace(&request, &author).await });
-    match cloning.await {
+    match state
+        .operations
+        .clone_workspace_detached(request, author)
+        .await
+    {
         // Spelled as this Server's Workspace listing spells its paths.
-        Ok(Ok(workspace)) => Json(ClonedWorkspace {
+        Ok(workspace) => Json(ClonedWorkspace {
             workspace_paths: crate::protocol::WorkspacePaths::discover(),
             workspace,
         })
         .into_response(),
-        Ok(Err(
+        Err(
             refusal @ (CloneRefusal::SidekickWorkspace { .. }
             | CloneRefusal::SidekickWorkspacePlace { .. }),
-        )) => session_error_response(
+        ) => session_error_response(
             StatusCode::CONFLICT,
             SessionErrorCode::SidekickWorkspaceSession,
             refusal.to_string(),
         ),
-        Ok(Err(refusal)) => session_error_response(
+        Err(refusal @ CloneRefusal::Stopped { .. }) => session_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            SessionErrorCode::CloneRefused,
+            refusal.to_string(),
+        ),
+        Err(refusal) => session_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             SessionErrorCode::CloneRefused,
             refusal.to_string(),
         ),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

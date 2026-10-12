@@ -547,3 +547,102 @@ async fn a_clone_on_a_remote_is_waited_on_as_a_clone_and_one_whose_answer_is_los
         "the Remote saw the Clone through though no one heard its answer"
     );
 }
+
+/// A Remote that begins to stop while a Clone a Peer's Sidekick asked of it
+/// is still running Git stops that Clone, though it runs apart from the
+/// Peer's request: Git ends, and what it had begun is removed before the
+/// Remote lets go. The Sidekick is told the Remote stopped it — or, where
+/// the Remote's stop cut the answer off on its way back, that it may have
+/// been done — and is never answered for from what the Remote last said.
+/// Git is held here by a Repository URL naming a server that takes the
+/// connection and never answers.
+#[tokio::test]
+async fn a_remote_stopping_mid_clone_stops_git_and_removes_what_it_began_before_it_lets_go() {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut pair = paired("sidekick-remote-clone-stopping", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let (_there, there) = directory();
+    name_roots(&remote, &[&there]).await;
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listen for Git");
+    let url = format!(
+        "git://127.0.0.1:{}/atlas.git",
+        silent.local_addr().expect("a listening address").port()
+    );
+    let (connected, git_connected) = oneshot::channel();
+    let (let_go, git_let_go) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut connection, _) = silent.accept().await.expect("Git connects");
+        let _ = connected.send(());
+        let mut said = [0; 1024];
+        while connection.read(&mut said).await.is_ok_and(|read| read > 0) {}
+        let _ = let_go.send(());
+    });
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+
+    let cloning = {
+        let url = url.clone();
+        tokio::spawn(async move {
+            let refusal = refused(
+                &mut sidekick,
+                "clone_workspace",
+                json!({ "repository_url": url, "origin": REMOTE }),
+            )
+            .await;
+            (sidekick, refusal)
+        })
+    };
+    timeout(PROGRESS_DEADLINE, git_connected)
+        .await
+        .expect("the Remote's Git asks for the Repository")
+        .expect("Git connects");
+    assert!(
+        contents(&there).iter().all(|entry| entry.starts_with('.')) && !contents(&there).is_empty(),
+        "Git is making the clone out of sight: {:?}",
+        contents(&there)
+    );
+
+    let Serving {
+        server,
+        _directories,
+        ..
+    } = pair.remote;
+    timeout(PROGRESS_DEADLINE, server.shutdown())
+        .await
+        .expect("the Remote stops")
+        .expect("shut down the Remote");
+    assert_eq!(
+        contents(&there),
+        Vec::<String>::new(),
+        "what the Clone began is removed before the Remote lets go"
+    );
+    timeout(PROGRESS_DEADLINE, git_let_go)
+        .await
+        .expect("the Remote's Git is stopped")
+        .expect("Git lets go of its connection");
+
+    let (_sidekick, refusal) = cloning.await.expect("the Tool answers");
+    let stopped = format!(
+        "The Remote `{REMOTE}` refused it: This server began to stop before the Clone of `{url}` \
+         was done, so it was stopped and what it had begun is removed; a clone already whole may \
+         land all the same, and is then listed among this server's Workspaces once it is back."
+    );
+    let cut_off = format!(
+        "The Remote `{REMOTE}` stopped answering once it had been asked. The Clone may have been \
+         done there all the same: list that Remote's Workspaces with list_workspaces and \
+         \"origin\": \"{REMOTE}\" to find out before asking again; nothing is kept to do later."
+    );
+    assert!(
+        refusal == stopped || refusal == cut_off,
+        "the Sidekick is told the Remote stopped the Clone, or that its answer was cut off: \
+         {refusal}"
+    );
+
+    pair.own
+        .shutdown()
+        .await
+        .expect("shut down the Sidekick's own Server");
+}

@@ -34,7 +34,11 @@
 //! Icon and Description derived on the Remote, at the Agent its Landing
 //! begins a Session with where none is named, as a Session that Sidekick
 //! began there would be; and since a Clone takes as long as Git does, the
-//! Remote is given as long to answer as one may take.
+//! Remote is given as long to answer as one may take. The Remote sees such
+//! a Clone through on a task of its own, whatever becomes of the Peer's
+//! request, until it begins to stop: that stops the Clone as an abandoned
+//! one is stopped, and the stop waits a while for it to let go of what it
+//! began before the Remote lets go.
 //!
 //! [`SourceControlService::clone_repository`]: crate::source_control::SourceControlService::clone_repository
 
@@ -46,6 +50,7 @@ use std::{
 };
 
 use axum::http::Method;
+use tokio::sync::watch;
 
 use super::{
     SessionOperations,
@@ -76,22 +81,73 @@ const ROOT_READS_AT_ONCE: usize = 8;
 const LANDED_READ_WITHIN: Duration = Duration::from_secs(5);
 
 /// What a Clone takes that is this Server's own: the home a Workspace Root
-/// beginning with `~` lies beneath, how long a Clone may run, and the reads
-/// apart a Root is read by.
+/// beginning with `~` lies beneath, how long a Clone may run, the reads
+/// apart a Root is read by, and the Clones run on tasks of their own.
 #[derive(Clone)]
 pub(crate) struct WorkspaceCloning {
     home: Option<PathBuf>,
     timeout: Duration,
     reads: Arc<ReadsApart>,
+    detached: DetachedClones,
 }
 
 impl WorkspaceCloning {
-    pub(crate) fn new(home: Option<PathBuf>, timeout: Duration) -> Self {
+    pub(crate) fn new(home: Option<PathBuf>, timeout: Duration, detached: DetachedClones) -> Self {
         Self {
             home,
             timeout,
             reads: Arc::new(ReadsApart::new("suru-clone-root-read", ROOT_READS_AT_ONCE)),
+            detached,
         }
+    }
+}
+
+/// The Clones Sidekicks on Peers ask of this Server, each run on a task of
+/// its own, so it is seen through however its Peer fares, until this Server
+/// begins to stop, which stops every one: counted while they run, so a
+/// stopping Server can wait until each has let go of what it began.
+#[derive(Clone)]
+pub(crate) struct DetachedClones {
+    /// Whether this Server has begun to stop.
+    stopping: watch::Receiver<bool>,
+    running: Arc<watch::Sender<usize>>,
+}
+
+impl DetachedClones {
+    /// Clones run apart until `stopping` says this Server has begun to stop.
+    pub(crate) fn new(stopping: watch::Receiver<bool>) -> Self {
+        Self {
+            stopping,
+            running: Arc::new(watch::channel(0).0),
+        }
+    }
+
+    /// Waits until none is running: what a stopping Server waits on, once
+    /// its stop has stopped every one, before it waits on what they left to
+    /// see through (see [`SourceControlService::settle_clones`]).
+    ///
+    /// [`SourceControlService::settle_clones`]: crate::source_control::SourceControlService::settle_clones
+    pub(crate) async fn stopped(&self) {
+        let _ = self
+            .running
+            .subscribe()
+            .wait_for(|running| *running == 0)
+            .await;
+    }
+
+    /// One more running, until the answer is dropped.
+    fn begin(&self) -> RunningClone {
+        self.running.send_modify(|running| *running += 1);
+        RunningClone(self.running.clone())
+    }
+}
+
+/// One Clone running apart.
+struct RunningClone(Arc<watch::Sender<usize>>);
+
+impl Drop for RunningClone {
+    fn drop(&mut self) {
+        self.0.send_modify(|running| *running -= 1);
     }
 }
 
@@ -156,6 +212,8 @@ pub(crate) enum CloneRefusal {
         destination: PathBuf,
         timeout: Duration,
     },
+    /// This Server began to stop before the Clone was done, and stopped it.
+    Stopped { url: String },
 }
 
 impl fmt::Display for CloneRefusal {
@@ -282,6 +340,12 @@ impl fmt::Display for CloneRefusal {
                  in did not answer in time, so nothing was cloned.",
                 spelled(*timeout)
             ),
+            Self::Stopped { url } => write!(
+                formatter,
+                "This server began to stop before the Clone of `{url}` was done, so it was \
+                 stopped and what it had begun is removed; a clone already whole may land all \
+                 the same, and is then listed among this server's Workspaces once it is back."
+            ),
         }
     }
 }
@@ -295,6 +359,7 @@ impl CloneRefusal {
             Self::LeftBehind { .. } => Some("failed, leaving what it made behind"),
             Self::TimedOut { .. } => Some("timed out"),
             Self::StillLanding { .. } => Some("was still landing when its time ran out"),
+            Self::Stopped { .. } => Some("was stopped as the server stopped"),
             Self::Occupied { .. } => Some("found its destination occupied"),
             Self::NoRoot
             | Self::RootUnnamed { .. }
@@ -776,6 +841,52 @@ impl SessionOperations {
             .into_iter()
             .find(|listed| listed.id == workspace.id)
             .unwrap_or(workspace))
+    }
+
+    /// Clones as [`Self::clone_workspace`] does, for the Sidekick on a Peer
+    /// `author` names, on a task of its own: the Clone is seen through
+    /// however the Peer fares — one that stops listening loses only the
+    /// answer — until this Server begins to stop. That stops it as an
+    /// abandoned Clone is stopped: Git ends, and what it began is removed on
+    /// its own, among what every Clone leaves to see through, which the
+    /// stopping Server waits on; a clone already whole may land all the
+    /// same, to be found as discovery finds one. A Clone asked for once the
+    /// stop has begun is stopped before it begins.
+    pub(crate) async fn clone_workspace_detached(
+        &self,
+        request: CloneWorkspaceRequest,
+        author: Author,
+    ) -> Result<Workspace, CloneRefusal> {
+        let url = request.repository_url.clone();
+        let running = self.cloning.detached.begin();
+        let mut stopping = self.cloning.detached.stopping.clone();
+        let operations = self.clone();
+        let cloning = tokio::spawn(async move {
+            // Let go only once the Clone is dropped, and with it whatever it
+            // left to be removed is counted among what Clones see through.
+            let _running = running;
+            tokio::select! {
+                biased;
+                () = crate::provider::wait_for_shutdown(&mut stopping) => {
+                    tracing::info!(
+                        repository_url = %without_credentials(&request.repository_url),
+                        sidekick = %Cloner(&author),
+                        "a Clone of a Repository URL into a Workspace Root was stopped as the \
+                         server stopped"
+                    );
+                    Err(CloneRefusal::Stopped {
+                        url: request.repository_url.clone(),
+                    })
+                }
+                cloned = operations.clone_workspace(&request, &author) => cloned,
+            }
+        });
+        match cloning.await {
+            Ok(answer) => answer,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            // Only a runtime going away cancels it.
+            Err(_) => Err(CloneRefusal::Stopped { url }),
+        }
     }
 
     /// Clones the Repository `request` names on the Remote `name` for

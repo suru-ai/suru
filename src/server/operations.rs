@@ -81,7 +81,7 @@ mod workspaces;
 
 pub(crate) use acts_at::ActRefusal;
 pub(crate) use beginnings::BeginningRefusal;
-pub(crate) use clones::{CloneRefusal, WorkspaceCloning};
+pub(crate) use clones::{CloneRefusal, DetachedClones, WorkspaceCloning};
 pub(crate) use origins::{
     Gathered, OriginRefusal, Origins, Refusal, RemoteActRefusal, RemoteReach, SessionReadRefusal,
     SilentRemote,
