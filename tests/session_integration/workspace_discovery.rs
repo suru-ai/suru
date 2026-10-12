@@ -444,6 +444,59 @@ async fn a_root_naming_suru_s_own_data_directory_is_ignored() {
     server.shutdown().await.expect("shut down server");
 }
 
+/// A Root ignored as Suru's own data directory holds nothing from another
+/// Root: a linked Worktree directly within the Root beside it, of a
+/// Repository whose main root stands directly within the data directory,
+/// counts for that Repository's Workspace under the Root it is in, as it
+/// would were no Root named there at all.
+#[tokio::test]
+async fn a_root_ignored_as_the_data_directory_leaves_a_linked_worktree_beside_it_counting() {
+    const CHANNEL: &str = "workspace-discovery-data-directory-linked";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    std::fs::create_dir(&projects).expect("create the Workspace Root");
+    let (config, server) = server_with_roots(&home, CHANNEL, &[], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let data = canonical(config.data_dir());
+    let atlas = data.join("atlas");
+    repository(&atlas);
+    let topic = projects.join("topic");
+    git(&atlas, &["worktree", "add", "-b", "topic", spelled(&topic)]);
+    client
+        .mutate_setting(SettingMutation::WorkspaceRoots {
+            value: Some(vec![
+                spelled(&data).to_owned(),
+                spelled(&projects).to_owned(),
+            ]),
+        })
+        .await
+        .expect("name the data directory as a Root beside another");
+
+    let atlas_id = repository_id(&atlas.join(".git"));
+    assert_eq!(
+        listed(&client)
+            .await
+            .iter()
+            .map(located)
+            .collect::<Vec<_>>(),
+        [(atlas_id.clone(), atlas.clone())],
+        "the linked Worktree counts for its Repository's Workspace, presented by its main root"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    let projects_spelled = spelled(&projects).replace('\\', "\\\\");
+    assert_eq!(
+        entries_on_disk(&config).get(&atlas_id),
+        Some(&(
+            Some(atlas.clone()),
+            format!(r#"{{"discovered":{{"root":"{projects_spelled}"}}}}"#)
+        )),
+        "known by discovery under the Root the linked Worktree is in"
+    );
+}
+
 /// A Root standing directly within another is a Root and never a
 /// Workspace, however it is spelled: the other Root's scan enters it as
 /// nothing, though it is a Repository, nor counts a linked Worktree of it

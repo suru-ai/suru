@@ -30,9 +30,11 @@
 //! writing alone, so a Root on a mount gone quiet holds back no other Root's
 //! discoveries. A Root naming Suru's own data directory, where the Sidekick
 //! Workspace is kept, is ignored, the Log saying why, so the Sidekick
-//! Workspace is never within a Root. Discovery derives no Icon and no
-//! Description: the first Session begun in a discovered Workspace derives
-//! them as it would anywhere.
+//! Workspace is never within a Root — and, being no Root, holds nothing
+//! from another: neither a Workspace presented at it nor a Repository
+//! presented directly within it is kept from counting where it is found.
+//! Discovery derives no Icon and no Description: the first Session begun in
+//! a discovered Workspace derives them as it would anywhere.
 //!
 //! Each Root is scanned on its own, on a task of its own, and everything a
 //! scan reads from the filesystem or source control is read apart, on a
@@ -527,20 +529,30 @@ impl RootScan for RegistryScan {
             );
             return;
         }
+        // A Root ignored as Suru's own data directory is no Root at all, so
+        // it holds nothing this one would otherwise count.
         let others = root_directories::resolve(
             &self.resolutions,
             self.home.as_deref(),
             self.wait,
             commit.roots().iter().filter(|other| *other != root),
         )
-        .await;
+        .await
+        .into_values()
+        .filter(|other| {
+            !self
+                .data_root
+                .as_deref()
+                .is_some_and(|data_root| other.names(data_root))
+        })
+        .collect::<Vec<_>>();
         let at_a_root = |presented: &Path| {
-            presented == resolved || others.values().any(|other| other.names(presented))
+            presented == resolved || others.iter().any(|other| other.names(presented))
         };
         let directly_within_another = |presented: &Path| {
             presented
                 .parent()
-                .is_some_and(|holder| others.values().any(|other| other.names(holder)))
+                .is_some_and(|holder| others.iter().any(|other| other.names(holder)))
         };
         let mut readings = stream::iter(children.into_iter().map(|child| async move {
             let source_control = self.source_control.clone();
