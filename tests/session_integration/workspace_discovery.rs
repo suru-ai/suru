@@ -25,7 +25,9 @@ use suru::{
 use crate::{
     failing_provider_support::FailingProviderRuntime,
     repositories::git,
-    workspace_registry::{canonical, connected_client, listed, repository},
+    workspace_registry::{
+        BY_SESSION, canonical, connected_client, entries_on_disk, listed, quiet_request, repository,
+    },
 };
 
 /// A memo no test outlasts: every listing after the first reuses its scan.
@@ -203,6 +205,170 @@ async fn a_scan_moments_old_is_reused_until_the_roots_change() {
         [(repository_id(&atlas.join(".git")), atlas.clone())],
         "the Root was discovered as it was named, and that scan is reused, so the Repository \
          made since is not listed yet"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// Discovery at start enters each Repository root within a Root in the
+/// Registry before anything is listed, known by discovery under that Root
+/// as the Setting spells it. A Workspace a Session began in before it was
+/// within a Root stays known by that Session.
+#[tokio::test]
+async fn discovery_at_start_enters_each_repository_known_by_the_root_it_was_found_under() {
+    const CHANNEL: &str = "workspace-discovery-provenance";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    let ledger = projects.join("ledger");
+    repository(&ledger);
+    let (config, server) = server_with_roots(&home, CHANNEL, &[], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    client
+        .create_session(quiet_request(&ledger, "Balance the ledger"))
+        .await
+        .expect("begin a Session in the ledger before it is within a Root");
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+
+    let (_, restarted) = server_with_roots(&home, CHANNEL, &["~/projects"], NEVER_AGAIN).await;
+    restarted.workspace_discovery_settled().await;
+    restarted.shutdown().await.expect("shut down server");
+
+    let entries = entries_on_disk(&config);
+    assert_eq!(
+        entries.get(&repository_id(&atlas.join(".git"))),
+        Some(&(
+            Some(atlas.clone()),
+            r#"{"discovered":{"root":"~/projects"}}"#.to_owned()
+        )),
+        "the Repository is entered at start, known by the Root it was found under"
+    );
+    assert_eq!(
+        entries.get(&repository_id(&ledger.join(".git"))),
+        Some(&(Some(ledger.clone()), BY_SESSION.to_owned())),
+        "a Workspace a Session began in stays known by that Session"
+    );
+}
+
+/// A Root that cannot be read is skipped — nothing is made where it names —
+/// and the Roots that can be read are discovered all the same, one beginning
+/// with `~` beneath the Server's home.
+#[tokio::test]
+async fn a_root_that_cannot_be_read_is_skipped_and_never_made() {
+    const CHANNEL: &str = "workspace-discovery-unreadable-root";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let unplugged = home.join("unplugged").join("projects");
+    let atlas = home.join("projects").join("atlas");
+    repository(&atlas);
+    let (_, server) = server_with_roots(
+        &home,
+        CHANNEL,
+        &[spelled(&unplugged), "~/projects"],
+        Duration::ZERO,
+    )
+    .await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+
+    assert_eq!(
+        listed(&client)
+            .await
+            .iter()
+            .map(located)
+            .collect::<Vec<_>>(),
+        [(repository_id(&atlas.join(".git")), atlas.clone())],
+        "the Root that can be read is discovered"
+    );
+    assert!(
+        !home.join("unplugged").exists(),
+        "nothing is made where the Root that cannot be read names"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A Repository cloned by hand into a Root while the Server runs is listed
+/// the next time Workspaces are listed, without a restart.
+#[tokio::test]
+async fn a_repository_cloned_by_hand_after_start_is_listed_at_the_next_listing() {
+    const CHANNEL: &str = "workspace-discovery-cloned-by-hand";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    let (_, server) =
+        server_with_roots(&home, CHANNEL, &[spelled(&projects)], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    assert_eq!(
+        listed(&client)
+            .await
+            .iter()
+            .map(located)
+            .collect::<Vec<_>>(),
+        [(repository_id(&atlas.join(".git")), atlas.clone())]
+    );
+
+    let copy = projects.join("atlas-copy");
+    git(
+        &projects,
+        &["clone", "--quiet", spelled(&atlas), spelled(&copy)],
+    );
+
+    assert_eq!(
+        listed(&client)
+            .await
+            .iter()
+            .map(located)
+            .collect::<Vec<_>>(),
+        [
+            (repository_id(&atlas.join(".git")), atlas.clone()),
+            (repository_id(&copy.join(".git")), copy.clone()),
+        ],
+        "the clone is listed beside the Repository it was cloned from, as a Workspace of its own"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// The Sidekick Workspace is never discovered, even made a Repository
+/// directly within a Root: it is listed as itself and nothing else is
+/// presented at its directory.
+#[tokio::test]
+async fn the_sidekick_workspace_is_never_discovered() {
+    const CHANNEL: &str = "workspace-discovery-sidekick";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let (config, server) = server_with_roots(&home, CHANNEL, &[], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let sidekick = client
+        .sidekick_workspace()
+        .await
+        .expect("make the Sidekick Workspace")
+        .workspace;
+    repository(&sidekick.path);
+    client
+        .mutate_setting(SettingMutation::WorkspaceRoots {
+            value: Some(vec![spelled(&canonical(config.data_dir())).to_owned()]),
+        })
+        .await
+        .expect("name the directory the Sidekick Workspace is in as a Root");
+
+    let at_sidekick = listed(&client)
+        .await
+        .into_iter()
+        .filter(|workspace| workspace.path == sidekick.path)
+        .map(|workspace| workspace.id)
+        .collect::<Vec<_>>();
+    assert!(
+        at_sidekick.iter().all(|id| *id == sidekick.id),
+        "nothing but the Sidekick Workspace is presented at its directory: {at_sidekick:?}"
     );
 
     drop(client);

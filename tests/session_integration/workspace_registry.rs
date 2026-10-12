@@ -31,7 +31,7 @@ use crate::{
 
 /// A first Prompt naming no Agent Selection, so its Session asks for no
 /// Errand and its Workspace carries only what a test gives it.
-fn quiet_request(directory: &Path, prompt: &str) -> CreateSessionRequest {
+pub(super) fn quiet_request(directory: &Path, prompt: &str) -> CreateSessionRequest {
     CreateSessionRequest {
         session_id: None,
         preparation_id: None,
