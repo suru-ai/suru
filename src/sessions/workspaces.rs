@@ -276,6 +276,32 @@ impl SessionStore {
         inherited
     }
 
+    /// Enters `workspace`, which discovery found presented at `directory`
+    /// directly within the Workspace Root `root`, in the Registry: known by
+    /// discovery under that Root where it has no entry yet, and otherwise
+    /// only moved to where it is presented now (see
+    /// [`Self::enter_workspace`]). Whatever another identity was entered at
+    /// that directory is superseded, as wherever else a Workspace is first
+    /// seen, so what it carried passes to `workspace` and every Session
+    /// grouped there wears it.
+    pub(crate) fn enter_discovered(&self, workspace: &Workspace, directory: &Path, root: &str) {
+        let inherited = {
+            let mut state = self.state.lock().unwrap();
+            self.enter_workspace(
+                &mut state,
+                &workspace.id,
+                Some(workspace),
+                WorkspaceProvenance::Discovered {
+                    root: root.to_owned(),
+                },
+            );
+            self.retire_superseded(&mut state, workspace, Some(directory), None)
+        };
+        if inherited {
+            self.regroup_workspace(&workspace.id);
+        }
+    }
+
     pub(crate) async fn discover_workspaces(
         &self,
         source_control: &SourceControlService,

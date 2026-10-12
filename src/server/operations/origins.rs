@@ -977,7 +977,7 @@ impl SessionOperations {
     ) -> Result<Gathered<Vec<SessionListItem>>, OriginRefusal> {
         let asked_at = self.sessions.moment();
         let gathered = self
-            .gather(origins, || self.sessions.list(None), SESSIONS_PATH)
+            .gather(origins, async { self.sessions.list(None) }, SESSIONS_PATH)
             .await?;
         // What a Remote lists now confirms what it holds, and what it no
         // longer holds.
@@ -998,16 +998,18 @@ impl SessionOperations {
         &self,
         origins: &Origins,
     ) -> Result<Gathered<WorkspaceListing>, OriginRefusal> {
-        self.gather(origins, || self.workspace_listing(), WORKSPACES_PATH)
+        self.gather(origins, self.workspace_listing(), WORKSPACES_PATH)
             .await
     }
 
     /// Every Workspace this Server knows, as its Workspace Registry lists
-    /// them, spelled in its own paths: what its `GET /v1/workspaces`
-    /// answers, a Peer included. An entry whose Repository source control
-    /// has read during this run is presented as that Repository is, so one
-    /// whose main checkout is not known is named so.
-    pub(crate) fn workspace_listing(&self) -> WorkspaceListing {
+    /// them once the Workspace Roots are discovered into it — afresh, or by
+    /// a scan only moments old — spelled in its own paths: what its `GET
+    /// /v1/workspaces` answers, a Peer included. An entry whose Repository
+    /// source control has read during this run is presented as that
+    /// Repository is, so one whose main checkout is not known is named so.
+    pub(crate) async fn workspace_listing(&self) -> WorkspaceListing {
+        self.root_discovery.discover().await;
         let repositories = self.source_control.repositories();
         let mut workspaces = self.sessions.listed_workspaces();
         for workspace in &mut workspaces {
@@ -1133,21 +1135,22 @@ impl SessionOperations {
         })
     }
 
-    /// What `read` gives at each Origin `origins` ranges over: `here` for this
-    /// Server, and for a Remote what its Session API answers a `GET` of
-    /// `path` with. A read at one Origin that cannot be read is refused,
-    /// saying why; one ranging Everywhere asks every Remote at once and names
-    /// each that did not answer.
+    /// What `read` gives at each Origin `origins` ranges over: what `here`
+    /// comes to for this Server, awaited only where `origins` ranges over
+    /// it, and for a Remote what its Session API answers a `GET` of `path`
+    /// with. A read at one Origin that cannot be read is refused, saying
+    /// why; one ranging Everywhere asks every Remote at once, while this
+    /// Server is read, and names each that did not answer.
     async fn gather<T: DeserializeOwned>(
         &self,
         origins: &Origins,
-        here: impl FnOnce() -> T,
+        here: impl Future<Output = T>,
         path: &str,
     ) -> Result<Gathered<T>, OriginRefusal> {
         let remotes = match origins {
             Origins::One(Outlook::Local) => {
                 return Ok(Gathered {
-                    answered: vec![(Outlook::Local, here())],
+                    answered: vec![(Outlook::Local, here.await)],
                     unanswered: Vec::new(),
                 });
             }
@@ -1165,16 +1168,18 @@ impl SessionOperations {
             }
             Origins::Everywhere => self.remotes.paired(),
         };
+        let (local, reads) = tokio::join!(
+            here,
+            join_all(
+                remotes
+                    .iter()
+                    .map(|remote| self.remotes.get(&remote.name, path)),
+            )
+        );
         let mut gathered = Gathered {
-            answered: vec![(Outlook::Local, here())],
+            answered: vec![(Outlook::Local, local)],
             unanswered: Vec::new(),
         };
-        let reads = join_all(
-            remotes
-                .iter()
-                .map(|remote| self.remotes.get(&remote.name, path)),
-        )
-        .await;
         // Each Pairing is asked after for every Remote at once, so one that
         // answered and was then unpaired while another was still being asked
         // takes what it said with it, as one whose Pairing has ended leaves

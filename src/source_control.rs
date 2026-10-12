@@ -13,7 +13,7 @@ mod directory_listing;
 mod git;
 pub mod naming;
 mod preparation;
-pub(crate) use directory_listing::list_directory;
+pub(crate) use directory_listing::{is_directory, is_hidden, list_directory};
 pub use git::GitSourceControl;
 pub(crate) use preparation::PreparationStore;
 
@@ -811,6 +811,19 @@ impl SourceControlService {
     ) -> ResolvedWorkspace {
         self.resolve_in_batch(&mut DiscoveryBatch::default(), directory, known)
             .await
+    }
+
+    /// What `directory` reads as to source control — the Sidekick
+    /// Workspace's as a directory of its own — without this Server
+    /// remembering the Repository found there. Discovery reads every
+    /// Repository directly within each Workspace Root this way, since a
+    /// remembered Repository is one checkout observation watches the
+    /// Worktrees of for as long as the Server runs.
+    pub(crate) async fn read_unremembered(&self, directory: &Path) -> ResolvedWorkspace {
+        match self.sidekick_reading(directory) {
+            Some(reading) => reading,
+            None => self.adapter.discover(directory).await,
+        }
     }
     /// Resolve within one discovery batch, so that several directories which
     /// fall back to the same Repository metadata or main checkout are read from

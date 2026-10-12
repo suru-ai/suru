@@ -46,6 +46,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 use super::LandingAgentSelectionStore;
+use super::root_discovery::RootDiscovery;
 use crate::attachments::{AttachmentStore, BindingRefusal, PromptAttachmentError};
 use crate::memories::MemoryStore;
 use crate::model_catalog::ModelCatalogService;
@@ -435,6 +436,9 @@ pub(crate) struct SessionOperations {
     remotes: RemoteReach,
     /// Where a change of a Setting is written, and everything that adopts it.
     settings_adoption: SettingsAdoption,
+    /// What discovers the Repositories within the Workspace Roots into the
+    /// Workspace Registry before the Registry is listed.
+    root_discovery: RootDiscovery,
     /// The Memories this Server keeps for its Sidekicks.
     memories: MemoryStore,
     /// The Remotes kept in view for the trees listing their Sessions.
@@ -459,6 +463,7 @@ impl SessionOperations {
         sidekick_workspace: SidekickWorkspace,
         remotes: RemoteReach,
         settings_adoption: SettingsAdoption,
+        root_discovery: RootDiscovery,
         memories: MemoryStore,
         remote_watches: RemoteWatches,
     ) -> Self {
@@ -478,6 +483,7 @@ impl SessionOperations {
             sidekick_workspace,
             remotes,
             settings_adoption,
+            root_discovery,
             memories,
             remote_watches,
         }

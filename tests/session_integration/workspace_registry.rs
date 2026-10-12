@@ -48,7 +48,7 @@ fn quiet_request(directory: &Path, prompt: &str) -> CreateSessionRequest {
     }
 }
 
-async fn connected_client(state_dir: &Path, channel: &str) -> ManagedClient {
+pub(super) async fn connected_client(state_dir: &Path, channel: &str) -> ManagedClient {
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir, channel).expect("configure client"),
     )
@@ -76,7 +76,7 @@ async fn landing_workspace(client: &ManagedClient, directory: &Path) -> Workspac
 }
 
 /// The Workspaces the Client's Workspace listing answers with, in its order.
-async fn listed(client: &ManagedClient) -> Vec<Workspace> {
+pub(super) async fn listed(client: &ManagedClient) -> Vec<Workspace> {
     client
         .list_workspaces()
         .await
@@ -86,7 +86,7 @@ async fn listed(client: &ManagedClient) -> Vec<Workspace> {
 
 /// A directory as the Server reads it, so a path the listing gives compares
 /// equal to it on every platform.
-fn canonical(path: &Path) -> PathBuf {
+pub(super) fn canonical(path: &Path) -> PathBuf {
     suru::paths::canonical(path).expect("read the directory canonically")
 }
 
@@ -109,7 +109,7 @@ fn named(
 }
 
 /// A Repository at `root` with one commit on `main`.
-fn repository(root: &Path) {
+pub(super) fn repository(root: &Path) {
     std::fs::create_dir_all(root).expect("create the Repository");
     git(root, &["init", "-b", "main"]);
     git(
@@ -150,7 +150,7 @@ struct StoredEntry {
 }
 
 /// The Server's database, opened beside it or after it.
-fn database(config: &ServerConfig) -> SqliteConnection {
+pub(super) fn database(config: &ServerConfig) -> SqliteConnection {
     SqliteConnection::establish(
         config
             .data_dir()
@@ -164,7 +164,9 @@ fn database(config: &ServerConfig) -> SqliteConnection {
 /// What the Registry left on disk for each Workspace, by its identity: the
 /// path it is presented by and how it came to be known, as the table spells
 /// them.
-fn entries_on_disk(config: &ServerConfig) -> HashMap<WorkspaceId, (Option<PathBuf>, String)> {
+pub(super) fn entries_on_disk(
+    config: &ServerConfig,
+) -> HashMap<WorkspaceId, (Option<PathBuf>, String)> {
     diesel::sql_query("SELECT id, path, provenance FROM workspaces")
         .load::<StoredEntry>(&mut database(config))
         .expect("read the Registry")
@@ -202,7 +204,7 @@ fn unreadable(config: &ServerConfig, session_id: SessionId) {
 }
 
 /// How the table spells a Workspace known by a Session.
-const BY_SESSION: &str = "\"session\"";
+pub(super) const BY_SESSION: &str = "\"session\"";
 /// How the table spells a Workspace known by its Description.
 const BY_DESCRIPTION: &str = "\"description\"";
 

@@ -73,6 +73,7 @@ mod election;
 pub(crate) mod operations;
 mod reclaim;
 mod relays;
+mod root_discovery;
 mod signals;
 
 use operations::{
@@ -162,6 +163,11 @@ pub const SHUTDOWN_OVERRUN: Duration = Duration::from_secs(5);
 pub struct ServerTimings {
     pub sse_keepalive_interval: Duration,
     pub checkout_observation_interval: Duration,
+    /// How long a discovery of the Repositories within the Workspace Roots
+    /// is reused by the Workspace listings that follow it before one
+    /// discovers them again, so listing stays cheap while a Repository
+    /// cloned by hand is still listed within moments.
+    pub root_discovery_memo: Duration,
     /// Delay after startup Workspace discovery before the first Reclaim pass.
     pub worktree_reclaim_startup_delay: Duration,
     /// Cadence of later automatic Reclaim passes.
@@ -345,6 +351,7 @@ impl Default for ServerTimings {
         Self {
             sse_keepalive_interval: Duration::from_secs(10),
             checkout_observation_interval: Duration::from_secs(1),
+            root_discovery_memo: Duration::from_secs(3),
             worktree_reclaim_startup_delay: Duration::from_secs(1),
             worktree_reclaim_interval: Duration::from_secs(60 * 60),
             worktree_reclaim_day: Duration::from_secs(24 * 60 * 60),
@@ -586,6 +593,13 @@ impl ServerTimings {
         self.checkout_observation_interval = interval;
         self
     }
+    /// Bounds how long a Workspace listing reuses the last discovery of the
+    /// Workspace Roots; injectable so a test sees a Repository made since
+    /// listed at once, or a scan reused, without waiting out the default.
+    pub fn with_root_discovery_memo(mut self, memo: Duration) -> Self {
+        self.root_discovery_memo = memo;
+        self
+    }
     pub fn with_worktree_reclaim_startup_delay(mut self, delay: Duration) -> Self {
         self.worktree_reclaim_startup_delay = delay;
         self
@@ -791,7 +805,8 @@ impl SessionEventSink {
 
 impl RunningServer {
     /// Startup Workspace discovery runs behind readiness. Resolves once every
-    /// persisted Session has been regrouped, or discovery was abandoned.
+    /// persisted Session has been regrouped and the Workspace Roots have
+    /// been discovered, or discovery was abandoned.
     pub async fn workspace_discovery_settled(&self) {
         let mut discovery = self.workspace_discovery.clone();
         let _ = discovery.wait_for(|settled| *settled).await;
@@ -1499,13 +1514,23 @@ async fn start(
     .with_sidekicks(sidekick_workspace.clone(), sidekick_acts);
     let source_control = crate::source_control::SourceControlService::new(source_control)
         .with_sidekick_workspace(sidekick_workspace.clone());
+    let root_discovery = root_discovery::RootDiscovery::new(
+        sessions.clone(),
+        source_control.clone(),
+        settings.subscribe(),
+        config.home_dir(),
+        timings.root_discovery_memo,
+    );
     // Persisted grouping is served at once; discovery regroups Sessions behind
     // readiness and publishes catalog changes, so a cold source control
-    // system never delays the server's readiness.
+    // system never delays the server's readiness. The Workspace Roots are
+    // discovered once the Sessions are regrouped, so a Workspace a Session
+    // is found working in is known by that Session rather than by its Root.
     let (workspace_discovery, workspace_discovery_rx) = watch::channel(false);
     {
         let sessions = sessions.clone();
         let source_control = source_control.clone();
+        let root_discovery = root_discovery.clone();
         let mut shutdown = provider_shutdown_rx.clone();
         tokio::spawn(async move {
             tokio::select! {
@@ -1513,11 +1538,12 @@ async fn start(
                 _ = wait_for_shutdown(&mut shutdown) => {
                     tracing::info!("Workspace discovery abandoned for shutdown");
                 }
-                result = sessions.discover_workspaces(&source_control) => {
-                    if let Err(error) = result {
+                () = async {
+                    if let Err(error) = sessions.discover_workspaces(&source_control).await {
                         tracing::error!("Workspace discovery failed: {error:#}");
                     }
-                }
+                    root_discovery.rediscover().await;
+                } => {}
             }
             workspace_discovery.send_replace(true);
         });
@@ -1622,6 +1648,7 @@ async fn start(
             runtimes.clone(),
             serving.clone(),
         ),
+        root_discovery,
         memories,
         operations::RemoteWatches::new(
             timings.remote_retry_interval,
@@ -3642,7 +3669,7 @@ async fn list_workspaces(State(state): State<AppState>, headers: HeaderMap) -> R
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(state.operations.workspace_listing()).into_response()
+    Json(state.operations.workspace_listing().await).into_response()
 }
 
 /// All Session-specific HTTP operations enter through one hydration boundary.

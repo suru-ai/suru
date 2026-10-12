@@ -60,7 +60,7 @@ pub(crate) fn list_directory(
             let name = entry.file_name().into_string().ok()?;
             let path = entry.path();
             Some(ChildDirectory {
-                hidden: name.starts_with('.') || carries_hidden_attribute(&entry),
+                hidden: is_hidden(&name, &entry),
                 source_control: listed_source_control(&path),
                 path,
                 name,
@@ -145,8 +145,14 @@ fn unreadable(error: &io::Error) -> String {
     format!("Could not read this directory: {error}")
 }
 
+/// Whether `entry`, named `name`, is hidden: by its leading dot on every
+/// platform, or by Windows' hidden attribute there.
+pub(crate) fn is_hidden(name: &str, entry: &std::fs::DirEntry) -> bool {
+    name.starts_with('.') || carries_hidden_attribute(entry)
+}
+
 /// Whether `entry` is a directory, a symlink counting as what it names.
-fn is_directory(entry: &std::fs::DirEntry) -> bool {
+pub(crate) fn is_directory(entry: &std::fs::DirEntry) -> bool {
     entry.file_type().is_ok_and(|kind| {
         kind.is_dir()
             || (kind.is_symlink()

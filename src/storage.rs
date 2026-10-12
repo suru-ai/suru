@@ -364,6 +364,9 @@ pub(crate) enum WorkspaceProvenance {
     /// Someone described it, or chose its Icon, before any Session worked
     /// there.
     Description,
+    /// Discovery found it directly within the Workspace Root `root`, spelled
+    /// as the Setting naming the Roots spelled it then.
+    Discovered { root: String },
 }
 
 /// One act of a Sidekick on a Session, as the `sidekick_acts` table keeps it:

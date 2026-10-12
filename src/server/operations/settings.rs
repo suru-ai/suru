@@ -20,7 +20,7 @@ use std::{future::Future, sync::Arc};
 
 use tokio::sync::{Mutex, watch};
 
-use super::SessionOperations;
+use super::{RootDiscovery, SessionOperations};
 use crate::{
     protocol::{SettingMutation, SettingsSnapshot},
     provider::{ProviderOrchestrator, ProviderRuntime},
@@ -105,8 +105,9 @@ impl SessionOperations {
     /// settings the reloaded document yields in force: every hosted Provider
     /// runtime takes the Server Settings it now runs under, the Serving
     /// listener moves to what its Settings say, every attached Client is
-    /// pushed the snapshot, and each live Session following a Provider's
-    /// Approval Posture Settings takes the posture they now make. The change
+    /// pushed the snapshot, each live Session following a Provider's
+    /// Approval Posture Settings takes the posture they now make, and
+    /// Workspace Roots that changed are discovered afresh. The change
     /// runs whole, after every change asked for before it has, and on a task
     /// of the Server's own, so it completes whether or not this is awaited to
     /// the end. A document that cannot take the edit changes nothing.
@@ -117,21 +118,29 @@ impl SessionOperations {
         let adoption = self.settings_adoption.clone();
         let sessions = self.sessions.clone();
         let providers = self.providers.clone();
+        let root_discovery = self.root_discovery.clone();
         self.settings_adoption
             .changes
-            .run(async move { adoption.change(mutation, &sessions, &providers).await })
+            .run(async move {
+                adoption
+                    .change(mutation, &sessions, &providers, &root_discovery)
+                    .await
+            })
             .await
     }
 }
 
 impl SettingsAdoption {
-    /// One change, from its write through the Approval Postures it reconciles.
+    /// One change, from its write through the Approval Postures it reconciles
+    /// and the Workspace Roots it names.
     async fn change(
         &self,
         mutation: SettingMutation,
         sessions: &SessionStore,
         providers: &ProviderOrchestrator,
+        root_discovery: &RootDiscovery,
     ) -> Result<SettingChanged, SettingsMutationError> {
+        let roots = self.snapshot.borrow().settings.workspace.roots.clone();
         // The edit is filesystem work, and the CST handles it parses the
         // document into are not `Send`; both stay on a blocking thread, where
         // the read, the edit, and the write are one scope.
@@ -157,6 +166,9 @@ impl SettingsAdoption {
                 });
         let changed = sessions.reconcile_approval_postures(&snapshot.settings);
         crate::server::apply_live_posture_updates(providers, changed).await;
+        if snapshot.settings.workspace.roots != roots {
+            root_discovery.rediscover().await;
+        }
         Ok(SettingChanged { snapshot, serving })
     }
 }
