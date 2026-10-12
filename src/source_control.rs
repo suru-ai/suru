@@ -103,6 +103,10 @@ pub enum CloneFailure {
     /// The Clone failed, or was stopped once its timeout passed, and what it
     /// left at its destination could not be removed, as this says.
     LeftBehind(String),
+    /// The clone was whole, but still taking its destination's name when
+    /// the timeout passed: it may yet land there, and where it cannot,
+    /// nothing will be left.
+    StillLanding,
 }
 
 #[async_trait]
@@ -204,12 +208,15 @@ pub trait SourceControl: Send + Sync {
     /// the Clone is whole, so no half-made one is ever taken for a
     /// Workspace, and nothing standing there is ever replaced: anything
     /// already there, or come to stand there meanwhile, refuses it and is
-    /// left as it was. `timeout` bounds making the clone; once it is whole,
+    /// left as it was. `timeout` bounds the call. Once the clone is whole,
     /// giving it its name — or removing it where it cannot have one — is
-    /// seen through whatever the time, and whatever becomes of whoever
-    /// awaits it. A Clone that fails leaves nothing behind once it answers;
-    /// what one stopped at its deadline, or abandoned, began is removed on a
-    /// task of its own.
+    /// seen through on its own whatever the time, and whatever becomes of
+    /// whoever awaits it; a call whose timeout passes meanwhile answers
+    /// [`CloneFailure::StillLanding`]. A Clone that fails leaves nothing
+    /// behind once it answers; what one stopped at its deadline, or
+    /// abandoned, began is removed on its own, and what a Server that died
+    /// meanwhile left is removed at the next start by
+    /// [`SourceControl::sweep_abandoned_clones`].
     async fn clone_repository(
         &self,
         url: &str,
@@ -217,6 +224,16 @@ pub trait SourceControl: Send + Sync {
         branch: Option<&str>,
         timeout: std::time::Duration,
     ) -> Result<Workspace, CloneFailure>;
+    /// Waits until everything Clones have left to see through on their own
+    /// — naming a whole clone, removing one that cannot be named or was
+    /// abandoned — is done: what a stopping Server waits on, a bounded
+    /// while, before it lets go.
+    async fn settle_clones(&self);
+    /// Removes from `root`, a Workspace Root, what Clones of a Server run no
+    /// longer alive left there mid-way, and nothing else: run at a Server's
+    /// start, as the backstop to [`SourceControl::settle_clones`] for a
+    /// Server that died or was cut off before its Clones settled.
+    async fn sweep_abandoned_clones(&self, root: &Path);
     /// Rename the branch a fresh preparation created for a Managed Worktree
     /// to the first of [`naming::numbered`] `proposal` — a fragment already
     /// shaped by [`naming::proposed_fragment`] — that no other branch holds,
@@ -729,6 +746,16 @@ impl SourceControlService {
     pub(crate) fn clone_capability(&self) -> crate::protocol::SourceControlCapability {
         self.adapter.clone_capability()
     }
+    /// Waits until what Clones have left to see through is done; see
+    /// [`SourceControl::settle_clones`].
+    pub(crate) async fn settle_clones(&self) {
+        self.adapter.settle_clones().await;
+    }
+    /// Removes from `root` what Clones of a dead Server run left there; see
+    /// [`SourceControl::sweep_abandoned_clones`].
+    pub(crate) async fn sweep_abandoned_clones(&self, root: &Path) {
+        self.adapter.sweep_abandoned_clones(root).await;
+    }
     /// Clones `url` into `destination` as [`SourceControl::clone_repository`]
     /// does. The Repository made there is not remembered, so it joins no
     /// checkout observation until a Session works in it.
@@ -1142,6 +1169,8 @@ mod tests {
         ) -> Result<Workspace, CloneFailure> {
             Err(CloneFailure::Failed(STANDS_IN.to_owned()))
         }
+        async fn settle_clones(&self) {}
+        async fn sweep_abandoned_clones(&self, _root: &Path) {}
         async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
             let mut resolved = ResolvedWorkspace::directory(directory.to_owned());
             if directory == self.metadata {
@@ -1198,6 +1227,8 @@ mod tests {
         ) -> Result<Workspace, CloneFailure> {
             Err(CloneFailure::Failed(STANDS_IN.to_owned()))
         }
+        async fn settle_clones(&self) {}
+        async fn sweep_abandoned_clones(&self, _root: &Path) {}
         async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
             *self
                 .readings

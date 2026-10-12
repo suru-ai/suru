@@ -1094,3 +1094,187 @@ async fn a_clone_has_the_roots_discovered_afresh_and_its_workspace_stays_cloned(
         "however often the Root is scanned since, the Clone's Workspace is known by its Clone"
     );
 }
+
+/// Git whose every Clone, once whole, says where it is about to land and
+/// waits there until the test lets one more go on.
+fn gated_git() -> (
+    suru::source_control::GitSourceControl,
+    std::sync::mpsc::Receiver<PathBuf>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (landing, landings) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (landing, released) = (Mutex::new(landing), Mutex::new(released));
+    let git = suru::source_control::GitSourceControl::default().with_naming_observer(
+        move |destination: &Path| {
+            let _ = landing.lock().unwrap().send(destination.to_owned());
+            let _ = released.lock().unwrap().recv();
+        },
+    );
+    (git, landings, release)
+}
+
+/// A Clone whose clone is whole but still taking its name when the
+/// Server's bound on a Clone passes is refused then, saying the clone may
+/// yet land and will then be listed — rather than holding the call past its
+/// bound — and the clone lands once its naming goes on, and is listed as
+/// discovery finds it. A Server stopping while a Clone is still landing
+/// waits for it before it lets go.
+#[tokio::test]
+async fn a_clone_still_landing_at_its_bound_is_refused_saying_so_and_lands_and_is_listed_after() {
+    const CHANNEL: &str = "sidekick-clone-still-landing";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let (_projects, projects) = directory();
+    let (_elsewhere, elsewhere) = directory();
+    let atlas_origin = bare_repository(&elsewhere, "atlas");
+    let charts_origin = bare_repository(&elsewhere, "charts");
+    name_roots(config_dir.path(), &[spelled(&projects)]);
+    let (git, landings, release) = gated_git();
+    let mut hosted = host_providers_with_source_control(
+        state_dir.path(),
+        CHANNEL,
+        Some(config_dir.path()),
+        ServerTimings::default()
+            .with_broker_wait_second(WAIT_SECOND)
+            .with_broker_wait_progress_interval(WAIT_PROGRESS_EVERY)
+            .with_workspace_clone_timeout(Duration::from_secs(2))
+            .with_workspace_clone_settle(PROGRESS_DEADLINE)
+            .with_root_discovery_memo(Duration::ZERO)
+            .with_root_discovery_wait(AS_LONG_AS_IT_TAKES),
+        Arc::new(git),
+    )
+    .await;
+    let descriptor = hosted.server.descriptor().clone();
+    let (_sidekick_id, mut sidekick, _provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    let still_landing = |origin: &Path, destination: &Path| {
+        format!(
+            "The Clone of `{}` did not finish within 2 seconds: the whole clone was still taking \
+             its name, `{}`, so it may yet land there, and will then be listed among this \
+             server's Workspaces; if it cannot, nothing will be left of it.",
+            spelled(origin),
+            spelled(destination)
+        )
+    };
+
+    let atlas = projects.join("atlas");
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            "clone_workspace",
+            json!({ "repository_url": atlas_origin }),
+        )
+        .await,
+        still_landing(&atlas_origin, &atlas)
+    );
+    assert_eq!(
+        landings.try_recv(),
+        Ok(atlas.clone()),
+        "the clone was whole, held as it took its name"
+    );
+    assert!(!atlas.exists());
+    release.send(()).expect("let the clone take its name");
+    let landed = cloned_row(&atlas, Value::Null, Value::Null);
+    timeout(PROGRESS_DEADLINE, async {
+        while !list_workspaces(&mut sidekick).await.contains(&landed) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the clone lands, and a later listing finds it");
+    assert_eq!(
+        std::fs::read_to_string(atlas.join("README.md")).expect("the clone landed whole"),
+        readme("atlas")
+    );
+
+    let charts = projects.join("charts");
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            "clone_workspace",
+            json!({ "repository_url": charts_origin }),
+        )
+        .await,
+        still_landing(&charts_origin, &charts)
+    );
+    let server = hosted.server;
+    let stopping = tokio::spawn(async move { server.shutdown().await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !stopping.is_finished(),
+        "a stopping Server waits on a Clone still landing"
+    );
+    release.send(()).expect("let the clone take its name");
+    timeout(PROGRESS_DEADLINE, stopping)
+        .await
+        .expect("the Server stops once the Clone has landed")
+        .unwrap()
+        .expect("shut down server");
+    assert!(
+        charts.join("README.md").exists(),
+        "the Clone landed before the Server let go"
+    );
+    let mut left = contents(&projects);
+    left.retain(|name| name.starts_with('.'));
+    assert!(left.is_empty(), "nothing staged is left: {left:?}");
+}
+
+/// What a Clone of a Server that died mid-way left in a Workspace Root — a
+/// staging directory named as a Clone names one, holding the marker of a
+/// run no longer alive — is removed when a Server next starts, and nothing
+/// else is: not another hidden directory, though it hold such a marker, nor
+/// a directory so named without one.
+#[tokio::test]
+async fn what_a_dead_servers_clone_left_in_a_root_is_removed_at_the_next_start() {
+    const CHANNEL: &str = "sidekick-clone-swept";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let (_projects, projects) = directory();
+    name_roots(config_dir.path(), &[spelled(&projects)]);
+    let left = |name: &str, marked: bool| {
+        let staging = projects.join(name);
+        std::fs::create_dir_all(staging.join("clone")).expect("make what was left");
+        std::fs::write(staging.join("clone").join("README.md"), readme("atlas"))
+            .expect("write what was left");
+        if marked {
+            std::fs::write(staging.join("suru-clone"), "a run long gone")
+                .expect("mark what was left");
+        }
+        staging
+    };
+    let abandoned = left(".atlas.suru-clone-0123abcd", true);
+    let notes = left(".notes", true);
+    let unmarked = left(".maps.suru-clone-89abcdef", false);
+
+    let hosted = host_providers_with_timings(
+        state_dir.path(),
+        CHANNEL,
+        Some(config_dir.path()),
+        ServerTimings::default()
+            .with_broker_wait_second(WAIT_SECOND)
+            .with_broker_wait_progress_interval(WAIT_PROGRESS_EVERY)
+            .with_root_discovery_wait(AS_LONG_AS_IT_TAKES),
+    )
+    .await;
+    timeout(
+        PROGRESS_DEADLINE,
+        hosted.server.workspace_discovery_settled(),
+    )
+    .await
+    .expect("the Server's first discovery settles");
+
+    assert!(
+        !abandoned.exists(),
+        "what the dead run's Clone left is removed"
+    );
+    for survivor in [&notes, &unmarked] {
+        assert!(
+            survivor.join("clone").join("README.md").exists(),
+            "{} is left as it was",
+            survivor.display()
+        );
+    }
+
+    hosted.server.shutdown().await.expect("shut down server");
+}

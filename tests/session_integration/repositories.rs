@@ -552,6 +552,8 @@ async fn session_creation_rejects_execution_directory_that_changed_since_discove
                 "This stand-in reads directories and Clones nothing".to_owned(),
             ))
         }
+        async fn settle_clones(&self) {}
+        async fn sweep_abandoned_clones(&self, _root: &Path) {}
     }
     let temporary = tempfile::tempdir().unwrap();
     let root = canonical(temporary.path());
@@ -744,6 +746,12 @@ async fn a_failed_worktree_listing_retires_nothing_it_could_not_speak_for() {
             self.git
                 .clone_repository(url, destination, branch, timeout)
                 .await
+        }
+        async fn settle_clones(&self) {
+            self.git.settle_clones().await;
+        }
+        async fn sweep_abandoned_clones(&self, root: &Path) {
+            self.git.sweep_abandoned_clones(root).await;
         }
         async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
             self.git.discover(directory).await

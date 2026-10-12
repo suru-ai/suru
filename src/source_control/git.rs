@@ -71,9 +71,13 @@ pub struct GitSourceControl {
     /// Worktree root no longer looks like the one Git confirmed.
     validated_roots: Mutex<HashMap<CheckoutId, ValidatedRoot>>,
     on_disk: on_disk::OnDisk,
-    /// How a whole Clone takes its destination's name, never over anything
-    /// standing there; scripted where a test must see one slow to.
-    rename: cloning::Rename,
+    /// What this Server run's Clones share: how a whole clone takes its
+    /// name, what they have under way on their own, and the run they mark
+    /// their staging with.
+    cloning: cloning::Cloning,
+    /// What every Git command is run with in its environment beside the
+    /// Server's own, as though the Server had been started with it.
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 struct ValidatedRoot {
     common: PathBuf,
@@ -262,7 +266,8 @@ impl GitSourceControl {
             observer: None,
             validated_roots: Mutex::new(HashMap::new()),
             on_disk: on_disk::OnDisk::default(),
-            rename: std::sync::Arc::new(cloning::rename_new),
+            cloning: cloning::Cloning::default(),
+            environment: Vec::new(),
         }
     }
     pub fn with_preparation_observer(
@@ -275,6 +280,34 @@ impl GitSourceControl {
     /// An isolated Git user configuration, useful for embedded hosts and fixtures.
     pub fn with_configuration_file(mut self, path: impl Into<PathBuf>) -> Self {
         self.configuration_file = Some(path.into());
+        self
+    }
+    /// Runs every Git command with `name` set to `value` in its environment,
+    /// as though the Server had been started with it: for an embedding host
+    /// that must, and for a test standing in for an environment the Server
+    /// inherits. What a command must be run with whatever the environment
+    /// says — a Clone's refusals of prompts and of transports among it —
+    /// still stands over it.
+    pub fn with_environment(
+        mut self,
+        name: impl Into<std::ffi::OsString>,
+        value: impl Into<std::ffi::OsString>,
+    ) -> Self {
+        self.environment.push((name.into(), value.into()));
+        self
+    }
+    /// Has `observer` told — on the thread a whole clone is named on, with
+    /// its destination, just before it takes its name there — of every
+    /// Clone landing: for a host that watches them, and for a test that must
+    /// hold one there.
+    pub fn with_naming_observer(
+        mut self,
+        observer: impl Fn(&Path) + Send + Sync + 'static,
+    ) -> Self {
+        self.cloning.rename = std::sync::Arc::new(move |from: &Path, to: &Path| {
+            observer(to);
+            cloning::rename_new(from, to)
+        });
         self
     }
     pub fn with_mutation_timeout(mut self, timeout: Duration) -> Self {
@@ -340,6 +373,7 @@ impl GitSourceControl {
         for (name, value) in &executable.environment {
             command.env(name, value);
         }
+        command.envs(self.environment.iter().map(|(name, value)| (name, value)));
         // Ambient Git overrides must not redirect discovery into another checkout.
         for name in [
             "GIT_DIR",
@@ -939,6 +973,14 @@ impl SourceControl for GitSourceControl {
         timeout: Duration,
     ) -> Result<Workspace, super::CloneFailure> {
         self.clone_into(url, destination, branch, timeout).await
+    }
+
+    async fn settle_clones(&self) {
+        self.cloning.settled().await;
+    }
+
+    async fn sweep_abandoned_clones(&self, root: &Path) {
+        self.cloning.sweep(root).await;
     }
 
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {

@@ -1282,13 +1282,22 @@ async fn a_clone_through_an_ssh_the_user_names_asks_nothing_either() {
 
 /// A Repository URL naming Git's `ext::` transport, which runs a command
 /// the URL spells out, is refused in Git's words however the user's
-/// configuration allows it, and the command never runs.
+/// configuration allows it — and however the environment the Server was
+/// started in does: `GIT_ALLOW_PROTOCOL`, which stands over every
+/// configuration, and configuration given in the environment alike — and
+/// the command never runs.
 #[tokio::test]
 async fn a_clone_runs_no_command_a_repository_url_spells_out() {
     let (_temporary, root) = root();
     let configuration = root.join("gitconfig");
     std::fs::write(&configuration, "[protocol \"ext\"]\n\tallow = always\n").unwrap();
-    let adapter = GitSourceControl::default().with_configuration_file(&configuration);
+    let adapter = GitSourceControl::default()
+        .with_configuration_file(&configuration)
+        .with_environment("GIT_ALLOW_PROTOCOL", "ext")
+        .with_environment("GIT_CONFIG_PARAMETERS", "'protocol.ext.allow'='always'")
+        .with_environment("GIT_CONFIG_COUNT", "1")
+        .with_environment("GIT_CONFIG_KEY_0", "protocol.allow")
+        .with_environment("GIT_CONFIG_VALUE_0", "always");
     let ran = root.join("ran");
     let destination = root.join("atlas");
 

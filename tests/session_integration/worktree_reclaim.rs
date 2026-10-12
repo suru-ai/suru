@@ -439,6 +439,12 @@ impl SourceControl for DelayedAvailableObservation {
             .clone_repository(url, destination, branch, timeout)
             .await
     }
+    async fn settle_clones(&self) {
+        self.git.settle_clones().await;
+    }
+    async fn sweep_abandoned_clones(&self, root: &Path) {
+        self.git.sweep_abandoned_clones(root).await;
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         self.git.discover(directory).await
     }
@@ -505,6 +511,12 @@ impl SourceControl for ObservationDuringRemoval {
         self.git
             .clone_repository(url, destination, branch, timeout)
             .await
+    }
+    async fn settle_clones(&self) {
+        self.git.settle_clones().await;
+    }
+    async fn sweep_abandoned_clones(&self, root: &Path) {
+        self.git.sweep_abandoned_clones(root).await;
     }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         self.git.discover(directory).await
@@ -994,6 +1006,12 @@ impl SourceControl for PauseEagerRemoval {
             .clone_repository(url, destination, branch, timeout)
             .await
     }
+    async fn settle_clones(&self) {
+        self.git.settle_clones().await;
+    }
+    async fn sweep_abandoned_clones(&self, root: &Path) {
+        self.git.sweep_abandoned_clones(root).await;
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         self.git.discover(directory).await
     }
@@ -1049,6 +1067,12 @@ impl SourceControl for CountReclaimCandidates {
             .clone_repository(url, destination, branch, timeout)
             .await
     }
+    async fn settle_clones(&self) {
+        self.git.settle_clones().await;
+    }
+    async fn sweep_abandoned_clones(&self, root: &Path) {
+        self.git.sweep_abandoned_clones(root).await;
+    }
     async fn reclaim_candidate_observed(&self, _target: &CheckoutRemovalTarget) {
         self.candidates.fetch_add(1, Ordering::SeqCst);
     }
@@ -1100,6 +1124,12 @@ impl SourceControl for PauseAfterCandidateObservation {
         self.git
             .clone_repository(url, destination, branch, timeout)
             .await
+    }
+    async fn settle_clones(&self) {
+        self.git.settle_clones().await;
+    }
+    async fn sweep_abandoned_clones(&self, root: &Path) {
+        self.git.sweep_abandoned_clones(root).await;
     }
     async fn reclaim_candidate_observed(&self, _target: &CheckoutRemovalTarget) {
         if !self.paused.swap(true, Ordering::SeqCst) {
@@ -1887,6 +1917,12 @@ impl SourceControl for SilentDirectory {
             .clone_repository(url, destination, branch, timeout)
             .await
     }
+    async fn settle_clones(&self) {
+        self.git.settle_clones().await;
+    }
+    async fn sweep_abandoned_clones(&self, root: &Path) {
+        self.git.sweep_abandoned_clones(root).await;
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         *self
             .readings
@@ -2325,6 +2361,12 @@ impl SourceControl for FailFirstPreparationRetirement {
             .clone_repository(url, destination, branch, timeout)
             .await
     }
+    async fn settle_clones(&self) {
+        self.git.settle_clones().await;
+    }
+    async fn sweep_abandoned_clones(&self, root: &Path) {
+        self.git.sweep_abandoned_clones(root).await;
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         self.git.discover(directory).await
     }
@@ -2387,6 +2429,12 @@ impl SourceControl for FailFirstReclaim {
         self.git
             .clone_repository(url, destination, branch, timeout)
             .await
+    }
+    async fn settle_clones(&self) {
+        self.git.settle_clones().await;
+    }
+    async fn sweep_abandoned_clones(&self, root: &Path) {
+        self.git.sweep_abandoned_clones(root).await;
     }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         self.git.discover(directory).await

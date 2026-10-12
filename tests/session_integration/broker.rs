@@ -297,6 +297,25 @@ async fn host_providers_with_timings(
     config_dir: Option<&Path>,
     timings: ServerTimings,
 ) -> HostedProviders {
+    host_providers_with_source_control(
+        state_dir,
+        channel,
+        config_dir,
+        timings,
+        Arc::new(suru::source_control::GitSourceControl::default()),
+    )
+    .await
+}
+
+/// [`host_providers_with_timings`] on a Server whose source control is
+/// `source_control`.
+async fn host_providers_with_source_control(
+    state_dir: &Path,
+    channel: &str,
+    config_dir: Option<&Path>,
+    timings: ServerTimings,
+    source_control: Arc<dyn suru::source_control::SourceControl>,
+) -> HostedProviders {
     let (claude_runtime, claude) =
         ControlledProvider::with_provider(ProviderId::new("claude"), claude_models());
     let (codex_runtime, codex) =
@@ -310,7 +329,7 @@ async fn host_providers_with_timings(
     if let Some(config_dir) = config_dir {
         config = config.with_config_dir(config_dir);
     }
-    let server = server::spawn_with_providers_and_timings(
+    let server = server::spawn_with_source_control(
         config,
         vec![
             claude_runtime.clone(),
@@ -318,6 +337,7 @@ async fn host_providers_with_timings(
             copilot_runtime.clone(),
         ],
         timings,
+        source_control,
     )
     .await
     .expect("spawn server");

@@ -481,6 +481,12 @@ impl SourceControl for RefusingRemoval {
             .clone_repository(url, destination, branch, timeout)
             .await
     }
+    async fn settle_clones(&self) {
+        self.git.settle_clones().await;
+    }
+    async fn sweep_abandoned_clones(&self, root: &Path) {
+        self.git.sweep_abandoned_clones(root).await;
+    }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         self.git.discover(directory).await
     }

@@ -334,6 +334,11 @@ pub struct ServerTimings {
     /// minutes every Provider allows a Broker call, so a Repository too big
     /// to Clone in time is refused in words rather than cut off unanswered.
     pub workspace_clone_timeout: Duration,
+    /// How long a stopping Server waits, among what it lets go of
+    /// gracefully, for what Clones have left to see through on their own —
+    /// naming a whole clone, removing one — before it lets go of them too;
+    /// what is left then is removed at the next start.
+    pub workspace_clone_settle: Duration,
     /// How long after it was last uploaded or bound by an admitted Prompt an
     /// Attachment is left in place even once no Session references it, since
     /// a Prompt still in admission may be about to bind it (ADR 0037).
@@ -406,6 +411,7 @@ impl Default for ServerTimings {
             broker_wait_second: broker::WaitTimings::default().second,
             broker_wait_progress_interval: broker::WaitTimings::default().progress_every,
             workspace_clone_timeout: Duration::from_secs(10 * 60),
+            workspace_clone_settle: Duration::from_secs(3),
             attachment_grace: crate::attachments::ATTACHMENT_GRACE,
             attachment_sweep_interval: crate::attachments::ATTACHMENT_SWEEP_INTERVAL,
             save_retry_interval: crate::storage::SAVE_RETRY_INTERVAL,
@@ -668,6 +674,13 @@ impl ServerTimings {
     /// one refused for the time it took without waiting out the default.
     pub fn with_workspace_clone_timeout(mut self, timeout: Duration) -> Self {
         self.workspace_clone_timeout = timeout;
+        self
+    }
+    /// Bounds how long a stopping Server waits for its Clones to settle;
+    /// injectable so a test sees a stop wait on one, or not, without
+    /// waiting out the default.
+    pub fn with_workspace_clone_settle(mut self, settle: Duration) -> Self {
+        self.workspace_clone_settle = settle;
         self
     }
 
@@ -1545,6 +1558,8 @@ async fn start(
     .with_sidekicks(sidekick_workspace.clone(), sidekick_acts);
     let source_control = crate::source_control::SourceControlService::new(source_control)
         .with_sidekick_workspace(sidekick_workspace.clone());
+    let (clones_for_shutdown, clone_settle) =
+        (source_control.clone(), timings.workspace_clone_settle);
     let root_discovery = root_discovery::RootDiscovery::new(
         Arc::new(root_discovery::RegistryScan::new(
             sessions.clone(),
@@ -1572,6 +1587,9 @@ async fn start(
         let source_control = source_control.clone();
         let root_discovery = root_discovery.clone();
         let mut shutdown = provider_shutdown_rx.clone();
+        let roots = settings.subscribe();
+        let home = config.home_dir();
+        let sweep_within = timings.root_discovery_wait;
         tokio::spawn(async move {
             tokio::select! {
                 biased;
@@ -1581,6 +1599,26 @@ async fn start(
                 () = async {
                     if let Err(error) = sessions.discover_workspaces(&source_control).await {
                         tracing::error!("Workspace discovery failed: {error:#}");
+                    }
+                    // What Clones of a run that died left in the Roots is
+                    // removed before the Roots are first discovered, waited
+                    // on no longer than discovery is.
+                    let roots = roots.borrow().settings.workspace.roots.clone();
+                    let sweeps = roots
+                        .iter()
+                        .filter_map(|root| root_discovery::expand(root, home.as_deref()))
+                        .map(|root| {
+                            let source_control = source_control.clone();
+                            async move { source_control.sweep_abandoned_clones(&root).await }
+                        });
+                    if tokio::time::timeout(sweep_within, futures_util::future::join_all(sweeps))
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!(
+                            "a Workspace Root was still being swept of abandoned Clones as \
+                             discovery began"
+                        );
                     }
                     let ticket = root_discovery.rediscover();
                     root_discovery.settled(ticket).await;
@@ -1922,6 +1960,17 @@ async fn start(
                 let providers_stopped = provider_shutdown_task
                     .await
                     .context("Provider shutdown task panicked");
+                // A Clone the requests just drained left landing, or
+                // removing what it made, is seen through a while yet.
+                if tokio::time::timeout(clone_settle, clones_for_shutdown.settle_clones())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "a Clone was still landing as the server stopped; what it leaves is \
+                         removed at the next start"
+                    );
+                }
                 (served, providers_stopped)
             }
         };

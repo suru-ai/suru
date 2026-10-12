@@ -124,6 +124,14 @@ pub(crate) enum CloneRefusal {
         destination: Option<PathBuf>,
         timeout: Duration,
     },
+    /// The clone was whole but still taking its name at `destination` when
+    /// the Server's bound on a Clone passed: it may yet land there, and is
+    /// then listed as discovery finds it.
+    StillLanding {
+        url: String,
+        destination: PathBuf,
+        timeout: Duration,
+    },
 }
 
 impl fmt::Display for CloneRefusal {
@@ -215,6 +223,18 @@ impl fmt::Display for CloneRefusal {
                 spelled(*timeout),
                 destination.display()
             ),
+            Self::StillLanding {
+                url,
+                destination,
+                timeout,
+            } => write!(
+                formatter,
+                "The Clone of `{url}` did not finish within {}: the whole clone was still taking \
+                 its name, `{}`, so it may yet land there, and will then be listed among this \
+                 server's Workspaces; if it cannot, nothing will be left of it.",
+                spelled(*timeout),
+                destination.display()
+            ),
             Self::TimedOut {
                 url,
                 destination: None,
@@ -237,6 +257,7 @@ impl CloneRefusal {
             Self::Failed { .. } => Some("failed"),
             Self::LeftBehind { .. } => Some("failed, leaving what it made behind"),
             Self::TimedOut { .. } => Some("timed out"),
+            Self::StillLanding { .. } => Some("was still landing when its time ran out"),
             Self::Occupied { .. } => Some("found its destination occupied"),
             Self::NoRoot
             | Self::RootUnnamed { .. }
@@ -609,6 +630,11 @@ impl SessionOperations {
                     CloneFailure::TimedOut => CloneRefusal::TimedOut {
                         url: url.to_owned(),
                         destination: Some(destination.clone()),
+                        timeout: self.cloning.timeout,
+                    },
+                    CloneFailure::StillLanding => CloneRefusal::StillLanding {
+                        url: url.to_owned(),
+                        destination: destination.clone(),
                         timeout: self.cloning.timeout,
                     },
                 };
