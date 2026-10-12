@@ -23,8 +23,8 @@ use suru::{
     protocol::{
         AgentSelection, ChildDirectory, DirectoryListing, DirectorySourceControl,
         EffectiveSettings, ListDirectoryRequest, ModelAvailability, ModelCatalog, ModelId,
-        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ResolvedWorkspace, Session,
-        SessionId, SessionListItem, SessionStatus, SessionSummary, SessionTimestamp,
+        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, RepositoryId, ResolvedWorkspace,
+        Session, SessionId, SessionListItem, SessionStatus, SessionSummary, SessionTimestamp,
         SidebarSettings, SidebarVisibility, SkillCatalog, SkillCatalogCapabilities,
         SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery,
         Workspace,
@@ -206,6 +206,70 @@ fn a_workspace_whose_sessions_are_all_gone_is_offered_while_the_sidebar_shows_no
     );
     assert!(
         !drawn_in_sidebar(&frame, "archive"),
+        "and shows nothing of a Workspace no Session works in: {frame:?}"
+    );
+}
+
+/// A Repository discovered within a Workspace Root is listed by its Server
+/// before any Session has begun there, and the picker offers it as it
+/// offers any Workspace: by its name, its path beside it. Choosing it opens
+/// the Landing in it, and the Sidebar, which groups Sessions, shows nothing
+/// of it.
+#[test]
+fn a_repository_discovered_within_a_root_is_offered_and_opens_the_landing_in_it() {
+    let root = workspace_dir();
+    let here = workspace_in(root.path(), "here");
+    let atlas = workspace_in(root.path(), "atlas");
+    let discovered = discovered_repository(&atlas);
+    let mut application = connected_application(&here);
+    show_sidebar(&mut application, vec![rooted("Tend the garden", &here, 20)]);
+
+    open_picker_with(&mut application, vec![discovered.clone()]);
+    let rows = picker_rows(&application);
+    let row = rows
+        .iter()
+        .find(|row| row.contains("atlas"))
+        .unwrap_or_else(|| panic!("the discovered Repository is offered: {rows:?}"));
+    assert!(
+        row.contains("atlas · ") && row.ends_with(&format!("{}atlas", std::path::MAIN_SEPARATOR)),
+        "it is named, its path spelled beside it: {rows:?}"
+    );
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "atlas");
+
+    let transition = choose_unanswered(&mut application);
+    let ApplicationTransition::DetachSessionAndResolveWorkspace { request, .. } = &transition
+    else {
+        panic!("choosing the discovered Repository opens the Landing in it, not {transition:?}");
+    };
+    assert_eq!(request.path, atlas);
+    assert_eq!(request.workspace_id.as_ref(), Some(&discovered.id));
+    let Some((outlook, surface, request_id, _)) = workspace_resolution(&transition) else {
+        unreachable!("a Workspace Picker choice is a resolution");
+    };
+    let mut resolved = ResolvedWorkspace::directory(atlas.clone());
+    resolved.workspace = discovered;
+    application
+        .handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface,
+            request_id,
+            result: Ok(resolved),
+        })
+        .expect("deliver the Server's resolution of the discovered Repository");
+
+    assert!(
+        landing_location(&application).ends_with("atlas"),
+        "the Landing stands in the discovered Repository: {}",
+        landing_location(&application)
+    );
+    let frame = rendered_application_rows_at(&application, SIDEBAR_WIDE, 20);
+    assert!(
+        drawn_in_sidebar(&frame, "Tend the garden"),
+        "the Sidebar groups the Sessions it lists: {frame:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&frame, "atlas"),
         "and shows nothing of a Workspace no Session works in: {frame:?}"
     );
 }
@@ -2132,6 +2196,16 @@ fn narrowable_workspaces() -> Vec<Workspace> {
 /// directory `path`.
 fn registered(path: &Path) -> Workspace {
     Workspace::directory(path.to_owned())
+}
+
+/// A Repository whose main root is `root`, as its Server lists one it
+/// discovered within a Workspace Root: by its identity and that root alone,
+/// carrying nothing derived.
+fn discovered_repository(root: &Path) -> Workspace {
+    Workspace {
+        id: RepositoryId::from_metadata("git", &root.join(".git")).workspace_id(),
+        ..Workspace::directory(root.to_owned())
+    }
 }
 
 /// A Workspace path rooted per platform, so a fixture reads as an absolute
