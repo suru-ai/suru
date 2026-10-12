@@ -329,6 +329,11 @@ pub struct ServerTimings {
     /// How often a Broker wait still waiting reports progress, keeping the
     /// idle window of the harness that called it open (ADR 0034).
     pub broker_wait_progress_interval: Duration,
+    /// How long a Sidekick's Clone of a Repository URL may run before it is
+    /// stopped and refused, leaving nothing behind: well within the fifteen
+    /// minutes every Provider allows a Broker call, so a Repository too big
+    /// to Clone in time is refused in words rather than cut off unanswered.
+    pub workspace_clone_timeout: Duration,
     /// How long after it was last uploaded or bound by an admitted Prompt an
     /// Attachment is left in place even once no Session references it, since
     /// a Prompt still in admission may be about to bind it (ADR 0037).
@@ -400,6 +405,7 @@ impl Default for ServerTimings {
             state_dir_check_interval: STATE_DIR_CHECK_INTERVAL,
             broker_wait_second: broker::WaitTimings::default().second,
             broker_wait_progress_interval: broker::WaitTimings::default().progress_every,
+            workspace_clone_timeout: Duration::from_secs(10 * 60),
             attachment_grace: crate::attachments::ATTACHMENT_GRACE,
             attachment_sweep_interval: crate::attachments::ATTACHMENT_SWEEP_INTERVAL,
             save_retry_interval: crate::storage::SAVE_RETRY_INTERVAL,
@@ -656,6 +662,12 @@ impl ServerTimings {
     /// Sets how often a Broker wait still waiting reports progress.
     pub fn with_broker_wait_progress_interval(mut self, interval: Duration) -> Self {
         self.broker_wait_progress_interval = interval;
+        self
+    }
+    /// Bounds how long a Sidekick's Clone may run; injectable so a test sees
+    /// one refused for the time it took without waiting out the default.
+    pub fn with_workspace_clone_timeout(mut self, timeout: Duration) -> Self {
+        self.workspace_clone_timeout = timeout;
         self
     }
 
@@ -1665,6 +1677,7 @@ async fn start(
         settings.subscribe(),
         Arc::new(hosted_providers),
         timings.checkout_skill_timeout,
+        operations::WorkspaceCloning::new(config.home_dir(), timings.workspace_clone_timeout),
         sidekick_workspace.clone(),
         operations::RemoteReach::new(
             serving.clone(),

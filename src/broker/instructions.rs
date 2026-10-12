@@ -18,8 +18,9 @@
 //! Sidekick is, to name the Tools that are its alone — read off the same registry the Broker lists
 //! and dispatches by, so a Tool added there is named here without more — to say how it reaches
 //! the user's other machines (ADR 0044), to say what it may not do, so it does not attempt what
-//! will be refused (ADR 0043), and to say a Sidekick Report wakes it, so it does not poll the
-//! Sessions it set to work.
+//! will be refused (ADR 0043), to name the Workspace Roots its Clones are bound to as the user had
+//! named them when it was started — as a JSON array, so the note stays one line however a Root is
+//! spelled — and to say a Sidekick Report wakes it, so it does not poll the Sessions it set to work.
 //!
 //! Where Memories exist, a Sidekick's note ends with an index of them: the titles of the
 //! [`INDEXED_TITLES`] most recently changed, newest first, each beside the memory_id it is recalled
@@ -49,22 +50,24 @@ use serde::Serialize;
 use crate::memories::{self, INDEXED_TITLES, MAX_TITLE_CHARS, MemoryId, MemoryIndex};
 
 /// The note for an Agent that is `role` to the Broker, naming each of the Broker's Tools as
-/// `tool_name` spells the Tool the Broker serves under the given name. A Sidekick's ends with the
-/// index of `memories`, where it holds any; no other Agent is told of Memories.
+/// `tool_name` spells the Tool the Broker serves under the given name. A Sidekick's names `roots`,
+/// the Workspace Roots its Clones are bound to, and ends with the index of `memories`, where it
+/// holds any; no other Agent is told of either.
 pub(crate) fn instruction_note(
     role: BrokerRole,
     memories: &MemoryIndex,
+    roots: &[String],
     tool_name: impl Fn(&str) -> String,
 ) -> String {
     let note = agent_note(&tool_name);
     match role {
         BrokerRole::Agent => note,
         BrokerRole::Sidekick if memories.is_empty() => {
-            format!("{note} {}", sidekick_note(&tool_name))
+            format!("{note} {}", sidekick_note(roots, &tool_name))
         }
         BrokerRole::Sidekick => format!(
             "{note} {} {}",
-            sidekick_note(&tool_name),
+            sidekick_note(roots, &tool_name),
             memory_note(memories, &tool_name)
         ),
     }
@@ -95,8 +98,8 @@ fn agent_note(tool_name: &impl Fn(&str) -> String) -> String {
 }
 
 /// What a Sidekick is told besides: what it is, the Tools that are its alone, how it reaches a
-/// Remote, and the acts no Tool offers it.
-fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
+/// Remote, the Workspace Roots `roots` its Clones are bound to, and the acts no Tool offers it.
+fn sidekick_note(roots: &[String], tool_name: &impl Fn(&str) -> String) -> String {
     let tools = BrokerTool::offered_to(BrokerRole::Sidekick)
         .filter(|tool| tool.is_sidekicks())
         .map(|tool| tool_name(tool.name()))
@@ -117,6 +120,7 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
     ]
     .map(|tool| tool_name(tool.name()));
     let [list_settings, describe_setting, set_setting] = &settings;
+    let cloning = clone_note(roots, tool_name);
     format!(
         "You are a Sidekick: an Agent that works across Suru itself rather than within one body \
          of work, so Suru offers you Tools of its own for that as well: {tools}. Their \
@@ -137,7 +141,7 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
          from what it last said, and an act on one is refused rather than kept for later. What \
          you send a Remote stands there as sent by a Sidekick on this machine, and its own \
          Sidekick Workspace refuses you as yours does. Nothing else reaches a Remote: its \
-         Settings and Memories are its own. You cannot delete a \
+         Settings and Memories are its own. {cloning} You cannot delete a \
          Session, decide an Approval, change an Approval Posture, read or change the Settings \
          that govern Serving and Pairing, or add, log in to or remove a Relay, and you may not \
          act on any Session of the Sidekick Workspace, your own included, nor begin one there, \
@@ -156,6 +160,28 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
          describe and set with {list_settings}, {describe_setting} and {set_setting} are this \
          server's own, never a Remote's, and a change you make takes effect and reaches every \
          Client as the user's own does. {SIDEKICK_SETTINGS_RULE}"
+    )
+}
+
+/// What a Sidekick is told of `clone_workspace`: that it Clones only directly within one of this
+/// server's Workspace Roots, and which Roots the user had named, `roots`, when it was started —
+/// as a JSON array, so however a Root is spelled the note stays one line — or that there were none.
+fn clone_note(roots: &[String], tool_name: &impl Fn(&str) -> String) -> String {
+    let clone_workspace = tool_name(BrokerTool::CloneWorkspace.name());
+    let bound = format!(
+        "{clone_workspace} Clones a Repository URL into a new Workspace directly within one of \
+         this server's Workspace Roots and nowhere else, never yet on a Remote;"
+    );
+    if roots.is_empty() {
+        return format!(
+            "{bound} the user had named none when you were started here, so it refuses until they \
+             name one in the workspace.roots Setting."
+        );
+    }
+    let roots = serde_json::to_string(roots).expect("the Workspace Roots always serialize");
+    format!(
+        "{bound} the Roots the user named, as they stood when you were started here, are {roots}; \
+         give one as its `root` where there are several."
     )
 }
 
@@ -223,7 +249,12 @@ mod tests {
 
     #[test]
     fn the_note_names_every_tool_the_broker_serves_as_the_harness_names_it() {
-        let note = instruction_note(BrokerRole::Agent, &MemoryIndex::default(), claude_named);
+        let note = instruction_note(
+            BrokerRole::Agent,
+            &MemoryIndex::default(),
+            &[],
+            claude_named,
+        );
         for tool in BrokerTool::offered_to(BrokerRole::Agent) {
             assert!(
                 note.contains(&claude_named(tool.name())),
@@ -249,7 +280,12 @@ mod tests {
     /// and it is one line, as a launch argument or a system message carries it.
     #[test]
     fn the_note_is_one_short_paragraph() {
-        let note = instruction_note(BrokerRole::Agent, &MemoryIndex::default(), claude_named);
+        let note = instruction_note(
+            BrokerRole::Agent,
+            &MemoryIndex::default(),
+            &[],
+            claude_named,
+        );
         let words = note.split_whitespace().count();
         assert!(words <= 150, "the note runs to {words} words: {note}");
         assert!(!note.contains('\n'), "the note is one line: {note:?}");
@@ -260,7 +296,7 @@ mod tests {
     #[test]
     fn every_agent_is_told_in_one_sentence_what_list_workspaces_is_for() {
         for role in [BrokerRole::Agent, BrokerRole::Sidekick] {
-            let note = instruction_note(role, &MemoryIndex::default(), claude_named);
+            let note = instruction_note(role, &MemoryIndex::default(), &[], claude_named);
             assert!(
                 note.contains(
                     " Call mcp__suru__list_workspaces to learn where the user's other work lives: \
@@ -271,9 +307,66 @@ mod tests {
         }
     }
 
+    /// A Sidekick is told the one Tool that writes to the user's disk outside its own Execution
+    /// Directory, and the Workspace Roots that bound it as the user named them when it was started:
+    /// as data, in a JSON array, so whatever a Root is spelled with leaves the note one line.
+    #[test]
+    fn a_sidekick_is_told_clone_workspace_and_the_roots_that_bound_it() {
+        let roots = ["~/src".to_owned(), "/srv/work\"quoted\"\nroot".to_owned()];
+        let note = instruction_note(
+            BrokerRole::Sidekick,
+            &MemoryIndex::default(),
+            &roots,
+            claude_named,
+        );
+        assert!(
+            note.contains(
+                "mcp__suru__clone_workspace Clones a Repository URL into a new Workspace directly \
+                 within one of this server's Workspace Roots and nowhere else, never yet on a \
+                 Remote; the Roots the user named, as they stood when you were started here, \
+                 are [\"~/src\",\"/srv/work\\\"quoted\\\"\\nroot\"]; give one as its `root` where \
+                 there are several."
+            ),
+            "{note}"
+        );
+        assert!(!note.contains('\n'), "the note is one line: {note:?}");
+
+        let none = instruction_note(
+            BrokerRole::Sidekick,
+            &MemoryIndex::default(),
+            &[],
+            claude_named,
+        );
+        assert!(
+            none.contains(
+                "mcp__suru__clone_workspace Clones a Repository URL into a new Workspace directly \
+                 within one of this server's Workspace Roots and nowhere else, never yet on a \
+                 Remote; the user had named none when you were started here, so it refuses \
+                 until they name one in the workspace.roots Setting."
+            ),
+            "{none}"
+        );
+
+        let agent = instruction_note(
+            BrokerRole::Agent,
+            &MemoryIndex::default(),
+            &roots,
+            claude_named,
+        );
+        assert!(
+            !agent.contains("Workspace Root") && !agent.contains("~/src"),
+            "no other Agent is told of the Roots: {agent}"
+        );
+    }
+
     #[test]
     fn an_agent_is_told_nothing_of_the_sidekicks_tools() {
-        let note = instruction_note(BrokerRole::Agent, &MemoryIndex::default(), claude_named);
+        let note = instruction_note(
+            BrokerRole::Agent,
+            &MemoryIndex::default(),
+            &[],
+            claude_named,
+        );
         for tool in BrokerTool::ALL
             .into_iter()
             .filter(|tool| tool.is_sidekicks())
@@ -289,11 +382,17 @@ mod tests {
 
     #[test]
     fn a_sidekick_is_told_its_own_tools_and_what_it_may_not_do() {
-        let note = instruction_note(BrokerRole::Sidekick, &MemoryIndex::default(), claude_named);
+        let note = instruction_note(
+            BrokerRole::Sidekick,
+            &MemoryIndex::default(),
+            &[],
+            claude_named,
+        );
         assert!(
             note.starts_with(&instruction_note(
                 BrokerRole::Agent,
                 &MemoryIndex::default(),
+                &[],
                 claude_named
             )),
             "a Sidekick is told of every Tool any Agent is: {note}"
@@ -420,19 +519,29 @@ mod tests {
 
     #[test]
     fn a_sidekick_told_of_no_memories_is_told_nothing_of_them() {
-        let note = instruction_note(BrokerRole::Sidekick, &MemoryIndex::default(), claude_named);
+        let note = instruction_note(
+            BrokerRole::Sidekick,
+            &MemoryIndex::default(),
+            &[],
+            claude_named,
+        );
         assert!(!note.contains("memory_id"), "{note}");
         assert!(!note.contains("Memories Sidekicks kept"), "{note}");
         assert!(
-            !instruction_note(BrokerRole::Agent, &kept(3, 0), claude_named).contains("emor"),
+            !instruction_note(BrokerRole::Agent, &kept(3, 0), &[], claude_named).contains("emor"),
             "and no other Agent is told of Memories, whatever there are"
         );
     }
 
     #[test]
     fn a_sidekick_is_told_the_titles_most_recently_changed_as_data_and_how_many_more_there_are() {
-        let none = instruction_note(BrokerRole::Sidekick, &MemoryIndex::default(), claude_named);
-        let note = instruction_note(BrokerRole::Sidekick, &kept(2, 0), claude_named);
+        let none = instruction_note(
+            BrokerRole::Sidekick,
+            &MemoryIndex::default(),
+            &[],
+            claude_named,
+        );
+        let note = instruction_note(BrokerRole::Sidekick, &kept(2, 0), &[], claude_named);
         assert_eq!(
             note,
             format!(
@@ -447,11 +556,11 @@ mod tests {
             )
         );
         assert!(
-            instruction_note(BrokerRole::Sidekick, &kept(1, 1), claude_named)
+            instruction_note(BrokerRole::Sidekick, &kept(1, 1), &[], claude_named)
                 .contains("\"Memory 0\"}], and 1 more is older.")
         );
         assert!(
-            instruction_note(BrokerRole::Sidekick, &kept(30, 12), claude_named)
+            instruction_note(BrokerRole::Sidekick, &kept(30, 12), &[], claude_named)
                 .contains("\"Memory 0\"}], and 12 more are older.")
         );
     }
@@ -477,7 +586,7 @@ mod tests {
                 .collect(),
             older: 0,
         };
-        let note = instruction_note(BrokerRole::Sidekick, &memories, claude_named);
+        let note = instruction_note(BrokerRole::Sidekick, &memories, &[], claude_named);
         assert!(!note.contains('\n'), "the note is one line: {note:?}");
         let (titles, after) = indexed(&note);
         assert_eq!(
@@ -509,7 +618,12 @@ mod tests {
 
     #[test]
     fn the_index_is_bounded_and_one_line_whatever_its_titles_hold() {
-        let none = instruction_note(BrokerRole::Sidekick, &MemoryIndex::default(), claude_named);
+        let none = instruction_note(
+            BrokerRole::Sidekick,
+            &MemoryIndex::default(),
+            &[],
+            claude_named,
+        );
         let unruly = MemoryIndex {
             recent: (0..40)
                 .map(|memory| IndexedMemory {
@@ -519,7 +633,7 @@ mod tests {
                 .collect(),
             older: 0,
         };
-        let note = instruction_note(BrokerRole::Sidekick, &unruly, claude_named);
+        let note = instruction_note(BrokerRole::Sidekick, &unruly, &[], claude_named);
         assert!(!note.contains('\n'), "the note is one line: {note:?}");
         let (titles, after) = indexed(&note);
         assert_eq!(titles.len(), INDEXED_TITLES, "only thirty are named");
@@ -541,7 +655,7 @@ mod tests {
                 .collect(),
             older: 1_000_000,
         };
-        let note = instruction_note(BrokerRole::Sidekick, &quoted, claude_named);
+        let note = instruction_note(BrokerRole::Sidekick, &quoted, &[], claude_named);
         let index = note.chars().count() - none.chars().count();
         assert!(index <= 7_500, "the index runs to {index} characters");
     }

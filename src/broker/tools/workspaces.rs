@@ -1,7 +1,8 @@
-//! `list_workspaces` and `set_workspace_description`: the Tools through which
-//! a Sidekick learns which Workspaces its own Server knows — or a Remote, or
-//! every Server Everywhere — and records what it learned one is for, on its
-//! own Server or a Remote. A Remote's Workspaces are listed as that Remote
+//! `list_workspaces`, `set_workspace_description` and `clone_workspace`: the
+//! Tools through which a Sidekick learns which Workspaces its own Server
+//! knows — or a Remote, or every Server Everywhere — records what it learned
+//! one is for, on its own Server or a Remote, and makes a new one by Cloning
+//! a Repository URL directly within one of its own Server's Workspace Roots. A Remote's Workspaces are listed as that Remote
 //! lists them to anyone who asks, named in its own paths' syntax, each row
 //! carrying the Remote's name, and a Description is set on one of them as a
 //! Client turned toward that Remote sets one, through the Remote's own
@@ -39,6 +40,17 @@
 //! turned toward it resolves one, which judges the path as the very text
 //! given, in that Server's own syntax, and refuses one it finds nothing at in
 //! its own words.
+//!
+//! A Clone is the very operation a Remote will perform for its Peers'
+//! Sidekicks
+//! ([`SessionOperations::clone_workspace`](crate::server::operations::SessionOperations::clone_workspace)),
+//! which judges where it may go and refuses, in words the Sidekick can pass
+//! on, whatever it may not do; its Workspace is answered as a row of
+//! `list_workspaces` names it, so a Sidekick may begin work there at once. It
+//! is this Server's alone for now: an `origin` naming a Remote is refused as
+//! not yet understood. No other Agent is offered it, a Sidekick's Subagents
+//! among them, since a Clone writes to the user's disk outside the Agent's
+//! own Execution Directory.
 
 use std::path::{Path, PathBuf};
 
@@ -55,7 +67,7 @@ use crate::{
         Outlook, SetWorkspaceDescriptionRequest, Workspace, WorkspaceDescription, WorkspaceId,
         WorkspacePaths, one_line_description,
     },
-    server::operations::{Origins, Refusal, RemoteActRefusal},
+    server::operations::{CloneRequest, Origins, Refusal, RemoteActRefusal},
 };
 
 /// `list_workspaces`' description as one caller reads it. What every caller
@@ -150,8 +162,111 @@ directory there is refused saying why — a Remote's in its own words — as are
 text running longer, a Remote that does not answer, and a Remote's own \
 Sidekick Workspace, which refuses you as yours refuses its Peers.";
 
+pub(super) const CLONE_WORKSPACE_DESCRIPTION: &str = "\
+Clone a Repository URL into a new Workspace directly within one of this \
+server's Workspace Roots — the directories the user named for their work — \
+and nowhere else. Answers once the Clone is done with the new Workspace as a \
+row of list_workspaces, {\"workspace_id\": \"...\", \"name\": \"...\", \
+\"path\": \"...\", \"description\": null, \"icon\": null}, ready for \
+begin_session; Suru derives its Icon and Description at once, as for a \
+Workspace a first Session begins in, and list_workspaces shows them once they \
+land. Takes \"repository_url\", the address to Clone from as Git reads one: an \
+https or ssh URL, user@host:path, or the path of a Repository on this \
+server's machine; \"root\", the Workspace Root to Clone into, spelled as the \
+workspace.roots Setting names it or as the directory it names, which may be \
+left out where exactly one Root is configured and must be given where \
+several are; \"name\", the directory to make within the Root, one plain \
+directory name and never a path, the URL's last segment without \".git\" \
+unless given; \"branch\", the branch to check out, the Repository's default \
+unless given; and \"origin\", a Remote's name, which this server does not yet \
+understand for a Clone and refuses, so leave it out. The Clone is Git's \
+ordinary one, neither shallow nor recursing into submodules, and asks no one \
+for anything: a credential Git cannot find fails it at once. It is refused, \
+saying why, when no Workspace Root is configured; when \"root\" is left out \
+while several are, or names none of them, naming those configured; when the \
+Root cannot be read, since Suru never makes one; when \"name\" is not one \
+plain directory name; when something already stands where the Clone would \
+go, naming the Workspace there by its workspace_id where it is one; when Git \
+fails, in Git's own words; and when it does not finish within the time this \
+server allows a Clone, well within the time a call may take. A Clone Git \
+began and could not finish leaves nothing behind.";
+
 /// What `list_workspaces` takes: the Servers whose Workspaces to list.
 const LIST_TAKES: [&str; 1] = ["origin"];
+
+/// What `clone_workspace` takes.
+const CLONE_TAKES: [&str; 5] = ["repository_url", "root", "name", "branch", "origin"];
+
+/// The JSON Schema of `clone_workspace`'s arguments.
+pub(super) fn clone_workspace_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "repository_url": {
+                "type": "string",
+                "description": "The address to Clone from, as Git reads one: an https or ssh \
+                    URL, user@host:path, or the path of a Repository on this server's machine.",
+            },
+            "root": {
+                "type": "string",
+                "description": "The Workspace Root to Clone into, spelled as the workspace.roots \
+                    Setting names it or as the directory it names; leave it out where exactly \
+                    one Root is configured.",
+            },
+            "name": {
+                "type": "string",
+                "description": "The directory to make within the Root: one plain directory \
+                    name, never a path. The URL's last segment without .git unless given.",
+            },
+            "branch": {
+                "type": "string",
+                "description": "The branch to check out; the Repository's default unless given.",
+            },
+            "origin": {
+                "type": "string",
+                "description": "A Remote's name, to Clone there; this server does not yet \
+                    understand a Clone on a Remote and refuses one, so leave it out.",
+            },
+        },
+        "required": ["repository_url"],
+        "additionalProperties": false,
+    })
+}
+
+/// What `clone_workspace` was called with, as the Clone takes it: a Root or
+/// a branch with nothing in it names none, while a name is left for the
+/// Clone to judge, whatever it holds.
+fn clone_arguments(arguments: &Map<String, Value>) -> Result<CloneRequest, ToolRefusal> {
+    let tool = BrokerTool::CloneWorkspace;
+    takes_only(tool, arguments, &CLONE_TAKES)?;
+    let text = |argument: &str, what: &str| match arguments.get(argument) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(given)) => Ok(Some(given.clone())),
+        Some(_) => Err(ToolRefusal::new(format!(
+            "{} `{argument}` must be a string: {what}.",
+            super::possessive(tool)
+        ))),
+    };
+    let named = |given: Option<String>| given.filter(|given| !given.trim().is_empty());
+    let repository_url = named(text(
+        "repository_url",
+        "the address to Clone from, as Git reads one",
+    )?)
+    .ok_or_else(|| {
+        ToolRefusal::new(
+            "clone_workspace needs `repository_url`, the address to Clone from, as Git reads one.",
+        )
+    })?;
+    Ok(CloneRequest {
+        repository_url,
+        root: named(text(
+            "root",
+            "the Workspace Root to Clone into, as the workspace.roots Setting names it",
+        )?),
+        name: text("name", "one plain directory name to make within the Root")?,
+        branch: named(text("branch", "the branch to check out")?),
+    })
+}
 
 /// The JSON Schema of `list_workspaces`' arguments, as an Agent that is
 /// `role` to the Broker may give them: a Sidekick, the Origins to list, and
@@ -470,6 +585,34 @@ impl BrokerTools {
             description,
         })
         .expect("a described Workspace always serializes"))
+    }
+
+    /// Answers `clone_workspace`: Clones the Repository URL directly within
+    /// the Workspace Root the call names, or the only one, as this server's
+    /// own Clone does, and answers the Workspace made there as a row of
+    /// `list_workspaces` names it. A Clone on a Remote is not yet understood,
+    /// and is refused.
+    pub(super) async fn clone_workspace(&self, call: &ToolCall) -> Result<Value, ToolRefusal> {
+        let request = clone_arguments(&call.arguments)?;
+        if let Outlook::Remote(name) = origins::origin(BrokerTool::CloneWorkspace, &call.arguments)?
+        {
+            return Err(ToolRefusal::new(format!(
+                "clone_workspace does not yet understand a Clone on a Remote, so nothing was \
+                 cloned on `{name}`; leave `origin` out to Clone within this server's Workspace \
+                 Roots."
+            )));
+        }
+        let workspace = self
+            .operations
+            .clone_workspace(&request, call.caller.session_id())
+            .await
+            .map_err(|refusal| ToolRefusal::new(refusal.to_string()))?;
+        Ok(serde_json::to_value(listed_workspace(
+            &Outlook::Local,
+            &WorkspacePaths::discover(),
+            workspace,
+        ))
+        .expect("a row of Workspaces always serializes"))
     }
 
     /// Answers `set_workspace_description` for a Workspace the Remote `name`
@@ -812,6 +955,131 @@ mod tests {
                 "list_workspaces takes no argument `limit`; it takes `origin`."
             ))
         );
+    }
+
+    fn clone(arguments: Value) -> Result<CloneRequest, ToolRefusal> {
+        let Value::Object(arguments) = arguments else {
+            panic!("arguments are an object");
+        };
+        clone_arguments(&arguments)
+    }
+
+    #[test]
+    fn clone_arguments_are_read_as_their_schema_gives_them() {
+        assert_eq!(
+            clone(json!({ "repository_url": "https://example.com/atlas.git" })),
+            Ok(CloneRequest {
+                repository_url: "https://example.com/atlas.git".to_owned(),
+                root: None,
+                name: None,
+                branch: None,
+            }),
+            "only the Repository URL is needed"
+        );
+        assert_eq!(
+            clone(json!({
+                "repository_url": "git@example.com:atlas.git",
+                "root": "~/src",
+                "name": "charts",
+                "branch": "main",
+                "origin": null,
+            })),
+            Ok(CloneRequest {
+                repository_url: "git@example.com:atlas.git".to_owned(),
+                root: Some("~/src".to_owned()),
+                name: Some("charts".to_owned()),
+                branch: Some("main".to_owned()),
+            })
+        );
+        assert_eq!(
+            clone(json!({
+                "repository_url": "git@example.com:atlas.git",
+                "root": "",
+                "name": null,
+                "branch": "  ",
+            })),
+            Ok(CloneRequest {
+                repository_url: "git@example.com:atlas.git".to_owned(),
+                root: None,
+                name: None,
+                branch: None,
+            }),
+            "a Root or a branch with nothing in it names none"
+        );
+        assert_eq!(
+            clone(json!({ "repository_url": "git@example.com:atlas.git", "name": "" })),
+            Ok(CloneRequest {
+                repository_url: "git@example.com:atlas.git".to_owned(),
+                root: None,
+                name: Some(String::new()),
+                branch: None,
+            }),
+            "a name is left for the Clone to judge, whatever it holds"
+        );
+        for refused in [
+            json!({}),
+            json!({ "repository_url": "" }),
+            json!({ "repository_url": "   " }),
+            json!({ "repository_url": 7 }),
+            json!({ "repository_url": "atlas.git", "root": 7 }),
+            json!({ "repository_url": "atlas.git", "name": ["atlas"] }),
+            json!({ "repository_url": "atlas.git", "branch": false }),
+            json!({ "repository_url": "atlas.git", "depth": 1 }),
+            json!({ "repository_url": "atlas.git", "recurse_submodules": true }),
+        ] {
+            let refusal = clone(refused.clone()).expect_err("refused");
+            assert!(
+                refusal.to_string().starts_with("clone_workspace"),
+                "{refused} is refused naming the Tool: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_clone_schema_takes_what_its_arguments_read_and_needs_only_the_url() {
+        let schema = clone_workspace_schema();
+        let mut properties = schema["properties"]
+            .as_object()
+            .expect("the schema names its properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        properties.sort_unstable();
+        let mut takes = CLONE_TAKES.to_vec();
+        takes.sort_unstable();
+        assert_eq!(properties, takes);
+        assert_eq!(schema["required"], json!(["repository_url"]));
+        assert_eq!(schema["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn clone_workspaces_description_states_the_roots_bound_and_each_refusal() {
+        for said in [
+            "directly within one of this server's Workspace Roots",
+            "and nowhere else",
+            "as a row of list_workspaces",
+            "begin_session",
+            "\"repository_url\"",
+            "\"root\"",
+            "\"name\"",
+            "\"branch\"",
+            "\"origin\"",
+            "neither shallow nor recursing into submodules",
+            "a credential Git cannot find fails it at once",
+            "when no Workspace Root is configured",
+            "naming those configured",
+            "when the Root cannot be read",
+            "not one plain directory name",
+            "naming the Workspace there by its workspace_id",
+            "in Git's own words",
+            "does not finish within",
+            "leaves nothing behind",
+        ] {
+            assert!(
+                CLONE_WORKSPACE_DESCRIPTION.contains(said),
+                "clone_workspace's description says {said:?}: {CLONE_WORKSPACE_DESCRIPTION}"
+            );
+        }
     }
 
     #[test]

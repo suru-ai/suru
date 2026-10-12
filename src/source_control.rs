@@ -92,8 +92,8 @@ pub enum BranchRename {
     Renamed { branch: String },
 }
 
-/// Why a Clone of a Repository URL made no Workspace. Whatever the reason,
-/// nothing the Clone began is left at its destination.
+/// Why a Clone of a Repository URL made no Workspace. Nothing the Clone
+/// began is left at its destination, unless removing it failed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CloneFailure {
     /// Something already stands at the destination, which the Clone left as
@@ -103,6 +103,9 @@ pub enum CloneFailure {
     Failed(String),
     /// The Clone was still running when its timeout passed, and was stopped.
     TimedOut,
+    /// The Clone failed, or was stopped once its timeout passed, and what it
+    /// left at its destination could not be removed, as this says.
+    LeftBehind(String),
 }
 
 #[async_trait]

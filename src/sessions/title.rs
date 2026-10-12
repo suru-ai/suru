@@ -265,16 +265,7 @@ impl Derivation {
             &prompt.attachments,
             asks_branch,
         );
-        // The Sidekick Workspace is Suru's own: it wears a standing Icon and
-        // is described only by whoever chooses to, so nothing of it is derived.
-        let workspace_errand = ((workspace.icon.is_none() || workspace.description.is_none())
-            && !self.sessions.is_sidekick_workspace(&workspace.id))
-        .then(|| {
-            (
-                workspace.id.clone(),
-                workspace_icon::errand_prompt(workspace),
-            )
-        });
+        let workspace_errand = self.workspace_errand(workspace);
         let errands = self.errands.clone();
         let models = self.models.clone();
         let sessions = self.sessions.clone();
@@ -370,6 +361,76 @@ impl Derivation {
             };
             tokio::join!(rename, workspace_icon);
         });
+    }
+
+    /// Forks the Workspace Errand alone for `workspace`, which a Sidekick
+    /// has just Cloned to `execution_directory` on behalf of the Session
+    /// `on_behalf_of`, using `provider`, and returns at once — so the new
+    /// Workspace has its Icon and Description derived as the first Session
+    /// begun there would have them: governed by the same Setting, which
+    /// follows the Sidekick's own Provider unless it pins another or turns
+    /// derivation off, run in the Workspace itself, and asked only where it
+    /// still lacks either.
+    pub(crate) fn derive_cloned_workspace(
+        &self,
+        on_behalf_of: SessionId,
+        provider: Option<ProviderId>,
+        workspace: &Workspace,
+        execution_directory: std::path::PathBuf,
+    ) {
+        let Some(errand_at) = self.errand_at(on_behalf_of, provider) else {
+            return;
+        };
+        let Some((workspace_id, prompt)) = self.workspace_errand(workspace) else {
+            return;
+        };
+        let errands = self.errands.clone();
+        let models = self.models.clone();
+        let sessions = self.sessions.clone();
+        tokio::spawn(async move {
+            let (provider, pinned) = match &errand_at {
+                ErrandAt::Provider(provider) => (provider, None),
+                ErrandAt::Selection(selection) => (&selection.provider, Some(selection)),
+            };
+            let Some(selection) = models.resolved_errand_selection(provider, pinned).await else {
+                tracing::info!(
+                    ?workspace_id,
+                    "no Workspace Errand: `{provider}` offers no Model to run one at"
+                );
+                return;
+            };
+            derive_workspace(
+                &errands,
+                &sessions,
+                workspace_id,
+                ProviderErrand {
+                    prompt,
+                    schema: workspace_icon::reply_schema(),
+                    selection,
+                    execution_directory,
+                },
+            )
+            .await;
+        });
+    }
+
+    /// The Workspace Errand `workspace` asks for — its identity and the
+    /// Prompt asking for its Icon and Description — where it still lacks
+    /// either. The Sidekick Workspace is Suru's own: it wears a standing Icon
+    /// and is described only by whoever chooses to, so nothing of it is
+    /// derived.
+    fn workspace_errand(
+        &self,
+        workspace: &Workspace,
+    ) -> Option<(crate::protocol::WorkspaceId, String)> {
+        ((workspace.icon.is_none() || workspace.description.is_none())
+            && !self.sessions.is_sidekick_workspace(&workspace.id))
+        .then(|| {
+            (
+                workspace.id.clone(),
+                workspace_icon::errand_prompt(workspace),
+            )
+        })
     }
 
     /// Where this derivation's Errands go, as the Setting in force decides,

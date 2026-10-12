@@ -71,6 +71,7 @@ use crate::storage::StorageError;
 
 mod acts_at;
 mod beginnings;
+mod clones;
 mod memories;
 mod origins;
 mod remote_entries;
@@ -79,6 +80,7 @@ mod workspaces;
 
 pub(crate) use acts_at::ActRefusal;
 pub(crate) use beginnings::BeginningRefusal;
+pub(crate) use clones::{CloneRequest, WorkspaceCloning};
 pub(crate) use origins::{
     Gathered, OriginRefusal, Origins, Refusal, RemoteActRefusal, RemoteReach, SessionReadRefusal,
     SilentRemote,
@@ -430,6 +432,9 @@ pub(crate) struct SessionOperations {
     /// identity.
     hosted_providers: Arc<Vec<ProviderId>>,
     checkout_skill_timeout: Duration,
+    /// The home and the timeout a Sidekick's Clone of a Repository URL
+    /// takes.
+    cloning: WorkspaceCloning,
     /// Whose Sessions no Sidekick acts on.
     sidekick_workspace: SidekickWorkspace,
     /// How what a Sidekick reads of a Remote is fetched through the Pairing.
@@ -460,6 +465,7 @@ impl SessionOperations {
         settings: watch::Receiver<SettingsSnapshot>,
         hosted_providers: Arc<Vec<ProviderId>>,
         checkout_skill_timeout: Duration,
+        cloning: WorkspaceCloning,
         sidekick_workspace: SidekickWorkspace,
         remotes: RemoteReach,
         settings_adoption: SettingsAdoption,
@@ -480,6 +486,7 @@ impl SessionOperations {
             settings,
             hosted_providers,
             checkout_skill_timeout,
+            cloning,
             sidekick_workspace,
             remotes,
             settings_adoption,

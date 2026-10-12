@@ -24,6 +24,7 @@ use suru::{
 use super::*;
 
 pub(super) mod answering;
+mod cloning;
 mod memories;
 mod reading;
 mod remotes;
@@ -43,7 +44,7 @@ pub(super) const ORDINARY_TOOLS: [&str; 7] = [
 ];
 
 /// The Tools a Sidekick is offered: the ordinary ones, then its own.
-pub(super) const SIDEKICK_TOOLS: [&str; 25] = [
+pub(super) const SIDEKICK_TOOLS: [&str; 26] = [
     "list_providers",
     "spawn_subagent",
     "read_subagent",
@@ -60,6 +61,7 @@ pub(super) const SIDEKICK_TOOLS: [&str; 25] = [
     "begin_session",
     "answer_questionnaire",
     "set_workspace_description",
+    "clone_workspace",
     "list_remotes",
     "list_settings",
     "describe_setting",
@@ -425,6 +427,17 @@ async fn a_sidekicks_brokered_subagent_is_offered_the_ordinary_tools_alone() {
         refused["message"],
         json!("The Broker offers no Tool named `list_sessions`"),
         "{refused}"
+    );
+    let refused = unoffered(
+        &mut subagent,
+        "clone_workspace",
+        json!({ "repository_url": "https://example.invalid/atlas.git" }),
+    )
+    .await;
+    assert_eq!(
+        refused["message"],
+        json!("The Broker offers no Tool named `clone_workspace`"),
+        "delegated work cannot Clone on its own: {refused}"
     );
 
     hosted.server.shutdown().await.expect("shut down server");

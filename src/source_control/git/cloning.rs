@@ -75,12 +75,10 @@ impl GitSourceControl {
                 );
                 let why = match failure {
                     CloneFailure::Failed(said) => said,
-                    CloneFailure::TimedOut => "It did not finish in time".to_owned(),
-                    CloneFailure::Occupied => unreachable!("an occupied destination runs no Git"),
+                    _ => "It did not finish in time".to_owned(),
                 };
-                Err(CloneFailure::Failed(format!(
-                    "{why}; and what it left at `{}` could not be removed: {error}",
-                    destination.display()
+                Err(CloneFailure::LeftBehind(format!(
+                    "{why}; removing what it left failed: {error}"
                 )))
             }
         }

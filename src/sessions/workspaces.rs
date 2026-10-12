@@ -152,6 +152,34 @@ impl SessionStore {
         workspaces
     }
 
+    /// Enters `workspace`, which a Sidekick just Cloned to `directory`, in
+    /// the Registry: known by its Clone where it has no entry yet, and
+    /// otherwise only moved to where it is presented now (see
+    /// [`Self::enter_workspace`]). Whatever another identity was entered at
+    /// that directory is superseded, as wherever else a Workspace is first
+    /// seen, so what it carried passes to `workspace`, and every Session
+    /// grouped there wears it. Answers `workspace` dressed in what its entry
+    /// carries.
+    pub(crate) fn enter_cloned(&self, workspace: &Workspace, directory: &Path) -> Workspace {
+        let mut dressed = workspace.clone();
+        let inherited = {
+            let mut state = self.state.lock().unwrap();
+            self.enter_workspace(
+                &mut state,
+                &workspace.id,
+                Some(workspace),
+                WorkspaceProvenance::Cloned,
+            );
+            let inherited = self.retire_superseded(&mut state, workspace, Some(directory), None);
+            state.dress_workspace(&mut dressed);
+            inherited
+        };
+        if inherited {
+            self.regroup_workspace(&workspace.id);
+        }
+        dressed
+    }
+
     /// Enters a Workspace in the Registry the moment it is seen: an entry
     /// known by `provenance` where it has none, presented where and as
     /// `presented` — the Workspace as it was just resolved — presents it.

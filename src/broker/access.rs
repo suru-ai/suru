@@ -3,13 +3,15 @@
 //! presented token to the Session it names and what that Session's Agent is to
 //! the Broker — a Sidekick, or any other Agent (ADR 0042).
 //!
-//! A Sidekick's handoff also carries what it begins knowing of Memories: the
-//! titles of those most recently changed, read as its token is minted. A
-//! token is minted at every start of a Session's Provider — its first, and
-//! each relaunch, after a Server stop or a lost connection among them — so a
-//! Sidekick is told of Memories as they stood when its Provider was last
-//! started, and one whose Provider runs on is not told of a Memory stored or
-//! changed since, which it finds by searching.
+//! A Sidekick's handoff also carries what it begins knowing of Memories — the
+//! titles of those most recently changed — and the Workspace Roots its Clones
+//! are bound to, both read as its token is minted. A token is minted at every
+//! start of a Session's Provider — its first, and each relaunch, after a
+//! Server stop or a lost connection among them — so a Sidekick is told of
+//! Memories and Roots as they stood when its Provider was last started, and
+//! one whose Provider runs on is not told of a Memory stored or changed
+//! since, which it finds by searching, nor of the Roots changed since, which
+//! it reads among the Settings.
 
 use std::{
     collections::HashMap,
@@ -123,6 +125,9 @@ pub struct BrokerHandoff {
     /// What a Sidekick begins knowing of Memories, as they stood when the
     /// token was minted, and nothing for any other Agent.
     memories: MemoryIndex,
+    /// The Workspace Roots a Sidekick's Clones are bound to, as the user had
+    /// named them when the token was minted, and none for any other Agent.
+    roots: Vec<String>,
 }
 
 impl BrokerHandoff {
@@ -143,11 +148,11 @@ impl BrokerHandoff {
     /// The note the harness appends to its Agent's instructions, naming each
     /// Tool the Broker offers this Agent as `tool_name` spells the Tool the
     /// Broker serves under the given name. A Sidekick's names the Tools that
-    /// are its alone and what it may not do, and the titles of the Memories
-    /// most recently changed where there are any; every other Agent's is the
-    /// same.
+    /// are its alone and what it may not do, the Workspace Roots its Clones
+    /// are bound to, and the titles of the Memories most recently changed
+    /// where there are any; every other Agent's is the same.
     pub fn instruction_note(&self, tool_name: impl Fn(&str) -> String) -> String {
-        super::instruction_note(self.role, &self.memories, tool_name)
+        super::instruction_note(self.role, &self.memories, &self.roots, tool_name)
     }
 }
 
@@ -167,6 +172,7 @@ impl BrokerHandoff {
             token: BrokerToken::mint(),
             role,
             memories: MemoryIndex::default(),
+            roots: Vec::new(),
         }
     }
 }
@@ -292,9 +298,12 @@ impl BrokerAccess {
         }
         let session_id = session.id;
         let role = BrokerRole::of(session, &self.sidekick);
-        let memories = match role {
-            BrokerRole::Sidekick => self.memory_index().await,
-            BrokerRole::Agent => MemoryIndex::default(),
+        let (memories, roots) = match role {
+            BrokerRole::Sidekick => (
+                self.memory_index().await,
+                self.settings.borrow().settings.workspace.roots.clone(),
+            ),
+            BrokerRole::Agent => (MemoryIndex::default(), Vec::new()),
         };
         let token = BrokerToken::mint();
         let id = {
@@ -318,6 +327,7 @@ impl BrokerAccess {
                 token,
                 role,
                 memories,
+                roots,
             },
         })
     }

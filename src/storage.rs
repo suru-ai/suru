@@ -361,6 +361,8 @@ pub(crate) enum WorkspaceProvenance {
     /// A Session began there, or was found working there when its directory
     /// was resolved again.
     Session,
+    /// A Sidekick Cloned it directly within a Workspace Root.
+    Cloned,
     /// Someone described it, or chose its Icon, before any Session worked
     /// there.
     Description,

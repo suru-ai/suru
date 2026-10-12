@@ -126,7 +126,7 @@ async fn deriving_session(
 /// The Errand asking `provider` for a Workspace's Icon and Description, told
 /// apart from a Title Errand by its schema; any Title Errand met first is
 /// answered on the way.
-async fn next_workspace_errand(
+pub(in crate::broker) async fn next_workspace_errand(
     provider: &mut ControlledProvider,
 ) -> crate::provider_support::ErrandRequest {
     timeout(PROGRESS_DEADLINE, async {

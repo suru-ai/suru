@@ -86,6 +86,9 @@ pub(super) enum BrokerTool {
     AnswerQuestionnaire,
     /// A Sidekick's: a Workspace's Description set, as the user sets one.
     SetWorkspaceDescription,
+    /// A Sidekick's: a Repository URL Cloned directly within a Workspace
+    /// Root, as a new Workspace.
+    CloneWorkspace,
     /// A Sidekick's: the Remotes its own Server is paired with, and whether
     /// each answers.
     ListRemotes,
@@ -113,7 +116,7 @@ pub(super) enum BrokerTool {
 impl BrokerTool {
     /// Every Tool, in the order `tools/list` lists those a caller is offered:
     /// every Agent's first, then a Sidekick's own.
-    pub(super) const ALL: [Self; 25] = [
+    pub(super) const ALL: [Self; 26] = [
         Self::ListProviders,
         Self::SpawnSubagent,
         Self::ReadSubagent,
@@ -130,6 +133,7 @@ impl BrokerTool {
         Self::BeginSession,
         Self::AnswerQuestionnaire,
         Self::SetWorkspaceDescription,
+        Self::CloneWorkspace,
         Self::ListRemotes,
         Self::ListSettings,
         Self::DescribeSetting,
@@ -158,6 +162,7 @@ impl BrokerTool {
             | Self::BeginSession
             | Self::AnswerQuestionnaire
             | Self::SetWorkspaceDescription
+            | Self::CloneWorkspace
             | Self::ListRemotes
             | Self::ListSettings
             | Self::DescribeSetting
@@ -196,7 +201,8 @@ impl BrokerTool {
             | Self::BeginSession
             | Self::AnswerQuestionnaire
             | Self::ListWorkspaces
-            | Self::SetWorkspaceDescription => true,
+            | Self::SetWorkspaceDescription
+            | Self::CloneWorkspace => true,
             Self::ListProviders
             | Self::SpawnSubagent
             | Self::ReadSubagent
@@ -247,6 +253,7 @@ impl BrokerTool {
             Self::AnswerQuestionnaire => "answer_questionnaire",
             Self::ListWorkspaces => "list_workspaces",
             Self::SetWorkspaceDescription => "set_workspace_description",
+            Self::CloneWorkspace => "clone_workspace",
             Self::ListRemotes => "list_remotes",
             Self::ListSettings => "list_settings",
             Self::DescribeSetting => "describe_setting",
@@ -279,6 +286,7 @@ impl BrokerTool {
             | Self::AnswerQuestionnaire
             | Self::ListWorkspaces
             | Self::SetWorkspaceDescription
+            | Self::CloneWorkspace
             | Self::ListRemotes
             | Self::ListSettings
             | Self::DescribeSetting
@@ -317,6 +325,7 @@ impl BrokerTool {
             Self::AnswerQuestionnaire => "Answer Questionnaire",
             Self::ListWorkspaces => "List Workspaces",
             Self::SetWorkspaceDescription => "Set Workspace Description",
+            Self::CloneWorkspace => "Clone Workspace",
             Self::ListRemotes => "List Remotes",
             Self::ListSettings => "List Settings",
             Self::DescribeSetting => "Describe Setting",
@@ -353,6 +362,7 @@ impl BrokerTool {
                 BrokerRole::Agent => workspaces::LIST_THIS_SERVERS_WORKSPACES_DESCRIPTION,
             },
             Self::SetWorkspaceDescription => workspaces::SET_WORKSPACE_DESCRIPTION_DESCRIPTION,
+            Self::CloneWorkspace => workspaces::CLONE_WORKSPACE_DESCRIPTION,
             Self::ListRemotes => origins::LIST_REMOTES_DESCRIPTION,
             Self::ListSettings => settings::LIST_SETTINGS_DESCRIPTION,
             Self::DescribeSetting => settings::DESCRIBE_SETTING_DESCRIPTION,
@@ -476,6 +486,7 @@ impl BrokerTool {
             Self::AnswerQuestionnaire => session_acts::answer_questionnaire_schema(),
             Self::ListWorkspaces => workspaces::list_workspaces_schema(role),
             Self::SetWorkspaceDescription => workspaces::set_workspace_description_schema(),
+            Self::CloneWorkspace => workspaces::clone_workspace_schema(),
             Self::ListSettings => settings::list_settings_schema(),
             Self::DescribeSetting => settings::describe_setting_schema(),
             Self::SetSetting => settings::set_setting_schema(),
@@ -517,6 +528,7 @@ impl BrokerTool {
             | Self::BeginSession
             | Self::ListWorkspaces
             | Self::SetWorkspaceDescription
+            | Self::CloneWorkspace
             | Self::ListRemotes
             | Self::ListSettings
             | Self::DescribeSetting
@@ -553,6 +565,7 @@ impl BrokerTool {
             | Self::BeginSession
             | Self::AnswerQuestionnaire
             | Self::SetWorkspaceDescription
+            | Self::CloneWorkspace
             | Self::SetSetting
             | Self::StoreMemory
             | Self::UpdateMemory
@@ -874,6 +887,7 @@ impl BrokerTools {
             BrokerTool::AnswerQuestionnaire => self.answer_questionnaire(call).await,
             BrokerTool::ListWorkspaces => self.list_workspaces(&call).await,
             BrokerTool::SetWorkspaceDescription => self.set_workspace_description(&call).await,
+            BrokerTool::CloneWorkspace => self.clone_workspace(&call).await,
             BrokerTool::ListRemotes => self.list_remotes(&call).await,
             BrokerTool::ListSettings => self.list_settings(&call),
             BrokerTool::DescribeSetting => self.describe_setting(&call),
@@ -2043,6 +2057,12 @@ mod tests {
         assert!(!BrokerTool::ReadSession.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::AnswerQuestionnaire.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::SetWorkspaceDescription.is_offered_to(BrokerRole::Agent));
+        assert!(
+            !BrokerTool::CloneWorkspace.is_offered_to(BrokerRole::Agent)
+                && BrokerTool::CloneWorkspace.is_offered_to(BrokerRole::Sidekick),
+            "only a Sidekick writes to disk outside its own Execution Directory"
+        );
+        assert!(!BrokerTool::CloneWorkspace.is_read_only());
         assert!(!BrokerTool::ListRemotes.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::ListSettings.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::DescribeSetting.is_offered_to(BrokerRole::Agent));
