@@ -13,15 +13,15 @@
 //! that removes it unless the clone within is named: a name something
 //! already holds is passed over for another, and nothing the Clone removes
 //! was ever anyone else's. It holds a marker naming its Server run, locked
-//! for as long as the Clone lives, so that what a Server that died
-//! mid-Clone left behind is told from what a live one is making, and
-//! removed at the next start: that, and only that — a directory the Server
-//! recorded, still marked as the run that recorded it — never one merely
-//! named or marked as a Clone names and marks its own. The clone takes its
-//! destination's name only once it is whole, by the platform's own rename
-//! that refuses to replace anything — another Clone of the same name among
-//! it — so a Root never holds a half-made Workspace, even while one is
-//! being made.
+//! for as long as the Clone lives and the last of it removed, so that what
+//! a Server that died mid-Clone left behind is told from what a live one is
+//! making, and removed at the next start: that, and only that — a directory
+//! the Server recorded, still marked as the run that recorded it or with no
+//! marker at all — never one merely named or marked as a Clone names and
+//! marks its own. The clone takes its destination's name only once it is
+//! whole, by the platform's own rename that refuses to replace anything —
+//! another Clone of the same name among it — so a Root never holds a
+//! half-made Workspace, even while one is being made.
 //!
 //! The Clone's timeout bounds making the clone. Once Git has made it whole,
 //! one task sees naming it through, or — where it cannot be named —
@@ -605,24 +605,29 @@ fn sweep(staging: &CloneStaging) {
 /// What a sweep finds of a directory a Clone recorded.
 #[derive(Debug, Eq, PartialEq)]
 enum Left {
-    /// The Clone's staging, still marked as the run that recorded it, which
-    /// no live Clone holds: to be removed.
+    /// The Clone's staging, still marked as the run that recorded it — or
+    /// with no marker at all, which it is then marked as — which no live
+    /// Clone holds: to be removed.
     Abandoned,
     /// Nothing of the Clone's: the directory is gone, or what stands there
     /// is no staging of that run's — not named as a Clone names its
-    /// staging, no directory, or not marked as that run's, which is left as
-    /// it is. The record is done with either way.
+    /// staging, no directory, or marked as another's, which is left as it
+    /// is. The record is done with either way.
     Nothing,
     /// What cannot be told yet: the directory holding it cannot be read, as
-    /// on a drive not mounted, or a live Clone holds its marker. The record
-    /// stands, for the next start.
+    /// on a drive not mounted, a live Clone holds its marker, or one with
+    /// none cannot be marked. The record stands, for the next start.
     Unknown,
 }
 
 /// What the Clone recorded as `record` left behind, as [`Left`] tells it:
 /// abandoned only where the directory recorded is named as a Clone names its
 /// staging and holds a marker no live Clone holds locked, naming the run
-/// that recorded it.
+/// that recorded it — or holds none, as one whose removal was cut short
+/// once its marker had gone does: the record is the Server's evidence that
+/// it is its own, and the marker's lock only tells a live Clone's from one
+/// abandoned, so one with none is marked as that run's before it is taken
+/// for abandoned.
 fn left(record: &StagingRecord) -> Left {
     let staging = &record.directory;
     if !staging
@@ -647,7 +652,16 @@ fn left(record: &StagingRecord) -> Left {
     match std::fs::symlink_metadata(&marker) {
         Ok(metadata) if metadata.is_file() => {}
         Ok(_) => return Left::Nothing,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Left::Nothing,
+        // The Server's own all the same, as it recorded it: marked now as
+        // the run that recorded it, exclusively, so a Clone yet to mark it
+        // never can, and what a removal cut short leaves is still that
+        // run's.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match mark(staging, &record.run) {
+                Ok(_) => Left::Abandoned,
+                Err(_) => Left::Unknown,
+            };
+        }
         Err(_) => return Left::Unknown,
     }
     let Ok(mut marker) = std::fs::OpenOptions::new()
@@ -1109,13 +1123,51 @@ async fn persistently(
     }
 }
 
-/// Removes the directory tree at `path`. Git marks the objects it writes
-/// read-only, which Windows refuses to delete, so there each is made
-/// writable first.
+/// Removes the directory tree at `path`, never following a link: all a
+/// directory holds but a Clone's marker first, then the marker, then the
+/// directory, so a removal cut short — as by a Server that dies — leaves
+/// the marker saying whose it was for as long as anything else is left.
+/// Git marks the objects it writes read-only, which Windows refuses to
+/// delete, so there each is made writable first.
 fn remove_tree(path: &Path) -> std::io::Result<()> {
+    remove_tree_with(path, || {})
+}
+
+/// [`remove_tree`], with `unmarking` run once all the directory holds but
+/// its marker is gone, just before the marker goes.
+fn remove_tree_with(path: &Path, unmarking: impl FnOnce()) -> std::io::Result<()> {
     #[cfg(windows)]
     make_writable(path)?;
-    std::fs::remove_dir_all(path)
+    if !std::fs::symlink_metadata(path)?.is_dir() {
+        return std::fs::remove_dir_all(path);
+    }
+    let (marker, within): (Vec<_>, Vec<_>) = std::fs::read_dir(path)?
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .partition(|entry| entry.file_name() == MARKER);
+    for entry in &within {
+        remove_entry(entry)?;
+    }
+    unmarking();
+    for entry in &marker {
+        remove_entry(entry)?;
+    }
+    std::fs::remove_dir(path)
+}
+
+/// Removes `entry` and everything within it, never following a link.
+fn remove_entry(entry: &std::fs::DirEntry) -> std::io::Result<()> {
+    let (path, kind) = (entry.path(), entry.file_type()?);
+    // On Windows a link to a directory is removed as a directory is.
+    #[cfg(windows)]
+    if std::os::windows::fs::FileTypeExt::is_symlink_dir(&kind) {
+        return std::fs::remove_dir(path);
+    }
+    if kind.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
 }
 
 /// Clears the read-only attribute of `path` and of everything within it,
@@ -1894,14 +1946,15 @@ mod tests {
 
     /// A sweep removes what a Clone of a Server run no longer alive recorded
     /// and left — a directory it recorded, named as a Clone names its
-    /// staging, its marker unheld and naming the run that recorded it — and
-    /// nothing else: never a directory it did not record, however it is
-    /// named and marked, as a completed clone given such a name and holding
-    /// such a marker might be; nor one recorded but marked as another run's,
-    /// unmarked, or named otherwise; nor one whose marker is held, nor one of
-    /// this very run's. It forgets every record nothing of its Clone answers
-    /// to any longer, and keeps those it cannot yet tell: held, or within a
-    /// directory that cannot be read.
+    /// staging, its marker unheld and naming the run that recorded it, or
+    /// gone, as one whose removal was cut short once its marker had gone —
+    /// and nothing else: never a directory it did not record, however it is
+    /// named and marked or left unmarked, as a completed clone given such a
+    /// name and holding such a marker might be; nor one recorded but marked
+    /// as another run's, or named otherwise; nor one whose marker is held,
+    /// nor one of this very run's. It forgets every record nothing of its
+    /// Clone answers to any longer, and keeps those it cannot yet tell:
+    /// held, or within a directory that cannot be read.
     #[test]
     fn a_sweep_removes_only_what_a_dead_runs_clones_recorded_and_left() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1936,6 +1989,7 @@ mod tests {
             Some("a dead run"),
         );
         let unmarked = left(".logs.suru-clone-44444444", None, Some("a dead run"));
+        let unmarked_unrecorded = left(".tiles.suru-clone-66666666", None, None);
         let renamed = left("atlas", Some("a dead run"), Some("a dead run"));
         let ours = left(
             ".notes.suru-clone-11111111",
@@ -1965,11 +2019,21 @@ mod tests {
         }
 
         sweep(&run);
-        assert!(
-            !abandoned.exists(),
-            "what a dead run's Clone recorded and left is removed"
-        );
-        for survivor in [&unrecorded, &remarked, &unmarked, &renamed, &ours, &held] {
+        for removed in [&abandoned, &unmarked] {
+            assert!(
+                !removed.exists(),
+                "what a dead run's Clone recorded and left is removed: {}",
+                removed.display()
+            );
+        }
+        for survivor in [
+            &unrecorded,
+            &unmarked_unrecorded,
+            &remarked,
+            &renamed,
+            &ours,
+            &held,
+        ] {
             assert!(
                 survivor.join(CLONED).join("README.md").exists(),
                 "{} is left as it was",
@@ -2130,6 +2194,95 @@ mod tests {
         assert!(staging.exists());
         std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o755)).unwrap();
         gone(&staging).await;
+    }
+
+    /// The names directly within `directory`, sorted.
+    fn names_within(directory: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    /// Everything a staging directory holds is removed before its marker,
+    /// and its marker before the directory itself, so a removal cut short at
+    /// any point — as by a Server that dies — leaves nothing but what still
+    /// says whose it was, or nothing at all within.
+    #[test]
+    fn a_staging_directory_is_removed_with_its_marker_last() {
+        let temporary = tempfile::tempdir().unwrap();
+        let staging = temporary.path().join(staging_name("atlas", "0123abcd"));
+        let objects = staging.join(CLONED).join(".git").join("objects");
+        std::fs::create_dir_all(&objects).unwrap();
+        std::fs::write(staging.join(CLONED).join("README.md"), "# atlas").unwrap();
+        std::fs::write(staging.join("notes.txt"), "Within.").unwrap();
+        drop(mark(&staging, "a run").unwrap());
+
+        let mut unmarking = None;
+        remove_tree_with(&staging, || unmarking = Some(names_within(&staging))).unwrap();
+        assert_eq!(
+            unmarking,
+            Some(vec![MARKER.to_owned()]),
+            "the marker is all that is left as it goes"
+        );
+        assert!(!staging.exists());
+    }
+
+    /// A staging directory the Server recorded that has no marker — one
+    /// whose removal was cut short once its marker had gone, or whose Clone
+    /// had yet to mark it — is still the Server's own, the record its
+    /// evidence: a sweep marks it as the run that recorded it, exclusively,
+    /// so no Clone yet to mark it ever can, and removes it. Where removing
+    /// it is cut short, what is left stays recorded and marked, so a later
+    /// start finishes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_staging_directory_without_its_marker_is_marked_as_its_runs_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let staging = temporary.path().join(staging_name("atlas", "0123abcd"));
+        let held = staging.join(CLONED).join("objects");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::write(held.join("pack"), b"pack").unwrap();
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::remove_file(held.join("pack")).is_ok() {
+            // Whoever runs this may remove what permissions forbid, so
+            // nothing can be held from them here.
+            std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let run = run_named("the next run");
+        run.records
+            .record(&StagingRecord {
+                directory: staging.clone(),
+                run: "a dead run".to_owned(),
+            })
+            .unwrap();
+
+        sweep(&run);
+        assert!(held.join("pack").exists(), "removing it is cut short");
+        assert_eq!(
+            std::fs::read_to_string(staging.join(MARKER)).unwrap(),
+            "a dead run",
+            "what is left is marked as the run that recorded it"
+        );
+        assert!(
+            mark(&staging, "a live run").is_err(),
+            "so no Clone yet to mark it ever can"
+        );
+        assert_eq!(
+            recorded(&run),
+            std::slice::from_ref(&staging),
+            "and stays recorded"
+        );
+
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o755)).unwrap();
+        sweep(&run);
+        assert!(!staging.exists(), "a later start finishes it");
+        assert!(recorded(&run).is_empty());
     }
 
     /// A staging directory found not to be there is taken for gone only

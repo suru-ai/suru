@@ -1547,11 +1547,13 @@ async fn a_clone_still_landing_at_its_bound_is_refused_saying_so_and_lands_and_i
 
 /// What a Clone of a Server that died mid-way recorded and left in a
 /// Workspace Root — a staging directory it recorded, still holding the
-/// marker of the run that recorded it — is removed when a Server next
+/// marker of the run that recorded it, or none, as one whose removal was
+/// cut short once its marker had gone — is removed when a Server next
 /// starts, its record with it, and nothing else is: not a directory named
-/// and marked just as a Clone names and marks its own that no Clone recorded
-/// — as a completed Workspace given such a name might be — nor one recorded
-/// but marked as another run's, nor another hidden directory.
+/// and marked just as a Clone names and marks its own, or named so and
+/// unmarked, that no Clone recorded — as a completed Workspace given such a
+/// name might be — nor one recorded but marked as another run's, nor
+/// another hidden directory.
 #[tokio::test]
 async fn what_a_dead_servers_clone_recorded_and_left_in_a_root_is_removed_at_the_next_start() {
     const CHANNEL: &str = "sidekick-clone-swept";
@@ -1578,21 +1580,25 @@ async fn what_a_dead_servers_clone_recorded_and_left_in_a_root_is_removed_at_the
     hosted.server.shutdown().await.expect("shut down server");
     let config =
         ServerConfig::new(state_dir.path(), CHANNEL).expect("configure the stopped Server");
-    let left = |name: &str, marked: &str, recorded: bool| {
+    let left = |name: &str, marked: Option<&str>, recorded: bool| {
         let staging = projects.join(name);
         std::fs::create_dir_all(staging.join("clone")).expect("make what was left");
         std::fs::write(staging.join("clone").join("README.md"), readme("atlas"))
             .expect("write what was left");
-        std::fs::write(staging.join("suru-clone"), marked).expect("mark what was left");
+        if let Some(marked) = marked {
+            std::fs::write(staging.join("suru-clone"), marked).expect("mark what was left");
+        }
         if recorded {
             record_staging(&config, &staging, GONE);
         }
         staging
     };
-    let abandoned = left(".atlas.suru-clone-0123abcd", GONE, true);
-    let unrecorded = left(".maps.suru-clone-89abcdef", GONE, false);
-    let remarked = left(".charts.suru-clone-00112233", "another run", true);
-    let notes = left(".notes", GONE, false);
+    let abandoned = left(".atlas.suru-clone-0123abcd", Some(GONE), true);
+    let unmarked = left(".logs.suru-clone-44556677", None, true);
+    let unrecorded = left(".maps.suru-clone-89abcdef", Some(GONE), false);
+    let unmarked_unrecorded = left(".tiles.suru-clone-8899aabb", None, false);
+    let remarked = left(".charts.suru-clone-00112233", Some("another run"), true);
+    let notes = left(".notes", Some(GONE), false);
 
     let hosted = host_providers_with_timings(
         state_dir.path(),
@@ -1608,11 +1614,14 @@ async fn what_a_dead_servers_clone_recorded_and_left_in_a_root_is_removed_at_the
     .await
     .expect("the Server's first discovery settles");
 
-    assert!(
-        !abandoned.exists(),
-        "what the dead run's Clone recorded and left is removed"
-    );
-    for survivor in [&unrecorded, &remarked, &notes] {
+    for removed in [&abandoned, &unmarked] {
+        assert!(
+            !removed.exists(),
+            "what the dead run's Clone recorded and left is removed: {}",
+            removed.display()
+        );
+    }
+    for survivor in [&unrecorded, &unmarked_unrecorded, &remarked, &notes] {
         assert!(
             survivor.join("clone").join("README.md").exists(),
             "{} is left as it was",
