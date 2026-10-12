@@ -57,47 +57,73 @@ use crate::{
     server::operations::{Origins, Refusal, RemoteActRefusal},
 };
 
-pub(super) const LIST_WORKSPACES_DESCRIPTION: &str = "\
-List the Workspaces this Suru server knows — the Repositories and \
-directories the user works in — so you can pick the right one for work, as \
-compact rows: first those the user's Sessions work in, most recently worked \
-in first, then those Suru holds a Description or Icon for though no Session \
-works there, by path. A directory Suru has never been told of is not listed, \
-even one the user's Client stands in; set_workspace_description makes one \
-known. Takes one optional argument, \"origin\": the name of a Remote, as \
-list_remotes gives it, to list the Workspaces that Remote knows instead, or \
-\"everywhere\" to list this server's and then each Remote's in turn. Answers \
-with JSON of the shape {\"workspaces\": [row, ...]}. Each row has \
-\"workspace_id\", the Workspace's identity; \"origin\", the name of the \
-Remote that knows it, left out for one on this server; \
-\"name\", the name the user knows it by; \"path\", the path it is presented \
-by, which list_sessions takes as its \"workspace\" and gives in its rows; \
-\"description\", what it is for, as {\"text\": \"...\", \"set\": true} where \
-the user or a Sidekick set it, \"set\": false where Suru derived it, or null \
-where it has none; and \"icon\", the name of its Icon in Suru's Icon \
-Catalog, or null. Your own Workspace, the Sidekick Workspace, is among \
-them. A listing \"everywhere\" lists only what each server answered with \
-now: one with a Remote that did not answer also has \"unanswered\", a list \
-naming each such Remote as \"origin\" with a \"reason\" saying why, and none \
-of its Workspaces. An \"origin\" naming a Remote this server is not paired \
-with, or one that does not answer, is refused saying so.";
+/// `list_workspaces`' description as one caller reads it. What every caller
+/// is answered — the listing, its order and the shape of its rows — is
+/// written once here, so a change to it reaches every caller's description;
+/// each fills in what is its own: what the listing is for, what the call
+/// takes, a row's `origin` and what else takes its path, and what it says
+/// after the rows.
+macro_rules! list_workspaces_description {
+    (
+        purpose: $purpose:literal,
+        takes: $takes:literal,
+        row_origin: $row_origin:literal,
+        path_used: $path_used:literal,
+        then: $then:literal $(,)?
+    ) => {
+        concat!(
+            "List the Workspaces this Suru server knows — the Repositories and \
+             directories the user works in — so you ",
+            $purpose,
+            ", as compact rows: first those the user's Sessions work in, most \
+             recently worked in first, then those Suru holds a Description or Icon \
+             for though no Session works there, by path. ",
+            $takes,
+            " Answers with JSON of the shape {\"workspaces\": [row, ...]}. Each \
+             row has \"workspace_id\", the Workspace's identity; ",
+            $row_origin,
+            "\"name\", the name the user knows it by; \"path\", the path it is \
+             presented by",
+            $path_used,
+            "; \"description\", what it is for, as {\"text\": \"...\", \"set\": \
+             true} where the user or a Sidekick set it, \"set\": false where Suru \
+             derived it, or null where it has none; and \"icon\", the name of its \
+             Icon in Suru's Icon Catalog, or null. ",
+            $then,
+        )
+    };
+}
+
+pub(super) const LIST_WORKSPACES_DESCRIPTION: &str = list_workspaces_description!(
+    purpose: "can pick the right one for work",
+    takes: "A directory Suru has never been told of is not listed, even one the \
+        user's Client stands in; set_workspace_description makes one known. Takes \
+        one optional argument, \"origin\": the name of a Remote, as list_remotes \
+        gives it, to list the Workspaces that Remote knows instead, or \
+        \"everywhere\" to list this server's and then each Remote's in turn.",
+    row_origin: "\"origin\", the name of the Remote that knows it, left out for one \
+        on this server; ",
+    path_used: ", which list_sessions takes as its \"workspace\" and gives in its \
+        rows",
+    then: "Your own Workspace, the Sidekick Workspace, is among them. A listing \
+        \"everywhere\" lists only what each server answered with now: one with a \
+        Remote that did not answer also has \"unanswered\", a list naming each such \
+        Remote as \"origin\" with a \"reason\" saying why, and none of its \
+        Workspaces. An \"origin\" naming a Remote this server is not paired with, \
+        or one that does not answer, is refused saying so.",
+);
 
 /// `list_workspaces` as any Agent but a Sidekick reads it: this server's
 /// Workspaces alone, in the rows a Sidekick's listing gives, and nothing of a
 /// Remote or of the Tools it is not offered.
-pub(super) const LIST_THIS_SERVERS_WORKSPACES_DESCRIPTION: &str = "\
-List the Workspaces this Suru server knows — the Repositories and \
-directories the user works in — so you know where the user's other work \
-lives and may read it where your own tools reach, as compact rows: first \
-those the user's Sessions work in, most recently worked in first, then those \
-Suru holds a Description or Icon for though no Session works there, by path. \
-Takes no arguments. Answers with JSON of the shape {\"workspaces\": [row, \
-...]}. Each row has \"workspace_id\", the Workspace's identity; \"name\", the \
-name the user knows it by; \"path\", the path it is presented by; \
-\"description\", what it is for, as {\"text\": \"...\", \"set\": true} where \
-the user set it, \"set\": false where Suru derived it, or null where it has \
-none; and \"icon\", the name of its Icon in Suru's Icon Catalog, or null. \
-Suru's own Workspace, the Sidekick Workspace, is among them.";
+pub(super) const LIST_THIS_SERVERS_WORKSPACES_DESCRIPTION: &str = list_workspaces_description!(
+    purpose: "know where the user's other work lives and may read it where your own \
+        tools reach",
+    takes: "Takes no arguments.",
+    row_origin: "",
+    path_used: "",
+    then: "Suru's own Workspace, the Sidekick Workspace, is among them.",
+);
 
 pub(super) const SET_WORKSPACE_DESCRIPTION_DESCRIPTION: &str = "\
 Set a Workspace's Description: a sentence or two saying what it is for, so \
