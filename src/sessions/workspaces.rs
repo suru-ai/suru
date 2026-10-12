@@ -489,10 +489,12 @@ impl SessionStore {
     /// Every Repository the Workspace Registry holds an entry for, by its
     /// identity and the path its entry presents it at — its main root, its
     /// bare root, or its repository metadata location — whether or not a
-    /// Session works there any longer: what the Reclaim sweep finds a
-    /// Repository by after a restart once nothing else names it (ADR 0051).
+    /// Session works there any longer, in the order of those paths: what the
+    /// Reclaim sweep finds a Repository by after a restart once nothing else
+    /// names it (ADR 0051).
     pub(crate) fn registered_repositories(&self) -> Vec<(RepositoryId, PathBuf)> {
-        self.state
+        let mut repositories = self
+            .state
             .lock()
             .unwrap()
             .workspaces
@@ -508,7 +510,9 @@ impl SessionStore {
                 )
             })
             .filter_map(|(id, stored)| Some((RepositoryId(id.0.clone()), stored.path.clone()?)))
-            .collect()
+            .collect::<Vec<_>>();
+        repositories.sort_by(|(_, left), (_, right)| left.cmp(right));
+        repositories
     }
 }
 

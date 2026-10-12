@@ -171,6 +171,11 @@ pub struct ServerTimings {
     /// since no Watch survives the restart that would read the backdated
     /// row, so tests shorten the day instead.
     pub worktree_reclaim_day: Duration,
+    /// How long a Reclaim pass waits on reading one Workspace Registry
+    /// entry's Repository before passing over it for that pass, so a
+    /// directory that does not answer — a network filesystem gone silent,
+    /// say — holds up no other Repository's Reclaim.
+    pub worktree_reclaim_registry_read_timeout: Duration,
     pub checkout_skill_timeout: Duration,
     /// How long an accepted shutdown keeps health and existing streams
     /// available so the final authenticated intent can reach clients before
@@ -343,6 +348,7 @@ impl Default for ServerTimings {
             worktree_reclaim_startup_delay: Duration::from_secs(1),
             worktree_reclaim_interval: Duration::from_secs(60 * 60),
             worktree_reclaim_day: Duration::from_secs(24 * 60 * 60),
+            worktree_reclaim_registry_read_timeout: Duration::from_secs(30),
             checkout_skill_timeout: Duration::from_secs(30),
             shutdown_grace: Duration::from_millis(100),
             shutdown_deadline: SHUTDOWN_DEADLINE,
@@ -590,6 +596,10 @@ impl ServerTimings {
     }
     pub fn with_worktree_reclaim_day(mut self, day: Duration) -> Self {
         self.worktree_reclaim_day = day;
+        self
+    }
+    pub fn with_worktree_reclaim_registry_read_timeout(mut self, timeout: Duration) -> Self {
+        self.worktree_reclaim_registry_read_timeout = timeout;
         self
     }
 

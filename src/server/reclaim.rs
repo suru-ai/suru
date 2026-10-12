@@ -12,7 +12,8 @@ use crate::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
@@ -51,7 +52,8 @@ pub(super) fn spawn(
             settings,
             day: timings.worktree_reclaim_day,
         };
-        if run_pass_or_shutdown(&reclaimer, &mut shutdown).await {
+        let registry = RegistryReads::new(timings.worktree_reclaim_registry_read_timeout);
+        if run_pass_or_shutdown(&reclaimer, &registry, &mut shutdown).await {
             return;
         }
         let interval = timings
@@ -61,7 +63,7 @@ pub(super) fn spawn(
             if wait_or_shutdown(interval, &mut shutdown).await {
                 return;
             }
-            if run_pass_or_shutdown(&reclaimer, &mut shutdown).await {
+            if run_pass_or_shutdown(&reclaimer, &registry, &mut shutdown).await {
                 return;
             }
         }
@@ -100,14 +102,18 @@ pub(super) fn spawn_orphans(
     });
 }
 
-async fn run_pass_or_shutdown(reclaimer: &Reclaimer, shutdown: &mut watch::Receiver<bool>) -> bool {
+async fn run_pass_or_shutdown(
+    reclaimer: &Reclaimer,
+    registry: &RegistryReads,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
     tokio::select! {
         biased;
         changed = shutdown.changed() => {
             let _ = changed;
             true
         }
-        _ = reclaimer.pass() => false,
+        _ = reclaimer.pass(registry) => false,
     }
 }
 
@@ -139,7 +145,7 @@ impl Reclaimer {
         days.saturating_mul(day)
     }
 
-    async fn pass(&self) {
+    async fn pass(&self, registry: &RegistryReads) {
         let AutoReclaim::AfterDays(days) = self.settings.borrow().settings.worktree.auto_reclaim
         else {
             return;
@@ -164,25 +170,6 @@ impl Reclaimer {
                 .entry(preparation.repository.id.clone())
                 .or_insert_with(|| preparation.repository.clone());
         }
-        // A Repository that neither a Session, this run's resolutions nor a
-        // preparation names is still found through its Workspace Registry
-        // entry, so a restart no longer forgets one no Session works in (ADR
-        // 0051). An entry whose directory cannot be read, or now reads as
-        // another Repository, is passed over until a later sweep.
-        for (id, path) in self.sessions.registered_repositories() {
-            if repositories.contains_key(&id) {
-                continue;
-            }
-            match self.source_control.read_repository(&path).await {
-                Some(repository) if repository.id == id => {
-                    repositories.insert(id, repository);
-                }
-                _ => tracing::debug!(
-                    repository = %path.display(),
-                    "Managed Worktree Reclaim passed over a Workspace Registry entry naming no Repository it could read"
-                ),
-            }
-        }
         for repository in repositories.values() {
             let repository_preparations = preparations
                 .iter()
@@ -196,6 +183,29 @@ impl Reclaimer {
                 ReclaimPopulation::All,
             )
             .await;
+        }
+        // A Repository that neither a Session, this run's resolutions nor a
+        // preparation names is still found through its Workspace Registry
+        // entry, so a restart no longer forgets one no Session works in (ADR
+        // 0051). Entries are read last, so one that does not answer holds up
+        // none of the Repositories above; one whose directory cannot be read
+        // in time, or now reads as another Repository, is passed over until
+        // a later pass.
+        for (id, path) in self.sessions.registered_repositories() {
+            if repositories.contains_key(&id) {
+                continue;
+            }
+            match registry.read(&self.source_control, &path).await {
+                // No preparation names it, or it would be among those above.
+                Some(repository) if repository.id == id => {
+                    self.reclaim_repository(&repository, days, &[], ReclaimPopulation::All)
+                        .await;
+                }
+                _ => tracing::debug!(
+                    repository = %path.display(),
+                    "Managed Worktree Reclaim passed over a Workspace Registry entry naming no Repository it could read"
+                ),
+            }
         }
     }
 
@@ -633,6 +643,108 @@ impl Reclaimer {
             rule = rule.log_name(),
             "Managed Worktree Reclaim failed; will retry: {error}"
         );
+    }
+}
+
+/// How a Reclaim pass reads the Repository a Workspace Registry entry
+/// names: on a thread of its own, where a directory that does not answer —
+/// a network filesystem gone silent, say — blocks that thread alone and
+/// neither the Server's executor nor its blocking pool, and for no longer
+/// than `timeout`, after which the pass goes on without it. A read still
+/// outstanding from an earlier pass is not begun again, so an entry that
+/// never answers holds one thread rather than one more each pass.
+struct RegistryReads {
+    /// See [`ServerTimings::worktree_reclaim_registry_read_timeout`].
+    timeout: Duration,
+    outstanding: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+impl RegistryReads {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            outstanding: Default::default(),
+        }
+    }
+
+    async fn read(&self, source_control: &SourceControlService, path: &Path) -> Option<Repository> {
+        if !self.outstanding.lock().unwrap().insert(path.to_owned()) {
+            tracing::debug!(
+                repository = %path.display(),
+                "Managed Worktree Reclaim is still reading a Workspace Registry entry from an earlier pass"
+            );
+            return None;
+        }
+        let outstanding = OutstandingRead {
+            reads: self.outstanding.clone(),
+            path: path.to_owned(),
+        };
+        let source_control = source_control.clone();
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let reader = std::thread::Builder::new()
+            .name("suru-reclaim-registry-read".to_owned())
+            .spawn(move || {
+                let _ = answer.send(read_on_own_runtime(&source_control, &outstanding.path));
+            });
+        if let Err(error) = reader {
+            tracing::warn!(
+                repository = %path.display(),
+                "Managed Worktree Reclaim could not read a Workspace Registry entry; will retry: {error}"
+            );
+            return None;
+        }
+        match tokio::time::timeout(self.timeout, answered).await {
+            Ok(Ok(repository)) => repository,
+            Ok(Err(_)) => {
+                tracing::warn!(
+                    repository = %path.display(),
+                    "Managed Worktree Reclaim could not read a Workspace Registry entry; will retry: its reader ended without answering"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    repository = %path.display(),
+                    timeout_ms = self.timeout.as_millis(),
+                    "Managed Worktree Reclaim passed over a Workspace Registry entry that did not answer in time; will retry"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// The Repository `path` is read as, on a runtime of the calling thread's
+/// own, so a read that never answers leans on nothing of the Server's and
+/// keeps no runtime from shutting down.
+fn read_on_own_runtime(source_control: &SourceControlService, path: &Path) -> Option<Repository> {
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(source_control.read_repository(path)),
+        Err(error) => {
+            tracing::warn!(
+                repository = %path.display(),
+                "Managed Worktree Reclaim could not read a Workspace Registry entry; will retry: {error}"
+            );
+            None
+        }
+    }
+}
+
+/// One entry's read, outstanding until the thread reading it lets it go,
+/// however that thread ends.
+struct OutstandingRead {
+    reads: Arc<Mutex<HashSet<PathBuf>>>,
+    path: PathBuf,
+}
+
+impl Drop for OutstandingRead {
+    fn drop(&mut self) {
+        if let Ok(mut reads) = self.reads.lock() {
+            reads.remove(&self.path);
+        }
     }
 }
 

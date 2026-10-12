@@ -1727,6 +1727,166 @@ async fn a_registry_entry_whose_directory_cannot_be_read_is_skipped_by_the_sweep
     restarted.shutdown().await.unwrap();
 }
 
+/// Long enough for a Registry entry to be read under a loaded test run, and
+/// well short of every progress deadline.
+const REGISTRY_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Git, but for one directory whose reading does not answer until the test
+/// lets it go, blocking the thread reading it as a filesystem gone silent
+/// does. Counts the readings begun of each directory.
+struct SilentDirectory {
+    git: GitSourceControl,
+    silent: PathBuf,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+    readings: std::sync::Mutex<std::collections::HashMap<PathBuf, usize>>,
+}
+
+impl SilentDirectory {
+    fn new(silent: PathBuf) -> Self {
+        Self {
+            git: GitSourceControl::default(),
+            silent,
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+            readings: Default::default(),
+        }
+    }
+
+    fn readings_of(&self, directory: &Path) -> usize {
+        self.readings
+            .lock()
+            .unwrap()
+            .get(directory)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+}
+
+#[async_trait::async_trait]
+impl SourceControl for SilentDirectory {
+    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+        *self
+            .readings
+            .lock()
+            .unwrap()
+            .entry(directory.to_owned())
+            .or_default() += 1;
+        if directory == self.silent {
+            // Never past the test's own deadline, so a pass that waits on
+            // this read on the Server's executor fails the test rather than
+            // hanging it.
+            let released = self.released.lock().unwrap();
+            let _ = self
+                .release
+                .wait_timeout_while(
+                    released,
+                    PROGRESS_DEADLINE + Duration::from_secs(5),
+                    |released| !*released,
+                )
+                .unwrap();
+        }
+        self.git.discover(directory).await
+    }
+
+    async fn list_checkouts(
+        &self,
+        repository: &Repository,
+    ) -> Result<Vec<CheckoutAssociation>, String> {
+        self.git.list_checkouts(repository).await
+    }
+
+    async fn inspect_removal(
+        &self,
+        target: &CheckoutRemovalTarget,
+    ) -> Result<CheckoutRemovalInspection, String> {
+        self.git.inspect_removal(target).await
+    }
+
+    async fn removal_branch_outcome(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git.removal_branch_outcome(target, inspection).await
+    }
+
+    async fn reclaim_checkout(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+        branch_outcome: CheckoutBranchOutcome,
+        preparations: &[PreparedCheckout],
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git
+            .reclaim_checkout(target, inspection, branch_outcome, preparations)
+            .await
+    }
+}
+
+/// A Registry entry whose directory does not answer — a network filesystem
+/// gone silent — costs a pass that entry alone: the pass goes on past it to
+/// Reclaim another Repository's orphan while its read still hangs, and no
+/// later pass begins a second read of it.
+#[tokio::test]
+async fn a_registry_entry_that_does_not_answer_holds_up_no_other_reclaim() {
+    let layout = ReclaimLayout::new("registry-silent");
+    // A pass reads entries in the order of their paths, so this one is read
+    // before the layout's own Repository.
+    let silent = layout.root.join("drive");
+    std::fs::create_dir(&silent).unwrap();
+    git(&silent, &["init", "-b", "main"]);
+    commit(&silent, "initial");
+    layout.pin(r#""off""#);
+    let config = layout.server_config("reclaim-registry-silent");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider_and_timings(config.clone(), runtime, timings())
+        .await
+        .unwrap();
+    let (elsewhere, _elsewhere_connection) = open(&server, &mut provider, &silent).await;
+    let (session, _connection) = open(&server, &mut provider, &layout.managed).await;
+    delete_session(&server, elsewhere.session.id).await;
+    delete_session(&server, session.session.id).await;
+    server.shutdown().await.unwrap();
+
+    layout.pin("14");
+    let adapter = Arc::new(SilentDirectory::new(silent.clone()));
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted = server::spawn_with_source_control(
+        config,
+        vec![runtime],
+        timings().with_worktree_reclaim_registry_read_timeout(REGISTRY_READ_TIMEOUT),
+        adapter.clone(),
+    )
+    .await
+    .unwrap();
+    wait_for_path(&layout.managed, false).await;
+    assert_eq!(
+        adapter.readings_of(&silent),
+        1,
+        "the pass went on past the silent entry, whose read still hangs"
+    );
+    timeout(PROGRESS_DEADLINE, async {
+        while adapter.readings_of(&layout.main) < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("later passes read the Registry again");
+    assert_eq!(
+        adapter.readings_of(&silent),
+        1,
+        "no pass begins a second read of an entry still outstanding"
+    );
+    adapter.release();
+    restarted.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn startup_reclaims_an_orphan_without_an_attached_client_and_retains_an_unproven_branch() {
     let layout = ReclaimLayout::new("startup-orphan");
