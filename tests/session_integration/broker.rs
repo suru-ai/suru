@@ -672,7 +672,8 @@ async fn a_harness_speaking_the_2026_07_28_revision_is_answered_a_tool_list_it_c
             "read_subagent",
             "send_to_subagent",
             "wait_subagents",
-            "stop_subagent"
+            "stop_subagent",
+            "list_workspaces"
         ],
     );
     assert_eq!(
