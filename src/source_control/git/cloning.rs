@@ -2,11 +2,14 @@
 //! neither shallow nor recursing into submodules — run through the runner
 //! every other Git command is, with nothing it may ask anyone.
 //!
-//! The destination is made before Git runs, so a Clone never writes into
-//! what another put there, nor removes it: two Clones of one name race to
-//! make it, and the one that loses is refused as though it had found it.
-//! What a Clone that fails or is stopped leaves there is removed, the
-//! directory with it.
+//! Git makes the clone out of sight, in a hidden directory beside its
+//! destination, which discovery passes over and nobody mistakes for a
+//! Workspace, and the clone takes its destination's name only once it is
+//! whole — never over whatever has come to stand there meanwhile, another
+//! Clone of the same name among them. So a Root never holds a half-made
+//! Workspace, even while one is being made. What a Clone that fails, runs
+//! out of time, or is abandoned by whoever awaited it leaves there is
+//! removed.
 use super::*;
 use crate::source_control::CloneFailure;
 
@@ -15,12 +18,13 @@ use crate::source_control::CloneFailure;
 /// or host it would have to ask about fails the Clone at once.
 const UNASKING_SSH: &str = "ssh -o BatchMode=yes";
 
-/// How many more times removing what a Clone left behind is tried once it
-/// has failed, and how long apart: a Git stopped at its deadline may still
-/// be letting go of what it held, and on Windows its files cannot be removed
-/// until it has.
-const REMOVAL_RETRIES: u32 = 20;
-const REMOVAL_RETRY: Duration = Duration::from_millis(50);
+/// How many more times removing or naming what a Clone made is tried once it
+/// has failed, and how long apart: a Git stopped at its deadline may still be
+/// letting go of what it held, and on Windows a file just written may be
+/// held a moment longer by whatever reads it, so what Git made can be
+/// neither removed nor renamed until then.
+const RETRIES: u32 = 20;
+const RETRY: Duration = Duration::from_millis(50);
 
 impl GitSourceControl {
     /// Clones `url` into `destination`, as
@@ -41,44 +45,53 @@ impl GitSourceControl {
                 destination.display()
             )));
         };
-        match std::fs::create_dir(destination) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(CloneFailure::Occupied);
-            }
-            Err(error) => {
-                return Err(CloneFailure::Failed(format!(
-                    "Could not make `{}`: {error}",
-                    destination.display()
-                )));
-            }
+        if std::fs::symlink_metadata(destination).is_ok() {
+            return Err(CloneFailure::Occupied);
         }
+        let hidden = format!(
+            ".{name}.suru-clone-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let staged = Staged(Some(parent.join(&hidden)));
         let environment = unasking_environment(self.names_its_own_ssh(parent).await);
         let branch = branch.map(|branch| format!("--branch={branch}"));
         let mut args = vec!["clone", "--quiet"];
         args.extend(branch.as_deref());
         // Everything after `--` is the URL and the directory, however they
         // begin, so no URL is read as an option.
-        args.extend(["--", url, name]);
+        args.extend(["--", url, &hidden]);
         let failure = match self.run(parent, &args, timeout, None, &environment).await {
-            Ok(output) if output.status.success() => return Ok(self.discover(destination).await),
+            Ok(output) if output.status.success() => {
+                match take_name(staged.path(), destination).await {
+                    Ok(()) => {
+                        staged.disarm();
+                        return Ok(self.discover(destination).await);
+                    }
+                    Err(failure) => failure,
+                }
+            }
             Ok(output) => CloneFailure::Failed(said(&output)),
             Err(Unrun::TimedOut) => CloneFailure::TimedOut,
             Err(Unrun::Failed(reason)) => CloneFailure::Failed(reason),
         };
-        match remove_partial(destination).await {
+        let staging = staged.disarm();
+        match remove_partial(&staging).await {
             Ok(()) => Err(failure),
             Err(error) => {
                 tracing::warn!(
-                    destination = %destination.display(),
+                    staging = %staging.display(),
                     "what a Clone left behind could not be removed: {error}"
                 );
                 let why = match failure {
                     CloneFailure::Failed(said) => said,
+                    CloneFailure::Occupied => {
+                        "Something came to stand at its destination".to_owned()
+                    }
                     _ => "It did not finish in time".to_owned(),
                 };
                 Err(CloneFailure::LeftBehind(format!(
-                    "{why}; removing what it left failed: {error}"
+                    "{why}; removing what it left at `{}` failed: {error}",
+                    staging.display()
                 )))
             }
         }
@@ -95,6 +108,41 @@ impl GitSourceControl {
                 .text(directory, &["config", "--get", "core.sshCommand"])
                 .await
                 .is_some()
+    }
+}
+
+/// The hidden directory a Clone is made in, removed on a task of its own
+/// should the Clone be abandoned before it is named or removed — as where
+/// whoever awaited it goes away, and Git with it.
+struct Staged(Option<PathBuf>);
+
+impl Staged {
+    fn path(&self) -> &Path {
+        self.0
+            .as_deref()
+            .expect("a staged Clone is held until disarmed")
+    }
+
+    /// Leaves what is staged to whoever disarms it, answering where it is.
+    fn disarm(mut self) -> PathBuf {
+        self.0.take().expect("a staged Clone is disarmed once")
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if let Some(staging) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                if let Err(error) = remove_partial(&staging).await {
+                    tracing::warn!(
+                        staging = %staging.display(),
+                        "what an abandoned Clone left behind could not be removed: {error}"
+                    );
+                }
+            });
+        }
     }
 }
 
@@ -130,22 +178,55 @@ fn said(output: &Output) -> String {
     }
 }
 
-/// Removes what a Clone that did not finish left at `destination`, the
-/// directory it made itself, trying again a few times where that fails.
-async fn remove_partial(destination: &Path) -> std::io::Result<()> {
+/// Gives the whole clone at `staging` its name, `destination`, unless
+/// something has come to stand there since, which it never replaces.
+async fn take_name(staging: &Path, destination: &Path) -> Result<(), CloneFailure> {
+    let (from, to) = (staging.to_owned(), destination.to_owned());
+    let named = persistently(move || {
+        if std::fs::symlink_metadata(&to).is_ok() {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
+        std::fs::rename(&from, &to)
+    })
+    .await;
+    match named {
+        Ok(()) => Ok(()),
+        Err(_) if std::fs::symlink_metadata(destination).is_ok() => Err(CloneFailure::Occupied),
+        Err(error) => Err(CloneFailure::Failed(format!(
+            "Could not give the clone its name, `{}`: {error}",
+            destination.display()
+        ))),
+    }
+}
+
+/// Removes what a Clone that did not finish left at `staging`; nothing
+/// there is nothing to remove.
+async fn remove_partial(staging: &Path) -> std::io::Result<()> {
+    let staging = staging.to_owned();
+    persistently(move || match remove_tree(&staging) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        removed => removed,
+    })
+    .await
+}
+
+/// Runs `act` on a thread of its own until it succeeds, trying it again a
+/// few times, a moment apart, where it fails.
+async fn persistently(
+    act: impl Fn() -> std::io::Result<()> + Clone + Send + 'static,
+) -> std::io::Result<()> {
     let mut retries = 0;
     loop {
-        let removing = destination.to_owned();
-        let removed = tokio::task::spawn_blocking(move || remove_tree(&removing))
+        let attempt = act.clone();
+        let acted = tokio::task::spawn_blocking(attempt)
             .await
             .unwrap_or_else(|error| Err(std::io::Error::other(error)));
-        match removed {
+        match acted {
             Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) if retries == REMOVAL_RETRIES => return Err(error),
+            Err(error) if retries == RETRIES => return Err(error),
             Err(_) => {
                 retries += 1;
-                tokio::time::sleep(REMOVAL_RETRY).await;
+                tokio::time::sleep(RETRY).await;
             }
         }
     }

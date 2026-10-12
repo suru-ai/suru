@@ -204,10 +204,12 @@ pub trait SourceControl: Send + Sync {
     /// there yet whose parent is, checking out `branch` or the Repository's
     /// default, and answer the Workspace made there as discovery reads it.
     /// The Clone is the system's ordinary one, and asks no one anything: a
-    /// credential it cannot find fails it at once. Anything already standing
-    /// at `destination` refuses it and is left as it was; a Clone that fails,
-    /// or is still running once `timeout` has passed, is stopped and leaves
-    /// nothing at `destination`.
+    /// credential it cannot find fails it at once. Nothing stands at
+    /// `destination` until the Clone is whole, so no half-made one is ever
+    /// taken for a Workspace. Anything already standing at `destination`
+    /// refuses it and is left as it was; a Clone that fails, is still
+    /// running once `timeout` has passed, or is abandoned leaves nothing
+    /// behind.
     async fn clone_repository(
         &self,
         _url: &str,

@@ -1135,3 +1135,70 @@ async fn a_clone_needing_a_credential_git_cannot_find_fails_at_once() {
     assert!(!destination.exists(), "nothing is left at the destination");
     server.abort();
 }
+
+/// What stands directly within `directory`, by name, sorted.
+fn names_within(directory: &Path) -> Vec<String> {
+    let mut names = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names
+}
+
+/// A Clone is made out of sight, in a hidden directory beside where it is
+/// going, so nothing stands under its destination's name until it is whole;
+/// and one abandoned by whoever awaited it — Git stopped with it — leaves
+/// nothing behind.
+#[tokio::test]
+async fn a_clone_is_made_out_of_sight_and_one_abandoned_leaves_nothing_behind() {
+    let (_temporary, root) = root();
+    let projects = root.join("projects");
+    std::fs::create_dir(&projects).unwrap();
+    let destination = projects.join("atlas");
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "git://127.0.0.1:{}/atlas.git",
+        silent.local_addr().unwrap().port()
+    );
+    let held = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((connection, _)) = silent.accept().await {
+            held.push(connection);
+        }
+    });
+    let adapter = GitSourceControl::default();
+
+    {
+        let cloning = adapter.clone_repository(&url, &destination, None, UNREACHED);
+        tokio::pin!(cloning);
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                tokio::select! {
+                    finished = &mut cloning => panic!("the Clone waits on its silent server: {finished:?}"),
+                    () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
+                        let names = names_within(&projects);
+                        if !names.is_empty() {
+                            return names;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("Git begins the Clone");
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(
+            seen[0].starts_with(".atlas."),
+            "Git makes the Clone in a hidden directory beside its destination: {seen:?}"
+        );
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while !names_within(&projects).is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("an abandoned Clone leaves nothing behind");
+    held.abort();
+}
