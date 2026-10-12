@@ -1126,6 +1126,7 @@ pub(crate) fn repository_workspace(repository: &Repository) -> Workspace {
         // or regrouped (`SessionStore::regroup`).
         icon: None,
         description: None,
+        unavailable: None,
     }
 }
 

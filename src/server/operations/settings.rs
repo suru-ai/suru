@@ -108,13 +108,14 @@ impl SessionOperations {
     /// listener moves to what its Settings say, every attached Client is
     /// pushed the snapshot, each live Session following a Provider's
     /// Approval Posture Settings takes the posture they now make, and
-    /// Workspace Roots that changed begin to be discovered afresh. The change
-    /// runs whole, after every change asked for before it has, and on a task
-    /// of the Server's own, so it completes whether or not this is awaited to
-    /// the end. A document that cannot take the edit changes nothing. Once
-    /// it has run, and so holds no later change off, its answer waits on
-    /// the discovery it began, though never past the bound any wait on
-    /// discovery keeps.
+    /// Workspace Roots that changed begin to be discovered afresh, what was
+    /// discovered under a Root taken away dropped with it unless a Session
+    /// belongs to it. The change runs whole, after every change asked for
+    /// before it has, and on a task of the Server's own, so it completes
+    /// whether or not this is awaited to the end. A document that cannot
+    /// take the edit changes nothing. Once it has run, and so holds no later
+    /// change off, its answer waits on the discovery it began, though never
+    /// past the bound any wait on discovery keeps.
     pub(crate) async fn change_setting(
         &self,
         mutation: SettingMutation,
@@ -176,8 +177,13 @@ impl SettingsAdoption {
                 });
         let changed = sessions.reconcile_approval_postures(&snapshot.settings);
         crate::server::apply_live_posture_updates(providers, changed).await;
-        let rediscovery =
-            (snapshot.settings.workspace.roots != roots).then(|| root_discovery.rediscover());
+        let rediscovery = (snapshot.settings.workspace.roots != roots).then(|| {
+            // The Roots taken away are let go first, so no scan of one still
+            // running enters anything once what it discovered is dropped.
+            let ticket = root_discovery.rediscover();
+            sessions.forget_unrooted(&snapshot.settings.workspace.roots);
+            ticket
+        });
         Ok((SettingChanged { snapshot, serving }, rediscovery))
     }
 }

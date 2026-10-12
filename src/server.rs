@@ -73,6 +73,7 @@ mod election;
 pub(crate) mod operations;
 mod reads_apart;
 mod reclaim;
+mod registry_standing;
 mod relays;
 mod root_discovery;
 mod signals;
@@ -172,7 +173,10 @@ pub struct ServerTimings {
     /// The longest a Workspace listing, a change of the Roots, or the
     /// Server's start waits on a discovery of the Workspace Roots before
     /// going on without it — answering from the Workspace Registry as it
-    /// stands — so a Root on a mount gone quiet holds nothing up.
+    /// stands — so a Root on a mount gone quiet holds nothing up; and the
+    /// longest a listing, or the start, then waits on reading where each
+    /// Registry entry is presented, an entry whose reading has not answered
+    /// by then listed as unavailable.
     pub root_discovery_wait: Duration,
     /// Delay after startup Workspace discovery before the first Reclaim pass.
     pub worktree_reclaim_startup_delay: Duration,
@@ -844,10 +848,12 @@ impl SessionEventSink {
 
 impl RunningServer {
     /// Startup Workspace discovery runs behind readiness. Resolves once every
-    /// persisted Session has been regrouped and the startup scan of the
+    /// persisted Session has been regrouped, the startup scan of the
     /// Workspace Roots has finished or been waited on for
     /// `root_discovery_wait`, whichever comes first — so a Root still being
-    /// scanned may go on being discovered after this resolves — or once
+    /// scanned may go on being discovered after this resolves — and the
+    /// Workspace Registry has been brought in step with the disk and the
+    /// Roots, its readings waited on no longer than that bound either; or once
     /// discovery was abandoned for shutdown. The first Reclaim pass waits on
     /// the same signal, so it waits for the regrouping in full but for the
     /// Roots no longer than that bound.
@@ -1560,32 +1566,41 @@ async fn start(
         .with_sidekick_workspace(sidekick_workspace.clone());
     let (clones_for_shutdown, clone_settle) =
         (source_control.clone(), timings.workspace_clone_settle);
+    let workspace_roots: root_discovery::Roots = {
+        let settings = settings.subscribe();
+        Arc::new(move || settings.borrow().settings.workspace.roots.clone())
+    };
     let root_discovery = root_discovery::RootDiscovery::new(
         Arc::new(root_discovery::RegistryScan::new(
             sessions.clone(),
             source_control.clone(),
             config.home_dir(),
         )),
-        {
-            let settings = settings.subscribe();
-            Arc::new(move || settings.borrow().settings.workspace.roots.clone())
-        },
+        workspace_roots.clone(),
         timings.root_discovery_memo,
         timings.root_discovery_wait,
         root_discovery::Monotonic::real(),
         provider_shutdown_rx.clone(),
+    );
+    let registry_standing = registry_standing::RegistryStanding::new(
+        sessions.clone(),
+        workspace_roots,
+        timings.root_discovery_wait,
     );
     // Persisted grouping is served at once; discovery regroups Sessions behind
     // readiness and publishes catalog changes, so a cold source control
     // system never delays the server's readiness. The Workspace Roots are
     // discovered once the Sessions are regrouped, so a Workspace a Session
     // is found working in is known by that Session rather than by its Root,
-    // and waited on no longer than any discovery is.
+    // and waited on no longer than any discovery is; then the Registry is
+    // brought in step with the disk and the Roots, as every listing brings
+    // it.
     let (workspace_discovery, workspace_discovery_rx) = watch::channel(false);
     {
         let sessions = sessions.clone();
         let source_control = source_control.clone();
         let root_discovery = root_discovery.clone();
+        let registry_standing = registry_standing.clone();
         let mut shutdown = provider_shutdown_rx.clone();
         let roots = settings.subscribe();
         let home = config.home_dir();
@@ -1622,6 +1637,7 @@ async fn start(
                     }
                     let ticket = root_discovery.rediscover();
                     root_discovery.settled(ticket).await;
+                    registry_standing.check().await;
                 } => {}
             }
             workspace_discovery.send_replace(true);
@@ -1729,6 +1745,7 @@ async fn start(
             serving.clone(),
         ),
         root_discovery,
+        registry_standing,
         memories,
         operations::RemoteWatches::new(
             timings.remote_retry_interval,

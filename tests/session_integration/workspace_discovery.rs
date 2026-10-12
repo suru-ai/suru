@@ -56,7 +56,7 @@ pub(crate) const AS_LONG_AS_IT_TAKES: Duration = Duration::from_secs(60 * 60);
 
 /// The Config Document a Server reads its Workspace Roots from, naming
 /// `roots`, written into `config_dir`.
-fn name_roots(config_dir: &Path, roots: &[&str]) {
+pub(super) fn name_roots(config_dir: &Path, roots: &[&str]) {
     std::fs::create_dir_all(config_dir).expect("create the config root");
     let document = json!({ "workspace": { "roots": roots } });
     std::fs::write(config_dir.join("suru.jsonc"), document.to_string())
@@ -64,7 +64,7 @@ fn name_roots(config_dir: &Path, roots: &[&str]) {
 }
 
 /// A path as a Workspace Root names it.
-fn spelled(path: &Path) -> &str {
+pub(super) fn spelled(path: &Path) -> &str {
     path.to_str().expect("the fixture's path is UTF-8")
 }
 
@@ -73,7 +73,7 @@ fn spelled(path: &Path) -> &str {
 /// Worktrees it knows alone, so no Git it runs keeps a Repository's
 /// directory open when a test lets go of it, which Windows refuses to
 /// delete.
-async fn server_with_roots(
+pub(super) async fn server_with_roots(
     home: &Path,
     channel: &str,
     roots: &[&str],
@@ -98,7 +98,7 @@ async fn server_with_roots(
 }
 
 /// The identity of the Repository whose shared metadata is `metadata`.
-fn repository_id(metadata: &Path) -> WorkspaceId {
+pub(super) fn repository_id(metadata: &Path) -> WorkspaceId {
     RepositoryId::from_metadata("git", metadata).workspace_id()
 }
 

@@ -51,6 +51,7 @@ impl Layout {
             source_control: SourceControlAvailability::Available,
             icon: None,
             description: None,
+            unavailable: None,
         };
         let checkouts = [(&main, CheckoutKind::Main), (&linked, CheckoutKind::Linked)]
             .into_iter()

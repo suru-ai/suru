@@ -139,6 +139,7 @@ impl SessionStore {
                     repository: repository.map(Box::new),
                     icon: None,
                     description: None,
+                    unavailable: None,
                 };
                 state.dress_workspace(&mut workspace);
                 Some(workspace)
@@ -327,6 +328,75 @@ impl SessionStore {
         };
         if inherited {
             self.regroup_workspace(&workspace.id);
+        }
+    }
+
+    /// Every entry the Registry holds a path for, by its identity and the
+    /// path it is presented at: where each is read for its standing.
+    pub(crate) fn presented_entries(&self) -> Vec<(WorkspaceId, PathBuf)> {
+        self.state
+            .lock()
+            .unwrap()
+            .workspaces
+            .iter()
+            .filter_map(|(id, stored)| Some((id.clone(), stored.path.clone()?)))
+            .collect()
+    }
+
+    /// Drops the entry `workspace_id` names, found gone from `path` while
+    /// the directory holding it could be read, its Icon and Description
+    /// with it — unless a Session belongs to it, which keeps it. One that
+    /// has since been presented elsewhere is left alone. Answers whether the
+    /// entry stands at `path` still.
+    pub(crate) fn forget_gone(&self, workspace_id: &WorkspaceId, path: &Path) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let presented_there = state
+            .workspaces
+            .get(workspace_id)
+            .is_some_and(|stored| stored.path.as_deref() == Some(path));
+        if !presented_there {
+            return false;
+        }
+        if state.grouped_besides(workspace_id, None) {
+            return true;
+        }
+        state.workspaces.remove(workspace_id);
+        tracing::info!(
+            workspace = %workspace_id.0,
+            path = %path.display(),
+            "a Workspace Registry entry was dropped, its directory gone"
+        );
+        self.storage.forget_workspace(workspace_id.clone());
+        false
+    }
+
+    /// Drops every entry discovered under a Workspace Root `roots` no longer
+    /// names, its Icon and Description with it, unless a Session belongs to
+    /// it. Every entry known otherwise is left alone.
+    pub(crate) fn forget_unrooted(&self, roots: &[String]) {
+        let mut state = self.state.lock().unwrap();
+        let unrooted = state
+            .workspaces
+            .iter()
+            .filter(|(_, stored)| {
+                matches!(
+                    &stored.provenance,
+                    WorkspaceProvenance::Discovered { root } if !roots.contains(root)
+                )
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for workspace_id in unrooted {
+            if state.grouped_besides(&workspace_id, None) {
+                continue;
+            }
+            state.workspaces.remove(&workspace_id);
+            tracing::info!(
+                workspace = %workspace_id.0,
+                "a Workspace Registry entry was dropped with the Workspace Root it was discovered \
+                 under"
+            );
+            self.storage.forget_workspace(workspace_id);
         }
     }
 

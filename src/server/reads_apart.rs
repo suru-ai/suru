@@ -5,8 +5,9 @@
 //! down. At most one read of a path is outstanding at once, so a path that
 //! never answers holds one thread however often it is asked for again, and
 //! no more reads are outstanding at once than a limit allows. Reclaim reads
-//! the Workspace Registry's entries this way, and discovery each Workspace
-//! Root and the directories directly within it.
+//! the Workspace Registry's entries this way, discovery each Workspace Root
+//! and the directories directly within it, and every Workspace listing where
+//! each entry is presented.
 
 use std::{
     collections::HashSet,

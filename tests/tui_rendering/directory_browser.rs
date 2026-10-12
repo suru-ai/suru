@@ -4351,6 +4351,7 @@ fn inside_linked_worktree(main: &Path, linked: &Path, directory: &Path) -> Resol
             source_control: SourceControlAvailability::Available,
             icon: None,
             description: None,
+            unavailable: None,
         },
         execution_directory: Some(ExecutionDirectory {
             path: directory.to_owned(),
@@ -4382,6 +4383,7 @@ fn bare_repository(root: &Path) -> ResolvedWorkspace {
             source_control: SourceControlAvailability::Available,
             icon: None,
             description: None,
+            unavailable: None,
         },
         execution_directory: None,
         checkout: None,

@@ -46,6 +46,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 use super::LandingAgentSelectionStore;
+use super::registry_standing::RegistryStanding;
 use super::root_discovery::RootDiscovery;
 use crate::attachments::{AttachmentStore, BindingRefusal, PromptAttachmentError};
 use crate::memories::MemoryStore;
@@ -444,6 +445,9 @@ pub(crate) struct SessionOperations {
     /// What discovers the Repositories within the Workspace Roots into the
     /// Workspace Registry before the Registry is listed.
     root_discovery: RootDiscovery,
+    /// What keeps the Workspace Registry in step with the disk and the Roots
+    /// as it is listed.
+    registry_standing: RegistryStanding,
     /// The Memories this Server keeps for its Sidekicks.
     memories: MemoryStore,
     /// The Remotes kept in view for the trees listing their Sessions.
@@ -470,6 +474,7 @@ impl SessionOperations {
         remotes: RemoteReach,
         settings_adoption: SettingsAdoption,
         root_discovery: RootDiscovery,
+        registry_standing: RegistryStanding,
         memories: MemoryStore,
         remote_watches: RemoteWatches,
     ) -> Self {
@@ -491,6 +496,7 @@ impl SessionOperations {
             remotes,
             settings_adoption,
             root_discovery,
+            registry_standing,
             memories,
             remote_watches,
         }

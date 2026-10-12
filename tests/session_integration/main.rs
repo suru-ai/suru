@@ -45,6 +45,7 @@ mod workspace_discovery;
 mod workspace_icon_choice;
 mod workspace_icons;
 mod workspace_registry;
+mod workspace_standing;
 
 mod approval_posture;
 mod approvals;

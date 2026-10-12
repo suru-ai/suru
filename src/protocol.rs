@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 101;
+pub const PROTOCOL_VERSION: u32 = 102;
 mod attachment;
 mod reading;
 mod relay;
@@ -493,6 +493,41 @@ pub struct Workspace {
     /// absent until a derivation lands one or someone sets one, and carried
     /// on every copy of a Workspace for the same reason its Icon is.
     pub description: Option<WorkspaceDescription>,
+    /// Why the Workspace cannot be opened now, where the Workspace listing
+    /// that carried this copy could not read its directory (see the
+    /// **Workspace Registry** glossary entry). A listing reads it afresh each
+    /// time; no other copy of a Workspace carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<WorkspaceUnavailability>,
+}
+
+/// Why a Workspace its Server lists cannot be opened now: its directory, as
+/// the listing read it, could not be read.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceUnavailability {
+    /// Its directory is gone, though a Session belongs to it, which keeps
+    /// it listed.
+    Gone,
+    /// Its directory stands but cannot be read.
+    Unreadable,
+    /// The directory holding its own cannot be read — moved away, not
+    /// mounted, or sealed — so its own cannot be found.
+    HolderUnreadable,
+    /// Reading its directory did not answer in time.
+    Unanswered,
+}
+
+impl WorkspaceUnavailability {
+    /// Why, in plain words, as a reader or an Agent is told it.
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Gone => "its directory is gone",
+            Self::Unreadable => "its directory cannot be read",
+            Self::HolderUnreadable => "the directory holding it cannot be read",
+            Self::Unanswered => "its directory did not answer in time",
+        }
+    }
 }
 
 impl Workspace {
@@ -504,6 +539,7 @@ impl Workspace {
             source_control: SourceControlAvailability::NotDetected,
             icon: None,
             description: None,
+            unavailable: None,
         }
     }
     pub fn main_unknown(&self) -> bool {

@@ -28,7 +28,7 @@
 //! it — faulty, or worse — is not taken into memory whole, and the Remote is
 //! named as having said too much.
 
-use std::{fmt, time::Duration};
+use std::{collections::HashMap, fmt, time::Duration};
 
 use axum::{
     body::Body,
@@ -43,7 +43,8 @@ use crate::{
     protocol::{
         ACT_HEADER, ActId, Author, Outlook, ReadRequest, Remote, RemoteStatus, SessionError,
         SessionErrorCode, SessionId, SessionListItem, SessionReadingAnswer, SessionReadingQuery,
-        SnapshotWithSummary, WorkspaceListing, WorkspacePaths,
+        SnapshotWithSummary, WorkspaceId, WorkspaceListing, WorkspacePaths,
+        WorkspaceUnavailability,
     },
     serving::{PairingFailure, ServingController},
     session_projection::agent_reading::{self, KnownRemote, ReadAt},
@@ -1004,22 +1005,39 @@ impl SessionOperations {
 
     /// Every Workspace this Server knows, as its Workspace Registry lists
     /// them once the Workspace Roots are discovered into it — afresh, or by
-    /// a scan only moments old — spelled in its own paths: what its `GET
+    /// a scan only moments old — and it is brought in step with the disk
+    /// and the Roots, spelled in its own paths: what its `GET
     /// /v1/workspaces` answers, a Peer included. An entry whose Repository
     /// source control has read during this run is presented as that
-    /// Repository is, so one whose main checkout is not known is named so.
+    /// Repository is, so one whose main checkout is not known is named so,
+    /// and one whose directory cannot be read now says why it cannot be
+    /// opened.
     pub(crate) async fn workspace_listing(&self) -> WorkspaceListing {
         self.root_discovery.discover().await;
-        self.registered_workspace_listing()
+        let unavailable = self.registry_standing.check().await;
+        self.listing_of_registry(unavailable)
     }
 
     /// Every Workspace this Server's Workspace Registry holds now, as
     /// [`Self::workspace_listing`] lists them, without discovering the
-    /// Workspace Roots first: for what has just had them discovered.
+    /// Workspace Roots first: for what has just had them discovered. It
+    /// reads no entry's directory, so it says of none that it cannot be
+    /// opened.
     pub(crate) fn registered_workspace_listing(&self) -> WorkspaceListing {
+        self.listing_of_registry(HashMap::new())
+    }
+
+    /// Every Workspace the Registry holds now, each whose Repository source
+    /// control has read during this run presented as that Repository is,
+    /// and each `unavailable` names saying why it cannot be opened.
+    fn listing_of_registry(
+        &self,
+        mut unavailable: HashMap<WorkspaceId, WorkspaceUnavailability>,
+    ) -> WorkspaceListing {
         let repositories = self.source_control.repositories();
         let mut workspaces = self.sessions.listed_workspaces();
         for workspace in &mut workspaces {
+            workspace.unavailable = unavailable.remove(&workspace.id);
             if let Some(repository) = repositories
                 .iter()
                 .find(|repository| repository.id.workspace_id() == workspace.id)
