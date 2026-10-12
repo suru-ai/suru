@@ -45,7 +45,7 @@ use crate::{
 
 use super::{
     Landing, SessionSave, StorageError, StorageRepository, StoredResumeState, StoredSidekickAct,
-    WorkspaceProvenance, WorkspaceWrite,
+    WorkspacePresentation, WorkspaceProvenance, WorkspaceWrite,
 };
 
 /// How long the writer waits without a command before an idle tick, and how
@@ -164,10 +164,11 @@ enum WriterCommand {
         provenance: WorkspaceProvenance,
     },
     /// A Workspace's Registry entry, made where it has none and otherwise
-    /// moved to where the Workspace is presented now.
+    /// moved to where, and as what, the Workspace is presented now.
     RecordWorkspace {
         workspace_id: WorkspaceId,
         path: PathBuf,
+        presentation: WorkspacePresentation,
         provenance: WorkspaceProvenance,
     },
     /// A Session's Resume State, landed after the save the Session owed, if
@@ -461,10 +462,11 @@ impl Writer {
             WriterCommand::RecordWorkspace {
                 workspace_id,
                 path,
+                presentation,
                 provenance,
             } => {
                 if let Err(error) =
-                    repository.write_workspace_entry(workspace_id, path, &provenance)
+                    repository.write_workspace_entry(workspace_id, path, presentation, &provenance)
                 {
                     tracing::warn!("could not save a Workspace Registry entry: {error}");
                 }
@@ -870,19 +872,21 @@ impl StorageSink {
             });
     }
 
-    /// Records a Workspace in the Registry as presented at `path` — an entry
-    /// known by `provenance` where it has none, or the entry it has moved to
-    /// `path` — off the Session store's own commit path, behind every write
-    /// the store queued before it.
+    /// Records a Workspace in the Registry as presented at `path`, as
+    /// `presentation` says — an entry known by `provenance` where it has
+    /// none, or the entry it has moved there — off the Session store's own
+    /// commit path, behind every write the store queued before it.
     pub(crate) fn record_workspace(
         &self,
         workspace_id: WorkspaceId,
         path: PathBuf,
+        presentation: WorkspacePresentation,
         provenance: WorkspaceProvenance,
     ) {
         let _ = self.commands.send(WriterCommand::RecordWorkspace {
             workspace_id,
             path,
+            presentation,
             provenance,
         });
     }

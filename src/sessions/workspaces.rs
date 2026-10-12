@@ -1,11 +1,61 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use super::{SessionStore, SessionStoreState};
 use crate::{
-    protocol::{SessionChange, SessionId, Workspace, WorkspaceId},
+    protocol::{
+        Repository, RepositoryId, RepositoryLocation, SessionChange, SessionId,
+        SourceControlAvailability, SourceControlCapabilities, SourceControlCapability, Workspace,
+        WorkspaceId,
+    },
     source_control::SourceControlService,
-    storage::{StoredWorkspace, WorkspaceProvenance},
+    storage::{StoredWorkspace, WorkspacePresentation, WorkspaceProvenance},
 };
+
+/// Why a Repository its Registry entry presents, but which this Server has
+/// not read since it started, offers nothing yet.
+const UNREAD_REPOSITORY: &str = "Suru has not read this Repository since it started";
+
+/// The Repository an entry presented at `path` stands for, as far as how
+/// that path presents it says: where it is presented by its bare root or by
+/// its repository metadata location, the path is that metadata's, so the
+/// Repository is known by its identity and its location without being read
+/// — which is what names an entry whose main checkout is not known as its
+/// Sessions name it. It is offered as unread, so nothing is asked of it until
+/// source control reads it. A plain directory has none, and a main root does
+/// not say where its metadata lies, so neither is presented with one.
+fn presented_repository(
+    workspace_id: &WorkspaceId,
+    path: &Path,
+    presentation: WorkspacePresentation,
+) -> Option<Repository> {
+    let location = match presentation {
+        WorkspacePresentation::BareRoot => RepositoryLocation::Bare {
+            root: path.to_owned(),
+        },
+        WorkspacePresentation::RepositoryMetadata => RepositoryLocation::UnknownMain,
+        WorkspacePresentation::Directory | WorkspacePresentation::MainRoot => return None,
+    };
+    let (system, _) = workspace_id.0.split_once(':')?;
+    let unread = || SourceControlCapability::Unsupported {
+        reason: UNREAD_REPOSITORY.to_owned(),
+    };
+    Some(Repository {
+        id: RepositoryId(workspace_id.0.clone()),
+        system: system.to_owned(),
+        metadata_directory: path.to_owned(),
+        location,
+        availability: SourceControlAvailability::Unavailable {
+            reason: UNREAD_REPOSITORY.to_owned(),
+        },
+        capabilities: SourceControlCapabilities {
+            list_checkouts: unread(),
+            create_checkout: unread(),
+            recover_checkout: unread(),
+            remove_checkout: unread(),
+            rename_branch: unread(),
+        },
+    })
+}
 
 impl SessionStoreState {
     /// Dresses `workspace` in what this store holds for it (see
@@ -50,12 +100,12 @@ impl SessionStore {
     /// them (ADR 0051): first those the Sessions a listing holds work in —
     /// every top-level Session's that says, readable or not, as
     /// [`Self::list`] lists them — most recently worked in first; then the
-    /// rest, by path. Each is given as its entry presents it — its identity
-    /// and the path it was last presented by — dressed in what the entry
-    /// carries, with nothing of its Repository, which only a resolution
-    /// reads; the Sessions only order them. An entry that says nowhere,
-    /// having landed before rows kept a path, cannot be named and is left
-    /// out until a Session working there presents it.
+    /// rest, by path. Each is given as its entry presents it — its identity,
+    /// the path it was last presented by, and as much of its Repository as
+    /// how that path presents it says (see [`presented_repository`]) — and
+    /// dressed in what the entry carries; the Sessions only order them. An
+    /// entry that says nowhere, having landed before rows kept a path, cannot
+    /// be named and is left out until a Session working there presents it.
     pub(crate) fn listed_workspaces(&self) -> Vec<Workspace> {
         let worked = self
             .list(None)
@@ -74,11 +124,19 @@ impl SessionStore {
             .workspaces
             .iter()
             .filter_map(|(id, stored)| {
+                let path = stored.path.clone()?;
+                let repository = stored
+                    .presentation
+                    .and_then(|presentation| presented_repository(id, &path, presentation));
                 let mut workspace = Workspace {
                     id: id.clone(),
-                    path: stored.path.clone()?,
-                    repository: None,
-                    source_control: crate::protocol::SourceControlAvailability::NotDetected,
+                    path,
+                    source_control: repository
+                        .as_ref()
+                        .map_or(SourceControlAvailability::NotDetected, |repository| {
+                            repository.availability.clone()
+                        }),
+                    repository: repository.map(Box::new),
                     icon: None,
                     description: None,
                 };
@@ -95,30 +153,39 @@ impl SessionStore {
     }
 
     /// Enters a Workspace in the Registry the moment it is seen: an entry
-    /// known by `provenance` where it has none, presented at `presented`
-    /// where that says anywhere. An entry it already has keeps how it came
-    /// to be known and everything it carries, and is only moved to where the
-    /// Workspace is presented now — a main root learned since, say. The
-    /// durable write is queued under the store's own lock, so it lands in
-    /// the order the store decided it, among the Icon and Description writes
-    /// beside it. Answers the entry.
+    /// known by `provenance` where it has none, presented where and as
+    /// `presented` — the Workspace as it was just resolved — presents it.
+    /// An entry it already has keeps how it came to be known and everything
+    /// it carries, and is only moved to where, and as what, the Workspace is
+    /// presented now — a main root learned since, say. The durable write is
+    /// queued under the store's own lock, so it lands in the order the store
+    /// decided it, among the Icon and Description writes beside it. Answers
+    /// the entry.
     pub(super) fn enter_workspace<'state>(
         &self,
         state: &'state mut SessionStoreState,
         workspace_id: &WorkspaceId,
-        presented: Option<PathBuf>,
+        presented: Option<&Workspace>,
         provenance: WorkspaceProvenance,
     ) -> &'state mut StoredWorkspace {
         let stored = state
             .workspaces
             .entry(workspace_id.clone())
             .or_insert_with(|| StoredWorkspace::known_by(provenance));
-        if let Some(path) = presented
-            && stored.path.as_ref() != Some(&path)
-        {
-            stored.path = Some(path.clone());
-            self.storage
-                .record_workspace(workspace_id.clone(), path, stored.provenance.clone());
+        if let Some(workspace) = presented {
+            let presentation = WorkspacePresentation::of(workspace);
+            if stored.path.as_ref() != Some(&workspace.path)
+                || stored.presentation != Some(presentation)
+            {
+                stored.path = Some(workspace.path.clone());
+                stored.presentation = Some(presentation);
+                self.storage.record_workspace(
+                    workspace_id.clone(),
+                    workspace.path.clone(),
+                    presentation,
+                    stored.provenance.clone(),
+                );
+            }
         }
         stored
     }
@@ -237,7 +304,7 @@ impl SessionStore {
         self.enter_workspace(
             &mut state,
             &workspace.id,
-            Some(workspace.path.clone()),
+            Some(&workspace),
             WorkspaceProvenance::Session,
         );
         // The table is authoritative for a Workspace's Icon and Description:

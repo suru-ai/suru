@@ -17,16 +17,15 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
         CreateSessionRequest, ExecutionDirectory, InitialPrompt, Outlook, PromptId,
-        ResolveWorkspaceRequest, Workspace, WorkspaceDescription, WorkspaceId,
+        ResolveWorkspaceRequest, SessionId, SessionListItem, Workspace, WorkspaceDescription,
+        WorkspaceId,
     },
     server::{self, ServerConfig, ServerTimings},
 };
-use tokio::time::timeout;
 
 use crate::{
     failing_provider_support::{FailingProviderRuntime, spawn_with_failing_provider},
     repositories::git,
-    server_support::PROGRESS_DEADLINE,
     support,
 };
 
@@ -179,6 +178,29 @@ fn entries_on_disk(config: &ServerConfig) -> HashMap<WorkspaceId, (Option<PathBu
         .collect()
 }
 
+/// Takes the Server's database back to before the workspaces table was the
+/// Registry, with `then` run against it there: the migration that makes it
+/// one runs again at the next start.
+fn age_to_before_the_registry(config: &ServerConfig, then: &str) {
+    database(config)
+        .batch_execute(&format!(
+            "ALTER TABLE workspaces DROP COLUMN provenance;
+             ALTER TABLE workspaces DROP COLUMN presentation;
+             DELETE FROM __diesel_schema_migrations WHERE version = '20261012000000';
+             {then}"
+        ))
+        .expect("age the database back to before the Registry");
+}
+
+/// Leaves the Session `session_id` stored but unreadable — its status no
+/// longer reads — while what it says of its Workspace still does.
+fn unreadable(config: &ServerConfig, session_id: SessionId) {
+    diesel::sql_query("UPDATE sessions SET status = 'no longer a status' WHERE id = ?")
+        .bind::<diesel::sql_types::Text, _>(session_id.to_string())
+        .execute(&mut database(config))
+        .expect("leave the Session unreadable");
+}
+
 /// How the table spells a Workspace known by a Session.
 const BY_SESSION: &str = "\"session\"";
 /// How the table spells a Workspace known by its Description.
@@ -324,78 +346,166 @@ async fn a_session_enters_its_workspace_by_its_presented_root_and_an_entry_keeps
     );
 }
 
-/// A Session whose Workspace the Registry holds no entry for — one stored
-/// before entries were kept for every Workspace — still groups under its own
-/// copy of its Workspace, and re-resolving its directory at start enters the
-/// Workspace, by its presented root and known by a Session, so it is listed
-/// from then on, its Sessions or no.
+/// A Workspace a Session is found working in when its directory is
+/// resolved again at start — one it was never grouped under, since its
+/// directory became a Repository while the Server was down — is entered then,
+/// by its presented root and known by a Session, and listed from then on,
+/// its Sessions or no.
 #[tokio::test]
-async fn re_resolving_a_sessions_directory_at_start_enters_its_workspace() {
+async fn a_workspace_a_session_is_found_in_when_resolved_again_at_start_is_entered() {
     const CHANNEL: &str = "workspace-registry-re-resolution";
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let notes = tempfile::tempdir().expect("create the notes Workspace");
-    let config = ServerConfig::new(state_dir.path(), CHANNEL).expect("configure");
-    let server = spawn_with_failing_provider(config.clone())
-        .await
-        .expect("spawn server");
-    let client = connected_client(state_dir.path(), CHANNEL).await;
+    let home = tempfile::tempdir().expect("create a home for the Workspaces");
+    let home = canonical(home.path());
+    let notes = home.join("notes");
+    std::fs::create_dir(&notes).expect("create the notes directory");
+    let config = ServerConfig::new(home.join("state"), CHANNEL).expect("configure");
+    let server = quiet_server(config.clone()).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
     let created = client
-        .create_session(quiet_request(notes.path(), "Keep the notes"))
+        .create_session(quiet_request(&notes, "Keep the notes"))
         .await
-        .expect("create a Session in the notes Workspace");
-    let workspace = created.session.workspace.clone();
+        .expect("create a Session in the notes directory");
+    assert!(created.session.workspace.repository.is_none());
     drop(client);
     server.shutdown().await.expect("shut down server");
-    database(&config)
-        .batch_execute("DELETE FROM workspaces;")
-        .expect("forget every Registry entry, as a store from before the Registry would");
+    repository(&notes);
 
-    let restarted = spawn_with_failing_provider(config.clone())
+    let restarted = quiet_server(config.clone()).await;
+    restarted.workspace_discovery_settled().await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let regrouped = client
+        .read_session(created.session.id)
         .await
-        .expect("respawn server");
-    let client = connected_client(state_dir.path(), CHANNEL).await;
-    let sessions = client.list_sessions(None).await.expect("list Sessions");
-    assert_eq!(
-        sessions
-            .iter()
-            .filter_map(suru::protocol::SessionListItem::workspace)
-            .collect::<Vec<_>>(),
-        [&workspace],
-        "the Session groups under its own copy of its Workspace"
+        .expect("read the Session")
+        .session
+        .workspace;
+    assert!(
+        regrouped.repository.is_some(),
+        "the Session works in the Repository its directory became"
     );
-    timeout(PROGRESS_DEADLINE, async {
-        while !listed(&client).await.contains(&workspace) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("re-resolving the Session's directory enters its Workspace");
     client
         .delete_session(created.session.id)
         .await
         .expect("delete the Workspace's only Session");
-    assert_eq!(
-        listed(&client).await,
-        std::slice::from_ref(&workspace),
-        "the Workspace is listed by its entry, with no Session left there"
+    assert!(
+        listed(&client)
+            .await
+            .iter()
+            .map(named)
+            .any(|listed| listed == named(&regrouped)),
+        "the Workspace re-resolution found is listed by its entry, with no Session left there"
     );
 
     drop(client);
     restarted.shutdown().await.expect("shut down server");
     assert_eq!(
-        entries_on_disk(&config).get(&workspace.id),
-        Some(&(Some(workspace.path.clone()), BY_SESSION.to_owned())),
+        entries_on_disk(&config).get(&regrouped.id),
+        Some(&(Some(notes), BY_SESSION.to_owned())),
         "the entry re-resolution made is known by a Session"
     );
 }
 
-/// The migration that made the workspaces table the Registry says how each
-/// row it found came to be known: by a Session where one is grouped under
-/// its Workspace, and by its Description otherwise. Each keeps what it
-/// carries, and is listed as before.
+/// A Session stored before the workspaces table was the Registry may work in
+/// a Workspace no Icon or Description ever landed for, so with no row, or one
+/// whose row predates rows keeping a path. The migration enters each as its
+/// Sessions present it, known by a Session, so it is listed at the first
+/// start, before any Session's directory is resolved again — even where the
+/// only Session there cannot be read, and so is never resolved again at all.
 #[tokio::test]
-async fn a_row_stored_before_entries_kept_their_provenance_is_known_by_a_session_or_by_its_description()
- {
+async fn a_workspace_a_stored_session_works_in_is_listed_from_the_first_start_with_the_registry() {
+    const CHANNEL: &str = "workspace-registry-seeding";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let notes = tempfile::tempdir().expect("create the notes Workspace");
+    let atlas = tempfile::tempdir().expect("create the atlas Workspace");
+    let config = ServerConfig::new(state_dir.path(), CHANNEL).expect("configure");
+    let server = spawn_with_failing_provider(config.clone())
+        .await
+        .expect("spawn server");
+    let client = connected_client(state_dir.path(), CHANNEL).await;
+    let noted = client
+        .create_session(quiet_request(notes.path(), "Keep the notes"))
+        .await
+        .expect("create a Session in the notes Workspace")
+        .session;
+    let charted = client
+        .create_session(quiet_request(atlas.path(), "Chart the atlas"))
+        .await
+        .expect("create a Session in the atlas Workspace")
+        .session;
+    client
+        .set_workspace_description(&charted.workspace.id, None, "Where the atlas is charted.")
+        .await
+        .expect("describe the atlas Workspace");
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    unreadable(&config, noted.id);
+    age_to_before_the_registry(
+        &config,
+        &format!(
+            "DELETE FROM workspaces WHERE id = '{}';
+             UPDATE workspaces SET path = NULL WHERE id = '{}';",
+            noted.workspace.id.0, charted.workspace.id.0
+        ),
+    );
+
+    let migrated = spawn_with_failing_provider(config.clone())
+        .await
+        .expect("spawn server over the aged database");
+    let client = connected_client(state_dir.path(), CHANNEL).await;
+    let listing = listed(&client).await;
+    let described = Some(WorkspaceDescription {
+        text: "Where the atlas is charted.".to_owned(),
+        set: true,
+    });
+    assert_eq!(
+        listing.iter().map(named).collect::<Vec<_>>(),
+        [
+            (
+                charted.workspace.id.clone(),
+                charted.workspace.path.clone(),
+                None,
+                described
+            ),
+            (
+                noted.workspace.id.clone(),
+                noted.workspace.path.clone(),
+                None,
+                None
+            ),
+        ],
+        "both are listed at once, each where its Sessions present it"
+    );
+    assert!(
+        client
+            .list_sessions(None)
+            .await
+            .expect("list Sessions")
+            .iter()
+            .any(|item| matches!(item, SessionListItem::Unreadable(_))
+                && item.workspace() == Some(&noted.workspace)),
+        "the unreadable Session still groups under its own copy of its Workspace"
+    );
+    drop(client);
+    migrated.shutdown().await.expect("shut down server");
+
+    let entries = entries_on_disk(&config);
+    assert_eq!(
+        entries.get(&noted.workspace.id),
+        Some(&(Some(noted.workspace.path), BY_SESSION.to_owned())),
+        "a Workspace a Session works in without a row is entered, known by that Session"
+    );
+    assert_eq!(
+        entries.get(&charted.workspace.id),
+        Some(&(Some(charted.workspace.path), BY_SESSION.to_owned())),
+        "a row without a path is presented where its Session presents it"
+    );
+}
+
+/// The migration says how each row it found came to be known: by a Session
+/// where one is grouped under its Workspace, and by its Description
+/// otherwise. Each keeps what it carries, and is listed as before.
+#[tokio::test]
+async fn a_row_stored_before_the_registry_is_known_by_a_session_or_by_its_description() {
     const CHANNEL: &str = "workspace-registry-backfill";
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let atlas = tempfile::tempdir().expect("create the atlas Workspace");
@@ -424,12 +534,7 @@ async fn a_row_stored_before_entries_kept_their_provenance_is_known_by_a_session
     let before = listed(&client).await;
     drop(client);
     server.shutdown().await.expect("shut down server");
-    database(&config)
-        .batch_execute(
-            "ALTER TABLE workspaces DROP COLUMN provenance;
-             DELETE FROM __diesel_schema_migrations WHERE version = '20261012000000';",
-        )
-        .expect("age the table back to before entries kept their provenance");
+    age_to_before_the_registry(&config, "");
 
     let migrated = spawn_with_failing_provider(config.clone())
         .await
@@ -458,4 +563,95 @@ async fn a_row_stored_before_entries_kept_their_provenance_is_known_by_a_session
         Some(BY_DESCRIPTION),
         "a row no Session is grouped under was known by its Description"
     );
+}
+
+/// A Workspace presented by its repository metadata location, its main
+/// checkout not known, is named so wherever it is listed, as the Sessions
+/// working there name it — even where its only Session cannot be read, so
+/// its Repository is never read again: its entry says how its path presents
+/// it, from the Session that entered it and from the migration alike.
+#[tokio::test]
+async fn an_entry_whose_main_checkout_is_unknown_is_named_so_without_its_repository_being_read() {
+    const CHANNEL: &str = "workspace-registry-presentation";
+    let home = tempfile::tempdir().expect("create a home for the Repository");
+    let home = canonical(home.path());
+    let main = home.join("main checkout");
+    let metadata = home.join("atlas.git");
+    git(
+        &home,
+        &[
+            "init",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            metadata.to_str().expect("the fixture's path is UTF-8"),
+            main.to_str().expect("the fixture's path is UTF-8"),
+        ],
+    );
+    git(
+        &main,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let linked = home.join("linked");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "topic",
+            linked.to_str().expect("the fixture's path is UTF-8"),
+        ],
+    );
+    let config = ServerConfig::new(home.join("state"), CHANNEL).expect("configure");
+    let server = quiet_server(config.clone()).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let created = client
+        .create_session(quiet_request(&linked, "Chart the atlas"))
+        .await
+        .expect("create a Session in the linked Worktree")
+        .session;
+    assert!(
+        created.workspace.main_unknown(),
+        "the Repository's main checkout is not known"
+    );
+    let paths = client
+        .list_workspaces()
+        .await
+        .expect("list Workspaces")
+        .workspace_paths;
+    let name = paths.workspace_name(&created.workspace);
+    assert_eq!(name, "atlas.git (main checkout unknown)");
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    unreadable(&config, created.id);
+
+    for (restart, age) in [("the next start", false), ("the migration", true)] {
+        if age {
+            age_to_before_the_registry(&config, "");
+        }
+        let restarted = quiet_server(config.clone()).await;
+        restarted.workspace_discovery_settled().await;
+        let client = connected_client(&home.join("state"), CHANNEL).await;
+        let listing = client.list_workspaces().await.expect("list Workspaces");
+        let listed = listing
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == created.workspace.id)
+            .unwrap_or_else(|| panic!("the Workspace is listed after {restart}"));
+        assert_eq!(
+            listing.workspace_paths.workspace_name(listed),
+            name,
+            "after {restart}, the Workspace is named as its Session names it"
+        );
+        drop(client);
+        restarted.shutdown().await.expect("shut down server");
+    }
 }

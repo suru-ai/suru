@@ -28,9 +28,9 @@ use crate::{
 
 use super::{
     StorageError, StoredResumeState, StoredSidekickAct, StoredSubagentIdentity, StoredWorkspace,
-    UnreadableStoredSession, WorkspaceProvenance, activities, landing_agent_selection, messages,
-    model_catalog, prompts, provider_resume_states, provider_subagent_identities, sessions,
-    sidekick_acts, turns,
+    UnreadableStoredSession, WorkspacePresentation, WorkspaceProvenance, activities,
+    landing_agent_selection, messages, model_catalog, prompts, provider_resume_states,
+    provider_subagent_identities, sessions, sidekick_acts, turns,
     unsaved::{SessionRows, UnsavedRows},
     workspaces,
 };
@@ -100,8 +100,9 @@ impl LandingAgentSelectionRow {
     }
 }
 
-/// One entry of the Workspace Registry: a Workspace's presented root, its
-/// Icon and its Description, and how it came to be known, as JSON.
+/// One entry of the Workspace Registry: a Workspace's presented root and how
+/// that presents it, its Icon and its Description, and how it came to be
+/// known, each way of saying how as JSON.
 /// `created_at` stamps the row's first write, whichever made it; each later
 /// write of the Icon or the Description moves `updated_at` alone, through the
 /// explicit conflict updates in `StorageRepository` rather than through this
@@ -117,14 +118,17 @@ pub(super) struct WorkspaceRow {
     description_set: bool,
     path: Option<String>,
     provenance: String,
+    presentation: Option<String>,
 }
 
 impl WorkspaceRow {
     /// An entry made by its first sighting, presented at `path` where a
-    /// column can spell it, and carrying nothing yet.
+    /// column can spell it, as `presentation` says it is, and carrying
+    /// nothing yet.
     pub(super) fn entered(
         workspace_id: WorkspaceId,
         path: Option<String>,
+        presentation: Option<WorkspacePresentation>,
         provenance: &WorkspaceProvenance,
         at: SessionTimestamp,
     ) -> Self {
@@ -137,7 +141,8 @@ impl WorkspaceRow {
             description: None,
             description_set: false,
             path,
-            provenance: provenance_column(provenance),
+            provenance: json_column(provenance),
+            presentation: presentation.as_ref().map(json_column),
         }
     }
 
@@ -149,7 +154,7 @@ impl WorkspaceRow {
     ) -> Self {
         Self {
             icon: Some(icon),
-            ..Self::entered(workspace_id, None, provenance, at)
+            ..Self::entered(workspace_id, None, None, provenance, at)
         }
     }
 
@@ -165,13 +170,14 @@ impl WorkspaceRow {
         Self {
             description,
             description_set,
-            ..Self::entered(workspace_id, None, provenance, at)
+            ..Self::entered(workspace_id, None, None, provenance, at)
         }
     }
 
     /// The entry as the Session store holds it, or `None` where its
-    /// provenance no longer reads. A Description is only ever set with text,
-    /// so a row whose text is absent carries none, whatever its flag says.
+    /// provenance no longer reads; a presentation that no longer reads is
+    /// one not known. A Description is only ever set with text, so a row
+    /// whose text is absent carries none, whatever its flag says.
     pub(super) fn into_stored(self) -> Option<(WorkspaceId, StoredWorkspace)> {
         let provenance = match serde_json::from_str(&self.provenance) {
             Ok(provenance) => provenance,
@@ -187,21 +193,26 @@ impl WorkspaceRow {
             text,
             set: self.description_set,
         });
+        let presentation = self
+            .presentation
+            .and_then(|presentation| serde_json::from_str(&presentation).ok());
         Some((
             WorkspaceId(self.id),
             StoredWorkspace {
                 icon: self.icon,
                 description,
                 path: self.path.map(PathBuf::from),
+                presentation,
                 provenance,
             },
         ))
     }
 }
 
-/// How a Workspace came to be known, as the `provenance` column spells it.
-pub(super) fn provenance_column(provenance: &WorkspaceProvenance) -> String {
-    serde_json::to_string(provenance).expect("a Workspace's provenance always serializes")
+/// How a Registry entry says how — how it came to be known, or how its path
+/// presents it — as its column spells it.
+pub(super) fn json_column(value: &impl Serialize) -> String {
+    serde_json::to_string(value).expect("a Registry entry's facts always serialize")
 }
 
 /// One Sidekick's latest act on one Session, as the `sidekick_acts` table

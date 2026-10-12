@@ -305,9 +305,10 @@ impl SessionStore {
             {
                 return false;
             }
-            let presented = state.presented_path(workspace_id, None);
+            let presented = state.presenting(workspace_id, None);
             let provenance = state.landing_provenance(workspace_id);
-            let stored = self.enter_workspace(&mut state, workspace_id, presented, provenance);
+            let stored =
+                self.enter_workspace(&mut state, workspace_id, presented.as_ref(), provenance);
             stored.icon = Some(icon.clone());
             let provenance = stored.provenance.clone();
             match landing {
@@ -384,25 +385,15 @@ impl SessionStoreState {
         }
     }
 
-    /// Where a Workspace is presented now: at `presented_at`, where the
-    /// caller resolved it there, or else as a Session working in it presents
-    /// it, or else as its entry last recorded — or nowhere this server can say.
-    pub(super) fn presented_path(
+    /// The Workspace as it is presented now: as `resolved` presents it,
+    /// where the caller resolved it, or else as a Session working in it
+    /// presents it — or `None`, leaving its entry presented as it was last.
+    pub(super) fn presenting(
         &self,
         workspace_id: &WorkspaceId,
-        presented_at: Option<&Path>,
-    ) -> Option<PathBuf> {
-        presented_at
-            .map(Path::to_path_buf)
-            .or_else(|| {
-                self.grouped(workspace_id)
-                    .map(|workspace| workspace.path.clone())
-            })
-            .or_else(|| {
-                self.workspaces
-                    .get(workspace_id)
-                    .and_then(|stored| stored.path.clone())
-            })
+        resolved: Option<&Workspace>,
+    ) -> Option<Workspace> {
+        resolved.or_else(|| self.grouped(workspace_id)).cloned()
     }
 
     /// A copy of a Workspace that a Session grouped under it carries, one

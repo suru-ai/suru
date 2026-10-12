@@ -20,8 +20,8 @@ use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
         AgentSelection, CheckoutAssociation, ExecutionDirectory, Outlook, PromptId, ProviderId,
-        SessionId, SessionSnapshot, SessionSummary, SessionTimestamp, TranscriptItem,
-        UnreadableSessionSummary, WorkspaceDescription, WorkspaceId,
+        RepositoryLocation, SessionId, SessionSnapshot, SessionSummary, SessionTimestamp,
+        TranscriptItem, UnreadableSessionSummary, Workspace, WorkspaceDescription, WorkspaceId,
     },
     provider::{ProviderResumeState, ProviderSubagentId},
     runtime::protect_current_user_file,
@@ -117,6 +117,7 @@ diesel::table! {
         description_set -> Bool,
         path -> Nullable<Text>,
         provenance -> Text,
+        presentation -> Nullable<Text>,
     }
 }
 
@@ -288,9 +289,10 @@ fn stamp_column(stamp: SessionTimestamp) -> i64 {
 
 /// One entry of the Workspace Registry, as the `workspaces` table holds it
 /// (ADR 0051): the path the Workspace is presented by — its presented root,
-/// as it was last resolved — the Icon and the Description it owns for
-/// itself, each absent until one lands, and how it came to be known. Its
-/// Repository is no part of it: that is resolved fresh from the path.
+/// as it was last resolved — and how that path presents it, the Icon and
+/// the Description it owns for itself, each absent until one lands, and how
+/// it came to be known. Its Repository is no part of it: that is resolved
+/// fresh from the path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredWorkspace {
     pub(crate) icon: Option<String>,
@@ -298,6 +300,9 @@ pub(crate) struct StoredWorkspace {
     /// Absent only for an entry that predates rows keeping a path, or whose
     /// path no column can spell, until a Session presents it afresh.
     pub(crate) path: Option<PathBuf>,
+    /// Absent where it is not known: for an entry that predates the
+    /// Registry and that no Session presents.
+    pub(crate) presentation: Option<WorkspacePresentation>,
     pub(crate) provenance: WorkspaceProvenance,
 }
 
@@ -309,7 +314,39 @@ impl StoredWorkspace {
             icon: None,
             description: None,
             path: None,
+            presentation: None,
             provenance,
+        }
+    }
+}
+
+/// How the path a Workspace is presented by presents it: as a directory
+/// outside source control, or as its Repository's main root, its bare root,
+/// or — where its main checkout is not known — its repository metadata
+/// location (see the **Workspace** glossary entry). Kept beside the path, so
+/// an entry is named as a Session working there names it without its
+/// Repository being read again.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspacePresentation {
+    Directory,
+    MainRoot,
+    BareRoot,
+    RepositoryMetadata,
+}
+
+impl WorkspacePresentation {
+    /// How `workspace`, as it was resolved, is presented by its path.
+    pub(crate) fn of(workspace: &Workspace) -> Self {
+        match workspace
+            .repository
+            .as_deref()
+            .map(|repository| &repository.location)
+        {
+            None => Self::Directory,
+            Some(RepositoryLocation::Main { .. }) => Self::MainRoot,
+            Some(RepositoryLocation::Bare { .. }) => Self::BareRoot,
+            Some(RepositoryLocation::UnknownMain) => Self::RepositoryMetadata,
         }
     }
 }
@@ -863,22 +900,25 @@ impl StorageRepository {
         Ok(())
     }
 
-    /// Records a Workspace in the Registry as presented at `path`: an entry
-    /// known by `provenance` where it has none, and otherwise the path alone,
-    /// the entry keeping how it came to be known and everything it carries.
-    /// A path no column can spell is left unsaid, so such a Workspace is
-    /// presented by its Sessions alone, as one whose row predates the column
-    /// is.
+    /// Records a Workspace in the Registry as presented at `path`, as
+    /// `presentation` says it is: an entry known by `provenance` where it has
+    /// none, and otherwise where and how it is presented alone, the entry
+    /// keeping how it came to be known and everything it carries. A path no
+    /// column can spell is left unsaid, so such a Workspace is presented by
+    /// its Sessions alone, as one whose row predates the column is.
     fn write_workspace_entry(
         &self,
         workspace_id: WorkspaceId,
         path: PathBuf,
+        presentation: WorkspacePresentation,
         provenance: &WorkspaceProvenance,
     ) -> Result<(), StorageError> {
         let path = path.to_str().map(str::to_owned);
+        let presented = path.as_ref().map(|_| presentation);
         let row = WorkspaceRow::entered(
             workspace_id,
             path.clone(),
+            presented,
             provenance,
             SessionTimestamp::now(),
         );
@@ -889,7 +929,10 @@ impl StorageRepository {
         match path {
             Some(path) => insert
                 .do_update()
-                .set(workspaces::path.eq(Some(path)))
+                .set((
+                    workspaces::path.eq(Some(path)),
+                    workspaces::presentation.eq(Some(rows::json_column(&presentation))),
+                ))
                 .execute(&mut connection),
             None => insert.do_nothing().execute(&mut connection),
         }

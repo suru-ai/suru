@@ -646,7 +646,7 @@ impl SessionStore {
         self.enter_workspace(
             &mut state,
             &snapshot.session.workspace.id,
-            Some(snapshot.session.workspace.path.clone()),
+            Some(&snapshot.session.workspace),
             crate::storage::WorkspaceProvenance::Session,
         );
         state.publish_catalog_change(SessionCatalogChange::Created { session_id });

@@ -26,7 +26,7 @@
 //! presented by when its Description landed, so a Workspace described before
 //! any Session works in it is known, and listed, by where it is.
 
-use std::{fmt, path::Path};
+use std::fmt;
 
 use crate::protocol::{
     MAX_WORKSPACE_DESCRIPTION_CHARS, SessionCatalogChange, Workspace, WorkspaceDescription,
@@ -132,11 +132,7 @@ impl SessionStore {
             text: line,
             set: true,
         });
-        self.land_workspace_description(
-            workspace_id,
-            description.clone(),
-            resolved.map(|resolved| resolved.path.as_path()),
-        );
+        self.land_workspace_description(workspace_id, description.clone(), resolved);
         Ok(description)
     }
 
@@ -168,15 +164,16 @@ impl SessionStore {
     ///
     /// A Workspace the Registry holds no entry for is entered as the landing
     /// finds it — known by a Session where one is grouped under it, and
-    /// otherwise by being described — and the entry keeps where it is
-    /// presented: at `presented_at`, where the caller resolved it there.
+    /// otherwise by being described — and the entry keeps where, and as
+    /// what, it is presented: as `resolved` presents it, where the caller
+    /// resolved it.
     fn land_workspace_description(
         &self,
         workspace_id: &WorkspaceId,
         description: Option<WorkspaceDescription>,
-        presented_at: Option<&Path>,
+        resolved: Option<&Workspace>,
     ) -> bool {
-        self.land_workspace_description_meanwhile(workspace_id, description, presented_at, || {})
+        self.land_workspace_description_meanwhile(workspace_id, description, resolved, || {})
     }
 
     /// [`Self::land_workspace_description`], running `meanwhile` at the one
@@ -187,7 +184,7 @@ impl SessionStore {
         &self,
         workspace_id: &WorkspaceId,
         description: Option<WorkspaceDescription>,
-        presented_at: Option<&Path>,
+        resolved: Option<&Workspace>,
         meanwhile: impl FnOnce(),
     ) -> bool {
         {
@@ -204,9 +201,10 @@ impl SessionStore {
             {
                 return false;
             }
-            let presented = state.presented_path(workspace_id, presented_at);
+            let presented = state.presenting(workspace_id, resolved);
             let provenance = state.landing_provenance(workspace_id);
-            let stored = self.enter_workspace(&mut state, workspace_id, presented, provenance);
+            let stored =
+                self.enter_workspace(&mut state, workspace_id, presented.as_ref(), provenance);
             stored.description = description.clone();
             let provenance = stored.provenance.clone();
             match derived {
