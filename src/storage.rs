@@ -945,6 +945,21 @@ impl StorageRepository {
         Ok(())
     }
 
+    /// Records that a Workspace's Registry entry is known from now on by
+    /// `provenance`; an entry not stored is left unstored.
+    fn write_workspace_provenance(
+        &self,
+        workspace_id: WorkspaceId,
+        provenance: &WorkspaceProvenance,
+    ) -> Result<(), StorageError> {
+        let mut connection = connect(&self.database_path)?;
+        diesel::update(workspaces::table.find(workspace_id.0))
+            .set(workspaces::provenance.eq(rows::json_column(provenance)))
+            .execute(&mut connection)
+            .map_err(|error| StorageError::WriteWorkspaceEntry(error.to_string()))?;
+        Ok(())
+    }
+
     /// Drops a Workspace's Registry entry, its Icon and Description with it.
     fn forget_workspace(&self, workspace_id: WorkspaceId) -> Result<(), StorageError> {
         let mut connection = connect(&self.database_path)?;

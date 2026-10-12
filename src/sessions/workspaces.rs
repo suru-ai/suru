@@ -370,10 +370,32 @@ impl SessionStore {
         false
     }
 
-    /// Drops every entry discovered under a Workspace Root `roots` no longer
-    /// names, its Icon and Description with it, unless a Session belongs to
-    /// it. Every entry known otherwise is left alone.
-    pub(crate) fn forget_unrooted(&self, roots: &[String]) {
+    /// Every Workspace Root an entry was discovered under, as the Setting
+    /// spelled it then, each once.
+    pub(crate) fn discovered_roots(&self) -> Vec<String> {
+        let mut roots = self
+            .state
+            .lock()
+            .unwrap()
+            .workspaces
+            .values()
+            .filter_map(|stored| match &stored.provenance {
+                WorkspaceProvenance::Discovered { root } => Some(root.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+
+    /// Drops every entry discovered under a Workspace Root that `removed`
+    /// says was taken away, its Icon and Description with it — unless a
+    /// Session belongs to it. That one is kept, and is known by that Session
+    /// from now on, so it stands as any entry a Session made does, whatever
+    /// later becomes of the Session or the Roots. Every entry known
+    /// otherwise is left alone.
+    pub(crate) fn forget_unrooted(&self, removed: impl Fn(&str) -> bool) {
         let mut state = self.state.lock().unwrap();
         let unrooted = state
             .workspaces
@@ -381,13 +403,18 @@ impl SessionStore {
             .filter(|(_, stored)| {
                 matches!(
                     &stored.provenance,
-                    WorkspaceProvenance::Discovered { root } if !roots.contains(root)
+                    WorkspaceProvenance::Discovered { root } if removed(root)
                 )
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for workspace_id in unrooted {
             if state.grouped_besides(&workspace_id, None) {
+                if let Some(stored) = state.workspaces.get_mut(&workspace_id) {
+                    stored.provenance = WorkspaceProvenance::Session;
+                    self.storage
+                        .record_workspace_provenance(workspace_id, WorkspaceProvenance::Session);
+                }
                 continue;
             }
             state.workspaces.remove(&workspace_id);

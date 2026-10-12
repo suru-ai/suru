@@ -80,6 +80,16 @@ pub(super) async fn server_with_roots(
     memo: Duration,
 ) -> (ServerConfig, server::RunningServer) {
     name_roots(&home.join("config"), roots);
+    server_beneath(home, channel, memo).await
+}
+
+/// A Server beneath `home`, as [`server_with_roots`] makes one, reading
+/// whatever Config Document its config root holds.
+pub(super) async fn server_beneath(
+    home: &Path,
+    channel: &str,
+    memo: Duration,
+) -> (ServerConfig, server::RunningServer) {
     let config = ServerConfig::new(home.join("state"), channel)
         .expect("configure")
         .with_config_dir(home.join("config"))

@@ -171,6 +171,11 @@ enum WriterCommand {
         presentation: WorkspacePresentation,
         provenance: WorkspaceProvenance,
     },
+    /// A Workspace's Registry entry known from now on by `provenance`.
+    RecordWorkspaceProvenance {
+        workspace_id: WorkspaceId,
+        provenance: WorkspaceProvenance,
+    },
     /// A Workspace's Registry entry dropped, its Icon and Description with
     /// it.
     ForgetWorkspace(WorkspaceId),
@@ -472,6 +477,17 @@ impl Writer {
                     repository.write_workspace_entry(workspace_id, path, presentation, &provenance)
                 {
                     tracing::warn!("could not save a Workspace Registry entry: {error}");
+                }
+            }
+            // Best-effort as an entry's own write is: one that fails to land
+            // is known as it was after a restart.
+            WriterCommand::RecordWorkspaceProvenance {
+                workspace_id,
+                provenance,
+            } => {
+                if let Err(error) = repository.write_workspace_provenance(workspace_id, &provenance)
+                {
+                    tracing::warn!("could not save how a Workspace is known: {error}");
                 }
             }
             // Best-effort as an entry's own write is: one that fails to drop
@@ -900,6 +916,22 @@ impl StorageSink {
             presentation,
             provenance,
         });
+    }
+
+    /// Records that a Workspace's Registry entry is known from now on by
+    /// `provenance`, off the Session store's own commit path, behind every
+    /// write the store queued before it.
+    pub(crate) fn record_workspace_provenance(
+        &self,
+        workspace_id: WorkspaceId,
+        provenance: WorkspaceProvenance,
+    ) {
+        let _ = self
+            .commands
+            .send(WriterCommand::RecordWorkspaceProvenance {
+                workspace_id,
+                provenance,
+            });
     }
 
     /// Drops a Workspace's Registry entry, its Icon and Description with it,

@@ -29,7 +29,7 @@ use tokio::time::timeout;
 
 use crate::{
     server_support::PROGRESS_DEADLINE,
-    workspace_discovery::{repository_id, server_with_roots, spelled},
+    workspace_discovery::{repository_id, server_beneath, server_with_roots, spelled},
     workspace_registry::{
         BY_SESSION, canonical, connected_client, entries_on_disk, landing_workspace, listed,
         quiet_request, repository, set,
@@ -358,10 +358,12 @@ async fn an_entry_sealed_or_whose_holder_is_sealed_is_kept_unavailable() {
 
 /// Removing a Workspace Root drops the entries discovered under it that no
 /// Session belongs to, Icon and Description with them, so an over-broad
-/// Root can be undone; one a Session belongs to is kept, until no Session
-/// does. An entry first known by a Session or by its Description is left
-/// alone though it lies within the Root, and so is everything discovered
-/// under another Root.
+/// Root can be undone. One a Session belongs to is kept, and stands from
+/// then on as any entry a Session made does: deleting that Session, or
+/// naming the Root again and taking it away again, leaves it listed while
+/// its directory can be read. An entry first known by a Session or by its
+/// Description is left alone though it lies within the Root, and so is
+/// everything discovered under another Root.
 #[tokio::test]
 async fn removing_a_root_drops_what_was_discovered_under_it_but_what_a_session_belongs_to() {
     const CHANNEL: &str = "workspace-standing-root-removed";
@@ -434,14 +436,17 @@ async fn removing_a_root_drops_what_was_discovered_under_it_but_what_a_session_b
         "only what was discovered under the Root taken away, with no Session, is dropped"
     );
     delete_once_settled(&client, balanced.id).await;
+    let kept = [
+        (old.clone(), None),
+        (drafts.clone(), None),
+        (ledger.clone(), None),
+        (notes.clone(), None),
+    ];
     assert_eq!(
         standings(&client).await,
-        [
-            (old.clone(), None),
-            (drafts.clone(), None),
-            (notes.clone(), None),
-        ],
-        "once no Session belongs to it, an entry discovered under a Root taken away goes with it"
+        kept,
+        "an entry kept for its Session stands once no Session belongs to it, its directory \
+         readable"
     );
 
     client
@@ -453,10 +458,28 @@ async fn removing_a_root_drops_what_was_discovered_under_it_but_what_a_session_b
         None,
         "a Repository discovered again under the Root carries nothing it carried before"
     );
+    client
+        .mutate_setting(name(&[&archive]))
+        .await
+        .expect("take the projects Root away again");
+    assert_eq!(
+        standings(&client).await,
+        kept,
+        "the entry kept for its Session is no longer the Root's to take away"
+    );
 
     drop(client);
     server.shutdown().await.expect("shut down server");
     let entries = entries_on_disk(&config);
+    assert_eq!(
+        entries.get(&balanced.workspace.id),
+        Some(&(Some(ledger.clone()), BY_SESSION.to_owned())),
+        "the entry kept for its Session is known by a Session from then on"
+    );
+    assert!(
+        !entries.contains_key(&atlas_id),
+        "what no Session belonged to is dropped from disk: {entries:?}"
+    );
     assert_eq!(
         entries.get(&noted.workspace.id),
         Some(&(Some(notes.clone()), BY_SESSION.to_owned())),
@@ -475,5 +498,179 @@ async fn removing_a_root_drops_what_was_discovered_under_it_but_what_a_session_b
             format!(r#"{{"discovered":{{"root":"{archive_spelled}"}}}}"#)
         )),
         "and so is one discovered under another Root"
+    );
+}
+
+/// The Config Document a Server reads its Workspace Roots from, written by
+/// hand into `home`'s config root as `text`.
+fn write_config_document(home: &Path, text: &str) {
+    std::fs::write(home.join("config").join("suru.jsonc"), text)
+        .expect("write the Config Document");
+}
+
+/// A Config Document that cannot be read whole names no Roots the user
+/// meant to take away: a Server started on one keeps every entry discovered
+/// under the Roots it named before, with what each carries.
+#[tokio::test]
+async fn a_server_started_on_a_config_document_it_cannot_read_keeps_every_discovered_entry() {
+    const CHANNEL: &str = "workspace-standing-malformed-config";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    let (_, server) =
+        server_with_roots(&home, CHANNEL, &[spelled(&projects)], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    client
+        .set_workspace_description(
+            &repository_id(&atlas.join(".git")),
+            Some(&atlas),
+            "Maps of everything.",
+        )
+        .await
+        .expect("describe the discovered Repository");
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+
+    for (document, broken) in [
+        ("{ \"workspace\": { \"roots\": [", "not JSONC"),
+        ("[\"not an object\"]", "no object at its top"),
+        (
+            "{ \"workspace\": { \"roots\": \"~/projects\" } }",
+            "Roots that are no list",
+        ),
+    ] {
+        write_config_document(&home, document);
+        let (_, server) = server_beneath(&home, CHANNEL, Duration::ZERO).await;
+        server.workspace_discovery_settled().await;
+        let client = connected_client(&home.join("state"), CHANNEL).await;
+        assert_eq!(
+            standings(&client).await,
+            [(atlas.clone(), None)],
+            "a Config Document with {broken} takes nothing away"
+        );
+        assert_eq!(
+            description_at(&client, &atlas).await,
+            set("Maps of everything."),
+            "and the entry carries all it did"
+        );
+        drop(client);
+        server.shutdown().await.expect("shut down server");
+    }
+}
+
+/// A Root taken away by hand while the Server was stopped is taken away at
+/// its next start, where the Config Document names the Roots whole: what was
+/// discovered under it that no Session belongs to is dropped, and one a
+/// Session belongs to is kept, known by that Session from then on.
+#[tokio::test]
+async fn a_root_taken_away_while_the_server_was_stopped_is_taken_away_at_start() {
+    const CHANNEL: &str = "workspace-standing-root-edited-away";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    let ledger = projects.join("ledger");
+    repository(&ledger);
+    let (config, server) =
+        server_with_roots(&home, CHANNEL, &[spelled(&projects)], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let balanced = client
+        .create_session(quiet_request(&ledger, "Balance the ledger"))
+        .await
+        .expect("begin a Session in a discovered Repository")
+        .session;
+    assert_eq!(
+        standings(&client).await,
+        [(atlas.clone(), None), (ledger.clone(), None)]
+    );
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+
+    let (_, restarted) = server_with_roots(&home, CHANNEL, &[], Duration::ZERO).await;
+    restarted.workspace_discovery_settled().await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    assert_eq!(
+        standings(&client).await,
+        [(ledger.clone(), None)],
+        "what was discovered under the Root taken away is dropped, but what a Session belongs to"
+    );
+    drop(client);
+    restarted.shutdown().await.expect("shut down server");
+
+    let entries = entries_on_disk(&config);
+    assert!(
+        !entries.contains_key(&repository_id(&atlas.join(".git"))),
+        "{entries:?}"
+    );
+    assert_eq!(
+        entries.get(&balanced.workspace.id),
+        Some(&(Some(ledger.clone()), BY_SESSION.to_owned())),
+        "the entry kept for its Session is known by a Session from then on"
+    );
+}
+
+/// Roots are told apart as the directories they name: a Root spelled with
+/// `~` and spelled out in full beneath the home is one Root, so changing one
+/// spelling for the other — through the Setting, or by hand while the
+/// Server is stopped — takes nothing away, and taking the Root away in
+/// either spelling drops what was discovered under it.
+#[tokio::test]
+async fn a_root_spelled_another_way_is_the_same_root() {
+    const CHANNEL: &str = "workspace-standing-root-respelled";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    let in_full = spelled(&projects).to_owned();
+    let (config, server) = server_with_roots(&home, CHANNEL, &["~/projects"], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let atlas_id = repository_id(&atlas.join(".git"));
+    client
+        .set_workspace_description(&atlas_id, Some(&atlas), "Maps of everything.")
+        .await
+        .expect("describe the discovered Repository");
+    let name = |roots: &[&str]| SettingMutation::WorkspaceRoots {
+        value: Some(roots.iter().map(|root| (*root).to_owned()).collect()),
+    };
+
+    client
+        .mutate_setting(name(&[&in_full]))
+        .await
+        .expect("spell the Root out in full");
+    assert_eq!(
+        description_at(&client, &atlas).await,
+        set("Maps of everything."),
+        "spelling the Root out in full takes nothing away"
+    );
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+
+    let (_, restarted) = server_with_roots(&home, CHANNEL, &["~/projects/"], Duration::ZERO).await;
+    restarted.workspace_discovery_settled().await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    assert_eq!(
+        description_at(&client, &atlas).await,
+        set("Maps of everything."),
+        "nor does spelling it with `~` again by hand while the Server is stopped"
+    );
+
+    client
+        .mutate_setting(name(&[]))
+        .await
+        .expect("take the Root away");
+    assert_eq!(
+        standings(&client).await,
+        [],
+        "taken away in any spelling, the Root takes what was discovered under it"
+    );
+    drop(client);
+    restarted.shutdown().await.expect("shut down server");
+    assert!(
+        !entries_on_disk(&config).contains_key(&atlas_id),
+        "and it is dropped from disk"
     );
 }

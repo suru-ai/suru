@@ -12,10 +12,16 @@
 //!   mounted, say — is kept and listed as unavailable, since nothing tells
 //!   its absence from a deletion.
 //!
-//! An entry discovered under a Workspace Root that is no longer named is
-//! dropped with that Root, unless a Session belongs to it: when the Roots
-//! change, and at every such reading after, so one kept for its Session goes
-//! once no Session does.
+//! An entry discovered under a Workspace Root is dropped with that Root,
+//! unless a Session belongs to it: when the Roots change, and once at start
+//! where the Config Document names the Roots whole, so a Root taken away by
+//! hand while the Server was stopped is taken away too. One a Session
+//! belongs to is kept, and is known by that Session from then on, so it
+//! stands as any entry a Session made does. Roots are told apart as the
+//! directories they name rather than by how the Setting spells them, so
+//! `~/projects` spelled out in full takes nothing away; and a Config
+//! Document that could not be read whole takes nothing away either, since
+//! the Roots it leaves are no word of the user's.
 //!
 //! Every directory is read apart, on a thread of its own (see
 //! [`super::reads_apart`]), so one on a mount gone quiet holds up neither
@@ -25,9 +31,9 @@
 //! outstanding — is listed as unavailable and never dropped.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     io,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -36,7 +42,7 @@ use futures_util::{StreamExt, stream};
 
 use super::{
     reads_apart::{NotRead, ReadsApart},
-    root_discovery::Roots,
+    root_discovery,
 };
 use crate::{
     protocol::{WorkspaceId, WorkspaceUnavailability},
@@ -73,7 +79,8 @@ pub(crate) struct RegistryStanding(Arc<Standing>);
 
 struct Standing {
     sessions: SessionStore,
-    roots: Roots,
+    /// The directory a Root beginning with `~` names a directory beneath.
+    home: Option<PathBuf>,
     probe: Probe,
     reads: ReadsApart,
     /// The longest anything waits on the readings.
@@ -82,30 +89,38 @@ struct Standing {
     /// reading of a directory outstanding and take it for one that does not
     /// answer.
     checking: tokio::sync::Mutex<()>,
+    /// One change of the Roots taken in at a time, the one at start among
+    /// them, so none decides on Roots another has changed since.
+    roots_changing: tokio::sync::Mutex<()>,
 }
 
 impl RegistryStanding {
-    pub(crate) fn new(sessions: SessionStore, roots: Roots, wait: Duration) -> Self {
-        Self::with_probe(sessions, roots, wait, Arc::new(read_standing))
+    pub(crate) fn new(sessions: SessionStore, home: Option<PathBuf>, wait: Duration) -> Self {
+        Self::with_probe(sessions, home, wait, Arc::new(read_standing))
     }
 
-    fn with_probe(sessions: SessionStore, roots: Roots, wait: Duration, probe: Probe) -> Self {
+    fn with_probe(
+        sessions: SessionStore,
+        home: Option<PathBuf>,
+        wait: Duration,
+        probe: Probe,
+    ) -> Self {
         Self(Arc::new(Standing {
             sessions,
-            roots,
+            home,
             probe,
             reads: ReadsApart::new("suru-workspace-standing-read", READS_AT_ONCE),
             wait,
             checking: tokio::sync::Mutex::new(()),
+            roots_changing: tokio::sync::Mutex::new(()),
         }))
     }
 
-    /// Drops what the Roots no longer hold and what the disk no longer
-    /// does, as the module says, and answers why each entry left that
-    /// cannot be opened now cannot be, by its identity.
+    /// Drops what the disk no longer holds, as the module says, and answers
+    /// why each entry left that cannot be opened now cannot be, by its
+    /// identity.
     pub(crate) async fn check(&self) -> HashMap<WorkspaceId, WorkspaceUnavailability> {
         let _one_at_a_time = self.0.checking.lock().await;
-        self.0.sessions.forget_unrooted(&(self.0.roots)());
         let entries = self.0.sessions.presented_entries();
         let directories = entries
             .iter()
@@ -171,6 +186,144 @@ impl RegistryStanding {
                 Some(WorkspaceUnavailability::Unanswered)
             }
         }
+    }
+}
+
+impl RegistryStanding {
+    /// Drops what was discovered under a Workspace Root `before` named and
+    /// `after` names no longer, as the module says: once the Roots have
+    /// changed from `before` to `after`.
+    pub(crate) async fn roots_changed(&self, before: &[String], after: &[String]) {
+        let _one_at_a_time = self.0.roots_changing.lock().await;
+        self.forget_removed(before, after).await;
+    }
+
+    /// Drops what was discovered under a Workspace Root that the Roots
+    /// `named` reads no longer name, as the module says: once at start.
+    /// `named` reads the Roots in force as this decides, and nothing where
+    /// the Config Document did not name them whole.
+    pub(crate) async fn roots_at_start(&self, named: impl FnOnce() -> Option<Vec<String>>) {
+        let _one_at_a_time = self.0.roots_changing.lock().await;
+        let Some(roots) = named() else {
+            tracing::warn!(
+                "the Workspace Roots were not read whole from the Config Document, so nothing \
+                 discovered under a Root is dropped at start"
+            );
+            return;
+        };
+        self.forget_removed(&self.0.sessions.discovered_roots(), &roots)
+            .await;
+    }
+
+    async fn forget_removed(&self, before: &[String], after: &[String]) {
+        let recorded = self.0.sessions.discovered_roots();
+        if recorded.is_empty() {
+            return;
+        }
+        let named = self
+            .resolve(before.iter().chain(after).chain(&recorded))
+            .await;
+        let same = |left: &String, right: &String| named[left].same(&named[right]);
+        let removed = before
+            .iter()
+            .filter(|root| !after.iter().any(|kept| same(root, kept)))
+            .collect::<Vec<_>>();
+        let unrooted = recorded
+            .iter()
+            .filter(|root| {
+                removed.iter().any(|gone| same(root, gone))
+                    && !after.iter().any(|kept| same(root, kept))
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
+        if !unrooted.is_empty() {
+            self.0
+                .sessions
+                .forget_unrooted(|root| unrooted.contains(root));
+        }
+    }
+
+    /// The directory each Root among `roots` names, by how it is spelled:
+    /// as written, with `~` read beneath the home, and as the filesystem
+    /// resolves it — read apart, and waited on no longer than the bound on
+    /// waiting, so a Root on a mount gone quiet is told apart by the other
+    /// two alone.
+    async fn resolve<'a>(
+        &self,
+        roots: impl Iterator<Item = &'a String>,
+    ) -> HashMap<String, NamedDirectory> {
+        let mut named = roots
+            .map(|root| {
+                let written = root_discovery::expand(root, self.0.home.as_deref())
+                    .map(|directory| directory.components().collect::<PathBuf>());
+                (
+                    root.clone(),
+                    NamedDirectory {
+                        spelled: root.clone(),
+                        written,
+                        resolved: None,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let written = named
+            .iter()
+            .filter_map(|(root, directory)| Some((root.clone(), directory.written.clone()?)))
+            .collect::<Vec<_>>();
+        let mut resolved = HashMap::new();
+        let resolutions = stream::iter(written.into_iter().map(|(root, directory)| async move {
+            let read = directory.clone();
+            let resolution = self
+                .0
+                .reads
+                .read(
+                    &directory,
+                    move || async move { crate::paths::canonical(&read) },
+                )
+                .await;
+            (root, resolution)
+        }))
+        .buffer_unordered(CONCURRENT_READINGS)
+        .for_each(|(root, resolution)| {
+            if let Ok(Ok(directory)) = resolution {
+                resolved.insert(root, directory);
+            }
+            std::future::ready(())
+        });
+        if tokio::time::timeout(self.0.wait, resolutions)
+            .await
+            .is_err()
+        {
+            tracing::debug!("told Workspace Roots apart before every one was resolved");
+        }
+        for (root, directory) in resolved {
+            if let Some(named) = named.get_mut(&root) {
+                named.resolved = Some(directory);
+            }
+        }
+        named
+    }
+}
+
+/// The directory a Workspace Root names, as far as it could be told.
+struct NamedDirectory {
+    /// The Root as the Setting spells it.
+    spelled: String,
+    /// The path it names, `~` read beneath the home and its separators made
+    /// plain; `None` for one beneath a home this Server does not know.
+    written: Option<PathBuf>,
+    /// That path as the filesystem resolves it, links and all; `None` where
+    /// it could not be resolved in time.
+    resolved: Option<PathBuf>,
+}
+
+impl NamedDirectory {
+    /// Whether `other` names the same directory: spelled alike, written
+    /// alike, or resolved alike.
+    fn same(&self, other: &Self) -> bool {
+        self.spelled == other.spelled
+            || self.written.is_some() && self.written == other.written
+            || self.resolved.is_some() && self.resolved == other.resolved
     }
 }
 
@@ -305,7 +458,7 @@ mod tests {
         let readings = Arc::new(AtomicUsize::new(0));
         let standing = RegistryStanding::with_probe(
             sessions.clone(),
-            Arc::new(Vec::<String>::new),
+            None,
             Duration::from_millis(20),
             Arc::new({
                 let (gate, readings, stalled) = (gate.clone(), readings.clone(), stalled.clone());

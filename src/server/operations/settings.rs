@@ -20,7 +20,7 @@ use std::{future::Future, sync::Arc};
 
 use tokio::sync::{Mutex, watch};
 
-use super::{RootDiscovery, SessionOperations};
+use super::{RegistryStanding, RootDiscovery, SessionOperations};
 use crate::server::root_discovery::Ticket;
 use crate::{
     protocol::{SettingMutation, SettingsSnapshot},
@@ -124,12 +124,19 @@ impl SessionOperations {
         let sessions = self.sessions.clone();
         let providers = self.providers.clone();
         let root_discovery = self.root_discovery.clone();
+        let registry_standing = self.registry_standing.clone();
         let (changed, rediscovery) = self
             .settings_adoption
             .changes
             .run(async move {
                 adoption
-                    .change(mutation, &sessions, &providers, &root_discovery)
+                    .change(
+                        mutation,
+                        &sessions,
+                        &providers,
+                        &root_discovery,
+                        &registry_standing,
+                    )
                     .await
             })
             .await?;
@@ -150,6 +157,7 @@ impl SettingsAdoption {
         sessions: &SessionStore,
         providers: &ProviderOrchestrator,
         root_discovery: &RootDiscovery,
+        registry_standing: &RegistryStanding,
     ) -> Result<(SettingChanged, Option<Ticket>), SettingsMutationError> {
         let roots = self.snapshot.borrow().settings.workspace.roots.clone();
         // The edit is filesystem work, and the CST handles it parses the
@@ -177,13 +185,17 @@ impl SettingsAdoption {
                 });
         let changed = sessions.reconcile_approval_postures(&snapshot.settings);
         crate::server::apply_live_posture_updates(providers, changed).await;
-        let rediscovery = (snapshot.settings.workspace.roots != roots).then(|| {
+        let rediscovery = if snapshot.settings.workspace.roots == roots {
+            None
+        } else {
             // The Roots taken away are let go first, so no scan of one still
             // running enters anything once what it discovered is dropped.
             let ticket = root_discovery.rediscover();
-            sessions.forget_unrooted(&snapshot.settings.workspace.roots);
-            ticket
-        });
+            registry_standing
+                .roots_changed(&roots, &snapshot.settings.workspace.roots)
+                .await;
+            Some(ticket)
+        };
         Ok((SettingChanged { snapshot, serving }, rediscovery))
     }
 }

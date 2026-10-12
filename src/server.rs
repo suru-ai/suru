@@ -1566,17 +1566,16 @@ async fn start(
         .with_sidekick_workspace(sidekick_workspace.clone());
     let (clones_for_shutdown, clone_settle) =
         (source_control.clone(), timings.workspace_clone_settle);
-    let workspace_roots: root_discovery::Roots = {
-        let settings = settings.subscribe();
-        Arc::new(move || settings.borrow().settings.workspace.roots.clone())
-    };
     let root_discovery = root_discovery::RootDiscovery::new(
         Arc::new(root_discovery::RegistryScan::new(
             sessions.clone(),
             source_control.clone(),
             config.home_dir(),
         )),
-        workspace_roots.clone(),
+        {
+            let settings = settings.subscribe();
+            Arc::new(move || settings.borrow().settings.workspace.roots.clone())
+        },
         timings.root_discovery_memo,
         timings.root_discovery_wait,
         root_discovery::Monotonic::real(),
@@ -1584,7 +1583,7 @@ async fn start(
     );
     let registry_standing = registry_standing::RegistryStanding::new(
         sessions.clone(),
-        workspace_roots,
+        config.home_dir(),
         timings.root_discovery_wait,
     );
     // Persisted grouping is served at once; discovery regroups Sessions behind
@@ -1592,15 +1591,18 @@ async fn start(
     // system never delays the server's readiness. The Workspace Roots are
     // discovered once the Sessions are regrouped, so a Workspace a Session
     // is found working in is known by that Session rather than by its Root,
-    // and waited on no longer than any discovery is; then the Registry is
-    // brought in step with the disk and the Roots, as every listing brings
-    // it.
+    // and waited on no longer than any discovery is. Before the Roots are
+    // discovered, what was discovered under a Root taken away while the
+    // Server was stopped is dropped with it, where the Config Document names
+    // the Roots whole; once they are, the Registry is brought in step with
+    // the disk, as every listing brings it.
     let (workspace_discovery, workspace_discovery_rx) = watch::channel(false);
     {
         let sessions = sessions.clone();
         let source_control = source_control.clone();
         let root_discovery = root_discovery.clone();
         let registry_standing = registry_standing.clone();
+        let roots_in_force = settings.subscribe();
         let mut shutdown = provider_shutdown_rx.clone();
         let roots = settings.subscribe();
         let home = config.home_dir();
@@ -1635,6 +1637,12 @@ async fn start(
                              discovery began"
                         );
                     }
+                    registry_standing
+                        .roots_at_start(|| {
+                            crate::settings::workspace_roots_named_whole(&roots_in_force.borrow())
+                                .map(<[String]>::to_vec)
+                        })
+                        .await;
                     let ticket = root_discovery.rediscover();
                     root_discovery.settled(ticket).await;
                     registry_standing.check().await;

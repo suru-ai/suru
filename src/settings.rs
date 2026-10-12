@@ -2454,6 +2454,22 @@ fn parse_options() -> ParseOptions {
     }
 }
 
+/// The Workspace Roots `snapshot` holds, where they are the user's word in
+/// full: no Config Document was ignored, nor the Roots or any entry of
+/// them. A document that could not be read, parsed or taken whole leaves
+/// Roots that name nothing the user said, so nothing may be taken away on
+/// their account.
+pub(crate) fn workspace_roots_named_whole(snapshot: &SettingsSnapshot) -> Option<&[String]> {
+    snapshot
+        .diagnostics
+        .iter()
+        .all(|diagnostic| {
+            diagnostic.severity != SettingsDiagnosticSeverity::Error
+                && diagnostic.key.as_deref() != Some(WORKSPACE_ROOTS)
+        })
+        .then_some(snapshot.settings.workspace.roots.as_slice())
+}
+
 /// Loads the Config Document stack under `config_dir` and collapses it into
 /// the effective-settings snapshot. `None` — no configured root — loads pure
 /// defaults, which is also what any broken document degrades to.
