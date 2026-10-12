@@ -732,3 +732,60 @@ async fn a_change_of_another_setting_takes_nothing_away_for_roots_spoiled_by_han
     drop(client);
     server.shutdown().await.expect("shut down server");
 }
+
+/// A Root spelled as a link and respelled as where the link led, while the
+/// mount that holds both is gone, cannot be told from the Root it was: so
+/// what was discovered under it is kept, with what it carries, rather than
+/// taken away. Links are made where a mode of the filesystem says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_root_respelled_as_where_its_link_led_while_neither_resolves_takes_nothing_away() {
+    const CHANNEL: &str = "workspace-standing-root-link-gone";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let mount = home.join("mount");
+    let projects = mount.join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    let link = home.join("work");
+    std::os::unix::fs::symlink(&projects, &link).expect("link to the projects");
+    let (_, server) = server_with_roots(&home, CHANNEL, &[spelled(&link)], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    client
+        .set_workspace_description(
+            &repository_id(&atlas.join(".git")),
+            Some(&atlas),
+            "Maps of everything.",
+        )
+        .await
+        .expect("describe the Repository discovered through the link");
+    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+
+    let unmounted = home.join("unmounted");
+    std::fs::rename(&mount, &unmounted).expect("take the mount away, the link left dangling");
+    client
+        .mutate_setting(SettingMutation::WorkspaceRoots {
+            value: Some(vec![spelled(&projects).to_owned()]),
+        })
+        .await
+        .expect("spell the Root as where the link led");
+    assert_eq!(
+        standings(&client).await,
+        [(
+            atlas.clone(),
+            Some(WorkspaceUnavailability::HolderUnreadable)
+        )],
+        "what was discovered through the link is kept, while neither spelling resolves"
+    );
+
+    std::fs::rename(&unmounted, &mount).expect("bring the mount back");
+    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+    assert_eq!(
+        description_at(&client, &atlas).await,
+        set("Maps of everything."),
+        "carrying all it did"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}

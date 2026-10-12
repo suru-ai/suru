@@ -338,16 +338,26 @@ impl RegistryStanding {
         let named = self
             .resolve(before.iter().chain(after).chain(&recorded))
             .await;
-        let same = |left: &String, right: &String| named[left].same(&named[right]);
+        let likeness = |left: &String, right: &String| named[left].likeness(&named[right]);
+        // A Root is taken away only where it is surely none of the Roots
+        // after, and what was discovered under one only where it surely is
+        // that Root: what cannot be told keeps everything.
+        let surely_none_after = |root: &String| {
+            after
+                .iter()
+                .all(|kept| likeness(root, kept) == Likeness::Different)
+        };
         let removed = before
             .iter()
-            .filter(|root| !after.iter().any(|kept| same(root, kept)))
+            .filter(|root| surely_none_after(root))
             .collect::<Vec<_>>();
         let unrooted = recorded
             .iter()
             .filter(|root| {
-                removed.iter().any(|gone| same(root, gone))
-                    && !after.iter().any(|kept| same(root, kept))
+                removed
+                    .iter()
+                    .any(|gone| likeness(root, gone) == Likeness::Same)
+                    && surely_none_after(root)
             })
             .cloned()
             .collect::<HashSet<_>>();
@@ -361,8 +371,7 @@ impl RegistryStanding {
     /// The directory each Root among `roots` names, by how it is spelled:
     /// as written, with `~` read beneath the home, and as the filesystem
     /// resolves it — read apart, and waited on no longer than the bound on
-    /// waiting, so a Root on a mount gone quiet is told apart by the other
-    /// two alone.
+    /// waiting, so a Root on a mount gone quiet is not resolved at all.
     async fn resolve<'a>(
         &self,
         roots: impl Iterator<Item = &'a String>,
@@ -376,7 +385,7 @@ impl RegistryStanding {
                     NamedDirectory {
                         spelled: root.clone(),
                         written,
-                        resolved: None,
+                        resolved: Resolution::Untold,
                     },
                 )
             })
@@ -400,9 +409,12 @@ impl RegistryStanding {
         }))
         .buffer_unordered(CONCURRENT_READINGS)
         .for_each(|(root, resolution)| {
-            if let Ok(Ok(directory)) = resolution {
-                resolved.insert(root, directory);
-            }
+            let resolution = match resolution {
+                Ok(Ok(directory)) => Resolution::Resolved(directory),
+                Ok(Err(error)) if error.kind() == io::ErrorKind::NotFound => Resolution::Missing,
+                Ok(Err(_)) | Err(_) => Resolution::Untold,
+            };
+            resolved.insert(root, resolution);
             std::future::ready(())
         });
         if tokio::time::timeout(self.0.wait, resolutions)
@@ -411,9 +423,9 @@ impl RegistryStanding {
         {
             tracing::debug!("told Workspace Roots apart before every one was resolved");
         }
-        for (root, directory) in resolved {
+        for (root, resolution) in resolved {
             if let Some(named) = named.get_mut(&root) {
-                named.resolved = Some(directory);
+                named.resolved = resolution;
             }
         }
         named
@@ -452,18 +464,54 @@ struct NamedDirectory {
     /// The path it names, `~` read beneath the home and its separators made
     /// plain; `None` for one beneath a home this Server does not know.
     written: Option<PathBuf>,
-    /// That path as the filesystem resolves it, links and all; `None` where
-    /// it could not be resolved in time.
-    resolved: Option<PathBuf>,
+    /// What the filesystem made of that path.
+    resolved: Resolution,
+}
+
+/// What the filesystem made of the path a Root names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Resolution {
+    /// The directory it leads to, links and all.
+    Resolved(PathBuf),
+    /// Nothing is there, nor at the end of any link along it.
+    Missing,
+    /// Nothing could be told: it was not read in time, could not be read,
+    /// or names a home this Server does not know.
+    Untold,
+}
+
+/// Whether two Roots name the same directory, as far as can be told.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Likeness {
+    Same,
+    Different,
+    Untold,
 }
 
 impl NamedDirectory {
-    /// Whether `other` names the same directory: spelled alike, written
-    /// alike, or resolved alike.
-    fn same(&self, other: &Self) -> bool {
-        self.spelled == other.spelled
-            || self.written.is_some() && self.written == other.written
-            || self.resolved.is_some() && self.resolved == other.resolved
+    /// Whether `other` names the same directory: surely so where they are
+    /// spelled alike, written alike, or resolved alike; surely not where
+    /// both resolve elsewhere, or one resolves and nothing is there for the
+    /// other, since a path leading nowhere names no directory that is
+    /// there; and otherwise untold — a link whose mount is gone may lead
+    /// where the other names.
+    fn likeness(&self, other: &Self) -> Likeness {
+        if self.spelled == other.spelled || self.written.is_some() && self.written == other.written
+        {
+            return Likeness::Same;
+        }
+        match (&self.resolved, &other.resolved) {
+            (Resolution::Resolved(left), Resolution::Resolved(right)) => {
+                if left == right {
+                    Likeness::Same
+                } else {
+                    Likeness::Different
+                }
+            }
+            (Resolution::Resolved(_), Resolution::Missing)
+            | (Resolution::Missing, Resolution::Resolved(_)) => Likeness::Different,
+            _ => Likeness::Untold,
+        }
     }
 }
 
@@ -995,6 +1043,74 @@ mod tests {
             Vec::<PathBuf>::new(),
             "the step at start had taken away what it decided to before the change put its \
              Roots in force"
+        );
+    }
+
+    /// Two Roots are the same directory where spelled, written or resolved
+    /// alike, surely not where both resolve elsewhere or nothing is there
+    /// for one while the other resolves, and untold otherwise.
+    #[test]
+    fn roots_are_told_apart_only_as_far_as_they_can_be() {
+        let named = |spelled: &str, written: &[&str], resolved: Resolution| NamedDirectory {
+            spelled: spelled.to_owned(),
+            written: (!written.is_empty()).then(|| absolute(written)),
+            resolved,
+        };
+        let resolved = |components: &[&str]| Resolution::Resolved(absolute(components));
+        let projects = named(
+            "~/projects",
+            &["home", "projects"],
+            resolved(&["home", "projects"]),
+        );
+        for (other, likeness, why) in [
+            (
+                named("~/projects/", &["home", "projects"], Resolution::Untold),
+                Likeness::Same,
+                "written alike",
+            ),
+            (
+                named("/link", &["link"], resolved(&["home", "projects"])),
+                Likeness::Same,
+                "resolved alike",
+            ),
+            (
+                named("/notes", &["notes"], resolved(&["notes"])),
+                Likeness::Different,
+                "resolved elsewhere",
+            ),
+            (
+                named("/unplugged", &["unplugged"], Resolution::Missing),
+                Likeness::Different,
+                "nothing there",
+            ),
+            (
+                named("/quiet", &["quiet"], Resolution::Untold),
+                Likeness::Untold,
+                "not resolved in time",
+            ),
+            (
+                named("~someone/projects", &[], Resolution::Untold),
+                Likeness::Untold,
+                "beneath an unknown home",
+            ),
+        ] {
+            assert_eq!(projects.likeness(&other), likeness, "{why}");
+            assert_eq!(
+                other.likeness(&projects),
+                likeness,
+                "{why}, either way round"
+            );
+        }
+        let dangling = named("/link", &["link"], Resolution::Missing);
+        let target = named(
+            "/mount/projects",
+            &["mount", "projects"],
+            Resolution::Missing,
+        );
+        assert_eq!(
+            dangling.likeness(&target),
+            Likeness::Untold,
+            "a dangling link may lead where a path with nothing there names"
         );
     }
 
