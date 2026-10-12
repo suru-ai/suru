@@ -5,7 +5,7 @@ use std::{
 };
 use suru::{
     protocol::*,
-    source_control::{GitSourceControl, SourceControl},
+    source_control::{CloneFailure, GitSourceControl, SourceControl},
 };
 
 fn git(directory: &Path, args: &[&str]) {
@@ -942,4 +942,196 @@ async fn validated_worktree_moved_behind_a_symlink_at_its_root_is_unavailable() 
         adapter.observe(&checkout).await.availability,
         SourceControlAvailability::Unavailable { .. }
     ));
+}
+
+/// A bare Repository at `within`/atlas.git, holding one commit on `main`, as
+/// the server a Repository URL names would hold it; answers its path.
+fn bare_origin(within: &Path) -> PathBuf {
+    let work = within.join("atlas-work");
+    init(&work);
+    commit(&work);
+    let bare = within.join("atlas.git");
+    git(
+        within,
+        &[
+            "clone",
+            "--bare",
+            "--quiet",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    bare
+}
+
+/// How long a Clone these tests expect to finish may take: far longer than
+/// any does, so only a Clone left waiting on a prompt reaches it.
+const UNREACHED: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[tokio::test]
+async fn a_clone_answers_the_workspace_it_made_as_discovery_reads_it() {
+    let (_temporary, root) = root();
+    let origin = bare_origin(&root);
+    let projects = root.join("projects");
+    std::fs::create_dir(&projects).unwrap();
+    let destination = projects.join("atlas");
+    let adapter = GitSourceControl::default();
+    assert_eq!(
+        adapter.clone_capability(),
+        SourceControlCapability::Available,
+        "Git reports that it Clones"
+    );
+
+    let cloned = adapter
+        .clone_repository(origin.to_str().unwrap(), &destination, None, UNREACHED)
+        .await
+        .unwrap();
+    assert_eq!(cloned, adapter.discover(&destination).await);
+    assert_eq!(cloned.workspace.path, destination);
+    assert!(matches!(
+        &cloned.workspace.repository.as_deref().unwrap().location,
+        RepositoryLocation::Main { root } if root == &destination
+    ));
+    assert_eq!(
+        read_git(&destination, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "main"
+    );
+}
+
+#[tokio::test]
+async fn a_clone_never_touches_what_stands_at_its_destination() {
+    let (_temporary, root) = root();
+    let origin = bare_origin(&root);
+    let destination = root.join("atlas");
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(destination.join("notes.txt"), "Mine.").unwrap();
+    let adapter = GitSourceControl::default();
+
+    assert_eq!(
+        adapter
+            .clone_repository(origin.to_str().unwrap(), &destination, None, UNREACHED)
+            .await,
+        Err(CloneFailure::Occupied)
+    );
+    assert_eq!(
+        std::fs::read_to_string(destination.join("notes.txt")).unwrap(),
+        "Mine."
+    );
+    assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_clone_answers_in_gits_words_and_leaves_nothing_at_its_destination() {
+    let (_temporary, root) = root();
+    let origin = bare_origin(&root);
+    let destination = root.join("atlas");
+    let adapter = GitSourceControl::default();
+
+    let missing = root.join("missing.git");
+    let Err(CloneFailure::Failed(said)) = adapter
+        .clone_repository(missing.to_str().unwrap(), &destination, None, UNREACHED)
+        .await
+    else {
+        panic!("a Repository URL naming nothing fails the Clone");
+    };
+    assert!(said.starts_with("fatal: "), "Git's own words: {said}");
+    assert!(!destination.exists(), "nothing is left at the destination");
+
+    let Err(CloneFailure::Failed(said)) = adapter
+        .clone_repository(
+            origin.to_str().unwrap(),
+            &destination,
+            Some("nowhere"),
+            UNREACHED,
+        )
+        .await
+    else {
+        panic!("a branch the Repository lacks fails the Clone");
+    };
+    assert!(said.contains("nowhere"), "Git's own words: {said}");
+    assert!(
+        !destination.exists(),
+        "nor where Git had made the Repository before failing"
+    );
+}
+
+#[tokio::test]
+async fn a_clone_outlasting_its_timeout_is_stopped_and_leaves_nothing_at_its_destination() {
+    let (_temporary, root) = root();
+    let destination = root.join("atlas");
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "git://127.0.0.1:{}/atlas.git",
+        silent.local_addr().unwrap().port()
+    );
+    let held = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((connection, _)) = silent.accept().await {
+            held.push(connection);
+        }
+    });
+    let adapter = GitSourceControl::default();
+
+    assert_eq!(
+        adapter
+            .clone_repository(
+                &url,
+                &destination,
+                None,
+                std::time::Duration::from_millis(300)
+            )
+            .await,
+        Err(CloneFailure::TimedOut)
+    );
+    assert!(!destination.exists(), "nothing is left at the destination");
+    held.abort();
+}
+
+/// A server that asks for credentials, as one serving a private Repository
+/// does, is answered at once that none could be had: Git asks no one, so the
+/// Clone fails in its own words rather than waiting on a prompt nobody sees.
+#[tokio::test]
+async fn a_clone_needing_a_credential_git_cannot_find_fails_at_once() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let (_temporary, root) = root();
+    let destination = root.join("private");
+    let asking = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/private.git",
+        asking.local_addr().unwrap().port()
+    );
+    let server = tokio::spawn(async move {
+        while let Ok((mut connection, _)) = asking.accept().await {
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                match connection.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&buffer[..read]),
+                }
+            }
+            let _ = connection
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"suru\"\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+        }
+    });
+    let configuration = root.join("gitconfig");
+    std::fs::write(&configuration, "").unwrap();
+    let adapter = GitSourceControl::default().with_configuration_file(&configuration);
+
+    let failure = adapter
+        .clone_repository(&url, &destination, None, UNREACHED)
+        .await;
+    let Err(CloneFailure::Failed(said)) = failure else {
+        panic!("a credential Git cannot find fails the Clone at once: {failure:?}");
+    };
+    assert!(
+        said.contains("terminal prompts disabled"),
+        "Git says it asked no one: {said}"
+    );
+    assert!(!destination.exists(), "nothing is left at the destination");
+    server.abort();
 }

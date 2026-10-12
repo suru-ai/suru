@@ -11,6 +11,7 @@ use std::{
 };
 use tokio::process::Command;
 mod branches;
+mod cloning;
 mod executable;
 mod on_disk;
 mod preparation;
@@ -20,6 +21,40 @@ pub(super) use on_disk::listed_source_control;
 
 /// How many listed Worktree roots discovery has Git confirm at once.
 const CONCURRENT_ROOT_CONFIRMATIONS: usize = 8;
+
+/// Why a Git command answered nothing.
+enum Unrun {
+    /// It was still running once its timeout passed, and was stopped.
+    TimedOut,
+    /// It could not be run, as this says.
+    Failed(String),
+}
+
+impl From<Unrun> for String {
+    fn from(unrun: Unrun) -> Self {
+        match unrun {
+            Unrun::TimedOut => "Git operation timed out".to_owned(),
+            Unrun::Failed(reason) => reason,
+        }
+    }
+}
+
+/// A Git command's arguments as the Log shows them: each as given, but for
+/// the credential a Repository URL among them carries.
+struct Shown<'a>(&'a [&'a str]);
+
+impl std::fmt::Debug for Shown<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_list()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|argument| super::without_credentials(argument)),
+            )
+            .finish()
+    }
+}
 
 /// Git command execution stays on its owning Server. Timeouts and the executable
 /// are injectable so unavailable/hung installations need no global environment edits.
@@ -266,13 +301,28 @@ impl GitSourceControl {
         timeout: Duration,
         input: Option<&str>,
     ) -> Result<Output, String> {
+        self.run(directory, args, timeout, input, &[])
+            .await
+            .map_err(String::from)
+    }
+    /// Runs Git in `directory` with `args`, `input` on its standard input,
+    /// and `environment` set beside what every Git command is run with,
+    /// stopping it — and whatever it started — once `timeout` has passed.
+    async fn run(
+        &self,
+        directory: &Path,
+        args: &[&str],
+        timeout: Duration,
+        input: Option<&str>,
+        environment: &[(&str, &str)],
+    ) -> Result<Output, Unrun> {
         use std::io::Write;
         let stdin = if let Some(input) = input {
             use std::io::{Seek, SeekFrom};
-            let mut file = tempfile::tempfile().map_err(|e| e.to_string())?;
-            file.write_all(input.as_bytes())
-                .map_err(|e| e.to_string())?;
-            file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            let unwritten = |error: std::io::Error| Unrun::Failed(error.to_string());
+            let mut file = tempfile::tempfile().map_err(unwritten)?;
+            file.write_all(input.as_bytes()).map_err(unwritten)?;
+            file.seek(SeekFrom::Start(0)).map_err(unwritten)?;
             Stdio::from(file)
         } else {
             Stdio::null()
@@ -303,6 +353,9 @@ impl GitSourceControl {
         command
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0");
+        command.envs(environment.iter().copied());
+        // A Repository URL may carry a credential, which the Log never does.
+        let args = Shown(args);
         let started = Instant::now();
         // Run as a process tree of its own, so a command abandoned at its
         // deadline — or, on Unix, still running as the Server dies — takes
@@ -333,15 +386,13 @@ impl GitSourceControl {
                 "Git command timed out"
             ),
         }
-        result
-            .map_err(|_| "Git operation timed out".to_owned())?
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    "Git is not installed or cannot be found".to_owned()
-                } else {
-                    format!("Git could not run: {error}")
-                }
+        result.map_err(|_| Unrun::TimedOut)?.map_err(|error| {
+            Unrun::Failed(if error.kind() == std::io::ErrorKind::NotFound {
+                "Git is not installed or cannot be found".to_owned()
+            } else {
+                format!("Git could not run: {error}")
             })
+        })
     }
     async fn mutate(&self, directory: &Path, args: &[&str]) -> Result<(), String> {
         let output = self
@@ -872,6 +923,20 @@ impl SourceControl for GitSourceControl {
         });
         Some(reading)
     }
+    fn clone_capability(&self) -> SourceControlCapability {
+        SourceControlCapability::Available
+    }
+
+    async fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        branch: Option<&str>,
+        timeout: Duration,
+    ) -> Result<ResolvedWorkspace, super::CloneFailure> {
+        self.clone_into(url, destination, branch, timeout).await
+    }
+
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
         let path = crate::paths::canonical(directory).unwrap_or_else(|_| directory.to_owned());
         let mut resolved = ResolvedWorkspace::directory(path.clone());

@@ -39,6 +39,27 @@ pub(crate) fn recovery_for_branch_outcome(
     Ok(recovery)
 }
 
+/// Why a system that does not Clone refuses to.
+const CLONING_UNSUPPORTED: &str = "Cloning a Repository URL is unsupported";
+
+/// `url` with the credential it may carry — the user information before the
+/// host of a URL spelled with a scheme — put out of sight, as the Log spells
+/// a Repository URL. An address of any other form, such as `git@host:path`
+/// or a local path, carries none and is answered as it is.
+pub(crate) fn without_credentials(url: &str) -> std::borrow::Cow<'_, str> {
+    let Some(scheme) = url.find("://") else {
+        return url.into();
+    };
+    let host = scheme + "://".len();
+    let authority = url[host..]
+        .find(['/', '?', '#'])
+        .map_or(&url[host..], |end| &url[host..host + end]);
+    match authority.rfind('@') {
+        Some(at) => format!("{}***{}", &url[..host], &url[host + at..]).into(),
+        None => url.into(),
+    }
+}
+
 /// Observable preparation boundaries, injectable for interruption testing and hosts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreparationCheckpoint {
@@ -69,6 +90,19 @@ pub enum BranchRename {
     Unchanged,
     /// The branch goes by this full name now.
     Renamed { branch: String },
+}
+
+/// Why a Clone of a Repository URL made no Workspace. Whatever the reason,
+/// nothing the Clone began is left at its destination.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CloneFailure {
+    /// Something already stands at the destination, which the Clone left as
+    /// it was.
+    Occupied,
+    /// The source control system could not Clone it, in its own words.
+    Failed(String),
+    /// The Clone was still running when its timeout passed, and was stopped.
+    TimedOut,
 }
 
 #[async_trait]
@@ -155,6 +189,31 @@ pub trait SourceControl: Send + Sync {
         Err("Preparation ownership retirement is unsupported".into())
     }
     async fn discover(&self, directory: &Path) -> ResolvedWorkspace;
+    /// Whether this system Clones a Repository URL into a new directory, as
+    /// [`SourceControl::clone_repository`] does. A system that does not keeps
+    /// the default, which says so.
+    fn clone_capability(&self) -> crate::protocol::SourceControlCapability {
+        crate::protocol::SourceControlCapability::Unsupported {
+            reason: CLONING_UNSUPPORTED.to_owned(),
+        }
+    }
+    /// Clone the Repository `url` names into `destination`, a directory not
+    /// there yet whose parent is, checking out `branch` or the Repository's
+    /// default, and answer the Workspace made there as discovery reads it.
+    /// The Clone is the system's ordinary one, and asks no one anything: a
+    /// credential it cannot find fails it at once. Anything already standing
+    /// at `destination` refuses it and is left as it was; a Clone that fails,
+    /// or is still running once `timeout` has passed, is stopped and leaves
+    /// nothing at `destination`.
+    async fn clone_repository(
+        &self,
+        _url: &str,
+        _destination: &Path,
+        _branch: Option<&str>,
+        _timeout: std::time::Duration,
+    ) -> Result<ResolvedWorkspace, CloneFailure> {
+        Err(CloneFailure::Failed(CLONING_UNSUPPORTED.to_owned()))
+    }
     /// Rename the branch a fresh preparation created for a Managed Worktree
     /// to the first of [`naming::numbered`] `proposal` — a fragment already
     /// shaped by [`naming::proposed_fragment`] — that no other branch holds,
@@ -645,6 +704,24 @@ impl SourceControlService {
             .cloned()
             .collect()
     }
+    /// Whether this Server's source control Clones a Repository URL.
+    pub(crate) fn clone_capability(&self) -> crate::protocol::SourceControlCapability {
+        self.adapter.clone_capability()
+    }
+    /// Clones `url` into `destination` as [`SourceControl::clone_repository`]
+    /// does. The Repository made there is not remembered, so it joins no
+    /// checkout observation until a Session works in it.
+    pub(crate) async fn clone_repository(
+        &self,
+        url: &str,
+        destination: &Path,
+        branch: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<ResolvedWorkspace, CloneFailure> {
+        self.adapter
+            .clone_repository(url, destination, branch, timeout)
+            .await
+    }
     pub(crate) async fn list_checkouts(
         &self,
         repository: &Repository,
@@ -1112,6 +1189,42 @@ mod tests {
                 .find(|checkout| checkout.association.root == directory)
                 .map(|checkout| checkout.association.clone());
             resolved
+        }
+    }
+
+    #[test]
+    fn a_repository_urls_credential_is_put_out_of_sight_and_nothing_else() {
+        for (url, shown) in [
+            (
+                "https://octocat:ghp_secret@github.com/org/atlas.git",
+                "https://***@github.com/org/atlas.git",
+            ),
+            (
+                "https://ghp_secret@github.com/org/atlas.git",
+                "https://***@github.com/org/atlas.git",
+            ),
+            (
+                "ssh://git@example.com:2222/atlas.git",
+                "ssh://***@example.com:2222/atlas.git",
+            ),
+            ("https://user:p@ss@example.com", "https://***@example.com"),
+            (
+                "https://github.com/org/atlas.git",
+                "https://github.com/org/atlas.git",
+            ),
+            (
+                "https://github.com/org/atlas@v2.git",
+                "https://github.com/org/atlas@v2.git",
+            ),
+            (
+                "git@github.com:org/atlas.git",
+                "git@github.com:org/atlas.git",
+            ),
+            ("file:///C:/src/atlas.git", "file:///C:/src/atlas.git"),
+            (r"C:\src\atlas.git", r"C:\src\atlas.git"),
+            ("--quiet", "--quiet"),
+        ] {
+            assert_eq!(without_credentials(url), shown, "{url}");
         }
     }
 
