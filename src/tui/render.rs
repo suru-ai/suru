@@ -379,6 +379,9 @@ pub(super) fn render_with_slots(
         if state.settings_panel.numeric_editor().is_some() {
             render_numeric_editor(frame, state, main, theme);
         }
+        if state.settings_panel.list_editor_is_open() {
+            render_list_editor(frame, state, main, theme);
+        }
     }
     // Choice pickers can be opened by a settings row, so they are drawn over
     // the panel that asked and take the reader's answer first.
@@ -1563,6 +1566,69 @@ fn render_numeric_editor(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         area,
         lines,
         " Number ",
+        theme,
+    );
+}
+
+/// The list editor over the settings panel: what the list holds above its
+/// rows — every entry, then the row a new one is added at — and why the last
+/// save pinned nothing and the keys beneath. The rows are windowed over the
+/// room the view leaves, keeping focus in view, and the focused row shows the
+/// end of a long entry, which is where typing lands.
+fn render_list_editor(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
+    let editor = state
+        .settings_panel
+        .list_editor()
+        .expect("the list editor is open when it is rendered");
+    let rows = editor.entries.len().saturating_add(1);
+    let wanted = u16::try_from(rows.saturating_add(5)).unwrap_or(u16::MAX);
+    let area = centered_rect(
+        main,
+        main.width.saturating_sub(4).min(64),
+        wanted.min(main.height.saturating_sub(2)),
+    );
+    let content_width = usize::from(area.width.saturating_sub(2));
+    let capacity = usize::from(area.height.saturating_sub(2)).saturating_sub(3);
+    let mut lines = vec![Line::styled(
+        truncate_to_width(editor.label, content_width),
+        theme.text.subdued,
+    )];
+    let shown = editor
+        .window
+        .settle_rows(rows, capacity, Some(editor.focus));
+    for index in shown {
+        let focused = index == editor.focus;
+        let marker = if focused { "› " } else { "  " };
+        let text_width = content_width.saturating_sub(marker.width());
+        let (text, style) = match editor.entries.get(index) {
+            Some(entry) if focused => (
+                truncate_from_left_to_width(entry, text_width),
+                theme.selection.focused,
+            ),
+            Some(entry) => (truncate_to_width(entry, text_width), theme.form_field.text),
+            None if focused => (editor.placeholder.to_owned(), theme.selection.focused),
+            None => (editor.placeholder.to_owned(), theme.text.subdued),
+        };
+        lines.push(Line::styled(format!("{marker}{text}"), style));
+    }
+    lines.push(Line::styled(
+        truncate_to_width(editor.error.unwrap_or(""), content_width),
+        theme.feedback.error,
+    ));
+    lines.push(Line::styled(
+        truncate_to_width(
+            "↑↓ move · Ctrl+D remove · Enter save · Esc cancel",
+            content_width,
+        ),
+        theme.text.subdued,
+    ));
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::ListEditor,
+        area,
+        lines,
+        " List ",
         theme,
     );
 }

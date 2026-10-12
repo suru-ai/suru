@@ -18,6 +18,7 @@ mod fuzzy;
 mod hyperlink;
 mod icon_picker;
 mod keymap;
+mod list_editor;
 mod list_window;
 mod markdown;
 mod model_options;

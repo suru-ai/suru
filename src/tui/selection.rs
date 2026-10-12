@@ -155,6 +155,7 @@ pub(super) enum SelectionSurface {
     Sidebar,
     Settings,
     NumericEditor,
+    ListEditor,
     Serve,
     Context,
     Connect,

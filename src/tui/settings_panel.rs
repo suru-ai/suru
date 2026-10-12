@@ -45,11 +45,16 @@ use crate::{
     provider::built_in_providers,
     settings::{
         NumericSettingChoice, SCHEMA, SettingChoiceSurface, SettingDescriptor, SettingGroup,
-        provider_enablement, provider_settings,
+        TextListSettingChoice, provider_enablement, provider_settings,
     },
 };
 
-use super::{ModelListRequest, commands::NumericDigit, list_window::ListWindow};
+use super::{
+    ModelListRequest,
+    commands::NumericDigit,
+    list_editor::{ListEditor, ListEditorView},
+    list_window::ListWindow,
+};
 
 /// What a row reports about a Provider the read in force asked about and the
 /// answer passed over. Nothing came back for it, which is Suru's problem to
@@ -154,6 +159,7 @@ pub(super) struct SettingsPanel {
     /// a cell rather than taken by an edit.
     layout: RefCell<PanelLayout>,
     numeric_editor: Option<NumericEditor>,
+    list_editor: Option<ListEditor>,
 }
 
 /// Where the reader stands on one tab: the row focus is on, and the window
@@ -487,6 +493,39 @@ impl SettingsPanel {
 
     pub(super) fn cancel_numeric_edit(&mut self) {
         self.numeric_editor = None;
+    }
+
+    pub(super) fn open_list_editor(
+        &mut self,
+        choice: TextListSettingChoice,
+        settings: &EffectiveSettings,
+    ) {
+        self.list_editor = Some(ListEditor::open(choice, settings));
+    }
+
+    pub(super) fn list_editor(&self) -> Option<ListEditorView<'_>> {
+        self.list_editor.as_ref().map(ListEditor::view)
+    }
+
+    pub(super) fn list_editor_is_open(&self) -> bool {
+        self.list_editor.is_some()
+    }
+
+    /// The open list editor, for an edit of the draft it holds.
+    pub(super) fn edit_list(&mut self) -> Option<&mut ListEditor> {
+        self.list_editor.as_mut()
+    }
+
+    /// Saves the open list editor's draft as one mutation, closing it, or
+    /// leaves it open saying which entry the Setting refuses.
+    pub(super) fn save_list_edit(&mut self) -> Option<SettingMutation> {
+        let mutation = self.list_editor.as_mut()?.save()?;
+        self.list_editor = None;
+        Some(mutation)
+    }
+
+    pub(super) fn cancel_list_edit(&mut self) {
+        self.list_editor = None;
     }
 
     /// Takes the reason an edit never landed, so the reader learns the Config

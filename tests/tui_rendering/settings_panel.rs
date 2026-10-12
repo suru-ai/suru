@@ -28,7 +28,7 @@ use suru::{
         ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
         SessionId, SessionSettings, SettingMutation, SettingScope, SettingsSnapshot, SidebarScope,
         SidebarSettings, SidebarVisibility, SidekickSettings, ToolCallVisibility,
-        TranscriptSettings,
+        TranscriptSettings, WorkspaceSettings,
     },
     settings::SettingGroup,
     tui::{
@@ -643,6 +643,352 @@ fn source_control_tab_presents_the_server_reclaim_setting_between_providers_and_
         &["worktree.autoReclaim"],
     );
     assert!(row(&application, "Reclaim Managed Worktrees").contains("off [pinned]"));
+}
+
+/// Workspace Roots rooted the way the platform under test roots an absolute
+/// path: a POSIX path is relative to Windows, which is given drive-rooted
+/// ones instead.
+#[cfg(windows)]
+const WORK_ROOT: &str = r"D:\work";
+#[cfg(not(windows))]
+const WORK_ROOT: &str = "/srv/work";
+#[cfg(windows)]
+const ARCHIVE_ROOT: &str = r"E:\archive";
+#[cfg(not(windows))]
+const ARCHIVE_ROOT: &str = "/mnt/archive";
+
+/// The heading the Workspace Roots' list editor opens under, which is how a
+/// test tells it is open.
+const ROOTS_EDITOR: &str = "Directories your work lives in";
+
+/// Effective settings naming `roots` as the Workspace Roots.
+fn with_workspace_roots(roots: &[&str]) -> EffectiveSettings {
+    EffectiveSettings {
+        workspace: WorkspaceSettings {
+            roots: roots.iter().map(|root| (*root).to_owned()).collect(),
+        },
+        ..EffectiveSettings::default()
+    }
+}
+
+/// The panel open on the Source Control tab with the Workspace Roots focused,
+/// and Enter pressed to open their list editor.
+fn open_workspace_roots_editor(application: &mut Application) {
+    open_panel(application);
+    click_tab(application, "Source Control");
+    focus_setting(application, "workspace.roots");
+    assert_eq!(
+        press(application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "opening the list editor is local presentation state"
+    );
+}
+
+fn screen(application: &Application) -> String {
+    rendered_application_rows(application).join("\n")
+}
+
+fn invoke(application: &mut Application, command: CommandId) -> ApplicationTransition {
+    application
+        .handle_event(ApplicationEvent::Command(command))
+        .expect("invoke a list editor command")
+}
+
+#[test]
+fn the_source_control_tab_presents_the_workspace_roots_beneath_reclaim_naming_none_by_default() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    click_tab(&mut application, "Source Control");
+
+    let rows = rendered_application_rows(&application);
+    assert!(
+        row_index(&rows, "Reclaim Managed Worktrees") < row_index(&rows, "Workspace Roots"),
+        "the Roots keep the worktree Settings' company: {rows:?}"
+    );
+    let roots = row(&application, "Workspace Roots");
+    assert!(
+        roots.contains("none [default]"),
+        "no Root is named until the user names one: {roots}"
+    );
+    let descriptor = suru::settings::SCHEMA
+        .iter()
+        .find(|descriptor| descriptor.key == "workspace.roots")
+        .expect("the schema declares the Workspace Roots");
+    assert_eq!(descriptor.group, SettingGroup::SourceControl);
+    assert_eq!(descriptor.scope, SettingScope::Server);
+    focus_setting(&mut application, "workspace.roots");
+    assert!(
+        screen(&application).contains("Enter choose"),
+        "the row teaches that Enter opens where its Roots are chosen"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "a list has no values for Space to step through"
+    );
+
+    deliver_snapshot(
+        &mut application,
+        with_workspace_roots(&["~/src", WORK_ROOT]),
+        &["workspace.roots"],
+    );
+    let roots = row(&application, "Workspace Roots");
+    assert!(
+        roots.contains(&format!("~/src, {WORK_ROOT} [pinned]")),
+        "the row names every Root as the user named it: {roots}"
+    );
+}
+
+/// The list editor is the panel's surface for a Setting holding a list: its
+/// rows are the entries, with one more to add an entry at, and every edit of
+/// them — a row added, a row edited, a row removed — stays a draft until Enter
+/// saves the whole list as one mutation.
+#[test]
+fn the_workspace_roots_list_editor_adds_edits_and_removes_rows_and_saves_them_as_one_mutation() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        with_workspace_roots(&["~/src", WORK_ROOT]),
+        &["workspace.roots"],
+    );
+    open_workspace_roots_editor(&mut application);
+    let opened = screen(&application);
+    assert!(
+        opened.contains(ROOTS_EDITOR)
+            && opened.contains("› ~/src")
+            && opened.contains(WORK_ROOT)
+            && opened.contains("add a Root"),
+        "the editor opens on the Roots in force, focused on the first: {opened}"
+    );
+
+    // Edit the focused row in place.
+    for _ in 0.."src".len() {
+        press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    }
+    type_terminal_text(&mut application, "code");
+    assert!(
+        screen(&application).contains("› ~/code"),
+        "{}",
+        screen(&application)
+    );
+
+    // Remove the next one.
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert!(screen(&application).contains(&format!("› {WORK_ROOT}")));
+    assert_eq!(
+        press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
+        ApplicationTransition::Continue,
+        "removing a row is a draft until it is saved"
+    );
+    assert!(
+        !screen(&application).contains(WORK_ROOT),
+        "{}",
+        screen(&application)
+    );
+
+    // Add one at the row standing for a new entry, which focus is now on.
+    type_terminal_text(&mut application, ARCHIVE_ROOT);
+    let added = screen(&application);
+    assert!(
+        added.contains(&format!("› {ARCHIVE_ROOT}")) && added.contains("add a Root"),
+        "typing on the add row makes it an entry, with a new add row beneath: {added}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+            value: Some(vec!["~/code".to_owned(), ARCHIVE_ROOT.to_owned()]),
+        }),
+        "Enter saves the whole list as one mutation"
+    );
+    assert!(
+        !screen(&application).contains(ROOTS_EDITOR),
+        "saving closes the editor"
+    );
+    assert!(
+        row(&application, "Workspace Roots").contains(&format!("~/src, {WORK_ROOT} [pinned]")),
+        "and the row waits for the refreshed snapshot"
+    );
+    deliver_snapshot(
+        &mut application,
+        with_workspace_roots(&["~/code", ARCHIVE_ROOT]),
+        &["workspace.roots"],
+    );
+    assert!(
+        row(&application, "Workspace Roots").contains(&format!("~/code, {ARCHIVE_ROOT} [pinned]"))
+    );
+}
+
+/// An entry the Setting refuses keeps the editor open, focused on that entry
+/// and naming it, so nothing is pinned until every Root is one; a row the
+/// reader emptied is no entry at all, and Esc leaves the Setting as it was.
+#[test]
+fn a_root_neither_absolute_nor_beginning_with_a_tilde_keeps_the_list_editor_open_naming_it() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_workspace_roots_editor(&mut application);
+    assert!(
+        screen(&application).contains("› add a Root"),
+        "a list with no entries opens on the row to add one at: {}",
+        screen(&application)
+    );
+
+    type_terminal_text(&mut application, "~/src");
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    type_terminal_text(&mut application, "projects");
+    press(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "a relative Root pins nothing"
+    );
+    let refused = screen(&application);
+    assert!(
+        refused.contains("\"projects\" is not an absolute path or a path beginning with ~")
+            && refused.contains("› projects"),
+        "the editor stays open, focused on the entry it names: {refused}"
+    );
+
+    press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    press(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    type_terminal_text(&mut application, WORK_ROOT);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    type_terminal_text(&mut application, "x");
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+            value: Some(vec!["~/src".to_owned(), WORK_ROOT.to_owned()]),
+        }),
+        "an absolute Root and a home-relative one are saved; an emptied row is no entry"
+    );
+
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    type_terminal_text(&mut application, "~/notes");
+    assert_eq!(
+        press(&mut application, KeyCode::Esc, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "cancelling pins nothing"
+    );
+    assert!(
+        !screen(&application).contains(ROOTS_EDITOR),
+        "Esc closes the editor"
+    );
+    assert!(row(&application, "Workspace Roots").contains("none [default]"));
+}
+
+#[test]
+fn list_editor_commands_can_be_invoked_semantically_and_take_pasted_text() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        with_workspace_roots(&["~/src", WORK_ROOT]),
+        &["workspace.roots"],
+    );
+    open_workspace_roots_editor(&mut application);
+
+    for command in [
+        CommandId::InvokeSemantic(SemanticCommandId::SettingsListNext),
+        CommandId::InvokeSemantic(SemanticCommandId::SettingsListRemove),
+        CommandId::InvokeSemantic(SemanticCommandId::SettingsListPrevious),
+        CommandId::InvokeSemantic(SemanticCommandId::SettingsListDeleteBackward),
+        CommandId::InvokeSemanticText(SemanticCommandId::SettingsListInsert, "c".to_owned()),
+        CommandId::InvokeSemantic(SemanticCommandId::SettingsListNext),
+    ] {
+        assert_eq!(
+            invoke(&mut application, command),
+            ApplicationTransition::Continue
+        );
+    }
+    application
+        .handle_terminal_event(InputEvent::Paste(format!("{ARCHIVE_ROOT}\n")))
+        .expect("paste a Root");
+    assert!(
+        screen(&application).contains(&format!("› {ARCHIVE_ROOT}")),
+        "a paste lands on the focused row, its line break dropped: {}",
+        screen(&application)
+    );
+    assert_eq!(
+        invoke(
+            &mut application,
+            CommandId::InvokeSemantic(SemanticCommandId::SettingsListSave)
+        ),
+        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+            value: Some(vec!["~/src".to_owned(), ARCHIVE_ROOT.to_owned()]),
+        }),
+        "plugins and future pointer behaviour reach the same mutation as the keyboard"
+    );
+
+    open_workspace_roots_editor(&mut application);
+    assert_eq!(
+        invoke(
+            &mut application,
+            CommandId::InvokeSemantic(SemanticCommandId::SettingsListCancel)
+        ),
+        ApplicationTransition::Continue
+    );
+    assert!(!screen(&application).contains(ROOTS_EDITOR));
+}
+
+#[test]
+fn a_list_editor_closes_with_its_panel_and_takes_no_input_while_another_overlay_hides_it() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_workspace_roots_editor(&mut application);
+
+    assert!(
+        matches!(
+            invoke(
+                &mut application,
+                CommandId::InvokeSemantic(SemanticCommandId::ModelList)
+            ),
+            ApplicationTransition::ListModels(_)
+        ),
+        "the newer overlay opens"
+    );
+    invoke(
+        &mut application,
+        CommandId::InvokeSemanticText(SemanticCommandId::SettingsListInsert, "~/hidden".to_owned()),
+    );
+    assert_eq!(
+        invoke(
+            &mut application,
+            CommandId::InvokeSemantic(SemanticCommandId::SettingsListSave)
+        ),
+        ApplicationTransition::Continue,
+        "a hidden editor saves nothing"
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::CloseModelPicker))
+        .expect("close the newer overlay");
+    type_terminal_text(&mut application, "~/src");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+            value: Some(vec!["~/src".to_owned()]),
+        }),
+        "the editor took no input while another overlay hid it"
+    );
+
+    open_workspace_roots_editor(&mut application);
+    invoke(
+        &mut application,
+        CommandId::InvokeSemantic(SemanticCommandId::SettingsClose),
+    );
+    let closed = screen(&application);
+    assert!(
+        !closed.contains(ROOTS_EDITOR) && !closed.contains(" Settings "),
+        "closing the owner leaves no invisible list editor behind: {closed}"
+    );
+    assert_eq!(
+        invoke(
+            &mut application,
+            CommandId::InvokeSemantic(SemanticCommandId::SettingsListSave)
+        ),
+        ApplicationTransition::Continue,
+        "input aimed at the closed editor changes nothing"
+    );
 }
 
 #[test]

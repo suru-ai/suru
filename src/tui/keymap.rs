@@ -935,6 +935,48 @@ pub(super) fn command_for_numeric_editor_event(event: InputEvent) -> Option<Comm
     Some(CommandId::InvokeSemantic(command))
 }
 
+/// The list editor has the keys while it stands over the settings panel: the
+/// arrows walk its rows, what the reader types or pastes lands on the focused
+/// row, Backspace takes a character back, Ctrl+D removes the focused entry,
+/// Enter saves the whole list, and Esc closes it without saving.
+pub(super) fn command_for_list_editor_event(event: InputEvent) -> Option<CommandId> {
+    let key = match event {
+        InputEvent::Key(key) => key,
+        InputEvent::Paste(text) => {
+            return Some(CommandId::InvokeSemanticText(
+                SemanticCommandId::SettingsListInsert,
+                text,
+            ));
+        }
+        _ => return None,
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let semantic = match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::SettingsListPrevious
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::SettingsListNext
+        }
+        (KeyCode::Backspace, KeyModifiers::NONE) => SemanticCommandId::SettingsListDeleteBackward,
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) => SemanticCommandId::SettingsListRemove,
+        (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::SettingsListSave,
+        (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::SettingsListCancel,
+        (KeyCode::Char(character), modifiers)
+            if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            return Some(CommandId::InvokeSemanticText(
+                SemanticCommandId::SettingsListInsert,
+                character.to_string(),
+            ));
+        }
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(semantic))
+}
+
 struct PickerCommandBindings {
     previous: CommandId,
     next: CommandId,

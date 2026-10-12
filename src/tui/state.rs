@@ -59,16 +59,16 @@ use super::{
         command_for_completion_event, command_for_connect_overlay_event,
         command_for_context_overlay_event, command_for_directory_browser_event,
         command_for_icon_picker_event, command_for_interrupt_confirmation_event,
-        command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
-        command_for_monitoring_subagent_view_event, command_for_numeric_editor_event,
-        command_for_queued_prompt_event, command_for_relay_overlay_event,
-        command_for_serve_overlay_event, command_for_session_picker_event,
-        command_for_settings_panel_event, command_for_sidebar_event,
-        command_for_sidebar_menu_event, command_for_subagent_picker_event,
-        command_for_subagent_view_event, command_for_subagent_view_leader_event,
-        command_for_terminal_event, command_for_theme_picker_event,
-        command_for_workspace_description_editor_event, command_for_workspace_picker_event,
-        command_for_workspace_picker_menu_event,
+        command_for_leader_event, command_for_list_editor_event, command_for_model_options_event,
+        command_for_model_picker_event, command_for_monitoring_subagent_view_event,
+        command_for_numeric_editor_event, command_for_queued_prompt_event,
+        command_for_relay_overlay_event, command_for_serve_overlay_event,
+        command_for_session_picker_event, command_for_settings_panel_event,
+        command_for_sidebar_event, command_for_sidebar_menu_event,
+        command_for_subagent_picker_event, command_for_subagent_view_event,
+        command_for_subagent_view_leader_event, command_for_terminal_event,
+        command_for_theme_picker_event, command_for_workspace_description_editor_event,
+        command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
@@ -3713,6 +3713,8 @@ impl TuiState {
             Some(SelectionSurface::ModelOptions)
         } else if self.settings_panel.numeric_editor_is_open() {
             Some(SelectionSurface::NumericEditor)
+        } else if self.settings_panel.list_editor_is_open() {
+            Some(SelectionSurface::ListEditor)
         } else if self.settings_panel.is_open() {
             Some(SelectionSurface::Settings)
         } else if self.worktree_picker.open {
@@ -9685,6 +9687,13 @@ impl Application {
                     | SemanticCommandId::SettingsNumericDeleteBackward
                     | SemanticCommandId::SettingsNumericApply
                     | SemanticCommandId::SettingsNumericCancel
+                    | SemanticCommandId::SettingsListPrevious
+                    | SemanticCommandId::SettingsListNext
+                    | SemanticCommandId::SettingsListInsert
+                    | SemanticCommandId::SettingsListDeleteBackward
+                    | SemanticCommandId::SettingsListRemove
+                    | SemanticCommandId::SettingsListSave
+                    | SemanticCommandId::SettingsListCancel
             )
         {
             return Ok(ApplicationTransition::Continue);
@@ -10176,6 +10185,15 @@ impl Application {
             | SemanticCommandId::SettingsNumericApply
             | SemanticCommandId::SettingsNumericCancel) => {
                 Ok(self.handle_settings_panel_command(command))
+            }
+            command @ (SemanticCommandId::SettingsListPrevious
+            | SemanticCommandId::SettingsListNext
+            | SemanticCommandId::SettingsListInsert
+            | SemanticCommandId::SettingsListDeleteBackward
+            | SemanticCommandId::SettingsListRemove
+            | SemanticCommandId::SettingsListSave
+            | SemanticCommandId::SettingsListCancel) => {
+                Ok(self.handle_list_editor_command(command, invocation.subject))
             }
             SemanticCommandId::SessionList => {
                 let listing = self.state.session_picker.open();
@@ -10852,9 +10870,11 @@ impl Application {
                                 .open(&current, pin, &self.theme_catalog);
                             self.resolve_theme();
                         }
-                        // The list editor arrives with the panel's next
-                        // surface; until then the row opens nothing.
-                        SettingChoiceSurface::TextList(_) => {}
+                        SettingChoiceSurface::TextList(choice) => {
+                            self.state
+                                .settings_panel
+                                .open_list_editor(choice, &self.state.settings);
+                        }
                     }
                 }
                 None
@@ -10888,6 +10908,42 @@ impl Application {
             ApplicationTransition::Continue,
             ApplicationTransition::MutateSetting,
         )
+    }
+
+    /// Handles the list editor's own commands, which edit the draft it holds
+    /// until saving answers with the one mutation pinning the whole list.
+    fn handle_list_editor_command(
+        &mut self,
+        command: SemanticCommandId,
+        subject: SemanticSubject,
+    ) -> ApplicationTransition {
+        let panel = &mut self.state.settings_panel;
+        match command {
+            SemanticCommandId::SettingsListSave => {
+                return panel.save_list_edit().map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::MutateSetting,
+                );
+            }
+            SemanticCommandId::SettingsListCancel => panel.cancel_list_edit(),
+            command => {
+                if let Some(editor) = panel.edit_list() {
+                    match (command, subject) {
+                        (SemanticCommandId::SettingsListPrevious, _) => editor.select_previous(),
+                        (SemanticCommandId::SettingsListNext, _) => editor.select_next(),
+                        (SemanticCommandId::SettingsListInsert, SemanticSubject::Text(text)) => {
+                            editor.insert(&text);
+                        }
+                        (SemanticCommandId::SettingsListDeleteBackward, _) => {
+                            editor.delete_backward();
+                        }
+                        (SemanticCommandId::SettingsListRemove, _) => editor.remove(),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        ApplicationTransition::Continue
     }
 
     /// Sends out the catalog listing an Availability read the panel has begun
@@ -11442,6 +11498,7 @@ impl Application {
                 SelectionSurface::NumericEditor => {
                     return command_for_numeric_editor_event(event);
                 }
+                SelectionSurface::ListEditor => return command_for_list_editor_event(event),
                 SelectionSurface::Settings => return command_for_settings_panel_event(event),
                 SelectionSurface::Worktrees => {
                     return super::keymap::command_for_worktree_picker_event(event);
