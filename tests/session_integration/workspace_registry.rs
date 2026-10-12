@@ -16,8 +16,8 @@ use diesel::{Connection, RunQueryDsl, SqliteConnection, connection::SimpleConnec
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        CreateSessionRequest, ExecutionDirectory, InitialPrompt, PromptId, Workspace,
-        WorkspaceDescription, WorkspaceId,
+        CreateSessionRequest, ExecutionDirectory, InitialPrompt, Outlook, PromptId,
+        ResolveWorkspaceRequest, Workspace, WorkspaceDescription, WorkspaceId,
     },
     server::{self, ServerConfig, ServerTimings},
 };
@@ -57,6 +57,23 @@ async fn connected_client(state_dir: &Path, channel: &str) -> ManagedClient {
     .expect("connect client");
     support::receive_managed_client_initial_state(&mut client).await;
     client
+}
+
+/// The Workspace `directory` lies in, as the Landing asks the Server for it
+/// before any Session has begun there.
+async fn landing_workspace(client: &ManagedClient, directory: &Path) -> Workspace {
+    client
+        .outlook(Outlook::Local)
+        .resolve_workspace(ResolveWorkspaceRequest {
+            checkout_id: None,
+            remembered_execution_directory: None,
+            workspace_id: None,
+            base: None,
+            path: directory.to_owned(),
+        })
+        .await
+        .expect("resolve the Landing's Workspace")
+        .workspace
 }
 
 /// The Workspaces the Client's Workspace listing answers with, in its order.
@@ -246,7 +263,7 @@ async fn a_session_enters_its_workspace_by_its_presented_root_and_an_entry_keeps
     let server = quiet_server(config.clone()).await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
 
-    let drafts_id = WorkspaceId::directory(&drafts);
+    let drafts_id = landing_workspace(&client, &drafts).await.id;
     client
         .set_workspace_description(&drafts_id, Some(&drafts), "Where drafts wait.")
         .await
@@ -399,7 +416,7 @@ async fn a_row_stored_before_entries_kept_their_provenance_is_known_by_a_session
         .set_workspace_description(&charted.id, None, "Where the atlas is charted.")
         .await
         .expect("describe the atlas Workspace");
-    let drafts_id = WorkspaceId::directory(&drafts);
+    let drafts_id = landing_workspace(&client, &drafts).await.id;
     client
         .set_workspace_description(&drafts_id, Some(&drafts), "Where drafts wait.")
         .await

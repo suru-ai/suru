@@ -19,10 +19,11 @@
 //! A Server knows each Workspace its Workspace Registry holds an entry for —
 //! every one a Session has begun in, whether or not one works there still,
 //! and every one described before any Session did — and lists them from the
-//! Registry alone. The listing names each as a compact row: its identity, its name, its presented root's path,
-//! its Description and whether that was set rather than derived, and its
-//! Icon's name. A directory a Client merely stands in, which its Server was
-//! never told of, is no Workspace the Server knows, and is not listed.
+//! Registry alone. The listing names each as a compact row: its identity,
+//! its name, its presented root's path, its Description and whether that was
+//! set rather than derived, and its Icon's name. A directory a Client merely
+//! stands in, which its Server was never told of, is no Workspace the Server
+//! knows, and is not listed.
 //!
 //! A Description a Sidekick sets is set through the very operations the
 //! Workspace endpoint performs for the user — a directory no known Workspace
