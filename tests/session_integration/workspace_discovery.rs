@@ -17,16 +17,27 @@ use std::{
     time::Duration,
 };
 
+use serde_json::json;
 use suru::{
-    protocol::{RepositoryId, SettingMutation, Workspace, WorkspaceId},
+    protocol::{
+        ProviderId, RepositoryId, SettingMutation, Workspace, WorkspaceDescription, WorkspaceId,
+    },
     server::{self, ServerConfig, ServerTimings},
 };
+use tokio::time::timeout;
 
 use crate::{
     failing_provider_support::FailingProviderRuntime,
+    provider_support::ControlledProvider,
     repositories::git,
+    server_support::{
+        PROGRESS_DEADLINE, next_derived_title, next_workspace_description_changed,
+        next_workspace_icon_changed,
+    },
+    support::{hosted_model, hosted_selection},
     workspace_registry::{
-        BY_SESSION, canonical, connected_client, entries_on_disk, listed, quiet_request, repository,
+        BY_SESSION, canonical, connected_client, entries_on_disk, landing_workspace, listed,
+        quiet_request, repository, set,
     },
 };
 
@@ -369,6 +380,144 @@ async fn the_sidekick_workspace_is_never_discovered() {
     assert!(
         at_sidekick.iter().all(|id| *id == sidekick.id),
         "nothing but the Sidekick Workspace is presented at its directory: {at_sidekick:?}"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A directory described before it became a Repository is superseded there
+/// once discovery finds the Repository, as wherever a Workspace is first
+/// seen: the directory is listed once, as the Repository's, carrying the
+/// Description it was given.
+#[tokio::test]
+async fn a_repository_discovered_where_a_described_directory_was_supersedes_its_entry() {
+    const CHANNEL: &str = "workspace-discovery-supersedes";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    let notes = projects.join("notes");
+    std::fs::create_dir_all(&notes).expect("create the notes directory");
+    let (_, server) = server_with_roots(&home, CHANNEL, &[], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let directory = landing_workspace(&client, &notes).await;
+    client
+        .set_workspace_description(&directory.id, Some(&notes), "Where the notes are kept.")
+        .await
+        .expect("describe the notes directory");
+    repository(&notes);
+    client
+        .mutate_setting(SettingMutation::WorkspaceRoots {
+            value: Some(vec![spelled(&projects).to_owned()]),
+        })
+        .await
+        .expect("name the Workspace Root");
+
+    assert_eq!(
+        listed(&client)
+            .await
+            .iter()
+            .map(|workspace| (located(workspace), workspace.description.clone()))
+            .collect::<Vec<_>>(),
+        [(
+            (repository_id(&notes.join(".git")), notes.clone()),
+            set("Where the notes are kept.")
+        )],
+        "the directory is listed once, as the Repository's, with the Description it was given"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// The Provider hosted for the Errand test, and its one Model.
+const PROVIDER: &str = "controlled";
+const MODEL: &str = "controlled-default";
+
+/// Discovery derives nothing, so no Errand is asked on a discovered
+/// Workspace's account; the first Session begun there asks for its Icon and
+/// Description as a first Session anywhere does, and they land on its entry.
+#[tokio::test]
+async fn no_errand_is_asked_for_a_discovered_workspace_until_a_session_begins_there() {
+    const CHANNEL: &str = "workspace-discovery-errand";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    name_roots(&home.join("config"), &[spelled(&projects)]);
+    let (runtime, mut provider) = ControlledProvider::with_provider(
+        ProviderId::new(PROVIDER),
+        vec![hosted_model(PROVIDER, MODEL)],
+    );
+    let server = server::spawn_with_provider_and_timings(
+        ServerConfig::new(home.join("state"), CHANNEL)
+            .expect("configure")
+            .with_config_dir(home.join("config")),
+        runtime,
+        ServerTimings::default()
+            .with_checkout_observation_interval(Duration::from_secs(60 * 60))
+            .with_root_discovery_memo(Duration::ZERO),
+    )
+    .await
+    .expect("spawn server");
+    server.workspace_discovery_settled().await;
+    let mut client = connected_client(&home.join("state"), CHANNEL).await;
+    let discovered = listed(&client).await;
+    assert_eq!(
+        discovered.iter().map(located).collect::<Vec<_>>(),
+        [(repository_id(&atlas.join(".git")), atlas.clone())]
+    );
+    assert!(
+        provider.try_next_errand().is_none(),
+        "discovery asks no Errand for the Workspaces it finds"
+    );
+
+    let mut request = quiet_request(&atlas, "Chart the atlas");
+    request.agent_selection = Some(hosted_selection(PROVIDER, MODEL));
+    client
+        .create_session(request)
+        .await
+        .expect("begin the first Session in the discovered Workspace");
+    let title = timeout(PROGRESS_DEADLINE, provider.next_errand())
+        .await
+        .expect("the Title Errand reaches the Provider");
+    assert!(
+        title.schema()["properties"]["title"].is_object(),
+        "the first Errand asked is the Session's Title: {}",
+        title.schema()
+    );
+    title.succeed(json!({ "title": "Chart the atlas", "icon": "md-bug" }));
+    next_derived_title(&mut client).await;
+    let workspace_errand = timeout(PROGRESS_DEADLINE, provider.next_errand())
+        .await
+        .expect("the Workspace Errand reaches the Provider");
+    workspace_errand.succeed(json!({
+        "icon": "dev-rust",
+        "description": "Where the atlas is charted.",
+    }));
+    next_workspace_description_changed(&mut client).await;
+    next_workspace_icon_changed(&mut client).await;
+
+    let described = listed(&client).await;
+    assert_eq!(
+        described
+            .iter()
+            .map(|workspace| (
+                located(workspace),
+                workspace.icon.clone(),
+                workspace.description.clone()
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            located(&discovered[0]),
+            Some("dev-rust".to_owned()),
+            Some(WorkspaceDescription {
+                text: "Where the atlas is charted.".to_owned(),
+                set: false,
+            })
+        )],
+        "the first Session's Errand lands the Icon and Description on the discovered entry"
     );
 
     drop(client);

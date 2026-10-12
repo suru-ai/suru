@@ -60,7 +60,7 @@ pub(super) async fn connected_client(state_dir: &Path, channel: &str) -> Managed
 
 /// The Workspace `directory` lies in, as the Landing asks the Server for it
 /// before any Session has begun there.
-async fn landing_workspace(client: &ManagedClient, directory: &Path) -> Workspace {
+pub(super) async fn landing_workspace(client: &ManagedClient, directory: &Path) -> Workspace {
     client
         .outlook(Outlook::Local)
         .resolve_workspace(ResolveWorkspaceRequest {
@@ -358,7 +358,7 @@ async fn listed_at(client: &ManagedClient, path: &Path) -> Vec<Workspace> {
 }
 
 /// A Description as a user sets it.
-fn set(text: &str) -> Option<WorkspaceDescription> {
+pub(super) fn set(text: &str) -> Option<WorkspaceDescription> {
     Some(WorkspaceDescription {
         text: text.to_owned(),
         set: true,
