@@ -411,7 +411,7 @@ impl suru::source_control::SourceControl for GatedObservation {
         destination: &Path,
         branch: Option<&str>,
         timeout: std::time::Duration,
-    ) -> Result<suru::protocol::ResolvedWorkspace, suru::source_control::CloneFailure> {
+    ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
         self.git
             .clone_repository(url, destination, branch, timeout)
             .await

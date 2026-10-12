@@ -71,6 +71,9 @@ pub struct GitSourceControl {
     /// Worktree root no longer looks like the one Git confirmed.
     validated_roots: Mutex<HashMap<CheckoutId, ValidatedRoot>>,
     on_disk: on_disk::OnDisk,
+    /// How a whole Clone takes its destination's name, never over anything
+    /// standing there; scripted where a test must see one slow to.
+    rename: cloning::Rename,
 }
 struct ValidatedRoot {
     common: PathBuf,
@@ -259,6 +262,7 @@ impl GitSourceControl {
             observer: None,
             validated_roots: Mutex::new(HashMap::new()),
             on_disk: on_disk::OnDisk::default(),
+            rename: std::sync::Arc::new(cloning::rename_new),
         }
     }
     pub fn with_preparation_observer(
@@ -933,7 +937,7 @@ impl SourceControl for GitSourceControl {
         destination: &Path,
         branch: Option<&str>,
         timeout: Duration,
-    ) -> Result<ResolvedWorkspace, super::CloneFailure> {
+    ) -> Result<Workspace, super::CloneFailure> {
         self.clone_into(url, destination, branch, timeout).await
     }
 

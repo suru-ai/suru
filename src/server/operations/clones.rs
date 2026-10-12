@@ -9,9 +9,11 @@
 //!
 //! The Clone itself is source control's ([`SourceControlService::clone_repository`]),
 //! bounded by this Server's own timeout, and leaves nothing behind where it
-//! fails or runs out of time. One that lands is entered in the Workspace
-//! Registry as Cloned — no scan of the Roots happening upon it first takes
-//! it for discovered — has its Icon and Description derived at once, as the
+//! fails or runs out of time. One that lands is read apart, within a bound
+//! of its own, and entered in the Workspace Registry as Cloned — as read,
+//! or as the Clone knew it where the reading does not answer in time, and
+//! no scan of the Roots happening upon it first takes it for discovered —
+//! has its Icon and Description derived at once, as the
 //! first Session begun there would, and has the Roots discovered afresh,
 //! waiting on that no longer than a listing would; the Log records what was
 //! Cloned where, the URL's credential aside.
@@ -35,10 +37,16 @@ use crate::{
     source_control::{CloneFailure, without_credentials},
 };
 
-/// The most reads of Workspace Roots a Clone makes that may be outstanding
-/// at once, each on a thread of its own: a Root that never answers holds
-/// one of them however often it is Cloned into again.
+/// The most reads a Clone makes apart — of Workspace Roots, and of what
+/// stands where a Clone goes — that may be outstanding at once, each on a
+/// thread of its own: a directory that never answers holds one of them
+/// however often it is asked for again.
 const ROOT_READS_AT_ONCE: usize = 8;
+
+/// How long reading the Workspace a Clone has just landed may take before
+/// the Clone answers with what it knew of it instead: a bound of its own,
+/// past the Clone's deadline, since the clone has landed whatever the time.
+const LANDED_READ_WITHIN: Duration = Duration::from_secs(5);
 
 /// What a Clone takes that is this Server's own: the home a Workspace Root
 /// beginning with `~` lies beneath, how long a Clone may run, and the reads
@@ -469,6 +477,56 @@ async fn placed(
     }
 }
 
+/// What `read` reads of `path` apart (see [`ReadsApart`]), where it answers
+/// within `bound`; `None` where it does not, or where a read of `path` begun
+/// earlier has still not ended.
+async fn read_within<T, Reading>(
+    reads: &ReadsApart,
+    path: &Path,
+    bound: Duration,
+    read: impl FnOnce() -> Reading + Send + 'static,
+) -> Option<T>
+where
+    T: Send + 'static,
+    Reading: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(bound, reads.read(path, read))
+        .await
+        .ok()?
+        .ok()
+}
+
+/// The Workspace a Clone landed at `destination`: as `read` reads it there
+/// apart, where that reading answers within `bound` and finds a Repository
+/// presented there, and otherwise `known`, what the Clone knew of it — its
+/// identity and where and how it is presented — so a mount gone quiet
+/// holds up neither the Clone's answer nor any of the Server's threads.
+async fn landed<Reading>(
+    reads: &ReadsApart,
+    destination: &Path,
+    known: Workspace,
+    bound: Duration,
+    read: impl FnOnce() -> Reading + Send + 'static,
+) -> Workspace
+where
+    Reading: std::future::Future<Output = crate::protocol::ResolvedWorkspace>,
+{
+    match read_within(reads, destination, bound, read).await {
+        Some(reading)
+            if reading.workspace.repository.is_some() && reading.workspace.path == destination =>
+        {
+            reading.workspace
+        }
+        _ => {
+            tracing::debug!(
+                destination = %destination.display(),
+                "a Clone's Workspace could not be read in time, so it is entered as the Clone knew it"
+            );
+            known
+        }
+    }
+}
+
 impl SessionOperations {
     /// Clones the Repository `request` names directly within the Workspace
     /// Root it names, or the only one configured, for the Sidekick whose
@@ -533,8 +591,8 @@ impl SessionOperations {
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await;
-        let cloned = match cloned {
-            Ok(cloned) => cloned,
+        let known = match cloned {
+            Ok(known) => known,
             Err(failure) => {
                 let refusal = match failure {
                     CloneFailure::Occupied => self.occupied(destination.clone(), deadline).await,
@@ -565,7 +623,17 @@ impl SessionOperations {
                 return Err(refusal);
             }
         };
-        let workspace = self.sessions.enter_cloned(&cloned.workspace, &destination);
+        let source_control = self.source_control.clone();
+        let reading = destination.clone();
+        let workspace = landed(
+            &self.cloning.reads,
+            &destination,
+            known,
+            LANDED_READ_WITHIN,
+            move || async move { source_control.read_unremembered(&reading).await },
+        )
+        .await;
+        let workspace = self.sessions.enter_cloned(&workspace, &destination);
         drop(landing);
         self.derivation.derive_cloned_workspace(
             on_behalf_of,
@@ -593,8 +661,9 @@ impl SessionOperations {
     /// stands: naming the Workspace there where it is one — one this
     /// Server's Registry presents there, or one source control finds rooted
     /// there that it has not yet been told of: a Repository presented there,
-    /// or a Worktree of one presented elsewhere. Source control is asked no
-    /// later than `deadline`, past which what stands there goes unnamed.
+    /// or a Worktree of one presented elsewhere. Source control reads it
+    /// apart and no later than `deadline`, past which what stands there goes
+    /// unnamed.
     async fn occupied(&self, destination: PathBuf, deadline: tokio::time::Instant) -> CloneRefusal {
         let registered = self
             .sessions
@@ -604,13 +673,18 @@ impl SessionOperations {
             .map(|workspace| workspace.id);
         let workspace = match registered {
             Some(workspace) => Some(workspace),
-            None => tokio::time::timeout_at(
-                deadline,
-                self.source_control.workspace_rooted_at(&destination),
-            )
-            .await
-            .ok()
-            .flatten(),
+            None => {
+                let source_control = self.source_control.clone();
+                let reading = destination.clone();
+                read_within(
+                    &self.cloning.reads,
+                    &destination,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    move || async move { source_control.workspace_rooted_at(&reading).await },
+                )
+                .await
+                .flatten()
+            }
         };
         CloneRefusal::Occupied {
             destination,
@@ -984,6 +1058,91 @@ mod tests {
             answering.await,
             Some(Ok((PathBuf::from(rooted("projects")).join("atlas"), false))),
             "a Root that answers places the Clone directly within it"
+        );
+        drop(release);
+    }
+
+    /// The Workspace a Clone just landed is read apart within a bound of its
+    /// own: one read in time is entered as source control reads it, and one
+    /// held up — on a mount gone quiet, say — or reading as no Repository
+    /// there, is entered as the Clone knew it, its identity and where and how
+    /// it is presented, so the Clone answers rather than hanging.
+    #[tokio::test]
+    async fn a_landed_clone_is_entered_as_read_in_time_or_as_the_clone_knew_it() {
+        use crate::protocol::{
+            Repository, RepositoryId, RepositoryLocation, ResolvedWorkspace,
+            SourceControlAvailability, SourceControlCapabilities,
+        };
+        let reads = ReadsApart::new("suru-clone-root-read", 4);
+        let destination = PathBuf::from(rooted("projects/atlas"));
+        let repository = |capabilities| Repository {
+            id: RepositoryId::from_metadata("git", &destination.join(".git")),
+            system: "git".to_owned(),
+            metadata_directory: destination.join(".git"),
+            location: RepositoryLocation::Main {
+                root: destination.clone(),
+            },
+            availability: SourceControlAvailability::Available,
+            capabilities,
+        };
+        let known = crate::source_control::repository_workspace(&repository(
+            SourceControlCapabilities::discovery_only(),
+        ));
+        let mut capable = SourceControlCapabilities::discovery_only();
+        capable.create_checkout = SourceControlCapability::Available;
+        let read = crate::source_control::repository_workspace(&repository(capable));
+
+        let answered = read.clone();
+        let reading = ResolvedWorkspace {
+            workspace: answered,
+            ..ResolvedWorkspace::directory(destination.clone())
+        };
+        assert_eq!(
+            landed(
+                &reads,
+                &destination,
+                known.clone(),
+                Duration::from_secs(30),
+                move || async move { reading },
+            )
+            .await,
+            read,
+            "a reading in time is entered as read"
+        );
+
+        let elsewhere = ResolvedWorkspace::directory(destination.clone());
+        assert_eq!(
+            landed(
+                &reads,
+                &destination,
+                known.clone(),
+                Duration::from_secs(30),
+                move || async move { elsewhere },
+            )
+            .await,
+            known,
+            "a reading finding no Repository there leaves what the Clone knew"
+        );
+
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let quiet = move || {
+            let _ = released.recv();
+            async move { ResolvedWorkspace::directory(PathBuf::new()) }
+        };
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                landed(
+                    &reads,
+                    &destination,
+                    known.clone(),
+                    Duration::from_millis(50),
+                    quiet,
+                ),
+            )
+            .await
+            .expect("a reading held up holds the Clone no longer than its bound"),
+            known
         );
         drop(release);
     }

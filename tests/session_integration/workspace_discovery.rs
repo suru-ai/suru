@@ -598,7 +598,7 @@ impl SourceControl for StallsWithin {
         destination: &Path,
         branch: Option<&str>,
         timeout: std::time::Duration,
-    ) -> Result<ResolvedWorkspace, suru::source_control::CloneFailure> {
+    ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
         self.git
             .clone_repository(url, destination, branch, timeout)
             .await
@@ -840,7 +840,7 @@ impl SourceControl for HoldsFirstReading {
         destination: &Path,
         branch: Option<&str>,
         timeout: std::time::Duration,
-    ) -> Result<ResolvedWorkspace, suru::source_control::CloneFailure> {
+    ) -> Result<suru::protocol::Workspace, suru::source_control::CloneFailure> {
         self.git
             .clone_repository(url, destination, branch, timeout)
             .await

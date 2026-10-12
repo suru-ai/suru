@@ -969,7 +969,7 @@ fn bare_origin(within: &Path) -> PathBuf {
 const UNREACHED: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[tokio::test]
-async fn a_clone_answers_the_workspace_it_made_as_discovery_reads_it() {
+async fn a_clone_answers_the_workspace_it_made_as_discovery_names_it() {
     let (_temporary, root) = root();
     let origin = bare_origin(&root);
     let projects = root.join("projects");
@@ -986,10 +986,15 @@ async fn a_clone_answers_the_workspace_it_made_as_discovery_reads_it() {
         .clone_repository(origin.to_str().unwrap(), &destination, None, UNREACHED)
         .await
         .unwrap();
-    assert_eq!(cloned, adapter.discover(&destination).await);
-    assert_eq!(cloned.workspace.path, destination);
+    let discovered = adapter.discover(&destination).await.workspace;
+    assert_eq!(
+        (&cloned.id, &cloned.path),
+        (&discovered.id, &discovered.path),
+        "the Clone knows the Workspace it made as discovery names it, without reading it"
+    );
+    assert_eq!(cloned.path, destination);
     assert!(matches!(
-        &cloned.workspace.repository.as_deref().unwrap().location,
+        &cloned.repository.as_deref().unwrap().location,
         RepositoryLocation::Main { root } if root == &destination
     ));
     assert_eq!(
@@ -1203,62 +1208,105 @@ async fn a_clone_is_made_out_of_sight_and_one_abandoned_leaves_nothing_behind() 
     held.abort();
 }
 
-/// An ssh the user names of their own — here one that asks for the
-/// passphrase of a locked key and waits on a terminal nobody watches unless
-/// told not to — is still told to ask nothing, so the Clone fails at once in
-/// its words rather than waiting out its timeout.
+/// An ssh the user names of their own is still told to ask nothing, first,
+/// so the Clone fails at once in its words rather than waiting out its
+/// timeout: one run under a name Git does not know, as a wrapper is, and
+/// one whose command tells it `-o BatchMode=no`, which the option the
+/// Clone gives first stands over. The ssh here asks for the passphrase of a
+/// locked key and waits on a terminal nobody watches unless the first
+/// `BatchMode` it is given is `yes`, as OpenSSH keeps the first value it is
+/// given; it answers Git's `-G` probe as OpenSSH does.
 #[tokio::test]
 async fn a_clone_through_an_ssh_the_user_names_asks_nothing_either() {
     let (_temporary, root) = root();
     let bin = root.join("bin");
     std::fs::create_dir(&bin).unwrap();
-    let ssh = bin.join("ssh");
-    std::fs::write(
-        &ssh,
-        "#!/bin/sh\n\
+    let script = "#!/bin/sh\n\
+         batch=\n\
          for argument in \"$@\"; do\n\
-         \x20 if [ \"$argument\" = BatchMode=yes ]; then\n\
-         \x20   echo 'Permission denied (publickey).' >&2\n\
-         \x20   exit 255\n\
-         \x20 fi\n\
+         \x20 case \"$argument\" in\n\
+         \x20   -G) exit 0 ;;\n\
+         \x20   BatchMode=*) [ -n \"$batch\" ] || batch=\"${argument#BatchMode=}\" ;;\n\
+         \x20 esac\n\
          done\n\
+         if [ \"$batch\" = yes ]; then\n\
+         \x20 echo 'Permission denied (publickey).' >&2\n\
+         \x20 exit 255\n\
+         fi\n\
          echo 'Enter passphrase for key locked_key:' >&2\n\
-         sleep 60\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+         sleep 60\n";
+    for (name, options) in [
+        ("vpn-wrapper", "-i locked_key"),
+        ("ssh", "-o BatchMode=no -i locked_key"),
+    ] {
+        let ssh = bin.join(name);
+        std::fs::write(&ssh, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let configuration = root.join(format!("{name}.gitconfig"));
+        std::fs::write(
+            &configuration,
+            format!(
+                "[core]\n\tsshCommand = {} {options}\n",
+                ssh.to_str().unwrap().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let adapter = GitSourceControl::default().with_configuration_file(&configuration);
+        let destination = root.join("atlas");
+
+        let failure = adapter
+            .clone_repository(
+                "ssh://git@example.invalid/atlas.git",
+                &destination,
+                None,
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+        let Err(CloneFailure::Failed(said)) = failure else {
+            panic!("{name} {options} fails the Clone at once: {failure:?}");
+        };
+        assert!(
+            said.contains("Permission denied (publickey)."),
+            "{name} {options}: {said}"
+        );
+        assert!(!destination.exists());
     }
+    let mut left = names_within(&root);
+    left.retain(|name| name.starts_with(".atlas"));
+    assert!(left.is_empty(), "nothing of the Clones is left: {left:?}");
+}
+
+/// A Repository URL naming Git's `ext::` transport, which runs a command
+/// the URL spells out, is refused in Git's words however the user's
+/// configuration allows it, and the command never runs.
+#[tokio::test]
+async fn a_clone_runs_no_command_a_repository_url_spells_out() {
+    let (_temporary, root) = root();
     let configuration = root.join("gitconfig");
-    std::fs::write(
-        &configuration,
-        format!(
-            "[core]\n\tsshCommand = {} -i locked_key\n",
-            ssh.to_str().unwrap().replace('\\', "/")
-        ),
-    )
-    .unwrap();
+    std::fs::write(&configuration, "[protocol \"ext\"]\n\tallow = always\n").unwrap();
     let adapter = GitSourceControl::default().with_configuration_file(&configuration);
+    let ran = root.join("ran");
     let destination = root.join("atlas");
 
     let failure = adapter
         .clone_repository(
-            "ssh://git@example.invalid/atlas.git",
+            &format!(
+                "ext::sh -c touch% {}",
+                ran.to_str().unwrap().replace('\\', "/")
+            ),
             &destination,
             None,
-            std::time::Duration::from_secs(30),
+            UNREACHED,
         )
         .await;
     let Err(CloneFailure::Failed(said)) = failure else {
-        panic!("the user's own ssh fails the Clone at once: {failure:?}");
+        panic!("an ext:: URL is refused: {failure:?}");
     };
-    assert!(said.contains("Permission denied (publickey)."), "{said}");
+    assert!(said.contains("not allowed"), "in Git's own words: {said}");
+    assert!(!ran.exists(), "the URL's command never ran");
     assert!(!destination.exists());
-    assert_eq!(
-        names_within(&root),
-        ["bin", "gitconfig"],
-        "nothing of the Clone is left beside it"
-    );
 }

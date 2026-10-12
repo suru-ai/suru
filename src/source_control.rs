@@ -196,23 +196,27 @@ pub trait SourceControl: Send + Sync {
     fn clone_capability(&self) -> crate::protocol::SourceControlCapability;
     /// Clone the Repository `url` names into `destination`, a directory not
     /// there yet whose parent is, checking out `branch` or the Repository's
-    /// default, and answer the Workspace made there as discovery reads it.
-    /// The Clone is the system's ordinary one, and asks no one anything: a
-    /// credential it cannot find fails it at once. Nothing stands at
-    /// `destination` until the Clone is whole, so no half-made one is ever
-    /// taken for a Workspace, and nothing standing there is ever replaced:
-    /// anything already there, or come to stand there meanwhile, refuses it
-    /// and is left as it was. `timeout` bounds the whole of it but reading
-    /// the Workspace once it has its name. A Clone that fails leaves nothing
-    /// behind once it answers; what one stopped at its deadline, or
-    /// abandoned, began is removed on a task of its own.
+    /// default, and answer the Workspace made there as the Clone knows it —
+    /// its identity and where and how it is presented — without reading it
+    /// again, which [`SourceControl::discover`] does. The Clone is the
+    /// system's ordinary one, and asks no one anything: a credential it
+    /// cannot find fails it at once. Nothing stands at `destination` until
+    /// the Clone is whole, so no half-made one is ever taken for a
+    /// Workspace, and nothing standing there is ever replaced: anything
+    /// already there, or come to stand there meanwhile, refuses it and is
+    /// left as it was. `timeout` bounds making the clone; once it is whole,
+    /// giving it its name — or removing it where it cannot have one — is
+    /// seen through whatever the time, and whatever becomes of whoever
+    /// awaits it. A Clone that fails leaves nothing behind once it answers;
+    /// what one stopped at its deadline, or abandoned, began is removed on a
+    /// task of its own.
     async fn clone_repository(
         &self,
         url: &str,
         destination: &Path,
         branch: Option<&str>,
         timeout: std::time::Duration,
-    ) -> Result<ResolvedWorkspace, CloneFailure>;
+    ) -> Result<Workspace, CloneFailure>;
     /// Rename the branch a fresh preparation created for a Managed Worktree
     /// to the first of [`naming::numbered`] `proposal` — a fragment already
     /// shaped by [`naming::proposed_fragment`] — that no other branch holds,
@@ -734,7 +738,7 @@ impl SourceControlService {
         destination: &Path,
         branch: Option<&str>,
         timeout: std::time::Duration,
-    ) -> Result<ResolvedWorkspace, CloneFailure> {
+    ) -> Result<Workspace, CloneFailure> {
         self.adapter
             .clone_repository(url, destination, branch, timeout)
             .await
@@ -1135,7 +1139,7 @@ mod tests {
             _destination: &Path,
             _branch: Option<&str>,
             _timeout: std::time::Duration,
-        ) -> Result<ResolvedWorkspace, CloneFailure> {
+        ) -> Result<Workspace, CloneFailure> {
             Err(CloneFailure::Failed(STANDS_IN.to_owned()))
         }
         async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
@@ -1191,7 +1195,7 @@ mod tests {
             _destination: &Path,
             _branch: Option<&str>,
             _timeout: std::time::Duration,
-        ) -> Result<ResolvedWorkspace, CloneFailure> {
+        ) -> Result<Workspace, CloneFailure> {
             Err(CloneFailure::Failed(STANDS_IN.to_owned()))
         }
         async fn discover(&self, directory: &Path) -> ResolvedWorkspace {

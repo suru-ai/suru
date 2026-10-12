@@ -381,13 +381,23 @@ impl Derivation {
         let Some(errand_at) = self.errand_at(on_behalf_of, provider) else {
             return;
         };
-        let Some((workspace_id, prompt)) = self.workspace_errand(workspace) else {
+        if !self.wants_workspace_errand(workspace) {
             return;
-        };
+        }
+        let workspace = workspace.clone();
         let errands = self.errands.clone();
         let models = self.models.clone();
         let sessions = self.sessions.clone();
         tokio::spawn(async move {
+            // The README the Errand carries is read off the Server's own
+            // threads, where a clone on a mount gone quiet holds up no one.
+            let workspace_id = workspace.id.clone();
+            let Ok(prompt) =
+                tokio::task::spawn_blocking(move || workspace_icon::errand_prompt(&workspace))
+                    .await
+            else {
+                return;
+            };
             let (provider, pinned) = match &errand_at {
                 ErrandAt::Provider(provider) => (provider, None),
                 ErrandAt::Selection(selection) => (&selection.provider, Some(selection)),
@@ -423,14 +433,19 @@ impl Derivation {
         &self,
         workspace: &Workspace,
     ) -> Option<(crate::protocol::WorkspaceId, String)> {
-        ((workspace.icon.is_none() || workspace.description.is_none())
-            && !self.sessions.is_sidekick_workspace(&workspace.id))
-        .then(|| {
+        self.wants_workspace_errand(workspace).then(|| {
             (
                 workspace.id.clone(),
                 workspace_icon::errand_prompt(workspace),
             )
         })
+    }
+
+    /// Whether `workspace` asks for a Workspace Errand: where it lacks an
+    /// Icon or a Description, and is not the Sidekick Workspace.
+    fn wants_workspace_errand(&self, workspace: &Workspace) -> bool {
+        (workspace.icon.is_none() || workspace.description.is_none())
+            && !self.sessions.is_sidekick_workspace(&workspace.id)
     }
 
     /// Where this derivation's Errands go, as the Setting in force decides,
