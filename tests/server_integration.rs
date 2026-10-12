@@ -1701,6 +1701,58 @@ async fn disabling_serving_ends_a_live_peer_stream_without_disturbing_local_clie
     pair.shutdown().await;
 }
 
+/// A Client turned toward a Remote reads that Remote's Workspace Registry as
+/// its Workspace Picker does: every Workspace the Remote has known, one no
+/// Session works in among them.
+#[tokio::test]
+async fn outlook_client_lists_its_remotes_workspace_registry() {
+    let pair = paired_servers("remote-workspace-listing").await;
+    let workspace = tempfile::tempdir().expect("create Serving Workspace");
+    let resolved = pair
+        .serving_client
+        .outlook(Outlook::Local)
+        .resolve_workspace(ResolveWorkspaceRequest {
+            checkout_id: None,
+            remembered_execution_directory: None,
+            workspace_id: None,
+            base: None,
+            path: workspace.path().to_owned(),
+        })
+        .await
+        .expect("resolve the Serving Server's Landing Workspace")
+        .workspace;
+    let (described, workspace) = (resolved.id, resolved.path);
+    pair.serving_client
+        .set_workspace_description(&described, Some(&workspace), "Where the notes are kept.")
+        .await
+        .expect("describe a Workspace on the Serving Server before any Session works there");
+
+    let listing = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()))
+        .list_workspaces()
+        .await
+        .expect("list the Remote's Workspaces through the local Server");
+
+    assert_eq!(
+        listing
+            .workspaces
+            .iter()
+            .map(|workspace| (&workspace.id, &workspace.path, &workspace.description))
+            .collect::<Vec<_>>(),
+        [(
+            &described,
+            &workspace,
+            &Some(WorkspaceDescription {
+                text: "Where the notes are kept.".to_owned(),
+                set: true,
+            })
+        )],
+        "the Remote lists the Workspace its Registry holds, though no Session works there"
+    );
+    pair.shutdown().await;
+}
+
 #[tokio::test]
 async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
     let (runtime, mut provider) = provider_support::ControlledProvider::with_provider(

@@ -1104,6 +1104,12 @@ impl OutlookClient {
         self.commands.list_sessions(workspace).await
     }
 
+    /// Every Workspace the Server this Outlook names knows, as its Workspace
+    /// Registry lists them, spelled in that Server's own paths.
+    pub async fn list_workspaces(&self) -> Result<WorkspaceListing> {
+        self.commands.list_workspaces().await
+    }
+
     pub async fn list_models(&self) -> Result<ModelCatalog> {
         self.commands.list_models().await
     }
