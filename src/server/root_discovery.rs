@@ -1,32 +1,38 @@
 //! Discovery of the Workspaces directly within each Workspace Root (ADR
 //! 0051): every child directory of a Root that is a Repository's main or
-//! bare root is entered in the Workspace Registry, known by discovery under
-//! that Root, so it is listed before any Session has begun there.
+//! bare root, or a linked Worktree of a Repository whose main or bare root
+//! is known, has that Repository's Workspace entered in the Workspace
+//! Registry, known by discovery under that Root, so it is listed before any
+//! Session has begun there.
 //!
 //! Only a Root's immediate children are read, and of those only the ones
-//! that are not hidden and that stand directly within the Root once read as
-//! the Server reads paths: a link is kept where it names another directory
-//! directly within the Root, and left alone where it names the Root itself
-//! or anywhere else, since a Repository reached only through a link is not
-//! directly within the Root. Nothing deeper is read, so a nested or vendored
-//! Repository stays out of the Registry. Each child is read through source
-//! control discovery, which reads the Sidekick Workspace as a directory of
-//! its own whatever it holds, and is kept only where it is the root its
-//! Repository is presented by: a plain directory, a directory within a
-//! Repository — as every child of a Root that is itself a Repository is —
-//! and a linked Worktree of a Repository presented elsewhere are each left
-//! alone, so a linked Worktree counts for its Repository's Workspace alone
-//! (ADR 0023). A Workspace presented at a Workspace Root — this one, or
-//! another named within it — is never entered, so a Root is never a
-//! Workspace, and an entry discovered under this Root that has since come to
-//! be presented at one is dropped, unless a Session belongs to it. Roots are
-//! told apart as directories (see [`super::root_directories`]); one that
-//! cannot be resolved is told by its writing alone, so a Root on a mount
-//! gone quiet holds back no other Root's discoveries. A Root naming Suru's
-//! own data directory, where the Sidekick Workspace is kept, is ignored, the
-//! Log saying why, so the Sidekick Workspace is never within a Root.
-//! Discovery derives no Icon and no Description: the first Session begun in
-//! a discovered Workspace derives them as it would anywhere.
+//! that are not hidden and that stand directly within the Root once read
+//! as the Server reads paths: a link is kept where it names another
+//! directory directly within the Root, and left alone where it names the
+//! Root itself or anywhere else, since a Repository reached only through a
+//! link is not directly within the Root. Nothing deeper is read, so a nested
+//! or vendored Repository stays out of the Registry. Each child is read
+//! through source control discovery, which reads the Sidekick Workspace as a
+//! directory of its own whatever it holds, and counts only where it is the
+//! root its Repository is presented by, or a linked Worktree of one: a plain
+//! directory and a directory within a Repository — as every child of a Root
+//! that is itself a Repository is — are left alone, and a linked Worktree
+//! counts for its Repository's Workspace, presented by its main or bare root
+//! wherever that is, and never as one of its own (ADR 0023); one of a
+//! Repository whose main root is unknown counts for nothing, and one of a
+//! Repository presented directly within another Root counts there alone,
+//! so its entry goes only with that Root. A Workspace
+//! presented at a Workspace Root — this one, or another named within it — is
+//! never entered, so a Root is never a Workspace, and an entry discovered
+//! under this Root that has since come to be presented at one is dropped,
+//! unless a Session belongs to it. Roots are told apart as directories (see
+//! [`super::root_directories`]); one that cannot be resolved is told by its
+//! writing alone, so a Root on a mount gone quiet holds back no other Root's
+//! discoveries. A Root naming Suru's own data directory, where the Sidekick
+//! Workspace is kept, is ignored, the Log saying why, so the Sidekick
+//! Workspace is never within a Root. Discovery derives no Icon and no
+//! Description: the first Session begun in a discovered Workspace derives
+//! them as it would anywhere.
 //!
 //! Each Root is scanned on its own, on a task of its own, and everything a
 //! scan reads from the filesystem or source control is read apart, on a
@@ -60,7 +66,7 @@ use tokio::sync::watch;
 
 use super::{reads_apart::ReadsApart, root_directories};
 use crate::{
-    protocol::{RepositoryLocation, ResolvedWorkspace, Workspace},
+    protocol::{CheckoutKind, RepositoryLocation, ResolvedWorkspace, Workspace},
     provider::wait_for_shutdown,
     sessions::SessionStore,
     source_control::{SourceControlService, is_directory, is_hidden},
@@ -404,7 +410,9 @@ impl RootDiscovery {
 }
 
 /// The scan the Server runs: every Repository root directly within a Root,
-/// entered in the Registry. The Root is listed, each child read through source control, and the other Roots
+/// and every linked Worktree there whose Repository's main or bare root is
+/// known, entered in the Registry by its Repository's Workspace. The Root is
+/// listed, each child read through source control, and the other Roots
 /// resolved, apart (see [`ReadsApart`]), so a filesystem that stops
 /// answering holds a thread of discovery's own rather than one the Server
 /// runs anything else on, and no more of them at once than [`READS_AT_ONCE`].
@@ -514,6 +522,11 @@ impl RootScan for RegistryScan {
         let at_a_root = |presented: &Path| {
             presented == resolved || others.values().any(|other| other.names(presented))
         };
+        let directly_within_another = |presented: &Path| {
+            presented
+                .parent()
+                .is_some_and(|holder| others.values().any(|other| other.names(holder)))
+        };
         let mut readings = stream::iter(children.into_iter().map(|child| async move {
             let source_control = self.source_control.clone();
             let read = child.clone();
@@ -550,10 +563,15 @@ impl RootScan for RegistryScan {
                 if let Some(read) = reading.workspace.repository.as_deref() {
                     self.source_control.learn_main_checkout(read);
                 }
-                match rooted_at(&child, reading) {
+                match counted_for(&child, reading) {
                     Some(workspace) if at_a_root(&workspace.path) => {
                         self.sessions.forget_discovered(&workspace.id, root);
                     }
+                    // A linked Worktree of a Repository presented directly
+                    // within another Root is that Root's to discover, so
+                    // its entry goes only with that Root.
+                    Some(workspace)
+                        if workspace.path != child && directly_within_another(&workspace.path) => {}
                     Some(workspace) => {
                         self.sessions.enter_discovered(&workspace, &child, root);
                         entered = true;
@@ -610,18 +628,21 @@ fn child_directories(root: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
     Ok((root, children))
 }
 
-/// The Workspace `reading` found, where `directory` is the root its
-/// Repository is presented by — main or bare — and nothing otherwise.
-fn rooted_at(directory: &Path, reading: ResolvedWorkspace) -> Option<Workspace> {
+/// The Workspace `reading` counts `directory` for: its Repository's, where
+/// `directory` is the root that Repository is presented by — main or bare
+/// — or a linked Worktree of a Repository whose main or bare root is known;
+/// and nothing otherwise.
+fn counted_for(directory: &Path, reading: ResolvedWorkspace) -> Option<Workspace> {
     let repository = reading.workspace.repository.as_deref()?;
-    match &repository.location {
-        RepositoryLocation::Main { root } | RepositoryLocation::Bare { root }
-            if root == directory =>
-        {
-            Some(reading.workspace)
-        }
-        _ => None,
-    }
+    let (RepositoryLocation::Main { root } | RepositoryLocation::Bare { root }) =
+        &repository.location
+    else {
+        return None;
+    };
+    let linked_here = reading.checkout.as_ref().is_some_and(|checkout| {
+        checkout.kind == CheckoutKind::Linked && checkout.root == directory
+    });
+    (root == directory || linked_here).then_some(reading.workspace)
 }
 
 #[cfg(test)]

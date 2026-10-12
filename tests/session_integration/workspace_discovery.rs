@@ -1,13 +1,13 @@
 //! Discovery: every Repository root directly within a Workspace Root — main
 //! or bare — is entered in the Workspace Registry, known by discovery under
-//! that Root, so it is listed before any Session has begun there (ADR 0051).
-//! Plain directories, hidden ones, anything deeper, a linked Worktree of a
-//! Repository elsewhere, the Sidekick Workspace, the Root itself and any
-//! Root within it are left alone, and so is everything within Suru's own
-//! data directory named as a Root. Discovery runs at start, when the Roots
-//! change, and whenever Workspaces are listed, reusing a scan only as old as
-//! the Server's memo allows, which these Servers shorten to nothing or
-//! lengthen past any test.
+//! that Root, so it is listed before any Session has begun there (ADR 0051);
+//! a linked Worktree there counts for its Repository's Workspace, wherever
+//! that is presented. Plain directories, hidden ones, anything deeper, the
+//! Sidekick Workspace, the Root itself and any Root within it are left
+//! alone, and so is everything within Suru's own data directory named as a
+//! Root. Discovery runs at start, when the Roots change, and whenever
+//! Workspaces are listed, reusing a scan only as old as the Server's memo
+//! allows, which these Servers shorten to nothing or lengthen past any test.
 //!
 //! Each test drives the Server as a Client does, with real Git Repositories
 //! in a temporary Root, and asserts on what the Client's Workspace listing
@@ -152,12 +152,13 @@ async fn a_repository_directly_within_a_root_is_listed_before_any_session_begins
 }
 
 /// Of a Root's contents, only the Repository roots directly within it are
-/// discovered, main or bare: a plain directory, a Repository two levels
-/// down, a hidden Repository, a linked Worktree of a Repository presented
-/// elsewhere, and — where links are made — a link to a Repository elsewhere
-/// are each left alone, and so is the Root itself, which is a Repository
-/// here, so every plain directory within it, and a link to it, is the
-/// Root's.
+/// discovered, main or bare, and a linked Worktree directly within it counts
+/// for its Repository's Workspace, presented by that Repository's main root
+/// outside the Root: a plain directory, a Repository two levels down, a
+/// hidden Repository, and — where links are made — a link to a Repository
+/// elsewhere are each left alone, and so is the Root itself, which is a
+/// Repository here, so every plain directory within it, and a link to it,
+/// is the Root's.
 #[tokio::test]
 async fn only_the_repository_roots_directly_within_a_root_are_discovered_main_or_bare() {
     const CHANNEL: &str = "workspace-discovery-shapes";
@@ -205,11 +206,13 @@ async fn only_the_repository_roots_directly_within_a_root_are_discovered_main_or
             .map(located)
             .collect::<Vec<_>>(),
         [
+            (repository_id(&elsewhere.join(".git")), elsewhere.clone()),
             (repository_id(&atlas.join(".git")), atlas.clone()),
             (repository_id(&ledger), ledger.clone()),
         ],
-        "the main and the bare Repository directly within the Root are listed, and nothing \
-         else within it, nor the Root"
+        "the main and the bare Repository directly within the Root are listed, and the \
+         Repository the linked Worktree within it belongs to, by its main root; nothing else \
+         within it, nor the Root"
     );
 
     drop(client);
@@ -533,6 +536,132 @@ async fn a_root_within_another_root_is_a_root_and_never_a_workspace() {
     assert!(
         !entries.contains_key(&atlas_id) && !entries.contains_key(&ledger_id),
         "and dropped from disk: {entries:?}"
+    );
+}
+
+/// A linked Worktree directly within a Root counts for its Repository's
+/// Workspace, presented by its main root outside the Root and known by
+/// discovery under the Root, and is entered as no Workspace of its own; one
+/// of a Repository whose main root is unknown counts for nothing. One of a
+/// Repository presented directly within another Root counts there alone, so
+/// taking away the Root the linked Worktree is in leaves it, with what it
+/// carries, while what was discovered only through that Root goes.
+#[tokio::test]
+async fn a_linked_worktree_within_a_root_counts_for_its_repositorys_workspace() {
+    const CHANNEL: &str = "workspace-discovery-linked-worktree";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    std::fs::create_dir(&projects).expect("create the Workspace Root");
+    let atlas = home.join("atlas");
+    repository(&atlas);
+    let topic = projects.join("topic");
+    git(&atlas, &["worktree", "add", "-b", "topic", spelled(&topic)]);
+    let away = home.join("away");
+    git(
+        &home,
+        &[
+            "init",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            spelled(&home.join("away.git")),
+            spelled(&away),
+        ],
+    );
+    git(
+        &away,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let orphan = projects.join("orphan");
+    git(
+        &away,
+        &["worktree", "add", "-b", "orphan", spelled(&orphan)],
+    );
+    let repos = home.join("repos");
+    let ledger = repos.join("ledger");
+    repository(&ledger);
+    let books = projects.join("books");
+    git(
+        &ledger,
+        &["worktree", "add", "-b", "books", spelled(&books)],
+    );
+    let (config, server) = server_with_roots(
+        &home,
+        CHANNEL,
+        &[spelled(&projects), spelled(&repos)],
+        Duration::ZERO,
+    )
+    .await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+
+    let (atlas_id, ledger_id) = (
+        repository_id(&atlas.join(".git")),
+        repository_id(&ledger.join(".git")),
+    );
+    assert_eq!(
+        listed(&client)
+            .await
+            .iter()
+            .map(located)
+            .collect::<Vec<_>>(),
+        [
+            (atlas_id.clone(), atlas.clone()),
+            (ledger_id.clone(), ledger.clone()),
+        ],
+        "each Repository a linked Worktree within the Root belongs to is listed by its main \
+         root, but the one whose main root is unknown"
+    );
+    client
+        .set_workspace_description(&ledger_id, Some(&ledger), "Where the books balance.")
+        .await
+        .expect("describe the Repository within the other Root");
+
+    client
+        .mutate_setting(SettingMutation::WorkspaceRoots {
+            value: Some(vec![spelled(&repos).to_owned()]),
+        })
+        .await
+        .expect("take away the Root the linked Worktrees are in");
+    assert_eq!(
+        listed(&client)
+            .await
+            .iter()
+            .map(|workspace| (located(workspace), workspace.description.clone()))
+            .collect::<Vec<_>>(),
+        [(
+            (ledger_id.clone(), ledger.clone()),
+            set("Where the books balance.")
+        )],
+        "what was discovered only through the Root taken away goes, and the Repository the \
+         other Root holds stays with what it carries"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    let entries = entries_on_disk(&config);
+    let repos_spelled = spelled(&repos).replace('\\', "\\\\");
+    assert_eq!(
+        entries.get(&ledger_id),
+        Some(&(
+            Some(ledger.clone()),
+            format!(r#"{{"discovered":{{"root":"{repos_spelled}"}}}}"#)
+        )),
+        "known by discovery under the Root that holds its main root"
+    );
+    assert!(
+        !entries.contains_key(&atlas_id)
+            && entries.values().all(|(path, _)| [&topic, &orphan, &books]
+                .iter()
+                .all(|linked| path.as_ref() != Some(*linked))),
+        "and no entry is presented at any linked Worktree: {entries:?}"
     );
 }
 
