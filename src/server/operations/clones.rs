@@ -10,35 +10,53 @@
 //! The Clone itself is source control's ([`SourceControlService::clone_repository`]),
 //! bounded by this Server's own timeout, and leaves nothing behind where it
 //! fails or runs out of time. One that lands is entered in the Workspace
-//! Registry as Cloned, has its Icon and Description derived at once, as the
-//! first Session begun there would, and asks discovery of the Roots to run
-//! again; the Log records what was Cloned where, the URL's credential aside.
+//! Registry as Cloned — no scan of the Roots happening upon it first takes
+//! it for discovered — has its Icon and Description derived at once, as the
+//! first Session begun there would, and has the Roots discovered afresh,
+//! waiting on that no longer than a listing would; the Log records what was
+//! Cloned where, the URL's credential aside.
 //!
 //! [`SourceControlService::clone_repository`]: crate::source_control::SourceControlService::clone_repository
 
 use std::{
     fmt,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use super::SessionOperations;
 use crate::{
     protocol::{SessionId, SourceControlCapability, Workspace, WorkspaceId},
+    server::{
+        reads_apart::{NotRead, ReadsApart},
+        root_discovery::expand,
+    },
     source_control::{CloneFailure, without_credentials},
 };
 
+/// The most reads of Workspace Roots a Clone makes that may be outstanding
+/// at once, each on a thread of its own: a Root that never answers holds
+/// one of them however often it is Cloned into again.
+const ROOT_READS_AT_ONCE: usize = 8;
+
 /// What a Clone takes that is this Server's own: the home a Workspace Root
-/// beginning with `~` lies beneath, and how long a Clone may run.
-#[derive(Clone, Debug)]
+/// beginning with `~` lies beneath, how long a Clone may run, and the reads
+/// apart a Root is read by.
+#[derive(Clone)]
 pub(crate) struct WorkspaceCloning {
     home: Option<PathBuf>,
     timeout: Duration,
+    reads: Arc<ReadsApart>,
 }
 
 impl WorkspaceCloning {
     pub(crate) fn new(home: Option<PathBuf>, timeout: Duration) -> Self {
-        Self { home, timeout }
+        Self {
+            home,
+            timeout,
+            reads: Arc::new(ReadsApart::new("suru-clone-root-read", ROOT_READS_AT_ONCE)),
+        }
     }
 }
 
@@ -247,17 +265,6 @@ fn spelled(timeout: Duration) -> String {
     format!("{amount} {unit}{plural}")
 }
 
-/// The directory the Workspace Root `root` names: beneath `home` where it
-/// begins with `~`, and as it is spelled otherwise; none for one beginning
-/// with `~` where no home is known, or naming another user's.
-fn expand(root: &str, home: Option<&Path>) -> Option<PathBuf> {
-    match Path::new(root).strip_prefix("~") {
-        Ok(beneath_home) => Some(home?.join(beneath_home)),
-        Err(_) if root.starts_with('~') => None,
-        Err(_) => Some(PathBuf::from(root)),
-    }
-}
-
 /// The Workspace Root among `roots` a Clone goes in: the one `named` names,
 /// as the Setting spells it or as the directory it names — however either
 /// spells that directory, so long as it can be read — or the only one where
@@ -424,10 +431,13 @@ fn named_by(url: &str) -> Result<&str, CloneRefusal> {
 
 /// Where a Clone named `name` goes — directly within the Root `named`
 /// names among `roots`, or the only one — and whether something stands
-/// there already, the Root read by `read` on a thread of its own, so a Root
-/// on a mount gone quiet holds up none of the Server's own. `None` where
-/// the reading has not answered by `deadline`.
+/// there already, the Root read by `read` apart (see [`ReadsApart`]), so a
+/// Root on a mount gone quiet holds up none of the Server's own threads,
+/// and holds one of its own however often it is Cloned into again. `None`
+/// where the reading has not answered by `deadline`, or one begun earlier
+/// still has not.
 async fn placed(
+    reads: &ReadsApart,
     deadline: tokio::time::Instant,
     roots: Vec<String>,
     named: Option<String>,
@@ -435,20 +445,28 @@ async fn placed(
     home: Option<PathBuf>,
     read: impl FnOnce(&str, Option<&Path>) -> Result<PathBuf, CloneRefusal> + Send + 'static,
 ) -> Option<Result<(PathBuf, bool), CloneRefusal>> {
-    let asked = named.clone().unwrap_or_else(|| roots.join(", "));
-    let placing = tokio::task::spawn_blocking(move || {
+    // No Root, or several and none named, is refused without reading one.
+    let asked = match (&named, roots.as_slice()) {
+        (Some(named), _) => named.clone(),
+        (None, [only]) => only.clone(),
+        (None, _) => {
+            return Some(chosen_root(&roots, None, home.as_deref()).map(|_| unreachable!()));
+        }
+    };
+    let placing = reads.read(Path::new(&asked), move || async move {
         let root = chosen_root(&roots, named.as_deref(), home.as_deref())?;
         let destination = read(root, home.as_deref())?.join(name);
         let occupied = std::fs::symlink_metadata(&destination).is_ok();
         Ok((destination, occupied))
     });
-    let placed = tokio::time::timeout_at(deadline, placing).await.ok()?;
-    Some(placed.unwrap_or_else(|error| {
-        Err(CloneRefusal::UnreadableRoot {
+    match tokio::time::timeout_at(deadline, placing).await {
+        Err(_) | Ok(Err(NotRead::Outstanding)) => None,
+        Ok(Err(not_read)) => Some(Err(CloneRefusal::UnreadableRoot {
             root: asked,
-            reason: error.to_string(),
-        })
-    }))
+            reason: not_read.to_string(),
+        })),
+        Ok(Ok(placed)) => Some(placed),
+    }
 }
 
 impl SessionOperations {
@@ -478,6 +496,7 @@ impl SessionOperations {
         }
         .to_owned();
         let Some(placed) = placed(
+            &self.cloning.reads,
             deadline,
             roots,
             request.root.clone(),
@@ -502,6 +521,9 @@ impl SessionOperations {
         {
             return Err(CloneRefusal::Unsupported { reason });
         }
+        // No scan enters the clone as discovered between its taking its name
+        // and the Clone entering it as Cloned.
+        let landing = self.root_discovery.landing(&destination);
         let cloned = self
             .source_control
             .clone_repository(
@@ -544,13 +566,14 @@ impl SessionOperations {
             }
         };
         let workspace = self.sessions.enter_cloned(&cloned.workspace, &destination);
+        drop(landing);
         self.derivation.derive_cloned_workspace(
             on_behalf_of,
             self.sessions.provider(on_behalf_of),
             &workspace,
             destination.clone(),
         );
-        self.rediscover_after_clone();
+        self.rediscover_after_clone().await;
         tracing::info!(
             repository_url = %without_credentials(url),
             destination = %destination.display(),
@@ -559,7 +582,7 @@ impl SessionOperations {
             "a Sidekick Cloned a Repository URL into a Workspace Root"
         );
         Ok(self
-            .workspace_listing()
+            .registered_workspace_listing()
             .workspaces
             .into_iter()
             .find(|listed| listed.id == workspace.id)
@@ -595,12 +618,17 @@ impl SessionOperations {
         }
     }
 
-    /// Has the Workspace Roots discovered again once a Clone has landed in
-    /// one: the one place a Clone asks for discovery (ADR 0051), and where
-    /// discovery of the Roots is begun afresh, through
-    /// `RootDiscovery::rediscover`, once this Server discovers its Roots.
-    /// Nothing waits on it, since the Clone's own entry is already written.
-    fn rediscover_after_clone(&self) {}
+    /// Has every Workspace Root discovered afresh once a Clone has landed in
+    /// one and entered its own Workspace in the Registry — the one place a
+    /// Clone asks for discovery (ADR 0051) — superseding a scan still running
+    /// that read the Root before the clone took its name, and waits for it
+    /// no longer than a listing waits on one. What the scan finds there
+    /// leaves the Clone's own entry known by its Clone, as an entry already
+    /// made always is.
+    async fn rediscover_after_clone(&self) {
+        let scans = self.root_discovery.rediscover();
+        self.root_discovery.settled(scans).await;
+    }
 }
 
 #[cfg(test)]
@@ -884,10 +912,13 @@ mod tests {
     /// A Root that does not answer — on a mount gone quiet, say — holds a
     /// Clone no longer than its deadline: placing it answers then, saying
     /// it timed out, and the refusal says the Root did not answer in time.
+    /// While its read is still outstanding, another Clone into that Root
+    /// answers so at once rather than reading it again, and another Root is
+    /// read as ever.
     #[tokio::test]
     async fn a_root_that_does_not_answer_holds_a_clone_no_longer_than_its_deadline() {
+        let reads = ReadsApart::new("suru-clone-root-read", 2);
         let (release, released) = std::sync::mpsc::channel::<()>();
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
         let quiet = move |root: &str, _home: Option<&Path>| {
             let _ = released.recv();
             Err(CloneRefusal::UnreadableRoot {
@@ -896,7 +927,8 @@ mod tests {
             })
         };
         let placing = placed(
-            deadline,
+            &reads,
+            tokio::time::Instant::now() + Duration::from_millis(50),
             vec![rooted("unplugged")],
             None,
             "atlas".to_owned(),
@@ -910,7 +942,6 @@ mod tests {
                 .is_none(),
             "and says it ran out of time"
         );
-        drop(release);
         assert_eq!(
             CloneRefusal::TimedOut {
                 url: "https://example.com/atlas.git".to_owned(),
@@ -922,7 +953,26 @@ mod tests {
              the Workspace Root it was to go in did not answer in time, so nothing was cloned."
         );
 
+        let again = placed(
+            &reads,
+            tokio::time::Instant::now() + Duration::from_secs(60 * 60),
+            vec![rooted("unplugged")],
+            None,
+            "charts".to_owned(),
+            None,
+            |_: &str, _: Option<&Path>| {
+                panic!("a Root whose read is outstanding is not read again")
+            },
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), again)
+                .await
+                .expect("a Clone into a Root still unread answers at once")
+                .is_none()
+        );
+
         let answering = placed(
+            &reads,
             tokio::time::Instant::now() + Duration::from_secs(30),
             vec![rooted("projects")],
             None,
@@ -935,6 +985,7 @@ mod tests {
             Some(Ok((PathBuf::from(rooted("projects")).join("atlas"), false))),
             "a Root that answers places the Clone directly within it"
         );
+        drop(release);
     }
 
     #[test]

@@ -1010,6 +1010,13 @@ impl SessionOperations {
     /// Repository is, so one whose main checkout is not known is named so.
     pub(crate) async fn workspace_listing(&self) -> WorkspaceListing {
         self.root_discovery.discover().await;
+        self.registered_workspace_listing()
+    }
+
+    /// Every Workspace this Server's Workspace Registry holds now, as
+    /// [`Self::workspace_listing`] lists them, without discovering the
+    /// Workspace Roots first: for what has just had them discovered.
+    pub(crate) fn registered_workspace_listing(&self) -> WorkspaceListing {
         let repositories = self.source_control.repositories();
         let mut workspaces = self.sessions.listed_workspaces();
         for workspace in &mut workspaces {

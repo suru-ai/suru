@@ -32,7 +32,8 @@ use super::{
 use crate::{
     broker::sidekick_acts::{acted, refused},
     repositories::git,
-    workspace_registry::entries_on_disk,
+    workspace_discovery::AS_LONG_AS_IT_TAKES,
+    workspace_registry::{entries_on_disk, repository},
 };
 
 /// How the Registry spells a Workspace a Sidekick Cloned.
@@ -988,5 +989,108 @@ async fn a_credential_in_a_repository_url_reaches_no_log() {
     assert!(
         !logged.contains("SECRET"),
         "no credential reaches the Log: {logged}"
+    );
+}
+
+/// A Clone has every Workspace Root discovered afresh once it has entered
+/// its own Workspace in the Registry: a Repository put in the Root by hand
+/// since the last scan, which listings would otherwise go on reusing, is
+/// listed at once. The Workspace the Clone made stays known by its Clone
+/// on disk — after that scan, and after every later one a listing makes.
+#[tokio::test]
+async fn a_clone_has_the_roots_discovered_afresh_and_its_workspace_stays_cloned() {
+    const CHANNEL: &str = "sidekick-clone-rediscovers";
+    /// A memo no test outlasts: every listing reuses the last scan.
+    const NEVER_AGAIN: Duration = Duration::from_secs(60 * 60);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let (_projects, projects) = directory();
+    let (_elsewhere, elsewhere) = directory();
+    let origin = bare_repository(&elsewhere, "atlas");
+    name_roots(config_dir.path(), &[spelled(&projects)]);
+    let reusing = |memo| {
+        ServerTimings::default()
+            .with_broker_wait_second(WAIT_SECOND)
+            .with_broker_wait_progress_interval(WAIT_PROGRESS_EVERY)
+            .with_root_discovery_memo(memo)
+            .with_root_discovery_wait(AS_LONG_AS_IT_TAKES)
+    };
+    let mut hosted = host_providers_with_timings(
+        state_dir.path(),
+        CHANNEL,
+        Some(config_dir.path()),
+        reusing(NEVER_AGAIN),
+    )
+    .await;
+    let descriptor = hosted.server.descriptor().clone();
+    let (_sidekick_id, mut sidekick, _provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    // The scan made at start has finished once a listing has answered.
+    list_workspaces(&mut sidekick).await;
+
+    let maps = projects.join("maps");
+    repository(&maps);
+    let maps_row = cloned_row(&maps, Value::Null, Value::Null);
+    assert!(
+        !list_workspaces(&mut sidekick).await.contains(&maps_row),
+        "a listing reuses the scan made before the Repository was put there"
+    );
+    let atlas = projects.join("atlas");
+    let answered = acted(
+        &mut sidekick,
+        "clone_workspace",
+        json!({ "repository_url": origin }),
+    )
+    .await;
+    assert_eq!(answered, cloned_row(&atlas, Value::Null, Value::Null));
+    let rows = list_workspaces(&mut sidekick).await;
+    assert!(
+        rows.contains(&maps_row) && rows.contains(&answered),
+        "the Clone had the Root discovered afresh: {rows:?}"
+    );
+    hosted.server.shutdown().await.expect("shut down server");
+
+    let config =
+        ServerConfig::new(state_dir.path(), CHANNEL).expect("configure the stopped Server");
+    let discovered = json!({ "discovered": { "root": spelled(&projects) } }).to_string();
+    let entries = entries_on_disk(&config);
+    assert_eq!(
+        (
+            entries.get(&repository_id(&atlas)),
+            entries.get(&repository_id(&maps))
+        ),
+        (
+            Some(&(Some(atlas.clone()), BY_CLONE.to_owned())),
+            Some(&(Some(maps.clone()), discovered.clone())),
+        ),
+        "the scan the Clone asked for found its Workspace and left it known by its Clone"
+    );
+
+    let hosted = host_providers_with_timings(
+        state_dir.path(),
+        CHANNEL,
+        Some(config_dir.path()),
+        reusing(Duration::ZERO),
+    )
+    .await;
+    let user = connected_client(state_dir.path(), CHANNEL).await;
+    for _ in 0..2 {
+        let listed = user
+            .list_workspaces()
+            .await
+            .expect("list Workspaces")
+            .workspaces;
+        assert!(
+            listed.iter().any(|workspace| workspace.path == atlas),
+            "every listing scans the Root afresh and finds the clone: {listed:?}"
+        );
+    }
+    drop(user);
+    hosted.server.shutdown().await.expect("shut down server");
+    let entries = entries_on_disk(&config);
+    assert_eq!(
+        entries.get(&repository_id(&atlas)),
+        Some(&(Some(atlas.clone()), BY_CLONE.to_owned())),
+        "however often the Root is scanned since, the Clone's Workspace is known by its Clone"
     );
 }

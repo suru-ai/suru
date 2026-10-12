@@ -122,6 +122,10 @@ struct State {
     /// Each Root followed — those named when the Roots were last read —
     /// with its own scans.
     roots: HashMap<String, Scans>,
+    /// The destinations a Clone is landing at, each with how many Clones
+    /// hold it: no scan enters what it finds at one, since the Clone enters
+    /// its own Workspace there, known by its Clone.
+    landing: HashMap<PathBuf, usize>,
 }
 
 /// One Root's scans.
@@ -185,18 +189,45 @@ pub(crate) struct Commit {
 }
 
 impl Commit {
-    /// Runs `enter` while this scan is still its Root's current one,
-    /// answering whether it ran.
-    pub(crate) fn while_current(&self, enter: impl FnOnce()) -> bool {
+    /// Runs `enter`, for what this scan found at `directory`, while this
+    /// scan is still its Root's current one and no Clone is landing at
+    /// `directory`, answering whether it ran.
+    pub(crate) fn while_current_at(&self, directory: &Path, enter: impl FnOnce()) -> bool {
         let state = self.discovery.0.state.lock().unwrap();
         let current = state
             .roots
             .get(&self.root)
-            .is_some_and(|scans| scans.generation == self.generation);
+            .is_some_and(|scans| scans.generation == self.generation)
+            && !state.landing.contains_key(directory);
         if current {
             enter();
         }
         current
+    }
+}
+
+/// A destination a Clone is landing at, held from before the clone takes
+/// its name until the Clone has entered it in the Registry, so that no scan
+/// happening upon it meanwhile enters it as discovered.
+pub(crate) struct Landing {
+    discovery: RootDiscovery,
+    destination: PathBuf,
+}
+
+impl Drop for Landing {
+    fn drop(&mut self) {
+        let mut state = self
+            .discovery
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(held) = state.landing.get_mut(&self.destination) {
+            *held -= 1;
+            if *held == 0 {
+                state.landing.remove(&self.destination);
+            }
+        }
     }
 }
 
@@ -261,6 +292,23 @@ impl RootDiscovery {
                 .map(|root| self.begin(&mut state, root))
                 .collect(),
         )
+    }
+
+    /// Holds `destination`, where a Clone is about to land, from every scan
+    /// until the answer is dropped.
+    pub(crate) fn landing(&self, destination: &Path) -> Landing {
+        *self
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .landing
+            .entry(destination.to_owned())
+            .or_default() += 1;
+        Landing {
+            discovery: self.clone(),
+            destination: destination.to_owned(),
+        }
     }
 
     /// Waits for the scans `ticket` names to finish, or for ones begun after
@@ -442,9 +490,10 @@ impl RootScan for RegistryScan {
             // What the reading teaches, of the Registry and of the
             // Repositories this Server remembers alike, is taken only while
             // this scan is current, so a reading begun before the directory
-            // changed and ended after a newer scan read it teaches nothing.
+            // changed and ended after a newer scan read it teaches nothing;
+            // nor while a Clone is landing there, which enters its own.
             let mut entered = false;
-            commit.while_current(|| {
+            commit.while_current_at(&child, || {
                 if let Some(read) = reading.workspace.repository.as_deref() {
                     self.source_control.learn_main_checkout(read);
                 }
@@ -469,7 +518,8 @@ impl RootScan for RegistryScan {
 /// The directory the Workspace Root `root` names: beneath `home` where it
 /// begins with `~`, and as it is spelled where it is absolute. `None` for
 /// one beginning with `~` where no home is known, or naming another user's.
-fn expand(root: &str, home: Option<&Path>) -> Option<PathBuf> {
+/// A Clone reads the Root it goes in by this too.
+pub(super) fn expand(root: &str, home: Option<&Path>) -> Option<PathBuf> {
     match Path::new(root).strip_prefix("~") {
         Ok(beneath_home) => Some(home?.join(beneath_home)),
         Err(_) if root.starts_with('~') => None,
@@ -578,7 +628,9 @@ mod tests {
                 .await
                 .expect("the scan's permits stay open")
                 .forget();
-            commit.while_current(|| self.entered.lock().unwrap().push(root.to_owned()));
+            commit.while_current_at(Path::new(root), || {
+                self.entered.lock().unwrap().push(root.to_owned());
+            });
         }
     }
 
@@ -776,12 +828,51 @@ mod tests {
             .expect("the scan's channel stays open");
 
         assert!(
-            !superseded.while_current(|| panic!("a superseded scan enters nothing")),
+            !superseded.while_current_at(Path::new("found"), || panic!(
+                "a superseded scan enters nothing"
+            )),
             "a scan that reaches its entry after another has begun is refused it"
         );
         assert!(
-            current.while_current(|| {}),
+            current.while_current_at(Path::new("found"), || {}),
             "the scan begun last enters what it finds"
+        );
+    }
+
+    /// A scan happening upon a Clone landing — named, but not yet entered by
+    /// its Clone — enters nothing there, so the Clone's entry is known by
+    /// its Clone; it enters what it finds anywhere else, and there too once
+    /// every Clone landing there has let go.
+    #[tokio::test]
+    async fn a_scan_enters_nothing_where_a_clone_is_landing() {
+        let mut scripted = scripted(&["~/projects"], Duration::ZERO, AS_LONG_AS_IT_TAKES);
+        let _ = scripted.discovery.rediscover();
+        let (_, scan) = tokio::time::timeout(SURELY, scripted.begun.recv())
+            .await
+            .expect("the scan begins")
+            .expect("the scan's channel stays open");
+        let atlas = absolute(&["home", "ada", "projects", "atlas"]);
+        let maps = absolute(&["home", "ada", "projects", "maps"]);
+
+        let landing = scripted.discovery.landing(&atlas);
+        let racing = scripted.discovery.landing(&atlas);
+        assert!(
+            !scan.while_current_at(&atlas, || panic!("no scan enters a Clone landing")),
+            "a destination a Clone is landing at is the Clone's to enter"
+        );
+        assert!(
+            scan.while_current_at(&maps, || {}),
+            "and nowhere else is held from the scan"
+        );
+        drop(landing);
+        assert!(
+            !scan.while_current_at(&atlas, || panic!("no scan enters a Clone landing")),
+            "it is held while any Clone landing there holds it"
+        );
+        drop(racing);
+        assert!(
+            scan.while_current_at(&atlas, || {}),
+            "and the scan enters what it finds there once the Clones let go"
         );
     }
 
