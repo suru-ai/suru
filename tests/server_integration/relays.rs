@@ -15,7 +15,7 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
         Relay, RelayAccount, RelayListing, RelayLogin, RelayLoginOutcome, RelayLoginRefusal,
-        RelaySide, RelayState, SessionError, SessionErrorCode,
+        RelaySide, RelayState, SessionError, SessionErrorCode, SettingMutation,
     },
     server::{self, ServerConfig, ServerTimings},
 };
@@ -385,6 +385,25 @@ impl TestServer {
             .follow_relay_login(&address)
             .await
             .expect("follow the login to its end")
+    }
+
+    /// Has the Server make its identity key now, as Serving's listener does
+    /// the first time it starts, and stop Serving again. A Server makes the
+    /// key on its first use, and an act on a Relay counts that use against
+    /// its answer budget, so a test whose budget is only what a silent Relay
+    /// may cost makes the key beforehand: under load, making it alone can
+    /// outlast so short a budget, and the Relay is then never dialed.
+    async fn make_identity_key(&self) {
+        for mutation in [
+            SettingMutation::ServingPort { value: Some(0) },
+            SettingMutation::ServingEnabled { value: Some(true) },
+            SettingMutation::ServingEnabled { value: Some(false) },
+        ] {
+            self.client
+                .mutate_setting(mutation)
+                .await
+                .expect("start and stop Serving, making the identity key");
+        }
     }
 
     /// The fingerprint of this Server's identity key.
@@ -1082,6 +1101,9 @@ async fn removing_a_relay_that_takes_connections_and_says_nothing_waits_only_its
         relay_timings().with_relay_answer_timeout(Duration::from_millis(100)),
     )
     .await;
+    // The budget is what the Relay's silence may cost, not the making of the
+    // key the Server proves itself with.
+    server.make_identity_key().await;
     let unanswered = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
