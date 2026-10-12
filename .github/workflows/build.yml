@@ -2,8 +2,10 @@ name: Build
 
 # Checks and builds Suru for every platform it ships for. A PR or a plain manual run checks formatting, lints,
 # tests, and keeps the archives as short-lived workflow artifacts. Given a tag, it attaches the archives to that
-# tag's draft release instead, one per target as each finishes; a target already attached is not rebuilt, so
-# re-running failed jobs (or dispatching again with the same tag) finishes a partial release.
+# tag's draft release instead, one per target as each finishes, each beside a .sha256 file of its checksum that
+# the install scripts verify the download against without calling GitHub's rate-limited API; a target already
+# attached is not rebuilt, so re-running failed jobs (or dispatching again with the same tag) finishes a partial
+# release.
 #
 # A release attests each archive's build provenance, and the binary's inside it, before attaching it, so
 # `gh attestation verify <file> --repo suru-ai/suru` traces either to the run and commit that built it.
@@ -140,18 +142,19 @@ jobs:
           FILE: ${{ steps.archive.outputs.file }}
         run: |
           set -euo pipefail
+          # The archive and its checksum are attached together, so the target counts as attached only with both.
           listing=$(gh api "repos/$GH_REPO/releases?per_page=100" --paginate --jq "
             .[] | select(.tag_name == \"$RELEASE_TAG\")
-            | \"release\t\(.draft)\", (.assets[] | select(.name == \"$FILE\") | \"asset\t\(.id)\t\(.state)\")")
+            | \"release\t\(.draft)\", (.assets[] | select(.name == \"$FILE\" or .name == \"$FILE.sha256\")
+              | \"asset\t\(.id)\t\(.state)\t\(.name)\")")
           draft=$(awk -F'\t' '$1 == "release" { print $2 }' <<< "$listing")
-          asset_id=$(awk -F'\t' '$1 == "asset" { print $2 }' <<< "$listing")
-          asset_state=$(awk -F'\t' '$1 == "asset" { print $3 }' <<< "$listing")
+          uploaded=$(awk -F'\t' '$1 == "asset" && $3 == "uploaded" { n++ } END { print n + 0 }' <<< "$listing")
           if [ -z "$draft" ]; then
             echo "::error::No release exists for $RELEASE_TAG."
             exit 1
           fi
-          if [ "$asset_state" = uploaded ]; then
-            echo "::notice::$FILE is already attached to $RELEASE_TAG; not rebuilding it."
+          if [ "$uploaded" = 2 ]; then
+            echo "::notice::$FILE and its checksum are already attached to $RELEASE_TAG; not rebuilding it."
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -159,11 +162,13 @@ jobs:
             echo "::error::$RELEASE_TAG is published, and a published release is immutable: $FILE can no longer be attached."
             exit 1
           fi
-          if [ -n "$asset_id" ]; then
-            # An interrupted upload leaves an unfinished asset holding the name; clear it for the new one.
-            echo "Deleting unfinished $FILE ($asset_state)"
+          # An interrupted upload leaves an unfinished asset holding the name, or the archive without its
+          # checksum; clear whatever is there for the rebuilt pair.
+          while IFS=$'\t' read -r _ asset_id asset_state asset_name; do
+            [ -n "$asset_id" ] || continue
+            echo "Deleting $asset_name ($asset_state)"
             gh api -X DELETE "repos/$GH_REPO/releases/assets/$asset_id"
-          fi
+          done <<< "$(awk -F'\t' '$1 == "asset"' <<< "$listing")"
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -356,6 +361,12 @@ jobs:
           else
             tar -czf "$FILE" "$STEM"
           fi
+          # In sha256sum's own format, so `sha256sum -c` checks it too; macOS has only shasum.
+          if command -v sha256sum > /dev/null 2>&1; then
+            sha256sum "$FILE" > "$FILE.sha256"
+          else
+            shasum -a 256 "$FILE" > "$FILE.sha256"
+          fi
 
       # Unlike packaging, attesting and attaching wait on every step above, so a macOS binary that failed its
       # signing or notarization is never released. Attesting comes first, so no archive is released unattested.
@@ -372,7 +383,7 @@ jobs:
         if: env.RELEASE_TAG != '' && steps.existing.outputs.skip != 'true'
         env:
           FILE: ${{ steps.archive.outputs.file }}
-        run: gh release upload "$RELEASE_TAG" "dist/$FILE"
+        run: gh release upload "$RELEASE_TAG" "dist/$FILE" "dist/$FILE.sha256"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() && env.RELEASE_TAG == '' && steps.package.outcome == 'success' }}

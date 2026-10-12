@@ -6,7 +6,9 @@
 #   SURU_VERSION      Release to install, e.g. v0.1.1. Defaults to the latest release.
 #   SURU_INSTALL_DIR  Directory the binary goes in. Defaults to %LOCALAPPDATA%\Programs\suru.
 #   SURU_YES          Set to 1 to answer yes to every question, for unattended installs.
-#   GITHUB_TOKEN      Sent to GitHub when set, which lifts the anonymous API rate limit.
+#
+# Talks only to GitHub's release pages and downloads, never its API, whose anonymous rate limit is shared by
+# everyone behind one IP address.
 #
 # Runs on Windows PowerShell 5.1 and PowerShell 7. Everything lives in one function that reports failure by
 # throwing: piped into iex the script runs in the caller's own session, which `exit` would close.
@@ -21,7 +23,7 @@ function Install-Suru {
     }
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-    $repo = 'suru-ai/suru'
+    $releases = 'https://github.com/suru-ai/suru/releases'
     $assumeYes = $env:SURU_YES -eq '1'
 
     # Answers $null when there is no one to ask, which every caller treats as a no.
@@ -72,22 +74,26 @@ function Install-Suru {
         }
     }
 
-    $headers = @{ Accept = 'application/vnd.github+json' }
-    if ($env:GITHUB_TOKEN) { $headers.Authorization = "Bearer $env:GITHUB_TOKEN" }
-    $releaseUrl = if ($env:SURU_VERSION) {
-        "https://api.github.com/repos/$repo/releases/tags/$env:SURU_VERSION"
+    if ($env:SURU_VERSION) {
+        $tag = $env:SURU_VERSION
+        try { Invoke-WebRequest -Uri "$releases/tag/$tag" -Method Head -UseBasicParsing | Out-Null }
+        catch { throw "Could not find the Suru release $tag. $_" }
     }
     else {
-        "https://api.github.com/repos/$repo/releases/latest"
+        # The latest release's page redirects to the release's own, which names its tag. Asked through .NET's
+        # own request, which hands back a redirect it is told not to follow; Invoke-WebRequest counts that an
+        # error, differently in each PowerShell.
+        try {
+            $request = [Net.WebRequest]::CreateHttp("$releases/latest")
+            $request.Method = 'HEAD'
+            $request.AllowAutoRedirect = $false
+            $response = $request.GetResponse()
+            try { $location = [string]$response.Headers['Location'] } finally { $response.Close() }
+        }
+        catch { throw "Could not read the latest Suru release from GitHub. $_" }
+        if (-not $location) { throw 'Could not read the latest Suru release from GitHub: its releases page did not name one.' }
+        $tag = $location.Substring($location.LastIndexOf('/') + 1)
     }
-    try {
-        $release = Invoke-RestMethod -Uri $releaseUrl -Headers $headers -UseBasicParsing
-    }
-    catch {
-        if ($env:SURU_VERSION) { throw "Could not find the Suru release $env:SURU_VERSION. $_" }
-        throw "Could not read the latest Suru release from GitHub. If GitHub is rate limiting you, set GITHUB_TOKEN and try again. $_"
-    }
-    $tag = $release.tag_name
     # The repository releases its Relay too, under tags of its own, never marked latest; anything but a Suru
     # release tag here is not one this installs.
     if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
@@ -105,11 +111,15 @@ function Install-Suru {
     }
     $kept = if ($installed) { "v$installed" } else { 'the installed version' }
 
+    # Each release attaches its checksum beside each archive, so the archive is verified without GitHub's API.
     $file = "suru-$tag-$target.zip"
-    $asset = $release.assets | Where-Object { $_.name -eq $file }
-    if (-not $asset) { throw "Suru $tag has no build for $target." }
-    if ($asset.digest -notmatch '^sha256:') { throw "Suru $tag publishes no checksum for $file, so it cannot be verified." }
-    $digest = $asset.digest -replace '^sha256:', ''
+    try {
+        $checksum = (Invoke-WebRequest -Uri "$releases/download/$tag/$file.sha256" -UseBasicParsing).Content
+    }
+    catch { throw "Suru $tag has no build for $target, or publishes no checksum for it, so it cannot be verified. $_" }
+    if ($checksum -is [byte[]]) { $checksum = [Text.Encoding]::ASCII.GetString($checksum) }
+    $digest = ([string]$checksum -split '\s+')[0]
+    if ($digest -notmatch '^[0-9a-fA-F]{64}$') { throw "The published checksum for $file is not a SHA-256 digest, so it cannot be verified." }
 
     # Windows will not replace an executable any process is running, a Client's as much as the Server's.
     # Asked before anything is downloaded, and acted on only once the new binary is verified.
@@ -131,14 +141,7 @@ function Install-Suru {
     try {
         Write-Host "Downloading Suru $tag for $target"
         $archive = Join-Path $tmp $file
-        if ($env:GITHUB_TOKEN) {
-            # The only download a private repository allows.
-            $download = @{ Accept = 'application/octet-stream'; Authorization = "Bearer $env:GITHUB_TOKEN" }
-            Invoke-WebRequest -Uri $asset.url -Headers $download -OutFile $archive -UseBasicParsing
-        }
-        else {
-            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive -UseBasicParsing
-        }
+        Invoke-WebRequest -Uri "$releases/download/$tag/$file" -OutFile $archive -UseBasicParsing
 
         $actual = (Get-FileHash -Path $archive -Algorithm SHA256).Hash
         if ($actual -ine $digest) {

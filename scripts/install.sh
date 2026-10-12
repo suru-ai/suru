@@ -7,14 +7,14 @@
 #   SURU_VERSION      Release to install, e.g. v0.1.1. Defaults to the latest release.
 #   SURU_INSTALL_DIR  Directory the binary goes in. Defaults to ~/.local/bin.
 #   SURU_YES          Set to 1 to answer yes to every question, for unattended installs.
-#   GITHUB_TOKEN      Sent to GitHub when set, which lifts the anonymous API rate limit.
 #
-# Kept to what macOS's bash 3.2 runs.
+# Talks only to GitHub's release pages and downloads, never its API, whose anonymous rate limit is shared by
+# everyone behind one IP address. Kept to what macOS's bash 3.2 runs.
 
 set -euo pipefail
 
 REPO=suru-ai/suru
-API=https://api.github.com/repos/$REPO
+RELEASES=https://github.com/$REPO/releases
 
 say() {
   printf '%s\n' "$*"
@@ -76,12 +76,11 @@ detect_target() {
   esac
 }
 
-github() {
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$@"
-  else
-    curl -fsSL "$@"
-  fi
+# The latest release's page redirects to the release's own, which names its tag.
+latest_tag() {
+  local location
+  location=$(curl -fsSI -o /dev/null -w '%{redirect_url}' "$RELEASES/latest") || return 1
+  printf '%s\n' "${location##*/}"
 }
 
 sha256() {
@@ -128,7 +127,7 @@ ensure_on_path() {
 }
 
 main() {
-  local target install_dir dest release tag file digest asset_url installed running tmp actual
+  local target install_dir dest tag file digest installed running tmp actual
 
   need curl
   need tar
@@ -140,14 +139,12 @@ main() {
   dest=$install_dir/suru
 
   if [ -n "${SURU_VERSION:-}" ]; then
-    release=$(github "$API/releases/tags/$SURU_VERSION") \
-      || fail "Could not find the Suru release $SURU_VERSION."
+    tag=$SURU_VERSION
+    curl -fsI -o /dev/null "$RELEASES/tag/$tag" || fail "Could not find the Suru release $tag."
   else
-    release=$(github "$API/releases/latest") \
-      || fail "Could not read the latest Suru release from GitHub. If GitHub is rate limiting you, set GITHUB_TOKEN and try again."
+    tag=$(latest_tag) || tag=
+    [ -n "$tag" ] || fail "Could not read the latest Suru release from GitHub."
   fi
-  tag=$(printf '%s\n' "$release" | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
-  [ -n "$tag" ] || fail "Could not read the release's tag from GitHub's answer."
   # The repository releases its Relay too, under tags of its own, never marked latest; anything but a Suru
   # release tag here is not one this installs.
   if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -163,18 +160,13 @@ main() {
     fi
   fi
 
-  # An asset's API URL comes before its name in the release, and its digest after.
+  # Each release attaches its checksum beside each archive, so the archive is verified without GitHub's API.
   file=suru-$tag-$target.tar.gz
-  asset_url=$(printf '%s\n' "$release" | awk -v file="$file" -F'"' '
-    $2 == "url" && $4 ~ /\/releases\/assets\/[0-9]+$/ { url = $4 }
-    $2 == "name" && $4 == file { print url; exit }
-  ')
-  digest=$(printf '%s\n' "$release" | awk -v file="$file" -F'"' '
-    $2 == "name" && $4 == file { found = 1 }
-    found && $2 == "digest" { sub(/^sha256:/, "", $4); print $4; exit }
-  ')
-  [ -n "$asset_url" ] || fail "Suru $tag has no build for $target."
-  [ -n "$digest" ] || fail "Suru $tag publishes no checksum for $file, so it cannot be verified."
+  digest=$(curl -fsL "$RELEASES/download/$tag/$file.sha256" | awk '{ print $1; exit }') \
+    || fail "Suru $tag has no build for $target, or publishes no checksum for it, so it cannot be verified."
+  if ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+    fail "The published checksum for $file is not a SHA-256 digest, so it cannot be verified."
+  fi
 
   # Asked before anything is downloaded, and acted on only once the new binary is verified.
   running=false
@@ -193,12 +185,7 @@ main() {
   trap "rm -rf '$tmp'" EXIT
 
   say "Downloading Suru $tag for $target"
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    # The only download a private repository allows.
-    github -H 'Accept: application/octet-stream' -o "$tmp/$file" "$asset_url"
-  else
-    curl -fsSL -o "$tmp/$file" "https://github.com/$REPO/releases/download/$tag/$file"
-  fi || fail "Could not download $file."
+  curl -fsSL -o "$tmp/$file" "$RELEASES/download/$tag/$file" || fail "Could not download $file."
 
   actual=$(sha256 "$tmp/$file")
   if [ "$actual" != "$digest" ]; then
