@@ -300,6 +300,13 @@ fn assert_is_the_broker_note(note: &str, method: &str) {
         note.contains("Suru never re-routes them"),
         "{method}'s note leaves the Agent's own subagent tools in place: {note:?}"
     );
+    assert!(
+        note.contains(
+            "Call mcp__suru__list_workspaces to learn where the user's other work lives: the \
+             Workspaces they work in on this machine, each with what it is for."
+        ),
+        "{method}'s note says what list_workspaces is for: {note:?}"
+    );
 }
 
 #[tokio::test]
@@ -521,6 +528,10 @@ async fn a_sidekicks_thread_is_handed_its_own_tools_and_note_and_another_session
         "a Session elsewhere is told nothing of a Sidekick's Tools: {note:?}"
     );
     assert!(!tools.contains(&"list_sessions".to_owned()), "{tools:?}");
+    assert!(
+        tools.contains(&"list_workspaces".to_owned()),
+        "though it is offered list_workspaces, as every Agent is: {tools:?}"
+    );
 }
 
 /// The `thread/start` parameters Codex was sent for threads handed the Broker's note, once there

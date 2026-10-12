@@ -112,8 +112,8 @@ fn broker_server(config: &McpConfigFile) -> &Value {
 }
 
 /// Checks the note `launch` appends to the Agent's system prompt: it names each of the Broker's
-/// Tools by the name Claude gives an MCP server's Tools, says when to prefer them, and leaves the
-/// Agent's own subagent tools where they are.
+/// Tools by the name Claude gives an MCP server's Tools, says when to prefer them, leaves the
+/// Agent's own subagent tools where they are, and says what `list_workspaces` is for.
 fn assert_carries_the_broker_note(launch: &Launch) {
     let note = launch.value("--append-system-prompt");
     for tool in [
@@ -134,6 +134,13 @@ fn assert_carries_the_broker_note(launch: &Launch) {
     assert!(
         note.contains("Suru never re-routes them"),
         "the note leaves the Agent's own subagent tools in place: {note:?}"
+    );
+    assert!(
+        note.contains(
+            "Call mcp__suru__list_workspaces to learn where the user's other work lives: the \
+             Workspaces they work in on this machine, each with what it is for."
+        ),
+        "the note says what list_workspaces is for: {note:?}"
     );
 }
 
@@ -272,11 +279,14 @@ async fn a_sidekicks_launch_is_handed_its_own_tools_and_note_and_another_session
         !note.contains("list_sessions") && !note.contains("Sidekick"),
         "a Session elsewhere is told nothing of a Sidekick's Tools: {note:?}"
     );
+    let tools = listed_tools(broker_server(&claude.mcp_config_of(&launch))).await;
     assert!(
-        !listed_tools(broker_server(&claude.mcp_config_of(&launch)))
-            .await
-            .contains(&"list_sessions".to_owned()),
-        "nor is its token offered them"
+        !tools.contains(&"list_sessions".to_owned()),
+        "nor is its token offered them: {tools:?}"
+    );
+    assert!(
+        tools.contains(&"list_workspaces".to_owned()),
+        "though it is offered list_workspaces, as every Agent is: {tools:?}"
     );
     elsewhere.shutdown().await;
 }

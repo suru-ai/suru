@@ -240,6 +240,13 @@ async fn session_create_and_resume_append_the_broker_note_to_copilots_system_mes
             note.contains("Suru never re-routes them"),
             "{method}'s note leaves the Agent's own subagent tools in place: {note:?}"
         );
+        assert!(
+            note.contains(
+                "Call suru-list_workspaces to learn where the user's other work lives: the \
+                 Workspaces they work in on this machine, each with what it is for."
+            ),
+            "{method}'s note says what list_workspaces is for: {note:?}"
+        );
     }
 }
 
@@ -340,6 +347,10 @@ async fn a_sidekicks_session_is_handed_its_own_tools_and_note_and_another_sessio
         "a Session elsewhere is told of the Broker and nothing of a Sidekick's Tools: {other_note:?}"
     );
     assert!(!tools.contains(&"list_sessions".to_owned()), "{tools:?}");
+    assert!(
+        tools.contains(&"list_workspaces".to_owned()),
+        "though it is offered list_workspaces, as every Agent is: {tools:?}"
+    );
 }
 
 /// The `session.create` parameters Copilot was sent for Sessions handed the Broker's note, once
