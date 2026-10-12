@@ -44,7 +44,7 @@ use serde_json::{Value, json};
 use crate::{
     icon_catalog,
     protocol::{RepositoryLocation, SessionCatalogChange, Workspace, WorkspaceId},
-    storage::StoredWorkspace,
+    storage::WorkspaceProvenance,
 };
 
 use super::{SessionStore, SessionStoreState, workspace_description};
@@ -297,21 +297,30 @@ impl SessionStore {
                 .state
                 .lock()
                 .expect("Session store lock is not poisoned");
-            let presented = state.presented_path(workspace_id, None);
-            let stored = state.workspaces.entry(workspace_id.clone()).or_default();
-            if landing == IconLanding::FillAbsence && stored.icon.is_some() {
+            if landing == IconLanding::FillAbsence
+                && state
+                    .workspaces
+                    .get(workspace_id)
+                    .is_some_and(|stored| stored.icon.is_some())
+            {
                 return false;
             }
+            let presented = state.presented_path(workspace_id, None);
+            let provenance = state.landing_provenance(workspace_id);
+            let stored = self.enter_workspace(&mut state, workspace_id, presented, provenance);
             stored.icon = Some(icon.clone());
+            let provenance = stored.provenance.clone();
             match landing {
-                IconLanding::FillAbsence => self
-                    .storage
-                    .save_workspace_icon(workspace_id.clone(), icon.clone()),
-                IconLanding::Replace => self
-                    .storage
-                    .replace_workspace_icon(workspace_id.clone(), icon.clone()),
+                IconLanding::FillAbsence => {
+                    self.storage
+                        .save_workspace_icon(workspace_id.clone(), icon.clone(), provenance)
+                }
+                IconLanding::Replace => self.storage.replace_workspace_icon(
+                    workspace_id.clone(),
+                    icon.clone(),
+                    provenance,
+                ),
             }
-            self.record_presented_path(stored, workspace_id, presented);
             state.publish_catalog_change(SessionCatalogChange::WorkspaceIconChanged {
                 workspace_id: workspace_id.clone(),
                 icon: Some(icon),
@@ -352,34 +361,27 @@ impl SessionStore {
             }
         }
     }
-
-    /// Keeps `presented` as where the Workspace whose row `stored` is was
-    /// presented when its Icon or Description just landed, writing it behind
-    /// that landing's own write where it moved — which is what lets the
-    /// Workspace be named once no Session works in it.
-    pub(super) fn record_presented_path(
-        &self,
-        stored: &mut StoredWorkspace,
-        workspace_id: &WorkspaceId,
-        presented: Option<PathBuf>,
-    ) {
-        if let Some(path) = presented
-            && stored.path.as_ref() != Some(&path)
-        {
-            stored.path = Some(path.clone());
-            self.storage
-                .record_workspace_path(workspace_id.clone(), path);
-        }
-    }
 }
 
 impl SessionStoreState {
     /// Whether this server has heard of a Workspace at all: it holds a
-    /// durable row for it, or groups a Session under it now, one Suru could
-    /// not read included. A Workspace it knows neither way is not one
+    /// Registry entry for it, or groups a Session under it now, one Suru
+    /// could not read included. A Workspace it knows neither way is not one
     /// anything may be set on.
     pub(super) fn knows_workspace(&self, workspace_id: &WorkspaceId) -> bool {
         self.workspaces.contains_key(workspace_id) || self.grouped(workspace_id).is_some()
+    }
+
+    /// How a Workspace an Icon or a Description is landing on came to be
+    /// known, should the landing be what enters it in the Registry: by a
+    /// Session where one is grouped under it, and otherwise by being
+    /// described.
+    pub(super) fn landing_provenance(&self, workspace_id: &WorkspaceId) -> WorkspaceProvenance {
+        if self.grouped(workspace_id).is_some() {
+            WorkspaceProvenance::Session
+        } else {
+            WorkspaceProvenance::Description
+        }
     }
 
     /// Where a Workspace is presented now: at `presented_at`, where the

@@ -30,7 +30,7 @@ use crate::{
         SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot, SettleSessionRequest,
         ShutdownReason, SkillCatalog, SkillCatalogRequest, UpdateAgentSelectionRequest,
         UpdateApprovalPostureRequest, ViewSessionRequest, WorkspaceDescriptionChanged,
-        WorkspaceIconChanged, WorkspaceId,
+        WorkspaceIconChanged, WorkspaceId, WorkspaceListing,
     },
 };
 
@@ -817,6 +817,12 @@ impl ManagedClient {
 
     pub async fn list_sessions(&self, workspace: Option<&Path>) -> Result<Vec<SessionListItem>> {
         self.session_commands().list_sessions(workspace).await
+    }
+
+    /// Every Workspace this Client's own Server knows, as its Workspace
+    /// Registry lists them, spelled in that Server's own paths.
+    pub async fn list_workspaces(&self) -> Result<WorkspaceListing> {
+        self.session_commands().list_workspaces().await
     }
 
     pub async fn list_models(&self) -> Result<ModelCatalog> {
@@ -2087,6 +2093,22 @@ impl SessionCommandClient {
         };
         let response = request.send().await.context("send Session listing")?;
         decode_api_response(response, "Session listing").await
+    }
+
+    pub(crate) async fn list_workspaces(&self) -> Result<WorkspaceListing> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .get(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/workspaces",
+            )?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Workspace listing")?;
+        decode_api_response(response, "Workspace listing").await
     }
 
     pub(crate) async fn attach_session(

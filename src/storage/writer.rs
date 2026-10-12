@@ -45,7 +45,7 @@ use crate::{
 
 use super::{
     Landing, SessionSave, StorageError, StorageRepository, StoredResumeState, StoredSidekickAct,
-    WorkspaceWrite,
+    WorkspaceProvenance, WorkspaceWrite,
 };
 
 /// How long the writer waits without a command before an idle tick, and how
@@ -131,9 +131,13 @@ enum WriterCommand {
     },
     SaveLandingAgentSelection(AgentSelection),
     SaveModelCatalog(RememberedProviderCatalog),
+    /// A derived Icon filling a Workspace's absent one. Each Icon and
+    /// Description write carries the provenance of the Registry entry it
+    /// lands in, for a row it finds missing and so makes.
     SaveWorkspaceIcon {
         workspace_id: WorkspaceId,
         icon: String,
+        provenance: WorkspaceProvenance,
     },
     /// A user's own choice replacing whatever a Workspace's Icon table row
     /// already held — the durable half of the Session store's own
@@ -142,12 +146,14 @@ enum WriterCommand {
     ReplaceWorkspaceIcon {
         workspace_id: WorkspaceId,
         icon: String,
+        provenance: WorkspaceProvenance,
     },
     /// A derived Description filling a Workspace's absent one, on the same
     /// terms `SaveWorkspaceIcon` fills an absent Icon.
     SaveWorkspaceDescription {
         workspace_id: WorkspaceId,
         description: WorkspaceDescription,
+        provenance: WorkspaceProvenance,
     },
     /// A Description the user or a Sidekick set, or its clearing, replacing
     /// whatever the Workspace's row already held, on the same terms
@@ -155,12 +161,14 @@ enum WriterCommand {
     ReplaceWorkspaceDescription {
         workspace_id: WorkspaceId,
         description: Option<WorkspaceDescription>,
+        provenance: WorkspaceProvenance,
     },
-    /// Where a Workspace whose Icon or Description just landed is presented,
-    /// written into the row that landing made or kept.
-    RecordWorkspacePath {
+    /// A Workspace's Registry entry, made where it has none and otherwise
+    /// moved to where the Workspace is presented now.
+    RecordWorkspace {
         workspace_id: WorkspaceId,
         path: PathBuf,
+        provenance: WorkspaceProvenance,
     },
     /// A Session's Resume State, landed after the save the Session owed, if
     /// any, since the state's row names the Session's.
@@ -385,10 +393,17 @@ impl Writer {
             // Best-effort on the same terms as a remembered Model Catalog: a
             // Workspace Icon that fails to persist costs nothing beyond the
             // next Session in that Workspace deriving one again.
-            WriterCommand::SaveWorkspaceIcon { workspace_id, icon } => {
-                if let Err(error) =
-                    repository.write_workspace_icon(workspace_id, icon, WorkspaceWrite::FillAbsence)
-                {
+            WriterCommand::SaveWorkspaceIcon {
+                workspace_id,
+                icon,
+                provenance,
+            } => {
+                if let Err(error) = repository.write_workspace_icon(
+                    workspace_id,
+                    icon,
+                    &provenance,
+                    WorkspaceWrite::FillAbsence,
+                ) {
                     tracing::warn!("could not save a Workspace Icon: {error}");
                 }
             }
@@ -396,10 +411,17 @@ impl Writer {
             // choice that fails to persist here still stands in memory for
             // the rest of this process, and only a restart would ever see the
             // table's stale row again.
-            WriterCommand::ReplaceWorkspaceIcon { workspace_id, icon } => {
-                if let Err(error) =
-                    repository.write_workspace_icon(workspace_id, icon, WorkspaceWrite::Replace)
-                {
+            WriterCommand::ReplaceWorkspaceIcon {
+                workspace_id,
+                icon,
+                provenance,
+            } => {
+                if let Err(error) = repository.write_workspace_icon(
+                    workspace_id,
+                    icon,
+                    &provenance,
+                    WorkspaceWrite::Replace,
+                ) {
                     tracing::warn!("could not save a chosen Workspace Icon: {error}");
                 }
             }
@@ -408,10 +430,12 @@ impl Writer {
             WriterCommand::SaveWorkspaceDescription {
                 workspace_id,
                 description,
+                provenance,
             } => {
                 if let Err(error) = repository.write_workspace_description(
                     workspace_id,
                     Some(description),
+                    &provenance,
                     WorkspaceWrite::FillAbsence,
                 ) {
                     tracing::warn!("could not save a Workspace Description: {error}");
@@ -420,21 +444,29 @@ impl Writer {
             WriterCommand::ReplaceWorkspaceDescription {
                 workspace_id,
                 description,
+                provenance,
             } => {
                 if let Err(error) = repository.write_workspace_description(
                     workspace_id,
                     description,
+                    &provenance,
                     WorkspaceWrite::Replace,
                 ) {
                     tracing::warn!("could not save a set Workspace Description: {error}");
                 }
             }
-            // Best-effort as the landing it follows is: a path that fails to
-            // persist costs only listing the Workspace once no Session works
-            // in it, after a restart.
-            WriterCommand::RecordWorkspacePath { workspace_id, path } => {
-                if let Err(error) = repository.write_workspace_path(workspace_id, path) {
-                    tracing::warn!("could not save where a Workspace is presented: {error}");
+            // Best-effort as a Workspace's Icon is: an entry that fails to
+            // persist costs only listing the Workspace after a restart until
+            // a Session working there enters it again.
+            WriterCommand::RecordWorkspace {
+                workspace_id,
+                path,
+                provenance,
+            } => {
+                if let Err(error) =
+                    repository.write_workspace_entry(workspace_id, path, &provenance)
+                {
+                    tracing::warn!("could not save a Workspace Registry entry: {error}");
                 }
             }
             WriterCommand::SaveResumeState {
@@ -774,20 +806,34 @@ impl StorageSink {
     /// Records a Workspace's Icon, off the Session store's own commit path:
     /// the in-memory guard against overwriting one is already applied by the
     /// time this fires, so this is purely the durable half landing behind it.
-    pub(crate) fn save_workspace_icon(&self, workspace_id: WorkspaceId, icon: String) {
-        let _ = self
-            .commands
-            .send(WriterCommand::SaveWorkspaceIcon { workspace_id, icon });
+    pub(crate) fn save_workspace_icon(
+        &self,
+        workspace_id: WorkspaceId,
+        icon: String,
+        provenance: WorkspaceProvenance,
+    ) {
+        let _ = self.commands.send(WriterCommand::SaveWorkspaceIcon {
+            workspace_id,
+            icon,
+            provenance,
+        });
     }
 
     /// Records a user's own choice of a Workspace's Icon, replacing whatever
     /// the table already held for it — off the Session store's own commit
     /// path the same way [`Self::save_workspace_icon`] is, but for the
     /// unconditional half of that commit rather than the fill-an-absence one.
-    pub(crate) fn replace_workspace_icon(&self, workspace_id: WorkspaceId, icon: String) {
-        let _ = self
-            .commands
-            .send(WriterCommand::ReplaceWorkspaceIcon { workspace_id, icon });
+    pub(crate) fn replace_workspace_icon(
+        &self,
+        workspace_id: WorkspaceId,
+        icon: String,
+        provenance: WorkspaceProvenance,
+    ) {
+        let _ = self.commands.send(WriterCommand::ReplaceWorkspaceIcon {
+            workspace_id,
+            icon,
+            provenance,
+        });
     }
 
     /// Records a derived Workspace Description where the table holds none,
@@ -797,10 +843,12 @@ impl StorageSink {
         &self,
         workspace_id: WorkspaceId,
         description: WorkspaceDescription,
+        provenance: WorkspaceProvenance,
     ) {
         let _ = self.commands.send(WriterCommand::SaveWorkspaceDescription {
             workspace_id,
             description,
+            provenance,
         });
     }
 
@@ -811,22 +859,32 @@ impl StorageSink {
         &self,
         workspace_id: WorkspaceId,
         description: Option<WorkspaceDescription>,
+        provenance: WorkspaceProvenance,
     ) {
         let _ = self
             .commands
             .send(WriterCommand::ReplaceWorkspaceDescription {
                 workspace_id,
                 description,
+                provenance,
             });
     }
 
-    /// Records where a Workspace is presented into the row its Icon or
-    /// Description just landed in, off the Session store's own commit path
-    /// and behind that landing's own write.
-    pub(crate) fn record_workspace_path(&self, workspace_id: WorkspaceId, path: PathBuf) {
-        let _ = self
-            .commands
-            .send(WriterCommand::RecordWorkspacePath { workspace_id, path });
+    /// Records a Workspace in the Registry as presented at `path` — an entry
+    /// known by `provenance` where it has none, or the entry it has moved to
+    /// `path` — off the Session store's own commit path, behind every write
+    /// the store queued before it.
+    pub(crate) fn record_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        path: PathBuf,
+        provenance: WorkspaceProvenance,
+    ) {
+        let _ = self.commands.send(WriterCommand::RecordWorkspace {
+            workspace_id,
+            path,
+            provenance,
+        });
     }
 
     /// Records a Sidekick's latest act on a Session that no change to the

@@ -43,6 +43,7 @@ mod working;
 mod workspace_descriptions;
 mod workspace_icon_choice;
 mod workspace_icons;
+mod workspace_registry;
 
 mod approval_posture;
 mod approvals;

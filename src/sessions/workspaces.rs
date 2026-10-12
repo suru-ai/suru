@@ -1,7 +1,10 @@
+use std::path::PathBuf;
+
 use super::{SessionStore, SessionStoreState};
 use crate::{
     protocol::{SessionChange, SessionId, Workspace, WorkspaceId},
     source_control::SourceControlService,
+    storage::{StoredWorkspace, WorkspaceProvenance},
 };
 
 impl SessionStoreState {
@@ -43,34 +46,33 @@ impl SessionStore {
             .find(|record| &record.summary.session.workspace.id == id)
             .map(|record| record.summary.session.workspace.clone())
     }
-    /// Every Workspace this server knows, as a listing of Workspaces names
-    /// them: first those the Sessions a listing holds work in — every
-    /// top-level Session's that says, readable or not, as [`Self::list`]
-    /// lists them — each once, most recently worked in first; then those it
-    /// holds a Description or Icon for though no such Session works in them,
-    /// by path. Each is dressed in what the `workspaces` table holds for it
-    /// now. One known only by its row is given as its row presents it — its
-    /// identity, the path it was last presented by, and what it carries —
-    /// with nothing of its Repository, which only a resolution reads, so no
-    /// source control is detected for it; one whose row says nowhere, having
-    /// landed before rows kept a path, cannot be named and is left out.
+    /// Every Workspace this server knows, as its Workspace Registry lists
+    /// them (ADR 0051): first those the Sessions a listing holds work in —
+    /// every top-level Session's that says, readable or not, as
+    /// [`Self::list`] lists them — most recently worked in first; then the
+    /// rest, by path. Each is given as its entry presents it — its identity
+    /// and the path it was last presented by — dressed in what the entry
+    /// carries, with nothing of its Repository, which only a resolution
+    /// reads; the Sessions only order them. An entry that says nowhere,
+    /// having landed before rows kept a path, cannot be named and is left
+    /// out until a Session working there presents it.
     pub(crate) fn listed_workspaces(&self) -> Vec<Workspace> {
-        let listed = self.list(None);
-        let state = self.state.lock().unwrap();
-        let mut workspaces = crate::protocol::distinct_workspaces(
-            listed
+        let worked = self
+            .list(None)
+            .iter()
+            .filter_map(crate::protocol::SessionListItem::workspace)
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        let recency = |workspace: &Workspace| {
+            worked
                 .iter()
-                .filter_map(crate::protocol::SessionListItem::workspace),
-        );
-        // A Session Suru could not read keeps the copy of its Workspace it
-        // was restored with, which the table may since have moved past.
-        for workspace in &mut workspaces {
-            state.dress_workspace(workspace);
-        }
-        let mut unworked = state
+                .position(|id| id == &workspace.id)
+                .unwrap_or(usize::MAX)
+        };
+        let state = self.state.lock().unwrap();
+        let mut workspaces = state
             .workspaces
             .iter()
-            .filter(|(id, _)| !workspaces.iter().any(|workspace| &workspace.id == *id))
             .filter_map(|(id, stored)| {
                 let mut workspace = Workspace {
                     id: id.clone(),
@@ -84,10 +86,43 @@ impl SessionStore {
                 Some(workspace)
             })
             .collect::<Vec<_>>();
-        unworked.sort_by(|left, right| left.path.cmp(&right.path));
-        workspaces.extend(unworked);
+        workspaces.sort_by(|left, right| {
+            recency(left)
+                .cmp(&recency(right))
+                .then_with(|| left.path.cmp(&right.path))
+        });
         workspaces
     }
+
+    /// Enters a Workspace in the Registry the moment it is seen: an entry
+    /// known by `provenance` where it has none, presented at `presented`
+    /// where that says anywhere. An entry it already has keeps how it came
+    /// to be known and everything it carries, and is only moved to where the
+    /// Workspace is presented now — a main root learned since, say. The
+    /// durable write is queued under the store's own lock, so it lands in
+    /// the order the store decided it, among the Icon and Description writes
+    /// beside it. Answers the entry.
+    pub(super) fn enter_workspace<'state>(
+        &self,
+        state: &'state mut SessionStoreState,
+        workspace_id: &WorkspaceId,
+        presented: Option<PathBuf>,
+        provenance: WorkspaceProvenance,
+    ) -> &'state mut StoredWorkspace {
+        let stored = state
+            .workspaces
+            .entry(workspace_id.clone())
+            .or_insert_with(|| StoredWorkspace::known_by(provenance));
+        if let Some(path) = presented
+            && stored.path.as_ref() != Some(&path)
+        {
+            stored.path = Some(path.clone());
+            self.storage
+                .record_workspace(workspace_id.clone(), path, stored.provenance.clone());
+        }
+        stored
+    }
+
     pub(crate) async fn discover_workspaces(
         &self,
         source_control: &SourceControlService,
@@ -194,6 +229,17 @@ impl SessionStore {
         mut checkout: Option<crate::protocol::CheckoutAssociation>,
     ) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap();
+        if !state.sessions.contains_key(&id) {
+            return Ok(());
+        }
+        // A Session found working in a Workspace makes it known, whatever
+        // else regrouping it changes.
+        self.enter_workspace(
+            &mut state,
+            &workspace.id,
+            Some(workspace.path.clone()),
+            WorkspaceProvenance::Session,
+        );
         // The table is authoritative for a Workspace's Icon and Description:
         // whatever resolution or a caller handed in, the current durable
         // reading wins, so every regrouped Session's own copy of its

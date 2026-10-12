@@ -1002,12 +1002,26 @@ impl SessionOperations {
             .await
     }
 
-    /// Every Workspace this Server knows, spelled in its own paths: what its
-    /// `GET /v1/workspaces` answers, a Peer included.
+    /// Every Workspace this Server knows, as its Workspace Registry lists
+    /// them, spelled in its own paths: what its `GET /v1/workspaces`
+    /// answers, a Peer included. An entry whose Repository source control
+    /// has read during this run is presented as that Repository is, so one
+    /// whose main checkout is not known is named so.
     pub(crate) fn workspace_listing(&self) -> WorkspaceListing {
+        let repositories = self.source_control.repositories();
+        let mut workspaces = self.sessions.listed_workspaces();
+        for workspace in &mut workspaces {
+            if let Some(repository) = repositories
+                .iter()
+                .find(|repository| repository.id.workspace_id() == workspace.id)
+            {
+                workspace.source_control = repository.availability.clone();
+                workspace.repository = Some(Box::new(repository.clone()));
+            }
+        }
         WorkspaceListing {
             workspace_paths: WorkspacePaths::discover(),
-            workspaces: self.sessions.listed_workspaces(),
+            workspaces,
         }
     }
 

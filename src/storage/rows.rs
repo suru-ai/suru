@@ -28,8 +28,9 @@ use crate::{
 
 use super::{
     StorageError, StoredResumeState, StoredSidekickAct, StoredSubagentIdentity, StoredWorkspace,
-    UnreadableStoredSession, activities, landing_agent_selection, messages, model_catalog, prompts,
-    provider_resume_states, provider_subagent_identities, sessions, sidekick_acts, turns,
+    UnreadableStoredSession, WorkspaceProvenance, activities, landing_agent_selection, messages,
+    model_catalog, prompts, provider_resume_states, provider_subagent_identities, sessions,
+    sidekick_acts, turns,
     unsaved::{SessionRows, UnsavedRows},
     workspaces,
 };
@@ -99,13 +100,12 @@ impl LandingAgentSelectionRow {
     }
 }
 
-/// A Workspace's durable, Workspace-owned state: its Icon and its
-/// Description. Nothing broader lives here, since ADR 0027 keeps no
-/// persisted registry of Repositories.
-/// `created_at` stamps the row's first write, whichever of the two made it;
-/// each later write of either moves `updated_at` alone, through the explicit
-/// conflict updates in `StorageRepository` rather than through this row's own
-/// `Insertable` derive.
+/// One entry of the Workspace Registry: a Workspace's presented root, its
+/// Icon and its Description, and how it came to be known, as JSON.
+/// `created_at` stamps the row's first write, whichever made it; each later
+/// write of the Icon or the Description moves `updated_at` alone, through the
+/// explicit conflict updates in `StorageRepository` rather than through this
+/// row's own `Insertable` derive, and no later write moves its provenance.
 #[derive(Insertable, Queryable, Selectable)]
 #[diesel(table_name = workspaces)]
 pub(super) struct WorkspaceRow {
@@ -115,62 +115,93 @@ pub(super) struct WorkspaceRow {
     updated_at: i64,
     description: Option<String>,
     description_set: bool,
-    /// Written apart from the Icon and the Description, once either has made
-    /// the row (see `StorageRepository::write_workspace_path`).
     path: Option<String>,
+    provenance: String,
 }
 
 impl WorkspaceRow {
-    pub(super) fn from_icon(workspace_id: WorkspaceId, icon: String, at: SessionTimestamp) -> Self {
+    /// An entry made by its first sighting, presented at `path` where a
+    /// column can spell it, and carrying nothing yet.
+    pub(super) fn entered(
+        workspace_id: WorkspaceId,
+        path: Option<String>,
+        provenance: &WorkspaceProvenance,
+        at: SessionTimestamp,
+    ) -> Self {
         let stamp = i64::try_from(at.0).unwrap_or(i64::MAX);
         Self {
             id: workspace_id.0,
-            icon: Some(icon),
+            icon: None,
             created_at: stamp,
             updated_at: stamp,
             description: None,
             description_set: false,
-            path: None,
+            path,
+            provenance: provenance_column(provenance),
+        }
+    }
+
+    pub(super) fn from_icon(
+        workspace_id: WorkspaceId,
+        icon: String,
+        provenance: &WorkspaceProvenance,
+        at: SessionTimestamp,
+    ) -> Self {
+        Self {
+            icon: Some(icon),
+            ..Self::entered(workspace_id, None, provenance, at)
         }
     }
 
     pub(super) fn from_description(
         workspace_id: WorkspaceId,
         description: Option<WorkspaceDescription>,
+        provenance: &WorkspaceProvenance,
         at: SessionTimestamp,
     ) -> Self {
-        let stamp = i64::try_from(at.0).unwrap_or(i64::MAX);
         let (description, description_set) = description.map_or((None, false), |description| {
             (Some(description.text), description.set)
         });
         Self {
-            id: workspace_id.0,
-            icon: None,
-            created_at: stamp,
-            updated_at: stamp,
             description,
             description_set,
-            path: None,
+            ..Self::entered(workspace_id, None, provenance, at)
         }
     }
 
-    /// The row as the Session store holds it. A Description is only ever
-    /// set with text, so a row whose text is absent carries none, whatever
-    /// its flag says.
-    pub(super) fn into_stored(self) -> (WorkspaceId, StoredWorkspace) {
+    /// The entry as the Session store holds it, or `None` where its
+    /// provenance no longer reads. A Description is only ever set with text,
+    /// so a row whose text is absent carries none, whatever its flag says.
+    pub(super) fn into_stored(self) -> Option<(WorkspaceId, StoredWorkspace)> {
+        let provenance = match serde_json::from_str(&self.provenance) {
+            Ok(provenance) => provenance,
+            Err(error) => {
+                tracing::warn!(
+                    workspace_id = %self.id,
+                    "a Workspace Registry entry's provenance no longer reads: {error}"
+                );
+                return None;
+            }
+        };
         let description = self.description.map(|text| WorkspaceDescription {
             text,
             set: self.description_set,
         });
-        (
+        Some((
             WorkspaceId(self.id),
             StoredWorkspace {
                 icon: self.icon,
                 description,
                 path: self.path.map(PathBuf::from),
+                provenance,
             },
-        )
+        ))
     }
+}
+
+/// How a Workspace came to be known, as the `provenance` column spells it.
+pub(super) fn provenance_column(provenance: &WorkspaceProvenance) -> String {
+    serde_json::to_string(provenance).expect("a Workspace's provenance always serializes")
 }
 
 /// One Sidekick's latest act on one Session, as the `sidekick_acts` table

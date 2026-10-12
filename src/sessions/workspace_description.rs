@@ -22,10 +22,9 @@
 //! the Workspace endpoint and a Sidekick's `set_workspace_description` set
 //! exactly the same one.
 //!
-//! Either way the Workspace's row also keeps the path it was presented by
-//! when its Description landed, so a Workspace described before any Session
-//! works in it, or after the last one is deleted, is still known by where it
-//! is.
+//! Either way the Workspace's Registry entry also keeps the path it was
+//! presented by when its Description landed, so a Workspace described before
+//! any Session works in it is known, and listed, by where it is.
 
 use std::{fmt, path::Path};
 
@@ -167,9 +166,10 @@ impl SessionStore {
     /// regrouping that follows reads the record as it then stands, so it is
     /// never stale either.
     ///
-    /// The row keeps where the Workspace is presented — at `presented_at`,
-    /// where the caller resolved it there — as
-    /// [`Self::record_presented_path`] keeps it.
+    /// A Workspace the Registry holds no entry for is entered as the landing
+    /// finds it — known by a Session where one is grouped under it, and
+    /// otherwise by being described — and the entry keeps where it is
+    /// presented: at `presented_at`, where the caller resolved it there.
     fn land_workspace_description(
         &self,
         workspace_id: &WorkspaceId,
@@ -195,24 +195,32 @@ impl SessionStore {
                 .state
                 .lock()
                 .expect("Session store lock is not poisoned");
-            let presented = state.presented_path(workspace_id, presented_at);
-            let stored = state.workspaces.entry(workspace_id.clone()).or_default();
-            match &description {
-                Some(derived @ WorkspaceDescription { set: false, .. }) => {
-                    if stored.description.is_some() {
-                        return false;
-                    }
-                    stored.description = description.clone();
-                    self.storage
-                        .save_workspace_description(workspace_id.clone(), derived.clone());
-                }
-                _ => {
-                    stored.description = description.clone();
-                    self.storage
-                        .replace_workspace_description(workspace_id.clone(), description.clone());
-                }
+            let derived = description.as_ref().filter(|description| !description.set);
+            if derived.is_some()
+                && state
+                    .workspaces
+                    .get(workspace_id)
+                    .is_some_and(|stored| stored.description.is_some())
+            {
+                return false;
             }
-            self.record_presented_path(stored, workspace_id, presented);
+            let presented = state.presented_path(workspace_id, presented_at);
+            let provenance = state.landing_provenance(workspace_id);
+            let stored = self.enter_workspace(&mut state, workspace_id, presented, provenance);
+            stored.description = description.clone();
+            let provenance = stored.provenance.clone();
+            match derived {
+                Some(derived) => self.storage.save_workspace_description(
+                    workspace_id.clone(),
+                    derived.clone(),
+                    provenance,
+                ),
+                None => self.storage.replace_workspace_description(
+                    workspace_id.clone(),
+                    description.clone(),
+                    provenance,
+                ),
+            }
             state.publish_catalog_change(SessionCatalogChange::WorkspaceDescriptionChanged {
                 workspace_id: workspace_id.clone(),
                 description,

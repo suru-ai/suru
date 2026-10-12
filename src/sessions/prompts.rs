@@ -641,6 +641,14 @@ impl SessionStore {
             }
             return Err(CreateSessionError::Unrecorded(format!("{error:#}")));
         }
+        // The Workspace it began in is known from now on, by the root it is
+        // presented by, whether or not this Session outlives it.
+        self.enter_workspace(
+            &mut state,
+            &snapshot.session.workspace.id,
+            Some(snapshot.session.workspace.path.clone()),
+            crate::storage::WorkspaceProvenance::Session,
+        );
         state.publish_catalog_change(SessionCatalogChange::Created { session_id });
         Ok(StoreOutcome::Created(snapshot))
     }

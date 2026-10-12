@@ -14,6 +14,7 @@ use diesel::{
     sql_types::{BigInt, Text},
 };
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     model_catalog::RememberedProviderCatalog,
@@ -45,7 +46,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20261007048200";
+const CURRENT_SCHEMA_VERSION: &str = "20261012000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -115,6 +116,7 @@ diesel::table! {
         description -> Nullable<Text>,
         description_set -> Bool,
         path -> Nullable<Text>,
+        provenance -> Text,
     }
 }
 
@@ -284,17 +286,47 @@ fn stamp_column(stamp: SessionTimestamp) -> i64 {
     i64::try_from(stamp.0).unwrap_or(i64::MAX)
 }
 
-/// What the `workspaces` table holds of one Workspace: the Icon and the
-/// Description it owns for itself, each absent until one lands, and the path
-/// it was presented by when one last did. Nothing broader lives there: ADR
-/// 0027 keeps no persisted registry of Repositories, so a Workspace's other
-/// facts are resolved fresh, and its path is read only where no Session
-/// working in it presents it afresh.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// One entry of the Workspace Registry, as the `workspaces` table holds it
+/// (ADR 0051): the path the Workspace is presented by — its presented root,
+/// as it was last resolved — the Icon and the Description it owns for
+/// itself, each absent until one lands, and how it came to be known. Its
+/// Repository is no part of it: that is resolved fresh from the path.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredWorkspace {
     pub(crate) icon: Option<String>,
     pub(crate) description: Option<WorkspaceDescription>,
+    /// Absent only for an entry that predates rows keeping a path, or whose
+    /// path no column can spell, until a Session presents it afresh.
     pub(crate) path: Option<PathBuf>,
+    pub(crate) provenance: WorkspaceProvenance,
+}
+
+impl StoredWorkspace {
+    /// An entry made just now, known by `provenance`, presented nowhere yet
+    /// and carrying nothing.
+    pub(crate) fn known_by(provenance: WorkspaceProvenance) -> Self {
+        Self {
+            icon: None,
+            description: None,
+            path: None,
+            provenance,
+        }
+    }
+}
+
+/// How a Workspace came to be known to this Server: the way its Registry
+/// entry was first made, which every later sighting leaves as it was (ADR
+/// 0051). Stored as JSON, so a way that must say more than its name — the
+/// Workspace Root a discovery found it under — carries it beside the name.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceProvenance {
+    /// A Session began there, or was found working there when its directory
+    /// was resolved again.
+    Session,
+    /// Someone described it, or chose its Icon, before any Session worked
+    /// there.
+    Description,
 }
 
 /// One act of a Sidekick on a Session, as the `sidekick_acts` table keeps it:
@@ -383,7 +415,7 @@ pub(crate) enum StorageError {
     WriteModelCatalog(String),
     WriteWorkspaceIcon(String),
     WriteWorkspaceDescription(String),
-    WriteWorkspacePath(String),
+    WriteWorkspaceEntry(String),
     WriteAttachment(String),
     WriteSidekickAct(String),
     WriteMemory(String),
@@ -437,8 +469,8 @@ impl fmt::Display for StorageError {
             Self::WriteWorkspaceDescription(message) => {
                 write!(formatter, "save a Workspace Description: {message}")
             }
-            Self::WriteWorkspacePath(message) => {
-                write!(formatter, "save where a Workspace is presented: {message}")
+            Self::WriteWorkspaceEntry(message) => {
+                write!(formatter, "save a Workspace Registry entry: {message}")
             }
             Self::WriteAttachment(message) => write!(formatter, "save an Attachment: {message}"),
             Self::WriteSidekickAct(message) => {
@@ -601,13 +633,12 @@ impl StorageRepository {
         .await
     }
 
-    /// Every Workspace this server holds an Icon or a Description for, as
-    /// the `workspaces` table holds them — its whole reading, since the table
-    /// carries nothing else (ADR 0027 keeps no persisted registry of
-    /// Repositories). A row that no longer decodes is left
-    /// out rather than failing startup: the next Session created in that
-    /// Workspace derives what it lacks again, exactly as if none had ever
-    /// landed.
+    /// The Workspace Registry, as the `workspaces` table holds it: every
+    /// Workspace this server has known, by its identity. A row that no
+    /// longer decodes is left out rather than failing startup: a Session
+    /// working there enters the Workspace again, and the next Session
+    /// created there derives what it lacks again, exactly as if none had
+    /// ever landed.
     pub(crate) async fn workspaces(
         &self,
     ) -> Result<HashMap<WorkspaceId, StoredWorkspace>, StorageError> {
@@ -618,7 +649,10 @@ impl StorageRepository {
                 .select(WorkspaceRow::as_select())
                 .load::<WorkspaceRow>(&mut connection)
                 .map_err(|error| StorageError::Read(error.to_string()))?;
-            Ok(rows.into_iter().map(WorkspaceRow::into_stored).collect())
+            Ok(rows
+                .into_iter()
+                .filter_map(WorkspaceRow::into_stored)
+                .collect())
         })
         .await
     }
@@ -751,15 +785,18 @@ impl StorageRepository {
     /// already did, and fills in a row a Description made alone. A chosen
     /// one ([`WorkspaceWrite::Replace`]) lands over whatever stood there.
     /// Only the Icon and `updated_at` move on conflict; `created_at` stays
-    /// whatever the row's first write stamped it.
+    /// whatever the row's first write stamped it, and the provenance
+    /// whatever made it, `provenance` being only what a row this write makes
+    /// is known by.
     fn write_workspace_icon(
         &self,
         workspace_id: WorkspaceId,
         icon: String,
+        provenance: &WorkspaceProvenance,
         write: WorkspaceWrite,
     ) -> Result<(), StorageError> {
         let stamp = SessionTimestamp::now();
-        let row = WorkspaceRow::from_icon(workspace_id, icon.clone(), stamp);
+        let row = WorkspaceRow::from_icon(workspace_id, icon.clone(), provenance, stamp);
         let mut connection = connect(&self.database_path)?;
         let upsert = diesel::insert_into(workspaces::table)
             .values(&row)
@@ -790,14 +827,17 @@ impl StorageRepository {
     /// set one, or none where it was cleared ([`WorkspaceWrite::Replace`]),
     /// over whatever stood there. A cleared Description is stored as no
     /// Description, not set, which is what lets the next derivation fill it.
+    /// A row this write makes is known by `provenance`.
     fn write_workspace_description(
         &self,
         workspace_id: WorkspaceId,
         description: Option<WorkspaceDescription>,
+        provenance: &WorkspaceProvenance,
         write: WorkspaceWrite,
     ) -> Result<(), StorageError> {
         let stamp = SessionTimestamp::now();
-        let row = WorkspaceRow::from_description(workspace_id, description.clone(), stamp);
+        let row =
+            WorkspaceRow::from_description(workspace_id, description.clone(), provenance, stamp);
         let (text, set) = description.map_or((None, false), |description| {
             (Some(description.text), description.set)
         });
@@ -823,23 +863,37 @@ impl StorageRepository {
         Ok(())
     }
 
-    /// Records the path a Workspace's row was presented by when its Icon or
-    /// Description last landed. A path no column can spell is left unsaid,
-    /// so such a Workspace is known by its Sessions alone, as one whose row
-    /// predates the column is.
-    fn write_workspace_path(
+    /// Records a Workspace in the Registry as presented at `path`: an entry
+    /// known by `provenance` where it has none, and otherwise the path alone,
+    /// the entry keeping how it came to be known and everything it carries.
+    /// A path no column can spell is left unsaid, so such a Workspace is
+    /// presented by its Sessions alone, as one whose row predates the column
+    /// is.
+    fn write_workspace_entry(
         &self,
         workspace_id: WorkspaceId,
         path: PathBuf,
+        provenance: &WorkspaceProvenance,
     ) -> Result<(), StorageError> {
-        let Some(path) = path.to_str() else {
-            return Ok(());
-        };
+        let path = path.to_str().map(str::to_owned);
+        let row = WorkspaceRow::entered(
+            workspace_id,
+            path.clone(),
+            provenance,
+            SessionTimestamp::now(),
+        );
         let mut connection = connect(&self.database_path)?;
-        diesel::update(workspaces::table.find(workspace_id.0))
-            .set(workspaces::path.eq(Some(path)))
-            .execute(&mut connection)
-            .map_err(|error| StorageError::WriteWorkspacePath(error.to_string()))?;
+        let insert = diesel::insert_into(workspaces::table)
+            .values(&row)
+            .on_conflict(workspaces::id);
+        match path {
+            Some(path) => insert
+                .do_update()
+                .set(workspaces::path.eq(Some(path)))
+                .execute(&mut connection),
+            None => insert.do_nothing().execute(&mut connection),
+        }
+        .map_err(|error| StorageError::WriteWorkspaceEntry(error.to_string()))?;
         Ok(())
     }
 
