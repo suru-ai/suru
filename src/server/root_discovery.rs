@@ -204,3 +204,72 @@ fn rooted_at(directory: &Path, reading: ResolvedWorkspace) -> Option<Workspace> 
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A path rooted as this platform roots absolute paths.
+    fn absolute(components: &[&str]) -> PathBuf {
+        components.iter().fold(
+            PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" }),
+            |path, component| path.join(component),
+        )
+    }
+
+    #[test]
+    fn a_roots_children_are_its_directories_but_the_hidden_ones() {
+        let root = tempfile::tempdir().expect("create a Root");
+        let root = crate::paths::canonical(root.path()).expect("read the Root canonically");
+        for directory in ["atlas", "ledger", ".tooling", "notes/deeper"] {
+            std::fs::create_dir_all(root.join(directory)).expect("create a child directory");
+        }
+        std::fs::write(root.join("README.md"), "Projects").expect("write a file");
+        let elsewhere = tempfile::tempdir().expect("create a directory elsewhere");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(elsewhere.path(), root.join("linked"))
+            .expect("link a directory elsewhere into the Root");
+
+        let mut children = child_directories(&root).expect("read the Root");
+        children.sort();
+
+        let mut expected = vec![root.join("atlas"), root.join("ledger"), root.join("notes")];
+        #[cfg(unix)]
+        expected.push(crate::paths::canonical(elsewhere.path()).expect("read it canonically"));
+        expected.sort();
+        assert_eq!(
+            children, expected,
+            "each directory directly within the Root, a link read as what it names, but neither \
+             a hidden directory, a file, nor anything deeper"
+        );
+    }
+
+    #[test]
+    fn a_root_that_is_not_there_cannot_be_read() {
+        let home = tempfile::tempdir().expect("create a home");
+        let missing = home.path().join("unplugged");
+        assert!(child_directories(&missing).is_err());
+        assert!(!missing.exists(), "reading a Root makes nothing");
+    }
+
+    #[test]
+    fn a_root_beginning_with_a_tilde_is_read_beneath_the_home() {
+        let home = absolute(&["home", "user"]);
+        assert_eq!(expand("~", Some(&home)), Some(home.clone()));
+        assert_eq!(
+            expand(&format!("~{}src", std::path::MAIN_SEPARATOR), Some(&home)),
+            Some(home.join("src"))
+        );
+        assert_eq!(expand("~/src", None), None, "no home is known");
+        assert_eq!(
+            expand("~someone/src", Some(&home)),
+            None,
+            "another user's home is not this Server's to read"
+        );
+        let projects = absolute(&["work", "projects"]);
+        assert_eq!(
+            expand(projects.to_str().expect("UTF-8"), Some(&home)),
+            Some(projects.clone())
+        );
+    }
+}
