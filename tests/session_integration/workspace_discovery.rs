@@ -597,6 +597,108 @@ async fn a_root_within_another_root_is_a_root_and_never_a_workspace() {
     );
 }
 
+/// A Root respelled is the same Root, so a Repository discovered directly
+/// within it, once named a Root of its own, is no Workspace, as it would be
+/// had the Root never been respelled.
+#[tokio::test]
+async fn a_root_named_within_a_root_since_respelled_is_never_a_workspace() {
+    const CHANNEL: &str = "workspace-discovery-nested-in-respelled";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    let (config, server) = server_with_roots(&home, CHANNEL, &["~/projects"], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let atlas_id = repository_id(&atlas.join(".git"));
+    assert_eq!(
+        listed(&client)
+            .await
+            .iter()
+            .map(located)
+            .collect::<Vec<_>>(),
+        [(atlas_id.clone(), atlas.clone())]
+    );
+    let name = |roots: &[&str]| SettingMutation::WorkspaceRoots {
+        value: Some(roots.iter().map(|root| (*root).to_owned()).collect()),
+    };
+    client
+        .mutate_setting(name(&[spelled(&projects)]))
+        .await
+        .expect("spell the Root out in full");
+
+    client
+        .mutate_setting(name(&[spelled(&projects), spelled(&atlas)]))
+        .await
+        .expect("name the Repository within the Root a Root of its own");
+    assert_eq!(
+        listed(&client).await,
+        [],
+        "a Root within the Root respelled is no Workspace"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    assert!(
+        !entries_on_disk(&config).contains_key(&atlas_id),
+        "and is dropped from disk"
+    );
+}
+
+/// What was discovered under a Root and has since come to be presented at
+/// a Root is dropped by whichever spelling of the Root it was discovered
+/// under now finds it there. Here the Config Document names the Roots
+/// beside a key it cannot take, so nothing discovered is settled at start
+/// and the entry is known still by the Root's old spelling.
+#[tokio::test]
+async fn a_root_within_a_root_spelled_anew_is_dropped_by_the_root_it_was_discovered_under() {
+    const CHANNEL: &str = "workspace-discovery-nested-spelled-anew";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    let (config, server) = server_with_roots(&home, CHANNEL, &["~/projects"], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let atlas_id = repository_id(&atlas.join(".git"));
+    assert_eq!(
+        listed(&client)
+            .await
+            .iter()
+            .map(located)
+            .collect::<Vec<_>>(),
+        [(atlas_id.clone(), atlas.clone())]
+    );
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+
+    std::fs::write(
+        home.join("config").join("suru.jsonc"),
+        json!({
+            "workspace": {
+                "roots": [spelled(&projects), spelled(&atlas)],
+                "rootz": [],
+            }
+        })
+        .to_string(),
+    )
+    .expect("write the Config Document");
+    let (_, restarted) = server_beneath(&home, CHANNEL, Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    assert_eq!(
+        listed(&client).await,
+        [],
+        "the Root's scan, in its new spelling, drops what was discovered there in its old one"
+    );
+
+    drop(client);
+    restarted.shutdown().await.expect("shut down server");
+    assert!(
+        !entries_on_disk(&config).contains_key(&atlas_id),
+        "and it is dropped from disk"
+    );
+}
+
 /// A linked Worktree directly within a Root counts for its Repository's
 /// Workspace, presented by its main root outside the Root and known by
 /// discovery under the Root, and is entered as no Workspace of its own; one

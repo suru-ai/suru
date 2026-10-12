@@ -373,20 +373,43 @@ impl SessionStore {
         }
     }
 
-    /// Drops the entry `workspace_id`, which discovery under the Workspace
-    /// Root `root` found presented at a Workspace Root, where it is known by
-    /// discovery under that Root and no Session belongs to it, its Icon and
-    /// Description with it: a Root is never a Workspace. Every entry known
-    /// otherwise is left alone.
-    pub(crate) fn forget_discovered(&self, workspace_id: &WorkspaceId, root: &str) {
+    /// The Workspace Root the entry `workspace_id` was discovered under, as
+    /// the Setting spelled it then, where it was.
+    pub(crate) fn discovered_under(&self, workspace_id: &WorkspaceId) -> Option<String> {
+        match &self
+            .state
+            .lock()
+            .unwrap()
+            .workspaces
+            .get(workspace_id)?
+            .provenance
+        {
+            WorkspaceProvenance::Discovered { root } => Some(root.clone()),
+            _ => None,
+        }
+    }
+
+    /// Drops the entry `workspace_id`, which discovery under a Workspace
+    /// Root found presented at a Workspace Root, where it is known by
+    /// discovery under that Root — spelled as one of `spellings` — and no
+    /// Session belongs to it, its Icon and Description with it: a Root is
+    /// never a Workspace. Every entry known otherwise is left alone.
+    pub(crate) fn forget_discovered(&self, workspace_id: &WorkspaceId, spellings: &[String]) {
         let mut state = self.state.lock().unwrap();
-        let discovered_there = state.workspaces.get(workspace_id).is_some_and(|stored| {
-            matches!(
-                &stored.provenance,
-                WorkspaceProvenance::Discovered { root: under } if under == root
-            )
-        });
-        if !discovered_there || state.grouped_besides(workspace_id, None) {
+        let Some(root) = state
+            .workspaces
+            .get(workspace_id)
+            .and_then(|stored| match &stored.provenance {
+                WorkspaceProvenance::Discovered { root } => {
+                    spellings.contains(root).then_some(root)
+                }
+                _ => None,
+            })
+            .cloned()
+        else {
+            return;
+        };
+        if state.grouped_besides(workspace_id, None) {
             return;
         }
         state.workspaces.remove(workspace_id);

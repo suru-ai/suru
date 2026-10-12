@@ -21,11 +21,12 @@
 //! wherever that is, and never as one of its own (ADR 0023); one of a
 //! Repository whose main root is unknown counts for nothing, and one of a
 //! Repository presented directly within another Root counts there alone,
-//! so its entry goes only with that Root. A Workspace
-//! presented at a Workspace Root — this one, or another named within it — is
-//! never entered, so a Root is never a Workspace, and an entry discovered
-//! under this Root that has since come to be presented at one is dropped,
-//! unless a Session belongs to it. Roots are told apart as directories (see
+//! so its entry goes only with that Root. A Workspace presented at a
+//! Workspace Root — this one, or another named within it — is never
+//! entered, so a Root is never a Workspace, and an entry discovered under
+//! this Root, in whichever spelling of it, that has since come to be
+//! presented at one is dropped, unless a Session belongs to it. Roots are
+//! told apart as directories (see
 //! [`super::root_directories`]); one that cannot be resolved is told by its
 //! writing alone, so a Root on a mount gone quiet holds back no other Root's
 //! discoveries. A Root naming Suru's own data directory, where the Sidekick
@@ -68,7 +69,7 @@ use tokio::sync::watch;
 
 use super::{reads_apart::ReadsApart, root_directories};
 use crate::{
-    protocol::{CheckoutKind, RepositoryLocation, ResolvedWorkspace, Workspace},
+    protocol::{CheckoutKind, RepositoryLocation, ResolvedWorkspace, Workspace, WorkspaceId},
     provider::wait_for_shutdown,
     sessions::SessionStore,
     source_control::{SourceControlService, is_directory, is_hidden},
@@ -477,6 +478,37 @@ impl RegistryScan {
             resolutions: ReadsApart::new("suru-root-discovery-resolution", RESOLUTIONS_AT_ONCE),
         }
     }
+
+    /// The spellings of the Root `root`, which leads to `resolved`, an entry
+    /// discovered under it may record: `root` itself, and the Root the entry
+    /// `workspace_id` was discovered under where that names the same
+    /// directory, spelled otherwise — before the change that respelled it
+    /// settled what was discovered under it, say.
+    async fn spellings_of(
+        &self,
+        root: &str,
+        resolved: &Path,
+        workspace_id: &WorkspaceId,
+    ) -> Vec<String> {
+        let mut spellings = vec![root.to_owned()];
+        if let Some(under) = self
+            .sessions
+            .discovered_under(workspace_id)
+            .filter(|under| under != root)
+        {
+            let named = root_directories::resolve(
+                &self.resolutions,
+                self.home.as_deref(),
+                self.wait,
+                std::iter::once(&under),
+            )
+            .await;
+            if named[&under].names(resolved) {
+                spellings.push(under);
+            }
+        }
+        spellings
+    }
 }
 
 #[async_trait]
@@ -580,6 +612,14 @@ impl RootScan for RegistryScan {
                     continue;
                 }
             };
+            let repository = reading.workspace.repository.clone();
+            let counted = counted_for(&child, reading);
+            let spellings = match &counted {
+                Some(workspace) if at_a_root(&workspace.path) => {
+                    self.spellings_of(root, &resolved, &workspace.id).await
+                }
+                _ => Vec::new(),
+            };
             // What the reading teaches, of the Registry and of the
             // Repositories this Server remembers alike, is taken only while
             // this scan is current, so a reading begun before the directory
@@ -587,12 +627,12 @@ impl RootScan for RegistryScan {
             // nor while a Clone is landing there, which enters its own.
             let mut entered = false;
             commit.while_current_at(&child, || {
-                if let Some(read) = reading.workspace.repository.as_deref() {
+                if let Some(read) = repository.as_deref() {
                     self.source_control.learn_main_checkout(read);
                 }
-                match counted_for(&child, reading) {
+                match counted {
                     Some(workspace) if at_a_root(&workspace.path) => {
-                        self.sessions.forget_discovered(&workspace.id, root);
+                        self.sessions.forget_discovered(&workspace.id, &spellings);
                     }
                     // A linked Worktree of a Repository presented directly
                     // within another Root is that Root's to discover, so
