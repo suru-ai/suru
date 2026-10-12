@@ -645,18 +645,6 @@ impl SourceControlService {
             .cloned()
             .collect()
     }
-    /// The Repository `directory` is read as now, where it reads as one and
-    /// source control could read it: read as a Session's directory is, but
-    /// not remembered, so a Repository found this way joins no checkout
-    /// observation.
-    pub(crate) async fn read_repository(&self, directory: &Path) -> Option<Repository> {
-        let repository = self
-            .discover_in_batch(&mut DiscoveryBatch::default(), directory)
-            .await
-            .workspace
-            .repository?;
-        (repository.availability == SourceControlAvailability::Available).then_some(*repository)
-    }
     pub(crate) async fn list_checkouts(
         &self,
         repository: &Repository,
@@ -816,11 +804,12 @@ impl SourceControlService {
     /// What `directory` reads as to source control — the Sidekick
     /// Workspace's as a directory of its own — without this Server
     /// remembering the Repository found there. Discovery reads every
-    /// Repository directly within each Workspace Root this way, since a
-    /// remembered Repository is one checkout observation watches the
-    /// Worktrees of for as long as the Server runs. A Repository already
-    /// remembered without its main checkout learns it from the reading all
-    /// the same, so it is presented by that checkout from then on.
+    /// Repository directly within each Workspace Root this way, and Reclaim
+    /// each Workspace Registry entry nothing else names, since a remembered
+    /// Repository is one checkout observation watches the Worktrees of for
+    /// as long as the Server runs. A Repository already remembered without
+    /// its main checkout learns it from the reading all the same, so it is
+    /// presented by that checkout from then on.
     pub(crate) async fn read_unremembered(&self, directory: &Path) -> ResolvedWorkspace {
         if let Some(reading) = self.sidekick_reading(directory) {
             return reading;

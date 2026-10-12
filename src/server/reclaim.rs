@@ -5,7 +5,7 @@ use crate::{
     protocol::{
         AutoReclaim, CheckoutAssociation, CheckoutBranchOutcome, CheckoutKind, CheckoutReclaim,
         CheckoutReclaimPhase, CheckoutRemovalTarget, ReclaimOperationId, Repository,
-        RepositoryLocation,
+        RepositoryLocation, SourceControlAvailability,
     },
     sessions::SessionStore,
     source_control::{PreparationStore, SourceControlService, recovery_for_branch_outcome},
@@ -714,15 +714,22 @@ impl RegistryReads {
     }
 }
 
-/// The Repository `path` is read as, on a runtime of the calling thread's
-/// own, so a read that never answers leans on nothing of the Server's and
-/// keeps no runtime from shutting down.
+/// The Repository `path` is read as now, where it reads as one and source
+/// control could read it, on a runtime of the calling thread's own, so a
+/// read that never answers leans on nothing of the Server's and keeps no
+/// runtime from shutting down. It is read without being remembered, so a
+/// Repository found this way joins no checkout observation.
 fn read_on_own_runtime(source_control: &SourceControlService, path: &Path) -> Option<Repository> {
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
-        Ok(runtime) => runtime.block_on(source_control.read_repository(path)),
+        Ok(runtime) => runtime
+            .block_on(source_control.read_unremembered(path))
+            .workspace
+            .repository
+            .filter(|repository| repository.availability == SourceControlAvailability::Available)
+            .map(|repository| *repository),
         Err(error) => {
             tracing::warn!(
                 repository = %path.display(),
