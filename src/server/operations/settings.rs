@@ -164,11 +164,11 @@ impl SettingsAdoption {
         // no longer hold, so the step at start never decides on Roots put
         // in force meanwhile.
         let held = registry_standing.hold_roots().await;
-        let (roots, named_before) = {
+        let (roots, named_whole_before) = {
             let before = self.snapshot.borrow();
             (
                 before.settings.workspace.roots.clone(),
-                crate::settings::workspace_roots_named_whole(&before).map(<[String]>::to_vec),
+                crate::settings::workspace_roots_named_whole(&before).is_some(),
             )
         };
         // The edit is filesystem work, and the CST handles it parses the
@@ -205,11 +205,10 @@ impl SettingsAdoption {
             // Only Roots the user named whole, before and after alike, say
             // that one was taken away: those a document left that could not
             // be read whole say nothing.
-            if let (Some(before), Some(after)) = (
-                named_before.as_deref(),
-                crate::settings::workspace_roots_named_whole(&snapshot),
-            ) {
-                registry_standing.roots_changed(&held, before, after).await;
+            if named_whole_before
+                && let Some(after) = crate::settings::workspace_roots_named_whole(&snapshot)
+            {
+                registry_standing.roots_changed(&held, after).await;
             }
             Some(ticket)
         };

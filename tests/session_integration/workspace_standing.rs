@@ -854,3 +854,132 @@ async fn a_server_started_on_a_config_root_it_cannot_search_keeps_every_discover
     drop(client);
     restarted.shutdown().await.expect("shut down server");
 }
+
+/// A Root spelled as a link on a removable drive, respelled by hand while
+/// the Server was stopped as the local directory the link led to, and the
+/// Server started before the drive is back: nothing there for the link
+/// tells nothing, so what was discovered through it is kept with what it
+/// carries, and once the drive is back the two spellings are told for the
+/// one directory they are. Links are made where a mode of the filesystem
+/// says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_root_respelled_as_where_its_link_led_while_its_drive_is_gone_takes_nothing_away() {
+    const CHANNEL: &str = "workspace-standing-root-link-drive-gone";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("local").join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    let drive = home.join("drive");
+    std::fs::create_dir(&drive).expect("create the drive");
+    let link = drive.join("projects");
+    std::os::unix::fs::symlink(&projects, &link).expect("link to the local projects");
+    let (_, server) = server_with_roots(&home, CHANNEL, &[spelled(&link)], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    client
+        .set_workspace_description(
+            &repository_id(&atlas.join(".git")),
+            Some(&atlas),
+            "Maps of everything.",
+        )
+        .await
+        .expect("describe the Repository discovered through the link");
+    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+
+    let unmounted = home.join("unmounted");
+    std::fs::rename(&drive, &unmounted).expect("take the drive away");
+    for (state, drive_back) in [("the drive gone", false), ("the drive back", true)] {
+        if drive_back {
+            std::fs::rename(&unmounted, &drive).expect("bring the drive back");
+        }
+        let (_, restarted) =
+            server_with_roots(&home, CHANNEL, &[spelled(&projects)], Duration::ZERO).await;
+        restarted.workspace_discovery_settled().await;
+        let client = connected_client(&home.join("state"), CHANNEL).await;
+        assert_eq!(
+            standings(&client).await,
+            [(atlas.clone(), None)],
+            "started with {state}, the Server keeps what was discovered through the link"
+        );
+        assert_eq!(
+            description_at(&client, &atlas).await,
+            set("Maps of everything."),
+            "with what it carries, started with {state}"
+        );
+        drop(client);
+        restarted.shutdown().await.expect("shut down server");
+    }
+}
+
+/// A Root taken away while its drive is gone keeps what was discovered
+/// under it, listed as unavailable, since nothing there tells it from the
+/// Roots still named; once the drive is back, the next change of the Roots
+/// tells it apart and takes that away.
+#[tokio::test]
+async fn a_root_taken_away_while_its_drive_is_gone_is_taken_away_once_the_drive_is_back() {
+    const CHANNEL: &str = "workspace-standing-root-taken-away-drive-gone";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let drive = home.join("drive");
+    let usb = drive.join("projects");
+    let atlas = usb.join("atlas");
+    repository(&atlas);
+    let local = home.join("local");
+    let other = home.join("other");
+    for directory in [&local, &other] {
+        std::fs::create_dir(directory).expect("create a Root");
+    }
+    let (config, server) = server_with_roots(
+        &home,
+        CHANNEL,
+        &[spelled(&usb), spelled(&local)],
+        Duration::ZERO,
+    )
+    .await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+    let name = |roots: &[&Path]| SettingMutation::WorkspaceRoots {
+        value: Some(roots.iter().map(|root| spelled(root).to_owned()).collect()),
+    };
+
+    let unplugged = home.join("unplugged");
+    std::fs::rename(&drive, &unplugged).expect("take the drive away");
+    client
+        .mutate_setting(name(&[&local]))
+        .await
+        .expect("take the drive's Root away");
+    assert_eq!(
+        standings(&client).await,
+        [(
+            atlas.clone(),
+            Some(WorkspaceUnavailability::HolderUnreadable)
+        )],
+        "what was discovered under it stays listed, unavailable, while the drive is gone"
+    );
+
+    std::fs::rename(&unplugged, &drive).expect("bring the drive back");
+    assert_eq!(
+        standings(&client).await,
+        [(atlas.clone(), None)],
+        "and is listed as ever once the drive is back"
+    );
+    client
+        .mutate_setting(name(&[&local, &other]))
+        .await
+        .expect("change the Roots again");
+    assert_eq!(
+        standings(&client).await,
+        [],
+        "until the next change of the Roots tells the drive's Root apart and takes it away"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    assert!(
+        !entries_on_disk(&config).contains_key(&repository_id(&atlas.join(".git"))),
+        "from disk too"
+    );
+}

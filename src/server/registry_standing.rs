@@ -15,13 +15,20 @@
 //! An entry discovered under a Workspace Root is dropped with that Root,
 //! unless a Session belongs to it: when the Roots change, and once at start,
 //! so a Root taken away by hand while the Server was stopped is taken away
-//! too. One a Session belongs to is kept, and is known by that Session from
-//! then on, so it stands as any entry a Session made does. Roots are told
-//! apart as the directories they name rather than by how the Setting spells
-//! them, so `~/projects` spelled out in full takes nothing away. Only Roots
-//! the Config Document names whole — before a change and after it alike —
-//! take anything away, since those a document left that could not be read
-//! whole are no word of the user's. The Roots are held still while either
+//! too — each time, what was discovered under any Root the Roots then in
+//! force surely do not name. One a Session belongs to is kept, and is known
+//! by that Session from then on, so it stands as any entry a Session made
+//! does. Roots are told apart as the directories they name rather than by
+//! how the Setting spells them, so `~/projects` spelled out in full takes
+//! nothing away; and a Root that cannot be told apart from those in force —
+//! nothing there, as for a link on a drive not mounted, which may lead
+//! where one of them names — takes nothing away until it can be. What was
+//! discovered under one taken away while its drive is gone stays listed as
+//! unavailable until the drive is back, and the next start or change of the
+//! Roots then tells it apart and takes it away. Only Roots the Config
+//! Document names whole — before a change and after it alike — take
+//! anything away, since those a document left that could not be read whole
+//! are no word of the user's. The Roots are held still while either
 //! decides (see [`RootsHeld`]), and the step at start takes nothing away
 //! where Settings were put in force anew since it read them.
 //!
@@ -285,16 +292,11 @@ impl RegistryStanding {
         }
     }
 
-    /// Drops what was discovered under a Workspace Root `before` named and
-    /// `after` names no longer, as the module says: once the Roots have
-    /// changed from `before` to `after`, while `_held` holds them still.
-    pub(crate) async fn roots_changed(
-        &self,
-        _held: &RootsHeld<'_>,
-        before: &[String],
-        after: &[String],
-    ) {
-        self.forget_removed(before, after, || true).await;
+    /// Drops what was discovered under a Workspace Root the Roots `after`
+    /// surely do not name, as the module says: once the Roots have changed
+    /// to `after`, while `_held` holds them still.
+    pub(crate) async fn roots_changed(&self, _held: &RootsHeld<'_>, after: &[String]) {
+        self.forget_unnamed(after, || true).await;
     }
 
     /// Drops what was discovered under a Workspace Root that the Roots in
@@ -323,41 +325,28 @@ impl RegistryStanding {
             }
             !moved
         };
-        self.forget_removed(&self.0.sessions.discovered_roots(), &roots, still)
-            .await;
+        self.forget_unnamed(&roots, still).await;
     }
 
-    /// Drops what was discovered under a Root `before` named and `after`
-    /// names no longer, so long as `still` says, as it comes to that, that
-    /// both say what the user named.
-    async fn forget_removed(&self, before: &[String], after: &[String], still: impl Fn() -> bool) {
+    /// Drops what was discovered under a Root that `roots`, the Roots in
+    /// force, surely do not name — so long as `still` says, as it comes to
+    /// that, that they are what the user named. A Root an entry was
+    /// discovered under that cannot be told apart from them keeps
+    /// everything, and is told again at the next start or change of the
+    /// Roots: one taken away while its drive is not mounted is taken away
+    /// once the drive is back.
+    async fn forget_unnamed(&self, roots: &[String], still: impl Fn() -> bool) {
         let recorded = self.0.sessions.discovered_roots();
         if recorded.is_empty() {
             return;
         }
-        let named = self
-            .resolve(before.iter().chain(after).chain(&recorded))
-            .await;
-        let likeness = |left: &String, right: &String| named[left].likeness(&named[right]);
-        // A Root is taken away only where it is surely none of the Roots
-        // after, and what was discovered under one only where it surely is
-        // that Root: what cannot be told keeps everything.
-        let surely_none_after = |root: &String| {
-            after
-                .iter()
-                .all(|kept| likeness(root, kept) == Likeness::Different)
-        };
-        let removed = before
-            .iter()
-            .filter(|root| surely_none_after(root))
-            .collect::<Vec<_>>();
+        let named = self.resolve(roots.iter().chain(&recorded)).await;
         let unrooted = recorded
             .iter()
             .filter(|root| {
-                removed
+                roots
                     .iter()
-                    .any(|gone| likeness(root, gone) == Likeness::Same)
-                    && surely_none_after(root)
+                    .all(|kept| named[*root].likeness(&named[kept]) == Likeness::Different)
             })
             .cloned()
             .collect::<HashSet<_>>();
@@ -491,10 +480,10 @@ enum Likeness {
 impl NamedDirectory {
     /// Whether `other` names the same directory: surely so where they are
     /// spelled alike, written alike, or resolved alike; surely not where
-    /// both resolve elsewhere, or one resolves and nothing is there for the
-    /// other, since a path leading nowhere names no directory that is
-    /// there; and otherwise untold — a link whose mount is gone may lead
-    /// where the other names.
+    /// both resolve, elsewhere; and otherwise untold. Nothing being there
+    /// for one tells nothing: a link on a drive not mounted may lead where
+    /// the other names, so a Root whose drive is gone is told apart only
+    /// once the drive is back.
     fn likeness(&self, other: &Self) -> Likeness {
         if self.spelled == other.spelled || self.written.is_some() && self.written == other.written
         {
@@ -508,8 +497,6 @@ impl NamedDirectory {
                     Likeness::Different
                 }
             }
-            (Resolution::Resolved(_), Resolution::Missing)
-            | (Resolution::Missing, Resolution::Resolved(_)) => Likeness::Different,
             _ => Likeness::Untold,
         }
     }
@@ -1016,9 +1003,7 @@ mod tests {
                                 // What the Registry held as the change put `~/b`
                                 // back in force.
                                 let listed_then = listed(&sessions);
-                                standing
-                                    .roots_changed(&held, &[], &["~/b".to_owned()])
-                                    .await;
+                                standing.roots_changed(&held, &["~/b".to_owned()]).await;
                                 listed_then
                             })
                         });
@@ -1047,8 +1032,8 @@ mod tests {
     }
 
     /// Two Roots are the same directory where spelled, written or resolved
-    /// alike, surely not where both resolve elsewhere or nothing is there
-    /// for one while the other resolves, and untold otherwise.
+    /// alike, surely not where both resolve elsewhere, and untold otherwise:
+    /// nothing being there for one tells nothing.
     #[test]
     fn roots_are_told_apart_only_as_far_as_they_can_be() {
         let named = |spelled: &str, written: &[&str], resolved: Resolution| NamedDirectory {
@@ -1080,8 +1065,8 @@ mod tests {
             ),
             (
                 named("/unplugged", &["unplugged"], Resolution::Missing),
-                Likeness::Different,
-                "nothing there",
+                Likeness::Untold,
+                "nothing there, as for a link on a drive not mounted",
             ),
             (
                 named("/quiet", &["quiet"], Resolution::Untold),
