@@ -447,61 +447,73 @@ impl SessionStore {
         false
     }
 
-    /// Every Workspace Root an entry was discovered under, as the Setting
-    /// spelled it then, each once.
-    pub(crate) fn discovered_roots(&self) -> Vec<String> {
-        let mut roots = self
-            .state
+    /// Every entry discovered under a Workspace Root: its identity, that
+    /// Root as the Setting spelled it then, and the path it is presented at,
+    /// where it has one.
+    pub(crate) fn discovered_entries(&self) -> Vec<DiscoveredEntry> {
+        self.state
             .lock()
             .unwrap()
             .workspaces
-            .values()
-            .filter_map(|stored| match &stored.provenance {
-                WorkspaceProvenance::Discovered { root } => Some(root.clone()),
+            .iter()
+            .filter_map(|(id, stored)| match &stored.provenance {
+                WorkspaceProvenance::Discovered { root } => Some(DiscoveredEntry {
+                    id: id.clone(),
+                    root: root.clone(),
+                    path: stored.path.clone(),
+                }),
                 _ => None,
             })
-            .collect::<Vec<_>>();
-        roots.sort();
-        roots.dedup();
-        roots
+            .collect()
     }
 
-    /// Drops every entry discovered under a Workspace Root that `removed`
-    /// says was taken away, its Icon and Description with it — unless a
-    /// Session belongs to it. That one is kept, and is known by that Session
-    /// from now on, so it stands as any entry a Session made does, whatever
-    /// later becomes of the Session or the Roots. Every entry known
-    /// otherwise is left alone.
-    pub(crate) fn forget_unrooted(&self, removed: impl Fn(&str) -> bool) {
+    /// Settles each entry `rerooted` names, where it is known still by
+    /// discovery under the Workspace Root `rerooted` names beside it — so an
+    /// entry entered or known otherwise since `rerooted` was decided is left
+    /// alone. One no Root in force holds is dropped, its Icon and
+    /// Description with it — unless a Session belongs to it, which keeps it
+    /// known by that Session from now on, so it stands as any entry a
+    /// Session made does, whatever later becomes of the Session or the
+    /// Roots. One another spelling of the Roots in force holds is known by
+    /// discovery under that spelling from now on, so taking that spelling
+    /// away later takes it.
+    pub(crate) fn reroot_discovered(&self, rerooted: HashMap<WorkspaceId, (String, Rerooting)>) {
         let mut state = self.state.lock().unwrap();
-        let unrooted = state
-            .workspaces
-            .iter()
-            .filter(|(_, stored)| {
+        for (workspace_id, (root, rerooting)) in rerooted {
+            let still_under_root = state.workspaces.get(&workspace_id).is_some_and(|stored| {
                 matches!(
                     &stored.provenance,
-                    WorkspaceProvenance::Discovered { root } if removed(root)
+                    WorkspaceProvenance::Discovered { root: under } if *under == root
                 )
-            })
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for workspace_id in unrooted {
-            if state.grouped_besides(&workspace_id, None) {
-                if let Some(stored) = state.workspaces.get_mut(&workspace_id) {
-                    stored.provenance = WorkspaceProvenance::Session;
-                    self.storage
-                        .record_workspace_provenance(workspace_id, WorkspaceProvenance::Session);
-                }
+            });
+            if !still_under_root {
                 continue;
             }
-            state.workspaces.remove(&workspace_id);
-            state.sightings.forget(&workspace_id);
-            tracing::info!(
-                workspace = %workspace_id.0,
-                "a Workspace Registry entry was dropped with the Workspace Root it was discovered \
-                 under"
-            );
-            self.storage.forget_workspace(workspace_id);
+            let provenance = match rerooting {
+                Rerooting::Respelled(spelling) => {
+                    WorkspaceProvenance::Discovered { root: spelling }
+                }
+                Rerooting::Unrooted if state.grouped_besides(&workspace_id, None) => {
+                    WorkspaceProvenance::Session
+                }
+                Rerooting::Unrooted => {
+                    state.workspaces.remove(&workspace_id);
+                    state.sightings.forget(&workspace_id);
+                    tracing::info!(
+                        workspace = %workspace_id.0,
+                        root,
+                        "a Workspace Registry entry was dropped with the Workspace Root it was \
+                         discovered under"
+                    );
+                    self.storage.forget_workspace(workspace_id);
+                    continue;
+                }
+            };
+            if let Some(stored) = state.workspaces.get_mut(&workspace_id) {
+                stored.provenance = provenance.clone();
+                self.storage
+                    .record_workspace_provenance(workspace_id, provenance);
+            }
         }
     }
 
@@ -743,6 +755,32 @@ impl SessionStore {
         repositories.sort_by(|(_, left), (_, right)| left.cmp(right));
         repositories
     }
+}
+
+/// A Registry entry discovered under a Workspace Root, as
+/// [`SessionStore::discovered_entries`] answers it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DiscoveredEntry {
+    pub(crate) id: WorkspaceId,
+    /// The Root it was discovered under, as the Setting spelled it then.
+    pub(crate) root: String,
+    /// Where it is presented: directly within the directory that Root
+    /// named when it was discovered there, but for a linked Worktree's
+    /// Repository, presented by its main or bare root wherever that is.
+    pub(crate) path: Option<PathBuf>,
+}
+
+/// What becomes of an entry discovered under a Workspace Root once the
+/// Roots in force no longer spell that Root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Rerooting {
+    /// No Root in force holds it, so it goes with the Root it was
+    /// discovered under.
+    Unrooted,
+    /// The Root in force spelled so holds it: the same directory spelled
+    /// another way, or one that may be, named in the very change that took
+    /// the other spelling away.
+    Respelled(String),
 }
 
 /// Whether the Workspace a Session is regrouped under was just resolved for

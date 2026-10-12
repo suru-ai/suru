@@ -83,6 +83,12 @@ impl NamedDirectory {
             || self.resolved == Resolution::Resolved(directory.to_owned())
     }
 
+    /// Whether the filesystem resolved this Root to a directory standing
+    /// now, so it is told apart from any directory it does not lead to.
+    pub(super) fn resolves(&self) -> bool {
+        matches!(self.resolved, Resolution::Resolved(_))
+    }
+
     fn surely_written_as(&self, path: Option<&Path>) -> bool {
         self.written.is_some() && self.written.as_deref() == path
     }

@@ -15,27 +15,30 @@
 //! An entry discovered under a Workspace Root is dropped with that Root,
 //! unless a Session belongs to it: when the Roots change, and once at start,
 //! so a Root taken away by hand while the Server was stopped is taken away
-//! too — each time, what was discovered under any Root the Roots then in
-//! force surely do not name. One a Session belongs to is kept, and is known
-//! by that Session from then on, so it stands as any entry a Session made
-//! does. Roots are told apart as the directories they name rather than by
-//! how the Setting spells them (see [`super::root_directories`]), so
-//! `~/projects` spelled out in full takes nothing away; and a Root that
-//! cannot be told apart from those in force — nothing there, as for a link
-//! on a drive not mounted, which may lead where one of them names — takes
-//! nothing away until it can be, at the next start or change of the Roots.
-//! A change that takes a Root away by its spelling is the user's word on
-//! that spelling, though: what was discovered under it goes at once,
-//! whether or not it can be resolved, unless a Root still named is spelled
-//! or written as it, resolves where it does, or is named in that very
-//! change and cannot be told from it, as the Root respelled may be. A Root
-//! naming Suru's own data directory is no Root in force, so what was
-//! discovered under it goes too. Only Roots the Config Document names whole
-//! — before a change and after it alike — take anything away, since those a
-//! document left that could not be read whole are no word of the user's.
-//! The Roots are held still while either decides (see [`RootsHeld`]), and
-//! the step at start takes nothing away where Settings were put in force
-//! anew since it read them.
+//! too — each time, what no Root then in force holds. One a Session belongs
+//! to is kept, and is known by that Session from then on, so it stands as
+//! any entry a Session made does. Roots are told apart as the directories
+//! they name rather than by how the Setting spells them (see
+//! [`super::root_directories`]), and an entry as the directory discovery
+//! found it presented directly within — the one its Root named then, but
+//! for a linked Worktree's Repository. A Root in force holds the entry where
+//! it names the same directory as the Root the entry was discovered under,
+//! or the one it was found within, so `~/projects` spelled out in full
+//! takes nothing away; one that resolves elsewhere holds it not, so a Root
+//! on a drive not mounted takes what was discovered under it once taken
+//! away, though it cannot be resolved; and one that can be told apart
+//! neither way — nothing there for it either, as for an alias on that same
+//! drive — may be the same directory, so the entry is kept until that can be
+//! told, at the next start or change of the Roots. What a Root in force
+//! holds is known by discovery under that Root's spelling from then on, and
+//! so is what a Root a change named anew may hold, as the Root respelled
+//! may: taking that spelling away later takes it. A Root naming Suru's own
+//! data directory is no Root in force, so what was discovered under it goes
+//! too. Only Roots the Config Document names whole — before a change and
+//! after it alike — settle anything, since those a document left that could
+//! not be read whole are no word of the user's. The Roots are held still
+//! while either decides (see [`RootsHeld`]), and the step at start settles
+//! nothing where Settings were put in force anew since it read them.
 //!
 //! Every directory is read apart, on a thread of its own (see
 //! [`super::reads_apart`]), so one on a mount gone quiet holds up neither
@@ -50,7 +53,7 @@
 //! began is no part of it, and is listed as it is.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -62,11 +65,11 @@ use tokio::sync::watch;
 
 use super::{
     reads_apart::{NotRead, ReadsApart},
-    root_directories::{self, Likeness},
+    root_directories::{self, Likeness, NamedDirectory},
 };
 use crate::{
     protocol::{SettingsSnapshot, WorkspaceId, WorkspaceUnavailability},
-    sessions::{SessionStore, Sighting},
+    sessions::{Rerooting, SessionStore, Sighting},
 };
 
 /// How many directories are read at once.
@@ -317,26 +320,26 @@ impl RegistryStanding {
         }
     }
 
-    /// Drops what was discovered under a Workspace Root the Roots `after`
-    /// surely do not name, or that this change took away by its spelling,
-    /// as the module says: once the Roots have changed from `before` to
-    /// `after`, while `_held` holds them still.
+    /// Drops what was discovered under a Workspace Root that no Root in
+    /// `after` holds, and knows what another spelling holds by that
+    /// spelling, as the module says: once the Roots have changed from
+    /// `before` to `after`, while `_held` holds them still.
     pub(crate) async fn roots_changed(
         &self,
         _held: &RootsHeld<'_>,
         before: &[String],
         after: &[String],
     ) {
-        self.forget_unnamed(after, Some(before), || true).await;
+        self.reroot(after, Some(before), || true).await;
     }
 
-    /// Drops what was discovered under a Workspace Root that the Roots in
-    /// force no longer name, as the module says: once at start, holding the
-    /// Roots still throughout. The Roots are read from `in_force` as this
-    /// decides; nothing is taken away where the Config Document did not
-    /// name them whole, nor where Settings were put in force anew before
-    /// this could take it away, since what it read no longer says what the
-    /// user named.
+    /// Drops what was discovered under a Workspace Root that no Root in
+    /// force holds, and knows what another spelling holds by that spelling,
+    /// as the module says: once at start, holding the Roots still
+    /// throughout. The Roots are read from `in_force` as this decides;
+    /// nothing is settled where the Config Document did not name them whole,
+    /// nor where Settings were put in force anew before this could settle
+    /// it, since what it read no longer says what the user named.
     pub(crate) async fn roots_at_start(&self, mut in_force: impl RootsInForce) {
         let _held = self.hold_roots().await;
         let Some(roots) = in_force.read() else {
@@ -356,33 +359,32 @@ impl RegistryStanding {
             }
             !moved
         };
-        self.forget_unnamed(&roots, None, still).await;
+        self.reroot(&roots, None, still).await;
     }
 
-    /// Drops what was discovered under a Root that `roots`, the Roots in
-    /// force, surely do not name — so long as `still` says, as it comes to
-    /// that, that they are what the user named. A Root an entry was
-    /// discovered under that cannot be told apart from them keeps
-    /// everything, and is told again at the next start or change of the
-    /// Roots — unless the change from `before` took it away by its
-    /// spelling, which only a Root it named anew and cannot tell from it,
-    /// as the Root respelled may be, keeps. A Root naming Suru's own data
-    /// directory is none of the Roots in force.
-    async fn forget_unnamed(
-        &self,
-        roots: &[String],
-        before: Option<&[String]>,
-        still: impl Fn() -> bool,
-    ) {
-        let recorded = self.0.sessions.discovered_roots();
-        if recorded.is_empty() {
+    /// Settles what was discovered under a Root that `roots`, the Roots in
+    /// force, no longer spell — so long as `still` says, as it comes to
+    /// that, that they are what the user named: each entry no Root in force
+    /// holds is dropped, and each one does is known by discovery under that
+    /// Root from then on (see [`rerooting`]). `before` holds the Roots a
+    /// change took them from, so a Root it named anew may be one it took
+    /// away, respelled. A Root naming Suru's own data directory is none of
+    /// the Roots in force.
+    async fn reroot(&self, roots: &[String], before: Option<&[String]>, still: impl Fn() -> bool) {
+        let discovered = self.0.sessions.discovered_entries();
+        if discovered.is_empty() {
             return;
         }
+        let recorded = discovered
+            .iter()
+            .map(|entry| &entry.root)
+            .filter(|root| !roots.contains(root))
+            .collect::<BTreeSet<_>>();
         let named = root_directories::resolve(
             &self.0.resolutions,
             self.0.home.as_deref(),
             self.0.wait,
-            roots.iter().chain(&recorded),
+            roots.iter().chain(recorded),
         )
         .await;
         let in_force = roots
@@ -394,30 +396,70 @@ impl RegistryStanding {
                     .as_deref()
                     .is_some_and(|data_root| named[*root].names(data_root))
             })
-            .collect::<Vec<_>>();
-        let taken_away = |root: &String| {
-            before.is_some_and(|before| before.contains(root) && !roots.contains(root))
-        };
-        let named_anew = |root: &String| before.is_some_and(|before| !before.contains(root));
-        let unrooted = recorded
-            .iter()
-            .filter(|root| {
-                in_force
-                    .iter()
-                    .all(|kept| match named[*root].likeness(&named[*kept]) {
-                        Likeness::Same => false,
-                        Likeness::Different => true,
-                        Likeness::Untold => taken_away(root) && !named_anew(kept),
-                    })
+            .map(|root| HeldBy {
+                spelled: root,
+                named: &named[root],
+                named_anew: before.is_some_and(|before| !before.contains(root)),
             })
-            .cloned()
-            .collect::<HashSet<_>>();
-        if !unrooted.is_empty() && still() {
-            self.0
-                .sessions
-                .forget_unrooted(|root| unrooted.contains(root));
+            .collect::<Vec<_>>();
+        let rerooted = discovered
+            .into_iter()
+            .filter(|entry| !in_force.iter().any(|root| *root.spelled == entry.root))
+            .filter_map(|entry| {
+                let holder = entry.path.as_deref().and_then(Path::parent);
+                let rerooting = rerooting(&named[&entry.root], holder, &in_force)?;
+                Some((entry.id, (entry.root, rerooting)))
+            })
+            .collect::<HashMap<_, _>>();
+        if !rerooted.is_empty() && still() {
+            self.0.sessions.reroot_discovered(rerooted);
         }
     }
+}
+
+/// A Root in force, as [`rerooting`] weighs whether it holds an entry.
+struct HeldBy<'a> {
+    spelled: &'a String,
+    named: &'a NamedDirectory,
+    /// Whether the change that put it in force named it anew.
+    named_anew: bool,
+}
+
+/// What becomes of an entry discovered under the Root `discovered` names, a
+/// spelling no Root `in_force` has, and found directly within `holder` — the
+/// directory that Root named then, as discovery read it. A Root in force
+/// surely holds it where it is the same directory, or names `holder`, and
+/// the entry is known by discovery under that Root from then on. One that
+/// resolves elsewhere is told apart from it: it was found where that Root
+/// does not lead. One that can be told apart neither way — nothing there for
+/// either, as on a drive not mounted, or one beneath a home not known — may
+/// be the same directory, so the entry is kept as it is and told again at
+/// the next start or change of the Roots; but where the change named that
+/// Root anew, as the Root respelled may be, the entry is known by it from
+/// then on. Where no Root in force holds the entry, nor may, it goes with
+/// the Root it was discovered under. `None` where it is kept as it is.
+fn rerooting(
+    discovered: &NamedDirectory,
+    holder: Option<&Path>,
+    in_force: &[HeldBy<'_>],
+) -> Option<Rerooting> {
+    let mut may_hold = false;
+    let mut respelled = None;
+    for root in in_force {
+        let likeness = discovered.likeness(root.named);
+        if likeness == Likeness::Same || holder.is_some_and(|holder| root.named.names(holder)) {
+            return Some(Rerooting::Respelled(root.spelled.clone()));
+        }
+        // A Root that resolves is told apart by where the entry was found,
+        // where that is known.
+        if likeness == Likeness::Untold && (holder.is_none() || !root.named.resolves()) {
+            may_hold = true;
+            if root.named_anew && respelled.is_none() {
+                respelled = Some(Rerooting::Respelled(root.spelled.clone()));
+            }
+        }
+    }
+    respelled.or((!may_hold).then_some(Rerooting::Unrooted))
 }
 
 /// How far one check has come, as every listing joining it reads it.
@@ -980,41 +1022,102 @@ mod tests {
         );
     }
 
-    /// A change taking a Root away by its spelling takes what was discovered
-    /// under it, though it cannot be told apart from the Roots still named —
-    /// unless the change named one anew that it cannot be told from, as the
-    /// Root respelled may be. Here `~/b` names a home this Server does not
-    /// know, and every other Root names nothing there, so nothing tells
-    /// any of them apart.
+    /// The Root each entry discovered under one is known by, by the path it
+    /// is presented at.
+    fn discovered_under(sessions: &SessionStore) -> Vec<(Option<PathBuf>, String)> {
+        let mut discovered = sessions
+            .discovered_entries()
+            .into_iter()
+            .map(|entry| (entry.path, entry.root))
+            .collect::<Vec<_>>();
+        discovered.sort();
+        discovered
+    }
+
+    /// A Root taken away keeps what was discovered under it only where a
+    /// Root still named may hold it: one that names nothing there, as on a
+    /// drive not mounted, may be it, while one that resolves elsewhere than
+    /// where it was found is not. Here `~/b` names a home this Server does
+    /// not know, so it is resolved by nothing.
     #[tokio::test]
-    async fn a_root_taken_away_by_its_spelling_takes_what_it_held_but_where_it_may_be_respelled() {
+    async fn a_root_taken_away_keeps_what_it_held_only_where_a_root_still_named_may_hold_it() {
         let (registry, atlas) = discovered_under_b().await;
         let standing = RegistryStanding::new(registry.sessions.clone(), None, None, SURELY);
-        let spell = |components: &[&str]| absolute(components).display().to_string();
-        let (kept, respelled) = (spell(&["nowhere", "kept"]), spell(&["nowhere", "b"]));
+        let elsewhere = tempfile::tempdir().expect("create a directory elsewhere");
+        let elsewhere = elsewhere.path().display().to_string();
+        let unplugged = absolute(&["nowhere", "kept"]).display().to_string();
 
         let held = standing.hold_roots().await;
         standing
             .roots_changed(
                 &held,
-                &["~/b".to_owned(), kept.clone()],
-                &[kept.clone(), respelled.clone()],
+                &["~/b".to_owned(), unplugged.clone(), elsewhere.clone()],
+                &[unplugged.clone(), elsewhere.clone()],
+            )
+            .await;
+        assert_eq!(
+            discovered_under(&registry.sessions),
+            [(Some(atlas.clone()), "~/b".to_owned())],
+            "a Root still named that names nothing there may be the one taken away, so what that \
+             held is kept as it is"
+        );
+
+        standing
+            .roots_changed(
+                &held,
+                &[unplugged, elsewhere.clone()],
+                std::slice::from_ref(&elsewhere),
             )
             .await;
         assert_eq!(
             listed(&registry.sessions),
-            std::slice::from_ref(&atlas),
-            "a Root named anew that cannot be told from the one taken away keeps what it held"
-        );
-
-        standing
-            .roots_changed(&held, &["~/b".to_owned(), kept.clone()], &[kept])
-            .await;
-        assert_eq!(
-            listed(&registry.sessions),
             Vec::<PathBuf>::new(),
-            "while one named before as well does not"
+            "while one resolving elsewhere than where it was found holds it not"
         );
+    }
+
+    /// What a Root in force holds of what was discovered under a spelling no
+    /// longer named is known by discovery under that Root from then on: one
+    /// naming where it was found, or one named anew in the very change that
+    /// took the other away and that cannot be told from it, as the Root
+    /// respelled may be. One that only may hold it, named before as well,
+    /// leaves it known as it was.
+    #[tokio::test]
+    async fn what_a_root_in_force_holds_is_known_by_its_spelling_from_then_on() {
+        let spell = |components: &[&str]| absolute(components).display().to_string();
+        let (b, unplugged) = (spell(&["b"]), spell(&["nowhere", "kept"]));
+        for (before, after, known_by, why) in [
+            (
+                vec!["~/b".to_owned()],
+                vec![b.clone()],
+                b.clone(),
+                "a Root naming where it was found holds it",
+            ),
+            (
+                vec!["~/b".to_owned()],
+                vec![spell(&["nowhere", "b"])],
+                spell(&["nowhere", "b"]),
+                "a Root named anew that cannot be told from the one taken away may be it respelled",
+            ),
+            (
+                vec!["~/b".to_owned(), unplugged.clone()],
+                vec![unplugged.clone()],
+                "~/b".to_owned(),
+                "a Root named before as well that only may hold it leaves it as it was",
+            ),
+        ] {
+            let (registry, atlas) = discovered_under_b().await;
+            let standing = RegistryStanding::new(registry.sessions.clone(), None, None, SURELY);
+            let held = standing.hold_roots().await;
+
+            standing.roots_changed(&held, &before, &after).await;
+
+            assert_eq!(
+                discovered_under(&registry.sessions),
+                [(Some(atlas), known_by)],
+                "{why}"
+            );
+        }
     }
 
     /// A Root naming Suru's own data directory is none of the Roots in

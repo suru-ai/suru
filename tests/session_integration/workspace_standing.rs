@@ -909,10 +909,10 @@ async fn a_root_respelled_as_where_its_link_led_while_its_drive_is_gone_takes_no
     }
 }
 
-/// A Root taken away by its spelling while its drive is gone takes what was
-/// discovered under it at once, though nothing there tells it from the Roots
-/// still named: taking that spelling away is the user's word on it. The
-/// drive coming back brings nothing back.
+/// A Root taken away while its drive is gone takes what was discovered under
+/// it at once, though nothing there resolves: the Root still named resolves
+/// elsewhere than where that was found, so it holds none of it. The drive
+/// coming back brings nothing back.
 #[tokio::test]
 async fn a_root_taken_away_while_its_drive_is_gone_takes_what_was_discovered_under_it() {
     const CHANNEL: &str = "workspace-standing-root-taken-away-drive-gone";
@@ -960,5 +960,168 @@ async fn a_root_taken_away_while_its_drive_is_gone_takes_what_was_discovered_und
     assert!(
         !entries_on_disk(&config).contains_key(&repository_id(&atlas.join(".git"))),
         "it is dropped from disk too"
+    );
+}
+
+/// How the Registry spells an entry known by discovery under `root`.
+fn by_discovery_under(root: &str) -> String {
+    let root = root.replace('\\', "\\\\");
+    format!(r#"{{"discovered":{{"root":"{root}"}}}}"#)
+}
+
+/// `root` spelled through a directory beside it and back, as an alias that
+/// names the same directory only once the filesystem resolves it — and so
+/// cannot be told from it while the drive both are on is gone. A `..` is
+/// read so on every platform, where a link is not.
+fn spelled_around(root: &Path) -> String {
+    let holder = root.parent().expect("the Root has a holder");
+    let beside = holder.join("beside");
+    std::fs::create_dir_all(&beside).expect("create a directory beside the Root");
+    spelled(
+        &beside
+            .join("..")
+            .join(root.file_name().expect("the Root has a name")),
+    )
+    .to_owned()
+}
+
+/// A Root taken away by its spelling while its drive is gone leaves what
+/// was discovered under it while a Root still named cannot be told from it
+/// — an alias of it on that same drive, here — so it is kept, unavailable,
+/// with what it carries; once the drive is back the alias holds it as the
+/// Root it is, and taking the alias away takes it.
+#[tokio::test]
+async fn a_root_taken_away_while_its_drive_is_gone_leaves_what_an_alias_still_named_may_hold() {
+    const CHANNEL: &str = "workspace-standing-root-alias-drive-gone";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let drive = home.join("drive");
+    let usb = drive.join("projects");
+    let atlas = usb.join("atlas");
+    repository(&atlas);
+    let alias = spelled_around(&usb);
+    let (config, server) =
+        server_with_roots(&home, CHANNEL, &[spelled(&usb)], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let atlas_id = repository_id(&atlas.join(".git"));
+    client
+        .set_workspace_description(&atlas_id, Some(&atlas), "Maps of everything.")
+        .await
+        .expect("describe the discovered Repository");
+    let name = |roots: &[&str]| SettingMutation::WorkspaceRoots {
+        value: Some(roots.iter().map(|root| (*root).to_owned()).collect()),
+    };
+    client
+        .mutate_setting(name(&[spelled(&usb), &alias]))
+        .await
+        .expect("name an alias of the Root beside it");
+    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+
+    let unplugged = home.join("unplugged");
+    std::fs::rename(&drive, &unplugged).expect("take the drive away");
+    client
+        .mutate_setting(name(&[&alias]))
+        .await
+        .expect("take the Root away, its alias still named");
+    assert_eq!(
+        standings(&client).await,
+        [(
+            atlas.clone(),
+            Some(WorkspaceUnavailability::HolderUnreadable)
+        )],
+        "what was discovered under it is kept while the alias still named may be the Root"
+    );
+
+    std::fs::rename(&unplugged, &drive).expect("bring the drive back");
+    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+    assert_eq!(
+        description_at(&client, &atlas).await,
+        set("Maps of everything."),
+        "carrying all it did"
+    );
+
+    client
+        .mutate_setting(name(&[]))
+        .await
+        .expect("take the alias away");
+    assert_eq!(
+        standings(&client).await,
+        [],
+        "taken away in every spelling, the Root takes what was discovered under it"
+    );
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    assert!(
+        !entries_on_disk(&config).contains_key(&atlas_id),
+        "and it is dropped from disk"
+    );
+}
+
+/// A Root respelled as an alias while its drive is there is the same Root,
+/// so what was discovered under it is known by discovery under the alias
+/// from then on: taking the alias away while the drive is gone takes it,
+/// as taking the Root away would have, though another Root is still named.
+#[tokio::test]
+async fn a_root_respelled_as_an_alias_takes_what_it_held_when_the_alias_is_taken_away() {
+    const CHANNEL: &str = "workspace-standing-root-alias-respelled";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let drive = home.join("drive");
+    let usb = drive.join("projects");
+    let atlas = usb.join("atlas");
+    repository(&atlas);
+    let alias = spelled_around(&usb);
+    let local = home.join("local");
+    std::fs::create_dir(&local).expect("create a Root");
+    let (config, server) = server_with_roots(
+        &home,
+        CHANNEL,
+        &[spelled(&usb), spelled(&local)],
+        Duration::ZERO,
+    )
+    .await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let atlas_id = repository_id(&atlas.join(".git"));
+    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+    let name = |roots: &[&str]| SettingMutation::WorkspaceRoots {
+        value: Some(roots.iter().map(|root| (*root).to_owned()).collect()),
+    };
+    client
+        .mutate_setting(name(&[&alias, spelled(&local)]))
+        .await
+        .expect("respell the Root as its alias");
+    assert_eq!(
+        standings(&client).await,
+        [(atlas.clone(), None)],
+        "respelling the Root takes nothing away"
+    );
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    assert_eq!(
+        entries_on_disk(&config).get(&atlas_id),
+        Some(&(Some(atlas.clone()), by_discovery_under(&alias))),
+        "what was discovered under the Root is known by discovery under the alias"
+    );
+
+    let (_, restarted) =
+        server_with_roots(&home, CHANNEL, &[&alias, spelled(&local)], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let unplugged = home.join("unplugged");
+    std::fs::rename(&drive, &unplugged).expect("take the drive away");
+    client
+        .mutate_setting(name(&[spelled(&local)]))
+        .await
+        .expect("take the alias away");
+    assert_eq!(
+        standings(&client).await,
+        [],
+        "what was discovered under the Root goes with its alias, the drive gone"
+    );
+
+    drop(client);
+    restarted.shutdown().await.expect("shut down server");
+    assert!(
+        !entries_on_disk(&config).contains_key(&atlas_id),
+        "and it is dropped from disk"
     );
 }

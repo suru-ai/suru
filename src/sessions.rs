@@ -72,7 +72,7 @@ mod watches;
 mod workspace_description;
 mod workspace_icon;
 mod workspaces;
-pub(crate) use workspaces::Sighting;
+pub(crate) use workspaces::{Rerooting, Sighting};
 
 pub(crate) use brokered::{
     BrokeredReadError, BrokeredResumeError, BrokeredSpawn, BrokeredSpawnCap, BrokeredSpawnError,
