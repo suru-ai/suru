@@ -89,7 +89,8 @@ impl fmt::Debug for BrokerToken {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BrokerRole {
     /// Any Agent but a Sidekick — a Sidekick's own Subagents among them —
-    /// offered the Tools through which it reaches any Provider Suru hosts.
+    /// offered the Tools through which it reaches any Provider Suru hosts,
+    /// and a listing of its own Server's Workspaces.
     Agent,
     /// The Agent of a top-level Session in the Sidekick Workspace, offered
     /// besides those the Tools that work across Suru itself.

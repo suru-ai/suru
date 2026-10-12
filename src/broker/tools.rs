@@ -5,10 +5,13 @@
 //!
 //! Which caller is offered a Tool is part of the Tool's own description
 //! ([`BrokerTool::is_sidekicks`]): every Agent is offered the Tools through
-//! which it reaches any Provider, and a Sidekick those besides the Tools that
-//! work across Suru itself (ADR 0042). The transport lists and dispatches by
+//! which it reaches any Provider, and a listing of its own Server's
+//! Workspaces, and a Sidekick those besides the Tools that work across Suru
+//! itself (ADR 0042, ADR 0051). The transport lists and dispatches by
 //! [`BrokerTool::offered_to`], and the note an Agent is told names what it
-//! reads, so a Sidekick's Tool is declared here and nowhere else.
+//! reads, so a Sidekick's Tool is declared here and nowhere else. A Tool
+//! every Agent is offered is described to each caller as it answers that
+//! caller ([`BrokerTool::description`]): only a Sidekick is told of Remotes.
 
 mod memories;
 mod origins;
@@ -60,6 +63,9 @@ pub(super) enum BrokerTool {
     SendToSubagent,
     WaitSubagents,
     StopSubagent,
+    /// Every Agent's: the Workspaces on its own Server, as compact rows — and
+    /// for a Sidekick, those on a Remote, or Everywhere.
+    ListWorkspaces,
     /// A Sidekick's: the Sessions on its own Server, a Remote, or Everywhere,
     /// as compact rows.
     ListSessions,
@@ -78,9 +84,6 @@ pub(super) enum BrokerTool {
     BeginSession,
     /// A Sidekick's: a Session's Questionnaire answered on the user's behalf.
     AnswerQuestionnaire,
-    /// A Sidekick's: the Workspaces on its own Server, a Remote, or
-    /// Everywhere, as compact rows.
-    ListWorkspaces,
     /// A Sidekick's: a Workspace's Description set, as the user sets one.
     SetWorkspaceDescription,
     /// A Sidekick's: the Remotes its own Server is paired with, and whether
@@ -117,6 +120,7 @@ impl BrokerTool {
         Self::SendToSubagent,
         Self::WaitSubagents,
         Self::StopSubagent,
+        Self::ListWorkspaces,
         Self::ListSessions,
         Self::ReadSession,
         Self::SendPrompt,
@@ -125,7 +129,6 @@ impl BrokerTool {
         Self::UnsettleSession,
         Self::BeginSession,
         Self::AnswerQuestionnaire,
-        Self::ListWorkspaces,
         Self::SetWorkspaceDescription,
         Self::ListRemotes,
         Self::ListSettings,
@@ -154,7 +157,6 @@ impl BrokerTool {
             | Self::UnsettleSession
             | Self::BeginSession
             | Self::AnswerQuestionnaire
-            | Self::ListWorkspaces
             | Self::SetWorkspaceDescription
             | Self::ListRemotes
             | Self::ListSettings
@@ -170,16 +172,19 @@ impl BrokerTool {
             | Self::ReadSubagent
             | Self::SendToSubagent
             | Self::WaitSubagents
-            | Self::StopSubagent => false,
+            | Self::StopSubagent
+            | Self::ListWorkspaces => false,
         }
     }
 
-    /// Whether the Tool takes an `origin`: reaches a Remote's Sessions or
-    /// Workspaces as well as this Server's. Only what a Sidekick reads of or
-    /// does to a Session or a Workspace crosses to a Remote — a Remote shares
-    /// its work, not its administration (ADR 0044) — so a Tool takes one only
-    /// by saying so here, and the one place an `origin` is read refuses it to
-    /// every other.
+    /// Whether the Tool takes an `origin` from a Sidekick: reaches a Remote's
+    /// Sessions or Workspaces as well as this Server's. Only what a Sidekick
+    /// reads of or does to a Session or a Workspace crosses to a Remote — a
+    /// Remote shares its work, not its administration (ADR 0044) — so a Tool
+    /// takes one only by saying so here, and the one place an `origin` is
+    /// read refuses it to every other. Any other Agent is told of no Remote,
+    /// so `list_workspaces`, the one such Tool it is offered, is described to
+    /// it without one and refuses one from it.
     pub(super) const fn takes_origin(self) -> bool {
         match self {
             Self::ListSessions
@@ -324,10 +329,10 @@ impl BrokerTool {
         }
     }
 
-    /// What the calling Agent reads about the Tool: when to use it, what it
-    /// takes, and the shape of what it answers — which is stable, so an Agent
-    /// may rely on it.
-    pub(super) fn description(self) -> &'static str {
+    /// What an Agent that is `role` to the Broker reads about the Tool: when
+    /// to use it, what it takes, and the shape of what it answers — which is
+    /// stable, so an Agent may rely on it.
+    pub(super) fn description(self, role: BrokerRole) -> &'static str {
         match self {
             Self::ListProviders => LIST_PROVIDERS_DESCRIPTION,
             Self::SpawnSubagent => SPAWN_SUBAGENT_DESCRIPTION,
@@ -343,7 +348,10 @@ impl BrokerTool {
             Self::UnsettleSession => session_acts::UNSETTLE_SESSION_DESCRIPTION,
             Self::BeginSession => session_beginning::DESCRIPTION,
             Self::AnswerQuestionnaire => session_acts::ANSWER_QUESTIONNAIRE_DESCRIPTION,
-            Self::ListWorkspaces => workspaces::LIST_WORKSPACES_DESCRIPTION,
+            Self::ListWorkspaces => match role {
+                BrokerRole::Sidekick => workspaces::LIST_WORKSPACES_DESCRIPTION,
+                BrokerRole::Agent => workspaces::LIST_THIS_SERVERS_WORKSPACES_DESCRIPTION,
+            },
             Self::SetWorkspaceDescription => workspaces::SET_WORKSPACE_DESCRIPTION_DESCRIPTION,
             Self::ListRemotes => origins::LIST_REMOTES_DESCRIPTION,
             Self::ListSettings => settings::LIST_SETTINGS_DESCRIPTION,
@@ -357,8 +365,9 @@ impl BrokerTool {
         }
     }
 
-    /// The JSON Schema of the Tool's arguments.
-    pub(super) fn input_schema(self) -> Map<String, Value> {
+    /// The JSON Schema of the Tool's arguments, as an Agent that is `role` to
+    /// the Broker may give them.
+    pub(super) fn input_schema(self, role: BrokerRole) -> Map<String, Value> {
         let schema = match self {
             Self::ListProviders | Self::ListRemotes => json!({
                 "type": "object",
@@ -465,7 +474,7 @@ impl BrokerTool {
             }
             Self::BeginSession => session_beginning::input_schema(),
             Self::AnswerQuestionnaire => session_acts::answer_questionnaire_schema(),
-            Self::ListWorkspaces => workspaces::list_workspaces_schema(),
+            Self::ListWorkspaces => workspaces::list_workspaces_schema(role),
             Self::SetWorkspaceDescription => workspaces::set_workspace_description_schema(),
             Self::ListSettings => settings::list_settings_schema(),
             Self::DescribeSetting => settings::describe_setting_schema(),
@@ -1868,12 +1877,14 @@ mod tests {
     #[test]
     fn no_tool_any_agent_is_offered_reaches_a_relay() {
         for tool in BrokerTool::ALL {
-            assert!(
-                !tool.name().contains("relay")
-                    && !tool.description().to_lowercase().contains("relay"),
-                "{} reaches a Relay",
-                tool.name()
-            );
+            for role in [BrokerRole::Agent, BrokerRole::Sidekick] {
+                assert!(
+                    !tool.name().contains("relay")
+                        && !tool.description(role).to_lowercase().contains("relay"),
+                    "{} reaches a Relay",
+                    tool.name()
+                );
+            }
         }
     }
 
@@ -2020,12 +2031,17 @@ mod tests {
                 "send_to_subagent",
                 "wait_subagents",
                 "stop_subagent",
+                "list_workspaces",
             ]
+        );
+        assert!(
+            BrokerTool::ALL
+                .starts_with(&BrokerTool::offered_to(BrokerRole::Agent).collect::<Vec<_>>()),
+            "every Agent's Tools are listed first, then a Sidekick's own"
         );
         assert!(!BrokerTool::ListSessions.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::ReadSession.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::AnswerQuestionnaire.is_offered_to(BrokerRole::Agent));
-        assert!(!BrokerTool::ListWorkspaces.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::SetWorkspaceDescription.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::ListRemotes.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::ListSettings.is_offered_to(BrokerRole::Agent));
@@ -2063,22 +2079,29 @@ mod tests {
     }
 
     /// A Remote shares its Sessions and Workspaces and nothing else, so only
-    /// a Sidekick's Tool reading or acting on those takes an `origin`: one
-    /// says so to take it, its schema offers it exactly then, and the one
-    /// place an `origin` is read refuses it to every other Tool — a Settings
-    /// or Memory Tool among them, whatever it is given.
+    /// a Tool reading or acting on those takes an `origin`, and only from a
+    /// Sidekick: one says so to take it, a Sidekick's schema offers it
+    /// exactly then, and the one place an `origin` is read refuses it to
+    /// every other Tool — a Settings or Memory Tool among them, whatever it
+    /// is given. Any other Agent is told of no Remote, so no schema it is
+    /// shown offers one.
     #[test]
-    fn a_tool_takes_an_origin_only_where_it_opts_in() {
+    fn a_tool_takes_an_origin_only_where_it_opts_in_and_only_from_a_sidekick() {
         for tool in BrokerTool::ALL {
             assert_eq!(
-                tool.input_schema()["properties"].get("origin").is_some(),
+                tool.input_schema(BrokerRole::Sidekick)["properties"]
+                    .get("origin")
+                    .is_some(),
                 tool.takes_origin(),
-                "{} offers an `origin` exactly where it takes one",
+                "{} offers a Sidekick an `origin` exactly where it takes one",
                 tool.name()
             );
             assert!(
-                !tool.takes_origin() || tool.is_sidekicks(),
-                "{} is every Agent's, and reaches no Remote",
+                !tool.is_offered_to(BrokerRole::Agent)
+                    || tool.input_schema(BrokerRole::Agent)["properties"]
+                        .get("origin")
+                        .is_none(),
+                "{} is every Agent's, and shows any other Agent no Remote",
                 tool.name()
             );
             let named = options(json!({ "origin": "workstation" }));
@@ -2104,9 +2127,77 @@ mod tests {
     fn every_tool_is_found_by_the_name_it_is_listed_under() {
         for tool in BrokerTool::ALL {
             assert_eq!(BrokerTool::named(tool.name()), Some(tool));
-            assert_eq!(tool.input_schema()["type"], json!("object"));
+            for role in [BrokerRole::Agent, BrokerRole::Sidekick] {
+                assert_eq!(tool.input_schema(role)["type"], json!("object"));
+                assert_eq!(
+                    tool.input_schema(role)["additionalProperties"],
+                    json!(false),
+                    "{} refuses an argument its schema does not name",
+                    tool.name()
+                );
+            }
         }
         assert_eq!(BrokerTool::named("spawn_everything"), None);
+    }
+
+    /// Every Agent may learn where the user's other work lives, though only
+    /// a Sidekick reaches a Remote's: an Agent's `list_workspaces` describes
+    /// this server's Workspaces alone and takes no arguments, and a
+    /// Sidekick's is as it always was.
+    #[test]
+    fn list_workspaces_is_described_to_each_caller_as_what_it_answers_that_caller() {
+        let tool = BrokerTool::ListWorkspaces;
+        let agents = tool.description(BrokerRole::Agent);
+        for unknown in [
+            "Remote",
+            "origin",
+            "everywhere",
+            "list_remotes",
+            "list_sessions",
+        ] {
+            assert!(
+                !agents.contains(unknown),
+                "an Agent is told nothing of {unknown}: {agents}"
+            );
+        }
+        assert!(
+            !agents.contains(BrokerTool::SetWorkspaceDescription.name()),
+            "nor of a Tool it is not offered: {agents}"
+        );
+        for field in [
+            "\"workspace_id\"",
+            "\"name\"",
+            "\"path\"",
+            "\"description\"",
+            "\"icon\"",
+        ] {
+            assert!(
+                agents.contains(field),
+                "an Agent's rows carry {field} as a Sidekick's do: {agents}"
+            );
+        }
+        assert!(
+            agents.contains("Takes no arguments")
+                && agents.contains("the Sidekick Workspace, is among them"),
+            "{agents}"
+        );
+        assert_eq!(
+            tool.input_schema(BrokerRole::Agent),
+            options(json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }))
+        );
+        assert_eq!(
+            tool.description(BrokerRole::Sidekick),
+            workspaces::LIST_WORKSPACES_DESCRIPTION
+        );
+        assert!(
+            tool.input_schema(BrokerRole::Sidekick)["properties"]
+                .get("origin")
+                .is_some()
+        );
     }
 
     #[test]
@@ -2168,7 +2259,7 @@ mod tests {
 
     #[test]
     fn stop_subagents_schema_requires_what_its_description_says_it_takes() {
-        let schema = BrokerTool::StopSubagent.input_schema();
+        let schema = BrokerTool::StopSubagent.input_schema(BrokerRole::Agent);
         for argument in STOP_TAKES {
             assert!(
                 schema["properties"]
@@ -2529,7 +2620,7 @@ mod tests {
 
     #[test]
     fn spawn_subagents_schema_requires_what_its_description_says_it_takes() {
-        let schema = BrokerTool::SpawnSubagent.input_schema();
+        let schema = BrokerTool::SpawnSubagent.input_schema(BrokerRole::Agent);
         let properties = schema["properties"]
             .as_object()
             .expect("the schema names its properties");
@@ -2688,7 +2779,7 @@ mod tests {
                 ][..],
             ),
         ] {
-            let schema = tool.input_schema();
+            let schema = tool.input_schema(BrokerRole::Agent);
             for argument in takes {
                 assert!(
                     schema["properties"]
@@ -2722,7 +2813,7 @@ mod tests {
             );
         }
         assert_eq!(
-            BrokerTool::SendToSubagent.input_schema()["required"],
+            BrokerTool::SendToSubagent.input_schema(BrokerRole::Agent)["required"],
             json!(SendArguments::REQUIRED),
             "a send must name the Subagent and the message; its summary may be left out"
         );
@@ -2733,7 +2824,9 @@ mod tests {
             "and everything a send must name, it takes"
         );
         assert_eq!(
-            BrokerTool::WaitSubagents.input_schema().get("required"),
+            BrokerTool::WaitSubagents
+                .input_schema(BrokerRole::Agent)
+                .get("required"),
             None,
             "a wait may name nothing it takes"
         );

@@ -60,6 +60,7 @@ mod sidekick_acts;
 mod sidekick_sessions;
 mod subsessions;
 mod watches;
+mod workspaces;
 
 fn choice(id: &str, label: &str) -> ModelOptionChoice {
     ModelOptionChoice {
@@ -486,6 +487,13 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
         initialized["capabilities"]["tools"].is_object(),
         "the Broker offers Tools: {initialized}"
     );
+    assert!(
+        initialized["instructions"]
+            .as_str()
+            .is_some_and(|instructions| instructions
+                .contains("Call list_workspaces to learn where the user's other work lives")),
+        "the Broker's own instructions say what list_workspaces is for: {initialized}"
+    );
 
     let tools = client.request("tools/list", json!({})).await;
     let tools = tools["tools"].as_array().expect("tools/list lists Tools");
@@ -500,9 +508,10 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
             "read_subagent",
             "send_to_subagent",
             "wait_subagents",
-            "stop_subagent"
+            "stop_subagent",
+            "list_workspaces"
         ],
-        "the Broker offers every Tool it has, in its own order"
+        "the Broker offers every Tool any Agent is offered, in its own order"
     );
     for (tool, answers_with, read_only) in [
         (&tools[0], "\"providers\"", true),
@@ -511,6 +520,7 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
         (&tools[3], "\"delivered\"", false),
         (&tools[4], "\"timed_out\"", true),
         (&tools[5], "\"stopped\"", false),
+        (&tools[6], "\"workspaces\"", true),
     ] {
         assert_eq!(tool["inputSchema"]["type"], json!("object"));
         assert!(
@@ -545,6 +555,11 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
         tools[5]["inputSchema"]["required"],
         json!(["id"]),
         "a stop names the Subagent it stops"
+    );
+    assert_eq!(
+        tools[6]["inputSchema"],
+        json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        "a listing of Workspaces takes nothing from an Agent, which is told of no Remote"
     );
 
     let listing = client.list_providers().await;

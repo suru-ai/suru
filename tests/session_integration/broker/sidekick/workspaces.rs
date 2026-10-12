@@ -11,7 +11,9 @@
 //! the endpoint resolves one — so it stands against every later derivation
 //! as the user's does, reaches every Client in the same catalog change, and
 //! outlives a restart; text with nothing in it clears it, so it may be
-//! derived again. Any other caller neither lists either Tool nor may call it.
+//! derived again. Any other caller is offered `list_workspaces` for its own
+//! Server alone (see `broker::workspaces`), and neither lists
+//! `set_workspace_description` nor may call it.
 //!
 //! Each test acts as the MCP client a Sidekick's harness is and asserts on
 //! what the Tools answer it, and on what Clients of the Session API observe.
@@ -29,9 +31,6 @@ use crate::{
     },
     server_support::next_workspace_description_changed,
 };
-
-/// The Tools through which a Sidekick learns and describes Workspaces.
-const WORKSPACE_TOOLS: [&str; 2] = ["list_workspaces", "set_workspace_description"];
 
 /// `list_workspaces`' rows, in its order.
 async fn list_workspaces(client: &mut McpClient) -> Vec<Value> {
@@ -52,7 +51,7 @@ async fn listed_row(client: &mut McpClient, workspace: &Workspace) -> Value {
 
 /// The row `list_workspaces` gives `workspace` while it carries `description`
 /// and the Icon named `icon`.
-fn row(workspace: &Workspace, description: Value, icon: Value) -> Value {
+pub(in crate::broker) fn row(workspace: &Workspace, description: Value, icon: Value) -> Value {
     json!({
         "workspace_id": workspace.id,
         "name": workspace
@@ -68,7 +67,7 @@ fn row(workspace: &Workspace, description: Value, icon: Value) -> Value {
 
 /// A Description as a row gives it: its text, and whether it was set rather
 /// than derived.
-fn description(text: &str, set: bool) -> Value {
+pub(in crate::broker) fn description(text: &str, set: bool) -> Value {
     json!({ "text": text, "set": set })
 }
 
@@ -95,7 +94,7 @@ fn described(workspace: &Workspace, description: Value) -> Value {
 /// A Session in `directory` that names no Agent Selection, so it asks for no
 /// Errand and its Workspace carries only what a test gives it; answers with
 /// the Session as the Session API gives it.
-async fn quiet_session(
+pub(in crate::broker) async fn quiet_session(
     descriptor: &RuntimeDescriptor,
     directory: &Path,
     title: &str,
@@ -150,7 +149,7 @@ async fn next_workspace_errand(
 }
 
 /// A Client of the Server `state_dir` and `channel` name, connected.
-async fn connected_client(state_dir: &Path, channel: &str) -> ManagedClient {
+pub(in crate::broker) async fn connected_client(state_dir: &Path, channel: &str) -> ManagedClient {
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir, channel).expect("configure the Client"),
     )
@@ -212,7 +211,7 @@ async fn relaunched_sidekick(
 }
 
 #[tokio::test]
-async fn a_sidekick_is_offered_the_workspace_tools_and_any_other_agent_is_not() {
+async fn a_sidekick_is_offered_both_workspace_tools_and_any_other_agent_the_listing_alone() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut hosted = host_providers(state_dir.path(), "sidekick-workspace-tools", None).await;
     let descriptor = hosted.server.descriptor().clone();
@@ -245,6 +244,10 @@ async fn a_sidekick_is_offered_the_workspace_tools_and_any_other_agent_is_not() 
         json!(true),
         "list_workspaces only reads: {listing}"
     );
+    assert!(
+        listing["inputSchema"]["properties"]["origin"].is_object(),
+        "a Sidekick's list_workspaces reaches a Remote: {listing}"
+    );
     let setting = described("set_workspace_description");
     assert_eq!(
         setting["annotations"]["readOnlyHint"],
@@ -258,23 +261,30 @@ async fn a_sidekick_is_offered_the_workspace_tools_and_any_other_agent_is_not() 
     );
 
     let ordinary_tools = listed_tools(&mut ordinary).await;
-    for tool in WORKSPACE_TOOLS {
-        assert!(
-            !ordinary_tools.iter().any(|listed| listed == tool),
-            "a Session elsewhere is not offered {tool}: {ordinary_tools:?}"
-        );
-        let refused = unoffered(
-            &mut ordinary,
-            tool,
-            json!({ "workspace": workspace, "text": "Mine now." }),
-        )
-        .await;
-        assert_eq!(
-            refused["message"],
-            json!(format!("The Broker offers no Tool named `{tool}`")),
-            "any other caller is answered as though {tool} did not exist: {refused}"
-        );
-    }
+    assert!(
+        ordinary_tools
+            .iter()
+            .any(|listed| listed == "list_workspaces"),
+        "a Session elsewhere is offered list_workspaces: {ordinary_tools:?}"
+    );
+    assert!(
+        !ordinary_tools
+            .iter()
+            .any(|listed| listed == "set_workspace_description"),
+        "but not set_workspace_description: {ordinary_tools:?}"
+    );
+    let refused = unoffered(
+        &mut ordinary,
+        "set_workspace_description",
+        json!({ "workspace": workspace, "text": "Mine now." }),
+    )
+    .await;
+    assert_eq!(
+        refused["message"],
+        json!("The Broker offers no Tool named `set_workspace_description`"),
+        "any other caller is answered as though set_workspace_description did not exist: \
+         {refused}"
+    );
 
     hosted.server.shutdown().await.expect("shut down server");
 }

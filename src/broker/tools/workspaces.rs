@@ -7,6 +7,15 @@
 //! Client turned toward that Remote sets one, through the Remote's own
 //! Workspace endpoint.
 //!
+//! Every other Agent — a Sidekick's Subagents among them — is offered
+//! `list_workspaces` too, so that it knows where the user's other work lives
+//! and may read it where its own Provider's tools reach (ADR 0051). It is
+//! told of no Remote, so its listing is its own Server's alone, in the very
+//! rows a Sidekick's is, the Sidekick Workspace among them: its description
+//! says nothing of an `origin`, and a call giving one — `everywhere` among
+//! them — is refused saying the Tool answers this server's Workspaces alone.
+//! It is offered no Tool that describes a Workspace or begins work in one.
+//!
 //! A Server knows a Workspace a Session works in — the one a Client's
 //! Workspace Picker offers for each listed Session — and one it holds a
 //! Description or Icon for though no Session works there. The listing names
@@ -36,16 +45,16 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::{
-    BrokerTool, BrokerTools, ToolCall, ToolRefusal,
+    BrokerRole, BrokerTool, BrokerTools, ToolCall, ToolRefusal,
     origins::{self, Unanswered},
-    takes_only,
+    takes_no_arguments, takes_only,
 };
 use crate::{
     protocol::{
         Outlook, SetWorkspaceDescriptionRequest, Workspace, WorkspaceDescription, WorkspaceId,
         WorkspacePaths, one_line_description,
     },
-    server::operations::{Refusal, RemoteActRefusal},
+    server::operations::{Origins, Refusal, RemoteActRefusal},
 };
 
 pub(super) const LIST_WORKSPACES_DESCRIPTION: &str = "\
@@ -73,6 +82,23 @@ naming each such Remote as \"origin\" with a \"reason\" saying why, and none \
 of its Workspaces. An \"origin\" naming a Remote this server is not paired \
 with, or one that does not answer, is refused saying so.";
 
+/// `list_workspaces` as any Agent but a Sidekick reads it: this server's
+/// Workspaces alone, in the rows a Sidekick's listing gives, and nothing of a
+/// Remote or of the Tools it is not offered.
+pub(super) const LIST_THIS_SERVERS_WORKSPACES_DESCRIPTION: &str = "\
+List the Workspaces this Suru server knows — the Repositories and \
+directories the user works in — so you know where the user's other work \
+lives and may read it where your own tools reach, as compact rows: first \
+those the user's Sessions work in, most recently worked in first, then those \
+Suru holds a Description or Icon for though no Session works there, by path. \
+Takes no arguments. Answers with JSON of the shape {\"workspaces\": [row, \
+...]}. Each row has \"workspace_id\", the Workspace's identity; \"name\", the \
+name the user knows it by; \"path\", the path it is presented by; \
+\"description\", what it is for, as {\"text\": \"...\", \"set\": true} where \
+the user set it, \"set\": false where Suru derived it, or null where it has \
+none; and \"icon\", the name of its Icon in Suru's Icon Catalog, or null. \
+Suru's own Workspace, the Sidekick Workspace, is among them.";
+
 pub(super) const SET_WORKSPACE_DESCRIPTION_DESCRIPTION: &str = "\
 Set a Workspace's Description: a sentence or two saying what it is for, so \
 that you, the user and later Sidekicks can tell Workspaces apart by more \
@@ -99,15 +125,52 @@ Sidekick Workspace, which refuses you as yours refuses its Peers.";
 /// What `list_workspaces` takes: the Servers whose Workspaces to list.
 const LIST_TAKES: [&str; 1] = ["origin"];
 
-/// The JSON Schema of `list_workspaces`' arguments.
-pub(super) fn list_workspaces_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "origin": origins::origins_property("Workspaces"),
-        },
-        "additionalProperties": false,
-    })
+/// The JSON Schema of `list_workspaces`' arguments, as an Agent that is
+/// `role` to the Broker may give them: a Sidekick, the Origins to list, and
+/// any other Agent nothing.
+pub(super) fn list_workspaces_schema(role: BrokerRole) -> Value {
+    match role {
+        BrokerRole::Sidekick => json!({
+            "type": "object",
+            "properties": {
+                "origin": origins::origins_property("Workspaces"),
+            },
+            "additionalProperties": false,
+        }),
+        BrokerRole::Agent => json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        }),
+    }
+}
+
+/// The Servers a call of `list_workspaces` by an Agent that is `role` to the
+/// Broker lists: for a Sidekick, those its `origin` names; for any other
+/// Agent, which is told of no Remote, this server alone — an `origin` it
+/// gives, whatever it names, refused saying so.
+fn listed_origins(
+    role: BrokerRole,
+    arguments: &Map<String, Value>,
+) -> Result<Origins, ToolRefusal> {
+    let tool = BrokerTool::ListWorkspaces;
+    match role {
+        BrokerRole::Sidekick => {
+            takes_only(tool, arguments, &LIST_TAKES)?;
+            origins::origins(tool, arguments)
+        }
+        BrokerRole::Agent => {
+            if arguments.contains_key("origin") {
+                return Err(ToolRefusal::new(format!(
+                    "{} answers this Suru server's Workspaces alone, so it takes no `origin`; \
+                     call it again without one.",
+                    tool.name()
+                )));
+            }
+            takes_no_arguments(tool, arguments)?;
+            Ok(Origins::One(Outlook::Local))
+        }
+    }
 }
 
 /// The JSON Schema of `set_workspace_description`'s arguments.
@@ -301,11 +364,10 @@ fn unknown_workspace(named: &str) -> ToolRefusal {
 
 impl BrokerTools {
     /// Answers `list_workspaces`: every Workspace known at the Origins the
-    /// call ranges over, this server's alone unless it names others, as a
-    /// row.
+    /// call ranges over, this server's alone unless a Sidekick's call names
+    /// others, as a row.
     pub(super) async fn list_workspaces(&self, call: &ToolCall) -> Result<Value, ToolRefusal> {
-        takes_only(BrokerTool::ListWorkspaces, &call.arguments, &LIST_TAKES)?;
-        let origins = origins::origins(BrokerTool::ListWorkspaces, &call.arguments)?;
+        let origins = listed_origins(call.caller.role(), &call.arguments)?;
         let gathered = self
             .operations
             .workspaces_in(&origins)
@@ -650,11 +712,73 @@ mod tests {
         assert_eq!(properties, takes);
         assert_eq!(schema["required"], json!(DescribeArguments::REQUIRED));
         assert_eq!(
-            list_workspaces_schema()["properties"]
+            list_workspaces_schema(BrokerRole::Sidekick)["properties"]
                 .as_object()
                 .map(|properties| properties.keys().cloned().collect::<Vec<_>>()),
             Some(LIST_TAKES.map(str::to_owned).to_vec()),
-            "list_workspaces takes only the Origins to list"
+            "a Sidekick's list_workspaces takes only the Origins to list"
+        );
+        assert_eq!(
+            list_workspaces_schema(BrokerRole::Agent),
+            json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            "any other Agent's takes nothing"
+        );
+    }
+
+    fn listed(role: BrokerRole, arguments: Value) -> Result<Origins, ToolRefusal> {
+        let Value::Object(arguments) = arguments else {
+            panic!("arguments are an object");
+        };
+        listed_origins(role, &arguments)
+    }
+
+    /// An Agent other than a Sidekick is told of no Remote, so its listing is
+    /// this server's alone: an `origin` it gives — `everywhere` among them,
+    /// and one naming this server — is refused saying so, and any other
+    /// argument as a Tool taking none refuses it. A Sidekick's listing reaches
+    /// where its `origin` says, as it always has.
+    #[test]
+    fn an_agents_listing_is_this_servers_alone_and_a_sidekicks_reaches_where_its_origin_says() {
+        let here = Ok(Origins::One(Outlook::Local));
+        assert_eq!(listed(BrokerRole::Agent, json!({})), here);
+        for origin in [
+            json!("everywhere"),
+            json!("Everywhere"),
+            json!("workstation"),
+            json!(""),
+            Value::Null,
+            json!(7),
+        ] {
+            assert_eq!(
+                listed(BrokerRole::Agent, json!({ "origin": origin })),
+                Err(ToolRefusal::new(
+                    "list_workspaces answers this Suru server's Workspaces alone, so it takes no \
+                     `origin`; call it again without one."
+                )),
+                "{origin}"
+            );
+        }
+        assert_eq!(
+            listed(BrokerRole::Agent, json!({ "limit": 5 })),
+            Err(ToolRefusal::new(
+                "list_workspaces takes no arguments; call it again without limit."
+            ))
+        );
+
+        assert_eq!(listed(BrokerRole::Sidekick, json!({})), here);
+        assert_eq!(
+            listed(BrokerRole::Sidekick, json!({ "origin": "everywhere" })),
+            Ok(Origins::Everywhere)
+        );
+        assert_eq!(
+            listed(BrokerRole::Sidekick, json!({ "origin": "workstation" })),
+            Ok(Origins::One(Outlook::Remote("workstation".to_owned())))
+        );
+        assert_eq!(
+            listed(BrokerRole::Sidekick, json!({ "limit": 5 })),
+            Err(ToolRefusal::new(
+                "list_workspaces takes no argument `limit`; it takes `origin`."
+            ))
         );
     }
 

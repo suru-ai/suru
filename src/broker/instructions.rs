@@ -13,11 +13,13 @@
 //! show its Session as working on its own Turn rather than waiting for Subagents.
 //!
 //! The note is written for what the Agent is to the Broker (ADR 0042). Every Agent's names the
-//! Tools every Agent is offered. A Sidekick's goes on to say what a Sidekick is, to name the Tools
-//! that are its alone — read off the same registry the Broker lists and dispatches by, so a Tool
-//! added there is named here without more — to say how it reaches the user's other machines
-//! (ADR 0044), to say what it may not do, so it does not attempt what will be refused (ADR 0043),
-//! and to say a Sidekick Report wakes it, so it does not poll the Sessions it set to work.
+//! Tools every Agent is offered, and says in a sentence that `list_workspaces` tells it where the
+//! user's other work lives, so it thinks to look (ADR 0051). A Sidekick's goes on to say what a
+//! Sidekick is, to name the Tools that are its alone — read off the same registry the Broker lists
+//! and dispatches by, so a Tool added there is named here without more — to say how it reaches
+//! the user's other machines (ADR 0044), to say what it may not do, so it does not attempt what
+//! will be refused (ADR 0043), and to say a Sidekick Report wakes it, so it does not poll the
+//! Sessions it set to work.
 //!
 //! Where Memories exist, a Sidekick's note ends with an index of them: the titles of the
 //! [`INDEXED_TITLES`] most recently changed, newest first, each beside the memory_id it is recalled
@@ -68,7 +70,8 @@ pub(crate) fn instruction_note(
     }
 }
 
-/// What every Agent handed the Broker is told: the Tools through which it reaches any Provider.
+/// What every Agent handed the Broker is told: the Tools through which it reaches any Provider,
+/// and the one through which it learns where the user's other work lives.
 fn agent_note(tool_name: &impl Fn(&str) -> String) -> String {
     let tools = BrokerTool::offered_to(BrokerRole::Agent)
         .map(|tool| tool_name(tool.name()))
@@ -76,6 +79,7 @@ fn agent_note(tool_name: &impl Fn(&str) -> String) -> String {
         .join(", ");
     let list_providers = tool_name(BrokerTool::ListProviders.name());
     let wait_subagents = tool_name(BrokerTool::WaitSubagents.name());
+    let list_workspaces = tool_name(BrokerTool::ListWorkspaces.name());
     format!(
         "Suru, the app hosting this session, offers you Tools of its own through its Broker: \
          {tools}. With them you can spawn Subagents on any Provider Suru hosts, on the Model you \
@@ -84,7 +88,9 @@ fn agent_note(tool_name: &impl Fn(&str) -> String) -> String {
          {list_providers} first to learn what may be chosen. A Subagent's settling reaches you as \
          a new message that wakes you if your turn has ended, so once you are only waiting on \
          Subagents, end your turn rather than calling {wait_subagents}. Your own tools for \
-         spawning Subagents remain available, and Suru never re-routes them."
+         spawning Subagents remain available, and Suru never re-routes them. Call \
+         {list_workspaces} to learn where the user's other work lives: the Workspaces they work \
+         in on this machine, each with what it is for."
     )
 }
 
@@ -245,8 +251,24 @@ mod tests {
     fn the_note_is_one_short_paragraph() {
         let note = instruction_note(BrokerRole::Agent, &MemoryIndex::default(), claude_named);
         let words = note.split_whitespace().count();
-        assert!(words <= 120, "the note runs to {words} words: {note}");
+        assert!(words <= 150, "the note runs to {words} words: {note}");
         assert!(!note.contains('\n'), "the note is one line: {note:?}");
+    }
+
+    /// Every Agent is offered a listing of its own Server's Workspaces, and told in one sentence
+    /// what it is for, so it thinks to use it; a Sidekick is told the same before what is its own.
+    #[test]
+    fn every_agent_is_told_in_one_sentence_what_list_workspaces_is_for() {
+        for role in [BrokerRole::Agent, BrokerRole::Sidekick] {
+            let note = instruction_note(role, &MemoryIndex::default(), claude_named);
+            assert!(
+                note.contains(
+                    " Call mcp__suru__list_workspaces to learn where the user's other work lives: \
+                     the Workspaces they work in on this machine, each with what it is for."
+                ),
+                "{role:?} is told what list_workspaces is for: {note}"
+            );
+        }
     }
 
     #[test]

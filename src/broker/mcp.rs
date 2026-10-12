@@ -44,7 +44,7 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use super::{
-    BROKER_PATH, BrokerAccess, BrokerCaller,
+    BROKER_PATH, BrokerAccess, BrokerCaller, BrokerRole,
     tools::{BrokerTool, BrokerTools, ProgressReporter, ToolCall, ToolProgress},
 };
 use crate::provider::{ProviderSubagentId, wait_for_shutdown};
@@ -61,7 +61,9 @@ send it more work, and stop_subagent to stop one whose work you no longer need. 
 When a Subagent settles, Suru reports it to you as a new message that wakes you \
 if your turn has ended, so once you have nothing left to do but wait on one, \
 end your turn. Call wait_subagents only when you must have a Subagent's result \
-before your turn ends.";
+before your turn ends. Call list_workspaces to learn where the user's other \
+work lives: the Workspaces they work in on this machine, each with what it is \
+for.";
 
 type Transport = StreamableHttpService<BrokerServer, NeverSessionManager>;
 
@@ -134,8 +136,9 @@ impl BrokerServer {
     }
 }
 
-fn described(tool: BrokerTool) -> Tool {
-    Tool::new(tool.name(), tool.description(), tool.input_schema())
+/// `tool` as an Agent that is `role` to the Broker is shown it.
+fn described(tool: BrokerTool, role: BrokerRole) -> Tool {
+    Tool::new(tool.name(), tool.description(role), tool.input_schema(role))
         .with_title(tool.title())
         .with_annotations(
             ToolAnnotations::with_title(tool.title())
@@ -199,7 +202,7 @@ impl ServerHandler for BrokerServer {
         };
         Ok(ListToolsResult::with_all_items(
             BrokerTool::offered_to(caller.role())
-                .map(described)
+                .map(|tool| described(tool, caller.role()))
                 .collect(),
         )
         .with_ttl_ms(0)
@@ -207,10 +210,11 @@ impl ServerHandler for BrokerServer {
     }
 
     /// A Tool's description, which rmcp reads for the shape of its arguments
-    /// alone; whether a caller is offered the Tool is asked where it is listed
-    /// and where it is called.
+    /// alone, and so the widest any caller is shown — a Sidekick's; whether a
+    /// caller is offered the Tool, and what it may give it, is asked where it
+    /// is listed and where it is called.
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        BrokerTool::named(name).map(described)
+        BrokerTool::named(name).map(|tool| described(tool, BrokerRole::Sidekick))
     }
 
     async fn call_tool(
