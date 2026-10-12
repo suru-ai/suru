@@ -21,6 +21,7 @@ use std::{future::Future, sync::Arc};
 use tokio::sync::{Mutex, watch};
 
 use super::{RootDiscovery, SessionOperations};
+use crate::server::root_discovery::Ticket;
 use crate::{
     protocol::{SettingMutation, SettingsSnapshot},
     provider::{ProviderOrchestrator, ProviderRuntime},
@@ -107,10 +108,13 @@ impl SessionOperations {
     /// listener moves to what its Settings say, every attached Client is
     /// pushed the snapshot, each live Session following a Provider's
     /// Approval Posture Settings takes the posture they now make, and
-    /// Workspace Roots that changed are discovered afresh. The change
+    /// Workspace Roots that changed begin to be discovered afresh. The change
     /// runs whole, after every change asked for before it has, and on a task
     /// of the Server's own, so it completes whether or not this is awaited to
-    /// the end. A document that cannot take the edit changes nothing.
+    /// the end. A document that cannot take the edit changes nothing. Once
+    /// it has run, and so holds no later change off, its answer waits on
+    /// the discovery it began, though never past the bound any wait on
+    /// discovery keeps.
     pub(crate) async fn change_setting(
         &self,
         mutation: SettingMutation,
@@ -119,27 +123,33 @@ impl SessionOperations {
         let sessions = self.sessions.clone();
         let providers = self.providers.clone();
         let root_discovery = self.root_discovery.clone();
-        self.settings_adoption
+        let (changed, rediscovery) = self
+            .settings_adoption
             .changes
             .run(async move {
                 adoption
                     .change(mutation, &sessions, &providers, &root_discovery)
                     .await
             })
-            .await
+            .await?;
+        if let Some(ticket) = rediscovery {
+            self.root_discovery.settled(ticket).await;
+        }
+        Ok(changed)
     }
 }
 
 impl SettingsAdoption {
     /// One change, from its write through the Approval Postures it reconciles
-    /// and the Workspace Roots it names.
+    /// and the discovery it begins of Workspace Roots it changed, which it
+    /// answers beside what changed without waiting on it.
     async fn change(
         &self,
         mutation: SettingMutation,
         sessions: &SessionStore,
         providers: &ProviderOrchestrator,
         root_discovery: &RootDiscovery,
-    ) -> Result<SettingChanged, SettingsMutationError> {
+    ) -> Result<(SettingChanged, Option<Ticket>), SettingsMutationError> {
         let roots = self.snapshot.borrow().settings.workspace.roots.clone();
         // The edit is filesystem work, and the CST handles it parses the
         // document into are not `Send`; both stay on a blocking thread, where
@@ -166,10 +176,9 @@ impl SettingsAdoption {
                 });
         let changed = sessions.reconcile_approval_postures(&snapshot.settings);
         crate::server::apply_live_posture_updates(providers, changed).await;
-        if snapshot.settings.workspace.roots != roots {
-            root_discovery.rediscover().await;
-        }
-        Ok(SettingChanged { snapshot, serving })
+        let rediscovery =
+            (snapshot.settings.workspace.roots != roots).then(|| root_discovery.rediscover());
+        Ok((SettingChanged { snapshot, serving }, rediscovery))
     }
 }
 

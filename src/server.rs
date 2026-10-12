@@ -163,11 +163,16 @@ pub const SHUTDOWN_OVERRUN: Duration = Duration::from_secs(5);
 pub struct ServerTimings {
     pub sse_keepalive_interval: Duration,
     pub checkout_observation_interval: Duration,
-    /// How long a discovery of the Repositories within the Workspace Roots
-    /// is reused by the Workspace listings that follow it before one
+    /// How long after a discovery of the Repositories within the Workspace
+    /// Roots finished the Workspace listings that follow reuse it before one
     /// discovers them again, so listing stays cheap while a Repository
     /// cloned by hand is still listed within moments.
     pub root_discovery_memo: Duration,
+    /// The longest a Workspace listing, a change of the Roots, or the
+    /// Server's start waits on a discovery of the Workspace Roots before
+    /// going on without it — answering from the Workspace Registry as it
+    /// stands — so a Root on a mount gone quiet holds nothing up.
+    pub root_discovery_wait: Duration,
     /// Delay after startup Workspace discovery before the first Reclaim pass.
     pub worktree_reclaim_startup_delay: Duration,
     /// Cadence of later automatic Reclaim passes.
@@ -352,6 +357,7 @@ impl Default for ServerTimings {
             sse_keepalive_interval: Duration::from_secs(10),
             checkout_observation_interval: Duration::from_secs(1),
             root_discovery_memo: Duration::from_secs(3),
+            root_discovery_wait: Duration::from_secs(1),
             worktree_reclaim_startup_delay: Duration::from_secs(1),
             worktree_reclaim_interval: Duration::from_secs(60 * 60),
             worktree_reclaim_day: Duration::from_secs(24 * 60 * 60),
@@ -600,6 +606,13 @@ impl ServerTimings {
         self.root_discovery_memo = memo;
         self
     }
+    /// Bounds how long anything waits on a discovery of the Workspace Roots;
+    /// injectable so a test sees what a scan found in the very next answer
+    /// however slowly it runs, or sees a stalled scan waited on only briefly.
+    pub fn with_root_discovery_wait(mut self, wait: Duration) -> Self {
+        self.root_discovery_wait = wait;
+        self
+    }
     pub fn with_worktree_reclaim_startup_delay(mut self, delay: Duration) -> Self {
         self.worktree_reclaim_startup_delay = delay;
         self
@@ -806,7 +819,8 @@ impl SessionEventSink {
 impl RunningServer {
     /// Startup Workspace discovery runs behind readiness. Resolves once every
     /// persisted Session has been regrouped and the Workspace Roots have
-    /// been discovered, or discovery was abandoned.
+    /// been discovered — or `root_discovery_wait` has passed waiting on
+    /// them — or discovery was abandoned.
     pub async fn workspace_discovery_settled(&self) {
         let mut discovery = self.workspace_discovery.clone();
         let _ = discovery.wait_for(|settled| *settled).await;
@@ -1515,17 +1529,23 @@ async fn start(
     let source_control = crate::source_control::SourceControlService::new(source_control)
         .with_sidekick_workspace(sidekick_workspace.clone());
     let root_discovery = root_discovery::RootDiscovery::new(
-        sessions.clone(),
-        source_control.clone(),
+        Arc::new(root_discovery::RegistryScan::new(
+            sessions.clone(),
+            source_control.clone(),
+            config.home_dir(),
+        )),
         settings.subscribe(),
-        config.home_dir(),
         timings.root_discovery_memo,
+        timings.root_discovery_wait,
+        timings.clock.clone(),
+        provider_shutdown_rx.clone(),
     );
     // Persisted grouping is served at once; discovery regroups Sessions behind
     // readiness and publishes catalog changes, so a cold source control
     // system never delays the server's readiness. The Workspace Roots are
     // discovered once the Sessions are regrouped, so a Workspace a Session
-    // is found working in is known by that Session rather than by its Root.
+    // is found working in is known by that Session rather than by its Root,
+    // and waited on no longer than any discovery is.
     let (workspace_discovery, workspace_discovery_rx) = watch::channel(false);
     {
         let sessions = sessions.clone();
@@ -1542,7 +1562,8 @@ async fn start(
                     if let Err(error) = sessions.discover_workspaces(&source_control).await {
                         tracing::error!("Workspace discovery failed: {error:#}");
                     }
-                    root_discovery.rediscover().await;
+                    let ticket = root_discovery.rediscover();
+                    root_discovery.settled(ticket).await;
                 } => {}
             }
             workspace_discovery.send_replace(true);

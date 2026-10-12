@@ -20,9 +20,11 @@ use std::{
 use serde_json::json;
 use suru::{
     protocol::{
-        ProviderId, RepositoryId, SettingMutation, Workspace, WorkspaceDescription, WorkspaceId,
+        ProviderId, RepositoryId, ResolvedWorkspace, SettingMutation, Workspace,
+        WorkspaceDescription, WorkspaceId,
     },
     server::{self, ServerConfig, ServerTimings},
+    source_control::{GitSourceControl, SourceControl},
 };
 use tokio::time::timeout;
 
@@ -44,6 +46,11 @@ use crate::{
 /// A memo no test outlasts: every listing after the first reuses its scan.
 const NEVER_AGAIN: Duration = Duration::from_secs(60 * 60);
 
+/// A bound on waiting for discovery that no test reaches, so whatever asks
+/// for a scan of the Roots answers with what it found, however slowly it
+/// runs on a loaded machine.
+pub(crate) const AS_LONG_AS_IT_TAKES: Duration = Duration::from_secs(60 * 60);
+
 /// The Config Document a Server reads its Workspace Roots from, naming
 /// `roots`, written into `config_dir`.
 fn name_roots(config_dir: &Path, roots: &[&str]) {
@@ -59,9 +66,10 @@ fn spelled(path: &Path) -> &str {
 }
 
 /// A Server beneath `home` whose Workspace Roots are `roots`, reusing a scan
-/// for `memo`, and which leaves the Worktrees it knows alone, so no Git it
-/// runs keeps a Repository's directory open when a test lets go of it, which
-/// Windows refuses to delete.
+/// for `memo` and waiting on each as long as it takes, and which leaves the
+/// Worktrees it knows alone, so no Git it runs keeps a Repository's
+/// directory open when a test lets go of it, which Windows refuses to
+/// delete.
 async fn server_with_roots(
     home: &Path,
     channel: &str,
@@ -78,7 +86,8 @@ async fn server_with_roots(
         Arc::new(FailingProviderRuntime),
         ServerTimings::default()
             .with_checkout_observation_interval(Duration::from_secs(60 * 60))
-            .with_root_discovery_memo(memo),
+            .with_root_discovery_memo(memo)
+            .with_root_discovery_wait(AS_LONG_AS_IT_TAKES),
     )
     .await
     .expect("spawn server");
@@ -465,7 +474,8 @@ async fn no_errand_is_asked_for_a_discovered_workspace_until_a_session_begins_th
         runtime,
         ServerTimings::default()
             .with_checkout_observation_interval(Duration::from_secs(60 * 60))
-            .with_root_discovery_memo(Duration::ZERO),
+            .with_root_discovery_memo(Duration::ZERO)
+            .with_root_discovery_wait(AS_LONG_AS_IT_TAKES),
     )
     .await
     .expect("spawn server");
@@ -527,6 +537,98 @@ async fn no_errand_is_asked_for_a_discovered_workspace_until_a_session_begins_th
         )],
         "the first Session's Errand lands the Icon and Description on the discovered entry"
     );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// Stands in for Git, but for every directory within `stalled`, whose
+/// reading never finishes, as a Root on a network mount gone quiet.
+struct StallsWithin {
+    git: GitSourceControl,
+    stalled: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl SourceControl for StallsWithin {
+    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+        if directory.starts_with(&self.stalled) {
+            std::future::pending::<()>().await;
+        }
+        self.git.discover(directory).await
+    }
+}
+
+/// A Root whose reading stalls holds back neither a change of the Roots —
+/// taking it away included — nor a listing, past the Server's bound on
+/// waiting for discovery: each answers, the listing from the Registry as it
+/// stands, and a Root named in its place is discovered all the same.
+#[tokio::test]
+async fn a_root_whose_reading_stalls_holds_back_no_change_of_the_roots_and_no_listing() {
+    const CHANNEL: &str = "workspace-discovery-stalled-root";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let stalled = home.join("stalled");
+    std::fs::create_dir_all(stalled.join("inner")).expect("create the stalled Root");
+    let projects = home.join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    let notes = home.join("notes");
+    std::fs::create_dir(&notes).expect("create the notes directory");
+    name_roots(&home.join("config"), &[]);
+    let server = server::spawn_with_source_control(
+        ServerConfig::new(home.join("state"), CHANNEL)
+            .expect("configure")
+            .with_config_dir(home.join("config")),
+        vec![Arc::new(FailingProviderRuntime)],
+        ServerTimings::default()
+            .with_checkout_observation_interval(Duration::from_secs(60 * 60))
+            .with_root_discovery_memo(Duration::ZERO)
+            .with_root_discovery_wait(Duration::from_millis(20)),
+        Arc::new(StallsWithin {
+            git: GitSourceControl::new("git"),
+            stalled: stalled.clone(),
+        }),
+    )
+    .await
+    .expect("spawn server");
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let noted = client
+        .create_session(quiet_request(&notes, "Keep the notes"))
+        .await
+        .expect("begin a Session in the notes directory")
+        .session
+        .workspace;
+    let name = |roots: &[&Path]| SettingMutation::WorkspaceRoots {
+        value: Some(roots.iter().map(|root| spelled(root).to_owned()).collect()),
+    };
+
+    timeout(PROGRESS_DEADLINE, client.mutate_setting(name(&[&stalled])))
+        .await
+        .expect("naming a Root whose reading stalls answers")
+        .expect("name the stalled Root");
+    let listing = timeout(PROGRESS_DEADLINE, listed(&client))
+        .await
+        .expect("a listing answers while the scan stalls");
+    assert_eq!(
+        listing.iter().map(located).collect::<Vec<_>>(),
+        [located(&noted)],
+        "the listing answers with what the Registry holds"
+    );
+
+    timeout(PROGRESS_DEADLINE, client.mutate_setting(name(&[&projects])))
+        .await
+        .expect("replacing the Root whose reading stalls answers")
+        .expect("name another Root in its place");
+    timeout(PROGRESS_DEADLINE, async {
+        while !listed(&client)
+            .await
+            .iter()
+            .any(|workspace| workspace.path == atlas)
+        {}
+    })
+    .await
+    .expect("the Root named in place of the stalled one is discovered");
 
     drop(client);
     server.shutdown().await.expect("shut down server");

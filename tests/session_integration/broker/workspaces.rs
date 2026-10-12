@@ -22,7 +22,7 @@ use crate::broker::{
     },
     sidekick_acts::{acted, refused},
 };
-use crate::repositories::git;
+use crate::{repositories::git, workspace_discovery::AS_LONG_AS_IT_TAKES};
 
 /// What an Agent other than a Sidekick is told when it asks for any Server's
 /// Workspaces but its own.
@@ -300,7 +300,9 @@ async fn an_agent_lists_the_repositories_discovered_within_the_workspace_roots()
         state_dir.path(),
         CHANNEL,
         Some(config_dir.path()),
-        ServerTimings::default().with_root_discovery_memo(Duration::ZERO),
+        ServerTimings::default()
+            .with_root_discovery_memo(Duration::ZERO)
+            .with_root_discovery_wait(AS_LONG_AS_IT_TAKES),
     )
     .await;
     let descriptor = hosted.server.descriptor().clone();
