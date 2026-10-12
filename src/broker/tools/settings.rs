@@ -57,10 +57,10 @@ use crate::{
 macro_rules! sidekick_settings_rule {
     () => {
         "You may read but not change a Setting that bounds what Agents may do or \
-         whose effect no later change can undo — an Approval Posture's, or \
-         automatic Worktree Reclaim — and you can neither read nor change the \
-         Settings governing Serving and Pairing; the user changes those in Suru's \
-         settings panel."
+         whose effect no later change can undo — an Approval Posture's, the \
+         Workspace Roots, or automatic Worktree Reclaim — and you can neither read \
+         nor change the Settings governing Serving and Pairing; the user changes \
+         those in Suru's settings panel."
     };
 }
 
@@ -76,8 +76,8 @@ pub(super) const LIST_SETTINGS_DESCRIPTION: &str = concat!(
      tab of Suru's settings panel by that name, to list only its Settings. \
      Answers with JSON of the shape {\"settings\": [{\"key\": \"...\", \"value\": \
      ...}, ...]}, each value as a Config Document spells it — a string, true or \
-     false, a number, or an object — whether the user pinned it or it is Suru's \
-     built-in default; describe_setting says which, and what else a Setting \
+     false, a number, a list, or an object — whether the user pinned it or it is \
+     Suru's built-in default; describe_setting says which, and what else a Setting \
      accepts. ",
     sidekick_settings_rule!(),
     " So the Settings governing Serving and Pairing are never listed. A \
@@ -871,6 +871,7 @@ mod tests {
         }
         assert!(
             SIDEKICK_SETTINGS_RULE.contains("automatic Worktree Reclaim")
+                && SIDEKICK_SETTINGS_RULE.contains("the Workspace Roots")
                 && SIDEKICK_SETTINGS_RULE.contains("Approval Posture")
                 && SIDEKICK_SETTINGS_RULE.contains("Serving and Pairing")
                 && SIDEKICK_SETTINGS_RULE.contains("settings panel")

@@ -731,7 +731,8 @@ async fn no_setting_governing_serving_or_pairing_is_listed_described_or_set() {
 }
 
 /// A Setting bounding what Agents may do — those an Approval Posture is made
-/// of — or doing what no later change undoes — automatic Worktree Reclaim — is
+/// of, and the Workspace Roots — or doing what no later change undoes —
+/// automatic Worktree Reclaim — is
 /// listed and described, so a Sidekick can tell the user what it says, but
 /// never changed, its pin neither set nor removed, the refusal saying why and
 /// that the user may change it.
@@ -758,7 +759,11 @@ async fn a_setting_a_sidekick_may_only_read_is_listed_and_described_but_never_ch
         .iter()
         .map(|descriptor| descriptor.key)
         .collect::<Vec<_>>();
-    for key in ["provider.claude.permissionMode", "worktree.autoReclaim"] {
+    for key in [
+        "provider.claude.permissionMode",
+        "worktree.autoReclaim",
+        "workspace.roots",
+    ] {
         assert!(keys_read_only.contains(&key), "{keys_read_only:?}");
     }
 
@@ -814,6 +819,85 @@ async fn a_setting_a_sidekick_may_only_read_is_listed_and_described_but_never_ch
             .approval_posture,
         posture_before,
         "and the Sidekick's own posture is as it was"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A Workspace Root rooted the way the platform under test roots an absolute
+/// path — drive-rooted on Windows, where a POSIX path is relative — on a drive
+/// that is not there, since a Root need not exist.
+#[cfg(windows)]
+const UNPLUGGED_ROOT: &str = r"Q:\unplugged\work";
+#[cfg(not(windows))]
+const UNPLUGGED_ROOT: &str = "/Volumes/unplugged/work";
+
+/// The Workspace Roots bound where a Sidekick may write, so a Sidekick reads
+/// which Roots there are — listed beside the other Source Control Settings and
+/// described as the list they are — but is refused every change to them, the
+/// user's list left as they named it.
+#[tokio::test]
+async fn a_sidekick_reads_the_workspace_roots_but_is_refused_changing_them() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let pinned = format!(
+        "{{ \"workspace\": {{ \"roots\": [\"~/src\", {}] }} }}\n",
+        serde_json::to_string(UNPLUGGED_ROOT).expect("a path spells as a JSON string")
+    );
+    write_config_document(config_dir.path(), &pinned);
+    let (server, mut claude) = host_claude(
+        state_dir.path(),
+        config_dir.path(),
+        "sidekick-workspace-roots",
+    )
+    .await;
+    let descriptor = server.descriptor().clone();
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&descriptor, &mut claude).await;
+
+    assert_eq!(
+        list_settings(&mut sidekick, json!({ "group": "source_control" })).await,
+        vec![
+            json!({ "key": "worktree.autoReclaim", "value": 14 }),
+            json!({ "key": "workspace.roots", "value": ["~/src", UNPLUGGED_ROOT] }),
+        ],
+        "the Roots are listed as the user named them, whether or not anything is there"
+    );
+    assert_eq!(
+        describe(&mut sidekick, "workspace.roots").await,
+        json!({
+            "key": "workspace.roots",
+            "label": "Workspace Roots",
+            "description": "The directories your work lives in, each an absolute path or one \
+                beginning with ~",
+            "group": "source_control",
+            "scope": "server",
+            "value": ["~/src", UNPLUGGED_ROOT],
+            "default": [],
+            "pinned": true,
+            "accepts": "a list of absolute paths or paths beginning with ~",
+            "settable": false,
+        }),
+        "a list, described as one"
+    );
+
+    for arguments in [
+        json!({ "key": "workspace.roots", "value": ["~/src", UNPLUGGED_ROOT, "~/elsewhere"] }),
+        json!({ "key": "workspace.roots", "value": [] }),
+        json!({ "key": "workspace.roots", "value": "projects" }),
+        json!({ "key": "workspace.roots" }),
+    ] {
+        assert_eq!(
+            refused(&mut sidekick, "set_setting", arguments.clone()).await,
+            "`workspace.roots` is a Setting a Sidekick may read but not change, since the \
+             Workspace Roots bound where a Sidekick may write, so it was left as it is; tell the \
+             user, who may change it in Suru's settings panel.",
+            "{arguments}"
+        );
+    }
+    assert_eq!(
+        config_document(config_dir.path()),
+        Some(pinned),
+        "no Root was added, taken away, or unpinned"
     );
 
     server.shutdown().await.expect("shut down server");
