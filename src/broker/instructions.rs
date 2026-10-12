@@ -20,7 +20,8 @@
 //! the user's other machines (ADR 0044), to say what it may not do, so it does not attempt what
 //! will be refused (ADR 0043), to name the Workspace Roots its Clones are bound to as the user had
 //! named them when it was started — as a JSON array, so the note stays one line however a Root is
-//! spelled — and to say a Sidekick Report wakes it, so it does not poll the Sessions it set to work.
+//! spelled — and that a Clone on a Remote is bound by that Remote's own Roots instead, and to say a
+//! Sidekick Report wakes it, so it does not poll the Sessions it set to work.
 //!
 //! Where Memories exist, a Sidekick's note ends with an index of them: the titles of the
 //! [`INDEXED_TITLES`] most recently changed, newest first, each beside the memory_id it is recalled
@@ -165,23 +166,27 @@ fn sidekick_note(roots: &[String], tool_name: &impl Fn(&str) -> String) -> Strin
 
 /// What a Sidekick is told of `clone_workspace`: that it Clones only directly within one of this
 /// server's Workspace Roots, and which Roots the user had named, `roots`, when it was started —
-/// as a JSON array, so however a Root is spelled the note stays one line — or that there were none.
+/// as a JSON array, so however a Root is spelled the note stays one line — or that there were none;
+/// and that a Clone on a Remote is bound by that Remote's own Roots instead.
 fn clone_note(roots: &[String], tool_name: &impl Fn(&str) -> String) -> String {
     let clone_workspace = tool_name(BrokerTool::CloneWorkspace.name());
     let bound = format!(
         "{clone_workspace} Clones a Repository URL into a new Workspace directly within one of \
-         this server's Workspace Roots and nowhere else, never yet on a Remote;"
+         this server's Workspace Roots and nowhere else;"
     );
+    let on_a_remote = "Given a Remote's `origin`, it Clones there instead, bound by that Remote's \
+         own Workspace Roots, which keep it there as these keep it here and which its refusals \
+         name.";
     if roots.is_empty() {
         return format!(
-            "{bound} the user had named none when you were started here, so it refuses until they \
-             name one in the workspace.roots Setting."
+            "{bound} the user had named none when you were started here, so it refuses here until \
+             they name one in the workspace.roots Setting. {on_a_remote}"
         );
     }
     let roots = serde_json::to_string(roots).expect("the Workspace Roots always serialize");
     format!(
         "{bound} the Roots the user named, as they stood when you were started here, are {roots}; \
-         give one as its `root` where there are several."
+         give one as its `root` where there are several. {on_a_remote}"
     )
 }
 
@@ -309,7 +314,8 @@ mod tests {
 
     /// A Sidekick is told the one Tool that writes to the user's disk outside its own Execution
     /// Directory, and the Workspace Roots that bound it as the user named them when it was started:
-    /// as data, in a JSON array, so whatever a Root is spelled with leaves the note one line.
+    /// as data, in a JSON array, so whatever a Root is spelled with leaves the note one line. It is
+    /// told a Clone on a Remote is bound by that Remote's own Roots instead, whatever these are.
     #[test]
     fn a_sidekick_is_told_clone_workspace_and_the_roots_that_bound_it() {
         let roots = ["~/src".to_owned(), "/srv/work\"quoted\"\nroot".to_owned()];
@@ -322,10 +328,12 @@ mod tests {
         assert!(
             note.contains(
                 "mcp__suru__clone_workspace Clones a Repository URL into a new Workspace directly \
-                 within one of this server's Workspace Roots and nowhere else, never yet on a \
-                 Remote; the Roots the user named, as they stood when you were started here, \
-                 are [\"~/src\",\"/srv/work\\\"quoted\\\"\\nroot\"]; give one as its `root` where \
-                 there are several."
+                 within one of this server's Workspace Roots and nowhere else; the Roots the user \
+                 named, as they stood when you were started here, are \
+                 [\"~/src\",\"/srv/work\\\"quoted\\\"\\nroot\"]; give one as its `root` where \
+                 there are several. Given a Remote's `origin`, it Clones there instead, bound by \
+                 that Remote's own Workspace Roots, which keep it there as these keep it here and \
+                 which its refusals name."
             ),
             "{note}"
         );
@@ -340,9 +348,11 @@ mod tests {
         assert!(
             none.contains(
                 "mcp__suru__clone_workspace Clones a Repository URL into a new Workspace directly \
-                 within one of this server's Workspace Roots and nowhere else, never yet on a \
-                 Remote; the user had named none when you were started here, so it refuses \
-                 until they name one in the workspace.roots Setting."
+                 within one of this server's Workspace Roots and nowhere else; the user had named \
+                 none when you were started here, so it refuses here until they name one in the \
+                 workspace.roots Setting. Given a Remote's `origin`, it Clones there instead, \
+                 bound by that Remote's own Workspace Roots, which keep it there as these keep it \
+                 here and which its refusals name."
             ),
             "{none}"
         );
