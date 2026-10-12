@@ -1202,3 +1202,63 @@ async fn a_clone_is_made_out_of_sight_and_one_abandoned_leaves_nothing_behind() 
     .expect("an abandoned Clone leaves nothing behind");
     held.abort();
 }
+
+/// An ssh the user names of their own — here one that asks for the
+/// passphrase of a locked key and waits on a terminal nobody watches unless
+/// told not to — is still told to ask nothing, so the Clone fails at once in
+/// its words rather than waiting out its timeout.
+#[tokio::test]
+async fn a_clone_through_an_ssh_the_user_names_asks_nothing_either() {
+    let (_temporary, root) = root();
+    let bin = root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let ssh = bin.join("ssh");
+    std::fs::write(
+        &ssh,
+        "#!/bin/sh\n\
+         for argument in \"$@\"; do\n\
+         \x20 if [ \"$argument\" = BatchMode=yes ]; then\n\
+         \x20   echo 'Permission denied (publickey).' >&2\n\
+         \x20   exit 255\n\
+         \x20 fi\n\
+         done\n\
+         echo 'Enter passphrase for key locked_key:' >&2\n\
+         sleep 60\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let configuration = root.join("gitconfig");
+    std::fs::write(
+        &configuration,
+        format!(
+            "[core]\n\tsshCommand = {} -i locked_key\n",
+            ssh.to_str().unwrap().replace('\\', "/")
+        ),
+    )
+    .unwrap();
+    let adapter = GitSourceControl::default().with_configuration_file(&configuration);
+    let destination = root.join("atlas");
+
+    let failure = adapter
+        .clone_repository(
+            "ssh://git@example.invalid/atlas.git",
+            &destination,
+            None,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+    let Err(CloneFailure::Failed(said)) = failure else {
+        panic!("the user's own ssh fails the Clone at once: {failure:?}");
+    };
+    assert!(said.contains("Permission denied (publickey)."), "{said}");
+    assert!(!destination.exists());
+    assert_eq!(
+        names_within(&root),
+        ["bin", "gitconfig"],
+        "nothing of the Clone is left beside it"
+    );
+}
