@@ -2067,7 +2067,7 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
             ));
         }
         lines.push(named(
-            "↑↓ move · Space open/close · → open · ← close/up · Enter choose · Esc close",
+            "↑↓ move · Space open/close · → open · ← up · Enter choose · Esc close",
             "↑↓ · Space · → · ← · Enter · Esc",
         ));
     }

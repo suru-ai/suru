@@ -567,10 +567,10 @@ pub(super) fn command_for_workspace_picker_event(event: InputEvent) -> Option<Co
 
 /// The Directory Browser walks its tree with the keys every picker walks its
 /// rows with — the arrows, and Ctrl+P and Ctrl+N — while Space opens or
-/// closes the focused row, Right opens it, Left closes it or walks the root
-/// up to its parent, Enter chooses it, Alt+H shows or hides hidden
-/// directories, and Esc closes the browser; a terminal sending Alt as an
-/// Escape before the letter is read as Alt all the same. Everything else the
+/// closes the focused row, Right steps into it, Left steps up to its parent
+/// or walks the root up to its own, Enter chooses it, Alt+H shows or hides
+/// hidden directories, and Esc closes the browser; a terminal sending Alt as
+/// an Escape before the letter is read as Alt all the same. Everything else the
 /// reader types or pastes goes to the end of the path field, which has no
 /// cursor for Left and Right to move: Backspace takes a character back, and
 /// Tab completes the field to the focused row. The pointer answers as it does
@@ -604,8 +604,8 @@ pub(super) fn command_for_directory_browser_event(event: InputEvent) -> Option<C
             SemanticCommandId::DirectoryBrowserNext
         }
         (KeyCode::Char(' '), KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserRowToggle,
-        (KeyCode::Right, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserRowOpen,
-        (KeyCode::Left, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserRowClose,
+        (KeyCode::Right, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserRowEnter,
+        (KeyCode::Left, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserRowParent,
         (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserChoose,
         (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::DirectoryBrowserClose,
         (KeyCode::Char('h'), KeyModifiers::ALT) => SemanticCommandId::DirectoryBrowserHiddenToggle,

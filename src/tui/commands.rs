@@ -251,10 +251,12 @@ pub enum SemanticCommandId {
     /// Opens the Directory Browser's focused row where it is closed, and
     /// closes it where it is open.
     DirectoryBrowserRowToggle,
-    DirectoryBrowserRowOpen,
-    /// Closes the Directory Browser's focused row, or on the root stands the
-    /// tree on the root's parent.
-    DirectoryBrowserRowClose,
+    /// Opens the Directory Browser's focused row and steps focus onto its
+    /// first child.
+    DirectoryBrowserRowEnter,
+    /// Steps the Directory Browser's focus onto the focused row's parent, or
+    /// on the root stands the tree on the root's parent.
+    DirectoryBrowserRowParent,
     /// Adds the typed or pasted text its invocation carries to the end of the
     /// Directory Browser's path field.
     DirectoryBrowserPathInsert,
@@ -663,8 +665,8 @@ impl SemanticCommandId {
             Self::DirectoryBrowserPrevious => "directory-browser.previous",
             Self::DirectoryBrowserNext => "directory-browser.next",
             Self::DirectoryBrowserRowToggle => "directory-browser.row.toggle",
-            Self::DirectoryBrowserRowOpen => "directory-browser.row.open",
-            Self::DirectoryBrowserRowClose => "directory-browser.row.close",
+            Self::DirectoryBrowserRowEnter => "directory-browser.row.enter",
+            Self::DirectoryBrowserRowParent => "directory-browser.row.parent",
             Self::DirectoryBrowserPathInsert => "directory-browser.path.insert",
             Self::DirectoryBrowserPathDeleteBackward => "directory-browser.path.delete-backward",
             Self::DirectoryBrowserPathComplete => "directory-browser.path.complete",
@@ -1293,19 +1295,20 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         keybinding: None,
     },
     SemanticCommandDescriptor {
-        id: SemanticCommandId::DirectoryBrowserRowOpen,
-        title: "Open Directory",
+        id: SemanticCommandId::DirectoryBrowserRowEnter,
+        title: "Enter Directory",
         reach: SemanticReach::Client,
-        description: "List the Directory Browser's focused directory beneath its row",
+        description: "Open the Directory Browser's focused directory and step onto its first \
+                      child",
         slash: None,
         keybinding: None,
     },
     SemanticCommandDescriptor {
-        id: SemanticCommandId::DirectoryBrowserRowClose,
-        title: "Close Directory",
+        id: SemanticCommandId::DirectoryBrowserRowParent,
+        title: "Go to Parent Directory",
         reach: SemanticReach::Client,
-        description: "Fold the Directory Browser's focused directory back to its row, or on the \
-                      root stand the tree on its parent",
+        description: "Step the Directory Browser's focus onto the focused directory's parent, or \
+                      on the root stand the tree on its parent",
         slash: None,
         keybinding: None,
     },

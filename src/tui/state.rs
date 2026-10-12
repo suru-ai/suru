@@ -7832,8 +7832,8 @@ impl Application {
                 None
             }
             SemanticCommandId::DirectoryBrowserRowToggle => browser.toggle_focused(),
-            SemanticCommandId::DirectoryBrowserRowOpen => browser.open_focused(),
-            SemanticCommandId::DirectoryBrowserRowClose => browser.close_focused(),
+            SemanticCommandId::DirectoryBrowserRowEnter => browser.enter_focused(),
+            SemanticCommandId::DirectoryBrowserRowParent => browser.focus_parent(),
             SemanticCommandId::DirectoryBrowserPathInsert => match subject {
                 SemanticSubject::Text(text) => browser.type_into_field(&text),
                 _ => None,
@@ -10358,8 +10358,8 @@ impl Application {
             command @ (SemanticCommandId::DirectoryBrowserPrevious
             | SemanticCommandId::DirectoryBrowserNext
             | SemanticCommandId::DirectoryBrowserRowToggle
-            | SemanticCommandId::DirectoryBrowserRowOpen
-            | SemanticCommandId::DirectoryBrowserRowClose
+            | SemanticCommandId::DirectoryBrowserRowEnter
+            | SemanticCommandId::DirectoryBrowserRowParent
             | SemanticCommandId::DirectoryBrowserPathInsert
             | SemanticCommandId::DirectoryBrowserPathDeleteBackward
             | SemanticCommandId::DirectoryBrowserPathComplete

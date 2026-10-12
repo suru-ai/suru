@@ -88,6 +88,10 @@ pub(super) struct DirectoryBrowser {
     /// number, so a listing landing above it leaves the reader where they
     /// were.
     focused: RowKey,
+    /// The row Right opened while the Server was still reading it, whose
+    /// first child focus steps onto once the listing lands — unless focus
+    /// has moved since, which lets the step go.
+    entering: Option<RowKey>,
     /// What each listing still awaited was asked for, so an answer to
     /// anything else — an earlier opening's request, or a leading part the
     /// reader has since typed over — moves nothing.
@@ -255,7 +259,7 @@ impl DirectoryBrowser {
             self.resolved.insert(spelling, execution_directory.clone());
         }
         self.root.clone_from(&execution_directory);
-        self.focused = RowKey::root(execution_directory);
+        self.focus(RowKey::root(execution_directory));
         self.window.open();
         self.open_row(self.focused.clone())
             .expect("a fresh tree has listed nothing yet")
@@ -270,6 +274,7 @@ impl DirectoryBrowser {
         self.field_refusal = None;
         self.tree.clear();
         self.opened.clear();
+        self.entering = None;
         self.awaiting.clear();
         self.refusal = None;
         self.pressed = None;
@@ -364,14 +369,36 @@ impl DirectoryBrowser {
         self.open_row(self.focused.clone())
     }
 
-    /// Closes the focused row, unless it is the root: Left there stands the
-    /// tree on the root's parent, as the Server named it, rather than folding
-    /// the tree away, leaving the former root open and focused beneath it,
-    /// and answers the listing the parent asks for. A root without a parent
-    /// stands where it is.
-    pub(super) fn close_focused(&mut self) -> Option<DirectoryListingAsk> {
+    /// Opens the focused row and steps focus onto the first child drawn
+    /// beneath it, answering the listing opening it asks for. Where the
+    /// Server is still reading the row, focus waits on it and steps in once
+    /// the listing lands, so long as it has not moved by then; where nothing
+    /// is drawn beneath it, focus stays on it.
+    pub(super) fn enter_focused(&mut self) -> Option<DirectoryListingAsk> {
+        let ask = self.open_focused();
+        let row = self.focused.clone();
+        if matches!(
+            self.tree.get(row.directory()),
+            Some(DirectoryEntries::Loading)
+        ) {
+            self.entering = Some(row);
+        } else {
+            self.step_into(&row);
+        }
+        ask
+    }
+
+    /// Steps focus onto the focused row's parent, closing nothing. On the
+    /// root it stands the tree on the root's parent, as the Server named it,
+    /// with focus on that parent and the former root open or closed beneath
+    /// it as it stood, and answers the listing the parent asks for. A root
+    /// without a parent stands where it is.
+    pub(super) fn focus_parent(&mut self) -> Option<DirectoryListingAsk> {
         if !self.focused.is_root() {
-            self.opened.remove(&self.focused);
+            let mut parent = self.focused.clone();
+            parent.0.pop();
+            self.focus(parent);
+            self.window.reveal();
             return None;
         }
         let Some(DirectoryEntries::Listed(DirectoryListing {
@@ -382,7 +409,7 @@ impl DirectoryBrowser {
             return None;
         };
         let parent = parent.clone();
-        let former = std::mem::replace(&mut self.root, parent.clone());
+        self.root.clone_from(&parent);
         self.field = self.beneath(&parent.to_string_lossy());
         self.leading_changed();
         // A parent that is the drive list goes by the empty path, so from
@@ -390,16 +417,14 @@ impl DirectoryBrowser {
         // Directory.
         self.resolved.insert(self.leading.clone(), parent.clone());
         self.filter.clear();
-        // Every row open stands beneath the former root, which stands open
-        // beneath its parent even where the reader had closed it.
+        // Every row open stands beneath the former root, which stands
+        // beneath its parent now.
         let beneath_parent = |row: RowKey| RowKey([vec![parent.clone()], row.0].concat());
-        let former = beneath_parent(RowKey::root(former));
         self.opened = std::mem::take(&mut self.opened)
             .into_iter()
             .map(beneath_parent)
-            .chain([former.clone()])
             .collect();
-        self.focused = former;
+        self.focus(RowKey::root(parent.clone()));
         self.window.reveal();
         self.open_row(RowKey::root(parent))
     }
@@ -494,12 +519,13 @@ impl DirectoryBrowser {
                 .iter()
                 .position(|key| *key == self.focused)
                 .unwrap_or_default();
-            self.focused = drawn[..focus]
+            let nearest = drawn[..focus]
                 .iter()
                 .rev()
                 .find(|key| remaining.contains(key))
                 .cloned()
                 .unwrap_or_else(|| RowKey::root(self.root.clone()));
+            self.focus(nearest);
         }
         self.window.reveal();
     }
@@ -569,7 +595,7 @@ impl DirectoryBrowser {
         } else {
             SemanticCommandId::DirectoryBrowserRowToggle
         };
-        self.focused = row.key.clone();
+        self.focus(row.key.clone());
         self.pressed = Some(PressedRow {
             row,
             rerooted: false,
@@ -625,16 +651,20 @@ impl DirectoryBrowser {
             (Asked::Directory(directory), Ok(listing)) => {
                 let root = listing.root.clone();
                 self.adopt(Some(&directory), listing);
-                if directory != self.root {
-                    return None;
-                }
-                let listed = (root != self.root).then(|| self.reroot(root)).flatten();
-                self.settle_focus();
+                let listed = if directory == self.root {
+                    let listed = (root != self.root).then(|| self.reroot(root)).flatten();
+                    self.settle_focus();
+                    listed
+                } else {
+                    None
+                };
+                self.enter_listed(&directory);
                 listed
             }
             (Asked::Directory(directory), Err(reason)) => {
                 self.tree
-                    .insert(directory, DirectoryEntries::Refused(reason));
+                    .insert(directory.clone(), DirectoryEntries::Refused(reason));
+                self.enter_listed(&directory);
                 None
             }
             (Asked::Root(spelling), Ok(listing)) => {
@@ -792,7 +822,7 @@ impl DirectoryBrowser {
         let opened = self.opened.iter().filter_map(beneath_root).collect();
         let focused = beneath_root(&self.focused).unwrap_or_else(|| RowKey::root(root.clone()));
         self.opened = opened;
-        self.focused = focused;
+        self.focus(focused);
         self.root = root;
         self.window.reveal();
         self.open_row(RowKey::root(self.root.clone()))
@@ -886,12 +916,13 @@ impl DirectoryBrowser {
         let directories = self.directories();
         let drawn = directories.contains(&self.focused);
         if !self.filter.is_empty() && (!drawn || self.focused.is_root()) {
-            self.focused = directories
+            let first = directories
                 .into_iter()
                 .nth(1)
                 .unwrap_or_else(|| RowKey::root(self.root.clone()));
+            self.focus(first);
         } else if !drawn {
-            self.focused = RowKey::root(self.root.clone());
+            self.focus(RowKey::root(self.root.clone()));
         }
         self.window.reveal();
     }
@@ -1068,8 +1099,45 @@ impl DirectoryBrowser {
             .unwrap_or(0);
         let length = directories.len() as isize;
         let next = (current as isize + distance).rem_euclid(length) as usize;
-        self.focused = directories.swap_remove(next);
+        self.focus(directories.swap_remove(next));
         self.window.reveal();
+    }
+
+    /// Puts focus on `row`. Focus moving anywhere else lets go of a step
+    /// into a row still being read, so a slow listing never pulls focus
+    /// back to where the reader has left.
+    fn focus(&mut self, row: RowKey) {
+        if self.focused != row {
+            self.entering = None;
+            self.focused = row;
+        }
+    }
+
+    /// Steps focus onto the first child drawn beneath `row`, where `row` is
+    /// open and draws one.
+    fn step_into(&mut self, row: &RowKey) {
+        let directories = self.directories();
+        let first_child = directories
+            .iter()
+            .position(|key| key == row)
+            .and_then(|at| directories.get(at + 1))
+            .filter(|next| next.0.len() == row.0.len() + 1);
+        if let Some(child) = first_child.cloned() {
+            self.focus(child);
+            self.window.reveal();
+        }
+    }
+
+    /// Takes the Server's answer for `directory` as the end of the wait on a
+    /// row Right opened while it was read, stepping focus in where it still
+    /// stands on that row.
+    fn enter_listed(&mut self, directory: &Path) {
+        let Some(row) = self.entering.take_if(|row| row.directory() == directory) else {
+            return;
+        };
+        if row == self.focused {
+            self.step_into(&row);
+        }
     }
 }
 

@@ -265,8 +265,10 @@ fn a_directory_s_children_are_asked_for_only_when_it_is_opened() {
     );
 }
 
+/// Right is "into": it opens the focused row and steps focus onto the first
+/// child drawn beneath it, waiting on the row while the Server reads it.
 #[test]
-fn right_opens_the_focused_row_and_left_closes_it() {
+fn right_opens_the_focused_row_and_steps_onto_its_first_child_once_listed() {
     let here = directory(&["nowhere", "here"]);
     let mut application = connected_application(&here);
     let (_, listing_id, _) = browse(&mut application);
@@ -275,25 +277,205 @@ fn right_opens_the_focused_row_and_left_closes_it() {
 
     let (_, listing_id, request) = expect_listing(key(&mut application, KeyCode::Right));
     assert_eq!(request.path, here.join("alpha"));
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ here · [current]",
+            "›   ▾ alpha",
+            "      Loading…",
+            "    ▸ beta"
+        ],
+        "focus waits on the row while the Server reads it"
+    );
+
+    answer(
+        &mut application,
+        listing_id,
+        &here.join("alpha"),
+        &["inner", "outer"],
+    );
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ here · [current]",
+            "    ▾ alpha",
+            "›     ▸ inner",
+            "      ▸ outer",
+            "    ▸ beta"
+        ],
+        "once it is listed, focus steps onto its first child"
+    );
+}
+
+/// A row whose children are had already steps focus in at once, whether it
+/// stands open or closed, and asks nothing of the Server.
+#[test]
+fn right_on_a_row_already_listed_steps_onto_its_first_child_at_once() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha", "beta"]);
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Char(' ')));
     answer(
         &mut application,
         listing_id,
         &here.join("alpha"),
         &["inner"],
     );
+
     assert_eq!(
         key(&mut application, KeyCode::Right),
         ApplicationTransition::Continue,
-        "Right on a row already open leaves it open"
+        "an open row steps in without asking again"
+    );
+    assert_eq!(focused(&application), "inner");
+
+    key(&mut application, KeyCode::Up);
+    key(&mut application, KeyCode::Char(' '));
+    assert_eq!(
+        tree(&application),
+        ["  ▾ here · [current]", "›   ▸ alpha", "    ▸ beta"]
+    );
+    assert_eq!(
+        key(&mut application, KeyCode::Right),
+        ApplicationTransition::Continue,
+        "a closed row listed already opens without asking again"
     );
     assert_eq!(
         tree(&application),
         [
             "  ▾ here · [current]",
-            "›   ▾ alpha",
-            "      ▸ inner",
+            "    ▾ alpha",
+            "›     ▸ inner",
             "    ▸ beta"
         ]
+    );
+}
+
+/// Focus the reader moves while a row is read is theirs: the listing landing
+/// opens the row but leaves focus where they put it, even back on that row.
+#[test]
+fn focus_moved_while_a_row_is_read_stays_where_the_reader_put_it() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha", "beta"]);
+    key(&mut application, KeyCode::Down);
+    let (_, alpha_listing, _) = expect_listing(key(&mut application, KeyCode::Right));
+    key(&mut application, KeyCode::Down);
+    let (_, beta_listing, _) = expect_listing(key(&mut application, KeyCode::Right));
+    key(&mut application, KeyCode::Down);
+
+    answer(&mut application, beta_listing, &here.join("beta"), &["b"]);
+    assert_eq!(
+        focused(&application),
+        "here",
+        "focus moved off beta stays where it went"
+    );
+
+    key(&mut application, KeyCode::Down);
+    answer(&mut application, alpha_listing, &here.join("alpha"), &["a"]);
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ here · [current]",
+            "›   ▾ alpha",
+            "      ▸ a",
+            "    ▾ beta",
+            "      ▸ b"
+        ],
+        "focus moved off alpha and back again stays on alpha"
+    );
+}
+
+/// With nothing drawn beneath a row — an empty directory, one the Server
+/// refused, or one holding only hidden directories — Right opens it and focus
+/// stays on it.
+#[test]
+fn right_on_a_row_with_nothing_drawn_beneath_it_stays_on_it() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(
+        &mut application,
+        listing_id,
+        &here,
+        &["empty", "hidden", "refused"],
+    );
+
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
+    answer(&mut application, listing_id, &here.join("empty"), &[]);
+    assert_eq!(focused(&application), "empty");
+
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
+    answer_flagging_hidden(
+        &mut application,
+        listing_id,
+        &here.join("hidden"),
+        &[(".git", true)],
+    );
+    assert_eq!(focused(&application), "hidden");
+
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
+    refuse(&mut application, listing_id, "Permission denied");
+    assert_eq!(
+        tree(&application),
+        [
+            "  ▾ here · [current]",
+            "    ▾ empty",
+            "    ▾ hidden",
+            "›   ▾ refused",
+            "      Error: Permission denied"
+        ]
+    );
+}
+
+/// The first child Right steps onto is the first one drawn, so a hidden
+/// directory left out is passed over.
+#[test]
+fn right_steps_past_hidden_directories_onto_the_first_child_drawn() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha"]);
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
+
+    answer_flagging_hidden(
+        &mut application,
+        listing_id,
+        &here.join("alpha"),
+        &[(".git", true), ("src", false)],
+    );
+
+    assert_eq!(focused(&application), "src");
+}
+
+/// Left is "up": it steps focus onto the parent row and closes nothing.
+#[test]
+fn left_steps_focus_onto_the_parent_row_leaving_every_row_open() {
+    let here = directory(&["nowhere", "here"]);
+    let mut application = connected_application(&here);
+    let (_, listing_id, _) = browse(&mut application);
+    answer(&mut application, listing_id, &here, &["alpha", "beta"]);
+    key(&mut application, KeyCode::Down);
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
+    answer(
+        &mut application,
+        listing_id,
+        &here.join("alpha"),
+        &["inner"],
+    );
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
+    answer(
+        &mut application,
+        listing_id,
+        &here.join("alpha").join("inner"),
+        &["deep"],
     );
 
     assert_eq!(
@@ -301,24 +483,20 @@ fn right_opens_the_focused_row_and_left_closes_it() {
         ApplicationTransition::Continue
     );
     assert_eq!(
-        tree(&application),
-        ["  ▾ here · [current]", "›   ▸ alpha", "    ▸ beta"],
-        "Left closes the row it is on and keeps focus there"
-    );
-
-    assert_eq!(
-        key(&mut application, KeyCode::Right),
+        key(&mut application, KeyCode::Left),
         ApplicationTransition::Continue,
-        "a directory already listed is not asked for again"
+        "a parent drawn already is no listing to ask for"
     );
     assert_eq!(
         tree(&application),
         [
             "  ▾ here · [current]",
             "›   ▾ alpha",
-            "      ▸ inner",
+            "      ▾ inner",
+            "        ▸ deep",
             "    ▸ beta"
-        ]
+        ],
+        "each Left steps up a row and leaves what was open open"
     );
 }
 
@@ -347,11 +525,11 @@ fn space_opens_and_closes_the_focused_row() {
     assert_eq!(tree(&application), ["› ▾ here · [current]", "    ▸ alpha"]);
 }
 
-/// Left is "up" where Right is "into": on the root it stands the tree on the
-/// root's parent, as the Server named it, with the former root left open and
-/// focused so walking up never loses the reader's place.
+/// Above the root its parent is not drawn, so Left there stands the tree on
+/// the root's parent, as the Server named it, and focuses that, with the
+/// former root beneath it as it stood.
 #[test]
-fn left_on_the_root_re_roots_the_tree_at_its_parent_with_the_former_root_open_and_focused() {
+fn left_on_the_root_re_roots_the_tree_at_its_parent_and_focuses_it() {
     let parent = directory(&["nowhere"]);
     let here = parent.join("here");
     let mut application = connected_application(&here);
@@ -375,20 +553,20 @@ fn left_on_the_root_re_roots_the_tree_at_its_parent_with_the_former_root_open_an
     );
     assert_eq!(
         tree(&application),
-        ["  ▾ nowhere", "    Loading…"],
-        "the parent is the root, still being read"
+        ["› ▾ nowhere", "    Loading…"],
+        "the parent is the focused root, still being read"
     );
 
     answer(&mut application, listing_id, &parent, &["here", "there"]);
     assert_eq!(
         tree(&application),
         [
-            "  ▾ nowhere",
-            "›   ▾ here · [current]",
+            "› ▾ nowhere",
+            "    ▾ here · [current]",
             "      ▸ alpha",
             "    ▸ there"
         ],
-        "the former root stands open and focused beneath its parent"
+        "the former root stands open beneath its parent, as it stood"
     );
 }
 
@@ -594,7 +772,7 @@ fn the_footer_names_the_keys_the_browser_answers() {
 
     let screen = rendered_application_rows_at(&application, WIDTH, HEIGHT);
     let footer = rendered_row(&screen, "Esc close");
-    for named in ["↑↓", "Space", "→", "← close/up", "Enter choose", "Esc"] {
+    for named in ["↑↓", "Space", "→", "← up", "Enter choose", "Esc"] {
         assert!(
             screen[footer].contains(named),
             "{named} is named: {}",
@@ -717,7 +895,7 @@ fn a_hidden_directory_the_tail_begins_is_left_out_until_alt_h_shows_it() {
         ],
     );
     type_path(&mut application, "m");
-    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Char(' ')));
     answer_flagging_hidden(
         &mut application,
         listing_id,
@@ -2034,15 +2212,12 @@ fn the_tree_s_keys_never_edit_the_path_field() {
 
     let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
     answer(&mut application, listing_id, &alpha, &["inner"]);
-    assert_eq!(path_field(&application), field, "Right opens the row");
+    assert_eq!(path_field(&application), field, "Right steps into the row");
     key(&mut application, KeyCode::Left);
-    assert_eq!(path_field(&application), field, "Left closes it");
+    assert_eq!(path_field(&application), field, "Left steps back out");
     key(&mut application, KeyCode::Char(' '));
-    assert_eq!(path_field(&application), field, "Space opens it again");
-    assert_eq!(
-        tree(&application),
-        ["  ▾ here · [current]", "›   ▾ alpha", "      ▸ inner"]
-    );
+    assert_eq!(path_field(&application), field, "Space closes it");
+    assert_eq!(tree(&application), ["  ▾ here · [current]", "›   ▸ alpha"]);
 }
 
 #[test]
@@ -2053,7 +2228,7 @@ fn the_tail_narrows_only_the_root_s_children() {
     let (_, listing_id, _) = browse(&mut application);
     answer(&mut application, listing_id, &here, &["alpha", "beta"]);
     key(&mut application, KeyCode::Down);
-    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Char(' ')));
     answer(&mut application, listing_id, &alpha, &["deep", "zeta"]);
 
     type_path(&mut application, "a");
@@ -2099,7 +2274,6 @@ fn tab_completes_the_path_field_to_the_focused_row_and_a_separator() {
     key(&mut application, KeyCode::Down);
     let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
     answer(&mut application, listing_id, &inner, &["deep"]);
-    key(&mut application, KeyCode::Down);
 
     let (_, _, request) = expect_listing(key(&mut application, KeyCode::Tab));
 
@@ -2359,7 +2533,7 @@ fn a_directory_already_listed_is_not_asked_for_again_when_the_field_reaches_it()
     let (_, listing_id, _) = browse(&mut application);
     answer(&mut application, listing_id, &here, &["alpha", "beta"]);
     key(&mut application, KeyCode::Down);
-    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Right));
+    let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Char(' ')));
     answer(&mut application, listing_id, &alpha, &["inner"]);
 
     assert!(
@@ -2389,10 +2563,10 @@ fn a_directory_already_listed_is_not_asked_for_again_when_the_field_reaches_it()
     assert_eq!(tree(&application), ["› ▾ sibling", "    ▸ leaf"]);
 }
 
-/// Left leaves the former root open beneath its parent even where the reader
+/// Left leaves the former root closed beneath its parent where the reader
 /// had closed it.
 #[test]
-fn left_on_a_closed_root_leaves_it_open_beneath_its_parent() {
+fn left_on_a_closed_root_leaves_it_closed_beneath_its_parent() {
     let parent = directory(&["nowhere"]);
     let here = parent.join("here");
     let mut application = connected_application(&here);
@@ -2406,12 +2580,7 @@ fn left_on_a_closed_root_leaves_it_open_beneath_its_parent() {
 
     assert_eq!(
         tree(&application),
-        [
-            "  ▾ nowhere",
-            "›   ▾ here · [current]",
-            "      ▸ alpha",
-            "    ▸ there"
-        ]
+        ["› ▾ nowhere", "    ▸ here · [current]", "    ▸ there"]
     );
 }
 
@@ -2471,12 +2640,12 @@ fn tab_into_a_link_then_left_walks_up_from_where_the_link_leads() {
     assert_eq!(
         tree(&application),
         [
-            "  ▾ target",
+            "› ▾ target",
             "    ▸ other",
-            "›   ▾ project",
+            "    ▾ project",
             "      ▸ inner"
         ],
-        "the former root stands open and focused beneath where the link leads"
+        "the former root stands open beneath where the link leads"
     );
 }
 
@@ -3426,8 +3595,8 @@ fn wheel_at(
 }
 
 /// Above a drive on Windows stands the drive list, which the Server names as
-/// the drive root's parent: Left reaches it as Left reaches any parent, the
-/// former drive open and focused beneath it, and the path field names it as
+/// the drive root's parent: Left reaches it as Left reaches any parent,
+/// focused with the former drive beneath it, and the path field names it as
 /// nothing, since it is no path that exists. The drives are what the Server
 /// can see, so these are a Windows Remote's answers whichever platform this
 /// Client runs on.
@@ -3446,20 +3615,20 @@ fn left_on_a_drive_root_reaches_the_drive_list_with_the_path_field_empty() {
         "the drive list is asked for by the path the Server named the drive's parent"
     );
     assert_eq!(path_field(&application), "", "the drive list is no path");
-    assert_eq!(tree(&application), ["  ▾ Drives", "    Loading…"]);
+    assert_eq!(tree(&application), ["› ▾ Drives", "    Loading…"]);
 
     answer_drive_list(&mut application, listing_id, &[r"C:\", r"D:\"]);
     assert_eq!(path_field(&application), "");
     assert_eq!(
         tree(&application),
         [
-            "  ▾ Drives",
-            r"›   ▾ C:\ · [current]",
+            "› ▾ Drives",
+            r"    ▾ C:\ · [current]",
             "      ▸ Users",
             "      ▸ Windows",
             r"    ▸ D:\"
         ],
-        "the former drive stands open and focused among the drives"
+        "the former drive stands open among the drives as it stood"
     );
 }
 
@@ -3467,7 +3636,6 @@ fn left_on_a_drive_root_reaches_the_drive_list_with_the_path_field_empty() {
 #[test]
 fn left_on_the_drive_list_moves_nothing() {
     let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
-    key(&mut application, KeyCode::Up);
     assert_eq!(focused(&application), "Drives");
     let rows = tree(&application);
 
@@ -3485,7 +3653,6 @@ fn left_on_the_drive_list_moves_nothing() {
 #[test]
 fn enter_on_the_drive_list_chooses_nothing() {
     let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
-    key(&mut application, KeyCode::Up);
     let rows = tree(&application);
 
     assert_eq!(
@@ -3501,6 +3668,7 @@ fn enter_on_the_drive_list_chooses_nothing() {
 #[test]
 fn enter_on_a_drive_in_the_drive_list_chooses_it() {
     let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
+    key(&mut application, KeyCode::Down);
     assert_eq!(focused(&application), r"C:\");
 
     let (_, _, request) = expect_choice(&key(&mut application, KeyCode::Enter));
@@ -3510,12 +3678,13 @@ fn enter_on_a_drive_in_the_drive_list_chooses_it() {
 
 /// Opening a drive from the drive list roots the tree there rather than
 /// unfolding it beneath a root the path field cannot name, so the field
-/// names the drive and Left goes back up to the drive list.
+/// names the drive and Left goes back up to the drive list. Right steps on
+/// into the drive's first child, as it steps into any row it opens.
 #[test]
 fn opening_another_drive_from_the_drive_list_roots_the_tree_there() {
     for opens in [KeyCode::Right, KeyCode::Char(' ')] {
         let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
-        for _ in ["Users", "Windows", r"D:\"] {
+        for _ in [r"C:\", "Users", "Windows", r"D:\"] {
             key(&mut application, KeyCode::Down);
         }
         assert_eq!(focused(&application), r"D:\");
@@ -3537,8 +3706,11 @@ fn opening_another_drive_from_the_drive_list_roots_the_tree_there() {
             Some(DRIVE_LIST),
             &["Data"],
         );
+        if opens == KeyCode::Right {
+            assert_eq!(tree(&application), [r"  ▾ D:\", "›   ▸ Data"]);
+            key(&mut application, KeyCode::Left);
+        }
         assert_eq!(tree(&application), [r"› ▾ D:\", "    ▸ Data"], "{opens:?}");
-
         assert_eq!(
             key(&mut application, KeyCode::Left),
             ApplicationTransition::Continue,
@@ -3548,21 +3720,23 @@ fn opening_another_drive_from_the_drive_list_roots_the_tree_there() {
         assert_eq!(
             tree(&application),
             [
-                "  ▾ Drives",
+                "› ▾ Drives",
                 r"    ▸ C:\ · [current]",
-                r"›   ▾ D:\",
+                r"    ▾ D:\",
                 "      ▸ Data"
             ],
-            "{opens:?}: the drive opened stands open and focused among the drives"
+            "{opens:?}: the drive opened stands open among the drives"
         );
     }
 }
 
 /// Left then Right walks up to the drive list and back down into the drive
-/// it came from, which is listed already and so asks nothing again.
+/// it came from, which is listed already and so asks nothing again, and on
+/// into its first child.
 #[test]
 fn right_on_the_former_drive_roots_the_tree_back_there() {
     let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
+    key(&mut application, KeyCode::Down);
 
     assert_eq!(
         key(&mut application, KeyCode::Right),
@@ -3573,7 +3747,7 @@ fn right_on_the_former_drive_roots_the_tree_back_there() {
     assert_eq!(path_field(&application), r"C:\");
     assert_eq!(
         tree(&application),
-        [r"› ▾ C:\ · [current]", "    ▸ Users", "    ▸ Windows"]
+        [r"  ▾ C:\ · [current]", "›   ▸ Users", "    ▸ Windows"]
     );
 }
 
@@ -3623,7 +3797,6 @@ fn before_the_drive_list_is_reached_an_empty_path_field_names_the_execution_dire
         Some(r"C:\"),
         &["me", "you"],
     );
-    key(&mut application, KeyCode::Up);
     let (_, listing_id, _) = expect_listing(key(&mut application, KeyCode::Left));
     answer_from_windows(
         &mut application,
@@ -3656,7 +3829,6 @@ fn before_the_drive_list_is_reached_an_empty_path_field_names_the_execution_dire
 #[test]
 fn tab_on_the_drive_list_completes_the_path_field_to_the_focused_drive() {
     let mut application = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
-    key(&mut application, KeyCode::Up);
     assert_eq!(focused(&application), "Drives");
     assert_eq!(
         key(&mut application, KeyCode::Tab),
@@ -3758,7 +3930,7 @@ fn a_press_on_the_drive_list_s_row_opens_or_closes_it_and_a_double_press_chooses
 fn a_double_press_on_a_drive_in_the_drive_list_chooses_it_as_enter_does() {
     for between in BETWEEN_PRESSES {
         let mut keyed = drive_list_reached_from(r"C:\", &[r"C:\", r"D:\"]);
-        for _ in ["Users", "Windows", r"D:\"] {
+        for _ in [r"C:\", "Users", "Windows", r"D:\"] {
             key(&mut keyed, KeyCode::Down);
         }
         key(&mut keyed, KeyCode::Char(' '));
