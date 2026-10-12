@@ -254,6 +254,24 @@ async fn wait_for_branch(root: &Path, branch: &str, exists: bool) {
     .unwrap_or_else(|_| panic!("{branch} existence never became {exists}"));
 }
 
+/// Drops the Workspace Registry's entry for `workspace_id` from a stopped
+/// Server's store, as though nothing had ever entered it.
+fn forget_registry_entry(config: &ServerConfig, workspace_id: &WorkspaceId) {
+    let mut database = SqliteConnection::establish(
+        config
+            .data_dir()
+            .join("suru.db")
+            .to_str()
+            .expect("database path is UTF-8"),
+    )
+    .expect("open the Session database");
+    let forgotten = diesel::sql_query("DELETE FROM workspaces WHERE id = ?")
+        .bind::<diesel::sql_types::Text, _>(&workspace_id.0)
+        .execute(&mut database)
+        .expect("forget the Registry entry");
+    assert_eq!(forgotten, 1, "the Registry held an entry to forget");
+}
+
 fn set_session_updated_at(config: &ServerConfig, session_ids: &[SessionId], updated_at: u64) {
     let mut database = SqliteConnection::establish(
         config
@@ -1631,12 +1649,15 @@ async fn startup_discovers_and_reclaims_a_prepared_worktree_after_its_last_sessi
 /// Until the Workspace Registry, a Repository with no Session and no failed
 /// preparation left was forgotten across a restart (ADR 0027), so an orphan
 /// whose last Session was deleted while Reclaim could not act stood for
-/// good. The entry its Session made now names the Repository to the first
-/// sweep after a restart (ADR 0051).
+/// good — as one still does where its Repository has no entry. The entry its
+/// Session made now names the Repository to the first sweep after a restart
+/// (ADR 0051).
 #[tokio::test]
 async fn restart_reclaims_an_orphan_whose_repository_only_its_registry_entry_names() {
     let layout = ReclaimLayout::new("registry-orphan");
     let branch = "refs/heads/suru/registry-orphan";
+    // The same again, but for the Registry entry it is about to lose.
+    let unregistered = ReclaimLayout::new("unregistered-orphan");
     layout.pin(r#""off""#);
     let config = layout.server_config("reclaim-registry-orphan");
     let (runtime, mut provider) = ControlledProvider::new();
@@ -1644,12 +1665,15 @@ async fn restart_reclaims_an_orphan_whose_repository_only_its_registry_entry_nam
         .await
         .unwrap();
     let (session, _connection) = open(&server, &mut provider, &layout.managed).await;
+    let (control, _control_connection) = open(&server, &mut provider, &unregistered.managed).await;
     delete_session(&server, session.session.id).await;
+    delete_session(&server, control.session.id).await;
     assert!(
-        layout.managed.is_dir(),
-        "off keeps the orphan until restart"
+        layout.managed.is_dir() && unregistered.managed.is_dir(),
+        "off keeps both orphans until restart"
     );
     server.shutdown().await.unwrap();
+    forget_registry_entry(&config, &control.session.workspace.id);
 
     layout.pin("14");
     let (runtime, _provider) = ControlledProvider::new();
@@ -1668,12 +1692,15 @@ async fn restart_reclaims_an_orphan_whose_repository_only_its_registry_entry_nam
         .json::<Vec<SessionListItem>>()
         .await
         .unwrap();
-    assert!(sessions.is_empty(), "no Session names the Repository");
+    assert!(sessions.is_empty(), "no Session names either Repository");
+    let registered = registered_paths(restarted.descriptor()).await;
     assert!(
-        registered_paths(restarted.descriptor())
-            .await
-            .contains(&layout.main),
+        registered.contains(&layout.main),
         "the Registry still lists the Repository's Workspace"
+    );
+    assert!(
+        !registered.contains(&unregistered.main),
+        "the Registry lists nothing for the other Repository"
     );
     // No Session, failed preparation, resolve call or catalog subscription
     // follows the restart: the Registry entry alone feeds the first sweep.
@@ -1681,6 +1708,12 @@ async fn restart_reclaims_an_orphan_whose_repository_only_its_registry_entry_nam
     assert!(
         !read_git(&layout.main, &["rev-parse", branch]).is_empty(),
         "an unproven branch is retained as by any Reclaim"
+    );
+    // Whatever is left of that sweep, the only one the interval allows.
+    tokio::time::sleep(RECLAIM_INTERVAL * 2).await;
+    assert!(
+        unregistered.managed.is_dir(),
+        "an orphan whose Repository has no entry survives the restart"
     );
     restarted.shutdown().await.unwrap();
 }
