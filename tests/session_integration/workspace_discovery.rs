@@ -633,3 +633,78 @@ async fn a_root_whose_reading_stalls_holds_back_no_change_of_the_roots_and_no_li
     drop(client);
     server.shutdown().await.expect("shut down server");
 }
+
+/// A Repository a Session first knew through a linked Worktree, its main
+/// checkout not known since its metadata lies apart, is named by its main
+/// checkout once discovery finds that checkout directly within a Root —
+/// rather than as one whose main checkout is unknown.
+#[tokio::test]
+async fn a_main_checkout_discovered_names_a_repository_a_session_knew_none_of() {
+    const CHANNEL: &str = "workspace-discovery-main-checkout";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    std::fs::create_dir(&projects).expect("create the Workspace Root");
+    let main = projects.join("atlas");
+    let metadata = home.join("atlas.git");
+    git(
+        &home,
+        &[
+            "init",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            spelled(&metadata),
+            spelled(&main),
+        ],
+    );
+    git(
+        &main,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let linked = home.join("linked");
+    git(&main, &["worktree", "add", "-b", "topic", spelled(&linked)]);
+    let (_, server) = server_with_roots(&home, CHANNEL, &[], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let created = client
+        .create_session(quiet_request(&linked, "Chart the atlas"))
+        .await
+        .expect("begin a Session in the linked Worktree")
+        .session;
+    assert!(
+        created.workspace.main_unknown(),
+        "the Session knows no main checkout of its Repository"
+    );
+
+    client
+        .mutate_setting(SettingMutation::WorkspaceRoots {
+            value: Some(vec![spelled(&projects).to_owned()]),
+        })
+        .await
+        .expect("name the Root the main checkout is in");
+
+    let listing = client.list_workspaces().await.expect("list Workspaces");
+    let listed = listing
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == created.workspace.id)
+        .expect("the Repository is listed");
+    assert_eq!(
+        (
+            listed.path.clone(),
+            listing.workspace_paths.workspace_name(listed)
+        ),
+        (main.clone(), "atlas".to_owned()),
+        "the Repository is named by the main checkout discovery found"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
