@@ -159,7 +159,18 @@ impl SettingsAdoption {
         root_discovery: &RootDiscovery,
         registry_standing: &RegistryStanding,
     ) -> Result<(SettingChanged, Option<Ticket>), SettingsMutationError> {
-        let roots = self.snapshot.borrow().settings.workspace.roots.clone();
+        // The Roots are held still from before the ones in force are read
+        // until those this change puts in force have taken away what they
+        // no longer hold, so the step at start never decides on Roots put
+        // in force meanwhile.
+        let held = registry_standing.hold_roots().await;
+        let (roots, named_before) = {
+            let before = self.snapshot.borrow();
+            (
+                before.settings.workspace.roots.clone(),
+                crate::settings::workspace_roots_named_whole(&before).map(<[String]>::to_vec),
+            )
+        };
         // The edit is filesystem work, and the CST handles it parses the
         // document into are not `Send`; both stay on a blocking thread, where
         // the read, the edit, and the write are one scope.
@@ -191,11 +202,18 @@ impl SettingsAdoption {
             // The Roots taken away are let go first, so no scan of one still
             // running enters anything once what it discovered is dropped.
             let ticket = root_discovery.rediscover();
-            registry_standing
-                .roots_changed(&roots, &snapshot.settings.workspace.roots)
-                .await;
+            // Only Roots the user named whole, before and after alike, say
+            // that one was taken away: those a document left that could not
+            // be read whole say nothing.
+            if let (Some(before), Some(after)) = (
+                named_before.as_deref(),
+                crate::settings::workspace_roots_named_whole(&snapshot),
+            ) {
+                registry_standing.roots_changed(&held, before, after).await;
+            }
             Some(ticket)
         };
+        drop(held);
         Ok((SettingChanged { snapshot, serving }, rediscovery))
     }
 }

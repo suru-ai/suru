@@ -13,15 +13,17 @@
 //!   its absence from a deletion.
 //!
 //! An entry discovered under a Workspace Root is dropped with that Root,
-//! unless a Session belongs to it: when the Roots change, and once at start
-//! where the Config Document names the Roots whole, so a Root taken away by
-//! hand while the Server was stopped is taken away too. One a Session
-//! belongs to is kept, and is known by that Session from then on, so it
-//! stands as any entry a Session made does. Roots are told apart as the
-//! directories they name rather than by how the Setting spells them, so
-//! `~/projects` spelled out in full takes nothing away; and a Config
-//! Document that could not be read whole takes nothing away either, since
-//! the Roots it leaves are no word of the user's.
+//! unless a Session belongs to it: when the Roots change, and once at start,
+//! so a Root taken away by hand while the Server was stopped is taken away
+//! too. One a Session belongs to is kept, and is known by that Session from
+//! then on, so it stands as any entry a Session made does. Roots are told
+//! apart as the directories they name rather than by how the Setting spells
+//! them, so `~/projects` spelled out in full takes nothing away. Only Roots
+//! the Config Document names whole — before a change and after it alike —
+//! take anything away, since those a document left that could not be read
+//! whole are no word of the user's. The Roots are held still while either
+//! decides (see [`RootsHeld`]), and the step at start takes nothing away
+//! where Settings were put in force anew since it read them.
 //!
 //! Every directory is read apart, on a thread of its own (see
 //! [`super::reads_apart`]), so one on a mount gone quiet holds up neither
@@ -51,7 +53,7 @@ use super::{
     root_discovery,
 };
 use crate::{
-    protocol::{WorkspaceId, WorkspaceUnavailability},
+    protocol::{SettingsSnapshot, WorkspaceId, WorkspaceUnavailability},
     sessions::{SessionStore, Sighting},
 };
 
@@ -94,8 +96,7 @@ struct Standing {
     /// How far the check begun last has come, which every listing asking
     /// while it reads joins.
     in_flight: Mutex<Option<watch::Receiver<Progress>>>,
-    /// One change of the Roots taken in at a time, the one at start among
-    /// them, so none decides on Roots another has changed since.
+    /// What holds the Roots still (see [`RootsHeld`]).
     roots_changing: tokio::sync::Mutex<()>,
 }
 
@@ -244,33 +245,92 @@ impl RegistryStanding {
     }
 }
 
-impl RegistryStanding {
-    /// Drops what was discovered under a Workspace Root `before` named and
-    /// `after` names no longer, as the module says: once the Roots have
-    /// changed from `before` to `after`.
-    pub(crate) async fn roots_changed(&self, before: &[String], after: &[String]) {
-        let _one_at_a_time = self.0.roots_changing.lock().await;
-        self.forget_removed(before, after).await;
+/// Where the step at start reads the Workspace Roots in force, and learns
+/// whether Settings have been put in force anew since.
+pub(crate) trait RootsInForce {
+    /// The Roots in force, where the Config Document names them whole, and
+    /// `None` where it does not.
+    fn read(&mut self) -> Option<Vec<String>>;
+
+    /// Whether Settings have been put in force anew since they were read.
+    fn moved(&self) -> bool;
+}
+
+impl RootsInForce for watch::Receiver<SettingsSnapshot> {
+    fn read(&mut self) -> Option<Vec<String>> {
+        crate::settings::workspace_roots_named_whole(&self.borrow_and_update())
+            .map(<[String]>::to_vec)
     }
 
-    /// Drops what was discovered under a Workspace Root that the Roots
-    /// `named` reads no longer name, as the module says: once at start.
-    /// `named` reads the Roots in force as this decides, and nothing where
-    /// the Config Document did not name them whole.
-    pub(crate) async fn roots_at_start(&self, named: impl FnOnce() -> Option<Vec<String>>) {
-        let _one_at_a_time = self.0.roots_changing.lock().await;
-        let Some(roots) = named() else {
+    fn moved(&self) -> bool {
+        self.has_changed().unwrap_or(true)
+    }
+}
+
+/// The Workspace Roots held still: no change of them is put in force, nor
+/// anything taken away on their account, but by whoever holds this.
+pub(crate) struct RootsHeld<'a> {
+    _still: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl RegistryStanding {
+    /// Holds the Roots still, once whoever held them last lets go. A change
+    /// of the Settings holds them from before it reads the Roots in force
+    /// until it has put its own in force and taken away what they no longer
+    /// hold, so the step at start never decides on Roots a change puts in
+    /// force meanwhile.
+    pub(crate) async fn hold_roots(&self) -> RootsHeld<'_> {
+        RootsHeld {
+            _still: self.0.roots_changing.lock().await,
+        }
+    }
+
+    /// Drops what was discovered under a Workspace Root `before` named and
+    /// `after` names no longer, as the module says: once the Roots have
+    /// changed from `before` to `after`, while `_held` holds them still.
+    pub(crate) async fn roots_changed(
+        &self,
+        _held: &RootsHeld<'_>,
+        before: &[String],
+        after: &[String],
+    ) {
+        self.forget_removed(before, after, || true).await;
+    }
+
+    /// Drops what was discovered under a Workspace Root that the Roots in
+    /// force no longer name, as the module says: once at start, holding the
+    /// Roots still throughout. The Roots are read from `in_force` as this
+    /// decides; nothing is taken away where the Config Document did not
+    /// name them whole, nor where Settings were put in force anew before
+    /// this could take it away, since what it read no longer says what the
+    /// user named.
+    pub(crate) async fn roots_at_start(&self, mut in_force: impl RootsInForce) {
+        let _held = self.hold_roots().await;
+        let Some(roots) = in_force.read() else {
             tracing::warn!(
                 "the Workspace Roots were not read whole from the Config Document, so nothing \
                  discovered under a Root is dropped at start"
             );
             return;
         };
-        self.forget_removed(&self.0.sessions.discovered_roots(), &roots)
+        let still = || {
+            let moved = in_force.moved();
+            if moved {
+                tracing::info!(
+                    "Settings were put in force while the Workspace Roots were read at start, so \
+                     nothing discovered under a Root is dropped then"
+                );
+            }
+            !moved
+        };
+        self.forget_removed(&self.0.sessions.discovered_roots(), &roots, still)
             .await;
     }
 
-    async fn forget_removed(&self, before: &[String], after: &[String]) {
+    /// Drops what was discovered under a Root `before` named and `after`
+    /// names no longer, so long as `still` says, as it comes to that, that
+    /// both say what the user named.
+    async fn forget_removed(&self, before: &[String], after: &[String], still: impl Fn() -> bool) {
         let recorded = self.0.sessions.discovered_roots();
         if recorded.is_empty() {
             return;
@@ -291,7 +351,7 @@ impl RegistryStanding {
             })
             .cloned()
             .collect::<HashSet<_>>();
-        if !unrooted.is_empty() {
+        if !unrooted.is_empty() && still() {
             self.0
                 .sessions
                 .forget_unrooted(|root| unrooted.contains(root));
@@ -512,18 +572,17 @@ mod tests {
 
     impl Registry {
         async fn holding(paths: &[&Path]) -> Self {
+            Self::of(paths.iter().map(|path| entry(path)).collect()).await
+        }
+
+        async fn of(entries: HashMap<WorkspaceId, StoredWorkspace>) -> Self {
             let data_dir = tempfile::tempdir().expect("create a data directory");
             let repository = StorageRepository::open(data_dir.path())
                 .await
                 .expect("open the Server's storage");
             let (writer, storage) = StorageWriter::spawn(repository);
             Self {
-                sessions: SessionStore::new(
-                    Default::default(),
-                    storage,
-                    Vec::new(),
-                    paths.iter().map(|path| entry(path)).collect(),
-                ),
+                sessions: SessionStore::new(Default::default(), storage, Vec::new(), entries),
                 _writer: writer,
                 _data_dir: data_dir,
             }
@@ -800,6 +859,143 @@ mod tests {
         for waited in listings.await.expect("the listings run to their end") {
             assert!(waited <= wait, "a listing waited {waited:?}, past {wait:?}");
         }
+    }
+
+    /// The Roots in force as a test scripts them: what reading them
+    /// answers, worked out as they are read, and whether Settings have been
+    /// put in force anew since.
+    struct ScriptedRoots<Read> {
+        read: Option<Read>,
+        moved: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl<Read: FnOnce() -> Option<Vec<String>>> RootsInForce for ScriptedRoots<Read> {
+        fn read(&mut self) -> Option<Vec<String>> {
+            (self.read.take().expect("the Roots are read once"))()
+        }
+
+        fn moved(&self) -> bool {
+            self.moved.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A Registry holding one entry, at `b/atlas`, discovered under the Root
+    /// `~/b`, which no Session belongs to.
+    async fn discovered_under_b() -> (Registry, PathBuf) {
+        let atlas = absolute(&["b", "atlas"]);
+        let registry = Registry::of(
+            [(
+                WorkspaceId::directory(&atlas),
+                StoredWorkspace {
+                    path: Some(atlas.clone()),
+                    presentation: Some(WorkspacePresentation::Directory),
+                    ..StoredWorkspace::known_by(WorkspaceProvenance::Discovered {
+                        root: "~/b".to_owned(),
+                    })
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .await;
+        (registry, atlas)
+    }
+
+    /// Settings put in force while the step at start decides, by whatever
+    /// way, leave it taking nothing away: what it read no longer says what
+    /// the user named. Here a change puts `~/b` back in force just after
+    /// the step read Roots without it.
+    #[tokio::test]
+    async fn settings_put_in_force_while_the_step_at_start_decides_leave_it_taking_nothing() {
+        let (registry, atlas) = discovered_under_b().await;
+        let standing = RegistryStanding::new(registry.sessions.clone(), None, SURELY);
+        let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        standing
+            .roots_at_start(ScriptedRoots {
+                read: Some({
+                    let moved = moved.clone();
+                    move || {
+                        moved.store(true, Ordering::SeqCst);
+                        Some(Vec::new())
+                    }
+                }),
+                moved,
+            })
+            .await;
+
+        assert_eq!(
+            listed(&registry.sessions),
+            [atlas],
+            "nothing is taken away on Roots no longer in force"
+        );
+
+        standing
+            .roots_at_start(ScriptedRoots {
+                read: Some(|| Some(Vec::new())),
+                moved: Arc::default(),
+            })
+            .await;
+        assert_eq!(
+            listed(&registry.sessions),
+            Vec::<PathBuf>::new(),
+            "while Roots still in force as the step decides take away what they no longer hold"
+        );
+    }
+
+    /// A change of the Roots cannot put Roots in force while the step at
+    /// start decides on the ones it read. Here a change putting back a Root
+    /// the Config Document had left out asks to, just as that step reads
+    /// the Roots without it, and is held off until the step has taken away
+    /// what it decided to: never does the step decide on Roots the change
+    /// had already put in force.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_change_of_the_roots_waits_for_the_step_at_start_to_decide() {
+        let (registry, _) = discovered_under_b().await;
+        let standing = RegistryStanding::new(registry.sessions.clone(), None, SURELY);
+        let change = Arc::new(Mutex::new(None::<std::thread::JoinHandle<Vec<PathBuf>>>));
+        let runtime = tokio::runtime::Handle::current();
+
+        standing
+            .roots_at_start(ScriptedRoots {
+                read: Some({
+                    let (standing, sessions, change) =
+                        (standing.clone(), registry.sessions.clone(), change.clone());
+                    move || {
+                        let putting_back = std::thread::spawn(move || {
+                            runtime.block_on(async {
+                                let held = standing.hold_roots().await;
+                                // What the Registry held as the change put `~/b`
+                                // back in force.
+                                let listed_then = listed(&sessions);
+                                standing
+                                    .roots_changed(&held, &[], &["~/b".to_owned()])
+                                    .await;
+                                listed_then
+                            })
+                        });
+                        let deadline = std::time::Instant::now() + Duration::from_millis(50);
+                        while !putting_back.is_finished() && std::time::Instant::now() < deadline {
+                            std::thread::yield_now();
+                        }
+                        *change.lock().unwrap() = Some(putting_back);
+                        Some(Vec::new())
+                    }
+                }),
+                moved: Arc::default(),
+            })
+            .await;
+
+        let putting_back = change.lock().unwrap().take().expect("the change began");
+        assert_eq!(
+            tokio::task::spawn_blocking(move || putting_back.join())
+                .await
+                .expect("the change is waited on")
+                .expect("the change runs to its end"),
+            Vec::<PathBuf>::new(),
+            "the step at start had taken away what it decided to before the change put its \
+             Roots in force"
+        );
     }
 
     #[test]

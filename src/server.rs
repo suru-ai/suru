@@ -1637,12 +1637,7 @@ async fn start(
                              discovery began"
                         );
                     }
-                    registry_standing
-                        .roots_at_start(|| {
-                            crate::settings::workspace_roots_named_whole(&roots_in_force.borrow())
-                                .map(<[String]>::to_vec)
-                        })
-                        .await;
+                    registry_standing.roots_at_start(roots_in_force).await;
                     let ticket = root_discovery.rediscover();
                     root_discovery.settled(ticket).await;
                     registry_standing.check().await;

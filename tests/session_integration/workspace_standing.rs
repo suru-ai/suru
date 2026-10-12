@@ -540,6 +540,14 @@ async fn a_server_started_on_a_config_document_it_cannot_read_keeps_every_discov
             "{ \"workspace\": { \"roots\": \"~/projects\" } }",
             "Roots that are no list",
         ),
+        (
+            "{ \"workspace\": [] }",
+            "a workspace group that is no object",
+        ),
+        (
+            "{ \"workspace\": { \"rootz\": [\"~/elsewhere\"] } }",
+            "the Roots misspelled",
+        ),
     ] {
         write_config_document(&home, document);
         let (_, server) = server_beneath(&home, CHANNEL, Duration::ZERO).await;
@@ -673,4 +681,54 @@ async fn a_root_spelled_another_way_is_the_same_root() {
         !entries_on_disk(&config).contains_key(&atlas_id),
         "and it is dropped from disk"
     );
+}
+
+/// A change of any Setting takes nothing away on account of Roots the
+/// Config Document no longer names whole: here the Roots are spoiled by
+/// hand while the Server runs, and the next change, of another Setting
+/// altogether, finds them gone from what it reads.
+#[tokio::test]
+async fn a_change_of_another_setting_takes_nothing_away_for_roots_spoiled_by_hand() {
+    const CHANNEL: &str = "workspace-standing-roots-spoiled";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    let (_, server) =
+        server_with_roots(&home, CHANNEL, &[spelled(&projects)], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    client
+        .set_workspace_description(
+            &repository_id(&atlas.join(".git")),
+            Some(&atlas),
+            "Maps of everything.",
+        )
+        .await
+        .expect("describe the discovered Repository");
+
+    write_config_document(&home, "{ \"workspace\": { \"roots\": \"~/projects\" } }");
+    let changed = client
+        .mutate_setting(SettingMutation::AppearanceShowIcons { value: Some(false) })
+        .await
+        .expect("change another Setting");
+    assert_eq!(
+        changed.settings.workspace.roots,
+        Vec::<String>::new(),
+        "the change reads no Roots from the spoiled document"
+    );
+
+    assert_eq!(
+        standings(&client).await,
+        [(atlas.clone(), None)],
+        "and takes away nothing discovered under the Roots it no longer reads"
+    );
+    assert_eq!(
+        description_at(&client, &atlas).await,
+        set("Maps of everything."),
+        "which carries all it did"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
 }

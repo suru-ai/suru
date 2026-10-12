@@ -2455,17 +2455,26 @@ fn parse_options() -> ParseOptions {
 }
 
 /// The Workspace Roots `snapshot` holds, where they are the user's word in
-/// full: no Config Document was ignored, nor the Roots or any entry of
-/// them. A document that could not be read, parsed or taken whole leaves
-/// Roots that name nothing the user said, so nothing may be taken away on
-/// their account.
+/// full: no Config Document was ignored, nor anything of the `workspace`
+/// group — the group itself, the Roots, any entry of them, or a key beside
+/// them that may be the Roots misspelled. A document that could not be read,
+/// parsed or taken whole there leaves Roots that name nothing the user said,
+/// so nothing may be taken away on their account.
 pub(crate) fn workspace_roots_named_whole(snapshot: &SettingsSnapshot) -> Option<&[String]> {
+    const GROUP: &str = "workspace";
+    let touches_the_roots = |key: &str| {
+        key == GROUP
+            || key
+                .strip_prefix(GROUP)
+                .is_some_and(|rest| rest.starts_with('.'))
+    };
+    debug_assert!(touches_the_roots(WORKSPACE_ROOTS));
     snapshot
         .diagnostics
         .iter()
         .all(|diagnostic| {
             diagnostic.severity != SettingsDiagnosticSeverity::Error
-                && diagnostic.key.as_deref() != Some(WORKSPACE_ROOTS)
+                && !diagnostic.key.as_deref().is_some_and(touches_the_roots)
         })
         .then_some(snapshot.settings.workspace.roots.as_slice())
 }
