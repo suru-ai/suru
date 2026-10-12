@@ -78,6 +78,10 @@ const CONCURRENT_READINGS: usize = 8;
 /// listed as unavailable until a later reading.
 const READS_AT_ONCE: usize = 32;
 
+/// The most resolutions of the Roots outstanding at once: a Root past it is
+/// told by its writing alone.
+const RESOLUTIONS_AT_ONCE: usize = 16;
+
 /// What reading the directory an entry is presented at finds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Reading {
@@ -105,7 +109,12 @@ struct Standing {
     /// names.
     data_root: Option<PathBuf>,
     probe: Probe,
+    /// The readings of where each entry is presented.
     reads: ReadsApart,
+    /// The resolutions of the Roots, apart from `reads` so a Root at which
+    /// an entry is presented is never left unresolved for that entry's
+    /// reading, nor that entry unread for the Root's resolution.
+    resolutions: ReadsApart,
     /// The longest anything waits on the readings.
     wait: Duration,
     /// How far the check begun last has come, which every listing asking
@@ -138,6 +147,7 @@ impl RegistryStanding {
             data_root,
             probe,
             reads: ReadsApart::new("suru-workspace-standing-read", READS_AT_ONCE),
+            resolutions: ReadsApart::new("suru-workspace-root-resolution", RESOLUTIONS_AT_ONCE),
             wait,
             in_flight: Mutex::new(None),
             roots_changing: tokio::sync::Mutex::new(()),
@@ -369,7 +379,7 @@ impl RegistryStanding {
             return;
         }
         let named = root_directories::resolve(
-            &self.0.reads,
+            &self.0.resolutions,
             self.0.home.as_deref(),
             self.0.wait,
             roots.iter().chain(&recorded),

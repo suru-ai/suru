@@ -415,7 +415,8 @@ impl RootDiscovery {
 /// listed, each child read through source control, and the other Roots
 /// resolved, apart (see [`ReadsApart`]), so a filesystem that stops
 /// answering holds a thread of discovery's own rather than one the Server
-/// runs anything else on, and no more of them at once than [`READS_AT_ONCE`].
+/// runs anything else on, and no more of them at once than each kind of
+/// read allows.
 pub(crate) struct RegistryScan {
     sessions: SessionStore,
     source_control: SourceControlService,
@@ -425,17 +426,30 @@ pub(crate) struct RegistryScan {
     data_root: Option<PathBuf>,
     /// The longest a scan waits on the other Roots being resolved.
     wait: Duration,
+    /// The listings of each Root.
+    listings: ReadsApart,
+    /// The readings of the directories within each Root, apart from
+    /// `listings` so a Root standing directly within another is neither
+    /// passed over by that Root's scan for its own listing nor listed the
+    /// less for that Root's reading of it.
     reads: ReadsApart,
-    /// The other Roots' resolutions, apart from `reads` so none is passed
-    /// over for a read of the same Root its own scan has outstanding.
+    /// The other Roots' resolutions, apart from `listings` so none is
+    /// passed over for a listing of the same Root its own scan has
+    /// outstanding.
     resolutions: ReadsApart,
 }
 
-/// The most reads of Roots and of the directories within them outstanding
-/// at once, across every Root: room for several Roots scanned together,
-/// each reading [`CONCURRENT_READINGS`] directories at a time, while
-/// directories that never answer hold no more threads than this. A read
-/// past it is passed over until a later scan.
+/// The most listings of Roots outstanding at once, across every scan: room
+/// for every Root scanned together, while Roots that never answer hold no
+/// more threads than this. A listing past it is passed over until a later
+/// scan.
+const LISTINGS_AT_ONCE: usize = 64;
+
+/// The most readings of the directories within the Roots outstanding at
+/// once, across every Root: room for several Roots scanned together, each
+/// reading [`CONCURRENT_READINGS`] directories at a time, while directories
+/// that never answer hold no more threads than this. A reading past it is
+/// passed over until a later scan.
 const READS_AT_ONCE: usize = 64;
 
 /// The most resolutions of the other Roots outstanding at once, across
@@ -456,6 +470,7 @@ impl RegistryScan {
             home,
             data_root,
             wait,
+            listings: ReadsApart::new("suru-root-discovery-listing", LISTINGS_AT_ONCE),
             reads: ReadsApart::new("suru-root-discovery-read", READS_AT_ONCE),
             resolutions: ReadsApart::new("suru-root-discovery-resolution", RESOLUTIONS_AT_ONCE),
         }
@@ -479,7 +494,7 @@ impl RootScan for RegistryScan {
         };
         let listed = directory.clone();
         let (resolved, children) = match self
-            .reads
+            .listings
             .read(
                 &directory,
                 move || async move { child_directories(&listed) },
