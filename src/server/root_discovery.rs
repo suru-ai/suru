@@ -439,11 +439,21 @@ impl RootScan for RegistryScan {
                     continue;
                 }
             };
-            if let Some(workspace) = rooted_at(&child, reading)
-                && commit.while_current(|| {
+            // What the reading teaches, of the Registry and of the
+            // Repositories this Server remembers alike, is taken only while
+            // this scan is current, so a reading begun before the directory
+            // changed and ended after a newer scan read it teaches nothing.
+            let mut entered = false;
+            commit.while_current(|| {
+                if let Some(read) = reading.workspace.repository.as_deref() {
+                    self.source_control.learn_main_checkout(read);
+                }
+                if let Some(workspace) = rooted_at(&child, reading) {
                     self.sessions.enter_discovered(&workspace, &child, root);
-                })
-            {
+                    entered = true;
+                }
+            });
+            if entered {
                 discovered += 1;
             }
         }

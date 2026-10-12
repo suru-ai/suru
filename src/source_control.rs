@@ -803,26 +803,33 @@ impl SourceControlService {
 
     /// What `directory` reads as to source control — the Sidekick
     /// Workspace's as a directory of its own — without this Server
-    /// remembering the Repository found there. Discovery reads every
-    /// Repository directly within each Workspace Root this way, and Reclaim
-    /// each Workspace Registry entry nothing else names, since a remembered
-    /// Repository is one checkout observation watches the Worktrees of for
-    /// as long as the Server runs. A Repository already remembered without
-    /// its main checkout learns it from the reading all the same, so it is
-    /// presented by that checkout from then on.
+    /// remembering the Repository found there, or learning anything of it.
+    /// Discovery reads every Repository directly within each Workspace Root
+    /// this way, and Reclaim each Workspace Registry entry nothing else
+    /// names, since a remembered Repository is one checkout observation
+    /// watches the Worktrees of for as long as the Server runs; a caller
+    /// that acts on the reading teaches the Server what it found through
+    /// [`Self::learn_main_checkout`].
     pub(crate) async fn read_unremembered(&self, directory: &Path) -> ResolvedWorkspace {
-        if let Some(reading) = self.sidekick_reading(directory) {
-            return reading;
+        match self.sidekick_reading(directory) {
+            Some(reading) => reading,
+            None => self.adapter.discover(directory).await,
         }
-        let reading = self.adapter.discover(directory).await;
-        if let Some(read) = reading.workspace.repository.as_deref()
-            && !matches!(read.location, RepositoryLocation::UnknownMain)
-            && let Some(known) = self.repositories.lock().unwrap().get_mut(&read.id)
+    }
+
+    /// Teaches a Repository this Server remembers without its main checkout
+    /// where that checkout is, from `read` — a reading of it just taken —
+    /// so it is presented by that checkout from then on. A Repository not
+    /// remembered stays so.
+    pub(crate) fn learn_main_checkout(&self, read: &Repository) {
+        if matches!(read.location, RepositoryLocation::UnknownMain) {
+            return;
+        }
+        if let Some(known) = self.repositories.lock().unwrap().get_mut(&read.id)
             && matches!(known.location, RepositoryLocation::UnknownMain)
         {
             known.location = read.location.clone();
         }
-        reading
     }
     /// Resolve within one discovery batch, so that several directories which
     /// fall back to the same Repository metadata or main checkout are read from

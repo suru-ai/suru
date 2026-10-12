@@ -803,3 +803,144 @@ async fn a_main_checkout_discovered_names_a_repository_a_session_knew_none_of() 
     drop(client);
     server.shutdown().await.expect("shut down server");
 }
+
+/// Stands in for Git, but for `held`: its first reading is made by Git and
+/// then held, read but not yet answered, until the test opens `gate`; every
+/// later reading finds `held` no Repository's, as though its checkout had
+/// moved on. Counts each reading of `held` begun in `readings`.
+struct HoldsFirstReading {
+    git: GitSourceControl,
+    held: PathBuf,
+    gate: Arc<Gate>,
+    readings: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl SourceControl for HoldsFirstReading {
+    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+        if directory != self.held {
+            return self.git.discover(directory).await;
+        }
+        if self.readings.fetch_add(1, Ordering::SeqCst) > 0 {
+            return ResolvedWorkspace::directory(directory.to_owned());
+        }
+        let reading = self.git.discover(directory).await;
+        self.gate.wait();
+        reading
+    }
+}
+
+/// What a scan read but did not enter before it was superseded teaches the
+/// Server nothing. A Repository a Session knew without its main checkout
+/// has that checkout read by a scan of a Root then taken away; the
+/// checkout moves on before that reading ends, and the Repository is still
+/// named as one whose main checkout is unknown, not by where it was.
+#[tokio::test]
+async fn a_main_checkout_read_by_a_superseded_scan_is_learned_nowhere() {
+    const CHANNEL: &str = "workspace-discovery-superseded-reading";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    std::fs::create_dir(&projects).expect("create the Workspace Root");
+    let main = projects.join("atlas");
+    let metadata = home.join("atlas.git");
+    git(
+        &home,
+        &[
+            "init",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            spelled(&metadata),
+            spelled(&main),
+        ],
+    );
+    git(
+        &main,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let linked = home.join("linked");
+    git(&main, &["worktree", "add", "-b", "topic", spelled(&linked)]);
+    name_roots(&home.join("config"), &[]);
+    let gate = Arc::new(Gate::default());
+    let held = OpensOnDrop(gate.clone());
+    let readings = Arc::new(AtomicUsize::new(0));
+    let server = server::spawn_with_source_control(
+        ServerConfig::new(home.join("state"), CHANNEL)
+            .expect("configure")
+            .with_config_dir(home.join("config")),
+        vec![Arc::new(FailingProviderRuntime)],
+        ServerTimings::default()
+            .with_checkout_observation_interval(Duration::from_secs(60 * 60))
+            .with_root_discovery_memo(Duration::ZERO)
+            .with_root_discovery_wait(Duration::from_millis(20)),
+        Arc::new(HoldsFirstReading {
+            git: GitSourceControl::new("git"),
+            held: main.clone(),
+            gate,
+            readings: readings.clone(),
+        }),
+    )
+    .await
+    .expect("spawn server");
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let created = client
+        .create_session(quiet_request(&linked, "Chart the atlas"))
+        .await
+        .expect("begin a Session in the linked Worktree")
+        .session;
+    assert!(created.workspace.main_unknown());
+    let name = |roots: &[&Path]| SettingMutation::WorkspaceRoots {
+        value: Some(roots.iter().map(|root| spelled(root).to_owned()).collect()),
+    };
+
+    client
+        .mutate_setting(name(&[&projects]))
+        .await
+        .expect("name the Root the main checkout is in");
+    timeout(PROGRESS_DEADLINE, async {
+        while readings.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a scan reads the main checkout");
+    client
+        .mutate_setting(name(&[]))
+        .await
+        .expect("take the Root away while its reading is held");
+    drop(held);
+    client
+        .mutate_setting(name(&[&projects]))
+        .await
+        .expect("name the Root again");
+    timeout(PROGRESS_DEADLINE, async {
+        while readings.load(Ordering::SeqCst) < 2 {
+            listed(&client).await;
+        }
+    })
+    .await
+    .expect("a later scan reads the directory afresh, once the held reading has ended");
+
+    let listing = client.list_workspaces().await.expect("list Workspaces");
+    let listed = listing
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == created.workspace.id)
+        .expect("the Repository is listed");
+    assert_eq!(
+        listing.workspace_paths.workspace_name(listed),
+        "atlas.git (main checkout unknown)",
+        "the main checkout the superseded scan read is learned nowhere"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
