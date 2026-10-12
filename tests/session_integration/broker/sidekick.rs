@@ -481,6 +481,17 @@ async fn a_call_a_sidekicks_native_subagent_makes_in_its_own_name_is_refused_the
         json!("The Broker offers no Tool named `list_sessions`"),
         "{refused}"
     );
+    let refused = unoffered(
+        &mut native,
+        "clone_workspace",
+        json!({ "repository_url": "https://example.invalid/atlas.git" }),
+    )
+    .await;
+    assert_eq!(
+        refused["message"],
+        json!("The Broker offers no Tool named `clone_workspace`"),
+        "a native Subagent cannot Clone in its Sidekick's name: {refused}"
+    );
     native.list_providers().await;
     list_sessions(&mut sidekick, json!({})).await;
 

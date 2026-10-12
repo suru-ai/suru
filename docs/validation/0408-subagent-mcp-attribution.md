@@ -143,3 +143,14 @@ calls carried the parent's token. Every call's `_meta` also had `callId`,
   a Sidekick may give, so an `origin` it gives is refused in words telling it
   to call again without `origin`. Fallback: none needed; the call that follows
   is answered.
+- **A native Claude or Copilot Subagent of a Sidekick is answered as the
+  Sidekick (#544).** Its calls stay with the token's Session, as above, and
+  that Session is the Sidekick's, so it is listed and may call every Tool
+  that is the Sidekick's alone, though ADR 0042 offers a Sidekick's Subagents
+  none of them. That includes `clone_workspace`, which writes a new
+  Workspace to the user's disk within a Workspace Root. A brokered Subagent
+  presents a token of its own and is refused them, and a native Codex
+  Subagent's call is attributed to its own Session and refused them, as
+  above. Fallback: none within the Broker; closing it waits on attributing a
+  Claude or Copilot Subagent's call by identity, the candidate the Claude
+  bullet names.
