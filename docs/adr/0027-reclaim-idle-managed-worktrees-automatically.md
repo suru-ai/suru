@@ -1,5 +1,7 @@
 # Reclaim idle Managed Worktrees automatically
 
+_Superseded in part by [ADR 0051](0051-keep-a-workspace-registry-fed-by-sessions-discovery-and-clones.md): the Server now keeps a Workspace Registry, so the last paragraph below no longer holds._
+
 The [Git Worktree lifecycle spec #302](https://github.com/suru-ai/suru/issues/302) made Worktree removal an explicit, user-confirmed act and put automatic deletion out of scope, on the grounds that a background task deleting directories is how work gets lost. In practice Managed Worktrees accumulate faster than anyone removes them, and a Repository's observation loop keeps reading every one of them each tick. We decided in [Reclaim spec #347](https://github.com/suru-ai/suru/issues/347) that the Server may Reclaim a Managed Worktree unattended, provided the rule is narrow enough that a Reclaim can never destroy anything that is not reproducible: it removes only what `git worktree remove` would remove without force, plus ignored files, and it refuses a Worktree that is Working, holds tracked changes, untracked files, or initialized submodules, or carries a Git lock Suru did not place. Reclaim is governed by one Server Setting, `worktree.autoReclaim`, a scalar holding `off` or a day count, in the Source Control group, defaulting to 14 days with a minimum of 1; `off` disables every kind of Reclaim.
 
 ## Considered Options
