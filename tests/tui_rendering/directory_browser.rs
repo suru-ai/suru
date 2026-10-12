@@ -1821,20 +1821,20 @@ fn a_workspace_the_workspace_picker_listed_wears_its_icon_while_the_sidebar_is_h
         !matches!(transition, ApplicationTransition::ListSessions(_)),
         "a hidden Sidebar asks for no Sessions: {transition:?}"
     );
-    let ApplicationTransition::ListSessions(request) =
+    let ApplicationTransition::ListWorkspaces(request) =
         invoke(&mut application, SemanticCommandId::WorkspaceList)
     else {
-        panic!("the Workspace Picker asks for its Sessions");
+        panic!("the Workspace Picker asks its Server for its Workspaces");
     };
     application
-        .handle_event(ApplicationEvent::SessionsListed {
+        .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            sessions: vec![
-                session_in(&here, Some("dev-python")),
-                session_in(&here.join("iconed"), Some("dev-rust")),
+            workspaces: vec![
+                workspace_with_icon(&here, Some("dev-python")),
+                workspace_with_icon(&here.join("iconed"), Some("dev-rust")),
             ],
         })
-        .expect("list the Workspace Picker's Sessions");
+        .expect("list the Workspace Picker's Workspaces");
     let children = [
         ("iconed", repository_root(branch("main"))),
         ("plain", DirectorySourceControl::Plain),
@@ -2111,6 +2111,14 @@ fn tree_drawn_from(
 
 /// A Session the Sidebar lists in the Workspace at `path`, wearing the Icon
 /// the Catalog names `icon`.
+/// The Workspace a Server lists for the plain directory `path`, wearing
+/// `icon` where it has one.
+fn workspace_with_icon(path: &Path, icon: Option<&str>) -> Workspace {
+    let mut workspace = Workspace::directory(path.to_owned());
+    workspace.icon = icon.map(str::to_owned);
+    workspace
+}
+
 fn session_in(path: &Path, icon: Option<&str>) -> SessionListItem {
     let mut session = listed_session(SessionId::new(), "Work", path, 1, 1);
     let SessionListItem::Readable(summary) = &mut session else {

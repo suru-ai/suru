@@ -15,11 +15,11 @@ use suru::{
     managed_client::SessionEvent,
     protocol::{
         AppearanceSettings, EffectiveSettings, Outlook, SessionId, SessionListItem,
-        SidebarSettings, SidebarVisibility, WorkspaceId,
+        SidebarSettings, SidebarVisibility, Workspace, WorkspaceId,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
-        SessionListRequest, SessionListScope, SessionListSurface,
+        WorkspaceListRequest,
     },
 };
 
@@ -553,12 +553,10 @@ fn pointer_choice_over_a_selector_entry_does_the_same() {
     assert!(!picker_is_drawn(&application));
 }
 
-fn expect_workspace_listing(transition: ApplicationTransition) -> SessionListRequest {
-    let ApplicationTransition::ListSessions(request) = transition else {
-        panic!("opening the Workspace Picker asks for its Sessions, not {transition:?}");
+fn expect_workspace_listing(transition: ApplicationTransition) -> WorkspaceListRequest {
+    let ApplicationTransition::ListWorkspaces(request) = transition else {
+        panic!("opening the Workspace Picker asks for the Server's Workspaces, not {transition:?}");
     };
-    assert_eq!(request.surface(), SessionListSurface::WorkspacePicker);
-    assert_eq!(request.scope(), &SessionListScope::AllWorkspaces);
     request
 }
 
@@ -580,11 +578,11 @@ fn workspace_picker_with_two_workspaces(
             .expect("open the Workspace Picker"),
     );
     application
-        .handle_event(ApplicationEvent::SessionsListed {
+        .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            sessions: vec![
-                listed_as(SessionId::new(), "Acorn work", &acorn),
-                listed_as(SessionId::new(), "Birch work", &birch),
+            workspaces: vec![
+                Workspace::directory(acorn.clone()),
+                Workspace::directory(birch),
             ],
         })
         .expect("hydrate the Workspace Picker");

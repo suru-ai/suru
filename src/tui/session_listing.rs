@@ -639,31 +639,6 @@ impl SessionListing {
         }
     }
 
-    /// Takes a Workspace's Description, as it was derived, set, or cleared,
-    /// into every listed Session rooted there and into the client's own
-    /// current Workspace where this is it, on the same terms
-    /// [`Self::set_workspace_icon_origin`] takes its Icon. A Workspace's
-    /// identity is only unique within its Origin — the same directory may be
-    /// a Workspace on two machines — so the current Workspace takes it only
-    /// from the Origin the listing looks into.
-    pub(super) fn set_workspace_description_origin(
-        &mut self,
-        outlook: Outlook,
-        workspace_id: &crate::protocol::WorkspaceId,
-        description: Option<crate::protocol::WorkspaceDescription>,
-    ) {
-        if outlook == self.outlook && &self.current_workspace.id == workspace_id {
-            self.current_workspace.description = description.clone();
-        }
-        for session in &mut self.origin_mut(outlook).sessions {
-            if let SessionListItem::Readable(summary) = &mut session.item
-                && &summary.session.workspace.id == workspace_id
-            {
-                summary.session.workspace.description = description.clone();
-            }
-        }
-    }
-
     /// Records a Session the server reports set aside as done for now, or
     /// brought back. The order this listing keeps is by when a Session was last
     /// updated, which settling does not touch, so nothing moves.
@@ -1087,44 +1062,6 @@ mod tests {
         );
     }
 
-    /// The same directory may be a Workspace on two machines, so a Workspace
-    /// identity alone does not say whose a Description is: the Workspace the
-    /// listing looks into takes one only from the Origin it looks into.
-    #[test]
-    fn the_current_workspace_takes_a_description_only_from_its_own_origin() {
-        let workspace = tempfile::tempdir().expect("create Workspace");
-        let mut listing = SessionListing::new(
-            SessionListSurface::WorkspacePicker,
-            workspace.path().to_owned(),
-        );
-        let studio = Outlook::Remote("studio".to_owned());
-        listing.adopt_outlook(studio.clone());
-        let shared = listing.current_workspace().id.clone();
-        let described = |text: &str| {
-            Some(crate::protocol::WorkspaceDescription {
-                text: text.to_owned(),
-                set: true,
-            })
-        };
-
-        listing.set_workspace_description_origin(
-            Outlook::Local,
-            &shared,
-            described("Kept on this machine."),
-        );
-        assert_eq!(
-            listing.current_workspace().description,
-            None,
-            "this machine's Description is not the studio's Workspace's"
-        );
-
-        listing.set_workspace_description_origin(studio, &shared, described("Kept on the studio."));
-        assert_eq!(
-            listing.current_workspace().description,
-            described("Kept on the studio.")
-        );
-    }
-
     #[test]
     fn a_listing_orders_its_sessions_most_recently_updated_first() {
         let workspace = tempfile::tempdir().expect("create Workspace");
@@ -1396,7 +1333,7 @@ mod tests {
     #[test]
     fn the_workspaces_a_listing_derives_stand_newest_work_first_and_include_this_client_s_own() {
         let mut listing = SessionListing::scoped(
-            SessionListSurface::WorkspacePicker,
+            SessionListSurface::Sidebar,
             root().join("here"),
             SessionListScope::AllWorkspaces,
         );
@@ -1430,7 +1367,7 @@ mod tests {
     #[test]
     fn a_workspace_this_client_works_in_and_has_worked_in_stands_once() {
         let mut listing = SessionListing::scoped(
-            SessionListSurface::WorkspacePicker,
+            SessionListSurface::Sidebar,
             root().join("here"),
             SessionListScope::AllWorkspaces,
         );
@@ -1454,7 +1391,7 @@ mod tests {
     #[test]
     fn a_session_listed_without_a_workspace_puts_none_on_offer() {
         let mut listing = SessionListing::scoped(
-            SessionListSurface::WorkspacePicker,
+            SessionListSurface::Sidebar,
             root().join("here"),
             SessionListScope::AllWorkspaces,
         );

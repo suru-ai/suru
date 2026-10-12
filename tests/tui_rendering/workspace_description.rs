@@ -14,13 +14,10 @@ use crossterm::event::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AppearanceSettings, EffectiveSettings, Outlook, SessionId, SessionListItem,
-        WorkspaceDescription, WorkspaceDescriptionChanged, WorkspaceId,
+        AppearanceSettings, EffectiveSettings, Outlook, Workspace, WorkspaceDescription,
+        WorkspaceDescriptionChanged, WorkspaceId,
     },
-    tui::{
-        Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
-        SessionListRequest, SessionListSurface,
-    },
+    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
 
 const WIDE: u16 = 100;
@@ -35,24 +32,15 @@ fn workspace(components: &[&str]) -> PathBuf {
     )
 }
 
-/// A listed Session rooted in `workspace`, whose Workspace carries
-/// `description` as the server sent it.
-fn rooted(
-    title: &str,
-    workspace: &Path,
-    updated_at: u64,
-    description: Option<&str>,
-) -> SessionListItem {
-    let mut item =
-        crate::support::listed_session(SessionId::new(), title, workspace, 1, updated_at);
-    let SessionListItem::Readable(summary) = &mut item else {
-        unreachable!("a listed Session is readable")
-    };
-    summary.session.workspace.description = description.map(|text| WorkspaceDescription {
+/// The Workspace its Server's Workspace Registry lists for the plain
+/// directory `workspace`, carrying `description` where it has one.
+fn registered(workspace: &Path, description: Option<&str>) -> Workspace {
+    let mut workspace = Workspace::directory(workspace.to_owned());
+    workspace.description = description.map(|text| WorkspaceDescription {
         text: text.to_owned(),
         set: false,
     });
-    item
+    workspace
 }
 
 fn icons_shown(show_icons: bool) -> EffectiveSettings {
@@ -65,28 +53,26 @@ fn icons_shown(show_icons: bool) -> EffectiveSettings {
     }
 }
 
-/// The Workspace Picker opened from `here` over `sessions`, with Icons shown
-/// or hidden as asked.
-fn picker_over(here: &Path, sessions: Vec<SessionListItem>, show_icons: bool) -> Application {
+/// The Workspace Picker opened from `here`, its Server listing
+/// `workspaces`, with Icons shown or hidden as asked.
+fn picker_over(here: &Path, workspaces: Vec<Workspace>, show_icons: bool) -> Application {
     let mut application = connected_application(here);
     deliver_settings(&mut application, icons_shown(show_icons));
-    let ApplicationTransition::ListSessions(request) = application
+    let ApplicationTransition::ListWorkspaces(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
             SemanticCommandId::WorkspaceList,
         )))
         .expect("open the Workspace Picker")
     else {
-        panic!("opening the Workspace Picker asks for its Sessions");
+        panic!("opening the Workspace Picker asks its Server for its Workspaces");
     };
-    assert_listing(&request);
     application
-        .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+        .handle_event(ApplicationEvent::WorkspacesListed {
+            request,
+            workspaces,
+        })
         .expect("hydrate the Workspace Picker");
     application
-}
-
-fn assert_listing(request: &SessionListRequest) {
-    assert_eq!(request.surface(), SessionListSurface::WorkspacePicker);
 }
 
 /// Two Workspaces besides the one the reader is in: "ledger", described,
@@ -95,13 +81,11 @@ fn described_and_plain(show_icons: bool) -> Application {
     picker_over(
         &workspace(&["work", "here"]),
         vec![
-            rooted(
-                "Ledger work",
+            registered(
                 &workspace(&["work", "ledger"]),
-                30,
                 Some("Where the quarterly ledger is reconciled."),
             ),
-            rooted("Atlas work", &workspace(&["work", "atlas"]), 20, None),
+            registered(&workspace(&["work", "atlas"]), None),
         ],
         show_icons,
     )
@@ -242,12 +226,7 @@ fn a_long_description_gives_up_its_tail_rather_than_the_rows() {
     let long = format!("Starts plainly. {}Ends unseen.", "middle words ".repeat(40));
     let mut application = picker_over(
         &workspace(&["work", "here"]),
-        vec![rooted(
-            "Ledger work",
-            &workspace(&["work", "ledger"]),
-            30,
-            Some(&long),
-        )],
+        vec![registered(&workspace(&["work", "ledger"]), Some(&long))],
         true,
     );
     press_key(&mut application, KeyCode::Down);
@@ -642,20 +621,19 @@ fn the_arrows_walk_the_row_menu_and_enter_acts_on_the_item_the_reader_is_on() {
 #[test]
 fn a_remote_workspace_s_description_is_saved_to_that_remote() {
     let mut application = crate::support::application_looking_at_studio();
-    let ApplicationTransition::ListSessions(request) = application
+    let ApplicationTransition::ListWorkspaces(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
             SemanticCommandId::WorkspaceList,
         )))
         .expect("open the Workspace Picker")
     else {
-        panic!("opening the Workspace Picker asks its Outlook for Sessions");
+        panic!("opening the Workspace Picker asks its Outlook for its Workspaces");
     };
-    assert_listing(&request);
     let studio_work = workspace(&["studio", "mural"]);
     application
-        .handle_event(ApplicationEvent::SessionsListed {
+        .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            sessions: vec![rooted("Mural work", &studio_work, 30, None)],
+            workspaces: vec![registered(&studio_work, None)],
         })
         .expect("hydrate the Workspace Picker");
     let buffer = rendered_application_buffer(&application, WIDE, TALL);
@@ -719,19 +697,19 @@ fn a_local_description_never_reaches_a_remote_workspace_of_the_same_identity() {
     let shared = workspace(&["shared", "mural"]);
     let mut application = crate::support::application_looking_at_studio();
     let open_on_studio = |application: &mut Application| {
-        let ApplicationTransition::ListSessions(request) = application
+        let ApplicationTransition::ListWorkspaces(request) = application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
                 SemanticCommandId::WorkspaceList,
             )))
             .expect("open the Workspace Picker")
         else {
-            panic!("opening the Workspace Picker asks its Outlook for Sessions");
+            panic!("opening the Workspace Picker asks its Outlook for its Workspaces");
         };
         assert_eq!(request.outlook(), &Outlook::Remote("studio".to_owned()));
         application
-            .handle_event(ApplicationEvent::SessionsListed {
+            .handle_event(ApplicationEvent::WorkspacesListed {
                 request,
-                sessions: vec![rooted("Mural work", &shared, 30, None)],
+                workspaces: vec![registered(&shared, None)],
             })
             .expect("hydrate the Workspace Picker");
     };

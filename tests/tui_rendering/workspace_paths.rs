@@ -217,7 +217,6 @@ fn remote_landing_paths_and_session_names_follow_the_remote_path_style() {
 fn the_workspace_picker_offers_no_remotes_sidekick_workspace() {
     use suru::protocol::{
         Outlook, PathStyle, SessionCatalogRevision, SessionCatalogSnapshot, SessionId,
-        SessionListItem, SessionSummary, SessionTimestamp,
     };
     use suru::tui::{ApplicationTransition, CommandId, SemanticCommandId};
 
@@ -242,35 +241,23 @@ fn the_workspace_picker_offers_no_remotes_sidekick_workspace() {
             }),
         })
         .unwrap();
-    let ApplicationTransition::ListSessions(request) = application
+    let ApplicationTransition::ListWorkspaces(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
             SemanticCommandId::WorkspaceList,
         )))
         .unwrap()
     else {
-        panic!("opening the Workspace Picker asks the Remote for its Sessions")
+        panic!("opening the Workspace Picker asks the Remote for its Workspaces")
     };
-    let listed = |id, path: &str, updated_at| {
-        let snapshot =
-            crate::support::navigable_session_snapshot(id, std::path::Path::new(path), 1);
-        SessionListItem::Readable(Box::new(SessionSummary {
-            checkout_state: None,
-            session: snapshot.session,
-            title: "Remote work".into(),
-            icon: None,
-            settled_at: None,
-            standing_inputs: Default::default(),
-            total_usage: None,
-            own_cost: None,
-            remote_subsessions: Vec::new(),
-            created_at: SessionTimestamp(1),
-            updated_at: SessionTimestamp(updated_at),
-        }))
+    let listed = |id, path: &str| {
+        crate::support::navigable_session_snapshot(id, std::path::Path::new(path), 1)
+            .session
+            .workspace
     };
     application
-        .handle_event(ApplicationEvent::SessionsListed {
+        .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            sessions: vec![listed(ids[0], sidekick, 30), listed(ids[1], other, 20)],
+            workspaces: vec![listed(ids[0], sidekick), listed(ids[1], other)],
         })
         .unwrap();
 
@@ -342,13 +329,16 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
                     )))
                     .unwrap();
             }
-            let ApplicationTransition::ListSessions(request) = transition else {
-                panic!("picker requests Sessions")
-            };
             let snapshot =
                 crate::support::navigable_session_snapshot(id, std::path::Path::new(path), 1);
-            application
-                .handle_event(ApplicationEvent::SessionsListed {
+            let listed = match transition {
+                ApplicationTransition::ListWorkspaces(request) => {
+                    ApplicationEvent::WorkspacesListed {
+                        request,
+                        workspaces: vec![snapshot.session.workspace],
+                    }
+                }
+                ApplicationTransition::ListSessions(request) => ApplicationEvent::SessionsListed {
                     request,
                     sessions: vec![SessionListItem::Readable(Box::new(SessionSummary {
                         checkout_state: None,
@@ -363,8 +353,10 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
                         created_at: SessionTimestamp(1),
                         updated_at: SessionTimestamp(2),
                     }))],
-                })
-                .unwrap();
+                },
+                transition => panic!("each picker asks for its listing, not {transition:?}"),
+            };
+            application.handle_event(listed).unwrap();
             let rendered = screen(&application);
             assert!(rendered.contains(label), "{command:?}: {rendered}");
             assert!(!rendered.contains(path), "{command:?}: {rendered}");

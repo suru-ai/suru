@@ -31,13 +31,13 @@ use suru::{
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, DirectoryListingId,
-        SemanticCommandId, SessionListRequest, SessionListScope, SessionListSurface, TerminalFacts,
-        WorkspaceResolutionSurface,
+        SemanticCommandId, SessionListScope, SessionListSurface, TerminalFacts,
+        WorkspaceListRequest, WorkspaceResolutionSurface,
     },
 };
 
 #[test]
-fn the_workspace_command_opens_a_picker_loading_every_workspace_s_sessions() {
+fn the_workspace_command_opens_a_picker_loading_its_servers_workspaces() {
     let mut application = connected_application(&workspace(&["work", "here"]));
     type_terminal_text(&mut application, "/workspace");
 
@@ -59,7 +59,7 @@ fn the_workspace_command_opens_a_picker_loading_every_workspace_s_sessions() {
     assert!(picker.contains("Workspaces"));
     assert!(
         picker.contains("Loading Workspaces"),
-        "the listing the picker derives its rows from is still on its way, and \
+        "the listing the picker draws its rows from is still on its way, and \
          an empty box would read as no Workspaces at all"
     );
 }
@@ -123,8 +123,10 @@ fn the_leader_chord_opens_the_picker() {
     );
 }
 
+/// The current Workspace stands first, and the rest in the order the Server
+/// lists them, which is by which held work most recently.
 #[test]
-fn the_current_workspace_stands_first_and_the_rest_by_which_held_work_most_recently() {
+fn the_current_workspace_stands_first_and_the_rest_as_the_server_lists_them() {
     let here = workspace(&["work", "here"]);
     let ledger = workspace(&["work", "ledger"]);
     let atlas = workspace(&["work", "atlas"]);
@@ -132,18 +134,14 @@ fn the_current_workspace_stands_first_and_the_rest_by_which_held_work_most_recen
 
     open_picker_with(
         &mut application,
-        vec![
-            rooted("Older work", &ledger, 10),
-            rooted("Newest work", &atlas, 30),
-            rooted("Work where I am", &here, 20),
-        ],
+        vec![registered(&atlas), registered(&here), registered(&ledger)],
     );
 
     let rows = picker_rows(&application);
     assert_eq!(
         rows.len(),
         3,
-        "one row per Workspace the Sessions are rooted in: {rows:?}"
+        "one row per Workspace the Server lists: {rows:?}"
     );
     assert!(rows[0].contains("here"), "{rows:?}");
     assert!(
@@ -158,18 +156,14 @@ fn the_current_workspace_stands_first_and_the_rest_by_which_held_work_most_recen
 }
 
 /// A Workspace with no Sessions yet is still somewhere the reader can be: the
-/// one this client is working in stands whether or not any work is rooted
-/// there.
+/// one this client is working in stands whether or not its Server lists it.
 #[test]
 fn the_workspace_the_client_works_in_stands_even_with_no_work_rooted_there() {
     let here = workspace(&["work", "here"]);
     let ledger = workspace(&["work", "ledger"]);
     let mut application = connected_application(&here);
 
-    open_picker_with(
-        &mut application,
-        vec![rooted("Work elsewhere", &ledger, 10)],
-    );
+    open_picker_with(&mut application, vec![registered(&ledger)]);
 
     let rows = picker_rows(&application);
     assert_eq!(rows.len(), 2, "{rows:?}");
@@ -180,6 +174,42 @@ fn the_workspace_the_client_works_in_stands_even_with_no_work_rooted_there() {
     assert!(rows[1].contains("ledger"), "{rows:?}");
 }
 
+/// The picker offers what its Server's Workspace Registry lists, so a
+/// Workspace whose every Session is gone is offered still, while the Sidebar,
+/// which groups Sessions, shows nothing of it.
+#[test]
+fn a_workspace_whose_sessions_are_all_gone_is_offered_while_the_sidebar_shows_nothing_of_it() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["work", "atlas"]);
+    let archive = workspace(&["work", "archive"]);
+    let mut application = connected_application(&here);
+    show_sidebar(
+        &mut application,
+        vec![rooted("Chart the atlas", &atlas, 20)],
+    );
+
+    open_picker_with(
+        &mut application,
+        vec![registered(&atlas), registered(&archive)],
+    );
+
+    let rows = picker_rows(&application);
+    assert!(
+        rows.iter().any(|row| row.contains("archive")),
+        "the Workspace no Session works in is offered: {rows:?}"
+    );
+    press(&mut application, KeyCode::Esc);
+    let frame = rendered_application_rows_at(&application, SIDEBAR_WIDE, 20);
+    assert!(
+        drawn_in_sidebar(&frame, "Chart the atlas"),
+        "the Sidebar groups the Sessions it lists: {frame:?}"
+    );
+    assert!(
+        !drawn_in_sidebar(&frame, "archive"),
+        "and shows nothing of a Workspace no Session works in: {frame:?}"
+    );
+}
+
 #[test]
 fn a_row_names_the_workspace_and_spells_its_path_beside_it() {
     let here = workspace(&["work", "here"]);
@@ -187,10 +217,7 @@ fn a_row_names_the_workspace_and_spells_its_path_beside_it() {
     let two = workspace(&["two", "api"]);
     let mut application = connected_application(&here);
 
-    open_picker_with(
-        &mut application,
-        vec![rooted("Newer", &one, 30), rooted("Older", &two, 20)],
-    );
+    open_picker_with(&mut application, vec![registered(&one), registered(&two)]);
 
     let rows = picker_rows(&application);
     let named = rows
@@ -221,7 +248,7 @@ fn the_sidekick_workspace_is_not_offered_where_the_reader_is_not_in_it() {
 
     open_picker_with(
         &mut application,
-        vec![rooted("Survey", &sidekick, 30), rooted("Older", &other, 20)],
+        vec![registered(&sidekick), registered(&other)],
     );
 
     let rows = picker_rows(&application);
@@ -244,7 +271,7 @@ fn searching_for_sidekick_does_not_offer_the_sidekick_workspace() {
     let sidekick = workspace(&["data", "sidekick"]);
     let mut application = connected_application(&here);
     name_sidekick_workspace(&mut application, &sidekick);
-    open_picker_with(&mut application, vec![rooted("Survey", &sidekick, 30)]);
+    open_picker_with(&mut application, vec![registered(&sidekick)]);
 
     type_terminal_text(&mut application, "sidekick");
 
@@ -268,7 +295,7 @@ fn the_sidekick_workspace_stands_first_by_name_alone_where_the_reader_is_in_it()
 
     open_picker_with(
         &mut application,
-        vec![rooted("Survey", &sidekick, 30), rooted("Older", &other, 20)],
+        vec![registered(&sidekick), registered(&other)],
     );
 
     let rows = picker_rows(&application);
@@ -290,18 +317,15 @@ fn a_row_draws_the_workspaces_own_icon_in_place_of_the_folder_glyph() {
     let plain = workspace(&["group", "plain-ws"]);
     let mut application = connected_application(&here);
 
-    let mut iconed_session = rooted("Newer", &iconed, 30);
-    let SessionListItem::Readable(summary) = &mut iconed_session else {
-        unreachable!()
-    };
-    summary.session.workspace.icon = Some("dev-rust".to_owned());
+    let mut iconed_workspace = registered(&iconed);
+    iconed_workspace.icon = Some("dev-rust".to_owned());
 
     let mut settings = EffectiveSettings::default();
     settings.appearance.show_icons = false;
     deliver_settings(&mut application, settings);
     open_picker_with(
         &mut application,
-        vec![iconed_session.clone(), rooted("Older", &plain, 20)],
+        vec![iconed_workspace.clone(), registered(&plain)],
     );
     let rows = picker_rows(&application);
     assert!(
@@ -314,10 +338,7 @@ fn a_row_draws_the_workspaces_own_icon_in_place_of_the_folder_glyph() {
     let mut settings = EffectiveSettings::default();
     settings.appearance.show_icons = true;
     deliver_settings(&mut application, settings);
-    open_picker_with(
-        &mut application,
-        vec![iconed_session, rooted("Older", &plain, 20)],
-    );
+    open_picker_with(&mut application, vec![iconed_workspace, registered(&plain)]);
     let rows = picker_rows(&application);
     let iconed_row = rows
         .iter()
@@ -345,10 +366,7 @@ fn two_spellings_of_one_directory_make_one_row() {
     let here = workspace_dir();
     let mut application = connected_application(&noncanonical_spelling(&here));
 
-    open_picker_with(
-        &mut application,
-        vec![rooted("Work where I am", here.path(), 20)],
-    );
+    open_picker_with(&mut application, vec![registered(here.path())]);
 
     let rows = picker_rows(&application);
     assert_eq!(
@@ -368,7 +386,7 @@ fn the_arrows_walk_the_rows_and_wrap_past_the_ends() {
 
     open_picker_with(
         &mut application,
-        vec![rooted("Older", &ledger, 10), rooted("Newer", &atlas, 30)],
+        vec![registered(&atlas), registered(&ledger)],
     );
 
     assert_eq!(
@@ -410,11 +428,7 @@ fn the_paging_keys_move_the_selection_a_page_at_a_time() {
 
     open_picker_with(
         &mut application,
-        elsewhere
-            .iter()
-            .enumerate()
-            .map(|(rank, path)| rooted("Work", path, 100 - rank as u64))
-            .collect(),
+        elsewhere.iter().map(|path| registered(path)).collect(),
     );
 
     assert_eq!(selected_row(&application), "here");
@@ -439,7 +453,7 @@ fn escape_closes_the_picker_leaving_everything_as_it_was() {
         )))
         .expect("type a Landing draft");
 
-    open_picker_with(&mut application, vec![rooted("Older", &ledger, 10)]);
+    open_picker_with(&mut application, vec![registered(&ledger)]);
     press(&mut application, KeyCode::Down);
 
     assert_eq!(
@@ -472,7 +486,7 @@ fn a_narrow_row_gives_up_the_head_of_the_path_rather_than_the_path() {
     let ledger = workspace(&["work", "ledger"]);
     let mut application = connected_application(&here);
 
-    open_picker_with(&mut application, vec![rooted("Older", &ledger, 10)]);
+    open_picker_with(&mut application, vec![registered(&ledger)]);
 
     let rows = picker_rows_at(&application, 28, 9);
     let row = rows
@@ -500,7 +514,7 @@ fn a_refused_listing_is_reported_in_the_picker() {
     );
 
     application
-        .handle_event(ApplicationEvent::SessionListingFailed {
+        .handle_event(ApplicationEvent::WorkspaceListingFailed {
             request,
             error: "the server is unreachable".to_owned(),
         })
@@ -531,7 +545,7 @@ fn a_left_press_on_a_row_chooses_it_exactly_as_enter_does() {
         let atlas = workspace_in(root.path(), "atlas");
         let picking = || {
             let mut application = connected_application(&here);
-            open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+            open_picker_with(&mut application, vec![registered(&atlas)]);
             application
         };
 
@@ -587,8 +601,7 @@ fn a_left_press_on_a_row_scrolled_into_view_chooses_that_row() {
         let here = workspace_in(root.path(), "here");
         let listed = NAMES
             .iter()
-            .zip(0..)
-            .map(|(name, age)| rooted(name, &workspace_in(root.path(), name), 100 - age))
+            .map(|name| registered(&workspace_in(root.path(), name)))
             .collect::<Vec<_>>();
         let picking = || {
             let mut application = connected_application(&here);
@@ -639,7 +652,7 @@ fn a_left_press_on_a_row_waits_out_a_pending_agent_selection_as_enter_does() {
         let atlas = workspace_in(root.path(), "atlas");
         let picking = || {
             let mut application = application_awaiting_agent_selection(&here);
-            open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+            open_picker_with(&mut application, vec![registered(&atlas)]);
             application
         };
 
@@ -673,11 +686,7 @@ fn a_left_press_on_a_row_is_refused_for_an_unreachable_remote_as_enter_is() {
             let mut application = application_looking_at_studio();
             open_picker_with(
                 &mut application,
-                vec![rooted(
-                    "Remote work",
-                    &crate::support::named_workspace_path("atlas"),
-                    30,
-                )],
+                vec![registered(&crate::support::named_workspace_path("atlas"))],
             );
             studio_stops_answering(&mut application, 1, Duration::from_secs(5));
             application
@@ -724,7 +733,7 @@ fn a_right_press_on_a_row_still_opens_its_menu() {
         let here = workspace(&["work", "here"]);
         let ledger = workspace(&["work", "ledger"]);
         let mut application = connected_application(&here);
-        open_picker_with(&mut application, vec![rooted("Older", &ledger, 10)]);
+        open_picker_with(&mut application, vec![registered(&ledger)]);
 
         assert_eq!(
             press_row(&mut application, frame, MouseButton::Right, "ledger"),
@@ -746,7 +755,7 @@ fn a_press_inside_the_picker_off_its_rows_moves_nothing() {
         let here = workspace(&["work", "here"]);
         let ledger = workspace(&["work", "ledger"]);
         let mut application = connected_application(&here);
-        open_picker_with(&mut application, vec![rooted("Older", &ledger, 10)]);
+        open_picker_with(&mut application, vec![registered(&ledger)]);
         let before = rendered_application_rows_at(&application, frame.0, frame.1);
 
         assert_eq!(
@@ -775,7 +784,7 @@ fn enter_closes_the_picker_and_lands_in_the_workspace_chosen_before_its_server_a
     let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
 
-    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    open_picker_with(&mut application, vec![registered(&atlas)]);
     press(&mut application, KeyCode::Down);
     assert_eq!(selected_row(&application), "atlas");
 
@@ -823,7 +832,7 @@ fn a_prompt_written_before_the_server_answers_waits_for_it() {
     let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
 
-    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    open_picker_with(&mut application, vec![registered(&atlas)]);
     press(&mut application, KeyCode::Down);
     let resolution = choose_unanswered(&mut application);
 
@@ -877,7 +886,7 @@ fn a_workspace_still_resolving_turns_a_spinner_where_its_checkout_state_will_sta
     let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
 
-    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    open_picker_with(&mut application, vec![registered(&atlas)]);
     press(&mut application, KeyCode::Down);
     let resolution = choose_unanswered(&mut application);
 
@@ -914,7 +923,7 @@ fn the_answer_fills_in_the_landing_beneath_the_draft_written_while_it_waited() {
     let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
 
-    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    open_picker_with(&mut application, vec![registered(&atlas)]);
     press(&mut application, KeyCode::Down);
     let resolution = choose_unanswered(&mut application);
     assert_eq!(
@@ -963,10 +972,7 @@ fn a_workspace_whose_directory_is_gone_is_refused_on_its_landing_and_moves_nothi
 
     open_picker_with(
         &mut application,
-        vec![
-            rooted("Gone work", &gone, 100),
-            rooted("Atlas work", &atlas, 90),
-        ],
+        vec![registered(&gone), registered(&atlas)],
     );
     press(&mut application, KeyCode::Down);
     assert_eq!(selected_row(&application), "gone");
@@ -1002,10 +1008,7 @@ fn a_workspace_whose_directory_is_gone_is_refused_on_its_landing_and_moves_nothi
 
     open_picker_with(
         &mut application,
-        vec![
-            rooted("Gone work", &gone, 100),
-            rooted("Atlas work", &atlas, 90),
-        ],
+        vec![registered(&gone), registered(&atlas)],
     );
     press(&mut application, KeyCode::Down);
     press(&mut application, KeyCode::Down);
@@ -1034,7 +1037,7 @@ fn a_workspace_replaced_by_a_file_is_refused_without_moving_any_scope() {
     load_skills(&mut application, here.path(), "review");
     show_sidebar(&mut application, Vec::new());
 
-    open_picker_with(&mut application, vec![rooted("Old work", &file, 30)]);
+    open_picker_with(&mut application, vec![registered(&file)]);
     press(&mut application, KeyCode::Down);
     assert_eq!(selected_row(&application), "old-work");
 
@@ -1073,7 +1076,7 @@ fn a_newer_choice_supersedes_a_workspace_still_resolving() {
     let here = workspace_in(root.path(), "here");
     let atlas = workspace_in(root.path(), "atlas");
     let ledger = workspace_in(root.path(), "ledger");
-    let listed = || vec![rooted("Newer", &atlas, 30), rooted("Older", &ledger, 20)];
+    let listed = || vec![registered(&atlas), registered(&ledger)];
     let mut application = connected_application(&here);
 
     open_picker_with(&mut application, listed());
@@ -1126,7 +1129,7 @@ fn a_fresh_landing_lets_go_of_a_workspace_still_resolving() {
     let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
 
-    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    open_picker_with(&mut application, vec![registered(&atlas)]);
     press(&mut application, KeyCode::Down);
     let resolution = choose_unanswered(&mut application);
 
@@ -1171,7 +1174,7 @@ fn a_late_refusal_for_a_workspace_let_go_of_moves_nothing() {
     let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
 
-    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    open_picker_with(&mut application, vec![registered(&atlas)]);
     press(&mut application, KeyCode::Down);
     let resolution = choose_unanswered(&mut application);
     let (outlook, surface, request_id, _) = crate::support::workspace_resolution(&resolution)
@@ -1222,7 +1225,7 @@ fn a_workspace_asked_for_elsewhere_supersedes_one_still_resolving() {
     let sidekick = workspace_in(root.path(), "sidekick");
     let mut application = connected_application(root.path());
 
-    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    open_picker_with(&mut application, vec![registered(&atlas)]);
     press(&mut application, KeyCode::Down);
     let resolution = choose_unanswered(&mut application);
 
@@ -1274,7 +1277,7 @@ fn the_workspace_the_reader_chose_roots_the_sessions_they_make_next() {
     let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
 
-    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    open_picker_with(&mut application, vec![registered(&atlas)]);
     press(&mut application, KeyCode::Down);
     choose(&mut application);
 
@@ -1311,7 +1314,7 @@ fn the_skill_catalog_answers_for_the_workspace_the_reader_chose() {
         "the Workspace the client launched in answers for its own Skills"
     );
 
-    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    open_picker_with(&mut application, vec![registered(&atlas)]);
     press(&mut application, KeyCode::Down);
     choose(&mut application);
 
@@ -1341,7 +1344,7 @@ fn the_session_pickers_current_workspace_scope_comes_to_mean_the_chosen_workspac
     let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
 
-    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    open_picker_with(&mut application, vec![registered(&atlas)]);
     press(&mut application, KeyCode::Down);
     choose(&mut application);
 
@@ -1371,10 +1374,7 @@ fn the_sidebars_chosen_scope_is_left_where_the_reader_put_it() {
 
     open_picker_with(
         &mut application,
-        vec![
-            rooted("Work where I am", &here, 20),
-            rooted("Work elsewhere", &atlas, 30),
-        ],
+        vec![registered(&atlas), registered(&here)],
     );
     press(&mut application, KeyCode::Down);
     choose(&mut application);
@@ -1406,7 +1406,7 @@ fn an_open_session_is_left_working_and_listed_and_nothing_is_asked() {
         vec![working("Long-running work", session_id, root.path())],
     );
 
-    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    open_picker_with(&mut application, vec![registered(&atlas)]);
     press(&mut application, KeyCode::Down);
 
     assert!(
@@ -1444,7 +1444,7 @@ fn choosing_the_workspace_the_client_is_already_in_opens_the_landing() {
     let atlas = workspace_in(root.path(), "atlas");
     let mut application = connected_application(&here);
 
-    open_picker_with(&mut application, vec![rooted("Newer", &atlas, 30)]);
+    open_picker_with(&mut application, vec![registered(&atlas)]);
     assert_eq!(
         selected_row(&application),
         "here",
@@ -1496,7 +1496,7 @@ fn enter_while_the_listing_is_on_its_way_chooses_nothing() {
 #[test]
 fn typing_narrows_the_rows_by_fuzzy_name_match() {
     let mut application = connected_application(&workspace(&["work", "here"]));
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
 
     type_terminal_text(&mut application, "ENE");
     assert_eq!(picker_query(&application), "ENE");
@@ -1520,7 +1520,7 @@ fn typing_narrows_the_rows_by_fuzzy_name_match() {
 #[test]
 fn the_rows_a_query_leaves_keep_the_picker_s_order() {
     let mut application = connected_application(&workspace(&["work", "here"]));
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
 
     type_terminal_text(&mut application, "e");
 
@@ -1545,7 +1545,7 @@ fn a_query_is_read_against_the_name_rather_than_the_path() {
     let mut application = connected_application(&workspace(&["work", "here"]));
     open_picker_with(
         &mut application,
-        vec![rooted("Older", &workspace(&["zephyr", "atlas"]), 10)],
+        vec![registered(&workspace(&["zephyr", "atlas"]))],
     );
 
     type_terminal_text(&mut application, "zephyr");
@@ -1561,7 +1561,7 @@ fn a_query_is_read_against_the_name_rather_than_the_path() {
 #[test]
 fn backspace_widens_the_rows_and_giving_the_query_up_restores_them_all() {
     let mut application = connected_application(&workspace(&["work", "here"]));
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
 
     type_terminal_text(&mut application, "eng");
     assert_eq!(picker_rows(&application).len(), 1, "narrowed to one");
@@ -1595,7 +1595,7 @@ fn backspace_widens_the_rows_and_giving_the_query_up_restores_them_all() {
 #[test]
 fn a_query_no_workspace_carries_says_so() {
     let mut application = connected_application(&workspace(&["work", "here"]));
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
 
     type_terminal_text(&mut application, "qqq");
 
@@ -1614,7 +1614,7 @@ fn a_query_no_workspace_carries_says_so() {
 #[test]
 fn the_reader_is_left_on_a_workspace_the_query_still_offers() {
     let mut application = connected_application(&workspace(&["work", "here"]));
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
 
     press(&mut application, KeyCode::Down);
     assert_eq!(selected_row(&application), "engine");
@@ -1639,7 +1639,7 @@ fn the_reader_is_left_on_a_workspace_the_query_still_offers() {
 #[test]
 fn a_paste_goes_into_the_query_whole() {
     let mut application = connected_application(&workspace(&["work", "here"]));
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
 
     application
         .handle_terminal_event(InputEvent::Paste("ledger".to_owned()))
@@ -1656,11 +1656,11 @@ fn a_paste_goes_into_the_query_whole() {
 #[test]
 fn opening_the_picker_again_starts_from_no_query() {
     let mut application = connected_application(&workspace(&["work", "here"]));
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
     type_terminal_text(&mut application, "eng");
     press(&mut application, KeyCode::Esc);
 
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
 
     assert_eq!(picker_query(&application), "");
     let rows = picker_rows(&application);
@@ -1677,7 +1677,7 @@ fn opening_the_picker_again_starts_from_no_query() {
 #[test]
 fn the_picker_stays_searchable_on_the_small_terminals_it_supports() {
     let mut application = connected_application(&workspace(&["work", "here"]));
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
     type_terminal_text(&mut application, "l");
 
     for (width, height) in [(43, 10), (28, 9)] {
@@ -1702,7 +1702,7 @@ fn the_picker_stays_searchable_on_the_small_terminals_it_supports() {
 #[test]
 fn enter_on_a_query_no_workspace_carries_chooses_nothing() {
     let mut application = connected_application(&workspace(&["work", "here"]));
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
     type_terminal_text(&mut application, "qqq");
 
     assert_eq!(choose(&mut application), ApplicationTransition::Continue);
@@ -1730,7 +1730,7 @@ fn the_browse_row_stands_first_above_the_workspace_rows() {
     let ledger = workspace(&["work", "ledger"]);
     let mut application = connected_application(&here);
 
-    open_picker_with(&mut application, vec![rooted("Older", &ledger, 10)]);
+    open_picker_with(&mut application, vec![registered(&ledger)]);
 
     let lines = picker_lines(&application);
     assert_eq!(
@@ -1751,7 +1751,7 @@ fn the_picker_opens_on_the_current_workspace_rather_than_the_browse_row() {
     let here = workspace(&["work", "here"]);
     let mut application = connected_application(&here);
 
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
 
     assert_eq!(selected_row(&application), "here");
     let (_, _, _, request) = workspace_resolution(&choose_unanswered(&mut application))
@@ -1765,7 +1765,7 @@ fn the_picker_opens_on_the_current_workspace_rather_than_the_browse_row() {
 #[test]
 fn a_query_hides_the_browse_row_and_clearing_it_brings_it_back() {
     let mut application = connected_application(&workspace(&["work", "here"]));
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
     press(&mut application, KeyCode::Up);
     assert_eq!(selected_row(&application), "Browse");
 
@@ -1806,7 +1806,7 @@ fn enter_on_the_browse_row_opens_the_directory_browser_at_the_execution_director
     let repository = workspace(&["work", "repo"]);
     let here = repository.join("here");
     let mut application = landing_in_subdirectory(&repository, &here);
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
     press(&mut application, KeyCode::Up);
 
     let (_, request) = expect_directory_listing(choose_unanswered(&mut application));
@@ -1834,7 +1834,7 @@ fn ctrl_o_opens_the_directory_browser_with_or_without_a_query() {
     for query in ["", "eng"] {
         let here = workspace(&["work", "here"]);
         let mut application = connected_application(&here);
-        open_picker_with(&mut application, narrowable_sessions());
+        open_picker_with(&mut application, narrowable_workspaces());
         type_terminal_text(&mut application, query);
 
         let (_, request) = expect_directory_listing(ctrl_o(&mut application));
@@ -1862,13 +1862,8 @@ fn escape_from_a_browser_opened_from_the_picker_returns_to_the_picker_as_it_was(
     open_picker_with(
         &mut application,
         (1..=20)
-            .map(|index| {
-                rooted(
-                    "Work",
-                    &workspace(&["work", &format!("ws{index:02}")]),
-                    index,
-                )
-            })
+            .rev()
+            .map(|index| registered(&workspace(&["work", &format!("ws{index:02}")])))
             .collect(),
     );
     type_terminal_text(&mut application, "ws");
@@ -1919,7 +1914,7 @@ fn a_choice_in_a_browser_opened_from_the_picker_closes_both() {
     let here = workspace(&["work", "here"]);
     let alpha = here.join("alpha");
     let mut application = connected_application(&here);
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
     type_terminal_text(&mut application, "eng");
     let (listing_id, _) = expect_directory_listing(ctrl_o(&mut application));
     application
@@ -1965,7 +1960,7 @@ fn a_choice_in_a_browser_opened_from_the_picker_closes_both() {
 #[test]
 fn the_footer_names_ctrl_o() {
     let mut application = connected_application(&workspace(&["work", "here"]));
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
 
     let wide = rendered_application_rows_at(&application, 80, 15);
     let footer = &wide[rendered_row(&wide, "Esc close")];
@@ -1984,7 +1979,7 @@ fn a_left_press_on_the_browse_row_opens_the_browser_exactly_as_enter_does() {
         let here = workspace(&["work", "here"]);
         let picking = || {
             let mut application = connected_application(&here);
-            open_picker_with(&mut application, narrowable_sessions());
+            open_picker_with(&mut application, narrowable_workspaces());
             application
         };
 
@@ -2015,7 +2010,7 @@ fn a_left_press_on_the_browse_row_opens_the_browser_exactly_as_enter_does() {
 fn enter_on_the_browse_row_does_not_wait_out_a_pending_agent_selection() {
     let here = workspace(&["work", "here"]);
     let mut application = application_awaiting_agent_selection(&here);
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
     press(&mut application, KeyCode::Up);
 
     let (_, request) = expect_directory_listing(choose_unanswered(&mut application));
@@ -2030,7 +2025,7 @@ fn enter_on_the_browse_row_does_not_wait_out_a_pending_agent_selection() {
 fn the_browse_row_has_no_menu_and_no_description_to_edit() {
     for frame in PICKER_FRAMES {
         let mut application = connected_application(&workspace(&["work", "here"]));
-        open_picker_with(&mut application, narrowable_sessions());
+        open_picker_with(&mut application, narrowable_workspaces());
         let before = rendered_application_rows_at(&application, frame.0, frame.1);
 
         assert_eq!(
@@ -2046,7 +2041,7 @@ fn the_browse_row_has_no_menu_and_no_description_to_edit() {
     }
 
     let mut application = connected_application(&workspace(&["work", "here"]));
-    open_picker_with(&mut application, narrowable_sessions());
+    open_picker_with(&mut application, narrowable_workspaces());
     press(&mut application, KeyCode::Up);
     let before = rendered_application_rows(&application);
     application
@@ -2081,11 +2076,7 @@ fn opening_the_browser_from_the_picker_is_refused_for_an_unreachable_remote() {
         let mut application = application_looking_at_studio();
         open_picker_with(
             &mut application,
-            vec![rooted(
-                "Remote work",
-                &crate::support::named_workspace_path("atlas"),
-                30,
-            )],
+            vec![registered(&crate::support::named_workspace_path("atlas"))],
         );
         studio_stops_answering(&mut application, 1, Duration::from_secs(5));
         type_terminal_text(&mut application, query);
@@ -2127,14 +2118,20 @@ fn opening_the_browser_from_the_picker_is_refused_for_an_unreachable_remote() {
 }
 
 /// The Workspaces the narrowing tests narrow: the client works in `here`, and
-/// the rest stand by which held work most recently — `engine`, `atlas`, then
-/// `ledger`.
-fn narrowable_sessions() -> Vec<SessionListItem> {
+/// the Server lists the rest by which held work most recently — `engine`,
+/// `atlas`, then `ledger`.
+fn narrowable_workspaces() -> Vec<Workspace> {
     vec![
-        rooted("Older", &workspace(&["work", "ledger"]), 10),
-        rooted("Newest", &workspace(&["work", "engine"]), 30),
-        rooted("Newer", &workspace(&["work", "atlas"]), 20),
+        registered(&workspace(&["work", "engine"])),
+        registered(&workspace(&["work", "atlas"])),
+        registered(&workspace(&["work", "ledger"])),
     ]
+}
+
+/// The Workspace the Server's Workspace Registry lists for the plain
+/// directory `path`.
+fn registered(path: &Path) -> Workspace {
+    Workspace::directory(path.to_owned())
 }
 
 /// A Workspace path rooted per platform, so a fixture reads as an absolute
@@ -2202,7 +2199,9 @@ fn name_sidekick_workspace(application: &mut Application, directory: &Path) {
         .expect("connect to a Server naming its Sidekick Workspace");
 }
 
-fn open_picker_with(application: &mut Application, sessions: Vec<SessionListItem>) {
+/// Opens the Workspace Picker, its Server answering with `workspaces` in the
+/// order it lists them.
+fn open_picker_with(application: &mut Application, workspaces: Vec<Workspace>) {
     let request = expect_workspace_listing(
         application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
@@ -2211,20 +2210,17 @@ fn open_picker_with(application: &mut Application, sessions: Vec<SessionListItem
             .expect("open the Workspace Picker"),
     );
     application
-        .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+        .handle_event(ApplicationEvent::WorkspacesListed {
+            request,
+            workspaces,
+        })
         .expect("hydrate the Workspace Picker");
 }
 
-fn expect_workspace_listing(transition: ApplicationTransition) -> SessionListRequest {
-    let ApplicationTransition::ListSessions(request) = transition else {
-        panic!("opening the Workspace Picker asks for its Sessions, not {transition:?}");
+fn expect_workspace_listing(transition: ApplicationTransition) -> WorkspaceListRequest {
+    let ApplicationTransition::ListWorkspaces(request) = transition else {
+        panic!("opening the Workspace Picker asks for the Server's Workspaces, not {transition:?}");
     };
-    assert_eq!(request.surface(), SessionListSurface::WorkspacePicker);
-    assert_eq!(
-        request.scope(),
-        &SessionListScope::AllWorkspaces,
-        "the Workspaces the reader is not in are the point of the picker"
-    );
     request
 }
 
@@ -2768,22 +2764,12 @@ fn repository_rows_deduplicate_by_metadata_identity_and_preserve_execution_conte
             }),
         })
         .unwrap();
-    let mut first = rooted("Linked Session", &execution, 20);
-    let SessionListItem::Readable(summary) = &mut first else {
-        unreachable!()
-    };
-    summary.session.workspace = unknown.clone();
-    open_picker_with(&mut application, vec![first.clone()]);
+    open_picker_with(&mut application, vec![unknown.clone()]);
     let rows = picker_rows_at(&application, 140, 18);
     assert_eq!(rows.len(), 1);
     assert!(rows[0].contains("main checkout unknown"));
     press(&mut application, KeyCode::Esc);
-    let mut second = rooted("Main Session", &main, 30);
-    let SessionListItem::Readable(summary) = &mut second else {
-        unreachable!()
-    };
-    summary.session.workspace = known.clone();
-    open_picker_with(&mut application, vec![second, first]);
+    open_picker_with(&mut application, vec![known.clone()]);
     let rows = picker_rows_at(&application, 140, 18);
     assert_eq!(rows.len(), 1, "known and unknown main are one Repository");
     assert!(rows[0].contains("[current]"));

@@ -48,7 +48,8 @@ use super::session_attach::{AttachOperationId, AttachOutcome, SessionAttach};
 use super::shimmer;
 use super::state::{
     Application, ApplicationEvent, ApplicationTransition, CommandId, EverywhereListRequest,
-    ModelListRequest, SessionListRequest, SessionListSurface, WorkspaceResolutionSurface,
+    ModelListRequest, SessionListRequest, SessionListSurface, WorkspaceListRequest,
+    WorkspaceResolutionSurface,
 };
 use crate::terminal::{
     CellSize, GraphicsReply, TerminalEvents, TerminalFacts, TerminalInput, request_terminal_colors,
@@ -138,6 +139,9 @@ struct SessionTasks {
     /// surface-and-Origin conversation.
     listing_sessions:
         HashMap<(SessionListSurface, Outlook), (SessionListRequest, tokio::task::JoinHandle<()>)>,
+    /// The Workspace Picker's one listing in flight, superseded by the next
+    /// opening.
+    listing_workspaces: Option<(WorkspaceListRequest, tokio::task::JoinHandle<()>)>,
     listing_models: Option<(ModelListRequest, tokio::task::JoinHandle<()>)>,
     listing_skills: Option<((Outlook, SkillCatalogRequest), tokio::task::JoinHandle<()>)>,
     catalog_origins: HashMap<Outlook, tokio::task::JoinHandle<()>>,
@@ -480,6 +484,22 @@ impl SessionTasks {
 
     fn finish_listing_models(&mut self, request: &ModelListRequest) {
         finish_listing(&mut self.listing_models, request);
+    }
+
+    fn finish_listing_workspaces(&mut self, request: &WorkspaceListRequest) {
+        finish_listing(&mut self.listing_workspaces, request);
+    }
+
+    fn list_workspaces(
+        &mut self,
+        commands: SessionCommandClient,
+        request: WorkspaceListRequest,
+        results: &UnboundedSender<SessionPickerResult>,
+    ) {
+        let results = results.clone();
+        replace_listing(&mut self.listing_workspaces, request, |request| {
+            spawn_workspace_listing(commands, request, results)
+        });
     }
 
     fn list_sessions(
@@ -1351,6 +1371,11 @@ impl RunLoop {
                     .attach(commands, reference, &self.channels.pickers);
             }
             ApplicationTransition::ListSessions(request) => self.list_sessions(request),
+            ApplicationTransition::ListWorkspaces(request) => {
+                let commands = self.client.session_commands_for(request.outlook().clone());
+                self.tasks
+                    .list_workspaces(commands, request, &self.channels.pickers);
+            }
             ApplicationTransition::ReconcileCatalogOrigins {
                 catalog_origins,
                 requests,
@@ -1808,7 +1833,8 @@ impl RunLoop {
             | ApplicationTransition::DetachSessionAndResolveWorkspace { .. }
             | ApplicationTransition::ResolveSidekickWorkspace { .. }
             | ApplicationTransition::CancelWorkspaceResolution(_)
-            | ApplicationTransition::ListDirectory { .. } => {
+            | ApplicationTransition::ListDirectory { .. }
+            | ApplicationTransition::ListWorkspaces(_) => {
                 unreachable!("managed events issue no other Session command");
             }
         }
@@ -2366,6 +2392,10 @@ impl RunLoop {
             SessionPickerResult::ListingFailed { request, .. } => {
                 self.application.awaits_listing(request)
             }
+            SessionPickerResult::WorkspacesListed { request, .. }
+            | SessionPickerResult::WorkspaceListingFailed { request, .. } => {
+                self.application.awaits_workspace_listing(request)
+            }
             SessionPickerResult::Attached { .. } | SessionPickerResult::AttachFailed { .. } => true,
         };
         match result {
@@ -2378,6 +2408,22 @@ impl RunLoop {
                 self.tasks.finish_listing_sessions(&request);
                 self.application
                     .handle_event(ApplicationEvent::SessionListingFailed { request, error })?;
+            }
+            SessionPickerResult::WorkspacesListed {
+                request,
+                workspaces,
+            } => {
+                self.tasks.finish_listing_workspaces(&request);
+                self.application
+                    .handle_event(ApplicationEvent::WorkspacesListed {
+                        request,
+                        workspaces,
+                    })?;
+            }
+            SessionPickerResult::WorkspaceListingFailed { request, error } => {
+                self.tasks.finish_listing_workspaces(&request);
+                self.application
+                    .handle_event(ApplicationEvent::WorkspaceListingFailed { request, error })?;
             }
             SessionPickerResult::Attached {
                 reference,
@@ -3628,6 +3674,14 @@ enum SessionPickerResult {
         request: SessionListRequest,
         error: String,
     },
+    WorkspacesListed {
+        request: WorkspaceListRequest,
+        workspaces: Vec<crate::protocol::Workspace>,
+    },
+    WorkspaceListingFailed {
+        request: WorkspaceListRequest,
+        error: String,
+    },
     Attached {
         reference: SessionReference,
         operation: AttachOperationId,
@@ -3677,6 +3731,28 @@ fn spawn_session_listing(
         {
             Ok(sessions) => SessionPickerResult::Listed { request, sessions },
             Err(error) => SessionPickerResult::ListingFailed {
+                request,
+                error: error.to_string(),
+            },
+        };
+        let _ = results.send(result);
+    })
+}
+
+/// Asks the Server `request` names for the Workspaces its Workspace Registry
+/// lists, in its order, for the Workspace Picker.
+fn spawn_workspace_listing(
+    commands: SessionCommandClient,
+    request: WorkspaceListRequest,
+    results: UnboundedSender<SessionPickerResult>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = match commands.list_workspaces().await {
+            Ok(listing) => SessionPickerResult::WorkspacesListed {
+                request,
+                workspaces: listing.workspaces,
+            },
+            Err(error) => SessionPickerResult::WorkspaceListingFailed {
                 request,
                 error: error.to_string(),
             },

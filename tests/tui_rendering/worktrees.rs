@@ -212,16 +212,16 @@ fn pick_other_workspace(
     app: &mut Application,
     contexts: &[ResolvedWorkspace],
 ) -> ApplicationTransition {
-    let ApplicationTransition::ListSessions(request) =
+    let ApplicationTransition::ListWorkspaces(request) =
         command(app, SemanticCommandId::WorkspaceList)
     else {
         panic!("list Workspace choices")
     };
-    app.handle_event(ApplicationEvent::SessionsListed {
+    app.handle_event(ApplicationEvent::WorkspacesListed {
         request,
-        sessions: contexts
+        workspaces: contexts
             .iter()
-            .map(|context| summary(context, "Session"))
+            .map(|context| context.workspace.clone())
             .collect(),
     })
     .unwrap();
@@ -884,7 +884,7 @@ fn pressing_the_workspace_beneath_the_landing_composer_opens_the_workspace_picke
         let pressed = press_reading(&mut app, framing.size, &location);
 
         assert!(
-            matches!(pressed, ApplicationTransition::ListSessions(_)),
+            matches!(pressed, ApplicationTransition::ListWorkspaces(_)),
             "{}: {pressed:?}",
             framing.what
         );

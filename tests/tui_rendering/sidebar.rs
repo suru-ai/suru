@@ -2462,11 +2462,12 @@ fn press_toggle(application: &mut Application) -> ApplicationTransition {
 /// surface that asked for it.
 fn expect_workspace_picker_listing(
     transition: ApplicationTransition,
-) -> suru::tui::SessionListRequest {
-    let ApplicationTransition::ListSessions(request) = transition else {
-        panic!("opening the Workspace Picker asks for its Sessions, not {transition:?}");
+) -> suru::tui::WorkspaceListRequest {
+    let ApplicationTransition::ListWorkspaces(request) = transition else {
+        panic!(
+            "opening the Workspace Picker asks the Server for its Workspaces, not {transition:?}"
+        );
     };
-    assert_eq!(request.surface(), SessionListSurface::WorkspacePicker);
     request
 }
 
@@ -2849,9 +2850,9 @@ fn moving_workspace_while_a_session_is_opening_reports_the_client_letting_go() {
             .expect("open the Workspace Picker"),
     );
     application
-        .handle_event(ApplicationEvent::SessionsListed {
+        .handle_event(ApplicationEvent::WorkspacesListed {
             request: listing,
-            sessions: vec![listed_as(SessionId::new(), "Elsewhere", &atlas, 2)],
+            workspaces: vec![Workspace::directory(atlas.clone())],
         })
         .expect("hydrate the Workspace Picker");
     press_sidebar_key(&mut application, KeyCode::Down);
@@ -7831,9 +7832,9 @@ fn the_workspace_the_reader_moved_to_stands_among_the_selectors_entries() {
             .expect("open the Workspace Picker"),
     );
     application
-        .handle_event(ApplicationEvent::SessionsListed {
+        .handle_event(ApplicationEvent::WorkspacesListed {
             request: listing,
-            sessions: vec![listed("Notes work", &notes, 2, now())],
+            workspaces: vec![Workspace::directory(notes.clone())],
         })
         .expect("hydrate the Workspace Picker");
     press_sidebar_key(&mut application, KeyCode::Down);

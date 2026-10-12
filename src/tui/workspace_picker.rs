@@ -1,5 +1,6 @@
-//! Workspace Picker state: the Workspaces a Session listing puts on offer,
-//! ordered for choosing and narrowed by what the reader types.
+//! Workspace Picker state: the Workspaces its Outlook's Server lists from its
+//! Workspace Registry, ordered for choosing and narrowed by what the reader
+//! types.
 
 use std::{
     cell::RefCell,
@@ -10,27 +11,24 @@ use std::{
 use ratatui::layout::Position;
 
 use crate::protocol::{
-    MAX_WORKSPACE_DESCRIPTION_CHARS, Outlook, SessionListItem, WorkspaceId, WorkspacePaths,
-    description_too_long, one_line_description,
+    MAX_WORKSPACE_DESCRIPTION_CHARS, Outlook, Workspace, WorkspaceDescription, WorkspaceId,
+    WorkspacePaths, description_too_long, one_line_description,
 };
 
 use super::{
-    SessionListRequest, SessionListScope, SessionListSurface,
+    WorkspaceListRequest,
     commands::{SemanticCommandId, SemanticInvocation},
     fuzzy::fuzzy_matches,
     list_window::ListWindow,
-    session_listing::SessionListing,
 };
 
 #[derive(Clone, Debug)]
 pub(super) struct WorkspacePicker {
     paths: Option<WorkspacePaths>,
     open: bool,
-    /// The Sessions the offered Workspaces are derived from, and the
-    /// conversation with the server that keeps them true. It asks across every
-    /// Workspace however narrow another surface's scope, because the
-    /// Workspaces the reader is not in are the whole point of the picker.
-    listing: SessionListing,
+    /// The Workspaces the Outlook's Server lists, and the conversation with
+    /// it that keeps them true.
+    listing: RegistryListing,
     /// What the reader has typed to narrow the Workspaces on offer, read
     /// against each one's name the way the session picker reads its own query
     /// against a Title.
@@ -73,6 +71,119 @@ pub(super) struct WorkspacePicker {
     /// box resolves to the item drawn under it.
     menu_geometry: RefCell<Option<WorkspacePickerMenuGeometry>>,
     window: ListWindow,
+}
+
+/// The Workspaces the Outlook's Server lists from its Workspace Registry,
+/// as the picker last asked for them: every one it has known, whether or not
+/// a Session works there now, in the order it lists them — those its
+/// Sessions work in, most recently worked in first, then the rest. Each
+/// opening asks again, and only the answer to the latest request lands.
+#[derive(Clone, Debug)]
+struct RegistryListing {
+    /// The Server the picker asks, which is the Outlook's.
+    outlook: Outlook,
+    /// The Workspace this client works in, which the picker offers whether
+    /// or not its Server lists it, being where the reader's next Session
+    /// will be.
+    current_workspace: Workspace,
+    request_sequence: u64,
+    /// The request whose reply the picker is waiting for. Any other reply is
+    /// a straggler from an opening the reader has moved past.
+    pending_request: Option<WorkspaceListRequest>,
+    workspaces: Vec<Workspace>,
+    loading: bool,
+    error: Option<String>,
+}
+
+impl RegistryListing {
+    fn new(current_workspace: Workspace) -> Self {
+        Self {
+            outlook: Outlook::Local,
+            current_workspace,
+            request_sequence: 0,
+            pending_request: None,
+            workspaces: Vec::new(),
+            loading: false,
+            error: None,
+        }
+    }
+
+    /// Asks the Outlook's Server for its Workspaces, dropping what the
+    /// picker holds, which answered an opening the reader has moved past.
+    fn refresh(&mut self) -> WorkspaceListRequest {
+        self.request_sequence += 1;
+        let request = WorkspaceListRequest::new(self.request_sequence, self.outlook.clone());
+        self.pending_request = Some(request.clone());
+        self.workspaces.clear();
+        self.loading = true;
+        self.error = None;
+        request
+    }
+
+    fn awaits(&self, request: &WorkspaceListRequest) -> bool {
+        self.pending_request.as_ref() == Some(request)
+    }
+
+    fn load(&mut self, request: &WorkspaceListRequest, workspaces: Vec<Workspace>) -> bool {
+        if !self.awaits(request) {
+            return false;
+        }
+        self.workspaces = workspaces;
+        self.loading = false;
+        self.pending_request = None;
+        true
+    }
+
+    fn fail(&mut self, request: &WorkspaceListRequest, error: String) {
+        if !self.awaits(request) {
+            return;
+        }
+        self.loading = false;
+        self.error = Some(error);
+        self.pending_request = None;
+    }
+
+    /// Drops what the picker holds and any request still in flight, so a
+    /// picker closing leaves no reply to land behind its back. The request
+    /// sequence survives: reopening must never make an earlier request valid
+    /// again.
+    fn clear(&mut self) {
+        self.workspaces.clear();
+        self.loading = false;
+        self.error = None;
+        self.pending_request = None;
+    }
+
+    /// Every copy of the Workspace `workspace_id` this listing holds of
+    /// `outlook`'s, the client's own current Workspace among them. A
+    /// Workspace's identity is only unique within its Origin — the same
+    /// directory may be a Workspace on two machines — so a change another
+    /// Origin announces reaches none of them.
+    fn copies_mut<'a>(
+        &'a mut self,
+        outlook: &Outlook,
+        workspace_id: &'a WorkspaceId,
+    ) -> impl Iterator<Item = &'a mut Workspace> {
+        let ours = outlook == &self.outlook;
+        self.workspaces
+            .iter_mut()
+            .chain(std::iter::once(&mut self.current_workspace))
+            .filter(move |workspace| ours && &workspace.id == workspace_id)
+    }
+
+    /// The Workspaces on offer: every one the Server lists, in its order,
+    /// and the one this client works in after them where the Server does not
+    /// list it.
+    fn workspaces(&self) -> Vec<Workspace> {
+        let mut workspaces = self.workspaces.clone();
+        if !workspaces
+            .iter()
+            .any(|listed| listed.id == self.current_workspace.id)
+        {
+            workspaces.push(self.current_workspace.clone());
+        }
+        workspaces
+    }
 }
 
 /// What a Workspace Picker row offers, which is how the picker holds the row
@@ -281,11 +392,7 @@ impl WorkspacePicker {
         Self {
             paths: None,
             open: false,
-            listing: SessionListing::scoped(
-                SessionListSurface::WorkspacePicker,
-                current_workspace,
-                SessionListScope::AllWorkspaces,
-            ),
+            listing: RegistryListing::new(current_workspace.into()),
             query: String::new(),
             selected: None,
             stepped_aside: false,
@@ -299,7 +406,7 @@ impl WorkspacePicker {
         }
     }
 
-    pub(super) fn open(&mut self) -> SessionListRequest {
+    pub(super) fn open(&mut self) -> WorkspaceListRequest {
         self.open = true;
         self.stepped_aside = false;
         self.refusal = None;
@@ -309,7 +416,6 @@ impl WorkspacePicker {
         self.description_editor = None;
         self.submitted_description = None;
         self.window.open();
-        self.listing.clear_error();
         self.listing.refresh()
     }
 
@@ -353,11 +459,11 @@ impl WorkspacePicker {
     }
 
     pub(super) fn is_loading(&self) -> bool {
-        self.listing.is_loading()
+        self.listing.loading
     }
 
     pub(super) fn error(&self) -> Option<&str> {
-        self.listing.error()
+        self.listing.error.as_deref()
     }
 
     pub(super) fn query(&self) -> &str {
@@ -399,7 +505,7 @@ impl WorkspacePicker {
     /// Takes the Workspace this client has moved to, so the picker marks as
     /// current — and stands first — where the reader now is.
     pub(super) fn adopt_workspace(&mut self, workspace: impl Into<crate::protocol::Workspace>) {
-        self.listing.adopt_current_workspace(workspace);
+        self.listing.current_workspace = workspace.into();
     }
 
     pub(super) fn adopt_workspace_paths(&mut self, paths: WorkspacePaths) {
@@ -419,70 +525,63 @@ impl WorkspacePicker {
 
     pub(super) fn adopt_outlook(&mut self, outlook: Outlook) {
         self.paths = None;
-        self.listing.adopt_outlook(outlook);
+        self.listing.outlook = outlook;
         self.close();
     }
 
-    /// Takes a listing the server answered with, leaving the reader on the
-    /// Workspace they were on where it is still offered and on the first row
-    /// — the current Workspace — otherwise.
-    pub(super) fn load(&mut self, request: &SessionListRequest, sessions: Vec<SessionListItem>) {
-        if !self.listing.load(request, sessions) {
+    /// Takes the Workspaces the server answered with, leaving the reader on
+    /// the Workspace they were on where it is still offered and on the first
+    /// row — the current Workspace — otherwise.
+    pub(super) fn load(&mut self, request: &WorkspaceListRequest, workspaces: Vec<Workspace>) {
+        if !self.listing.load(request, workspaces) {
             return;
         }
         self.keep_selection_offered();
     }
 
-    pub(super) fn fail_listing(&mut self, request: &SessionListRequest, error: String) {
+    pub(super) fn fail_listing(&mut self, request: &WorkspaceListRequest, error: String) {
         self.listing.fail(request, error);
     }
 
+    /// Takes a Workspace's Icon, as `outlook`'s Server announced it, into
+    /// every copy of it the picker holds of that Server's.
     pub(super) fn set_workspace_icon_origin(
         &mut self,
         outlook: Outlook,
-        workspace_id: &crate::protocol::WorkspaceId,
+        workspace_id: &WorkspaceId,
         icon: Option<String>,
     ) {
-        self.listing
-            .set_workspace_icon_origin(outlook, workspace_id, icon);
+        for workspace in self.listing.copies_mut(&outlook, workspace_id) {
+            workspace.icon = icon.clone();
+        }
     }
 
+    /// Takes a Workspace's Description, as it was derived, set, or cleared,
+    /// into every copy of it the picker holds of `outlook`'s, on the same
+    /// terms [`Self::set_workspace_icon_origin`] takes its Icon.
     pub(super) fn set_workspace_description_origin(
         &mut self,
         outlook: Outlook,
-        workspace_id: &crate::protocol::WorkspaceId,
-        description: Option<crate::protocol::WorkspaceDescription>,
+        workspace_id: &WorkspaceId,
+        description: Option<WorkspaceDescription>,
     ) {
-        self.listing
-            .set_workspace_description_origin(outlook, workspace_id, description);
+        for workspace in self.listing.copies_mut(&outlook, workspace_id) {
+            workspace.description = description.clone();
+        }
     }
 
-    /// The Outlook's Workspaces the picker's listing has heard of from its
-    /// Server: every one its Sessions are rooted in, for as long as it holds
-    /// that listing — open, or standing aside for the Directory Browser.
-    pub(super) fn listed_workspaces(&self) -> Vec<crate::protocol::Workspace> {
-        self.listing.listed_workspaces()
-    }
-
-    /// Whether a listing the server answered with would move anything the
-    /// picker draws.
-    ///
-    /// It is answered off the Sessions rather than off the Workspaces derived
-    /// from them, which can only over-report — and cannot here: the picker
-    /// asks for one listing, when it opens, and is loading until that listing
-    /// lands, so the one reply it ever awaits always has a loading line to
-    /// replace.
-    pub(super) fn would_move(
-        &self,
-        request: &SessionListRequest,
-        sessions: &[SessionListItem],
-    ) -> bool {
-        self.listing.would_move(request, sessions)
+    /// The Outlook's Workspaces the picker has heard of from its Server, for
+    /// as long as it holds that listing — open, or standing aside for the
+    /// Directory Browser.
+    pub(super) fn listed_workspaces(&self) -> Vec<Workspace> {
+        self.listing.workspaces.clone()
     }
 
     /// Whether a reply the server sent answers the listing this surface is
-    /// still waiting for.
-    pub(super) fn awaits_listing(&self, request: &SessionListRequest) -> bool {
+    /// still waiting for. The picker asks for one listing, when it opens, and
+    /// is loading until that listing lands, so the one reply it awaits always
+    /// has a loading line to replace.
+    pub(super) fn awaits_listing(&self, request: &WorkspaceListRequest) -> bool {
         self.listing.awaits(request)
     }
 
@@ -524,8 +623,8 @@ impl WorkspacePicker {
     }
 
     fn rows(&self) -> Vec<WorkspacePickerRow> {
-        let current = self.listing.current_workspace().to_owned();
-        let origin = self.listing.outlook().clone();
+        let current = self.listing.current_workspace.clone();
+        let origin = self.listing.outlook.clone();
         let browse = self.offers_browse().then(|| WorkspacePickerRow {
             selected: self.selected == Some(Offer::Browse),
             kind: WorkspacePickerRowKind::Browse,
@@ -568,7 +667,7 @@ impl WorkspacePicker {
     /// which is what a key that acts on "this row" acts on.
     pub(super) fn selected_target(&self) -> Option<(Outlook, WorkspaceId)> {
         let workspace = self.selected_workspace()?;
-        Some((self.listing.outlook().clone(), workspace.id))
+        Some((self.listing.outlook.clone(), workspace.id))
     }
 
     fn selected_workspace(&self) -> Option<crate::protocol::Workspace> {
@@ -590,8 +689,10 @@ impl WorkspacePicker {
 
     /// The Workspaces on offer in the order the picker stands them: the one
     /// the client is working in first, because a reader has to see where they
-    /// already are, then the rest by which held work most recently, because
-    /// that is where the next pick is likeliest to go.
+    /// already are, then the rest in the order its Server lists them — those
+    /// its Sessions work in by which held work most recently, because that is
+    /// where the next pick is likeliest to go, then those no Session works in
+    /// now.
     ///
     /// A query takes rows away and never rearranges the ones it leaves, so a
     /// reader narrowing the list goes on reading it in the order they learned
@@ -602,7 +703,7 @@ impl WorkspacePicker {
     /// it, but a reader in it still sees where they are and may change its
     /// Icon and Description.
     fn offered(&self) -> Vec<crate::protocol::Workspace> {
-        let current = self.listing.current_workspace().to_owned();
+        let current = self.listing.current_workspace.clone();
         let paths = self.paths();
         let mut offered = self
             .listing
@@ -612,8 +713,8 @@ impl WorkspacePicker {
             .filter(|path| fuzzy_matches(&self.query, &self.name(&path.path)))
             .collect::<Vec<_>>();
         // A stable sort on "is this not where I am", so the current Workspace
-        // takes the first row and the rest keep the order the listing derived
-        // them in, which is already newest work first.
+        // takes the first row and the rest keep the order the Server listed
+        // them in.
         offered.sort_by_key(|path| path.id != current.id);
         offered
     }

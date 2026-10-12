@@ -518,47 +518,19 @@ fn a_remote_catalog_change_refreshes_the_remote_sidebar() {
 fn a_fresh_landing_lets_go_of_a_remote_workspace_still_resolving() {
     let mut application = Application::default();
     turn_to_studio(&mut application);
-    let ApplicationTransition::ListSessions(request) = application
+    let ApplicationTransition::ListWorkspaces(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
             SemanticCommandId::WorkspaceList,
         )))
         .unwrap()
     else {
-        panic!("opening the Workspace picker asks for Sessions");
+        panic!("opening the Workspace picker asks its Server for its Workspaces");
     };
     let remote_only = std::path::PathBuf::from("remote-only-workspace");
     application
-        .handle_event(ApplicationEvent::SessionsListed {
+        .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            sessions: vec![SessionListItem::Readable(Box::new(SessionSummary {
-                checkout_state: None,
-                session: Session {
-                    checkout: None,
-                    context_fill: None,
-                    id: SessionId::new(),
-                    execution_directory: suru::protocol::ExecutionDirectory {
-                        path: remote_only.clone(),
-                    },
-                    workspace: Workspace::directory(remote_only.clone()),
-                    agent_selection: None,
-                    agent_selection_availability: ModelAvailability::Available,
-                    approval_posture: None,
-                    status: SessionStatus::Idle,
-                    working_since: None,
-                    monitoring_since: None,
-                    parent: None,
-                    begun_by: None,
-                },
-                title: "Remote work".to_owned(),
-                icon: None,
-                settled_at: None,
-                standing_inputs: Default::default(),
-                total_usage: None,
-                own_cost: None,
-                remote_subsessions: Vec::new(),
-                created_at: SessionTimestamp(1),
-                updated_at: SessionTimestamp(2),
-            }))],
+            workspaces: vec![Workspace::directory(remote_only.clone())],
         })
         .unwrap();
     press(&mut application, KeyCode::Down);
@@ -710,49 +682,21 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
     press(&mut application, KeyCode::Down);
     press(&mut application, KeyCode::Enter);
 
-    let ApplicationTransition::ListSessions(request) = application
+    let ApplicationTransition::ListWorkspaces(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
             SemanticCommandId::WorkspaceList,
         )))
         .unwrap()
     else {
-        panic!("opening the Workspace picker asks the Remote for its Sessions");
+        panic!("opening the Workspace picker asks the Remote for its Workspaces");
     };
     let remote_only = std::env::current_dir()
         .expect("read fixture root")
         .join("path-that-exists-only-on-the-remote");
     application
-        .handle_event(ApplicationEvent::SessionsListed {
+        .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            sessions: vec![SessionListItem::Readable(Box::new(SessionSummary {
-                checkout_state: None,
-                session: Session {
-                    checkout: None,
-                    context_fill: None,
-                    id: SessionId::new(),
-                    execution_directory: suru::protocol::ExecutionDirectory {
-                        path: remote_only.clone(),
-                    },
-                    workspace: Workspace::directory(remote_only.clone()),
-                    agent_selection: None,
-                    agent_selection_availability: ModelAvailability::Available,
-                    approval_posture: None,
-                    status: SessionStatus::Idle,
-                    working_since: None,
-                    monitoring_since: None,
-                    parent: None,
-                    begun_by: None,
-                },
-                title: "Remote work".to_owned(),
-                icon: None,
-                settled_at: None,
-                standing_inputs: Default::default(),
-                total_usage: None,
-                own_cost: None,
-                remote_subsessions: Vec::new(),
-                created_at: SessionTimestamp(1),
-                updated_at: SessionTimestamp(2),
-            }))],
+            workspaces: vec![Workspace::directory(remote_only.clone())],
         })
         .unwrap();
     press(&mut application, KeyCode::Down);

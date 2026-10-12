@@ -278,19 +278,33 @@ impl SessionListScope {
     }
 }
 
-/// Which surface a Session listing answers. Several of them list Sessions at
-/// once — the two pickers over the main view and the Sidebar beside it — so
-/// every request names its own, and no surface can take another's reply for
-/// one of its own.
-///
-/// The Workspace Picker lists Sessions for what they say about where work is
-/// rooted rather than to offer the Sessions themselves, but it asks the same
-/// question of the same server, so it asks through the same listing.
+/// Which surface a Session listing answers. Both list Sessions at once — the
+/// Session picker over the main view and the Sidebar beside it — so every
+/// request names its own, and neither can take the other's reply for one of
+/// its own.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SessionListSurface {
     SessionPicker,
-    WorkspacePicker,
     Sidebar,
+}
+
+/// The Workspace Picker's request for the Workspaces its Outlook's Server
+/// lists from its Workspace Registry. Each opening of the picker numbers a
+/// new one, so only the reply to the latest lands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceListRequest {
+    id: u64,
+    outlook: Outlook,
+}
+
+impl WorkspaceListRequest {
+    pub(super) const fn new(id: u64, outlook: Outlook) -> Self {
+        Self { id, outlook }
+    }
+
+    pub fn outlook(&self) -> &Outlook {
+        &self.outlook
+    }
 }
 
 /// One surface's request for the local Server's paired Remotes, used before
@@ -4738,6 +4752,16 @@ pub enum ApplicationEvent {
         request: SessionListRequest,
         error: String,
     },
+    /// The Workspaces the Workspace Picker's Outlook's Server lists, in the
+    /// order it lists them.
+    WorkspacesListed {
+        request: WorkspaceListRequest,
+        workspaces: Vec<Workspace>,
+    },
+    WorkspaceListingFailed {
+        request: WorkspaceListRequest,
+        error: String,
+    },
     ModelsListed {
         request: ModelListRequest,
         catalog: ModelCatalog,
@@ -5248,6 +5272,10 @@ pub enum ApplicationTransition {
     ViewAndAttachSession(SessionReference),
     AttachSession(SessionReference),
     ListSessions(SessionListRequest),
+    /// Ask the Outlook's Server for the Workspaces its Workspace Registry
+    /// lists, answering with [`ApplicationEvent::WorkspacesListed`] under the
+    /// same request.
+    ListWorkspaces(WorkspaceListRequest),
     /// Reconcile the Remote catalog streams owned by the run loop and dispatch
     /// any initial listings whose Origins established that desired set.
     ReconcileCatalogOrigins {
@@ -6041,7 +6069,6 @@ impl Application {
                     SessionListSurface::Sidebar => {
                         self.state.sidebar.load_everywhere_remotes(request, remotes)
                     }
-                    SessionListSurface::WorkspacePicker => None,
                 };
                 Ok(
                     requests.map_or(ApplicationTransition::Continue, |requests| {
@@ -6062,7 +6089,6 @@ impl Application {
                     SessionListSurface::Sidebar => {
                         self.state.sidebar.fail_everywhere_remotes(request, error);
                     }
-                    SessionListSurface::WorkspacePicker => {}
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -6563,9 +6589,6 @@ impl Application {
                             .session_picker
                             .load(&request, sessions, current.as_ref());
                     }
-                    SessionListSurface::WorkspacePicker => {
-                        self.state.workspace_picker.load(&request, sessions);
-                    }
                     SessionListSurface::Sidebar => {
                         let open = self.state.sidebar_highlight();
                         self.state.sidebar.load(&request, sessions, open.as_ref());
@@ -6578,11 +6601,19 @@ impl Application {
                     SessionListSurface::SessionPicker => {
                         self.state.session_picker.fail_listing(&request, error);
                     }
-                    SessionListSurface::WorkspacePicker => {
-                        self.state.workspace_picker.fail_listing(&request, error);
-                    }
                     SessionListSurface::Sidebar => self.state.sidebar.fail_listing(&request, error),
                 }
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::WorkspacesListed {
+                request,
+                workspaces,
+            } => {
+                self.state.workspace_picker.load(&request, workspaces);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::WorkspaceListingFailed { request, error } => {
+                self.state.workspace_picker.fail_listing(&request, error);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::ModelsListed { request, catalog } => {
@@ -10362,7 +10393,7 @@ impl Application {
             SemanticCommandId::WorkspaceList => {
                 let request = self.state.workspace_picker.open();
                 self.state.command_mode = CommandMode::Composer;
-                Ok(ApplicationTransition::ListSessions(request))
+                Ok(ApplicationTransition::ListWorkspaces(request))
             }
             // The browser starts where the Landing would begin a Session, on
             // whichever Server the Outlook is turned toward. Opened over the
@@ -11381,7 +11412,6 @@ impl Application {
                 .session_picker
                 .accepts_everywhere_remotes(request),
             SessionListSurface::Sidebar => self.state.sidebar.accepts_everywhere_remotes(request),
-            SessionListSurface::WorkspacePicker => false,
         }
     }
 
@@ -11403,9 +11433,6 @@ impl Application {
             SessionListSurface::SessionPicker => {
                 self.state.session_picker.would_move(request, sessions)
             }
-            SessionListSurface::WorkspacePicker => {
-                self.state.workspace_picker.would_move(request, sessions)
-            }
             SessionListSurface::Sidebar => self.state.sidebar.would_move(request, sessions),
         }
     }
@@ -11416,11 +11443,16 @@ impl Application {
     pub fn awaits_listing(&self, request: &SessionListRequest) -> bool {
         match request.surface() {
             SessionListSurface::SessionPicker => self.state.session_picker.awaits_listing(request),
-            SessionListSurface::WorkspacePicker => {
-                self.state.workspace_picker.awaits_listing(request)
-            }
             SessionListSurface::Sidebar => self.state.sidebar.awaits_listing(request),
         }
+    }
+
+    /// Whether a reply the server sent answers the Workspace listing the
+    /// Workspace Picker is still waiting for, which it draws as loading until
+    /// it lands — so an awaited reply always moves the frame, and a
+    /// straggler never does.
+    pub fn awaits_workspace_listing(&self, request: &WorkspaceListRequest) -> bool {
+        self.state.workspace_picker.awaits_listing(request)
     }
 
     /// Translates a terminal event through the active input mode. `None` means
