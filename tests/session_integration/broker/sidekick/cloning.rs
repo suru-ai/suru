@@ -156,8 +156,20 @@ fn contents(directory: &Path) -> Vec<String> {
     names
 }
 
+/// Waits until nothing stands directly within `directory`, as what a Clone
+/// stopped at its deadline began is removed on a task of its own.
+async fn emptied(directory: &Path) {
+    timeout(PROGRESS_DEADLINE, async {
+        while !contents(directory).is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("nothing is left in {}", directory.display()));
+}
+
 /// Everything logged on this test's thread — where the Server it hosts runs
-/// — at info and above, kept as it is written.
+/// — at `level` and above, kept as it is written.
 #[derive(Clone, Default)]
 struct Captured(Arc<Mutex<Vec<u8>>>);
 
@@ -173,14 +185,14 @@ impl std::io::Write for Captured {
 }
 
 impl Captured {
-    /// Captures what is logged on this thread for as long as the answer is
-    /// held.
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
+    /// Captures what is logged on this thread at `level` and above for as
+    /// long as the answer is held.
+    fn install(&self, level: tracing::Level) -> tracing::subscriber::DefaultGuard {
         let writer = self.clone();
         tracing::subscriber::set_default(
             tracing_subscriber::fmt()
                 .with_writer(move || writer.clone())
-                .with_max_level(tracing::Level::INFO)
+                .with_max_level(level)
                 .with_ansi(false)
                 .finish(),
         )
@@ -201,7 +213,7 @@ impl Captured {
 async fn a_sidekick_clones_a_repository_url_into_the_only_root_and_is_answered_its_row() {
     const CHANNEL: &str = "sidekick-clone-into-the-root";
     let log = Captured::default();
-    let _log = log.install();
+    let _log = log.install(tracing::Level::INFO);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
     let (_projects, projects) = directory();
@@ -573,8 +585,9 @@ async fn a_name_must_be_one_plain_directory_name_and_a_branch_is_checked_out() {
 
 /// Whatever already stands where a Clone would go refuses it and is left as
 /// it was: a Workspace there is named by its workspace_id — one the Server
-/// knows, and a Repository it has not yet been told of — and a plain
-/// directory is only said to be there.
+/// knows, a Repository it has not yet been told of, and a Worktree of a
+/// Repository presented elsewhere — and a plain directory is only said to be
+/// there.
 #[tokio::test]
 async fn an_existing_destination_is_refused_naming_the_workspace_there() {
     const CHANNEL: &str = "sidekick-clone-occupied";
@@ -637,6 +650,34 @@ async fn an_existing_destination_is_refused_naming_the_workspace_there() {
         .await,
         occupied(&maps, Some(&repository_id(&maps))),
         "so is a Repository the Server was never told of"
+    );
+
+    let (_mapped, mapped) = directory();
+    let main = mapped.join("maps");
+    std::fs::create_dir(&main).expect("create a Repository elsewhere");
+    git(&main, &["init", "-b", "main"]);
+    git(
+        &main,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let topic = projects.join("maps-topic");
+    git(&main, &["worktree", "add", "-b", "topic", spelled(&topic)]);
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            "clone_workspace",
+            json!({ "repository_url": origin, "name": "maps-topic" }),
+        )
+        .await,
+        occupied(&topic, Some(&repository_id(&main))),
+        "and a Worktree of a Repository presented elsewhere by that Repository's"
     );
 
     let notes = projects.join("notes");
@@ -779,10 +820,7 @@ async fn a_clone_outlasting_the_servers_bound_is_refused_and_leaves_no_directory
             spelled(&projects.join("atlas"))
         )
     );
-    assert!(
-        contents(&projects).is_empty(),
-        "nothing of the Clone is left in the Root"
-    );
+    emptied(&projects).await;
 
     hosted.server.shutdown().await.expect("shut down server");
 }
@@ -872,4 +910,83 @@ async fn only_a_sidekick_is_offered_clone_workspace_and_told_the_roots_that_boun
     assert!(contents(&projects).is_empty(), "and nothing is cloned");
 
     hosted.server.shutdown().await.expect("shut down server");
+}
+
+/// A Repository URL carrying a credential reaches no Log, however verbose,
+/// nor does the name its Clone would take from it: a Clone of one names its
+/// directory from the URL's path alone, is refused in Git's words, and is
+/// logged with the credential put out of sight; one whose path says nothing
+/// is refused for want of a name, the credential never made one.
+#[tokio::test]
+async fn a_credential_in_a_repository_url_reaches_no_log() {
+    const CHANNEL: &str = "sidekick-clone-credential";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config = ServerConfig::new(state_dir.path(), CHANNEL).expect("configure the Log");
+    let log = suru::logging::init_with_filter_directives(
+        &config,
+        suru::logging::Role::Server,
+        Some("trace,rmcp=trace,rmcp::service=trace".to_owned()),
+    )
+    .expect("initialize the Log at its most verbose");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let (_projects, projects) = directory();
+    name_roots(config_dir.path(), &[spelled(&projects)]);
+    let mut hosted = host_providers(state_dir.path(), CHANNEL, Some(config_dir.path())).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let (_sidekick_id, mut sidekick, _provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("find a port nothing listens on")
+        .local_addr()
+        .expect("a listening address")
+        .port();
+
+    let url = format!("http://octocat:ghp_SECRET@127.0.0.1:{closed}/org/atlas.git");
+    let refusal = refused(
+        &mut sidekick,
+        "clone_workspace",
+        json!({ "repository_url": url }),
+    )
+    .await;
+    assert!(
+        refusal.starts_with(&format!(
+            "Git could not Clone `{url}`, so nothing was left at `{}`: ",
+            spelled(&projects.join("atlas"))
+        )),
+        "the Clone is named from the URL's path alone: {refusal}"
+    );
+    let bare = "https://octocat:ghp_SECRET@example.invalid";
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            "clone_workspace",
+            json!({ "repository_url": bare }),
+        )
+        .await,
+        format!(
+            "No directory name can be told from the Repository URL `{bare}`, so nothing was \
+             cloned; give one as `name`."
+        )
+    );
+    assert!(contents(&projects).is_empty());
+
+    hosted.server.shutdown().await.expect("shut down server");
+    drop(log);
+    let logged = std::fs::read_dir(config.state_dir().join("log"))
+        .expect("read the Log directory")
+        .map(|entry| std::fs::read_to_string(entry.expect("a Log file").path()).expect("a Log"))
+        .collect::<String>();
+    assert!(
+        logged.contains(&format!("http://***@127.0.0.1:{closed}/org/atlas.git"))
+            && logged.contains(spelled(&projects.join("atlas"))),
+        "the refused Clone is logged with its URL and destination: {logged}"
+    );
+    assert!(
+        logged.contains("Git command finished"),
+        "Suru's own lines are written as verbosely as asked: {logged}"
+    );
+    assert!(
+        !logged.contains("SECRET"),
+        "no credential reaches the Log: {logged}"
+    );
 }

@@ -90,10 +90,12 @@ pub(crate) enum CloneRefusal {
         said: String,
     },
     /// The Clone ran past the Server's bound on one, was stopped, and
-    /// nothing was left behind.
+    /// nothing was left behind: at `destination`, where it was known, or
+    /// anywhere, where the Root it was to go in did not answer in time to
+    /// tell.
     TimedOut {
         url: String,
-        destination: PathBuf,
+        destination: Option<PathBuf>,
         timeout: Duration,
     },
 }
@@ -178,7 +180,7 @@ impl fmt::Display for CloneRefusal {
             ),
             Self::TimedOut {
                 url,
-                destination,
+                destination: Some(destination),
                 timeout,
             } => write!(
                 formatter,
@@ -186,6 +188,16 @@ impl fmt::Display for CloneRefusal {
                  was left at `{}`.",
                 spelled(*timeout),
                 destination.display()
+            ),
+            Self::TimedOut {
+                url,
+                destination: None,
+                timeout,
+            } => write!(
+                formatter,
+                "The Clone of `{url}` did not finish within {}: the Workspace Root it was to go \
+                 in did not answer in time, so nothing was cloned.",
+                spelled(*timeout)
             ),
         }
     }
@@ -306,14 +318,26 @@ fn readable_root(root: &str, home: Option<&Path>) -> Result<PathBuf, CloneRefusa
     crate::paths::canonical(&directory).map_err(|error| unreadable(error.to_string()))
 }
 
-/// `name`, where it is one plain directory name: something besides space,
-/// naming one directory within whatever directory it is joined to — never
-/// `.` or `..` — and holding no separator any platform reads, nor a drive's
-/// colon, so that on no platform does it name a directory anywhere else.
+/// The characters no Windows file name may hold: every separator any
+/// platform reads, a drive's colon, and the wildcards and redirections the
+/// Windows shell reserves.
+const UNPORTABLE: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+
+/// `name`, where it is one plain directory name, and the same one directory
+/// on every platform Suru runs on: something besides space, naming one
+/// directory within whatever directory it is joined to — never `.` or `..`
+/// — and holding no control character nor any of the [`UNPORTABLE`] ones,
+/// ending in neither a dot nor a space, which Windows takes away, and naming
+/// no device Windows reserves. A name refused on one platform is refused on
+/// all, so that a Clone's name never means one directory here and another,
+/// or none, there — and never a directory outside its Root.
 fn plain_name(name: &str) -> Result<&str, CloneRefusal> {
     let mut components = Path::new(name).components();
     let plain = !name.trim().is_empty()
-        && !name.contains(['/', '\\', ':', '\0'])
+        && !name.contains(UNPORTABLE)
+        && !name.chars().any(char::is_control)
+        && !name.ends_with(['.', ' '])
+        && !names_a_device(name)
         && matches!(
             (components.next(), components.next()),
             (Some(Component::Normal(only)), None) if only == name
@@ -327,18 +351,104 @@ fn plain_name(name: &str) -> Result<&str, CloneRefusal> {
     }
 }
 
+/// Whether `name` is one Windows reserves for a device — `CON`, `PRN`,
+/// `AUX`, `NUL`, `CONIN$`, `CONOUT$`, and `COM` or `LPT` with one digit, a
+/// superscript one among them — in any case, and whatever follows its first
+/// dot or the spaces before it.
+fn names_a_device(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(' ')
+        .to_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let mut characters = stem.chars();
+    let port = characters.by_ref().take(3).collect::<String>();
+    matches!(port.as_str(), "COM" | "LPT")
+        && matches!(
+            (characters.next(), characters.next()),
+            (Some('0'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+        )
+}
+
+/// The path within its Repository URL a Repository is named by, apart from
+/// where that Repository is and who may reach it: what follows the host of
+/// a URL spelled with a scheme — `https://`, `ssh://`, `file://` and the
+/// rest — and of Git's scp-like `user@host:path`, what follows the host's
+/// colon; any other address, a local path, is its own. Nothing of a URL's
+/// user, password or host is ever part of it.
+fn repository_path(url: &str) -> &str {
+    if let Some(scheme) = url.find("://").filter(|&scheme| {
+        scheme > 0
+            && url[..scheme]
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "+-.".contains(character))
+    }) {
+        let located = &url[scheme + "://".len()..];
+        let path = located
+            .find(['/', '\\'])
+            .map_or("", |start| &located[start..]);
+        return path.split(['?', '#']).next().unwrap_or(path);
+    }
+    match url.find(':') {
+        // A drive's colon begins a local path, as one after a separator ends
+        // no host.
+        Some(1) if url.starts_with(|first: char| first.is_ascii_alphabetic()) => url,
+        Some(colon) if !url[..colon].contains(['/', '\\']) => &url[colon + 1..],
+        _ => url,
+    }
+}
+
 /// The directory name a Clone of the Repository `url` names takes where it
-/// is given none, as Git names one: the URL's last segment, without `.git`.
+/// is given none, as Git names one: the last segment of the path it names
+/// its Repository by (see [`repository_path`]), without `.git` — never
+/// anything of its user, password or host.
 fn named_by(url: &str) -> Result<&str, CloneRefusal> {
-    let trimmed = url.trim_end_matches(['/', '\\']);
+    let path = repository_path(url);
+    let trimmed = path.trim_end_matches(['/', '\\']);
     let trimmed = trimmed
         .strip_suffix("/.git")
         .or_else(|| trimmed.strip_suffix("\\.git"))
         .unwrap_or(trimmed);
-    let last = trimmed.rsplit(['/', '\\', ':']).next().unwrap_or(trimmed);
+    let last = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
     plain_name(last.strip_suffix(".git").unwrap_or(last)).map_err(|_| CloneRefusal::NoNameInUrl {
         url: url.to_owned(),
     })
+}
+
+/// Where a Clone named `name` goes — directly within the Root `named`
+/// names among `roots`, or the only one — and whether something stands
+/// there already, the Root read by `read` on a thread of its own, so a Root
+/// on a mount gone quiet holds up none of the Server's own. `None` where
+/// the reading has not answered by `deadline`.
+async fn placed(
+    deadline: tokio::time::Instant,
+    roots: Vec<String>,
+    named: Option<String>,
+    name: String,
+    home: Option<PathBuf>,
+    read: impl FnOnce(&str, Option<&Path>) -> Result<PathBuf, CloneRefusal> + Send + 'static,
+) -> Option<Result<(PathBuf, bool), CloneRefusal>> {
+    let asked = named.clone().unwrap_or_else(|| roots.join(", "));
+    let placing = tokio::task::spawn_blocking(move || {
+        let root = chosen_root(&roots, named.as_deref(), home.as_deref())?;
+        let destination = read(root, home.as_deref())?.join(name);
+        let occupied = std::fs::symlink_metadata(&destination).is_ok();
+        Ok((destination, occupied))
+    });
+    let placed = tokio::time::timeout_at(deadline, placing).await.ok()?;
+    Some(placed.unwrap_or_else(|error| {
+        Err(CloneRefusal::UnreadableRoot {
+            root: asked,
+            reason: error.to_string(),
+        })
+    }))
 }
 
 impl SessionOperations {
@@ -357,30 +467,33 @@ impl SessionOperations {
         request: &CloneRequest,
         on_behalf_of: SessionId,
     ) -> Result<Workspace, CloneRefusal> {
+        // One bound for the whole of it: reading the Root, cloning, naming
+        // the clone, and removing what a Clone that failed made.
+        let deadline = tokio::time::Instant::now() + self.cloning.timeout;
+        let url = request.repository_url.as_str();
         let roots = self.settings.borrow().settings.workspace.roots.clone();
-        let home = self.cloning.home.clone();
-        let named = request.root.clone();
-        let asked = named.clone().unwrap_or_else(|| roots.join(", "));
         let name = match &request.name {
             Some(name) => plain_name(name)?,
-            None => named_by(&request.repository_url)?,
+            None => named_by(url)?,
         }
         .to_owned();
-        // A Root on a mount gone quiet may hold up whoever reads it, which
-        // is never one of the Server's own threads.
-        let (destination, occupied) = tokio::task::spawn_blocking(move || {
-            let root = chosen_root(&roots, named.as_deref(), home.as_deref())?;
-            let destination = readable_root(root, home.as_deref())?.join(name);
-            let occupied = std::fs::symlink_metadata(&destination).is_ok();
-            Ok((destination, occupied))
-        })
+        let Some(placed) = placed(
+            deadline,
+            roots,
+            request.root.clone(),
+            name,
+            self.cloning.home.clone(),
+            readable_root,
+        )
         .await
-        .unwrap_or_else(|error| {
-            Err(CloneRefusal::UnreadableRoot {
-                root: asked,
-                reason: error.to_string(),
-            })
-        })?;
+        else {
+            return Err(CloneRefusal::TimedOut {
+                url: url.to_owned(),
+                destination: None,
+                timeout: self.cloning.timeout,
+            });
+        };
+        let (destination, occupied) = placed?;
         if occupied {
             return Err(self.occupied(destination).await);
         }
@@ -389,14 +502,13 @@ impl SessionOperations {
         {
             return Err(CloneRefusal::Unsupported { reason });
         }
-        let url = request.repository_url.as_str();
         let cloned = self
             .source_control
             .clone_repository(
                 url,
                 &destination,
                 request.branch.as_deref(),
-                self.cloning.timeout,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await;
         let cloned = match cloned {
@@ -416,7 +528,7 @@ impl SessionOperations {
                     },
                     CloneFailure::TimedOut => CloneRefusal::TimedOut {
                         url: url.to_owned(),
-                        destination: destination.clone(),
+                        destination: Some(destination.clone()),
                         timeout: self.cloning.timeout,
                     },
                 };
@@ -456,8 +568,9 @@ impl SessionOperations {
 
     /// The refusal of a Clone to `destination`, where something already
     /// stands: naming the Workspace there where it is one — one this
-    /// Server's Registry presents there, or a Repository presented there
-    /// that it has not yet been told of.
+    /// Server's Registry presents there, or one source control finds rooted
+    /// there that it has not yet been told of: a Repository presented there,
+    /// or a Worktree of one presented elsewhere.
     async fn occupied(&self, destination: PathBuf) -> CloneRefusal {
         let registered = self
             .sessions
@@ -467,12 +580,7 @@ impl SessionOperations {
             .map(|workspace| workspace.id);
         let workspace = match registered {
             Some(workspace) => Some(workspace),
-            None => self
-                .source_control
-                .read_repository(&destination)
-                .await
-                .filter(|repository| repository.presentation_path() == destination)
-                .map(|repository| repository.id.workspace_id()),
+            None => self.source_control.workspace_rooted_at(&destination).await,
         };
         CloneRefusal::Occupied {
             destination,
@@ -515,11 +623,21 @@ mod tests {
             (r"C:\src\atlas.git", "atlas"),
             (r"C:\src\atlas\", "atlas"),
             ("/srv/git/atlas.git", "atlas"),
+            ("../atlas.git", "atlas"),
             ("atlas.dotted.git", "atlas.dotted"),
+            ("https://github.com/org/atlas.git?ref=main#readme", "atlas"),
+            ("git+ssh://example.com/srv/atlas.git", "atlas"),
         ] {
             assert_eq!(named_by(url), Ok(name), "{url}");
         }
-        for url in ["", ".git", "/", r"\"] {
+        for url in [
+            "",
+            ".git",
+            "/",
+            r"\",
+            "https://example.com",
+            "https://example.com/",
+        ] {
             assert_eq!(
                 named_by(url),
                 Err(CloneRefusal::NoNameInUrl {
@@ -530,9 +648,69 @@ mod tests {
         }
     }
 
+    /// A name is told from the path a Repository URL names its Repository
+    /// by, and never from who may reach it: a URL carrying a credential
+    /// gives the same name as one without, and one whose path says nothing
+    /// gives none — never the credential or the host — so a name the Log
+    /// may show carries nothing of either.
+    #[test]
+    fn a_clone_is_never_named_by_a_urls_credential_or_host() {
+        for (url, name) in [
+            (
+                "https://octocat:SECRET@example.invalid/org/atlas.git",
+                Some("atlas"),
+            ),
+            ("https://SECRET@example.invalid/atlas", Some("atlas")),
+            (
+                "ssh://git:SECRET@example.invalid:2222/srv/atlas.git/",
+                Some("atlas"),
+            ),
+            (
+                "http://user:SECRET@example.invalid:8080/atlas.git",
+                Some("atlas"),
+            ),
+            ("https://octocat:SECRET@example.invalid", None),
+            ("https://octocat:SECRET@example.invalid/", None),
+            ("https://SECRET@example.invalid?SECRET", None),
+            ("ssh://SECRET@example.invalid:2222", None),
+            ("octocat:SECRET@example.invalid:atlas.git", None),
+            ("SECRET@example.invalid:", None),
+        ] {
+            let named = named_by(url);
+            assert_eq!(
+                named,
+                match name {
+                    Some(name) => Ok(name),
+                    None => Err(CloneRefusal::NoNameInUrl {
+                        url: url.to_owned(),
+                    }),
+                },
+                "{url}"
+            );
+            if let Ok(name) = named {
+                assert!(
+                    !name.contains("SECRET") && !name.contains("example"),
+                    "{url}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_name_is_one_plain_directory_name_on_every_platform() {
-        for name in ["atlas", "atlas-2", "atlas.git", ".atlas", "the atlas"] {
+        for name in [
+            "atlas",
+            "atlas-2",
+            "atlas.git",
+            ".atlas",
+            "the atlas",
+            "console",
+            "com10",
+            "lpt",
+            "nul-atlas",
+            "CON-tools",
+            "auxiliary.txt",
+        ] {
             assert_eq!(plain_name(name), Ok(name));
         }
         for name in [
@@ -546,6 +724,28 @@ mod tests {
             "atlas/",
             "C:atlas",
             "atlas\0",
+            "atlas\ttab",
+            "atlas?",
+            "atlas*",
+            "a<b",
+            "a>b",
+            "a|b",
+            "\"atlas\"",
+            "atlas.",
+            "atlas ",
+            "NUL",
+            "nul",
+            "CON.txt",
+            "con .txt",
+            "Aux.tar.gz",
+            "PRN",
+            "COM1",
+            "com0",
+            "LPT9.log",
+            "COM\u{b9}",
+            "lpt\u{b3}",
+            "CONIN$",
+            "conout$.txt",
             &rooted("atlas"),
         ] {
             assert_eq!(
@@ -672,6 +872,62 @@ mod tests {
         };
         assert_eq!(root, missing.to_str().unwrap());
         assert!(!missing.exists(), "and is never made");
+    }
+
+    /// A Root that does not answer — on a mount gone quiet, say — holds a
+    /// Clone no longer than its deadline: placing it answers then, saying
+    /// it timed out, and the refusal says the Root did not answer in time.
+    #[tokio::test]
+    async fn a_root_that_does_not_answer_holds_a_clone_no_longer_than_its_deadline() {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let quiet = move |root: &str, _home: Option<&Path>| {
+            let _ = released.recv();
+            Err(CloneRefusal::UnreadableRoot {
+                root: root.to_owned(),
+                reason: "released".to_owned(),
+            })
+        };
+        let placing = placed(
+            deadline,
+            vec![rooted("unplugged")],
+            None,
+            "atlas".to_owned(),
+            None,
+            quiet,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), placing)
+                .await
+                .expect("placing a Clone answers by its deadline")
+                .is_none(),
+            "and says it ran out of time"
+        );
+        drop(release);
+        assert_eq!(
+            CloneRefusal::TimedOut {
+                url: "https://example.com/atlas.git".to_owned(),
+                destination: None,
+                timeout: Duration::from_millis(50),
+            }
+            .to_string(),
+            "The Clone of `https://example.com/atlas.git` did not finish within 50 milliseconds: \
+             the Workspace Root it was to go in did not answer in time, so nothing was cloned."
+        );
+
+        let answering = placed(
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            vec![rooted("projects")],
+            None,
+            "atlas".to_owned(),
+            None,
+            |root: &str, _home: Option<&Path>| Ok(PathBuf::from(root)),
+        );
+        assert_eq!(
+            answering.await,
+            Some(Ok((PathBuf::from(rooted("projects")).join("atlas"), false))),
+            "a Root that answers places the Clone directly within it"
+        );
     }
 
     #[test]

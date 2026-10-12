@@ -709,6 +709,24 @@ impl SourceControlService {
             .cloned()
             .collect()
     }
+    /// The Workspace `directory` is the root of, where it is one a
+    /// Repository is read at: the Repository presented there, or the one
+    /// whose Worktree it is the root of, wherever that Repository is
+    /// presented. Read as [`Self::read_unremembered`] reads it; a directory
+    /// merely within a Worktree is the root of none.
+    pub(crate) async fn workspace_rooted_at(
+        &self,
+        directory: &Path,
+    ) -> Option<crate::protocol::WorkspaceId> {
+        let reading = self.read_unremembered(directory).await;
+        let repository = reading.workspace.repository.as_deref()?;
+        (repository.presentation_path() == directory
+            || reading
+                .checkout
+                .as_ref()
+                .is_some_and(|checkout| checkout.root == directory))
+        .then(|| reading.workspace.id.clone())
+    }
     /// Whether this Server's source control Clones a Repository URL.
     pub(crate) fn clone_capability(&self) -> crate::protocol::SourceControlCapability {
         self.adapter.clone_capability()
