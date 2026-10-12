@@ -339,7 +339,7 @@ fn choosing_an_unavailable_workspace_is_refused_saying_why() {
 
     let frame = rendered_application_rows_at(&application, 100, 20).join("\n");
     assert!(
-        frame.contains("Error: the directory holding it cannot be read, so atlas"),
+        frame.contains("Error: its parent cannot be read, so atlas"),
         "the picker says why, naming the Workspace: {frame}"
     );
     assert_eq!(
@@ -413,8 +413,8 @@ fn the_unavailable_mark_stands_out_on_the_row_the_reader_is_on() {
     );
 }
 
-/// A refusal says why before it names the Workspace, so a long name never
-/// pushes the reason out of the one line the picker says it in.
+/// A refusal says why before it names the Workspace, so on the narrowest
+/// picker each reason stands whole, however long the name it gives way to.
 #[test]
 fn a_refusal_says_why_before_a_long_name() {
     let here = workspace(&["work", "here"]);
@@ -422,25 +422,29 @@ fn a_refusal_says_why_before_a_long_name() {
         "drive",
         "an-uncommonly-long-repository-name-that-no-row-of-any-width-holds-whole-beside-its-path",
     ]);
-    let mut application = connected_application(&here);
-    open_picker_with(
-        &mut application,
-        vec![
-            registered(&here),
-            unavailable(&long, WorkspaceUnavailability::Gone),
-        ],
-    );
-    press(&mut application, KeyCode::Down);
+    for why in [
+        WorkspaceUnavailability::Gone,
+        WorkspaceUnavailability::Unreadable,
+        WorkspaceUnavailability::HolderUnreadable,
+        WorkspaceUnavailability::Unanswered,
+    ] {
+        let mut application = connected_application(&here);
+        open_picker_with(
+            &mut application,
+            vec![registered(&here), unavailable(&long, why)],
+        );
+        press(&mut application, KeyCode::Down);
 
-    assert_eq!(
-        choose_unanswered(&mut application),
-        ApplicationTransition::Continue
-    );
-    let frame = rendered_application_rows_at(&application, 44, 20).join("\n");
-    assert!(
-        frame.contains("Error: its directory is gone, so"),
-        "a narrow picker still says why: {frame}"
-    );
+        assert_eq!(
+            choose_unanswered(&mut application),
+            ApplicationTransition::Continue
+        );
+        let frame = rendered_application_rows_at(&application, 44, 20).join("\n");
+        assert!(
+            frame.contains(&format!("Error: {}", why.reason())),
+            "a narrow picker says why whole: {frame}"
+        );
+    }
 }
 
 #[test]

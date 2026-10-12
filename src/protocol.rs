@@ -519,13 +519,15 @@ pub enum WorkspaceUnavailability {
 }
 
 impl WorkspaceUnavailability {
-    /// Why, in plain words, as a reader or an Agent is told it.
+    /// Why, in plain words, as a reader or an Agent is told it: short
+    /// enough to stand whole after `Error: ` on one line of the narrowest
+    /// Workspace Picker.
     pub const fn reason(self) -> &'static str {
         match self {
             Self::Gone => "its directory is gone",
             Self::Unreadable => "its directory cannot be read",
-            Self::HolderUnreadable => "the directory holding it cannot be read",
-            Self::Unanswered => "its directory did not answer in time",
+            Self::HolderUnreadable => "its parent cannot be read",
+            Self::Unanswered => "its directory did not answer",
         }
     }
 }
