@@ -466,6 +466,20 @@ impl SessionStore {
             return Err(CreateSessionError::AuthorGone);
         }
 
+        // The Workspace it is begun in is known from now on, by the root it is
+        // presented by, whether or not this Session outlives it; and
+        // whatever another identity was entered for its directory, or for
+        // where that Workspace is presented, is superseded, its Icon and
+        // Description passing to the Workspace where it has none.
+        self.enter_workspace(
+            &mut state,
+            &location.workspace.id,
+            Some(&location.workspace),
+            crate::storage::WorkspaceProvenance::Session,
+        );
+        let inherited =
+            self.retire_superseded(&mut state, &location.workspace, Some(&execution_path), None);
+        let workspace_id = location.workspace.id.clone();
         // The table is authoritative for a Workspace's Icon and Description;
         // a freshly resolved `location.workspace` never carries either of its
         // own, so this is the one place a newly created Session's Workspace
@@ -641,15 +655,13 @@ impl SessionStore {
             }
             return Err(CreateSessionError::Unrecorded(format!("{error:#}")));
         }
-        // The Workspace it began in is known from now on, by the root it is
-        // presented by, whether or not this Session outlives it.
-        self.enter_workspace(
-            &mut state,
-            &snapshot.session.workspace.id,
-            Some(&snapshot.session.workspace),
-            crate::storage::WorkspaceProvenance::Session,
-        );
         state.publish_catalog_change(SessionCatalogChange::Created { session_id });
+        drop(state);
+        if inherited {
+            // What a superseded entry carried now dresses the Workspace, so
+            // every Session already grouped there wears it too.
+            self.regroup_workspace(&workspace_id);
+        }
         Ok(StoreOutcome::Created(snapshot))
     }
 

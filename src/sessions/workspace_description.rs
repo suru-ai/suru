@@ -166,7 +166,8 @@ impl SessionStore {
     /// finds it — known by a Session where one is grouped under it, and
     /// otherwise by being described — and the entry keeps where, and as
     /// what, it is presented: as `resolved` presents it, where the caller
-    /// resolved it.
+    /// resolved it, which supersedes another identity entered there (see
+    /// [`Self::retire_superseded`]).
     fn land_workspace_description(
         &self,
         workspace_id: &WorkspaceId,
@@ -203,8 +204,17 @@ impl SessionStore {
             }
             let presented = state.presenting(workspace_id, resolved);
             let provenance = state.landing_provenance(workspace_id);
-            let stored =
-                self.enter_workspace(&mut state, workspace_id, presented.as_ref(), provenance);
+            self.enter_workspace(&mut state, workspace_id, presented.as_ref(), provenance);
+            // A Workspace the caller resolved where it is presented supersedes
+            // whatever another identity was entered there; the Sessions this
+            // landing regroups below wear what that entry passed on.
+            if let Some(resolved) = resolved {
+                self.retire_superseded(&mut state, resolved, None, None);
+            }
+            let stored = state
+                .workspaces
+                .get_mut(workspace_id)
+                .expect("a Workspace just entered has an entry");
             stored.description = description.clone();
             let provenance = stored.provenance.clone();
             match derived {

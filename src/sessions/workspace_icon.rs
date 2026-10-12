@@ -47,7 +47,7 @@ use crate::{
     storage::WorkspaceProvenance,
 };
 
-use super::{SessionStore, SessionStoreState, workspace_description};
+use super::{SessionStore, SessionStoreState, workspace_description, workspaces::Regrouping};
 
 /// The most of a README this carries into an Errand's prompt. Short for the
 /// same reason a first Prompt's opening is: naming an Icon should not cost a
@@ -353,7 +353,9 @@ impl SessionStore {
             })
             .collect::<Vec<_>>();
         for (session_id, workspace, checkout) in grouped {
-            if let Err(error) = self.regroup(session_id, workspace, checkout) {
+            if let Err(error) =
+                self.regroup_as(session_id, workspace, checkout, Regrouping::Redressed)
+            {
                 tracing::warn!(
                     %session_id,
                     %error,
@@ -394,6 +396,26 @@ impl SessionStoreState {
         resolved: Option<&Workspace>,
     ) -> Option<Workspace> {
         resolved.or_else(|| self.grouped(workspace_id)).cloned()
+    }
+
+    /// Whether a Session besides `besides` is grouped under a Workspace, one
+    /// Suru could not read included.
+    pub(super) fn grouped_besides(
+        &self,
+        workspace_id: &WorkspaceId,
+        besides: Option<crate::protocol::SessionId>,
+    ) -> bool {
+        self.sessions
+            .values()
+            .filter(|record| Some(record.snapshot.session.id) != besides)
+            .map(|record| &record.snapshot.session.workspace)
+            .chain(
+                self.unreadable_sessions
+                    .values()
+                    .filter(|unreadable| Some(unreadable.summary.id) != besides)
+                    .filter_map(|unreadable| unreadable.summary.workspace.as_ref()),
+            )
+            .any(|workspace| &workspace.id == workspace_id)
     }
 
     /// A copy of a Workspace that a Session grouped under it carries, one

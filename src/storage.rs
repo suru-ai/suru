@@ -940,6 +940,15 @@ impl StorageRepository {
         Ok(())
     }
 
+    /// Drops a Workspace's Registry entry, its Icon and Description with it.
+    fn forget_workspace(&self, workspace_id: WorkspaceId) -> Result<(), StorageError> {
+        let mut connection = connect(&self.database_path)?;
+        diesel::delete(workspaces::table.find(workspace_id.0))
+            .execute(&mut connection)
+            .map_err(|error| StorageError::WriteWorkspaceEntry(error.to_string()))?;
+        Ok(())
+    }
+
     /// A connection to land Session saves through, one after another.
     fn save_connection(&self) -> Result<SqliteConnection, StorageError> {
         connect(&self.database_path)

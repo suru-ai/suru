@@ -171,6 +171,9 @@ enum WriterCommand {
         presentation: WorkspacePresentation,
         provenance: WorkspaceProvenance,
     },
+    /// A Workspace's Registry entry dropped, its Icon and Description with
+    /// it.
+    ForgetWorkspace(WorkspaceId),
     /// A Session's Resume State, landed after the save the Session owed, if
     /// any, since the state's row names the Session's.
     SaveResumeState {
@@ -469,6 +472,14 @@ impl Writer {
                     repository.write_workspace_entry(workspace_id, path, presentation, &provenance)
                 {
                     tracing::warn!("could not save a Workspace Registry entry: {error}");
+                }
+            }
+            // Best-effort as an entry's own write is: one that fails to drop
+            // is listed again after a restart, until a resolution of its path
+            // finds it superseded again.
+            WriterCommand::ForgetWorkspace(workspace_id) => {
+                if let Err(error) = repository.forget_workspace(workspace_id) {
+                    tracing::warn!("could not drop a Workspace Registry entry: {error}");
                 }
             }
             WriterCommand::SaveResumeState {
@@ -889,6 +900,15 @@ impl StorageSink {
             presentation,
             provenance,
         });
+    }
+
+    /// Drops a Workspace's Registry entry, its Icon and Description with it,
+    /// off the Session store's own commit path, behind every write the store
+    /// queued before it.
+    pub(crate) fn forget_workspace(&self, workspace_id: WorkspaceId) {
+        let _ = self
+            .commands
+            .send(WriterCommand::ForgetWorkspace(workspace_id));
     }
 
     /// Records a Sidekick's latest act on a Session that no change to the

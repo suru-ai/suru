@@ -3,9 +3,9 @@ use std::path::Path;
 use super::{SessionStore, SessionStoreState};
 use crate::{
     protocol::{
-        Repository, RepositoryId, RepositoryLocation, SessionChange, SessionId,
-        SourceControlAvailability, SourceControlCapabilities, SourceControlCapability, Workspace,
-        WorkspaceId,
+        Repository, RepositoryId, RepositoryLocation, SessionCatalogChange, SessionChange,
+        SessionId, SourceControlAvailability, SourceControlCapabilities, SourceControlCapability,
+        Workspace, WorkspaceId,
     },
     source_control::SourceControlService,
     storage::{StoredWorkspace, WorkspacePresentation, WorkspaceProvenance},
@@ -190,6 +190,92 @@ impl SessionStore {
         stored
     }
 
+    /// Drops every entry a resolution of `workspace` has superseded: one
+    /// presented, under another identity, where `workspace` is presented or
+    /// at `directory`, the directory that was resolved — a plain directory's
+    /// own Workspace whose directory has since become a Repository's, say —
+    /// since that path belongs to `workspace` now. An entry a Session still
+    /// belongs to stands until that Session's own directory is resolved
+    /// again, `moving`, the Session this resolution regroups, aside. The
+    /// Icon and the Description a dropped entry carried pass to `workspace`'s
+    /// entry where it has none of its own, and every Client hears of them, so
+    /// nothing the user described is lost. Call it once `workspace` is
+    /// entered. Answers whether anything passed, which the Sessions already
+    /// grouped under `workspace` must then be regrouped to wear.
+    pub(super) fn retire_superseded(
+        &self,
+        state: &mut SessionStoreState,
+        workspace: &Workspace,
+        directory: Option<&Path>,
+        moving: Option<SessionId>,
+    ) -> bool {
+        let superseded = state
+            .workspaces
+            .iter()
+            .filter(|(id, stored)| {
+                *id != &workspace.id
+                    && stored
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| path == workspace.path || Some(path) == directory)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let mut inherited = false;
+        for retired_id in superseded {
+            if state.grouped_besides(&retired_id, moving) {
+                continue;
+            }
+            let Some(retired) = state.workspaces.remove(&retired_id) else {
+                continue;
+            };
+            tracing::info!(
+                superseded = %retired_id.0,
+                workspace = %workspace.id.0,
+                path = %workspace.path.display(),
+                "a Workspace Registry entry was superseded at its path"
+            );
+            self.storage.forget_workspace(retired_id);
+            let Some(entry) = state.workspaces.get_mut(&workspace.id) else {
+                continue;
+            };
+            let provenance = entry.provenance.clone();
+            let icon = retired.icon.filter(|_| entry.icon.is_none());
+            let description = retired.description.filter(|_| entry.description.is_none());
+            if let Some(icon) = &icon {
+                entry.icon = Some(icon.clone());
+                self.storage.save_workspace_icon(
+                    workspace.id.clone(),
+                    icon.clone(),
+                    provenance.clone(),
+                );
+            }
+            if let Some(description) = &description {
+                entry.description = Some(description.clone());
+                self.storage.save_workspace_description(
+                    workspace.id.clone(),
+                    description.clone(),
+                    provenance,
+                );
+            }
+            if let Some(icon) = icon {
+                inherited = true;
+                state.publish_catalog_change(SessionCatalogChange::WorkspaceIconChanged {
+                    workspace_id: workspace.id.clone(),
+                    icon: Some(icon),
+                });
+            }
+            if let Some(description) = description {
+                inherited = true;
+                state.publish_catalog_change(SessionCatalogChange::WorkspaceDescriptionChanged {
+                    workspace_id: workspace.id.clone(),
+                    description: Some(description),
+                });
+            }
+        }
+        inherited
+    }
+
     pub(crate) async fn discover_workspaces(
         &self,
         source_control: &SourceControlService,
@@ -289,24 +375,55 @@ impl SessionStore {
         }
         Ok(())
     }
+    /// Regroups a Session under `workspace`, which resolving its directory
+    /// found it works in — and, with `checkout`, the Worktree it works in.
     pub(crate) fn regroup(
+        &self,
+        id: SessionId,
+        workspace: Workspace,
+        checkout: Option<crate::protocol::CheckoutAssociation>,
+    ) -> anyhow::Result<()> {
+        let workspace_id = workspace.id.clone();
+        if self.regroup_as(id, workspace, checkout, Regrouping::Resolved)? {
+            // What a superseded entry carried now dresses the Workspace, so
+            // every Session already grouped there wears it too.
+            self.regroup_workspace(&workspace_id);
+        }
+        Ok(())
+    }
+
+    /// [`Self::regroup`], for a Workspace `regrouping` says was resolved for
+    /// the Session's directory, or is only its own copy dressed again.
+    /// Answers whether the Workspace's entry took on what a superseded entry
+    /// carried.
+    pub(super) fn regroup_as(
         &self,
         id: SessionId,
         mut workspace: Workspace,
         mut checkout: Option<crate::protocol::CheckoutAssociation>,
-    ) -> anyhow::Result<()> {
+        regrouping: Regrouping,
+    ) -> anyhow::Result<bool> {
         let mut state = self.state.lock().unwrap();
-        if !state.sessions.contains_key(&id) {
-            return Ok(());
-        }
+        let Some(directory) = state
+            .sessions
+            .get(&id)
+            .map(|record| record.snapshot.session.execution_directory.path.clone())
+        else {
+            return Ok(false);
+        };
         // A Session found working in a Workspace makes it known, whatever
-        // else regrouping it changes.
+        // else regrouping it changes; and where resolution found it there,
+        // whatever another identity was entered for its directory, or for
+        // where the Workspace is presented, is superseded — though this
+        // Session no longer keeps it.
         self.enter_workspace(
             &mut state,
             &workspace.id,
             Some(&workspace),
             WorkspaceProvenance::Session,
         );
+        let inherited = regrouping == Regrouping::Resolved
+            && self.retire_superseded(&mut state, &workspace, Some(&directory), Some(id));
         // The table is authoritative for a Workspace's Icon and Description:
         // whatever resolution or a caller handed in, the current durable
         // reading wins, so every regrouped Session's own copy of its
@@ -316,7 +433,7 @@ impl SessionStore {
         // landing does).
         state.dress_workspace(&mut workspace);
         let Some(record) = state.sessions.get_mut(&id) else {
-            return Ok(());
+            return Ok(inherited);
         };
         if let Some(checkout) = &mut checkout
             && let Some(previous) = &record.snapshot.session.checkout
@@ -332,7 +449,7 @@ impl SessionStore {
         if record.snapshot.session.workspace == workspace
             && record.snapshot.session.checkout == checkout
         {
-            return Ok(());
+            return Ok(inherited);
         }
         let mut next = record.snapshot.session.clone();
         next.workspace.clone_from(&workspace);
@@ -366,6 +483,16 @@ impl SessionStore {
         }
         // A Sidekick's tree names the Workspace of each Session beneath it.
         state.announce_subagent_tree(id);
-        Ok(())
+        Ok(inherited)
     }
+}
+
+/// Whether the Workspace a Session is regrouped under was just resolved for
+/// its directory — which is what may find another entry at that path
+/// superseded — or is only the Session's own copy, dressed again in what the
+/// Registry holds for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Regrouping {
+    Resolved,
+    Redressed,
 }

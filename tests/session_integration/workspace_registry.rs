@@ -346,13 +346,34 @@ async fn a_session_enters_its_workspace_by_its_presented_root_and_an_entry_keeps
     );
 }
 
+/// The Workspaces the Client's Workspace listing presents at `path`.
+async fn listed_at(client: &ManagedClient, path: &Path) -> Vec<Workspace> {
+    listed(client)
+        .await
+        .into_iter()
+        .filter(|workspace| workspace.path == path)
+        .collect()
+}
+
+/// A Description as a user sets it.
+fn set(text: &str) -> Option<WorkspaceDescription> {
+    Some(WorkspaceDescription {
+        text: text.to_owned(),
+        set: true,
+    })
+}
+
 /// A Workspace a Session is found working in when its directory is
 /// resolved again at start — one it was never grouped under, since its
 /// directory became a Repository while the Server was down — is entered then,
 /// by its presented root and known by a Session, and listed from then on,
-/// its Sessions or no.
+/// its Sessions or no. The plain directory's own Workspace it supersedes at
+/// that path is dropped, and the Description the user gave it passes to the
+/// Repository's, so the one directory is listed once and nothing the user
+/// described is lost.
 #[tokio::test]
-async fn a_workspace_a_session_is_found_in_when_resolved_again_at_start_is_entered() {
+async fn a_workspace_a_session_is_found_in_when_resolved_again_at_start_supersedes_its_directorys()
+{
     const CHANNEL: &str = "workspace-registry-re-resolution";
     let home = tempfile::tempdir().expect("create a home for the Workspaces");
     let home = canonical(home.path());
@@ -365,7 +386,12 @@ async fn a_workspace_a_session_is_found_in_when_resolved_again_at_start_is_enter
         .create_session(quiet_request(&notes, "Keep the notes"))
         .await
         .expect("create a Session in the notes directory");
-    assert!(created.session.workspace.repository.is_none());
+    let directory = created.session.workspace.clone();
+    assert!(directory.repository.is_none());
+    client
+        .set_workspace_description(&directory.id, None, "Where the notes are kept.")
+        .await
+        .expect("describe the notes directory");
     drop(client);
     server.shutdown().await.expect("shut down server");
     repository(&notes);
@@ -383,26 +409,190 @@ async fn a_workspace_a_session_is_found_in_when_resolved_again_at_start_is_enter
         regrouped.repository.is_some(),
         "the Session works in the Repository its directory became"
     );
+    assert_eq!(
+        regrouped.description,
+        set("Where the notes are kept."),
+        "the Session's Workspace wears the Description its directory was given"
+    );
     client
         .delete_session(created.session.id)
         .await
         .expect("delete the Workspace's only Session");
-    assert!(
-        listed(&client)
+    assert_eq!(
+        listed_at(&client, &notes)
             .await
             .iter()
             .map(named)
-            .any(|listed| listed == named(&regrouped)),
-        "the Workspace re-resolution found is listed by its entry, with no Session left there"
+            .collect::<Vec<_>>(),
+        [(
+            regrouped.id.clone(),
+            notes.clone(),
+            None,
+            set("Where the notes are kept.")
+        )],
+        "the directory is listed once, as the Repository's, with the Description it was given, \
+         and with no Session left there"
     );
 
     drop(client);
     restarted.shutdown().await.expect("shut down server");
+    let entries = entries_on_disk(&config);
     assert_eq!(
-        entries_on_disk(&config).get(&regrouped.id),
+        entries.get(&regrouped.id),
         Some(&(Some(notes), BY_SESSION.to_owned())),
         "the entry re-resolution made is known by a Session"
     );
+    assert!(
+        !entries.contains_key(&directory.id),
+        "the superseded directory's entry is dropped for good"
+    );
+}
+
+/// A Session begun in a directory that has become a Repository's finds the
+/// directory's own Workspace superseded there, but an entry a Session still
+/// works in stands until that Session's directory is resolved again. Once
+/// none does, the next Session begun there drops it, and what it carried
+/// passes to the Repository's Workspace, for every Session working there.
+#[tokio::test]
+async fn a_session_begun_where_a_directory_became_a_repository_supersedes_the_directorys_entry() {
+    const CHANNEL: &str = "workspace-registry-superseded-at-creation";
+    let home = tempfile::tempdir().expect("create a home for the Workspaces");
+    let home = canonical(home.path());
+    let notes = home.join("notes");
+    std::fs::create_dir(&notes).expect("create the notes directory");
+    let config = ServerConfig::new(home.join("state"), CHANNEL).expect("configure");
+    let server = quiet_server(config).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let first = client
+        .create_session(quiet_request(&notes, "Keep the notes"))
+        .await
+        .expect("create a Session in the notes directory")
+        .session;
+    client
+        .set_workspace_icon(&first.workspace.id, "dev-rust")
+        .await
+        .expect("choose the notes directory's Icon");
+    client
+        .set_workspace_description(&first.workspace.id, None, "Where the notes are kept.")
+        .await
+        .expect("describe the notes directory");
+    repository(&notes);
+
+    let second = client
+        .create_session(quiet_request(&notes, "File the notes"))
+        .await
+        .expect("create a Session in the Repository the directory became")
+        .session;
+    assert_ne!(second.workspace.id, first.workspace.id);
+    assert_eq!(
+        listed_at(&client, &notes)
+            .await
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>(),
+        [second.workspace.id.clone(), first.workspace.id.clone()],
+        "the directory's entry stands while a Session still works in it"
+    );
+
+    client
+        .delete_session(first.id)
+        .await
+        .expect("delete the Session the directory's entry was kept for");
+    let third = client
+        .create_session(quiet_request(&notes, "Sort the notes"))
+        .await
+        .expect("create another Session in the Repository")
+        .session;
+    let carried = (
+        third.workspace.id.clone(),
+        notes.clone(),
+        Some("dev-rust".to_owned()),
+        set("Where the notes are kept."),
+    );
+    assert_eq!(
+        named(&third.workspace),
+        carried,
+        "the Session begun now wears what the directory's entry carried"
+    );
+    assert_eq!(
+        listed_at(&client, &notes)
+            .await
+            .iter()
+            .map(named)
+            .collect::<Vec<_>>(),
+        std::slice::from_ref(&carried),
+        "the directory is listed once, as the Repository's"
+    );
+    assert_eq!(
+        named(
+            &client
+                .read_session(second.id)
+                .await
+                .expect("read the Session begun before")
+                .session
+                .workspace
+        ),
+        carried,
+        "a Session already working in the Repository wears it too"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A Description set by naming a directory whose own Workspace has become a
+/// Repository's lands on the Repository's Workspace and drops the directory's
+/// entry no Session works in, its Icon passing over where the Repository's
+/// has none.
+#[tokio::test]
+async fn describing_a_directory_that_became_a_repository_supersedes_the_directorys_entry() {
+    const CHANNEL: &str = "workspace-registry-superseded-at-description";
+    let home = tempfile::tempdir().expect("create a home for the Workspaces");
+    let home = canonical(home.path());
+    let notes = home.join("notes");
+    std::fs::create_dir(&notes).expect("create the notes directory");
+    let config = ServerConfig::new(home.join("state"), CHANNEL).expect("configure");
+    let server = quiet_server(config).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let directory = landing_workspace(&client, &notes).await;
+    client
+        .set_workspace_description(&directory.id, Some(&notes), "Where the notes wait.")
+        .await
+        .expect("describe the notes directory before any Session begins there");
+    client
+        .set_workspace_icon(&directory.id, "dev-rust")
+        .await
+        .expect("choose the notes directory's Icon");
+    repository(&notes);
+
+    let repository_workspace = landing_workspace(&client, &notes).await;
+    assert_ne!(repository_workspace.id, directory.id);
+    client
+        .set_workspace_description(
+            &repository_workspace.id,
+            Some(&notes),
+            "Where the notes are kept.",
+        )
+        .await
+        .expect("describe the Repository the directory became");
+
+    assert_eq!(
+        listed_at(&client, &notes)
+            .await
+            .iter()
+            .map(named)
+            .collect::<Vec<_>>(),
+        [(
+            repository_workspace.id,
+            notes.clone(),
+            Some("dev-rust".to_owned()),
+            set("Where the notes are kept.")
+        )],
+        "the directory is listed once, as the Repository's, keeping the Icon it was given"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
 }
 
 /// A Session stored before the workspaces table was the Registry may work in
