@@ -645,6 +645,18 @@ impl SourceControlService {
             .cloned()
             .collect()
     }
+    /// The Repository `directory` is read as now, where it reads as one and
+    /// source control could read it: read as a Session's directory is, but
+    /// not remembered, so a Repository found this way joins no checkout
+    /// observation.
+    pub(crate) async fn read_repository(&self, directory: &Path) -> Option<Repository> {
+        let repository = self
+            .discover_in_batch(&mut DiscoveryBatch::default(), directory)
+            .await
+            .workspace
+            .repository?;
+        (repository.availability == SourceControlAvailability::Available).then_some(*repository)
+    }
     pub(crate) async fn list_checkouts(
         &self,
         repository: &Repository,

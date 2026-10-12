@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{SessionStore, SessionStoreState};
 use crate::{
@@ -484,6 +484,31 @@ impl SessionStore {
         // A Sidekick's tree names the Workspace of each Session beneath it.
         state.announce_subagent_tree(id);
         Ok(inherited)
+    }
+
+    /// Every Repository the Workspace Registry holds an entry for, by its
+    /// identity and the path its entry presents it at — its main root, its
+    /// bare root, or its repository metadata location — whether or not a
+    /// Session works there any longer: what the Reclaim sweep finds a
+    /// Repository by after a restart once nothing else names it (ADR 0051).
+    pub(crate) fn registered_repositories(&self) -> Vec<(RepositoryId, PathBuf)> {
+        self.state
+            .lock()
+            .unwrap()
+            .workspaces
+            .iter()
+            .filter(|(_, stored)| {
+                matches!(
+                    stored.presentation,
+                    Some(
+                        WorkspacePresentation::MainRoot
+                            | WorkspacePresentation::BareRoot
+                            | WorkspacePresentation::RepositoryMetadata
+                    )
+                )
+            })
+            .filter_map(|(id, stored)| Some((RepositoryId(id.0.clone()), stored.path.clone()?)))
+            .collect()
     }
 }
 

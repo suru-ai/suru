@@ -164,6 +164,25 @@ impl Reclaimer {
                 .entry(preparation.repository.id.clone())
                 .or_insert_with(|| preparation.repository.clone());
         }
+        // A Repository that neither a Session, this run's resolutions nor a
+        // preparation names is still found through its Workspace Registry
+        // entry, so a restart no longer forgets one no Session works in (ADR
+        // 0051). An entry whose directory cannot be read, or now reads as
+        // another Repository, is passed over until a later sweep.
+        for (id, path) in self.sessions.registered_repositories() {
+            if repositories.contains_key(&id) {
+                continue;
+            }
+            match self.source_control.read_repository(&path).await {
+                Some(repository) if repository.id == id => {
+                    repositories.insert(id, repository);
+                }
+                _ => tracing::debug!(
+                    repository = %path.display(),
+                    "Managed Worktree Reclaim passed over a Workspace Registry entry naming no Repository it could read"
+                ),
+            }
+        }
         for repository in repositories.values() {
             let repository_preparations = preparations
                 .iter()

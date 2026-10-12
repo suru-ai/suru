@@ -134,6 +134,14 @@ fn eager_only_timings() -> server::ServerTimings {
         .with_worktree_reclaim_interval(EAGER_ONLY_DELAY)
 }
 
+/// Timings leaving a test time for the first sweep after startup and no
+/// other: the interval outlasts every progress deadline.
+fn first_sweep_only_timings() -> server::ServerTimings {
+    server::ServerTimings::default()
+        .with_worktree_reclaim_startup_delay(STARTUP_DELAY)
+        .with_worktree_reclaim_interval(EAGER_ONLY_DELAY)
+}
+
 async fn spawn(layout: &ReclaimLayout, channel: &str) -> server::RunningServer {
     let (runtime, _) = ControlledProvider::new();
     let server =
@@ -309,6 +317,38 @@ async fn listed_session(descriptor: &RuntimeDescriptor, session_id: SessionId) -
         .into_iter()
         .find(|item| item.id() == session_id)
         .expect("Session remains listed")
+}
+
+async fn delete_session(server: &server::RunningServer, session_id: SessionId) {
+    let deleted = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/sessions/{session_id}",
+            server.descriptor().base_url
+        ))
+        .bearer_auth(&server.descriptor().token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+}
+
+/// Where each Workspace the Server's Workspace Registry lists is presented.
+async fn registered_paths(descriptor: &RuntimeDescriptor) -> Vec<PathBuf> {
+    reqwest::Client::new()
+        .get(format!("{}/v1/workspaces", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<WorkspaceListing>()
+        .await
+        .unwrap()
+        .workspaces
+        .into_iter()
+        .map(|workspace| workspace.path)
+        .collect()
 }
 
 async fn wait_for_unavailable_reclaim_reason(
@@ -1585,6 +1625,105 @@ async fn startup_discovers_and_reclaims_a_prepared_worktree_after_its_last_sessi
     // the surviving Session must be enough to feed the dedicated startup pass.
     wait_for_path(&managed, false).await;
     wait_for_branch(&layout.main, &branch, false).await;
+    restarted.shutdown().await.unwrap();
+}
+
+/// Until the Workspace Registry, a Repository with no Session and no failed
+/// preparation left was forgotten across a restart (ADR 0027), so an orphan
+/// whose last Session was deleted while Reclaim could not act stood for
+/// good. The entry its Session made now names the Repository to the first
+/// sweep after a restart (ADR 0051).
+#[tokio::test]
+async fn restart_reclaims_an_orphan_whose_repository_only_its_registry_entry_names() {
+    let layout = ReclaimLayout::new("registry-orphan");
+    let branch = "refs/heads/suru/registry-orphan";
+    layout.pin(r#""off""#);
+    let config = layout.server_config("reclaim-registry-orphan");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider_and_timings(config.clone(), runtime, timings())
+        .await
+        .unwrap();
+    let (session, _connection) = open(&server, &mut provider, &layout.managed).await;
+    delete_session(&server, session.session.id).await;
+    assert!(
+        layout.managed.is_dir(),
+        "off keeps the orphan until restart"
+    );
+    server.shutdown().await.unwrap();
+
+    layout.pin("14");
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted =
+        server::spawn_with_provider_and_timings(config, runtime, first_sweep_only_timings())
+            .await
+            .unwrap();
+    let sessions = reqwest::Client::new()
+        .get(format!("{}/v1/sessions", restarted.descriptor().base_url))
+        .bearer_auth(&restarted.descriptor().token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Vec<SessionListItem>>()
+        .await
+        .unwrap();
+    assert!(sessions.is_empty(), "no Session names the Repository");
+    assert!(
+        registered_paths(restarted.descriptor())
+            .await
+            .contains(&layout.main),
+        "the Registry still lists the Repository's Workspace"
+    );
+    // No Session, failed preparation, resolve call or catalog subscription
+    // follows the restart: the Registry entry alone feeds the first sweep.
+    wait_for_path(&layout.managed, false).await;
+    assert!(
+        !read_git(&layout.main, &["rev-parse", branch]).is_empty(),
+        "an unproven branch is retained as by any Reclaim"
+    );
+    restarted.shutdown().await.unwrap();
+}
+
+/// An entry whose directory cannot be read names no Repository to the
+/// sweep, and keeps it from none that another entry names.
+#[tokio::test]
+async fn a_registry_entry_whose_directory_cannot_be_read_is_skipped_by_the_sweep() {
+    let layout = ReclaimLayout::new("registry-unreadable");
+    let drive = layout.root.join("drive");
+    let unreadable = drive.join("unreadable");
+    std::fs::create_dir_all(&unreadable).unwrap();
+    git(&unreadable, &["init", "-b", "main"]);
+    commit(&unreadable, "initial");
+    layout.pin(r#""off""#);
+    let config = layout.server_config("reclaim-registry-unreadable");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider_and_timings(config.clone(), runtime, timings())
+        .await
+        .unwrap();
+    let (elsewhere, _elsewhere_connection) = open(&server, &mut provider, &unreadable).await;
+    let (session, _connection) = open(&server, &mut provider, &layout.managed).await;
+    delete_session(&server, elsewhere.session.id).await;
+    delete_session(&server, session.session.id).await;
+    server.shutdown().await.unwrap();
+    // The drive is unmounted, as it were: the entry's directory and its
+    // parent both cannot be read. Moved rather than deleted, since Git
+    // leaves its objects read-only and Windows will not delete those.
+    std::fs::rename(&drive, layout.root.join("unmounted")).unwrap();
+
+    layout.pin("14");
+    let (runtime, _provider) = ControlledProvider::new();
+    let restarted =
+        server::spawn_with_provider_and_timings(config, runtime, first_sweep_only_timings())
+            .await
+            .unwrap();
+    assert!(
+        registered_paths(restarted.descriptor())
+            .await
+            .contains(&unreadable),
+        "an entry whose parent cannot be read stands"
+    );
+    wait_for_path(&layout.managed, false).await;
     restarted.shutdown().await.unwrap();
 }
 
