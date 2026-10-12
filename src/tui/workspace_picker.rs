@@ -606,10 +606,12 @@ impl WorkspacePicker {
             Offer::Workspace(_) => {
                 let workspace = self.selected_workspace()?;
                 Some(match workspace.unavailable {
+                    // Why comes first, so a long name never pushes it out
+                    // of the one line the picker says it in.
                     Some(why) => WorkspacePickerChoice::Refused(format!(
-                        "{} cannot be opened: {}",
-                        self.paths().workspace_name(&workspace),
-                        why.reason()
+                        "{}, so {} cannot be opened",
+                        why.reason(),
+                        self.paths().workspace_name(&workspace)
                     )),
                     None => WorkspacePickerChoice::Workspace(workspace),
                 })

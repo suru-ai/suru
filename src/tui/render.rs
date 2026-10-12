@@ -1965,18 +1965,25 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
                     .workspace_picker
                     .record_row(row_y, row_columns.clone(), &row.kind);
                 let marker = if row.selected { "› " } else { "  " };
-                let text = match &row.kind {
+                match &row.kind {
                     WorkspacePickerRowKind::Browse => {
                         let show_icons = state.settings().appearance.show_icons;
                         let label =
                             icon_label(show_icons, NF_FA_FOLDER_TREE, "Browse directories…");
-                        truncate_to_width(&format!("{marker}{label}"), content_width)
+                        Line::styled(
+                            truncate_to_width(&format!("{marker}{label}"), content_width),
+                            style,
+                        )
                     }
-                    WorkspacePickerRowKind::Workspace(workspace) => {
-                        workspace_picker_row_text(marker, workspace, content_width, state)
-                    }
-                };
-                Line::styled(text, style)
+                    WorkspacePickerRowKind::Workspace(workspace) => workspace_picker_row_line(
+                        marker,
+                        workspace,
+                        content_width,
+                        state,
+                        style,
+                        theme,
+                    ),
+                }
             })
             .collect::<Vec<_>>();
         if rows.is_empty() && lines.len() < content_height.saturating_sub(footer_rows) {
@@ -2473,37 +2480,70 @@ fn render_workspace_description_editor(
 }
 
 /// One Workspace Picker Workspace row after its `marker`: the name the
-/// Workspace goes by, whether it is where the client is working, and the path
-/// spelled in full — truncated from the left where the row cannot hold it, so
-/// the directories that tell two Workspaces of the same name apart are what
-/// survives. A path that says no more than the name, as the Sidekick
-/// Workspace's does, is left off.
-fn workspace_picker_row_text(
+/// Workspace goes by, whether it is where the client is working, whether it
+/// cannot be opened now, and the path spelled in full — truncated from the
+/// left where the row cannot hold it, so the directories that tell two
+/// Workspaces of the same name apart are what survives. A path that says no
+/// more than the name, as the Sidekick Workspace's does, is left off.
+fn workspace_picker_row_line(
     marker: &str,
     row: &WorkspaceRow,
     width: usize,
     state: &TuiState,
-) -> String {
+    style: Style,
+    theme: &Theme,
+) -> Line<'static> {
     let compact = width < usize::from(NARROW_TERMINAL_WIDTH);
     let separator = if compact { " " } else { " · " };
     let show_icons = state.settings().appearance.show_icons;
+    // Each mark keeps its place however long the name: the name gives way to
+    // them, as the path gives way to the name.
+    let current = row.current.then(|| current_workspace_mark(compact));
+    let unavailable = row
+        .unavailable
+        .is_some()
+        .then(|| unavailable_workspace_mark(compact));
+    let marks_width = current
+        .into_iter()
+        .chain(unavailable)
+        .map(|mark| separator.width() + mark.width())
+        .sum::<usize>();
     let name = icon_label(show_icons, row.icon.unwrap_or(NF_COD_FOLDER), &row.name);
-    let mut fields = vec![name];
-    if row.current {
-        fields.push(current_workspace_mark(compact).to_owned());
+    let name = truncate_to_width(
+        &name,
+        width
+            .saturating_sub(marker.width())
+            .saturating_sub(marks_width),
+    );
+    let mut head = format!("{marker}{name}");
+    if let Some(current) = current {
+        head.push_str(separator);
+        head.push_str(current);
     }
-    if row.unavailable.is_some() {
-        fields.push(unavailable_workspace_mark(compact).to_owned());
+    let mut used = head.width();
+    let mut spans = vec![Span::styled(head, style)];
+    // The unavailable mark is drawn as a warning over the row's own style,
+    // so it still stands out on the row the reader is on.
+    if let Some(unavailable) = unavailable {
+        used += separator.width() + unavailable.width();
+        spans.push(Span::styled(separator.to_owned(), style));
+        spans.push(Span::styled(
+            unavailable.to_owned(),
+            style.patch(theme.feedback.warning),
+        ));
     }
     let label = state.workspace_label(&state.outlook, &row.path);
-    let path_budget = width
-        .saturating_sub(marker.width())
-        .saturating_sub(fields.join(separator).width())
-        .saturating_sub(separator.width());
+    let path_budget = width.saturating_sub(used).saturating_sub(separator.width());
     if path_budget > 0 && label != row.name {
-        fields.push(truncate_from_left_to_width(&label, path_budget));
+        spans.push(Span::styled(
+            format!(
+                "{separator}{}",
+                truncate_from_left_to_width(&label, path_budget)
+            ),
+            style,
+        ));
     }
-    truncate_to_width(&format!("{marker}{}", fields.join(separator)), width)
+    Line::from(spans)
 }
 
 /// What marks the Workspace the client is working in wherever Workspaces are

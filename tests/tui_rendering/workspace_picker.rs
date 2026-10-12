@@ -18,6 +18,7 @@ use crate::support::{
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::style::Color;
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
@@ -338,8 +339,8 @@ fn choosing_an_unavailable_workspace_is_refused_saying_why() {
 
     let frame = rendered_application_rows_at(&application, 100, 20).join("\n");
     assert!(
-        frame.contains("atlas cannot be opened: the directory holding it cannot be read"),
-        "the picker says why: {frame}"
+        frame.contains("Error: the directory holding it cannot be read, so atlas"),
+        "the picker says why, naming the Workspace: {frame}"
     );
     assert_eq!(
         selected_row(&application),
@@ -350,6 +351,95 @@ fn choosing_an_unavailable_workspace_is_refused_saying_why() {
         session_picker_scope(&mut application),
         SessionListScope::CurrentWorkspace(here.into()),
         "nothing moved"
+    );
+}
+
+/// A name too long for its row gives way to the unavailable mark, which
+/// keeps its place however wide the row.
+#[test]
+fn a_long_name_never_hides_the_unavailable_mark() {
+    let here = workspace(&["work", "here"]);
+    let long = workspace(&[
+        "drive",
+        "an-uncommonly-long-repository-name-that-no-row-of-any-width-holds-whole-beside-its-path",
+    ]);
+    let mut application = connected_application(&here);
+    open_picker_with(
+        &mut application,
+        vec![
+            registered(&here),
+            unavailable(&long, WorkspaceUnavailability::Gone),
+        ],
+    );
+
+    for (width, mark) in [(80, " · [unavailable]"), (44, " !")] {
+        let rows = picker_rows_at(&application, width, 15);
+        let row = rows
+            .iter()
+            .find(|row| row.contains("an-uncommonly"))
+            .unwrap_or_else(|| panic!("the long-named Workspace is offered: {rows:?}"));
+        assert!(
+            row.contains(mark),
+            "a row {width} columns wide keeps the mark, the name giving way to it: {rows:?}"
+        );
+    }
+}
+
+/// The unavailable mark is drawn as a warning on the row the reader is on
+/// as on any other, so it stands out from the selection it sits in.
+#[test]
+fn the_unavailable_mark_stands_out_on_the_row_the_reader_is_on() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["drive", "atlas"]);
+    let mut application = connected_application(&here);
+    open_picker_with(
+        &mut application,
+        vec![
+            registered(&here),
+            unavailable(&atlas, WorkspaceUnavailability::HolderUnreadable),
+        ],
+    );
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "atlas");
+
+    let buffer = rendered_application_buffer(&application, 80, 15);
+    let cell = |needle: &str| buffer[text_position(&buffer, needle)].clone();
+    let (mark, name) = (cell("[unavailable]"), cell("atlas"));
+    assert_eq!(mark.fg, Color::Yellow, "the mark is drawn as a warning");
+    assert_ne!(mark.fg, name.fg, "apart from the name beside it");
+    assert_eq!(
+        mark.bg, name.bg,
+        "on the ground the selection gives the row it is on"
+    );
+}
+
+/// A refusal says why before it names the Workspace, so a long name never
+/// pushes the reason out of the one line the picker says it in.
+#[test]
+fn a_refusal_says_why_before_a_long_name() {
+    let here = workspace(&["work", "here"]);
+    let long = workspace(&[
+        "drive",
+        "an-uncommonly-long-repository-name-that-no-row-of-any-width-holds-whole-beside-its-path",
+    ]);
+    let mut application = connected_application(&here);
+    open_picker_with(
+        &mut application,
+        vec![
+            registered(&here),
+            unavailable(&long, WorkspaceUnavailability::Gone),
+        ],
+    );
+    press(&mut application, KeyCode::Down);
+
+    assert_eq!(
+        choose_unanswered(&mut application),
+        ApplicationTransition::Continue
+    );
+    let frame = rendered_application_rows_at(&application, 44, 20).join("\n");
+    assert!(
+        frame.contains("Error: its directory is gone, so"),
+        "a narrow picker still says why: {frame}"
     );
 }
 
