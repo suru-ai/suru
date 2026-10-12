@@ -246,6 +246,15 @@ fn workspace_round_trips_its_icon_and_description_and_tolerates_their_absence() 
     );
 }
 
+/// A path rooted as this platform roots absolute paths, so a fixture reads as
+/// absolute on Windows as readily as on Unix.
+fn absolute(components: &[&str]) -> PathBuf {
+    components.iter().fold(
+        PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" }),
+        |path, component| path.join(component),
+    )
+}
+
 /// A Workspace a listing could not read the directory of says why on the
 /// wire, and every other copy carries nothing of it.
 #[test]
@@ -258,7 +267,7 @@ fn workspace_round_trips_why_it_cannot_be_opened() {
     }
     let unavailable = Workspace {
         unavailable: Some(suru::protocol::WorkspaceUnavailability::HolderUnreadable),
-        ..Workspace::directory(PathBuf::from("/drive/atlas"))
+        ..Workspace::directory(absolute(&["drive", "atlas"]))
     };
     let encoded = serde_json::to_value(&unavailable).expect("encode Workspace");
     assert_eq!(encoded["unavailable"], json!("holder_unreadable"));
@@ -267,7 +276,7 @@ fn workspace_round_trips_why_it_cannot_be_opened() {
         unavailable
     );
     assert!(
-        serde_json::to_value(Workspace::directory(PathBuf::from("/work/suru")))
+        serde_json::to_value(Workspace::directory(absolute(&["work", "suru"])))
             .expect("encode Workspace")
             .get("unavailable")
             .is_none(),
