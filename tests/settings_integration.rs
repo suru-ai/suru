@@ -3512,3 +3512,83 @@ async fn text_selection_copy_rejects_unknown_values_naming_both_choices() {
     drop(client);
     server.shutdown().await.unwrap();
 }
+
+/// A config root that cannot be searched says so, as a Config Document that
+/// cannot be read does, rather than reading as one holding no document:
+/// whether either document name is there cannot be told, so neither is read,
+/// and a change of a Setting is refused rather than written to a document
+/// that may not be the one that wins. Windows denies searching a directory
+/// through an access control list rather than a mode, so this is pinned
+/// where a mode can say it; the discovery's unit test stands for it there.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_config_root_that_cannot_be_searched_is_an_error_and_takes_no_change() {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Gives the config root back its permissions however the test ends,
+    /// so it can be removed.
+    struct Unseal<'a>(&'a Path);
+    impl Drop for Unseal<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    const CHANNEL: &str = "settings-config-root-sealed";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let document = r#"{ "transcript": { "reasoningVisibility": "shown" } }"#;
+    std::fs::write(config_dir.path().join("suru.jsonc"), document).expect("write Config Document");
+    std::fs::set_permissions(config_dir.path(), std::fs::Permissions::from_mode(0o000))
+        .expect("seal the config root");
+    let unseal = Unseal(config_dir.path());
+    // A superuser searches past any mode, so there is nothing to refuse.
+    if std::fs::metadata(config_dir.path().join("suru.jsonc")).is_ok() {
+        return;
+    }
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), CHANNEL)
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let (client, snapshot) = attach(state_dir.path(), CHANNEL).await;
+    assert_eq!(
+        snapshot.settings.transcript.reasoning_visibility,
+        ReasoningVisibility::default(),
+        "nothing is read from a config root that cannot be searched"
+    );
+    assert_eq!(snapshot.pinned, Vec::<String>::new());
+    assert!(
+        !snapshot.diagnostics.is_empty()
+            && snapshot.diagnostics.iter().all(|diagnostic| {
+                diagnostic.severity == SettingsDiagnosticSeverity::Error
+                    && diagnostic.key.is_none()
+                    && diagnostic.file.parent() == Some(config_dir.path())
+                    && diagnostic.message.starts_with(
+                        "ignored, with every Config Document beside it, because \
+                                      whether it exists could not be told: ",
+                    )
+            }),
+        "the snapshot says why, naming each document name it could not tell: {:?}",
+        snapshot.diagnostics
+    );
+    assert!(
+        client
+            .mutate_setting(SettingMutation::AppearanceShowIcons { value: Some(false) })
+            .await
+            .is_err(),
+        "a change of a Setting is refused"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    drop(unseal);
+    assert_eq!(
+        std::fs::read_to_string(config_dir.path().join("suru.jsonc")).expect("read the document"),
+        document,
+        "and nothing was written"
+    );
+}

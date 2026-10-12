@@ -789,3 +789,68 @@ async fn a_root_respelled_as_where_its_link_led_while_neither_resolves_takes_not
     drop(client);
     server.shutdown().await.expect("shut down server");
 }
+
+/// A config root that cannot be searched names no Roots the user meant to
+/// take away: a Server started on one keeps every entry discovered under the
+/// Roots it named before, with what each carries. Windows denies searching a
+/// directory through an access control list rather than a mode, so this is
+/// pinned where a mode can say it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_server_started_on_a_config_root_it_cannot_search_keeps_every_discovered_entry() {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Gives the config root back its permissions however the test ends,
+    /// so it can be removed.
+    struct Unseal(PathBuf);
+    impl Drop for Unseal {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    const CHANNEL: &str = "workspace-standing-config-root-sealed";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let projects = home.join("projects");
+    let atlas = projects.join("atlas");
+    repository(&atlas);
+    let (_, server) =
+        server_with_roots(&home, CHANNEL, &[spelled(&projects)], Duration::ZERO).await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    client
+        .set_workspace_description(
+            &repository_id(&atlas.join(".git")),
+            Some(&atlas),
+            "Maps of everything.",
+        )
+        .await
+        .expect("describe the discovered Repository");
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+
+    let config_root = home.join("config");
+    std::fs::set_permissions(&config_root, std::fs::Permissions::from_mode(0o000))
+        .expect("seal the config root");
+    let _unseal = Unseal(config_root.clone());
+    // A superuser searches past any mode, so there is nothing to withhold.
+    if std::fs::metadata(config_root.join("suru.jsonc")).is_ok() {
+        return;
+    }
+    let (_, restarted) = server_beneath(&home, CHANNEL, Duration::ZERO).await;
+    restarted.workspace_discovery_settled().await;
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    assert_eq!(
+        standings(&client).await,
+        [(atlas.clone(), None)],
+        "a config root that cannot be searched takes nothing away"
+    );
+    assert_eq!(
+        description_at(&client, &atlas).await,
+        set("Maps of everything."),
+        "and the entry carries all it did"
+    );
+
+    drop(client);
+    restarted.shutdown().await.expect("shut down server");
+}

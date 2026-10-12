@@ -2316,8 +2316,20 @@ fn write_pin(
 ) -> Result<(), SettingsMutationError> {
     // The document a pin lands in is the one the loader reads back: the
     // highest-precedence document of the stack, or the primary name when the
-    // user has no Config Document yet.
-    let path = discover_documents(config_dir, &mut Vec::new())
+    // user has no Config Document yet. Where which one that is cannot be
+    // told, nothing is written.
+    let mut discovered = Vec::new();
+    let mut documents = discover_documents(config_dir, &mut discovered);
+    if let Some(untold) = discovered
+        .into_iter()
+        .find(|diagnostic| diagnostic.severity == SettingsDiagnosticSeverity::Error)
+    {
+        return Err(SettingsMutationError::Io {
+            path: untold.file,
+            message: untold.message,
+        });
+    }
+    let path = documents
         .pop()
         .unwrap_or_else(|| config_dir.join(PRIMARY_CONFIG_FILE));
     let existing = match fs::read_to_string(&path) {
@@ -2524,9 +2536,46 @@ fn discover_documents(
     config_dir: &Path,
     diagnostics: &mut Vec<SettingsDiagnostic>,
 ) -> Vec<PathBuf> {
+    discover_documents_by(config_dir, diagnostics, |path| match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    })
+}
+
+/// [`discover_documents`], each name told present or absent by `is_file`.
+/// A name that cannot be told either way — its directory cannot be
+/// searched, say — is an error of the stack as a whole rather than an
+/// absent document: which document wins cannot be known, so none is read,
+/// and the error says why, as a document that could not be read does.
+fn discover_documents_by(
+    config_dir: &Path,
+    diagnostics: &mut Vec<SettingsDiagnostic>,
+    is_file: impl Fn(&Path) -> std::io::Result<bool>,
+) -> Vec<PathBuf> {
     let primary = config_dir.join(PRIMARY_CONFIG_FILE);
     let fallback = config_dir.join(FALLBACK_CONFIG_FILE);
-    match (primary.is_file(), fallback.is_file()) {
+    let mut untold = false;
+    let mut present = |path: &Path| {
+        is_file(path).unwrap_or_else(|error| {
+            untold = true;
+            diagnostics.push(SettingsDiagnostic {
+                severity: SettingsDiagnosticSeverity::Error,
+                file: path.to_path_buf(),
+                key: None,
+                message: format!(
+                    "ignored, with every Config Document beside it, because whether it exists \
+                     could not be told: {error}"
+                ),
+            });
+            false
+        })
+    };
+    let found = (present(&primary), present(&fallback));
+    if untold {
+        return Vec::new();
+    }
+    match found {
         (true, true) => {
             diagnostics.push(SettingsDiagnostic {
                 severity: SettingsDiagnosticSeverity::Warning,
@@ -2669,6 +2718,56 @@ mod tests {
     use super::*;
 
     use crate::protocol::TranscriptSettings;
+
+    /// A Config Document name that cannot be told present or absent — its
+    /// directory cannot be searched, say — is an error of the whole stack,
+    /// so no document is read and the Roots it leaves are no word of the
+    /// user's; one that is simply not there is no error at all.
+    #[test]
+    fn a_document_name_that_cannot_be_told_present_or_absent_is_an_error_of_the_stack() {
+        let config_dir = Path::new("config");
+        let mut diagnostics = Vec::new();
+        let documents = discover_documents_by(config_dir, &mut diagnostics, |path| {
+            if path.ends_with(PRIMARY_CONFIG_FILE) {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(true)
+            }
+        });
+
+        assert_eq!(
+            documents,
+            Vec::<PathBuf>::new(),
+            "which document wins cannot be told, so none is read"
+        );
+        let [diagnostic] = diagnostics.as_slice() else {
+            panic!("one diagnostic says why: {diagnostics:?}");
+        };
+        assert_eq!(
+            (
+                diagnostic.severity,
+                diagnostic.file.as_path(),
+                diagnostic.key.as_deref()
+            ),
+            (
+                SettingsDiagnosticSeverity::Error,
+                config_dir.join(PRIMARY_CONFIG_FILE).as_path(),
+                None
+            )
+        );
+        let snapshot = SettingsSnapshot {
+            diagnostics,
+            ..SettingsSnapshot::default()
+        };
+        assert_eq!(workspace_roots_named_whole(&snapshot), None);
+
+        let mut diagnostics = Vec::new();
+        assert_eq!(
+            discover_documents_by(config_dir, &mut diagnostics, |_| Ok(false)),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(diagnostics, [], "no document there is no error");
+    }
 
     /// The JSON a pin writes into the Config Document, which is what the
     /// loader will read back and what a client shows.
