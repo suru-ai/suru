@@ -523,9 +523,15 @@ impl ScriptedClaude {
     /// Every launch the fixture has recorded, oldest first, with each one's arguments exactly as
     /// it received them. Unlike [`launch_arguments`](Self::launch_arguments), an empty argument and
     /// one carrying spaces both survive here.
+    ///
+    /// A launch is recorded once its line is whole: a line as long as a Sidekick's launch takes
+    /// the shell more than one write to append, and a read between them would find its arguments
+    /// cut short.
     pub fn exact_launches(&self) -> Vec<Launch> {
-        std::fs::read_to_string(&self.launches)
-            .unwrap_or_default()
+        let records = std::fs::read_to_string(&self.launches).unwrap_or_default();
+        records
+            .rsplit_once('\n')
+            .map_or("", |(whole, _)| whole)
             .lines()
             .filter_map(|record| record.split_once('\t'))
             .map(|(working_directory, arguments)| Launch {
