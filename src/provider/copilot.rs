@@ -43,6 +43,7 @@ mod transport;
 pub use runtime::CopilotRuntime;
 
 use super::{ProviderError, concise_remote_message};
+use crate::protocol::ProviderUnavailability;
 
 /// What the Log and failures call the Copilot harness server process.
 const COPILOT_HARNESS_NAME: &str = "Copilot CLI server";
@@ -64,6 +65,19 @@ const COPILOT_CLIENT_NAME: &str = "suru";
 
 /// What a Copilot failure is called when Copilot itself said nothing usable.
 const COPILOT_FAILURE_FALLBACK: &str = "Copilot Provider failed";
+
+/// What the user does outside Suru about each way Copilot can be unavailable. The install page is
+/// the installation guide the Copilot SDK's own troubleshooting sends a missing CLI to.
+fn copilot_fix(reason: ProviderUnavailability) -> &'static str {
+    match reason {
+        ProviderUnavailability::NotInstalled => {
+            "install the Copilot CLI from \
+             https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli"
+        }
+        ProviderUnavailability::NotSignedIn => "run `copilot login`",
+        ProviderUnavailability::IncompatibleVersion => "update the Copilot CLI",
+    }
+}
 
 fn copilot_error(message: impl AsRef<str>) -> ProviderError {
     ProviderError::new(concise_remote_message(

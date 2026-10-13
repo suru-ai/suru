@@ -1,7 +1,7 @@
 //! Claude's three unavailability conditions: a CLI that isn't installed, one below the version
 //! floor the wire is verified against, and one no user is signed in to. Each reaches the catalog as
-//! its own typed reason, each is found by a probe that never starts a Turn, and each clears on the
-//! refresh after the user fixes it outside Suru.
+//! its own typed reason with what fixes it beside, each is found by a probe that never starts a
+//! Turn, and each clears on the refresh after the user fixes it outside Suru.
 
 use crate::support::{
     CLAUDE_MODELS, CLAUDE_SUGGESTED_VERSION, SIGNED_IN_ACCOUNT, SIGNED_OUT_ACCOUNT, ScriptedClaude,
@@ -21,12 +21,18 @@ use suru::{
 };
 use tokio::time::Duration;
 
-/// The condition the Claude catalog reports, which every one of these tests reads the same way.
-fn condition(status: &ProviderCatalogStatus) -> (ProviderUnavailability, String) {
-    let ProviderCatalogStatus::Unavailable { reason, message } = status else {
+/// The condition the Claude catalog reports and what it says fixes it, which every one of these
+/// tests reads the same way.
+fn condition(status: &ProviderCatalogStatus) -> (ProviderUnavailability, String, String) {
+    let ProviderCatalogStatus::Unavailable {
+        reason,
+        message,
+        fix,
+    } = status
+    else {
         panic!("the Claude catalog reports a typed unavailability, got {status:?}");
     };
-    (*reason, message.clone())
+    (*reason, message.clone(), fix.clone())
 }
 
 /// Asserts the refresh after the user has fixed the condition outside Suru finds Claude usable
@@ -56,11 +62,15 @@ async fn a_missing_claude_binary_is_reported_as_not_installed_until_it_is_instal
         .list_models()
         .await
         .expect("the catalog request itself is answered");
-    let (reason, message) = condition(&claude_catalog(&catalog).status);
+    let (reason, message, fix) = condition(&claude_catalog(&catalog).status);
     assert_eq!(reason, ProviderUnavailability::NotInstalled);
     assert!(
         message.contains("could not launch"),
         "the condition names the CLI Suru could not launch, got: {message}"
+    );
+    assert_eq!(
+        fix, "install the Claude Code CLI from https://code.claude.com/docs/en/setup",
+        "the fix names the Claude Code documentation's install page"
     );
     assert_eq!(
         claude.launches(),
@@ -137,11 +147,15 @@ async fn a_cli_that_cannot_tell_suru_its_version_is_reported_as_incompatible() {
         .list_models()
         .await
         .expect("a CLI that refuses the question is an answer, not a crash");
-    let (reason, _) = condition(&claude_catalog(&catalog).status);
+    let (reason, _, fix) = condition(&claude_catalog(&catalog).status);
     assert_eq!(
         reason,
         ProviderUnavailability::IncompatibleVersion,
         "a CLI that will not say which version it is, is one Suru cannot vouch for"
+    );
+    assert_eq!(
+        fix, "update the Claude Code CLI",
+        "Suru cannot name the version that would answer, so the fix is to update"
     );
 
     server.shutdown().await.expect("shut the server down");
@@ -198,11 +212,15 @@ async fn a_cli_no_one_is_signed_in_to_is_reported_as_such_until_the_user_signs_i
         .list_models()
         .await
         .expect("the catalog request itself is answered");
-    let (reason, message) = condition(&claude_catalog(&catalog).status);
+    let (reason, message, fix) = condition(&claude_catalog(&catalog).status);
     assert_eq!(reason, ProviderUnavailability::NotSignedIn);
     assert!(
         message.contains("sign in"),
         "the condition says what the user does about it, got: {message}"
+    );
+    assert_eq!(
+        fix, "run `claude auth login`",
+        "the fix names the CLI's own login command"
     );
     assert_eq!(
         claude.control_subtypes(),

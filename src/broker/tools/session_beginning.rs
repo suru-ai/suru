@@ -36,8 +36,8 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::{
-    BrokerTool, BrokerTools, Choosable, ChosenOn, ToolCall, ToolRefusal, choosable, origins,
-    requested_selection_on, takes_only,
+    BrokerTool, BrokerTools, Choosable, ChosenOn, ToolCall, ToolRefusal, cannot_be_used_now,
+    choosable, origins, requested_selection_on, takes_only,
 };
 use crate::{
     protocol::{
@@ -532,8 +532,8 @@ fn landing_agent(
     };
     match choosable(hosted) {
         Choosable::Disabled => Err(unusable(off)),
-        Choosable::Unavailable { detail, .. } => {
-            Err(unusable(format!("cannot be used now: {detail}")))
+        Choosable::Unavailable { detail, fix, .. } => {
+            Err(unusable(cannot_be_used_now(&detail, fix.as_deref())))
         }
         Choosable::Models(mut models) => {
             if models.any(|model| model.id == selection.model) {

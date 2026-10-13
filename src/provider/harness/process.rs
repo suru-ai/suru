@@ -49,6 +49,10 @@ pub(crate) struct HarnessSpec {
     pub(crate) cwd: Option<std::path::PathBuf>,
     /// Variables set in the process's environment over those it inherits from Suru's.
     pub(crate) env: Vec<(OsString, OsString)>,
+    /// What the user does when `executable` is not there to launch: the Provider's own fix for
+    /// [`ProviderUnavailability::NotInstalled`], since only the Provider knows where its CLI is
+    /// installed from.
+    pub(crate) install_fix: &'static str,
 }
 
 /// The supervisor's handle into the transport running over the process it owns.
@@ -308,7 +312,7 @@ fn launch_failure(name: &str, spec: &HarnessSpec, error: &std::io::Error) -> Pro
     // fault of the run — every Provider launching a CLI reports it the same
     // typed way, so a client can say so instead of quoting an OS error.
     if error.kind() == std::io::ErrorKind::NotFound {
-        return failure.mark_unavailable(ProviderUnavailability::NotInstalled);
+        return failure.mark_unavailable(ProviderUnavailability::NotInstalled, spec.install_fix);
     }
     failure
 }
@@ -555,6 +559,7 @@ mod tests {
             name: "Fixture harness".to_owned(),
             cwd: None,
             env,
+            install_fix: "install the fixture harness",
         }
     }
 

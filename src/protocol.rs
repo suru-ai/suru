@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 103;
+pub const PROTOCOL_VERSION: u32 = 104;
 mod attachment;
 mod reading;
 mod relay;
@@ -323,7 +323,8 @@ pub enum ModelOptionValue {
 /// Why a Provider cannot be used right now. Each reason names a condition the
 /// user fixes outside Suru — installing the Provider's CLI, signing in to it,
 /// or moving to a version Suru speaks — which the next catalog refresh
-/// re-evaluates.
+/// re-evaluates. What the user does about it is the Provider's to say, so it
+/// travels beside the reason rather than being derived from it.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderUnavailability {
@@ -366,6 +367,12 @@ pub enum ProviderCatalogStatus {
     Unavailable {
         reason: ProviderUnavailability,
         message: String,
+        /// What the user does outside Suru to clear `reason`, as the
+        /// Provider's own Availability check names it — the page to install
+        /// its CLI from, the command that signs in to it — since only that
+        /// check knows what it looked for. An imperative the user can follow
+        /// as written, such as "run `copilot login`".
+        fix: String,
     },
     /// The user turned this Provider off, so Suru never consulted it: it lists
     /// no Models because none were asked for, and it reports no condition

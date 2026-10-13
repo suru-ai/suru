@@ -11,7 +11,7 @@ use tokio::{sync::watch, time::Duration};
 use super::{
     COPILOT_HARNESS_NAME, COPILOT_PROVIDER_ID, COPILOT_SERVER_ARGS, REASONING_EFFORT_OPTION_ID,
     catalog::model_descriptors,
-    copilot_error_context,
+    copilot_error_context, copilot_fix,
     errand::run_copilot_errand,
     session::{INTERRUPT_REQUEST_TIMEOUT, start_copilot_session},
     skills::CopilotSkills,
@@ -61,6 +61,7 @@ impl CopilotRuntime {
             name: COPILOT_HARNESS_NAME.to_owned(),
             cwd: None,
             env: Vec::new(),
+            install_fix: copilot_fix(ProviderUnavailability::NotInstalled),
         };
         Self {
             harness: SharedHarness::new(spec, CopilotConnector::new()),

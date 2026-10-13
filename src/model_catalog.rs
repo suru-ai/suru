@@ -99,7 +99,14 @@ impl CatalogState {
 /// itself went wrong — the typed condition the user fixes outside Suru.
 struct CatalogFailure {
     message: String,
-    unavailable: Option<ProviderUnavailability>,
+    unavailable: Option<CatalogUnavailability>,
+}
+
+/// The condition that left a Provider unusable, with what its own check said
+/// fixes it.
+struct CatalogUnavailability {
+    reason: ProviderUnavailability,
+    fix: String,
 }
 
 impl ModelCatalogService {
@@ -544,7 +551,12 @@ impl ProviderCatalog {
                 }
                 state.failure = Some(CatalogFailure {
                     message: error.to_string(),
-                    unavailable: error.unavailability(),
+                    unavailable: error.unavailability_with_fix().map(|(reason, fix)| {
+                        CatalogUnavailability {
+                            reason,
+                            fix: fix.to_owned(),
+                        }
+                    }),
                 });
             }
         }
@@ -687,12 +699,13 @@ fn catalog_status(state: &CatalogState) -> ProviderCatalogStatus {
             _,
             Some(CatalogFailure {
                 message,
-                unavailable: Some(reason),
+                unavailable: Some(CatalogUnavailability { reason, fix }),
             }),
             _,
         ) => ProviderCatalogStatus::Unavailable {
             reason: *reason,
             message: message.clone(),
+            fix: fix.clone(),
         },
         (_, _, true) => ProviderCatalogStatus::Refreshing,
         (Some(_), Some(failure), false) => ProviderCatalogStatus::Stale {
@@ -1024,6 +1037,7 @@ mod tests {
             ProviderError::unavailable(
                 ProviderUnavailability::NotSignedIn,
                 "sign in with the Copilot CLI: token ghp_secret was rejected",
+                "run `copilot login`",
             ),
         ));
         let service = ModelCatalogService::new(

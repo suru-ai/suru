@@ -1008,7 +1008,11 @@ fn unusable(catalog: &ModelCatalog) -> Option<String> {
                     reason
                     @ (ProviderUnavailability::NotInstalled | ProviderUnavailability::NotSignedIn),
                 message,
-            } => Some(format!("{provider} is {}: {message}", reason.label())),
+                fix,
+            } => Some(format!(
+                "{provider} is {}: {message}; {fix}",
+                reason.label()
+            )),
             ProviderCatalogStatus::Unavailable { message, .. }
             | ProviderCatalogStatus::Failed { message } => {
                 panic!("{provider} cannot be used: {message}")

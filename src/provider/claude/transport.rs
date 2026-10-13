@@ -32,11 +32,14 @@ use super::{
     claude_error,
     wire::{ControlRequest, ControlRequestEnvelope, ControlResponse},
 };
-use crate::provider::{
-    ProviderError, concise_remote_message,
-    harness::{
-        HarnessLink, HarnessSpec, ProcessGuard, ProcessRegistry, ProcessStdio,
-        spawn_harness_process, supervise_harness_process,
+use crate::{
+    protocol::ProviderUnavailability,
+    provider::{
+        ProviderError, concise_remote_message,
+        harness::{
+            HarnessLink, HarnessSpec, ProcessGuard, ProcessRegistry, ProcessStdio,
+            spawn_harness_process, supervise_harness_process,
+        },
     },
 };
 
@@ -247,6 +250,7 @@ impl StreamJsonTransport {
                 OsString::from(MAINTAIN_PROJECT_WORKING_DIR.0),
                 OsString::from(MAINTAIN_PROJECT_WORKING_DIR.1),
             )],
+            install_fix: super::claude_fix(ProviderUnavailability::NotInstalled),
         };
         let (process, ProcessStdio { stdin, stdout }) = spawn_harness_process(&spec).await?;
         let state = Arc::new(TransportState {

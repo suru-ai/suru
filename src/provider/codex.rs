@@ -21,6 +21,7 @@ mod wire;
 pub use session::CodexRuntime;
 
 use super::{ProviderError, concise_remote_message};
+use crate::protocol::ProviderUnavailability;
 
 /// What the Log and failures call the Codex harness server process.
 const CODEX_HARNESS_NAME: &str = "Codex app-server";
@@ -39,6 +40,19 @@ const DEFAULT_SERVICE_TIER_CHOICE_ID: &str = "default";
 
 /// What a Codex failure is called when Codex itself said nothing usable.
 const CODEX_FAILURE_FALLBACK: &str = "Codex Provider failed";
+
+/// What the user does outside Suru about each way Codex can be unavailable. The install page is
+/// the one the Codex CLI itself sends a user to when it cannot update itself. Codex's check finds
+/// only a CLI that is not installed today; the others stand ready for when it learns them (#547).
+fn codex_fix(reason: ProviderUnavailability) -> &'static str {
+    match reason {
+        ProviderUnavailability::NotInstalled => {
+            "install the Codex CLI from https://developers.openai.com/codex/cli/"
+        }
+        ProviderUnavailability::NotSignedIn => "run `codex login`",
+        ProviderUnavailability::IncompatibleVersion => "update the Codex CLI",
+    }
+}
 
 fn codex_error(message: impl AsRef<str>) -> ProviderError {
     ProviderError::new(concise_remote_message(

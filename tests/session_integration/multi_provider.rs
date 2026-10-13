@@ -593,7 +593,11 @@ async fn an_unavailable_provider_is_listed_with_its_reason_until_a_refresh_finds
         ProviderId::new("alpha"),
         "an unavailable Provider keeps its place in the catalog"
     );
-    let ProviderCatalogStatus::Unavailable { reason, message } = &catalog.providers[0].status
+    let ProviderCatalogStatus::Unavailable {
+        reason,
+        message,
+        fix,
+    } = &catalog.providers[0].status
     else {
         panic!(
             "the unavailable Provider carries a typed reason, got {:?}",
@@ -604,6 +608,10 @@ async fn an_unavailable_provider_is_listed_with_its_reason_until_a_refresh_finds
     assert!(
         message.contains("alpha"),
         "the reason keeps the Provider's own account of the condition, got {message:?}"
+    );
+    assert_eq!(
+        fix, "install the CLI",
+        "and what the Provider said fixes it travels beside the reason"
     );
     assert_eq!(catalog.providers[1].status, ProviderCatalogStatus::Fresh);
 

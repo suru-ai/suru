@@ -26,7 +26,7 @@ use super::{
 use crate::{
     protocol::{
         AgentSelection, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
-        ModelOptionValue, ProviderId,
+        ModelOptionValue, ProviderId, ProviderUnavailability,
     },
     provider::{
         ProviderErrand, ProviderError,
@@ -96,6 +96,7 @@ pub(super) async fn run(
         name: super::CODEX_ONE_SHOT_NAME.to_owned(),
         cwd: Some(errand.execution_directory),
         env: Vec::new(),
+        install_fix: super::codex_fix(ProviderUnavailability::NotInstalled),
     };
     let finished = run_harness_to_completion(&spec, errand.prompt)
         .await

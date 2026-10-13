@@ -639,9 +639,9 @@ impl SettingsPanel {
                 ProviderCatalogStatus::Warning { message } => {
                     (RowAvailability::Warning, Some(message.clone()))
                 }
-                ProviderCatalogStatus::Unavailable { reason, message } => {
-                    (RowAvailability::Unavailable(*reason), Some(message.clone()))
-                }
+                ProviderCatalogStatus::Unavailable {
+                    reason, message, ..
+                } => (RowAvailability::Unavailable(*reason), Some(message.clone())),
                 ProviderCatalogStatus::Failed { message } => {
                     (RowAvailability::Failed, Some(message.clone()))
                 }

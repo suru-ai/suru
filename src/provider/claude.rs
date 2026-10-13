@@ -46,7 +46,7 @@ pub use runtime::ClaudeRuntime;
 
 use std::ffi::OsString;
 
-use crate::protocol::{AgentSelection, ModelOptionValue};
+use crate::protocol::{AgentSelection, ModelOptionValue, ProviderUnavailability};
 
 use super::{ProviderError, concise_remote_message};
 
@@ -67,6 +67,18 @@ const REASONING_EFFORT_OPTION_ID: &str = "reasoning_effort";
 
 /// What a Claude failure is called when the CLI itself said nothing usable.
 const CLAUDE_FAILURE_FALLBACK: &str = "Claude Provider failed";
+
+/// What the user does outside Suru about each way Claude can be unavailable. The install page is the
+/// Claude Code documentation's own, and the login command is the one `claude auth --help` lists.
+fn claude_fix(reason: ProviderUnavailability) -> &'static str {
+    match reason {
+        ProviderUnavailability::NotInstalled => {
+            "install the Claude Code CLI from https://code.claude.com/docs/en/setup"
+        }
+        ProviderUnavailability::NotSignedIn => "run `claude auth login`",
+        ProviderUnavailability::IncompatibleVersion => "update the Claude Code CLI",
+    }
+}
 
 fn claude_error(message: impl AsRef<str>) -> ProviderError {
     ProviderError::new(concise_remote_message(

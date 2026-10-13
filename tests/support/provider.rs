@@ -20,6 +20,16 @@ use suru::provider::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
+/// What a controlled Provider says fixes each way it can be unavailable, as a
+/// real Provider's own check names the fix for what it found.
+fn controlled_fix(reason: ProviderUnavailability) -> &'static str {
+    match reason {
+        ProviderUnavailability::NotInstalled => "install the CLI",
+        ProviderUnavailability::NotSignedIn => "sign in to the CLI",
+        ProviderUnavailability::IncompatibleVersion => "update the CLI",
+    }
+}
+
 pub struct ControlledProvider {
     starts: mpsc::UnboundedReceiver<StartRequest>,
     errands: mpsc::UnboundedReceiver<ErrandRequest>,
@@ -642,10 +652,15 @@ impl StartRequest {
     }
 
     /// Fails the startup the way a Provider whose CLI the user has yet to
-    /// install or sign in to does: with the condition typed on the failure.
+    /// install or sign in to does: with the condition typed on the failure,
+    /// and what fixes it beside.
     pub fn fail_unavailable(self, reason: ProviderUnavailability, message: impl Into<String>) {
         self.response
-            .send(Err(ProviderError::unavailable(reason, message)))
+            .send(Err(ProviderError::unavailable(
+                reason,
+                message,
+                controlled_fix(reason),
+            )))
             .unwrap_or_else(|_| panic!("Provider startup response remains connected"));
     }
 }
@@ -1154,6 +1169,7 @@ impl ProviderRuntime for ControlledProviderRuntime {
                 Some(reason) => Err(ProviderError::unavailable(
                     reason,
                     format!("the {provider} CLI is {}", reason.label()),
+                    controlled_fix(reason),
                 )),
                 None => Ok(ProviderModelDiscovery::new(models)),
             }

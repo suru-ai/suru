@@ -25,7 +25,7 @@ use std::{
 use tokio::time::{Duration, Instant};
 
 use super::{
-    claude_error, claude_error_context,
+    claude_error, claude_error_context, claude_fix,
     transport::{ClaudeConnection, ClaudeSettingSources, StreamJsonTransport},
     wire::{ControlRequest, NativeAccount, NativeBinaryVersion, NativeInitialize},
 };
@@ -186,7 +186,10 @@ async fn verify_version(
 /// version is theirs to fix: reported this way it reads as an actionable condition rather than as a
 /// Provider that broke.
 fn version_drift(message: impl AsRef<str>) -> ProviderError {
-    claude_error(message).mark_unavailable(ProviderUnavailability::IncompatibleVersion)
+    claude_error(message).mark_unavailable(
+        ProviderUnavailability::IncompatibleVersion,
+        claude_fix(ProviderUnavailability::IncompatibleVersion),
+    )
 }
 
 /// Fails with the typed not-signed-in condition unless the CLI holds credentials it can work with
@@ -217,6 +220,7 @@ async fn verify_signed_in(
     Err(ProviderError::unavailable(
         ProviderUnavailability::NotSignedIn,
         "sign in with the Claude Code CLI",
+        claude_fix(ProviderUnavailability::NotSignedIn),
     ))
 }
 

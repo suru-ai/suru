@@ -2109,6 +2109,7 @@ fn an_unavailable_provider_names_its_reason_and_the_headline_carries_the_message
             ProviderCatalogStatus::Unavailable {
                 reason: ProviderUnavailability::NotInstalled,
                 message: "The codex CLI is not on PATH; install it and try again".to_owned(),
+                fix: "fix the CLI".to_owned(),
             },
         )],
     );
@@ -2276,6 +2277,7 @@ fn a_disabled_provider_is_never_read_and_makes_no_availability_claim() {
             ProviderCatalogStatus::Unavailable {
                 reason: ProviderUnavailability::NotSignedIn,
                 message: "the codex CLI is not signed in".to_owned(),
+                fix: "fix the CLI".to_owned(),
             },
         )],
     );
@@ -2410,6 +2412,7 @@ fn turning_a_provider_off_after_a_read_silences_its_row_and_the_headline() {
             ProviderCatalogStatus::Unavailable {
                 reason: ProviderUnavailability::NotSignedIn,
                 message: "the codex CLI is not signed in".to_owned(),
+                fix: "fix the CLI".to_owned(),
             },
         )],
     );
@@ -3468,6 +3471,7 @@ fn an_edit_the_server_refuses_says_so_and_leaves_the_row_where_it_was() {
             ProviderCatalogStatus::Unavailable {
                 reason: ProviderUnavailability::NotInstalled,
                 message: "the codex CLI is not on PATH".to_owned(),
+                fix: "fix the CLI".to_owned(),
             },
         )],
     );

@@ -416,7 +416,7 @@ pub struct ProviderError {
     kind: ProviderErrorKind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ProviderErrorKind {
     Failure,
     SelectionRejected,
@@ -425,10 +425,13 @@ enum ProviderErrorKind {
     /// The Provider knows the native request was already resolved elsewhere.
     DecisionWithdrawn,
     /// The Provider itself cannot be used yet, for a reason the user fixes
-    /// outside Suru. Carried on the error so whatever asked the runtime to
-    /// work — Model discovery above all — can report the condition rather
-    /// than a bare failure.
-    Unavailable(ProviderUnavailability),
+    /// outside Suru, and what the Provider says fixes it. Carried on the error
+    /// so whatever asked the runtime to work — Model discovery above all — can
+    /// report the condition rather than a bare failure.
+    Unavailable {
+        reason: ProviderUnavailability,
+        fix: String,
+    },
 }
 
 impl ProviderError {
@@ -488,11 +491,21 @@ impl ProviderError {
         }
     }
 
-    pub fn unavailable(reason: ProviderUnavailability, message: impl Into<String>) -> Self {
+    /// The Provider cannot be used until the user fixes `reason` outside Suru,
+    /// which they do as `fix` says: the Provider's own check names it, since
+    /// only that check knows which CLI and which account it looked for.
+    pub fn unavailable(
+        reason: ProviderUnavailability,
+        message: impl Into<String>,
+        fix: impl Into<String>,
+    ) -> Self {
         Self {
             message: message.into(),
             session_lost: false,
-            kind: ProviderErrorKind::Unavailable(reason),
+            kind: ProviderErrorKind::Unavailable {
+                reason,
+                fix: fix.into(),
+            },
         }
     }
 
@@ -511,8 +524,14 @@ impl ProviderError {
 
     /// The typed reason the Provider is unusable, when the failure carries one.
     pub(crate) fn unavailability(&self) -> Option<ProviderUnavailability> {
-        match self.kind {
-            ProviderErrorKind::Unavailable(reason) => Some(reason),
+        self.unavailability_with_fix().map(|(reason, _)| reason)
+    }
+
+    /// The typed reason the Provider is unusable and what the Provider said
+    /// fixes it, when the failure carries one.
+    pub(crate) fn unavailability_with_fix(&self) -> Option<(ProviderUnavailability, &str)> {
+        match &self.kind {
+            ProviderErrorKind::Unavailable { reason, fix } => Some((*reason, fix)),
             ProviderErrorKind::Failure
             | ProviderErrorKind::SelectionRejected
             | ProviderErrorKind::QuestionnaireRejected
@@ -521,8 +540,17 @@ impl ProviderError {
         }
     }
 
-    pub(crate) fn mark_unavailable(mut self, reason: ProviderUnavailability) -> Self {
-        self.kind = ProviderErrorKind::Unavailable(reason);
+    /// Reclassifies the failure as the Provider being unusable for `reason`,
+    /// which the user clears as `fix` says.
+    pub(crate) fn mark_unavailable(
+        mut self,
+        reason: ProviderUnavailability,
+        fix: impl Into<String>,
+    ) -> Self {
+        self.kind = ProviderErrorKind::Unavailable {
+            reason,
+            fix: fix.into(),
+        };
         self
     }
 

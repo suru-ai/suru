@@ -297,6 +297,7 @@ STUBBORN_TAIL
                 name: "Fixture harness".to_owned(),
                 cwd: None,
                 env: Vec::new(),
+                install_fix: "install the fixture harness",
             }
         }
 

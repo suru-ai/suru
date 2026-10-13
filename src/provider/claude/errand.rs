@@ -26,9 +26,12 @@ use std::ffi::OsString;
 use serde_json::Value;
 
 use super::{claude_error, claude_error_context, wire::ResultMessage};
-use crate::provider::{
-    ProviderErrand, ProviderError,
-    harness::{HarnessSpec, run_harness_to_completion},
+use crate::{
+    protocol::ProviderUnavailability,
+    provider::{
+        ProviderErrand, ProviderError,
+        harness::{HarnessSpec, run_harness_to_completion},
+    },
 };
 
 /// What every failure of a Claude Errand is called, so the Log names the same thing whether the CLI
@@ -68,6 +71,7 @@ pub(super) async fn run_claude_errand(
         name: super::CLAUDE_ONE_SHOT_NAME.to_owned(),
         cwd: Some(errand.execution_directory),
         env: Vec::new(),
+        install_fix: super::claude_fix(ProviderUnavailability::NotInstalled),
     };
     let finished = run_harness_to_completion(&spec, errand.prompt)
         .await

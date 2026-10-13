@@ -1,6 +1,7 @@
 //! Copilot's three unavailability conditions: a CLI that isn't installed, one holding no
 //! credentials, and one speaking a protocol version Suru does not. Each reaches the catalog as its
-//! own typed reason, and each clears on the refresh after the user fixes it outside Suru. Beside
+//! own typed reason with what fixes it beside, and each clears on the refresh after the user fixes
+//! it outside Suru. Beside
 //! them, the one way a signed-in CLI must never read as unavailable: credentials it keeps to
 //! itself.
 
@@ -13,13 +14,22 @@ use suru::{
     protocol::{ProviderCatalogStatus, ProviderUnavailability},
 };
 
-/// The condition the Copilot catalog reports, which every one of these tests reads the same way.
-fn condition(status: &ProviderCatalogStatus) -> (ProviderUnavailability, String) {
-    let ProviderCatalogStatus::Unavailable { reason, message } = status else {
+/// The condition the Copilot catalog reports and what it says fixes it, which every one of these
+/// tests reads the same way.
+fn condition(status: &ProviderCatalogStatus) -> (ProviderUnavailability, String, String) {
+    let ProviderCatalogStatus::Unavailable {
+        reason,
+        message,
+        fix,
+    } = status
+    else {
         panic!("the Copilot catalog reports a typed unavailability, got {status:?}");
     };
-    (*reason, message.clone())
+    (*reason, message.clone(), fix.clone())
 }
+
+/// What Copilot says fixes a CLI that is too old or too new for Suru, however it gave itself away.
+const UPDATE_THE_CLI: &str = "update the Copilot CLI";
 
 /// Asserts the refresh after the user has fixed the condition outside Suru finds Copilot usable
 /// again, which is the recovery every one of these conditions shares.
@@ -48,11 +58,17 @@ async fn a_copilot_cli_that_is_not_installed_is_reported_as_such_until_it_is_ins
         .list_models()
         .await
         .expect("the catalog request itself is answered");
-    let (reason, message) = condition(&copilot_catalog(&catalog).status);
+    let (reason, message, fix) = condition(&copilot_catalog(&catalog).status);
     assert_eq!(reason, ProviderUnavailability::NotInstalled);
     assert!(
         message.contains("copilot"),
         "the condition names the CLI Suru could not launch, got: {message}"
+    );
+    assert_eq!(
+        fix,
+        "install the Copilot CLI from \
+         https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli",
+        "the fix names GitHub's own installation guide"
     );
     assert_eq!(
         copilot.launches(),
@@ -82,11 +98,15 @@ async fn a_cli_holding_no_credentials_is_reported_as_not_signed_in_until_the_use
         .list_models()
         .await
         .expect("the catalog request itself is answered");
-    let (reason, message) = condition(&copilot_catalog(&catalog).status);
+    let (reason, message, fix) = condition(&copilot_catalog(&catalog).status);
     assert_eq!(reason, ProviderUnavailability::NotSignedIn);
     assert!(
         message.contains("sign in"),
         "the condition says what the user does about it, got: {message}"
+    );
+    assert_eq!(
+        fix, "run `copilot login`",
+        "the fix names the CLI's own login command"
     );
     assert_eq!(
         copilot.methods(),
@@ -163,11 +183,15 @@ async fn a_cli_speaking_a_protocol_suru_does_not_is_reported_as_an_incompatible_
         .list_models()
         .await
         .expect("a protocol mismatch is an answer, not a crash");
-    let (reason, message) = condition(&copilot_catalog(&catalog).status);
+    let (reason, message, fix) = condition(&copilot_catalog(&catalog).status);
     assert_eq!(reason, ProviderUnavailability::IncompatibleVersion);
     assert!(
         message.contains("version"),
         "the condition names the version drift, got: {message}"
+    );
+    assert_eq!(
+        fix, UPDATE_THE_CLI,
+        "Suru cannot name a version that would speak its protocol, so the fix is to update"
     );
 
     copilot.upgrade();
@@ -197,12 +221,16 @@ async fn a_cli_too_old_for_the_sign_in_query_is_reported_as_an_incompatible_vers
         .list_models()
         .await
         .expect("a CLI that predates the query is an answer, not a crash");
-    let (reason, _) = condition(&copilot_catalog(&catalog).status);
+    let (reason, _, fix) = condition(&copilot_catalog(&catalog).status);
     assert_eq!(
         reason,
         ProviderUnavailability::IncompatibleVersion,
         "a CLI too old to answer the sign-in query reads as version drift the handshake let \
          through, rather than as a Provider that broke"
+    );
+    assert_eq!(
+        fix, UPDATE_THE_CLI,
+        "and is fixed the way any other drift is"
     );
 
     server.shutdown().await.expect("shut the server down");

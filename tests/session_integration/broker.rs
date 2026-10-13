@@ -612,12 +612,13 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
                     "available": false,
                     "reason": "not_signed_in",
                     "detail": "the copilot CLI is not signed in",
+                    "fix": "sign in to the CLI",
                     "models": [],
                 },
             ],
         }),
         "every hosted Provider is listed in the hosted order; the unavailable one \
-         keeps its place with its reason and offers no Model"
+         keeps its place with its reason and what fixes it, and offers no Model"
     );
 
     let refused = client
@@ -1694,7 +1695,8 @@ async fn a_spawn_on_a_provider_or_model_that_cannot_be_chosen_is_refused_in_word
         ),
         (
             researcher("copilot", "gpt-4.1", json!({})),
-            "Provider `copilot` cannot be used now: the copilot CLI is not signed in",
+            "Provider `copilot` cannot be used now: the copilot CLI is not signed in; to fix it, \
+             the user can sign in to the CLI. Choose another Provider.",
         ),
         (
             researcher("gemini", "pro", json!({})),

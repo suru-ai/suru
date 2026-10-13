@@ -1330,6 +1330,7 @@ fn model_picker_shows_an_unavailable_provider_with_its_reason_and_refuses_select
                     status: ProviderCatalogStatus::Unavailable {
                         reason: ProviderUnavailability::NotInstalled,
                         message: "could not launch Codex app-server `codex`".to_owned(),
+                        fix: "fix the CLI".to_owned(),
                     },
                 }],
             },
@@ -1455,6 +1456,7 @@ fn model_picker_draws_no_row_at_all_for_a_provider_the_user_turned_off() {
                         status: ProviderCatalogStatus::Unavailable {
                             reason: ProviderUnavailability::NotInstalled,
                             message: "could not launch the Copilot CLI".to_owned(),
+                            fix: "fix the CLI".to_owned(),
                         },
                     },
                     ProviderModelCatalog {
@@ -1548,6 +1550,7 @@ fn model_picker_keeps_an_unavailable_provider_with_no_models_in_the_list() {
                         status: ProviderCatalogStatus::Unavailable {
                             reason: ProviderUnavailability::NotInstalled,
                             message: "could not launch Codex app-server `codex`".to_owned(),
+                            fix: "fix the CLI".to_owned(),
                         },
                     },
                     ProviderModelCatalog {
@@ -1629,6 +1632,7 @@ fn model_picker_shows_provider_display_names_from_the_catalog() {
                         status: ProviderCatalogStatus::Unavailable {
                             reason: ProviderUnavailability::NotSignedIn,
                             message: "run `copilot` to sign in".to_owned(),
+                            fix: "fix the CLI".to_owned(),
                         },
                     },
                 ],

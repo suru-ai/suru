@@ -138,7 +138,10 @@ fn version_drift(error: &impl std::fmt::Display) -> ProviderError {
     copilot_error(format!(
         "Copilot CLI server speaks another protocol: {error}"
     ))
-    .mark_unavailable(ProviderUnavailability::IncompatibleVersion)
+    .mark_unavailable(
+        ProviderUnavailability::IncompatibleVersion,
+        super::copilot_fix(ProviderUnavailability::IncompatibleVersion),
+    )
 }
 
 /// The live connection to one Copilot CLI server process: the SDK client every demand speaks
@@ -241,6 +244,7 @@ impl CopilotConnection {
         Err(ProviderError::unavailable(
             ProviderUnavailability::NotSignedIn,
             signed_out_message(auth.auth_errors.unwrap_or_default()),
+            super::copilot_fix(ProviderUnavailability::NotSignedIn),
         ))
     }
 

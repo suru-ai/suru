@@ -584,7 +584,10 @@ when it can be used now, false when it cannot, null when it is turned off and \
 so was never checked); \"reason\" and \"detail\" when \"available\" is false, \
 where reason is one of \"not_installed\", \"not_signed_in\", \
 \"incompatible_version\", \"catalog_failed\" or \"checking\" and detail says \
-what to tell the user; and \"models\", empty unless the Provider is available. \
+what to tell the user; \"fix\" beside them for not_installed, not_signed_in and \
+incompatible_version, saying what the user does to fix it, such as a command \
+to run, for you to pass on; and \"models\", empty unless the Provider is \
+available. \
 Each model has \"id\", \"name\", \"description\", \"default\" (true for the \
 Model the Provider uses unless told otherwise) and \"options\". Each Model \
 Option has \"id\", \"name\" and \"type\": a \"select\" option has \"choices\" \
@@ -1531,9 +1534,10 @@ pub(super) fn requested_selection_on(
                 ),
             }));
         }
-        Choosable::Unavailable { detail, .. } => {
+        Choosable::Unavailable { detail, fix, .. } => {
             return Err(ToolRefusal::new(format!(
-                "Provider `{provider}` cannot be used now: {detail} Choose another Provider."
+                "Provider `{provider}` {} Choose another Provider.",
+                cannot_be_used_now(&detail, fix.as_deref())
             )));
         }
         Choosable::Models(models) => models,
@@ -1656,6 +1660,8 @@ struct ListedProvider {
     reason: Option<UnavailableReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix: Option<String>,
     models: Vec<ListedModel>,
 }
 
@@ -1736,10 +1742,12 @@ enum Choosable<'a> {
     /// The user has turned the Provider off, so Suru never checked it.
     Disabled,
     /// It cannot be used now, for the reason given, which says what to tell
-    /// the user.
+    /// the user, and — where the Provider named one — what the user does to
+    /// fix it.
     Unavailable {
         reason: UnavailableReason,
         detail: String,
+        fix: Option<String>,
     },
     /// It can be used now, and these are the Models it will run.
     Models(Box<dyn Iterator<Item = &'a ModelDescriptor> + 'a>),
@@ -1748,13 +1756,19 @@ enum Choosable<'a> {
 fn choosable(catalog: &ProviderModelCatalog) -> Choosable<'_> {
     match &catalog.status {
         ProviderCatalogStatus::Disabled => Choosable::Disabled,
-        ProviderCatalogStatus::Unavailable { reason, message } => Choosable::Unavailable {
+        ProviderCatalogStatus::Unavailable {
+            reason,
+            message,
+            fix,
+        } => Choosable::Unavailable {
             reason: UnavailableReason::from(*reason),
             detail: message.clone(),
+            fix: Some(fix.clone()),
         },
         ProviderCatalogStatus::Failed { message } => Choosable::Unavailable {
             reason: UnavailableReason::CatalogFailed,
             detail: message.clone(),
+            fix: None,
         },
         // A first discovery still in flight has nothing to offer yet; a
         // re-check of Models already known leaves them selectable.
@@ -1762,6 +1776,7 @@ fn choosable(catalog: &ProviderModelCatalog) -> Choosable<'_> {
             reason: UnavailableReason::Checking,
             detail: "Suru is still asking this Provider for its Models; ask again shortly."
                 .to_owned(),
+            fix: None,
         },
         ProviderCatalogStatus::Fresh
         | ProviderCatalogStatus::Warning { .. }
@@ -1782,23 +1797,43 @@ fn choosable_models(catalog: &ProviderModelCatalog) -> impl Iterator<Item = &Mod
 }
 
 fn listed_provider(catalog: ProviderModelCatalog) -> ListedProvider {
-    let listed = |available, reason, detail, models| ListedProvider {
+    let listed = |available, reason, detail, fix, models| ListedProvider {
         id: catalog.provider.clone(),
         name: catalog.display_name.clone(),
         enabled: !matches!(catalog.status, ProviderCatalogStatus::Disabled),
         available,
         reason,
         detail,
+        fix,
         models,
     };
     match choosable(&catalog) {
-        Choosable::Disabled => listed(None, None, None, Vec::new()),
-        Choosable::Unavailable { reason, detail } => {
-            listed(Some(false), Some(reason), Some(detail), Vec::new())
-        }
-        Choosable::Models(models) => {
-            listed(Some(true), None, None, models.map(listed_model).collect())
-        }
+        Choosable::Disabled => listed(None, None, None, None, Vec::new()),
+        Choosable::Unavailable {
+            reason,
+            detail,
+            fix,
+        } => listed(Some(false), Some(reason), Some(detail), fix, Vec::new()),
+        Choosable::Models(models) => listed(
+            Some(true),
+            None,
+            None,
+            None,
+            models.map(listed_model).collect(),
+        ),
+    }
+}
+
+/// What a refusal says of a Provider that cannot be used now: why, as
+/// `detail` puts it, and what the user does to fix it where the Provider named
+/// that, so the Agent refused can pass both on.
+fn cannot_be_used_now(detail: &str, fix: Option<&str>) -> String {
+    match fix {
+        Some(fix) => format!(
+            "cannot be used now: {}; to fix it, the user can {fix}.",
+            detail.trim_end_matches('.')
+        ),
+        None => format!("cannot be used now: {detail}"),
     }
 }
 
@@ -1955,24 +1990,28 @@ mod tests {
     #[test]
     fn a_provider_that_cannot_be_used_says_why_and_offers_nothing() {
         let known = vec![model("runs", ModelAvailability::Available)];
-        for (status, models, reason, detail) in [
+        for (status, models, reason, detail, fix) in [
             (
                 ProviderCatalogStatus::Unavailable {
                     reason: ProviderUnavailability::NotInstalled,
-                    message: "install the Codex CLI".to_owned(),
+                    message: "could not launch `codex`".to_owned(),
+                    fix: "install the Codex CLI".to_owned(),
                 },
                 known.clone(),
                 "not_installed",
-                "install the Codex CLI",
+                "could not launch `codex`",
+                Some("install the Codex CLI"),
             ),
             (
                 ProviderCatalogStatus::Unavailable {
                     reason: ProviderUnavailability::IncompatibleVersion,
-                    message: "upgrade the Codex CLI".to_owned(),
+                    message: "the Codex CLI speaks another protocol".to_owned(),
+                    fix: "update the Codex CLI".to_owned(),
                 },
                 Vec::new(),
                 "incompatible_version",
-                "upgrade the Codex CLI",
+                "the Codex CLI speaks another protocol",
+                Some("update the Codex CLI"),
             ),
             (
                 ProviderCatalogStatus::Failed {
@@ -1981,18 +2020,28 @@ mod tests {
                 Vec::new(),
                 "catalog_failed",
                 "model/list timed out",
+                None,
             ),
         ] {
             let listed = listed(status.clone(), models);
             assert_eq!(listed["available"], json!(false), "{status:?}");
             assert_eq!(listed["reason"], json!(reason), "{status:?}");
             assert_eq!(listed["detail"], json!(detail), "{status:?}");
+            assert_eq!(
+                listed.get("fix"),
+                fix.map(|fix| json!(fix)).as_ref(),
+                "{status:?}"
+            );
             assert_eq!(listed["models"], json!([]), "{status:?}");
         }
 
         let checking = listed(ProviderCatalogStatus::Refreshing, Vec::new());
         assert_eq!(checking["available"], json!(false));
         assert_eq!(checking["reason"], json!("checking"));
+        assert!(
+            checking.get("fix").is_none(),
+            "Suru names no fix for a Provider it is still asking"
+        );
     }
 
     #[test]
@@ -2434,12 +2483,14 @@ mod tests {
             (
                 &spawnable(ProviderCatalogStatus::Unavailable {
                     reason: ProviderUnavailability::NotSignedIn,
-                    message: "sign in to the Codex CLI.".to_owned(),
+                    message: "the Codex CLI holds no credentials.".to_owned(),
+                    fix: "run `codex login`".to_owned(),
                 }),
                 "codex",
                 "runs",
                 json!({}),
-                "Provider `codex` cannot be used now: sign in to the Codex CLI. Choose another Provider.",
+                "Provider `codex` cannot be used now: the Codex CLI holds no credentials; to fix \
+                 it, the user can run `codex login`. Choose another Provider.",
             ),
             (
                 &catalog(ProviderCatalogStatus::Refreshing, Vec::new()),

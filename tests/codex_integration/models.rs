@@ -1114,8 +1114,9 @@ async fn generic_codex_turn_rejection_does_not_mark_the_model_unavailable() {
 }
 
 /// Issue #116: a Codex CLI that isn't installed is a condition the user fixes
-/// outside Suru, so the catalog reports it as typed unavailability and the next
-/// refresh clears it without a restart.
+/// outside Suru, so the catalog reports it as typed unavailability, with where
+/// to install it from beside it, and the next refresh clears it without a
+/// restart.
 #[tokio::test]
 async fn a_missing_codex_binary_is_reported_as_a_provider_that_is_not_installed() {
     let codex = ScriptedCodex::new(MODEL_CATALOG_CODEX);
@@ -1140,7 +1141,11 @@ async fn a_missing_codex_binary_is_reported_as_a_provider_that_is_not_installed(
         .list_models()
         .await
         .expect("the catalog reports the condition rather than failing the call");
-    let ProviderCatalogStatus::Unavailable { reason, message } = &missing.providers[0].status
+    let ProviderCatalogStatus::Unavailable {
+        reason,
+        message,
+        fix,
+    } = &missing.providers[0].status
     else {
         panic!(
             "a missing Codex binary is typed unavailability, got {:?}",
@@ -1151,6 +1156,10 @@ async fn a_missing_codex_binary_is_reported_as_a_provider_that_is_not_installed(
     assert!(
         message.contains("could not launch"),
         "the reason keeps Codex's own account of the condition, got {message:?}"
+    );
+    assert_eq!(
+        fix, "install the Codex CLI from https://developers.openai.com/codex/cli/",
+        "the fix names the page the Codex CLI itself sends a user to install from"
     );
     assert!(missing.providers[0].models.is_empty());
 

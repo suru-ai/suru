@@ -978,11 +978,13 @@ async fn a_landing_agent_that_cannot_be_used_is_refused_before_anything_is_begun
             refusal.starts_with(
                 "The user's Landing would begin the Session with Provider `codex`, which cannot \
                  be used now:"
-            ) && refusal.ends_with(
-                "Choose another Agent with `agent_selection`; list_providers says which may be \
-                 chosen."
-            ),
-            "a defaulted Agent is held to what a chosen one is: {refusal}"
+            ) && refusal.contains("to fix it, the user can sign in to the CLI.")
+                && refusal.ends_with(
+                    "Choose another Agent with `agent_selection`; list_providers says which may \
+                     be chosen."
+                ),
+            "a defaulted Agent is held to what a chosen one is, and the Sidekick is told what \
+             fixes the Provider so it can pass that on: {refusal}"
         );
     }
     assert!(

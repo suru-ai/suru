@@ -858,12 +858,12 @@ fn provider_condition(status: &ProviderCatalogStatus) -> Option<ProviderConditio
         ProviderCatalogStatus::Stale { message } | ProviderCatalogStatus::Failed { message } => {
             Some(ProviderCondition::Failing(message))
         }
-        ProviderCatalogStatus::Unavailable { reason, message } => {
-            Some(ProviderCondition::Unavailable {
-                reason: *reason,
-                message,
-            })
-        }
+        ProviderCatalogStatus::Unavailable {
+            reason, message, ..
+        } => Some(ProviderCondition::Unavailable {
+            reason: *reason,
+            message,
+        }),
         // A Provider the user turned off puts nothing in the list — not even a
         // reason, because Suru never looked for one.
         ProviderCatalogStatus::Fresh

@@ -39,13 +39,16 @@ use super::{
         TurnStartedParams, user_message_text,
     },
 };
-use crate::provider::{
-    ProviderError,
-    harness::{
-        HarnessLink, HarnessSpec, ProcessGuard, ProcessRegistry, ProcessStdio,
-        spawn_harness_process, supervise_harness_process,
+use crate::{
+    protocol::ProviderUnavailability,
+    provider::{
+        ProviderError,
+        harness::{
+            HarnessLink, HarnessSpec, ProcessGuard, ProcessRegistry, ProcessStdio,
+            spawn_harness_process, supervise_harness_process,
+        },
+        version::SuggestedCliVersion,
     },
-    version::SuggestedCliVersion,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -225,6 +228,7 @@ impl JsonRpcTransport {
             name: super::CODEX_HARNESS_NAME.to_owned(),
             cwd: None,
             env: Vec::new(),
+            install_fix: super::codex_fix(ProviderUnavailability::NotInstalled),
         };
         let (process, ProcessStdio { stdin, stdout }) = spawn_harness_process(&spec).await?;
         let (events, notifications) = mpsc::unbounded_channel();
