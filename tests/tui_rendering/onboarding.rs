@@ -5,9 +5,9 @@
 use std::{collections::HashSet, path::Path};
 
 use crate::support::{
-    connected_application, deliver_settings, enter_session, fixture_instance_id, model_descriptor,
-    ready_health, rendered_application_buffer, rendered_application_rows_at, text_position,
-    type_terminal_text, workspace_dir,
+    MutatesSetting, connected_application, deliver_settings, enter_session, fixture_instance_id,
+    model_descriptor, ready_health, rendered_application_buffer, rendered_application_rows_at,
+    text_position, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -26,7 +26,7 @@ use suru::{
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
-        TerminalFacts,
+        SettingRequest, TerminalFacts,
     },
 };
 
@@ -365,15 +365,11 @@ fn finishing_the_third_step_marks_the_server_onboarded_and_closes() {
     );
     assert!(screen(&application).contains("Step 3 of 3"));
     press(&mut application, KeyCode::Down);
+    let pin = finish_with(&mut application, true);
     assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        pins_show_icons(true),
-        "the answer is pinned first"
-    );
-    assert_eq!(
-        acknowledge_pin(&mut application, true),
+        acknowledge(&mut application, pin, true),
         ApplicationTransition::MarkOnboarded,
-        "and the mark follows once it lands"
+        "the mark follows the pin once it lands"
     );
     assert!(!onboarding_shown(&application), "{}", screen(&application));
 }
@@ -560,11 +556,14 @@ fn with_enablement(codex: bool, copilot: bool, claude: bool) -> EffectiveSetting
 /// What an edit's round trip leaves in force, as the Server answers it.
 fn settle_mutation(application: &mut Application, settings: EffectiveSettings) {
     application
-        .handle_event(ApplicationEvent::SettingMutated(SettingsSnapshot {
-            settings,
-            pinned: Vec::new(),
-            diagnostics: Vec::new(),
-        }))
+        .handle_event(ApplicationEvent::SettingMutated {
+            request: SettingRequest::new(),
+            snapshot: SettingsSnapshot {
+                settings,
+                pinned: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+        })
         .expect("receive the settings the edit left in force");
 }
 
@@ -731,9 +730,7 @@ fn space_writes_the_provider_under_the_cursor_through_its_enablement_at_once() {
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' ')),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
-            value: Some(false),
-        }),
+        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(false) }),
         "Space turns the Provider under the cursor off"
     );
     assert!(
@@ -750,9 +747,7 @@ fn space_writes_the_provider_under_the_cursor_through_its_enablement_at_once() {
     press(&mut application, KeyCode::Down);
     assert_eq!(
         press(&mut application, KeyCode::Char(' ')),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCopilotEnabled {
-            value: Some(false),
-        }),
+        MutatesSetting(SettingMutation::ProviderCopilotEnabled { value: Some(false) }),
         "Down moves the cursor to the next Provider"
     );
     press(&mut application, KeyCode::Down);
@@ -760,18 +755,14 @@ fn space_writes_the_provider_under_the_cursor_through_its_enablement_at_once() {
     press(&mut application, KeyCode::Up);
     assert_eq!(
         press(&mut application, KeyCode::Char(' ')),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderClaudeEnabled {
-            value: Some(false),
-        }),
+        MutatesSetting(SettingMutation::ProviderClaudeEnabled { value: Some(false) }),
         "the cursor wraps past either end: {}",
         screen(&application)
     );
     press(&mut application, KeyCode::Down);
     assert_eq!(
         press(&mut application, KeyCode::Char(' ')),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
-            value: Some(true),
-        }),
+        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(true) }),
         "and Space turns a Provider back on"
     );
     assert!(
@@ -1264,9 +1255,7 @@ fn space_after_a_move_no_frame_has_shown_toggles_nothing() {
     assert!(shown.contains("› [x] Claude"), "{shown}");
     assert_eq!(
         press(&mut application, KeyCode::Char(' ')),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderClaudeEnabled {
-            value: Some(false),
-        }),
+        MutatesSetting(SettingMutation::ProviderClaudeEnabled { value: Some(false) }),
         "once a frame has drawn it, Space toggles it"
     );
 }
@@ -1294,9 +1283,7 @@ fn space_on_a_terminal_too_small_to_draw_toggles_nothing() {
     assert!(screen(&application).contains("› [x] Codex"));
     assert_eq!(
         press(&mut application, KeyCode::Char(' ')),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
-            value: Some(false),
-        })
+        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(false) })
     );
 }
 
@@ -1338,9 +1325,7 @@ fn a_short_screen_keeps_the_lock_line_and_keys_and_follows_the_cursor() {
     }
     assert_eq!(
         press(&mut application, KeyCode::Char(' ')),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderClaudeEnabled {
-            value: Some(false),
-        }),
+        MutatesSetting(SettingMutation::ProviderClaudeEnabled { value: Some(false) }),
         "Space toggles the Provider on screen under the cursor"
     );
 
@@ -1422,9 +1407,7 @@ fn a_tiny_screen_acts_on_no_provider_it_does_not_draw() {
     assert!(roomier.contains("› [x] Codex"), "{roomier}");
     assert_eq!(
         press(&mut application, KeyCode::Char(' ')),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
-            value: Some(false),
-        }),
+        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(false) }),
         "and toggles the one it does"
     );
 
@@ -1617,9 +1600,7 @@ fn next_stays_locked_while_every_provider_is_disabled() {
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' ')),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
-            value: Some(true),
-        })
+        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(true) })
     );
     settle_mutation(&mut application, with_enablement(true, false, false));
     assert!(
@@ -1704,9 +1685,7 @@ fn slash_onboarding_shows_providers_turned_off_in_the_settings_panel() {
     press(&mut application, KeyCode::Down);
     assert_eq!(
         press(&mut application, KeyCode::Char(' ')),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCopilotEnabled {
-            value: Some(false),
-        }),
+        MutatesSetting(SettingMutation::ProviderCopilotEnabled { value: Some(false) }),
         "the settings panel turns Copilot off"
     );
     settle_mutation(&mut application, with_enablement(true, false, true));
@@ -1870,8 +1849,8 @@ fn focused_row(application: &Application) -> String {
 }
 
 /// What confirming the Derivation step on `errand` asks the Server to pin.
-fn derivation_pin(errand: DerivationErrand) -> ApplicationTransition {
-    ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+fn derivation_pin(errand: DerivationErrand) -> MutatesSetting {
+    MutatesSetting(SettingMutation::DerivationErrand {
         value: Some(errand),
     })
 }
@@ -2385,7 +2364,7 @@ fn applying_options_opened_elsewhere_does_not_answer_the_derivation_step() {
 
     let applied = apply_options(&mut application);
     assert!(
-        !matches!(applied, ApplicationTransition::MutateSetting(_)),
+        !matches!(applied, ApplicationTransition::MutateSetting { .. }),
         "the Agent's options pin nothing: {applied:?}"
     );
     assert!(
@@ -2447,16 +2426,17 @@ fn an_acknowledged_pin_moves_the_mark_of_the_value_in_force() {
         settings_deriving_with(DerivationErrand::FollowSession),
     );
     press(&mut application, KeyCode::Down);
-    assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        derivation_pin(DerivationErrand::Off)
-    );
+    let pin = press(&mut application, KeyCode::Enter);
+    assert_eq!(pin, derivation_pin(DerivationErrand::Off));
     application
-        .handle_event(ApplicationEvent::SettingMutated(SettingsSnapshot {
-            settings: settings_deriving_with(DerivationErrand::Off),
-            pinned: Vec::new(),
-            diagnostics: Vec::new(),
-        }))
+        .handle_event(ApplicationEvent::SettingMutated {
+            request: request_of(&pin),
+            snapshot: SettingsSnapshot {
+                settings: settings_deriving_with(DerivationErrand::Off),
+                pinned: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+        })
         .expect("hear the Server accept the pin");
 
     press(&mut application, KeyCode::Left);
@@ -2892,22 +2872,59 @@ fn with_show_icons(show_icons: bool) -> EffectiveSettings {
 }
 
 /// The pin Finish sends on the Icons step, ahead of any mark.
-fn pins_show_icons(show_icons: bool) -> ApplicationTransition {
-    ApplicationTransition::MutateSetting(SettingMutation::AppearanceShowIcons {
+fn pins_show_icons(show_icons: bool) -> MutatesSetting {
+    MutatesSetting(SettingMutation::AppearanceShowIcons {
         value: Some(show_icons),
     })
 }
 
-/// The Server's answer to a pin of Show icons: the Settings it left in
-/// force, with Show icons pinned at `show_icons`.
-fn acknowledge_pin(application: &mut Application, show_icons: bool) -> ApplicationTransition {
+/// The request a transition asking for a Setting mutation sends it under.
+fn request_of(transition: &ApplicationTransition) -> SettingRequest {
+    match transition {
+        ApplicationTransition::MutateSetting { request, .. } => *request,
+        other => panic!("a Setting mutation is asked for: {other:?}"),
+    }
+}
+
+/// Presses Finish on the Icons step, which pins Show icons at `show_icons`,
+/// answering the request the pin is sent under.
+fn finish_with(application: &mut Application, show_icons: bool) -> SettingRequest {
+    let finish = press(application, KeyCode::Enter);
+    assert_eq!(finish, pins_show_icons(show_icons));
+    request_of(&finish)
+}
+
+/// The Server's answer to the mutation sent under `request`: the Settings
+/// it left in force, with Show icons pinned at `show_icons`.
+fn acknowledge(
+    application: &mut Application,
+    request: SettingRequest,
+    show_icons: bool,
+) -> ApplicationTransition {
     application
-        .handle_event(ApplicationEvent::SettingMutated(SettingsSnapshot {
-            settings: with_show_icons(show_icons),
-            pinned: vec!["appearance.showIcons".to_owned()],
-            diagnostics: Vec::new(),
-        }))
-        .expect("receive the Settings the pin left in force")
+        .handle_event(ApplicationEvent::SettingMutated {
+            request,
+            snapshot: SettingsSnapshot {
+                settings: with_show_icons(show_icons),
+                pinned: vec!["appearance.showIcons".to_owned()],
+                diagnostics: Vec::new(),
+            },
+        })
+        .expect("receive the Settings the edit left in force")
+}
+
+/// The Server's refusal of the mutation sent under `request`.
+fn refuse(
+    application: &mut Application,
+    request: SettingRequest,
+    error: &str,
+) -> ApplicationTransition {
+    application
+        .handle_event(ApplicationEvent::SettingMutationFailed {
+            request,
+            error: error.to_owned(),
+        })
+        .expect("hear the edit was refused")
 }
 
 #[test]
@@ -2987,12 +3004,9 @@ fn choosing_the_icons_row_pins_show_icons_on_and_finishes() {
     press(&mut application, KeyCode::Down);
     assert!(screen(&application).contains("› They draw as icons"));
 
+    let pin = finish_with(&mut application, true);
     assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        pins_show_icons(true)
-    );
-    assert_eq!(
-        acknowledge_pin(&mut application, true),
+        acknowledge(&mut application, pin, true),
         ApplicationTransition::MarkOnboarded
     );
     assert!(!onboarding_shown(&application), "{}", screen(&application));
@@ -3019,12 +3033,9 @@ fn choosing_the_boxes_row_pins_show_icons_off_and_finishes() {
             screen(&application)
         );
 
+        let pin = finish_with(&mut application, false);
         assert_eq!(
-            press(&mut application, KeyCode::Enter),
-            pins_show_icons(false)
-        );
-        assert_eq!(
-            acknowledge_pin(&mut application, false),
+            acknowledge(&mut application, pin, false),
             ApplicationTransition::MarkOnboarded
         );
         assert!(!onboarding_shown(&application), "{}", screen(&application));
@@ -3207,10 +3218,7 @@ fn the_flow_waits_on_the_icons_step_until_the_pin_lands() {
     let mut application = offered_onboarding(workspace.path());
     on_the_icons_step(&mut application);
     press(&mut application, KeyCode::Down);
-    assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        pins_show_icons(true)
-    );
+    let pin = finish_with(&mut application, true);
     let saving = screen(&application);
     assert!(saving.contains("Step 3 of 3"), "{saving}");
     assert!(saving.contains("Saving your answer…"), "{saving}");
@@ -3227,16 +3235,11 @@ fn the_flow_waits_on_the_icons_step_until_the_pin_lands() {
     assert!(waiting.contains("› They draw as icons"), "{waiting}");
     assert!(waiting.contains("Saving your answer…"), "{waiting}");
 
-    // The Server's answer to another edit, which leaves Show icons
-    // unpinned, is not this pin landing.
+    // The Server's answer to another edit is not this pin landing, even
+    // where Show icons already stood pinned at the answer, as another
+    // Client may have left it.
     assert_eq!(
-        application
-            .handle_event(ApplicationEvent::SettingMutated(SettingsSnapshot {
-                settings: EffectiveSettings::default(),
-                pinned: vec!["provider.codex.enabled".to_owned()],
-                diagnostics: Vec::new(),
-            }))
-            .expect("receive the Settings another edit left in force"),
+        acknowledge(&mut application, SettingRequest::new(), true),
         ApplicationTransition::Continue
     );
     assert!(
@@ -3246,8 +3249,9 @@ fn the_flow_waits_on_the_icons_step_until_the_pin_lands() {
     );
 
     assert_eq!(
-        acknowledge_pin(&mut application, true),
-        ApplicationTransition::MarkOnboarded
+        acknowledge(&mut application, pin, true),
+        ApplicationTransition::MarkOnboarded,
+        "the pin's own answer finishes the flow"
     );
     assert!(!onboarding_shown(&application), "{}", screen(&application));
 }
@@ -3262,15 +3266,10 @@ fn a_refused_pin_keeps_the_flow_open_with_the_failure_and_finish_retries() {
     let mut application = offered_onboarding(workspace.path());
     on_the_icons_step(&mut application);
     press(&mut application, KeyCode::Up);
-    assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        pins_show_icons(false)
-    );
+    let pin = finish_with(&mut application, false);
 
     assert_eq!(
-        application
-            .handle_event(ApplicationEvent::SettingMutationFailed(REFUSAL.to_owned()))
-            .expect("hear the pin was refused"),
+        refuse(&mut application, pin, REFUSAL),
         ApplicationTransition::Continue,
         "no mark is asked for"
     );
@@ -3286,18 +3285,13 @@ fn a_refused_pin_keeps_the_flow_open_with_the_failure_and_finish_retries() {
         "{refused}"
     );
 
-    assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        pins_show_icons(false),
-        "Finish tries the pin again"
-    );
+    // Finish tries the pin again.
+    let retry = finish_with(&mut application, false);
     let retried = screen(&application);
     assert!(retried.contains("Saving your answer…"), "{retried}");
     assert!(!retried.contains("Could not save"), "{retried}");
     assert_eq!(
-        application
-            .handle_event(ApplicationEvent::SettingMutationFailed(REFUSAL.to_owned()))
-            .expect("hear the pin was refused again"),
+        refuse(&mut application, retry, REFUSAL),
         ApplicationTransition::Continue
     );
 
@@ -3315,10 +3309,7 @@ fn leaving_while_the_pin_is_saved_still_marks_the_server_onboarded() {
     let mut application = offered_onboarding(workspace.path());
     on_the_icons_step(&mut application);
     press(&mut application, KeyCode::Down);
-    assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        pins_show_icons(true)
-    );
+    let pin = finish_with(&mut application, true);
 
     assert_eq!(
         press(&mut application, KeyCode::Esc),
@@ -3326,9 +3317,44 @@ fn leaving_while_the_pin_is_saved_still_marks_the_server_onboarded() {
     );
     assert!(!onboarding_shown(&application), "{}", screen(&application));
     assert_eq!(
-        acknowledge_pin(&mut application, true),
+        acknowledge(&mut application, pin, true),
         ApplicationTransition::Continue,
         "the pin landing late asks no second mark"
+    );
+    assert!(!onboarding_shown(&application), "{}", screen(&application));
+}
+
+/// What the Server says of another edit while the pin is awaited — a
+/// Provider toggled on the first step and refused late — is that edit's:
+/// the pin stays awaited, and its own landing still finishes the flow.
+#[test]
+fn a_refusal_of_another_edit_leaves_the_pin_saving_and_its_landing_still_finishes() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    let toggle = press(&mut application, KeyCode::Char(' '));
+    assert_eq!(
+        toggle,
+        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(false) })
+    );
+    on_the_icons_step(&mut application);
+    press(&mut application, KeyCode::Down);
+    let pin = finish_with(&mut application, true);
+
+    assert_eq!(
+        refuse(
+            &mut application,
+            request_of(&toggle),
+            "Config Document is not editable"
+        ),
+        ApplicationTransition::Continue
+    );
+    let waiting = screen(&application);
+    assert!(waiting.contains("Saving your answer…"), "{waiting}");
+    assert!(!waiting.contains("Could not save"), "{waiting}");
+
+    assert_eq!(
+        acknowledge(&mut application, pin, true),
+        ApplicationTransition::MarkOnboarded
     );
     assert!(!onboarding_shown(&application), "{}", screen(&application));
 }

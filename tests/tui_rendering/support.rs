@@ -19,8 +19,8 @@ use suru::{
         ModelId, Outlook, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId,
         Question, Questionnaire, QuestionnaireId, QuestionnaireOutcome, ResolveWorkspaceRequest,
         ServerIdentity, Session, SessionChange, SessionId, SessionListItem, SessionRevision,
-        SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SettingsSnapshot,
-        TranscriptItem, Turn, TurnId, TurnStatus, Workspace, WorkspacePaths,
+        SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SettingMutation,
+        SettingsSnapshot, TranscriptItem, Turn, TurnId, TurnStatus, Workspace, WorkspacePaths,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -267,6 +267,20 @@ pub fn connected_application_homed(workspace: &std::path::Path) -> Application {
         )))
         .expect("connect application");
     application
+}
+
+/// What a transition asking for one Setting mutation is compared with: the
+/// mutation alone, whatever request the Application sent it under.
+#[derive(Debug)]
+pub struct MutatesSetting(pub SettingMutation);
+
+impl PartialEq<MutatesSetting> for ApplicationTransition {
+    fn eq(&self, expected: &MutatesSetting) -> bool {
+        matches!(
+            self,
+            ApplicationTransition::MutateSetting { mutation, .. } if *mutation == expected.0
+        )
+    }
 }
 
 /// Hands the client the effective-settings snapshot the server answers with,

@@ -33,10 +33,9 @@ use crate::{
     protocol::{
         AgentSelection, DerivationErrand, EffectiveSettings, ModelDescriptor, ModelId, Outlook,
         ProviderCatalogStatus, ProviderId, ProviderUnavailability, SettingMutation,
-        SettingsSnapshot,
     },
     provider::{BuiltInProvider, built_in_providers},
-    settings::{has_landed, provider_enablement},
+    settings::provider_enablement,
     theme::Theme,
 };
 
@@ -50,7 +49,7 @@ use super::{
     render::{NF_COD_FOLDER, NF_COD_GIT_BRANCH},
     selection::WrappedLine,
     slots::truncate_to_width,
-    state::CommandId,
+    state::{CommandId, SettingRequest},
     wrapped_text::{FIX_INDENT, WrappedText},
 };
 
@@ -121,10 +120,14 @@ pub(super) enum Opening {
 pub(super) enum Advance {
     /// The next step is on show.
     Moved,
-    /// The step was answered with this pin of the Setting it governs, and the
-    /// next step is on show; the last step stays on show until the pin lands,
-    /// which finishes the flow.
-    Pinned(SettingMutation),
+    /// The step was answered with this pin of the Setting it governs, sent
+    /// under `request`, and the next step is on show; the last step stays on
+    /// show until the answer to that request says the pin landed, which
+    /// finishes the flow.
+    Pinned {
+        pin: SettingMutation,
+        request: SettingRequest,
+    },
     /// The step's answer is `model`, whose Model Options the reader chooses
     /// first at the Model Options overlay opened over the step for `purpose`,
     /// seeded with `current`; applying them answers the step.
@@ -141,6 +144,16 @@ pub(super) enum Advance {
     /// step says why, and the Derivation and Icons steps have nothing under
     /// Row Focus to answer with.
     Held,
+}
+
+impl Advance {
+    /// The step answered with `pin`, sent under a request of its own.
+    fn pinned(pin: SettingMutation) -> Self {
+        Self::Pinned {
+            pin,
+            request: SettingRequest::new(),
+        }
+    }
 }
 
 /// What the flow reads of the Client's own Server, of which it keeps no copy:
@@ -765,10 +778,10 @@ impl DerivationStep {
     fn confirm(&self, recheck: &mut Recheck, pushes: u64) -> Advance {
         match self.list.choose() {
             Some(AgentSelectionAction::Named(index)) => {
-                Advance::Pinned(derivation_pin(NAMED_DERIVATIONS[index].0.clone()))
+                Advance::pinned(derivation_pin(NAMED_DERIVATIONS[index].0.clone()))
             }
             Some(AgentSelectionAction::Select(model)) if model.options.is_empty() => {
-                Advance::Pinned(pinned_selection(model.default_agent_selection()))
+                Advance::pinned(pinned_selection(model.default_agent_selection()))
             }
             Some(AgentSelectionAction::Select(model)) => {
                 let current = match &self.in_force {
@@ -900,8 +913,9 @@ struct IconsStep {
 enum Saving {
     #[default]
     Idle,
-    /// Sent and not yet answered; the flow finishes once it lands.
-    Pending(SettingMutation),
+    /// Sent under this request and not yet answered; the flow finishes once
+    /// the answer to it says it landed.
+    Pending(SettingRequest),
     /// Refused, for this reason, so Finish may send the pin again.
     Failed(String),
 }
@@ -1022,15 +1036,16 @@ impl IconsStep {
         matches!(self.saving, Saving::Pending(_))
     }
 
-    /// Sends the pin of the answer under Row Focus, unless one is already
-    /// awaited or there is no answer to pin.
-    fn finish(&mut self) -> Option<SettingMutation> {
+    /// Sends the pin of the answer under Row Focus under a request of its
+    /// own, unless one is already awaited or there is no answer to pin.
+    fn finish(&mut self) -> Option<Advance> {
         if self.is_saving() {
             return None;
         }
         let pin = self.pin()?;
-        self.saving = Saving::Pending(pin.clone());
-        Some(pin)
+        let request = SettingRequest::new();
+        self.saving = Saving::Pending(request);
+        Some(Advance::Pinned { pin, request })
     }
 
     /// The sample as drawn: a handful of Icon Catalog glyphs, then the fixed
@@ -1215,7 +1230,7 @@ impl Onboarding {
             }
             Some(Step::Derivation) => {
                 let advance = self.derivation.confirm(&mut self.recheck, server.pushes);
-                if matches!(advance, Advance::Pinned(_)) {
+                if matches!(advance, Advance::Pinned { .. }) {
                     self.move_on();
                 }
                 advance
@@ -1286,24 +1301,24 @@ impl Onboarding {
             }
             // The last step is passed only once it is answered, and stays
             // on show until the pin of its answer lands.
-            None => self.icons.finish().map_or(Advance::Held, Advance::Pinned),
+            None => self.icons.finish().unwrap_or(Advance::Held),
         }
     }
 
-    /// Whether `snapshot`, the Server's answer to an edit of its Settings,
-    /// shows the pin the Icons step awaits landed, which finishes the flow.
-    pub(super) fn pin_landed(&self, snapshot: &SettingsSnapshot) -> bool {
-        match &self.icons.saving {
-            Saving::Pending(pin) => has_landed(snapshot, pin),
-            Saving::Idle | Saving::Failed(_) => false,
-        }
+    /// Whether `request` is the pin the Icons step awaits: the Server
+    /// accepting it finishes the flow, and its refusal is said on the step.
+    /// The answer to any other edit leaves the pin awaited, whatever it
+    /// holds.
+    pub(super) fn awaits_pin(&self, request: SettingRequest) -> bool {
+        matches!(self.icons.saving, Saving::Pending(awaited) if awaited == request)
     }
 
-    /// Takes the Server's refusal of an edit of its Settings as the refusal
-    /// of the pin the Icons step awaits, answering whether one was awaited:
-    /// the step says why beneath its answers, and Finish may send it again.
-    pub(super) fn fail_pin(&mut self, error: &str) -> bool {
-        if !self.icons.is_saving() {
+    /// Takes the Server's refusal of `request` where it is the pin the Icons
+    /// step awaits, answering whether it was: the step says why beneath its
+    /// answers, and Finish may send it again. The refusal of any other edit
+    /// leaves it awaited.
+    pub(super) fn fail_pin(&mut self, request: SettingRequest, error: &str) -> bool {
+        if !self.awaits_pin(request) {
             return false;
         }
         self.icons.saving = Saving::Failed(format!("Could not save your answer: {error}"));

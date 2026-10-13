@@ -48,7 +48,7 @@ use super::session_attach::{AttachOperationId, AttachOutcome, SessionAttach};
 use super::shimmer;
 use super::state::{
     Application, ApplicationEvent, ApplicationTransition, CommandId, EverywhereListRequest,
-    ModelListRequest, SessionListRequest, SessionListSurface, WorkspaceListRequest,
+    ModelListRequest, SessionListRequest, SessionListSurface, SettingRequest, WorkspaceListRequest,
     WorkspaceResolutionSurface,
 };
 use crate::terminal::{
@@ -1445,10 +1445,11 @@ impl RunLoop {
                     self.channels.submissions.clone(),
                 );
             }
-            ApplicationTransition::MutateSetting(mutation) => {
+            ApplicationTransition::MutateSetting { mutation, request } => {
                 spawn_setting_mutation(
                     self.client.session_commands(),
                     mutation,
+                    request,
                     self.channels.submissions.clone(),
                 );
             }
@@ -1834,7 +1835,7 @@ impl RunLoop {
             | ApplicationTransition::ConfirmLandingAgentSelection(_)
             | ApplicationTransition::UpdateAgentSelection { .. }
             | ApplicationTransition::UpdateApprovalPosture { .. }
-            | ApplicationTransition::MutateSetting(_)
+            | ApplicationTransition::MutateSetting { .. }
             | ApplicationTransition::MarkOnboarded
             | ApplicationTransition::RecheckProviders { .. }
             | ApplicationTransition::BeginServing { .. }
@@ -2256,15 +2257,18 @@ impl RunLoop {
                 self.flush_agent_selection(transition);
             }
             // A pin landing may finish Onboarding, which marks the Server.
-            SubmissionResult::SettingMutated(snapshot) => {
-                let transition = self
-                    .application
-                    .handle_event(ApplicationEvent::SettingMutated(*snapshot))?;
+            SubmissionResult::SettingMutated { request, snapshot } => {
+                let transition =
+                    self.application
+                        .handle_event(ApplicationEvent::SettingMutated {
+                            request,
+                            snapshot: *snapshot,
+                        })?;
                 return Ok(self.dispatch_transition(transition));
             }
-            SubmissionResult::SettingMutationFailed(error) => {
+            SubmissionResult::SettingMutationFailed { request, error } => {
                 self.application
-                    .handle_event(ApplicationEvent::SettingMutationFailed(error))?;
+                    .handle_event(ApplicationEvent::SettingMutationFailed { request, error })?;
             }
             SubmissionResult::WorkspaceIconSetFailed { origin, error } => {
                 if self.application.outlook() != &origin {
@@ -3526,8 +3530,14 @@ enum SubmissionResult {
         operation_id: AgentSelectionOperationId,
         error: String,
     },
-    SettingMutated(Box<SettingsSnapshot>),
-    SettingMutationFailed(String),
+    SettingMutated {
+        request: SettingRequest,
+        snapshot: Box<SettingsSnapshot>,
+    },
+    SettingMutationFailed {
+        request: SettingRequest,
+        error: String,
+    },
     /// A user's chosen Workspace Icon was refused or could not be sent. A
     /// success carries no result of its own: it reaches every client,
     /// including this one, through the ordinary catalog stream instead.
@@ -4151,12 +4161,19 @@ fn spawn_workspace_description_set(
 fn spawn_setting_mutation(
     commands: SessionCommandClient,
     mutation: SettingMutation,
+    request: SettingRequest,
     results: UnboundedSender<SubmissionResult>,
 ) {
     tokio::spawn(async move {
         let result = match commands.mutate_setting(mutation).await {
-            Ok(snapshot) => SubmissionResult::SettingMutated(Box::new(snapshot)),
-            Err(error) => SubmissionResult::SettingMutationFailed(error.to_string()),
+            Ok(snapshot) => SubmissionResult::SettingMutated {
+                request,
+                snapshot: Box::new(snapshot),
+            },
+            Err(error) => SubmissionResult::SettingMutationFailed {
+                request,
+                error: error.to_string(),
+            },
         };
         let _ = results.send(result);
     });

@@ -70,5 +70,5 @@ pub use serve_overlay::ServeRequest;
 pub use state::{
     Application, ApplicationEvent, ApplicationTransition, CommandId, EverywhereListRequest,
     ModelListRequest, ScrollDirection, SessionListRequest, SessionListScope, SessionListSurface,
-    TerminalEventTaken, TuiState, WorkspaceListRequest, WorkspaceResolutionSurface,
+    SettingRequest, TerminalEventTaken, TuiState, WorkspaceListRequest, WorkspaceResolutionSurface,
 };

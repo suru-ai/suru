@@ -18,8 +18,8 @@ use suru::{
 };
 
 use crate::support::{
-    connected_application, connected_application_with_terminal_facts, deliver_settings,
-    enter_session, rendered_application_buffer, rendered_application_rows,
+    MutatesSetting, connected_application, connected_application_with_terminal_facts,
+    deliver_settings, enter_session, rendered_application_buffer, rendered_application_rows,
     rendered_application_rows_at, text_position, type_terminal_text, workspace_dir,
 };
 use crate::transcript::{application_with_ansi_palette_output, assert_ansi_palette};
@@ -144,7 +144,7 @@ fn a_user_theme_is_tagged_previewed_and_pinned_by_its_basename() {
     assert_eq!(preview.cell((0, 0)).unwrap().bg, Color::Rgb(21, 20, 27));
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::AppearanceTheme {
+        MutatesSetting(SettingMutation::AppearanceTheme {
             value: Some("reader".to_owned()),
         })
     );
@@ -474,7 +474,7 @@ fn escape_restores_the_opening_theme_and_enter_holds_preview_until_snapshot() {
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::AppearanceTheme {
+        MutatesSetting(SettingMutation::AppearanceTheme {
             value: Some("aura".to_owned()),
         })
     );
@@ -516,7 +516,7 @@ fn an_unrelated_snapshot_does_not_end_a_preview_still_being_browsed() {
     );
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::AppearanceTheme {
+        MutatesSetting(SettingMutation::AppearanceTheme {
             value: Some("aura".to_owned()),
         })
     );
@@ -561,7 +561,7 @@ fn reopening_before_the_snapshot_keeps_the_confirmed_preview_as_the_opening_them
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
     assert!(matches!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(_)
+        ApplicationTransition::MutateSetting { .. }
     ));
 
     open_theme_picker(&mut application);
@@ -594,7 +594,7 @@ fn choosing_system_pins_system_and_immediately_previews_terminal_colors() {
 
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::AppearanceTheme {
+        MutatesSetting(SettingMutation::AppearanceTheme {
             value: Some("system".to_owned()),
         })
     );

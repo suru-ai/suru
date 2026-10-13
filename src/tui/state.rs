@@ -4994,9 +4994,17 @@ pub enum ApplicationEvent {
         snapshot: Option<SessionSnapshot>,
         error: Option<String>,
     },
-    /// The effective settings an accepted edit left in force.
-    SettingMutated(SettingsSnapshot),
-    SettingMutationFailed(String),
+    /// The effective settings an accepted edit, asked for under `request`,
+    /// left in force.
+    SettingMutated {
+        request: SettingRequest,
+        snapshot: SettingsSnapshot,
+    },
+    /// Why the edit asked for under `request` never landed.
+    SettingMutationFailed {
+        request: SettingRequest,
+        error: String,
+    },
     /// Serving is enabled (where needed) and the ways an Invite may offer —
     /// the machine's current addresses — are ready for the reader to choose
     /// among.
@@ -5337,6 +5345,26 @@ pub struct TerminalEventTaken {
     pub transition: ApplicationTransition,
 }
 
+/// A client-local token naming one Setting mutation the Application asked
+/// for, carried back with the Server's answer to it, so a surface awaiting
+/// its own edit tells that answer from the answer to any other. It never
+/// leaves the Client.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SettingRequest(uuid::Uuid);
+
+impl SettingRequest {
+    /// A request no other is.
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+impl Default for SettingRequest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplicationTransition {
     SubmitDecision {
@@ -5468,8 +5496,12 @@ pub enum ApplicationTransition {
         session: SessionReference,
         request: crate::protocol::UpdateApprovalPostureRequest,
     },
-    /// One Setting's typed edit, on its way to the server that owns the file.
-    MutateSetting(SettingMutation),
+    /// One Setting's typed edit, on its way to the server that owns the file
+    /// under `request`, which the answer to it comes back with.
+    MutateSetting {
+        mutation: SettingMutation,
+        request: SettingRequest,
+    },
     /// Ask the Client's own Server to mark itself onboarded, as finishing or
     /// leaving Onboarding does. Every attached Client hears that it is.
     MarkOnboarded,
@@ -5635,6 +5667,16 @@ pub enum ApplicationTransition {
     },
 }
 
+impl ApplicationTransition {
+    /// One Setting's typed edit, under a request of its own.
+    fn mutate_setting(mutation: SettingMutation) -> Self {
+        Self::MutateSetting {
+            mutation,
+            request: SettingRequest::new(),
+        }
+    }
+}
+
 impl Application {
     pub fn new(workspace: impl AsRef<Path>, terminal_facts: TerminalFacts) -> Self {
         Self::from_state(TuiState::new(workspace), terminal_facts)
@@ -5789,13 +5831,13 @@ impl Application {
         let carries_settings = matches!(
             &event,
             ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(_))
-                | ApplicationEvent::SettingMutated(_)
+                | ApplicationEvent::SettingMutated { .. }
                 | ApplicationEvent::ServingPrepared {
                     settings: Some(_),
                     ..
                 }
         );
-        let mutation_failed = matches!(&event, ApplicationEvent::SettingMutationFailed(_));
+        let mutation_failed = matches!(&event, ApplicationEvent::SettingMutationFailed { .. });
         let theme_name = self.state.settings.appearance.theme.clone();
         self.state.remember_agent_selection_presentation();
         let transition = self.handle_event_inner(event)?;
@@ -6203,8 +6245,8 @@ impl Application {
             }
             // Onboarding finishes once the pin of its last answer lands, so
             // the mark never runs ahead of an answer the Server refuses.
-            ApplicationEvent::SettingMutated(snapshot) => {
-                let finished = self.state.onboarding.pin_landed(&snapshot);
+            ApplicationEvent::SettingMutated { request, snapshot } => {
+                let finished = self.state.onboarding.awaits_pin(request);
                 self.state.adopt_settings(snapshot);
                 Ok(if finished {
                     self.state.take_onboarding()
@@ -6212,10 +6254,10 @@ impl Application {
                     ApplicationTransition::Continue
                 })
             }
-            // A refusal while Onboarding awaits its pin is said there, where
+            // The refusal of the pin Onboarding awaits is said there, where
             // the reader can try it again.
-            ApplicationEvent::SettingMutationFailed(error) => {
-                if !self.state.onboarding.fail_pin(&error) {
+            ApplicationEvent::SettingMutationFailed { request, error } => {
+                if !self.state.onboarding.fail_pin(request, &error) {
                     self.state.settings_panel.report_failure(error);
                 }
                 Ok(ApplicationTransition::Continue)
@@ -8572,7 +8614,7 @@ impl Application {
             }
             CommandId::SelectTheme => self.state.theme_picker.confirm().map_or(
                 ApplicationTransition::Continue,
-                ApplicationTransition::MutateSetting,
+                ApplicationTransition::mutate_setting,
             ),
             CommandId::CloseThemePicker => {
                 restore = self.state.theme_picker.cancel();
@@ -10332,7 +10374,7 @@ impl Application {
                 .toggle_provider(&self.state.settings)
                 .map_or(
                     ApplicationTransition::Continue,
-                    ApplicationTransition::MutateSetting,
+                    ApplicationTransition::mutate_setting,
                 )),
             SemanticCommandId::OnboardingProvidersRecheck => Ok(self
                 .state
@@ -10356,7 +10398,10 @@ impl Application {
                 let server = OwnServer::of(&self.state.settings, &self.state.model_picker);
                 Ok(match self.state.onboarding.next(server) {
                     Advance::Moved | Advance::Held => ApplicationTransition::Continue,
-                    Advance::Pinned(pin) => ApplicationTransition::MutateSetting(pin),
+                    Advance::Pinned { pin, request } => ApplicationTransition::MutateSetting {
+                        mutation: pin,
+                        request,
+                    },
                     Advance::ChooseOptions {
                         model,
                         current,
@@ -11298,7 +11343,7 @@ impl Application {
         };
         mutation.map_or(
             ApplicationTransition::Continue,
-            ApplicationTransition::MutateSetting,
+            ApplicationTransition::mutate_setting,
         )
     }
 
@@ -11314,7 +11359,7 @@ impl Application {
             SemanticCommandId::SettingsListSave => {
                 return panel.save_list_edit().map_or(
                     ApplicationTransition::Continue,
-                    ApplicationTransition::MutateSetting,
+                    ApplicationTransition::mutate_setting,
                 );
             }
             SemanticCommandId::SettingsListCancel => panel.cancel_list_edit(),
@@ -11497,7 +11542,7 @@ impl Application {
         match purpose {
             ModelPickerPurpose::AgentSelection => self.apply_agent_selection(selection),
             ModelPickerPurpose::Setting(pin) => {
-                Ok(ApplicationTransition::MutateSetting(pin(selection)))
+                Ok(ApplicationTransition::mutate_setting(pin(selection)))
             }
         }
     }

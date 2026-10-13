@@ -2242,19 +2242,6 @@ impl fmt::Display for SettingsMutationError {
 
 impl std::error::Error for SettingsMutationError {}
 
-/// Whether `snapshot` shows `mutation` landed: the Setting it targets pinned
-/// at the value it pins, or no longer pinned where it removes the pin. A
-/// snapshot does not say which edit it answers, so a client waiting on one
-/// edit among others reads its landing off the snapshot instead.
-pub fn has_landed(snapshot: &SettingsSnapshot, mutation: &SettingMutation) -> bool {
-    let (key, value) = pin_for(mutation);
-    let pinned = snapshot.pinned.iter().any(|pinned| pinned == key);
-    match value {
-        Some(_) => pinned && pins_effective_value(mutation, &snapshot.settings),
-        None => !pinned,
-    }
-}
-
 /// The Setting a mutation targets, spelled as the schema's dotted key, and the
 /// JSON that pins it — `None` to remove the pin.
 fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
@@ -2750,27 +2737,6 @@ mod tests {
     use super::*;
 
     use crate::protocol::TranscriptSettings;
-
-    #[test]
-    fn a_pin_has_landed_once_a_snapshot_holds_it_pinned_at_its_value() {
-        let root = tempfile::tempdir().expect("create a config root");
-        let documents = ConfigDocuments::new(Some(root.path()));
-        let on = SettingMutation::AppearanceShowIcons { value: Some(true) };
-        let off = SettingMutation::AppearanceShowIcons { value: Some(false) };
-        let unpinned = SettingMutation::AppearanceShowIcons { value: None };
-
-        let fresh = documents.load();
-        assert!(
-            !has_landed(&fresh, &off),
-            "the default is no pin, however it agrees"
-        );
-        assert!(has_landed(&fresh, &unpinned));
-
-        let pinned = documents.mutate(&on).expect("pin Show icons on");
-        assert!(has_landed(&pinned, &on));
-        assert!(!has_landed(&pinned, &off), "pinned, but at another value");
-        assert!(!has_landed(&pinned, &unpinned));
-    }
 
     /// A Config Document name that cannot be told present or absent — its
     /// directory cannot be searched, say — is an error of the whole stack,

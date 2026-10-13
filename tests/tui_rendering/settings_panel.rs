@@ -13,7 +13,7 @@ use ratatui::{
 };
 
 use crate::support::{
-    application_looking_at_studio, connected_application, model_descriptor,
+    MutatesSetting, application_looking_at_studio, connected_application, model_descriptor,
     rendered_application_buffer, rendered_application_rows, rendered_application_rows_at,
     selected_session_snapshot, studio_stops_answering, text_position, type_terminal_text,
     workspace_dir,
@@ -36,7 +36,7 @@ use suru::{
     settings::SettingGroup,
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, DirectoryListingId,
-        ModelListRequest, NumericDigit, SemanticCommandId,
+        ModelListRequest, NumericDigit, SemanticCommandId, SettingRequest,
     },
 };
 
@@ -522,9 +522,7 @@ fn the_transcript_tab_presents_image_previews_on_by_default_beside_the_other_tra
     assert_eq!(focused_key(&application), "transcript.imagePreviews");
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::TranscriptImagePreviews {
-            value: Some(false),
-        }),
+        MutatesSetting(SettingMutation::TranscriptImagePreviews { value: Some(false) }),
         "Space turns previews off"
     );
     for key in [
@@ -582,7 +580,7 @@ fn the_transcript_tab_presents_tool_call_visibility_shown_by_default_beneath_rea
     assert_eq!(focused_key(&application), "transcript.toolCallVisibility");
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::TranscriptToolCallVisibility {
+        MutatesSetting(SettingMutation::TranscriptToolCallVisibility {
             value: Some(ToolCallVisibility::Hidden),
         }),
         "Space hides them"
@@ -608,7 +606,7 @@ fn the_transcript_tab_presents_tool_call_visibility_shown_by_default_beneath_rea
     focus_setting(&mut application, "transcript.toolCallVisibility");
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::TranscriptToolCallVisibility {
+        MutatesSetting(SettingMutation::TranscriptToolCallVisibility {
             value: Some(ToolCallVisibility::Shown),
         }),
         "stepping on from hidden wraps back to shown"
@@ -799,7 +797,7 @@ fn the_workspace_roots_list_editor_adds_edits_and_removes_rows_and_saves_them_as
     );
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+        MutatesSetting(SettingMutation::WorkspaceRoots {
             value: Some(vec!["~/code".to_owned(), ARCHIVE_ROOT.to_owned()]),
         }),
         "Enter saves the whole list as one mutation"
@@ -861,7 +859,7 @@ fn a_root_neither_absolute_nor_beginning_with_a_tilde_keeps_the_list_editor_open
     press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+        MutatesSetting(SettingMutation::WorkspaceRoots {
             value: Some(vec!["~/src".to_owned(), WORK_ROOT.to_owned()]),
         }),
         "an absolute Root and a home-relative one are saved; an emptied row is no entry"
@@ -917,7 +915,7 @@ fn list_editor_commands_can_be_invoked_semantically_and_take_pasted_text() {
             &mut application,
             CommandId::InvokeSemantic(SemanticCommandId::SettingsListSave)
         ),
-        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+        MutatesSetting(SettingMutation::WorkspaceRoots {
             value: Some(vec!["~/src".to_owned(), ARCHIVE_ROOT.to_owned()]),
         }),
         "plugins and future pointer behaviour reach the same mutation as the keyboard"
@@ -968,7 +966,7 @@ fn a_list_editor_closes_with_its_panel_and_takes_no_input_while_another_overlay_
     type_terminal_text(&mut application, "~/src");
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+        MutatesSetting(SettingMutation::WorkspaceRoots {
             value: Some(vec!["~/src".to_owned()]),
         }),
         "the editor took no input while another overlay hid it"
@@ -1010,7 +1008,7 @@ fn a_list_editor_closes_with_its_panel_and_takes_no_input_while_another_overlay_
     type_terminal_text(&mut application, "~/src");
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+        MutatesSetting(SettingMutation::WorkspaceRoots {
             value: Some(vec!["~/src".to_owned()]),
         }),
         "neither an edit nor a cancel reached the editor while the Serving overlay hid it"
@@ -1141,7 +1139,7 @@ fn tab_in_the_workspace_roots_editor_opens_the_directory_browser_over_the_panel(
     );
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+        MutatesSetting(SettingMutation::WorkspaceRoots {
             value: Some(vec![WORK_ROOT.to_owned()]),
         }),
         "nothing typed while the browser held the keys reached the draft"
@@ -1195,7 +1193,7 @@ fn a_directory_chosen_in_the_browser_adds_a_root_or_replaces_the_focused_one() {
 
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+        MutatesSetting(SettingMutation::WorkspaceRoots {
             value: Some(vec!["~/src".to_owned(), notes, projects]),
         }),
         "the browsed Roots are saved with the rest as one mutation"
@@ -1227,7 +1225,7 @@ fn the_list_editor_browses_through_a_semantic_command() {
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+        MutatesSetting(SettingMutation::WorkspaceRoots {
             value: Some(vec![root.display().to_string()]),
         }),
         "Enter on the root chooses the directory the tree stands on"
@@ -1267,7 +1265,7 @@ fn browsing_for_a_root_lists_the_client_s_own_server_while_looking_at_a_remote()
     );
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+        MutatesSetting(SettingMutation::WorkspaceRoots {
             value: Some(vec![projects.display().to_string()]),
         })
     );
@@ -1338,7 +1336,7 @@ fn the_appearance_theme_row_opens_the_picker_and_cancel_returns_to_the_row() {
     }
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::AppearanceTheme {
+        MutatesSetting(SettingMutation::AppearanceTheme {
             value: Some("system".to_owned()),
         }),
         "the picker returns through the Theme row's typed pin"
@@ -1359,7 +1357,7 @@ fn space_cycles_appearance_mode_through_system_dark_and_light_then_wraps() {
     assert!(row(&application, "Mode").contains("system"));
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::AppearanceMode {
+        MutatesSetting(SettingMutation::AppearanceMode {
             value: Some(AppearanceMode::Dark),
         })
     );
@@ -1375,7 +1373,7 @@ fn space_cycles_appearance_mode_through_system_dark_and_light_then_wraps() {
     assert!(row(&application, "Mode").contains("dark [pinned]"));
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::AppearanceMode {
+        MutatesSetting(SettingMutation::AppearanceMode {
             value: Some(AppearanceMode::Light),
         })
     );
@@ -1390,7 +1388,7 @@ fn space_cycles_appearance_mode_through_system_dark_and_light_then_wraps() {
     deliver_snapshot(&mut application, light, &["appearance.mode"]);
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::AppearanceMode {
+        MutatesSetting(SettingMutation::AppearanceMode {
             value: Some(AppearanceMode::System),
         }),
         "Space wraps past light to follow the terminal again"
@@ -1454,7 +1452,7 @@ fn the_experimental_tab_stands_past_the_providers_and_lists_the_settings_declare
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::ServingEnabled { value: Some(true) }),
+        MutatesSetting(SettingMutation::ServingEnabled { value: Some(true) }),
         "and Space cycles it on, as it cycles any other Setting"
     );
 
@@ -1493,7 +1491,7 @@ fn the_broker_setting_stands_under_the_experimental_tab_and_is_on_by_default() {
     focus_setting(&mut application, "broker.enabled");
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::BrokerEnabled { value: Some(false) }),
+        MutatesSetting(SettingMutation::BrokerEnabled { value: Some(false) }),
         "Space cycles the Broker off, as it cycles any other Setting"
     );
 
@@ -1560,7 +1558,7 @@ fn the_broker_limits_stand_under_the_experimental_tab_and_take_a_typed_cap() {
     type_terminal_text(&mut application, "10");
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::BrokerMaxDepth { value: Some(10) }),
+        MutatesSetting(SettingMutation::BrokerMaxDepth { value: Some(10) }),
         "Enter pins the depth the reader typed"
     );
 
@@ -1575,9 +1573,7 @@ fn the_broker_limits_stand_under_the_experimental_tab_and_take_a_typed_cap() {
     type_terminal_text(&mut application, "20");
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::BrokerMaxConcurrentSubagents {
-            value: Some(20),
-        }),
+        MutatesSetting(SettingMutation::BrokerMaxConcurrentSubagents { value: Some(20) }),
         "and the concurrency the reader typed"
     );
 
@@ -1651,7 +1647,7 @@ fn a_broker_limit_outside_its_bound_stays_in_the_editor_and_escape_discards_the_
     type_terminal_text(&mut application, "5");
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::BrokerMaxConcurrentSubagents {
+        MutatesSetting(SettingMutation::BrokerMaxConcurrentSubagents {
             value: Some(u32::MAX),
         }),
         "the largest count the Broker keeps is pinned like any other"
@@ -1754,7 +1750,7 @@ fn clicking_a_row_selects_it_without_changing_a_value() {
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::TranscriptReasoningVisibility {
+        MutatesSetting(SettingMutation::TranscriptReasoningVisibility {
             value: Some(ReasoningVisibility::Shown),
         }),
         "and Space still edits the focused Setting, wherever the focus came from"
@@ -1980,9 +1976,7 @@ fn space_on_a_provider_row_toggles_that_providers_enablement() {
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
-            value: Some(false),
-        }),
+        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(false) }),
         "Space on a Provider row turns that Provider off"
     );
     assert!(
@@ -1991,19 +1985,22 @@ fn space_on_a_provider_row_toggles_that_providers_enablement() {
     );
 
     application
-        .handle_event(ApplicationEvent::SettingMutated(snapshot(
-            EffectiveSettings {
-                provider: ProviderSettings {
-                    codex: CodexSettings {
-                        enabled: false,
-                        ..CodexSettings::default()
+        .handle_event(ApplicationEvent::SettingMutated {
+            request: SettingRequest::new(),
+            snapshot: snapshot(
+                EffectiveSettings {
+                    provider: ProviderSettings {
+                        codex: CodexSettings {
+                            enabled: false,
+                            ..CodexSettings::default()
+                        },
+                        ..ProviderSettings::default()
                     },
-                    ..ProviderSettings::default()
+                    ..EffectiveSettings::default()
                 },
-                ..EffectiveSettings::default()
-            },
-            &["provider.codex.enabled"],
-        )))
+                &["provider.codex.enabled"],
+            ),
+        })
         .expect("receive the settings the edit left in force");
     let codex = row(&application, "Codex");
     assert!(
@@ -2013,14 +2010,12 @@ fn space_on_a_provider_row_toggles_that_providers_enablement() {
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
-            value: Some(true),
-        }),
+        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(true) }),
         "Space turns a Provider back on"
     );
     assert_eq!(
         press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled { value: None }),
+        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: None }),
         "and undoing the choice is as easy as making it"
     );
 }
@@ -2684,7 +2679,7 @@ fn a_revealed_setting_navigates_cycles_and_resets_like_any_other_row() {
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexReasoningSummary {
+        MutatesSetting(SettingMutation::ProviderCodexReasoningSummary {
             value: Some(ReasoningSummaryDetail::Concise),
         }),
         "Space cycles the revealed Setting on from the value in force"
@@ -2712,9 +2707,7 @@ fn a_revealed_setting_navigates_cycles_and_resets_like_any_other_row() {
 
     assert_eq!(
         press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexReasoningSummary {
-            value: None,
-        }),
+        MutatesSetting(SettingMutation::ProviderCodexReasoningSummary { value: None }),
         "and Ctrl+D unpins it as it would any other Setting"
     );
 
@@ -2734,7 +2727,7 @@ fn a_revealed_setting_navigates_cycles_and_resets_like_any_other_row() {
     );
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexReasoningSummary {
+        MutatesSetting(SettingMutation::ProviderCodexReasoningSummary {
             value: Some(ReasoningSummaryDetail::Auto),
         }),
         "a revealed Setting on its last value wraps to the first, like every other"
@@ -2862,7 +2855,7 @@ fn a_disabled_provider_expands_and_its_settings_stay_editable() {
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexReasoningSummary {
+        MutatesSetting(SettingMutation::ProviderCodexReasoningSummary {
             value: Some(ReasoningSummaryDetail::Concise),
         }),
         "and whose Settings are edited as they would be were it enabled"
@@ -2927,7 +2920,7 @@ fn choosing_a_value_pins_it_and_the_row_follows_the_refreshed_snapshot() {
     let transition = press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE);
     assert_eq!(
         transition,
-        ApplicationTransition::MutateSetting(SettingMutation::TranscriptDefaultFoldPosture {
+        MutatesSetting(SettingMutation::TranscriptDefaultFoldPosture {
             value: Some(FoldPosture::Expanded),
         }),
         "choosing a value emits its set mutation immediately"
@@ -2938,10 +2931,13 @@ fn choosing_a_value_pins_it_and_the_row_follows_the_refreshed_snapshot() {
     );
 
     application
-        .handle_event(ApplicationEvent::SettingMutated(snapshot(
-            opening_at(FoldPosture::Expanded),
-            &["transcript.defaultFoldPosture"],
-        )))
+        .handle_event(ApplicationEvent::SettingMutated {
+            request: SettingRequest::new(),
+            snapshot: snapshot(
+                opening_at(FoldPosture::Expanded),
+                &["transcript.defaultFoldPosture"],
+            ),
+        })
         .expect("receive the settings the edit left in force");
     assert!(
         row(&application, "Default Fold posture").contains("expanded [pinned]"),
@@ -2962,7 +2958,7 @@ fn session_content_width_row_spells_maxima_and_space_selects_fill() {
     );
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SessionContentWidth {
+        MutatesSetting(SettingMutation::SessionContentWidth {
             value: Some(SessionContentWidth::Fill),
         }),
         "Space selects the Setting's named fill choice"
@@ -2979,7 +2975,7 @@ fn session_content_width_row_spells_maxima_and_space_selects_fill() {
     );
     assert_eq!(
         press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
-        ApplicationTransition::MutateSetting(SettingMutation::SessionContentWidth { value: None }),
+        MutatesSetting(SettingMutation::SessionContentWidth { value: None }),
         "the existing reset action removes the width pin"
     );
 }
@@ -3037,9 +3033,7 @@ fn sidebar_width_at_launch_uses_the_numeric_editor_and_typed_mutation() {
     press(&mut application, KeyCode::Char('0'), KeyModifiers::NONE);
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SidebarInitialWidth {
-            value: Some(60),
-        })
+        MutatesSetting(SettingMutation::SidebarInitialWidth { value: Some(60) })
     );
 }
 
@@ -3080,9 +3074,7 @@ fn aside_width_at_launch_uses_the_numeric_editor_and_typed_mutation() {
     press(&mut application, KeyCode::Char('4'), KeyModifiers::NONE);
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::AsideInitialWidth {
-            value: Some(24),
-        })
+        MutatesSetting(SettingMutation::AsideInitialWidth { value: Some(24) })
     );
 }
 
@@ -3104,7 +3096,7 @@ fn a_valid_numeric_edit_emits_a_typed_mutation_and_waits_for_the_refreshed_snaps
     press(&mut application, KeyCode::Char('0'), KeyModifiers::NONE);
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SessionContentWidth {
+        MutatesSetting(SettingMutation::SessionContentWidth {
             value: Some(SessionContentWidth::Maximum(120)),
         }),
         "Enter applies the edited number through the Setting's typed mutation"
@@ -3142,7 +3134,7 @@ fn the_auto_settle_row_spells_its_threshold_and_space_turns_settling_off() {
     );
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SidebarAutoSettle {
+        MutatesSetting(SettingMutation::SidebarAutoSettle {
             value: Some(AutoSettle::Off),
         }),
         "Space selects the Setting's one named choice"
@@ -3162,7 +3154,7 @@ fn the_auto_settle_row_spells_its_threshold_and_space_turns_settling_off() {
     press(&mut application, KeyCode::Char('7'), KeyModifiers::NONE);
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SidebarAutoSettle {
+        MutatesSetting(SettingMutation::SidebarAutoSettle {
             value: Some(AutoSettle::Idle(7)),
         }),
         "Enter applies the edited number through the Setting's typed mutation"
@@ -3218,7 +3210,7 @@ fn fill_has_no_hidden_maximum_and_cancel_discards_the_numeric_edit() {
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SessionContentWidth {
+        MutatesSetting(SettingMutation::SessionContentWidth {
             value: Some(SessionContentWidth::Fill),
         })
     );
@@ -3282,7 +3274,7 @@ fn numeric_editor_commands_can_be_invoked_semantically() {
                 SemanticCommandId::SettingsNumericApply,
             )))
             .expect("apply a numeric edit semantically"),
-        ApplicationTransition::MutateSetting(SettingMutation::SessionContentWidth {
+        MutatesSetting(SettingMutation::SessionContentWidth {
             value: Some(SessionContentWidth::Maximum(50)),
         }),
         "plugins and future pointer behavior reach the same typed mutation as the keyboard"
@@ -3365,7 +3357,7 @@ fn a_numeric_editor_hidden_by_a_newer_overlay_accepts_no_input() {
                 SemanticCommandId::SettingsNumericApply,
             )))
             .expect("apply after the newer overlay closes"),
-        ApplicationTransition::MutateSetting(SettingMutation::SessionContentWidth {
+        MutatesSetting(SettingMutation::SessionContentWidth {
             value: Some(SessionContentWidth::Maximum(50)),
         }),
         "the editor did not accept input while another overlay hid it"
@@ -3393,7 +3385,7 @@ fn space_cycles_a_setting_forward_and_wraps_past_the_last_value() {
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::TranscriptReasoningVisibility {
+        MutatesSetting(SettingMutation::TranscriptReasoningVisibility {
             value: Some(ReasoningVisibility::Hidden),
         }),
         "stepping on from the last value wraps to the first"
@@ -3409,7 +3401,7 @@ fn the_sidebar_scope_row_cycles_through_all_workspaces_current_workspace_and_eve
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SidebarInitialScope {
+        MutatesSetting(SettingMutation::SidebarInitialScope {
             value: Some(SidebarScope::CurrentWorkspace),
         })
     );
@@ -3420,7 +3412,7 @@ fn the_sidebar_scope_row_cycles_through_all_workspaces_current_workspace_and_eve
     );
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SidebarInitialScope {
+        MutatesSetting(SettingMutation::SidebarInitialScope {
             value: Some(SidebarScope::Everywhere),
         })
     );
@@ -3431,7 +3423,7 @@ fn the_sidebar_scope_row_cycles_through_all_workspaces_current_workspace_and_eve
     );
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SidebarInitialScope {
+        MutatesSetting(SettingMutation::SidebarInitialScope {
             value: Some(SidebarScope::AllWorkspaces),
         }),
         "the third value wraps to the first"
@@ -3456,7 +3448,7 @@ fn the_aside_rows_stand_in_general_beside_the_sidebars_and_visibility_cycles() {
     );
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::AsideInitialVisibility {
+        MutatesSetting(SettingMutation::AsideInitialVisibility {
             value: Some(AsideVisibility::Hidden),
         })
     );
@@ -3491,9 +3483,7 @@ fn the_general_tab_presents_hiding_subsessions_off_by_default_beside_the_sidebar
     );
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::SidekickHideSubsessions {
-            value: Some(true),
-        }),
+        MutatesSetting(SettingMutation::SidekickHideSubsessions { value: Some(true) }),
         "Space hides them"
     );
     let descriptor = suru::settings::SCHEMA
@@ -3541,9 +3531,10 @@ fn enter_never_edits_a_value_and_opens_nothing_on_a_row_that_stands_for_nothing(
     );
 
     application
-        .handle_event(ApplicationEvent::SettingMutationFailed(
-            "Config Document \"suru.jsonc\" is not valid JSONC".to_owned(),
-        ))
+        .handle_event(ApplicationEvent::SettingMutationFailed {
+            request: SettingRequest::new(),
+            error: "Config Document \"suru.jsonc\" is not valid JSONC".to_owned(),
+        })
         .expect("hear that an edit never landed");
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
     assert!(
@@ -3582,16 +3573,14 @@ fn resetting_a_pinned_setting_unpins_it_and_the_row_returns_to_the_default() {
 
     assert_eq!(
         press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
-        ApplicationTransition::MutateSetting(SettingMutation::TranscriptDefaultFoldPosture {
-            value: None,
-        }),
+        MutatesSetting(SettingMutation::TranscriptDefaultFoldPosture { value: None }),
         "the reset action emits the unset mutation"
     );
     application
-        .handle_event(ApplicationEvent::SettingMutated(snapshot(
-            EffectiveSettings::default(),
-            &[],
-        )))
+        .handle_event(ApplicationEvent::SettingMutated {
+            request: SettingRequest::new(),
+            snapshot: snapshot(EffectiveSettings::default(), &[]),
+        })
         .expect("receive the settings the reset left in force");
     assert!(
         row(&application, "Default Fold posture").contains("folded [default]"),
@@ -3607,9 +3596,7 @@ fn resetting_a_setting_unpins_it_whether_or_not_the_panel_thinks_it_is_pinned() 
 
     assert_eq!(
         press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
-        ApplicationTransition::MutateSetting(SettingMutation::TranscriptDefaultFoldPosture {
-            value: None,
-        }),
+        MutatesSetting(SettingMutation::TranscriptDefaultFoldPosture { value: None }),
         "the reset always asks the server to unpin, because the file is the server's to know"
     );
 }
@@ -3636,9 +3623,10 @@ fn an_edit_the_server_refuses_says_so_and_leaves_the_row_where_it_was() {
     press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE);
 
     application
-        .handle_event(ApplicationEvent::SettingMutationFailed(
-            "Config Document \"suru.jsonc\" is not valid JSONC".to_owned(),
-        ))
+        .handle_event(ApplicationEvent::SettingMutationFailed {
+            request: SettingRequest::new(),
+            error: "Config Document \"suru.jsonc\" is not valid JSONC".to_owned(),
+        })
         .expect("hear that the edit never landed");
     let panel = rendered_application_rows(&application).join("\n");
     assert!(
@@ -3711,7 +3699,7 @@ fn clicking_a_revealed_setting_focuses_it_like_any_other_row() {
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexReasoningSummary {
+        MutatesSetting(SettingMutation::ProviderCodexReasoningSummary {
             value: Some(ReasoningSummaryDetail::Concise),
         }),
         "Space edits the row the click focused, the edit gate intact"
@@ -3931,7 +3919,7 @@ fn the_title_derivation_row_cycles_its_named_values_and_spells_a_pinned_selectio
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+        MutatesSetting(SettingMutation::DerivationErrand {
             value: Some(DerivationErrand::Off),
         }),
         "Space walks the values the schema does name"
@@ -3949,7 +3937,7 @@ fn the_title_derivation_row_cycles_its_named_values_and_spells_a_pinned_selectio
     );
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+        MutatesSetting(SettingMutation::DerivationErrand {
             value: Some(DerivationErrand::FollowSession),
         }),
         "and cycling off it returns to the first value that has a word"
@@ -4001,7 +3989,7 @@ fn opening_the_title_derivation_row_pins_the_model_chosen_at_the_picker() {
     );
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
-        ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+        MutatesSetting(SettingMutation::DerivationErrand {
             value: Some(DerivationErrand::Pinned(pinned_selection())),
         }),
         "the Model the reader chose is pinned as this Setting's value, not as the Agent, \
@@ -4173,7 +4161,7 @@ fn title_options_pin_explicit_choices_even_equal_to_defaults_across_providers() 
         });
         assert_eq!(
             press(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
-            ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+            MutatesSetting(SettingMutation::DerivationErrand {
                 value: Some(DerivationErrand::Pinned(expected)),
             }),
             "explicit Low is pinned while untouched Speed follows defaults for {provider}"
@@ -4221,7 +4209,7 @@ fn title_options_reopen_own_overrides_and_can_restore_provider_defaults() {
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
-        ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+        MutatesSetting(SettingMutation::DerivationErrand {
             value: Some(DerivationErrand::Pinned(pinned_selection())),
         })
     );
@@ -4273,7 +4261,7 @@ fn choosing_another_title_model_or_provider_starts_with_inherited_options() {
         );
         assert_eq!(
             press(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
-            ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+            MutatesSetting(SettingMutation::DerivationErrand {
                 value: Some(DerivationErrand::Pinned(AgentSelection {
                     provider: ProviderId::new(provider),
                     model: ModelId::new(model),
@@ -4306,9 +4294,7 @@ fn copy_text_selection_cycles_on_the_general_tab() {
         );
         assert_eq!(
             press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-            ApplicationTransition::MutateSetting(SettingMutation::TextSelectionCopy {
-                value: Some(next)
-            })
+            MutatesSetting(SettingMutation::TextSelectionCopy { value: Some(next) })
         );
     }
 }
