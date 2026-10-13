@@ -38,6 +38,9 @@ pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const MODEL_CATALOG_EVENT: &str = "model_catalog";
 /// How the Serving listener stands, pushed to the Server's own Clients.
 pub const SERVING_LISTENER_EVENT: &str = "serving_listener";
+/// That the Server has been onboarded, pushed to the Server's own Clients the
+/// moment a Client marks it so, so each closes the Onboarding it offered.
+pub const ONBOARDED_EVENT: &str = "onboarded";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
 pub const SESSION_CATALOG_SNAPSHOT_EVENT: &str = "session_catalog_snapshot";
 pub const SESSION_CATALOG_UPDATED_EVENT: &str = "session_catalog_updated";
@@ -5231,6 +5234,10 @@ pub struct Health {
     pub workspace_paths: WorkspacePaths,
     pub lifecycle: LifecycleState,
     pub landing_agent_selection: Option<AgentSelection>,
+    /// Whether a Client has taken this Server's Onboarding, finishing it or
+    /// leaving it. A Server's own fact, kept in its storage rather than any
+    /// Config Document.
+    pub onboarded: bool,
     #[serde(flatten)]
     pub identity: ServerIdentity,
 }
@@ -5241,8 +5248,14 @@ impl Health {
             lifecycle,
             workspace_paths: WorkspacePaths::default(),
             landing_agent_selection: None,
+            onboarded: false,
             identity,
         }
+    }
+
+    pub fn with_onboarded(mut self, onboarded: bool) -> Self {
+        self.onboarded = onboarded;
+        self
     }
 
     pub fn with_workspace_paths(mut self, workspace_paths: WorkspacePaths) -> Self {
@@ -5284,6 +5297,8 @@ struct HealthWire {
     build_identity: String,
     #[serde(default)]
     landing_agent_selection: Option<AgentSelection>,
+    #[serde(default)]
+    onboarded: bool,
 }
 
 impl<'de> Deserialize<'de> for Health {
@@ -5302,6 +5317,7 @@ impl<'de> Deserialize<'de> for Health {
             wire.lifecycle,
         )
         .with_landing_agent_selection(wire.landing_agent_selection)
+        .with_onboarded(wire.onboarded)
         .with_workspace_paths(wire.workspace_paths))
     }
 }

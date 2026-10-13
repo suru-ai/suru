@@ -41,13 +41,13 @@ pub(crate) use writer::{
 };
 
 use rows::{
-    ActivityRow, LandingAgentSelectionRow, MessageRow, ModelCatalogRow, MovedPayload, PromptRow,
-    ProviderResumeStateRow, ProviderSubagentIdentityRow, SessionRow, SidekickActRow, StoredRows,
-    TurnRow, WorkspaceRow,
+    ActivityRow, LandingAgentSelectionRow, MessageRow, ModelCatalogRow, MovedPayload, OnboardedRow,
+    PromptRow, ProviderResumeStateRow, ProviderSubagentIdentityRow, SessionRow, SidekickActRow,
+    StoredRows, TurnRow, WorkspaceRow,
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20261013000000";
+const CURRENT_SCHEMA_VERSION: &str = "20261014000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -97,6 +97,13 @@ diesel::table! {
     landing_agent_selection (singleton) {
         singleton -> Integer,
         selection -> Text,
+    }
+}
+
+diesel::table! {
+    onboarded (singleton) {
+        singleton -> Integer,
+        record -> Text,
     }
 }
 
@@ -455,6 +462,7 @@ pub(crate) enum StorageError {
         message: String,
     },
     WriteLandingAgentSelection(String),
+    WriteOnboarded(String),
     WriteModelCatalog(String),
     WriteWorkspaceIcon(String),
     WriteWorkspaceDescription(String),
@@ -502,6 +510,12 @@ impl fmt::Display for StorageError {
             } => write!(formatter, "save Session {session_id}: {message}"),
             Self::WriteLandingAgentSelection(message) => {
                 write!(formatter, "save landing Agent Selection: {message}")
+            }
+            Self::WriteOnboarded(message) => {
+                write!(
+                    formatter,
+                    "save that this Server has been onboarded: {message}"
+                )
             }
             Self::WriteModelCatalog(message) => {
                 write!(formatter, "save remembered Model Catalog: {message}")
@@ -651,6 +665,27 @@ impl StorageRepository {
             // decode, preserve startup and fall back to the Provider's current default.
             Ok(row.and_then(LandingAgentSelectionRow::into_selection))
         })
+        .await
+    }
+
+    /// Whether this Server has been onboarded. A record that no longer
+    /// decodes counts as never having been, as an unreadable landing Agent
+    /// Selection counts as none: startup goes on, and the worst it costs is
+    /// Onboarding offered once more.
+    pub(crate) async fn onboarded(&self) -> Result<bool, StorageError> {
+        let database_path = self.database_path.as_ref().clone();
+        on_blocking_task(
+            "reading whether this Server has been onboarded",
+            move || {
+                let mut connection = connect(&database_path)?;
+                let row = onboarded::table
+                    .select(OnboardedRow::as_select())
+                    .first::<OnboardedRow>(&mut connection)
+                    .optional()
+                    .map_err(|error| StorageError::Read(error.to_string()))?;
+                Ok(row.and_then(OnboardedRow::into_record).is_some())
+            },
+        )
         .await
     }
 
@@ -1055,6 +1090,21 @@ impl StorageRepository {
             .set(&row)
             .execute(&mut connection)
             .map_err(|error| StorageError::WriteLandingAgentSelection(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Records that this Server was onboarded `at`, over any record that no
+    /// longer decodes.
+    fn save_onboarded(&self, at: SessionTimestamp) -> Result<(), StorageError> {
+        let row = OnboardedRow::onboarded_at(at)?;
+        let mut connection = connect(&self.database_path)?;
+        diesel::insert_into(onboarded::table)
+            .values(&row)
+            .on_conflict(onboarded::singleton)
+            .do_update()
+            .set(&row)
+            .execute(&mut connection)
+            .map_err(|error| StorageError::WriteOnboarded(error.to_string()))?;
         Ok(())
     }
 

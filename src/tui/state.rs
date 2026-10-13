@@ -2347,6 +2347,8 @@ impl TuiState {
             ManagedEvent::RemoteRecovered => self.end_recovery(&Outlook::Local),
             ManagedEvent::Relays(listing) => self.receive_relays(listing),
             ManagedEvent::ServingListener(state) => self.serving_listener = state,
+            // Nothing of Onboarding is offered yet, so there is nothing to close.
+            ManagedEvent::Onboarded => {}
             ManagedEvent::RemoteFailed { message, .. } => self.settle_remote_failure(message),
             ManagedEvent::ServerShutdown(shutdown) => {
                 self.stop_opening_loading();
@@ -2519,6 +2521,7 @@ impl TuiState {
             | ManagedEvent::Recovering(_)
             | ManagedEvent::Relays(_)
             | ManagedEvent::ServingListener(_)
+            | ManagedEvent::Onboarded
             | ManagedEvent::RemoteRecovered
             | ManagedEvent::RemoteFailed { .. }
             | ManagedEvent::ServerShutdown(_)
@@ -2598,6 +2601,7 @@ impl TuiState {
             | ManagedEvent::Recovering(_)
             | ManagedEvent::Relays(_)
             | ManagedEvent::ServingListener(_)
+            | ManagedEvent::Onboarded
             | ManagedEvent::RemoteRecovered
             | ManagedEvent::RemoteFailed { .. }
             | ManagedEvent::ServerShutdown(_)

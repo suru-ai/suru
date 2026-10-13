@@ -35,6 +35,8 @@ mod support;
 mod checkout_observation;
 #[path = "server_integration/directory_listing.rs"]
 mod directory_listing;
+#[path = "server_integration/onboarding.rs"]
+mod onboarding;
 #[path = "server_integration/preparation_recovery.rs"]
 mod preparation_recovery;
 #[path = "server_integration/relays.rs"]
@@ -2895,6 +2897,8 @@ async fn refuses_server_administration_to_peers(
         ),
         // The Server's own event stream tells its Clients of its Relays.
         (reqwest::Method::GET, "/v1/events", None),
+        // Only a Client's own Server is onboarded, never a Remote.
+        (reqwest::Method::PUT, "/v1/onboarded", None),
     ] {
         let mut request = http
             .request(method.clone(), format!("{remote_api}{path}"))
@@ -2902,14 +2906,11 @@ async fn refuses_server_administration_to_peers(
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request
-            .send()
-            .await
-            .expect("attempt Remote Relay administration");
+        let response = request.send().await.expect("attempt Remote administration");
         assert_eq!(
             response.status(),
             reqwest::StatusCode::FORBIDDEN,
-            "{method} {path} administers the Remote's Relays"
+            "{method} {path} administers the Remote"
         );
     }
 }

@@ -29,7 +29,7 @@ use crate::{
 use super::{
     StorageError, StoredResumeState, StoredSidekickAct, StoredSubagentIdentity, StoredWorkspace,
     UnreadableStoredSession, WorkspacePresentation, WorkspaceProvenance, activities,
-    landing_agent_selection, messages, model_catalog, prompts, provider_resume_states,
+    landing_agent_selection, messages, model_catalog, onboarded, prompts, provider_resume_states,
     provider_subagent_identities, sessions, sidekick_acts, turns,
     unsaved::{SessionRows, UnsavedRows},
     workspaces,
@@ -97,6 +97,36 @@ impl LandingAgentSelectionRow {
 
     pub(super) fn into_selection(self) -> Option<AgentSelection> {
         serde_json::from_str(&self.selection).ok()
+    }
+}
+
+/// That this Server has been onboarded, and when, as one JSON record.
+#[derive(AsChangeset, Insertable, Queryable, Selectable)]
+#[diesel(table_name = onboarded)]
+pub(super) struct OnboardedRow {
+    singleton: i32,
+    record: String,
+}
+
+/// What the `onboarded` row records: when a Client first took this Server's
+/// Onboarding.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OnboardedRecord {
+    onboarded_at: SessionTimestamp,
+}
+
+impl OnboardedRow {
+    pub(super) fn onboarded_at(at: SessionTimestamp) -> Result<Self, StorageError> {
+        Ok(Self {
+            singleton: 1,
+            record: serde_json::to_string(&OnboardedRecord { onboarded_at: at })
+                .map_err(|error| StorageError::WriteOnboarded(error.to_string()))?,
+        })
+    }
+
+    pub(super) fn into_record(self) -> Option<OnboardedRecord> {
+        serde_json::from_str(&self.record).ok()
     }
 }
 

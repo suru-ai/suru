@@ -38,7 +38,7 @@ use std::{
 use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
-        AgentSelection, SessionChange, SessionId, SessionStatus, SessionUpdate,
+        AgentSelection, SessionChange, SessionId, SessionStatus, SessionTimestamp, SessionUpdate,
         WorkspaceDescription, WorkspaceId,
     },
 };
@@ -130,6 +130,8 @@ enum WriterCommand {
         durability: std_mpsc::SyncSender<Result<Deletion, String>>,
     },
     SaveLandingAgentSelection(AgentSelection),
+    /// That this Server was onboarded, at the moment it was.
+    SaveOnboarded(SessionTimestamp),
     SaveModelCatalog(RememberedProviderCatalog),
     /// A derived Icon filling a Workspace's absent one. Each Icon and
     /// Description write carries the provenance of the Registry entry it
@@ -389,6 +391,13 @@ impl Writer {
             WriterCommand::SaveLandingAgentSelection(selection) => {
                 if let Err(error) = repository.save_landing_agent_selection(selection) {
                     tracing::warn!("could not save the landing Agent Selection: {error}");
+                }
+            }
+            // Best-effort on the same terms: a fact that fails to persist
+            // costs only Onboarding offered once more by the next process.
+            WriterCommand::SaveOnboarded(at) => {
+                if let Err(error) = repository.save_onboarded(at) {
+                    tracing::warn!("could not save that this Server has been onboarded: {error}");
                 }
             }
             // A remembered catalog is a nicety the next process starts from;
@@ -822,6 +831,10 @@ impl StorageSink {
         let _ = self
             .commands
             .send(WriterCommand::SaveLandingAgentSelection(selection));
+    }
+
+    pub(crate) fn save_onboarded(&self, at: SessionTimestamp) {
+        let _ = self.commands.send(WriterCommand::SaveOnboarded(at));
     }
 
     /// Remembers what a Provider just served, off the discovery's own path: a

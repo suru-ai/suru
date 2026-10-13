@@ -244,6 +244,10 @@ pub enum ManagedEvent {
     /// every connect, and again whenever it changes, so a client offers the
     /// machine's own addresses in an Invite only while the listener listens.
     ServingListener(crate::protocol::ListenerState),
+    /// The Server has been onboarded: pushed the moment any Client marks it
+    /// so, so each closes the Onboarding it offered. Whether it already was
+    /// as a Client connects is in the health it connected with.
+    Onboarded,
     /// A Remote catalog stream resumed after a transient link failure.
     RemoteRecovered,
     /// A Remote rejected further use of its Pairing. Unlike a transient drop,
@@ -573,6 +577,13 @@ impl ManagedClient {
     /// attached client — this one included — also receives on its event stream.
     pub async fn mutate_setting(&self, mutation: SettingMutation) -> Result<SettingsSnapshot> {
         self.session_commands().mutate_setting(mutation).await
+    }
+
+    /// Marks the Client's own Server onboarded, whichever way the Outlook is
+    /// turned. Every attached Client — this one included — hears
+    /// [`ManagedEvent::Onboarded`] the first time it is.
+    pub async fn mark_onboarded(&self) -> Result<()> {
+        self.session_commands().mark_onboarded().await
     }
 
     pub async fn issue_invite(&self, request: IssueInviteRequest) -> Result<IssuedInvite> {
@@ -1684,6 +1695,23 @@ impl SessionCommandClient {
     ) -> Result<SettingsSnapshot> {
         self.post_session_command("/v1/settings", &mutation, "Setting mutation")
             .await
+    }
+
+    pub(crate) async fn mark_onboarded(&self) -> Result<()> {
+        let descriptor = self.descriptor.borrow().clone();
+        self.http
+            .put(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/onboarded",
+            )?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send the mark that this Server is onboarded")?
+            .error_for_status()
+            .context("mark this Server onboarded")?;
+        Ok(())
     }
 
     pub(crate) async fn issue_invite(&self, request: IssueInviteRequest) -> Result<IssuedInvite> {

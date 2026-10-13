@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::protocol::{
-    ListenerState, MODEL_CATALOG_EVENT, ModelCatalog, RELAYS_EVENT, RelayListing,
+    ListenerState, MODEL_CATALOG_EVENT, ModelCatalog, ONBOARDED_EVENT, RELAYS_EVENT, RelayListing,
     RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SERVING_LISTENER_EVENT, SETTINGS_SNAPSHOT_EVENT,
     ServerShutdown, SettingsSnapshot, ShutdownReason,
 };
@@ -83,6 +83,14 @@ fn decode_event(event: Event, expected_instance_id: uuid::Uuid) -> Result<Manage
             let state: ListenerState =
                 serde_json::from_str(&event.data).context("decode the Serving listener's state")?;
             Ok(ManagedEvent::ServingListener(state))
+        }
+        ONBOARDED_EVENT => {
+            let onboarded: bool =
+                serde_json::from_str(&event.data).context("decode the onboarded fact")?;
+            if !onboarded {
+                bail!("server said it is not onboarded, which it only ever comes to be");
+            }
+            Ok(ManagedEvent::Onboarded)
         }
         SERVER_SHUTDOWN_EVENT => {
             let shutdown: ServerShutdown =

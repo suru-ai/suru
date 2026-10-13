@@ -3252,9 +3252,17 @@ fn peer_route_class(method: &Method, path: &str) -> PeerRouteClass {
     // The Server's own event stream tells its Clients of its Settings and its
     // Relays, which are its administration.
     let own_events = path == "/v1/events";
+    // Only a Client's own Server is onboarded; a Remote's is its own affair.
+    let onboarding = path == "/v1/onboarded";
     if crate::broker::is_broker_path(path) {
         PeerRouteClass::LoopbackOnly
-    } else if settings_mutation || stop || pairing_management || relay_management || own_events {
+    } else if settings_mutation
+        || stop
+        || pairing_management
+        || relay_management
+        || own_events
+        || onboarding
+    {
         PeerRouteClass::Administration
     } else {
         PeerRouteClass::Api

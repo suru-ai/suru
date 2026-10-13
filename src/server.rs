@@ -38,15 +38,15 @@ use crate::protocol::{
     AUTHOR_HEADER, Activity, AdmitPromptRequest, AgentSelection, Author, CloneWorkspaceRequest,
     ClonedWorkspace, CompactSessionRequest, CreateSessionRequest, InterruptOutcome,
     IssueInviteRequest, LifecycleState, ListDirectoryRequest, ListenerState, MODEL_CATALOG_EVENT,
-    Message, MessageId, MessageRole, MessageStatus, ModelCatalog, PROMPT_ADMISSION_HEADER,
-    PROTOCOL_VERSION, Peer, ProviderId, RELAYS_EVENT, RedeemInviteRequest, RelayListing, Remote,
-    ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SERVING_LISTENER_EVENT,
-    SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_ERROR_CODE_HEADER,
-    SESSION_READING_PATH, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
-    SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT,
-    ServerIdentity, ServerShutdown, SessionCatalogRevision, SessionChange, SessionError,
-    SessionErrorCode, SessionId, SessionReadingQuery, SessionRevision, SessionUpdate,
-    SetSessionIconRequest, SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest,
+    Message, MessageId, MessageRole, MessageStatus, ModelCatalog, ONBOARDED_EVENT,
+    PROMPT_ADMISSION_HEADER, PROTOCOL_VERSION, Peer, ProviderId, RELAYS_EVENT, RedeemInviteRequest,
+    RelayListing, Remote, ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
+    SERVING_LISTENER_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
+    SESSION_ERROR_CODE_HEADER, SESSION_READING_PATH, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
+    SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT,
+    SUBAGENT_TREE_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision,
+    SessionChange, SessionError, SessionErrorCode, SessionId, SessionReadingQuery, SessionRevision,
+    SessionUpdate, SetSessionIconRequest, SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest,
     SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
     SkillCatalogRequest, SubagentTreeRevision, SubagentTreeUpdate, TurnId,
     UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
@@ -1289,6 +1289,46 @@ impl LandingAgentSelectionStore {
     }
 }
 
+/// Whether this Server has been onboarded, held where every attached
+/// lifecycle stream watches it so each hears the moment it is.
+#[derive(Clone)]
+struct OnboardedStore {
+    onboarded: Arc<watch::Sender<bool>>,
+    storage: StorageSink,
+    clock: ServerClock,
+}
+
+impl OnboardedStore {
+    fn new(onboarded: bool, storage: StorageSink, clock: ServerClock) -> Self {
+        Self {
+            onboarded: Arc::new(watch::Sender::new(onboarded)),
+            storage,
+            clock,
+        }
+    }
+
+    fn current(&self) -> bool {
+        *self.onboarded.borrow()
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.onboarded.subscribe()
+    }
+
+    /// Records that this Server has been onboarded, telling every attached
+    /// Client the first time it is; marking it again changes nothing.
+    fn mark(&self) {
+        self.onboarded.send_if_modified(|onboarded| {
+            if *onboarded {
+                return false;
+            }
+            self.storage.save_onboarded(self.clock.now());
+            *onboarded = true;
+            true
+        });
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     preparations: crate::source_control::PreparationStore,
@@ -1302,6 +1342,7 @@ struct AppState {
     model_catalog: ModelCatalogService,
     skill_catalog: SkillCatalogService,
     landing_agent_selection: LandingAgentSelectionStore,
+    onboarded: OnboardedStore,
     /// The loaded effective-settings view. A watch channel so every attached
     /// lifecycle stream re-pushes the snapshot when a mutation (or a future
     /// Config Document watcher) replaces it; the Config Documents behind it,
@@ -1458,6 +1499,10 @@ async fn start(
         .landing_agent_selection()
         .await
         .context("load persisted landing Agent Selection")?;
+    let persisted_onboarded = repository
+        .onboarded()
+        .await
+        .context("load whether this Server has been onboarded")?;
     let remembered_model_catalog = repository
         .model_catalog()
         .await
@@ -1660,6 +1705,8 @@ async fn start(
     );
     let landing_agent_selection =
         LandingAgentSelectionStore::new(persisted_landing_agent_selection, storage.clone());
+    let onboarded =
+        OnboardedStore::new(persisted_onboarded, storage.clone(), timings.clock.clone());
     let model_catalog = ModelCatalogService::new(
         runtimes.iter().cloned(),
         settings.subscribe(),
@@ -1812,6 +1859,7 @@ async fn start(
         model_catalog,
         skill_catalog,
         landing_agent_selection,
+        onboarded,
         settings,
         serving: serving.clone(),
         relays: relays.clone(),
@@ -1853,6 +1901,7 @@ async fn start(
             "/v1/landing-agent-selection",
             put(confirm_landing_agent_selection),
         )
+        .route("/v1/onboarded", put(mark_onboarded))
         .route("/v1/workspaces", get(list_workspaces))
         .route("/v1/workspaces/resolve", post(resolve_workspace))
         .route("/v1/workspaces/directory", get(list_directory))
@@ -2191,6 +2240,7 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
         state.model_catalog.clone(),
         state.relays.subscribe(),
         state.serving.listener(),
+        state.onboarded.subscribe(),
         state.timings.sse_keepalive_interval,
     ))
     .into_response()
@@ -2206,6 +2256,7 @@ struct EventStreamState {
     pushed_catalog: ModelCatalog,
     relays: watch::Receiver<RelayListing>,
     listener: watch::Receiver<ListenerState>,
+    onboarded: watch::Receiver<bool>,
     keepalive: tokio::time::Interval,
     finished: bool,
 }
@@ -2230,8 +2281,13 @@ fn event_stream(
     model_catalog: ModelCatalogService,
     mut relays: watch::Receiver<RelayListing>,
     mut listener: watch::Receiver<ListenerState>,
+    mut onboarded: watch::Receiver<bool>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
+    // Whether the Server has been onboarded reaches a connecting Client in
+    // its health; the stream says so only as it comes to be, so every
+    // attached Client closes the Onboarding it offered.
+    onboarded.mark_unchanged();
     // Every connecting client receives the effective-settings snapshot before
     // any other protocol event; later replacements re-push through the watch.
     let snapshot = settings_snapshot_event(&settings.borrow_and_update());
@@ -2272,6 +2328,7 @@ fn event_stream(
         pushed_catalog,
         relays,
         listener,
+        onboarded,
         keepalive: tokio::time::interval_at(
             Instant::now() + keepalive_interval,
             keepalive_interval,
@@ -2331,6 +2388,19 @@ fn event_stream(
                         return None;
                     }
                     let event = serving_listener_event(&state.listener.borrow_and_update());
+                    return Some((Ok::<_, std::convert::Infallible>(event), state));
+                }
+                changed = state.onboarded.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    if !*state.onboarded.borrow_and_update() {
+                        continue;
+                    }
+                    let event = Event::default()
+                        .event(ONBOARDED_EVENT)
+                        .json_data(true)
+                        .expect("the onboarded fact always serializes");
                     return Some((Ok::<_, std::convert::Infallible>(event), state));
                 }
                 _ = state.keepalive.tick() => return Some((
@@ -2726,9 +2796,21 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
             .descriptor
             .health(state.shutdown.lifecycle())
             .with_workspace_paths(state.workspace_paths.clone())
-            .with_landing_agent_selection(state.landing_agent_selection.current()),
+            .with_landing_agent_selection(state.landing_agent_selection.current())
+            .with_onboarded(state.onboarded.current()),
     )
     .into_response()
+}
+
+/// Marks this Server onboarded, as a Client does once its reader finishes
+/// Onboarding or leaves it; every attached Client hears so on its lifecycle
+/// stream.
+async fn mark_onboarded(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    state.onboarded.mark();
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn confirm_landing_agent_selection(
@@ -4873,12 +4955,14 @@ mod tests {
             relays: Vec::new(),
         });
         let (listener, _) = watch::channel(ListenerState::Off);
+        let (onboarded, _) = watch::channel(true);
         let first = event_stream(
             shutdown.subscribe(),
             settings.subscribe(),
             model_catalog.clone(),
             relays.subscribe(),
             listener.subscribe(),
+            onboarded.subscribe(),
             Duration::from_secs(60),
         );
         let second = event_stream(
@@ -4887,6 +4971,7 @@ mod tests {
             model_catalog,
             relays.subscribe(),
             listener.subscribe(),
+            onboarded.subscribe(),
             Duration::from_secs(60),
         );
         pin_mut!(first);
