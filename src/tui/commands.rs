@@ -197,6 +197,16 @@ pub enum SemanticCommandId {
     /// Opens Onboarding at its first step over whatever is on screen, the
     /// Landing or a Session, every step showing the current values.
     OnboardingOpen,
+    /// Moves the cursor of Onboarding's Providers step to the Provider above,
+    /// or below, wrapping past either end.
+    OnboardingProvidersPrevious,
+    OnboardingProvidersNext,
+    /// Turns the Provider under the cursor of Onboarding's Providers step on
+    /// or off, writing its Enablement at once.
+    OnboardingProvidersToggle,
+    /// Re-reads every Provider's Availability from Onboarding's Providers
+    /// step, for a reader who has just fixed one outside Suru.
+    OnboardingProvidersRecheck,
     /// Confirms the Onboarding step on show and moves to the next, or
     /// finishes the flow on its last.
     OnboardingNext,
@@ -644,6 +654,10 @@ impl SemanticCommandId {
             Self::RelayServeThroughToggle => "relay.serve-through.toggle",
             Self::RelayClose => "relay.close",
             Self::OnboardingOpen => "onboarding.open",
+            Self::OnboardingProvidersPrevious => "onboarding.providers.previous",
+            Self::OnboardingProvidersNext => "onboarding.providers.next",
+            Self::OnboardingProvidersToggle => "onboarding.providers.toggle",
+            Self::OnboardingProvidersRecheck => "onboarding.providers.recheck",
             Self::OnboardingNext => "onboarding.next",
             Self::OnboardingBack => "onboarding.back",
             Self::OnboardingLeave => "onboarding.leave",
@@ -2110,6 +2124,43 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             aliases: &[],
             takes_text: false,
         }),
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingProvidersPrevious,
+        title: "Previous Onboarding Provider",
+        reach: SemanticReach::Client,
+        description: "Move to the Provider above on Onboarding's Providers step",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingProvidersNext,
+        title: "Next Onboarding Provider",
+        reach: SemanticReach::Client,
+        description: "Move to the Provider below on Onboarding's Providers step",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingProvidersToggle,
+        title: "Toggle Onboarding Provider",
+        // Like the settings panel's edits, it writes the Client's own Server's
+        // Setting, never the Origin's, so an Origin out of reach does not
+        // refuse it.
+        reach: SemanticReach::Client,
+        description: "Enable or disable the Provider under the cursor",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingProvidersRecheck,
+        title: "Re-check Providers",
+        // It asks the Client's own Server, whose Onboarding this is, whichever
+        // Origin is on screen.
+        reach: SemanticReach::Client,
+        description: "Read every Provider's Availability again",
+        slash: None,
         keybinding: None,
     },
     SemanticCommandDescriptor {

@@ -39,6 +39,7 @@ use super::{
     list_window::WindowEntry,
     model_options::ModelOptionChoiceRow,
     model_picker::{FIX_INDENT, ModelPickerRow, fix_rows},
+    onboarding::OwnServer,
     relay_overlay::serve_through_status,
     serve_overlay::{CandidateWay, LISTENER_FAILED, LISTENER_OFF, ServeWays},
     session_picker::SessionPickerRow,
@@ -3193,15 +3194,28 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
 }
 
 fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
+    let server = OwnServer::of(state.settings(), &state.model_picker);
+    let width = main.width.saturating_sub(4).min(76);
+    // The box keeps one height from step to step, and grows past it only for
+    // a step with more to draw — every Provider's fix beneath its row — as
+    // far as the screen has room.
+    let wanted = state
+        .onboarding
+        .rows_wanted(usize::from(width.saturating_sub(2)), theme, server)
+        .saturating_add(2);
     let area = centered_rect(
         main,
-        main.width.saturating_sub(4).min(76),
-        main.height.saturating_sub(2).min(16),
+        width,
+        u16::try_from(wanted)
+            .unwrap_or(u16::MAX)
+            .max(16)
+            .min(main.height.saturating_sub(2)),
     );
     let lines = state.onboarding.lines(
         usize::from(area.width.saturating_sub(2)),
         usize::from(area.height.saturating_sub(2)),
         theme,
+        server,
     );
     render_overlay_box(
         frame,

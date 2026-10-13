@@ -73,7 +73,7 @@ use super::{
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
-    onboarding::{Advance, Onboarding, Opening},
+    onboarding::{Advance, Onboarding, Opening, OwnServer},
     relay_overlay::{
         ListingLanded, RedemptionLoginLead, RelayLoginAct, RelayLoginFollow, RelayLoginLead,
         RelayOverlay, RelayRequest,
@@ -10202,12 +10202,40 @@ impl Application {
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::Continue)
             }
+            SemanticCommandId::OnboardingProvidersPrevious => {
+                self.state.onboarding.select_previous_provider();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::OnboardingProvidersNext => {
+                self.state.onboarding.select_next_provider();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::OnboardingProvidersToggle => Ok(self
+                .state
+                .onboarding
+                .toggle_provider(&self.state.settings)
+                .map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::MutateSetting,
+                )),
+            // The same listing of every Provider the Model picker's retry row
+            // asks for, of the Client's own Server whose Onboarding this is.
+            SemanticCommandId::OnboardingProvidersRecheck => {
+                Ok(if self.state.onboarding.shows_providers() {
+                    ApplicationTransition::ListModels(
+                        self.state.model_picker.begin_refresh_of(&Outlook::Local),
+                    )
+                } else {
+                    ApplicationTransition::Continue
+                })
+            }
             SemanticCommandId::OnboardingNext => {
                 if !self.state.onboarding.is_open() {
                     return Ok(ApplicationTransition::Continue);
                 }
-                Ok(match self.state.onboarding.next() {
-                    Advance::Moved => ApplicationTransition::Continue,
+                let server = OwnServer::of(&self.state.settings, &self.state.model_picker);
+                Ok(match self.state.onboarding.next(server) {
+                    Advance::Moved | Advance::Held => ApplicationTransition::Continue,
                     Advance::Finished => self.state.take_onboarding(),
                 })
             }

@@ -148,6 +148,24 @@ impl<'a> CatalogNames<'a> {
     }
 }
 
+/// How the latest catalog heard from one Outlook's Server stands for each of
+/// its Providers, read by a surface reporting Availability beyond the picker.
+/// A Provider no catalog in hand names has no status yet.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::tui) struct CatalogStatuses<'a>(&'a [ProviderModels]);
+
+impl<'a> CatalogStatuses<'a> {
+    pub(in crate::tui) fn status(
+        &self,
+        provider: &ProviderId,
+    ) -> Option<&'a ProviderCatalogStatus> {
+        self.0
+            .iter()
+            .find(|candidate| &candidate.provider == provider)
+            .map(|candidate| &candidate.status)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ModelPickerRow<'a> {
     Provider {
@@ -230,6 +248,18 @@ impl ModelPicker {
         let request = ModelListRequest::new(self.request_sequence, self.outlook.clone());
         self.active_request = Some(request.clone());
         request
+    }
+
+    /// Mints the listing that re-reads every Provider of `outlook`'s Server.
+    /// One of the picker's own Outlook is the listing it waits on and loads,
+    /// as [`Self::begin_refresh`] mints; one of another Outlook is only asked
+    /// for, and what it finds reaches the cache as that Server pushes it.
+    pub(super) fn begin_refresh_of(&mut self, outlook: &Outlook) -> ModelListRequest {
+        if *outlook == self.outlook {
+            return self.begin_refresh();
+        }
+        self.request_sequence = self.request_sequence.wrapping_add(1);
+        ModelListRequest::new(self.request_sequence, outlook.clone())
     }
 
     pub(super) fn adopt_outlook(&mut self, outlook: Outlook) {
@@ -333,6 +363,16 @@ impl ModelPicker {
     /// Models, for a surface naming them outside the picker.
     pub(super) fn catalog_names(&self) -> CatalogNames<'_> {
         CatalogNames(&self.cached_providers)
+    }
+
+    /// How the latest catalog heard for `outlook` stands for each Provider,
+    /// for a surface reporting Availability outside the picker.
+    pub(super) fn catalog_statuses(&self, outlook: &Outlook) -> CatalogStatuses<'_> {
+        CatalogStatuses(
+            self.cached_providers
+                .get(outlook)
+                .map_or(&[], Vec::as_slice),
+        )
     }
 
     /// The Provider as the latest catalog lists it: the live list first, then

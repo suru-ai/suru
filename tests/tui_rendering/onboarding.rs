@@ -12,8 +12,10 @@ use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        EffectiveSettings, Health, Outlook, RemoteHealth, RemoteStatus, SettingsDiagnostic,
-        SettingsDiagnosticSeverity, SettingsSnapshot, SidebarSettings, SidebarVisibility, Way,
+        EffectiveSettings, Health, ModelCatalog, Outlook, ProviderCatalogStatus, ProviderId,
+        ProviderModelCatalog, ProviderUnavailability, RemoteHealth, RemoteStatus, SettingMutation,
+        SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarSettings,
+        SidebarVisibility, Way,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -365,11 +367,11 @@ fn finishing_the_third_step_marks_the_server_onboarded_and_closes() {
 fn onboarding_owns_the_keys_while_it_is_open() {
     let workspace = workspace_dir();
     let mut application = offered_onboarding(workspace.path());
-    type_terminal_text(&mut application, "draft");
+    type_terminal_text(&mut application, "hello");
     press(&mut application, KeyCode::Esc);
     let landing = screen(&application);
     assert!(
-        !landing.contains("draft"),
+        !landing.contains("hello"),
         "nothing typed over Onboarding reaches the composer: {landing}"
     );
 }
@@ -527,5 +529,626 @@ fn the_launch_notice_waits_beneath_onboarding_and_is_read_once_it_closes() {
         !notice(&application),
         "the next key reads it: {}",
         screen(&application)
+    );
+}
+
+/// Settings in which each built-in Provider is enabled as given, in their
+/// fixed order: Codex, Copilot, Claude.
+fn with_enablement(codex: bool, copilot: bool, claude: bool) -> EffectiveSettings {
+    let mut settings = EffectiveSettings::default();
+    settings.provider.codex.enabled = codex;
+    settings.provider.copilot.enabled = copilot;
+    settings.provider.claude.enabled = claude;
+    settings
+}
+
+/// What an edit's round trip leaves in force, as the Server answers it.
+fn settle_mutation(application: &mut Application, settings: EffectiveSettings) {
+    application
+        .handle_event(ApplicationEvent::SettingMutated(SettingsSnapshot {
+            settings,
+            pinned: Vec::new(),
+            diagnostics: Vec::new(),
+        }))
+        .expect("receive the settings the edit left in force");
+}
+
+/// A catalog naming each Provider by its status alone, which is all a
+/// Provider row reads of it.
+fn catalog(providers: &[(&str, ProviderCatalogStatus)]) -> ModelCatalog {
+    ModelCatalog {
+        providers: providers
+            .iter()
+            .map(|(provider, status)| ProviderModelCatalog {
+                provider: ProviderId::new(*provider),
+                display_name: (*provider).to_owned(),
+                models: Vec::new(),
+                status: status.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// The Client's own Server pushes the Model Catalog as it now stands, as it
+/// does after every connect and whenever a Provider's catalog changes.
+fn push_catalog(application: &mut Application, providers: &[(&str, ProviderCatalogStatus)]) {
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::ModelCatalog(
+            catalog(providers),
+        )))
+        .expect("hear the Model Catalog the Server pushed");
+}
+
+fn unavailable(reason: ProviderUnavailability, fix: &str) -> ProviderCatalogStatus {
+    ProviderCatalogStatus::Unavailable {
+        reason,
+        message: "the Provider's own account of it".to_owned(),
+        fix: fix.to_owned(),
+    }
+}
+
+/// Every Provider unavailable, as on a machine with none of their CLIs.
+fn nothing_installed() -> [(&'static str, ProviderCatalogStatus); 3] {
+    [
+        (
+            "codex",
+            unavailable(
+                ProviderUnavailability::NotInstalled,
+                "install the Codex CLI from https://developers.openai.com/codex/cli/",
+            ),
+        ),
+        (
+            "copilot",
+            unavailable(ProviderUnavailability::NotSignedIn, "run `copilot login`"),
+        ),
+        (
+            "claude",
+            unavailable(
+                ProviderUnavailability::NotInstalled,
+                "install the Claude Code CLI from https://code.claude.com/docs/en/setup",
+            ),
+        ),
+    ]
+}
+
+/// The line the Providers step draws for `provider`'s row.
+fn provider_row(application: &Application, provider: &str) -> String {
+    let rows = rendered_application_rows_at(application, 100, 24);
+    rows.iter()
+        .find(|row| row.contains(&format!("] {provider}")))
+        .unwrap_or_else(|| panic!("no row for {provider}: {}", rows.join("\n")))
+        .trim_end()
+        .to_owned()
+}
+
+/// The text of `provider`'s row within the Onboarding box, from its
+/// checkbox to the end of what it says.
+fn provider_row_text(application: &Application, provider: &str) -> String {
+    let row = provider_row(application, provider);
+    let start = row
+        .find('[')
+        .expect("a Provider row begins with its checkbox");
+    row[start..].trim_end_matches(['│', ' ']).to_owned()
+}
+
+#[test]
+fn the_providers_step_lists_every_built_in_provider_ticked_on_a_fresh_install() {
+    let workspace = workspace_dir();
+    let application = offered_onboarding(workspace.path());
+    let rows = rendered_application_rows_at(&application, 100, 24);
+    let order = ["Codex", "Copilot", "Claude"].map(|provider| {
+        rows.iter()
+            .position(|row| row.contains(&format!("[x] {provider}")))
+            .unwrap_or_else(|| panic!("{provider} begins ticked: {}", rows.join("\n")))
+    });
+    assert!(
+        order.windows(2).all(|pair| pair[0] < pair[1]),
+        "in the fixed built-in order: {}",
+        rows.join("\n")
+    );
+    assert!(
+        provider_row(&application, "Codex").contains("› [x] Codex"),
+        "the cursor begins on the first: {}",
+        screen(&application)
+    );
+}
+
+#[test]
+fn space_writes_the_provider_under_the_cursor_through_its_enablement_at_once() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
+            value: Some(false),
+        }),
+        "Space turns the Provider under the cursor off"
+    );
+    assert!(
+        provider_row(&application, "Codex").contains("[x] Codex"),
+        "the row waits on the Server rather than showing what the file has not taken"
+    );
+    settle_mutation(&mut application, with_enablement(false, true, true));
+    assert!(
+        provider_row(&application, "Codex").contains("[ ] Codex"),
+        "and follows what the edit left in force: {}",
+        screen(&application)
+    );
+
+    press(&mut application, KeyCode::Down);
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCopilotEnabled {
+            value: Some(false),
+        }),
+        "Down moves the cursor to the next Provider"
+    );
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Up);
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderClaudeEnabled {
+            value: Some(false),
+        }),
+        "the cursor wraps past either end: {}",
+        screen(&application)
+    );
+    press(&mut application, KeyCode::Down);
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
+            value: Some(true),
+        }),
+        "and Space turns a Provider back on"
+    );
+    assert!(
+        screen(&application).contains("Step 1 of 3"),
+        "toggling moves no step"
+    );
+}
+
+#[test]
+fn each_provider_row_shows_its_catalog_status() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    assert_eq!(
+        provider_row_text(&application, "Codex"),
+        "[x] Codex · checking",
+        "nothing heard yet is said as such"
+    );
+
+    push_catalog(
+        &mut application,
+        &[
+            ("codex", ProviderCatalogStatus::Fresh),
+            ("copilot", ProviderCatalogStatus::Refreshing),
+            (
+                "claude",
+                ProviderCatalogStatus::Warning {
+                    message: "Claude Code 1.0 lacks the newest permission modes".to_owned(),
+                },
+            ),
+        ],
+    );
+    assert_eq!(
+        provider_row_text(&application, "Codex"),
+        "[x] Codex · available"
+    );
+    assert_eq!(
+        provider_row_text(&application, "Copilot"),
+        "[x] Copilot · refreshing"
+    );
+    assert_eq!(
+        provider_row_text(&application, "Claude"),
+        "[x] Claude · warning"
+    );
+    assert!(
+        screen(&application).contains("Claude Code 1.0 lacks the newest permission modes"),
+        "beneath a warning, what it warns of: {}",
+        screen(&application)
+    );
+
+    push_catalog(
+        &mut application,
+        &[(
+            "codex",
+            ProviderCatalogStatus::Stale {
+                message: "the newest refresh failed".to_owned(),
+            },
+        )],
+    );
+    assert_eq!(
+        provider_row_text(&application, "Codex"),
+        "[x] Codex · available",
+        "a catalog still serving what it last read is still available"
+    );
+
+    push_catalog(
+        &mut application,
+        &[(
+            "copilot",
+            ProviderCatalogStatus::Failed {
+                message: "the Model listing timed out".to_owned(),
+            },
+        )],
+    );
+    assert_eq!(
+        provider_row_text(&application, "Copilot"),
+        "[x] Copilot · error"
+    );
+    assert!(
+        screen(&application).contains("the Model listing timed out"),
+        "beneath a failed read, what failed: {}",
+        screen(&application)
+    );
+}
+
+#[test]
+fn an_unavailable_provider_shows_its_reason_and_the_whole_fix_beneath() {
+    const INSTALL_PAGE: &str =
+        "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli";
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    push_catalog(
+        &mut application,
+        &[
+            (
+                "codex",
+                unavailable(ProviderUnavailability::NotSignedIn, "run `codex login`"),
+            ),
+            (
+                "copilot",
+                unavailable(
+                    ProviderUnavailability::NotInstalled,
+                    &format!("install the Copilot CLI from {INSTALL_PAGE}"),
+                ),
+            ),
+            (
+                "claude",
+                unavailable(
+                    ProviderUnavailability::IncompatibleVersion,
+                    "update the Claude Code CLI",
+                ),
+            ),
+        ],
+    );
+
+    // Wide enough for the box to hold the install page's address on a line.
+    let rows = rendered_application_rows_at(&application, 140, 30);
+    let screen = rows.join("\n");
+    for (provider, reason, fix) in [
+        ("Codex", "not signed in", "run `codex login`"),
+        ("Copilot", "not installed", "install the Copilot CLI from"),
+        (
+            "Claude",
+            "incompatible version",
+            "update the Claude Code CLI",
+        ),
+    ] {
+        let row = rows
+            .iter()
+            .position(|row| row.contains(&format!("] {provider}")))
+            .unwrap_or_else(|| panic!("{provider} has a row: {screen}"));
+        assert!(
+            rows[row].contains(&format!("[x] {provider} · {reason} ")),
+            "{screen}"
+        );
+        assert!(
+            rows[row + 1].contains(fix),
+            "what fixes {provider} stands beneath its row: {screen}"
+        );
+    }
+    assert!(
+        screen.contains(INSTALL_PAGE),
+        "an install page is drawn whole, never cut short: {screen}"
+    );
+}
+
+#[test]
+fn a_disabled_provider_claims_no_availability() {
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    deliver_settings(&mut application, with_enablement(true, false, true));
+    push_catalog(
+        &mut application,
+        &[
+            ("codex", ProviderCatalogStatus::Fresh),
+            ("copilot", ProviderCatalogStatus::Disabled),
+            ("claude", ProviderCatalogStatus::Fresh),
+        ],
+    );
+    assert_eq!(
+        provider_row_text(&application, "Copilot"),
+        "[ ] Copilot · disabled"
+    );
+}
+
+#[test]
+fn the_recheck_key_issues_the_all_providers_refresh_and_its_answer_reaches_the_rows() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    push_catalog(&mut application, &nothing_installed());
+    let footer = screen(&application);
+    assert!(
+        footer.contains("r Re-check"),
+        "the key is taught at the foot: {footer}"
+    );
+
+    let ApplicationTransition::ListModels(request) = press(&mut application, KeyCode::Char('r'))
+    else {
+        panic!(
+            "r re-reads every Provider's Availability: {}",
+            screen(&application)
+        );
+    };
+    assert_eq!(
+        request.outlook(),
+        &Outlook::Local,
+        "of the Client's own Server"
+    );
+
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: catalog(&[
+                ("codex", ProviderCatalogStatus::Fresh),
+                (
+                    "copilot",
+                    unavailable(ProviderUnavailability::NotSignedIn, "run `copilot login`"),
+                ),
+                ("claude", ProviderCatalogStatus::Refreshing),
+            ]),
+        })
+        .expect("receive what the re-check found");
+    assert_eq!(
+        provider_row_text(&application, "Codex"),
+        "[x] Codex · available",
+        "{}",
+        screen(&application)
+    );
+    assert_eq!(
+        provider_row_text(&application, "Claude"),
+        "[x] Claude · refreshing"
+    );
+}
+
+#[test]
+fn the_recheck_asks_the_clients_own_server_while_a_remote_is_viewed() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    deliver_settings(&mut application, EffectiveSettings::default());
+    turn_outlook(&mut application, KeyCode::Down);
+    type_terminal_text(&mut application, "/onboarding");
+    press(&mut application, KeyCode::Enter);
+    assert!(screen(&application).contains("Step 1 of 3"));
+
+    let ApplicationTransition::ListModels(request) = press(&mut application, KeyCode::Char('r'))
+    else {
+        panic!("r re-reads every Provider's Availability");
+    };
+    assert_eq!(
+        request.outlook(),
+        &Outlook::Local,
+        "Onboarding is the Client's own Server's, whichever Outlook is turned"
+    );
+}
+
+#[test]
+fn next_stays_locked_while_no_enabled_provider_is_available_and_unlocks_once_one_is() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    push_catalog(&mut application, &nothing_installed());
+
+    let locked = screen(&application);
+    assert!(
+        locked.contains("Next is locked: no enabled Provider is available"),
+        "a line under the rows says why: {locked}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        screen(&application).contains("Step 1 of 3"),
+        "Enter moves nowhere: {}",
+        screen(&application)
+    );
+
+    let [codex, copilot, _] = nothing_installed();
+    push_catalog(
+        &mut application,
+        &[codex, copilot, ("claude", ProviderCatalogStatus::Fresh)],
+    );
+    let unlocked = screen(&application);
+    assert!(!unlocked.contains("Next is locked"), "{unlocked}");
+    press(&mut application, KeyCode::Enter);
+    assert!(
+        screen(&application).contains("Step 2 of 3"),
+        "one available Provider is enough: {}",
+        screen(&application)
+    );
+}
+
+/// A machine with none of the Providers' CLIs is where a first-time user is
+/// likeliest to begin, and the box makes room for every fix and for why Next
+/// is locked rather than cutting either short.
+#[test]
+fn every_fix_and_the_lock_line_are_drawn_with_no_provider_installed() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    push_catalog(
+        &mut application,
+        &[
+            (
+                "codex",
+                unavailable(
+                    ProviderUnavailability::NotInstalled,
+                    "install the Codex CLI from https://developers.openai.com/codex/cli/",
+                ),
+            ),
+            (
+                "copilot",
+                unavailable(
+                    ProviderUnavailability::NotInstalled,
+                    "install the Copilot CLI from \
+                     https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli",
+                ),
+            ),
+            (
+                "claude",
+                unavailable(
+                    ProviderUnavailability::NotInstalled,
+                    "install the Claude Code CLI from https://code.claude.com/docs/en/setup",
+                ),
+            ),
+        ],
+    );
+
+    let shown = screen(&application);
+    for drawn in [
+        "https://developers.openai.com/codex/cli/",
+        "install the Copilot CLI from",
+        "https://code.claude.com/docs/en/setup",
+        "Next is locked: no enabled Provider is available.",
+        "Esc Leave",
+    ] {
+        assert!(shown.contains(drawn), "{drawn:?} is drawn: {shown}");
+    }
+}
+
+#[test]
+fn next_stays_locked_while_every_provider_is_disabled() {
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    deliver_settings(&mut application, with_enablement(false, false, false));
+    push_catalog(
+        &mut application,
+        &[
+            ("codex", ProviderCatalogStatus::Disabled),
+            ("copilot", ProviderCatalogStatus::Disabled),
+            ("claude", ProviderCatalogStatus::Disabled),
+        ],
+    );
+
+    let locked = screen(&application);
+    assert!(
+        locked.contains("Next is locked: enable at least one Provider"),
+        "{locked}"
+    );
+    press(&mut application, KeyCode::Enter);
+    assert!(screen(&application).contains("Step 1 of 3"));
+
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
+            value: Some(true),
+        })
+    );
+    settle_mutation(&mut application, with_enablement(true, false, false));
+    assert!(
+        !screen(&application).contains("Next is locked"),
+        "an enabled Provider not found unavailable opens the way: {}",
+        screen(&application)
+    );
+}
+
+#[test]
+fn an_available_provider_that_is_disabled_does_not_unlock_next() {
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    deliver_settings(&mut application, with_enablement(true, false, false));
+    let [codex, ..] = nothing_installed();
+    push_catalog(
+        &mut application,
+        &[
+            codex,
+            ("copilot", ProviderCatalogStatus::Fresh),
+            ("claude", ProviderCatalogStatus::Fresh),
+        ],
+    );
+    assert!(
+        screen(&application).contains("Next is locked: no enabled Provider is available"),
+        "{}",
+        screen(&application)
+    );
+    press(&mut application, KeyCode::Enter);
+    assert!(screen(&application).contains("Step 1 of 3"));
+}
+
+#[test]
+fn a_warning_or_refreshing_provider_does_not_lock_next() {
+    for passing in [
+        ProviderCatalogStatus::Warning {
+            message: "an older CLI than Suru prefers".to_owned(),
+        },
+        ProviderCatalogStatus::Refreshing,
+    ] {
+        let workspace = workspace_dir();
+        let mut application = offered_onboarding(workspace.path());
+        let [codex, copilot, _] = nothing_installed();
+        push_catalog(&mut application, &[codex, copilot, ("claude", passing)]);
+        assert!(
+            !screen(&application).contains("Next is locked"),
+            "{}",
+            screen(&application)
+        );
+        press(&mut application, KeyCode::Enter);
+        assert!(
+            screen(&application).contains("Step 2 of 3"),
+            "{}",
+            screen(&application)
+        );
+    }
+}
+
+#[test]
+fn going_back_to_the_providers_step_finds_it_as_left() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Enter);
+    press(&mut application, KeyCode::Left);
+    assert!(
+        provider_row(&application, "Copilot").contains("› [x] Copilot"),
+        "{}",
+        screen(&application)
+    );
+}
+
+#[test]
+fn slash_onboarding_shows_providers_turned_off_in_the_settings_panel() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    deliver_settings(&mut application, EffectiveSettings::default());
+
+    press_with(&mut application, KeyCode::Char('x'), KeyModifiers::CONTROL);
+    press(&mut application, KeyCode::Char(','));
+    press(&mut application, KeyCode::Right);
+    press(&mut application, KeyCode::Down);
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCopilotEnabled {
+            value: Some(false),
+        }),
+        "the settings panel turns Copilot off"
+    );
+    settle_mutation(&mut application, with_enablement(true, false, true));
+    press(&mut application, KeyCode::Esc);
+
+    type_terminal_text(&mut application, "/onboarding");
+    press(&mut application, KeyCode::Enter);
+    assert!(screen(&application).contains("Step 1 of 3"));
+    assert!(provider_row(&application, "Codex").contains("[x] Codex"));
+    assert!(
+        provider_row(&application, "Copilot").contains("[ ] Copilot"),
+        "{}",
+        screen(&application)
+    );
+    assert!(provider_row(&application, "Claude").contains("[x] Claude"));
+    assert!(
+        provider_row(&application, "Codex").contains("› [x] Codex"),
+        "the cursor begins on the first row again"
     );
 }
