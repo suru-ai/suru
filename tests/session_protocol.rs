@@ -284,6 +284,42 @@ fn workspace_round_trips_why_it_cannot_be_opened() {
     );
 }
 
+/// Health says whether the Server has been onboarded, always: a health
+/// without it is no health this protocol reads.
+#[test]
+fn health_carries_whether_the_server_has_been_onboarded() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 105,
+            "saying whether a Server has been onboarded changes the wire"
+        );
+    }
+    let health = suru::protocol::Health::new(
+        suru::protocol::ServerIdentity {
+            instance_id: Uuid::nil(),
+            pid: 1,
+            protocol_version: PROTOCOL_VERSION,
+            build_identity: "suru@test".to_owned(),
+        },
+        suru::protocol::LifecycleState::Ready,
+    )
+    .with_onboarded(true);
+    let mut encoded = serde_json::to_value(&health).expect("encode health");
+    assert_eq!(encoded["onboarded"], json!(true));
+    assert_eq!(
+        serde_json::from_value::<suru::protocol::Health>(encoded.clone()).expect("decode health"),
+        health
+    );
+    encoded
+        .as_object_mut()
+        .expect("health is an object")
+        .remove("onboarded");
+    assert!(
+        serde_json::from_value::<suru::protocol::Health>(encoded).is_err(),
+        "a health that does not say is refused"
+    );
+}
+
 #[test]
 fn skill_catalog_request_round_trips_provider_and_workspace_context() {
     let request = SkillCatalogRequest {
