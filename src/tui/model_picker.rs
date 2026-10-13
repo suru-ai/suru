@@ -99,6 +99,9 @@ pub(super) struct ModelPicker {
     /// back to one names its Models again without waiting to hear the catalog
     /// anew.
     cached_providers: HashMap<Outlook, Vec<ProviderModels>>,
+    /// How many catalogs each Outlook's Server has pushed, which tells a
+    /// reading asked of it earlier whether a newer word has landed since.
+    pushes: HashMap<Outlook, u64>,
     providers: Vec<ProviderModels>,
     /// One current presentation per Outlook, retained while another Outlook is
     /// visible so returning to it restores the label it previously showed.
@@ -410,8 +413,24 @@ impl ModelPicker {
     /// nothing else: the rows of a picker already open keep answering to the
     /// listing it asked for.
     pub(super) fn adopt_catalog(&mut self, outlook: Outlook, catalog: ModelCatalog) {
+        *self.pushes.entry(outlook.clone()).or_default() += 1;
         self.cached_providers
             .insert(outlook, normalize_catalog(catalog.providers));
+    }
+
+    /// How many catalogs `outlook`'s Server has pushed so far.
+    pub(super) fn pushes(&self, outlook: &Outlook) -> u64 {
+        self.pushes.get(outlook).copied().unwrap_or_default()
+    }
+
+    /// Takes in what a reading of `outlook`'s Server found, asked of it when
+    /// it had pushed `pushes` catalogs, into the cache as a push would go —
+    /// unless it has pushed one since, which is its newer word.
+    pub(super) fn adopt_reading(&mut self, outlook: Outlook, catalog: ModelCatalog, pushes: u64) {
+        if self.pushes(&outlook) == pushes {
+            self.cached_providers
+                .insert(outlook, normalize_catalog(catalog.providers));
+        }
     }
 
     pub(super) fn finish(&mut self, request: &ModelListRequest) {

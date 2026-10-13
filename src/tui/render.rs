@@ -181,6 +181,10 @@ pub(super) fn render_with_slots(
     state.workspace_picker.forget_frame();
     // So are the Directory Browser's rows, and its box the wheel answers over.
     state.directory_browser.forget_frame();
+    // Onboarding acts on the Provider under its cursor only where a frame
+    // drew it, so its record of which it drew starts over with the frame,
+    // and a frame too small to draw anything leaves it drawing none.
+    state.onboarding.forget_frame();
     *state.header_icon_area.borrow_mut() = None;
     // The Unreachable banner's "Try again" is pointable on the same terms, and
     // is only there on a frame that drew it.

@@ -1095,6 +1095,200 @@ fn the_recheck_reads_the_clients_own_server_over_a_remote_and_its_listing_still_
     );
 }
 
+/// Asks for a re-check of every Provider, answering the request its answer
+/// must name.
+fn recheck(application: &mut Application) -> uuid::Uuid {
+    let ApplicationTransition::RecheckProviders { recheck } =
+        press(application, KeyCode::Char('r'))
+    else {
+        panic!("r re-reads every Provider's Availability");
+    };
+    recheck
+}
+
+/// The Client's own Server answers the re-check `recheck`.
+fn answer_recheck(
+    application: &mut Application,
+    recheck: uuid::Uuid,
+    result: Result<ModelCatalog, String>,
+) {
+    application
+        .handle_event(ApplicationEvent::ProvidersRechecked { recheck, result })
+        .expect("receive the re-check's answer");
+}
+
+fn codex_available() -> ModelCatalog {
+    let [_, copilot, claude] = nothing_installed();
+    catalog(&[("codex", ProviderCatalogStatus::Fresh), copilot, claude])
+}
+
+/// Only the newest re-check answers for the rows: one superseded before it
+/// answered says nothing of them or of Next, however late it lands.
+#[test]
+fn only_the_newest_recheck_answers_for_the_rows() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    push_catalog(&mut application, &nothing_installed());
+    let first = recheck(&mut application);
+    let second = recheck(&mut application);
+
+    answer_recheck(&mut application, second, Ok(codex_available()));
+    assert_eq!(
+        provider_row_text(&application, "Codex"),
+        "[x] Codex · available"
+    );
+    answer_recheck(&mut application, first, Ok(catalog(&nothing_installed())));
+    answer_recheck(&mut application, first, Err("too late".to_owned()));
+    let after = screen(&application);
+    assert_eq!(
+        provider_row_text(&application, "Codex"),
+        "[x] Codex · available",
+        "the superseded answer does not undo the newest: {after}"
+    );
+    assert!(!after.contains("Next is locked"), "{after}");
+    assert!(!after.contains("Could not re-check"), "{after}");
+    press(&mut application, KeyCode::Enter);
+    assert!(
+        screen(&application).contains("Step 2 of 3"),
+        "{}",
+        screen(&application)
+    );
+}
+
+/// A re-check the flow was left before it answered moves nothing: the rows,
+/// taken again, read what the Server last said itself.
+#[test]
+fn a_recheck_answered_after_leaving_the_flow_moves_nothing() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    push_catalog(&mut application, &nothing_installed());
+    let asked = recheck(&mut application);
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::MarkOnboarded
+    );
+
+    answer_recheck(&mut application, asked, Ok(codex_available()));
+    type_terminal_text(&mut application, "/onboarding");
+    press(&mut application, KeyCode::Enter);
+    assert_eq!(
+        provider_row_text(&application, "Codex"),
+        "[x] Codex · not installed",
+        "{}",
+        screen(&application)
+    );
+}
+
+/// A re-check asked of the Server before the Client reconnected to it is no
+/// longer awaited: what that Server is now says itself, so the old answer
+/// moves nothing.
+#[test]
+fn a_recheck_asked_before_a_reconnect_moves_nothing() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    push_catalog(&mut application, &nothing_installed());
+    let asked = recheck(&mut application);
+
+    connect(&mut application, unonboarded_health());
+    assert!(
+        !screen(&application).contains("Re-checking"),
+        "{}",
+        screen(&application)
+    );
+    answer_recheck(&mut application, asked, Ok(codex_available()));
+    assert_eq!(
+        provider_row_text(&application, "Codex"),
+        "[x] Codex · not installed",
+        "{}",
+        screen(&application)
+    );
+}
+
+/// What the Server pushes is its newest word, so a re-check asked before a
+/// push landed gives way to that push.
+#[test]
+fn a_push_after_the_recheck_was_asked_outranks_its_answer() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    push_catalog(&mut application, &nothing_installed());
+    let asked = recheck(&mut application);
+
+    let [_, copilot, claude] = nothing_installed();
+    push_catalog(
+        &mut application,
+        &[("codex", ProviderCatalogStatus::Fresh), copilot, claude],
+    );
+    answer_recheck(&mut application, asked, Ok(catalog(&nothing_installed())));
+    let after = screen(&application);
+    assert_eq!(
+        provider_row_text(&application, "Codex"),
+        "[x] Codex · available",
+        "{after}"
+    );
+    assert!(
+        !after.contains("Re-checking"),
+        "the re-check is settled all the same: {after}"
+    );
+}
+
+/// Space acts on the Provider under the cursor only where the last frame
+/// drew that Provider, so keys taken together — a move and then Space,
+/// before any frame shows where the move went — toggle nothing unseen.
+#[test]
+fn space_after_a_move_no_frame_has_shown_toggles_nothing() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    push_catalog(&mut application, &every_cli_missing());
+    let short = rendered_application_rows_at(&application, 80, 16).join("\n");
+    assert!(!short.contains("Claude"), "{short}");
+
+    press(&mut application, KeyCode::Up);
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::Continue,
+        "the cursor moved to Claude, which no frame has drawn"
+    );
+
+    let shown = rendered_application_rows_at(&application, 80, 16).join("\n");
+    assert!(shown.contains("› [x] Claude"), "{shown}");
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderClaudeEnabled {
+            value: Some(false),
+        }),
+        "once a frame has drawn it, Space toggles it"
+    );
+}
+
+/// A terminal shrunk below what Suru draws in shows no Provider at all, so
+/// Space toggles none until a frame draws one again.
+#[test]
+fn space_on_a_terminal_too_small_to_draw_toggles_nothing() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    let normal = screen(&application);
+    assert!(normal.contains("› [x] Codex"), "{normal}");
+
+    let skipped = rendered_application_rows_at(&application, 20, 10).join("\n");
+    assert!(!skipped.contains("Codex"), "{skipped}");
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+
+    assert!(screen(&application).contains("› [x] Codex"));
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
+            value: Some(false),
+        })
+    );
+}
+
 /// A terminal too short for every Provider with its fix beneath it shows a
 /// window over them that follows the cursor, so the Provider Space would
 /// toggle is always one on screen, while why Next is locked and the keys at

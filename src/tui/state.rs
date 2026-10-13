@@ -2339,6 +2339,9 @@ impl TuiState {
                         .refocus(self.landing_agent_selection.as_ref());
                 }
                 let onboarded = health.onboarded;
+                // A re-check asked before the reconnect was asked of a
+                // connection that is gone, and the Server pushes what it is now.
+                self.onboarding.forget_recheck();
                 self.identity = Some(health.identity);
                 self.end_recovery(&Outlook::Local);
                 self.manually_stopped = false;
@@ -5896,20 +5899,18 @@ impl Application {
                 self.state.context_overlay.receive(request_id, result);
                 Ok(ApplicationTransition::Continue)
             }
-            // What a re-check read is the Client's own Server's catalog as it
-            // now stands, as good as one it pushed, whether or not the flow
-            // still awaits that re-check.
+            // Only the re-check the flow awaits answers for the rows, and what
+            // it read reaches the Local catalog as a push would, unless the
+            // Server has pushed one since it was asked: that is its newer word.
             ApplicationEvent::ProvidersRechecked { recheck, result } => {
-                let failure = match result {
-                    Ok(catalog) => {
-                        self.state
-                            .model_picker
-                            .adopt_catalog(Outlook::Local, catalog);
-                        None
-                    }
-                    Err(error) => Some(error),
-                };
-                self.state.onboarding.settle_recheck(recheck, failure);
+                let failure = result.as_ref().err().cloned();
+                if let Some(pushes) = self.state.onboarding.settle_recheck(recheck, failure)
+                    && let Ok(catalog) = result
+                {
+                    self.state
+                        .model_picker
+                        .adopt_reading(Outlook::Local, catalog, pushes);
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::AttachmentUploadFailed { paste, reason } => {
@@ -10251,7 +10252,7 @@ impl Application {
             SemanticCommandId::OnboardingProvidersRecheck => Ok(self
                 .state
                 .onboarding
-                .begin_recheck()
+                .begin_recheck(self.state.model_picker.pushes(&Outlook::Local))
                 .map_or(ApplicationTransition::Continue, |recheck| {
                     ApplicationTransition::RecheckProviders { recheck }
                 })),

@@ -19,7 +19,7 @@
 //! step afresh. Each step is handed the keys first, and only what it leaves
 //! is read as one of the keys every step shares.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -164,9 +164,10 @@ struct ProvidersStep {
     /// The row the cursor is on.
     cursor: usize,
     window: ListWindow,
-    /// Whether the last frame drew the row under the cursor, which is what
-    /// Space and Enter may act on; nothing until a frame has drawn the step.
-    cursor_drawn: Cell<Option<bool>>,
+    /// The Providers whose rows the last frame drew, which are the ones
+    /// Space and Enter may act on; nothing until a frame has been drawn since
+    /// the step opened.
+    drawn: RefCell<Option<Vec<&'static ProviderId>>>,
     recheck: Recheck,
 }
 
@@ -175,8 +176,9 @@ struct ProvidersStep {
 enum Recheck {
     #[default]
     Idle,
-    /// Asked for, under this request, and not yet answered.
-    Awaiting(uuid::Uuid),
+    /// Asked for under `recheck`, when the Client's own Server had pushed
+    /// `pushes` catalogs, and not yet answered.
+    Awaiting { recheck: uuid::Uuid, pushes: u64 },
     /// The newest re-check was not answered, for this reason.
     Failed(String),
 }
@@ -227,10 +229,15 @@ impl ProvidersStep {
         self.window.reveal();
     }
 
-    /// Whether the row under the cursor is one the reader can see: the last
-    /// frame drew it, or no frame has drawn the step yet.
+    /// Whether the Provider under the cursor is one the reader can see: the
+    /// last frame drew its row, or no frame has been drawn yet.
     fn cursor_seen(&self) -> bool {
-        self.cursor_drawn.get() != Some(false)
+        match &*self.drawn.borrow() {
+            None => true,
+            Some(drawn) => Self::providers()
+                .nth(self.cursor)
+                .is_some_and(|provider| drawn.contains(&&provider.id)),
+        }
     }
 
     /// The edit turning the Provider under the cursor off where it is on and
@@ -328,7 +335,11 @@ impl ProvidersStep {
                     | Standing::Available
                     | Standing::Refreshing => Beneath::Nothing,
                 };
-                ProviderEntry { line, beneath }
+                ProviderEntry {
+                    provider: &provider.id,
+                    line,
+                    beneath,
+                }
             })
             .collect()
     }
@@ -345,7 +356,7 @@ impl ProvidersStep {
         let width = u16::try_from(width).unwrap_or(u16::MAX);
         let recheck = match &self.recheck {
             Recheck::Idle => None,
-            Recheck::Awaiting(_) => Some(("Re-checking every Provider…", theme.text.subdued)),
+            Recheck::Awaiting { .. } => Some(("Re-checking every Provider…", theme.text.subdued)),
             Recheck::Failed(failure) => Some((failure.as_str(), theme.feedback.error)),
         };
         Self::lock(server)
@@ -433,20 +444,15 @@ impl ProvidersStep {
         let shown = self.window.settle(&window, capacity, Some(self.cursor));
         let end = lines.len() + capacity;
         let mut wrapped = Vec::new();
-        let mut cursor_drawn = false;
-        for (row, entry) in entries
-            .into_iter()
-            .enumerate()
-            .skip(shown.start)
-            .take(shown.len())
-        {
+        let mut drawn = Vec::new();
+        for entry in entries.into_iter().skip(shown.start).take(shown.len()) {
             // Only a row taller than the whole window is cut short, and then
             // from what goes beneath it.
             let room = end.saturating_sub(lines.len());
             if room == 0 {
                 break;
             }
-            cursor_drawn |= row == self.cursor;
+            drawn.push(entry.provider);
             lines.push(entry.line);
             match entry.beneath {
                 Beneath::Fix(fix, style) => {
@@ -460,7 +466,7 @@ impl ProvidersStep {
                 Beneath::Message(_) | Beneath::Nothing => {}
             }
         }
-        self.cursor_drawn.set(Some(cursor_drawn));
+        self.drawn.replace(Some(drawn));
         if notes_gap {
             lines.push(Line::default());
         }
@@ -476,6 +482,7 @@ impl ProvidersStep {
 
 /// One Provider's row as the step lays it out, and what goes beneath it.
 struct ProviderEntry<'a> {
+    provider: &'static ProviderId,
     line: Line<'static>,
     beneath: Beneath<'a>,
 }
@@ -668,25 +675,56 @@ impl Onboarding {
 
     /// Begins a re-read of every Provider from the Providers step, while it
     /// is on show, answering the request the Client's own Server is to be
-    /// asked under. A newer re-check takes the place of one still awaited.
-    pub(super) fn begin_recheck(&mut self) -> Option<uuid::Uuid> {
+    /// asked under; that Server has pushed `pushes` catalogs so far. A newer
+    /// re-check takes the place of one still awaited.
+    pub(super) fn begin_recheck(&mut self, pushes: u64) -> Option<uuid::Uuid> {
         self.shows_providers().then(|| {
             let recheck = uuid::Uuid::new_v4();
-            self.providers.recheck = Recheck::Awaiting(recheck);
+            self.providers.recheck = Recheck::Awaiting { recheck, pushes };
             recheck
         })
     }
 
-    /// Takes the Server's answer to `recheck`: what it read reaches the rows
-    /// through the catalog, and here only whether the newest re-check failed.
-    /// An answer to one since superseded settles nothing.
-    pub(super) fn settle_recheck(&mut self, recheck: uuid::Uuid, failure: Option<String>) {
-        if !matches!(self.providers.recheck, Recheck::Awaiting(awaited) if awaited == recheck) {
-            return;
+    /// Takes the Server's answer to `recheck` where it is the re-check
+    /// awaited, answering how many catalogs the Server had pushed when it was
+    /// asked. An answer to any other — superseded, or asked before the flow
+    /// last closed or the Client last reconnected — is no answer at all, and
+    /// settles nothing whether it found the Providers or failed.
+    pub(super) fn settle_recheck(
+        &mut self,
+        recheck: uuid::Uuid,
+        failure: Option<String>,
+    ) -> Option<u64> {
+        let Recheck::Awaiting {
+            recheck: awaited,
+            pushes,
+        } = self.providers.recheck
+        else {
+            return None;
+        };
+        if awaited != recheck {
+            return None;
         }
         self.providers.recheck = failure.map_or(Recheck::Idle, |error| {
             Recheck::Failed(format!("Could not re-check the Providers: {error}"))
         });
+        Some(pushes)
+    }
+
+    /// Gives up how the re-check stands, because the Client has reconnected
+    /// to its own Server, which says what it is now itself.
+    pub(super) fn forget_recheck(&mut self) {
+        self.providers.recheck = Recheck::Idle;
+    }
+
+    /// Starts the record of which Providers were drawn over with the frame,
+    /// so one that draws none of them — the step not on show, or the
+    /// terminal too small to draw anything — leaves Space and Enter nothing
+    /// to act on.
+    pub(super) fn forget_frame(&self) {
+        if self.is_open() {
+            self.providers.drawn.replace(Some(Vec::new()));
+        }
     }
 
     /// Moves the Providers step's cursor to the Provider above.
