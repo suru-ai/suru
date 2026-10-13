@@ -1455,6 +1455,14 @@ impl RunLoop {
             ApplicationTransition::MarkOnboarded => {
                 spawn_onboarded_mark(self.client.session_commands());
             }
+            ApplicationTransition::FinishOnboarding { pin } => {
+                spawn_setting_mutation(
+                    self.client.session_commands(),
+                    pin,
+                    self.channels.submissions.clone(),
+                );
+                spawn_onboarded_mark(self.client.session_commands());
+            }
             ApplicationTransition::RecheckProviders { recheck } => {
                 spawn_providers_recheck(
                     self.client.session_commands(),
@@ -1836,6 +1844,7 @@ impl RunLoop {
             | ApplicationTransition::UpdateApprovalPosture { .. }
             | ApplicationTransition::MutateSetting(_)
             | ApplicationTransition::MarkOnboarded
+            | ApplicationTransition::FinishOnboarding { .. }
             | ApplicationTransition::RecheckProviders { .. }
             | ApplicationTransition::BeginServing { .. }
             | ApplicationTransition::IssueInvite { .. }

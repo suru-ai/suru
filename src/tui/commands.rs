@@ -207,6 +207,11 @@ pub enum SemanticCommandId {
     /// Re-reads every Provider's Availability from Onboarding's Providers
     /// step, for a reader who has just fixed one outside Suru.
     OnboardingProvidersRecheck,
+    /// Moves Row Focus on Onboarding's Icons step to the answer above, or
+    /// below, wrapping past either end; from neither answer, to the last, or
+    /// the first.
+    OnboardingIconsPrevious,
+    OnboardingIconsNext,
     /// Confirms the Onboarding step on show and moves to the next, or
     /// finishes the flow on its last.
     OnboardingNext,
@@ -664,6 +669,8 @@ impl SemanticCommandId {
             Self::OnboardingProvidersNext => "onboarding.providers.next",
             Self::OnboardingProvidersToggle => "onboarding.providers.toggle",
             Self::OnboardingProvidersRecheck => "onboarding.providers.recheck",
+            Self::OnboardingIconsPrevious => "onboarding.icons.previous",
+            Self::OnboardingIconsNext => "onboarding.icons.next",
             Self::OnboardingNext => "onboarding.next",
             Self::OnboardingBack => "onboarding.back",
             Self::OnboardingLeave => "onboarding.leave",
@@ -2170,6 +2177,22 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         // Origin is on screen, so no Origin out of reach refuses it.
         reach: SemanticReach::Client,
         description: "Read every Provider's Availability again",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingIconsPrevious,
+        title: "Previous Onboarding Icons Answer",
+        reach: SemanticReach::Client,
+        description: "Move to the answer above on Onboarding's Icons step",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingIconsNext,
+        title: "Next Onboarding Icons Answer",
+        reach: SemanticReach::Client,
+        description: "Move to the answer below on Onboarding's Icons step",
         slash: None,
         keybinding: None,
     },

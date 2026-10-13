@@ -19,7 +19,7 @@
 //! step afresh. Each step is handed the keys first, and only what it leaves
 //! is read as one of the keys every step shares.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -29,6 +29,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    icon_catalog,
     protocol::{
         AgentSelection, DerivationErrand, EffectiveSettings, ModelDescriptor, ModelId, Outlook,
         ProviderCatalogStatus, ProviderId, ProviderUnavailability, SettingMutation,
@@ -45,6 +46,7 @@ use super::{
     commands::SemanticCommandId,
     list_window::{ListWindow, WindowEntry},
     model_picker::{CatalogStatuses, ModelPicker, ModelPickerPurpose},
+    render::{NF_COD_FOLDER, NF_COD_GIT_BRANCH},
     selection::WrappedLine,
     slots::truncate_to_width,
     state::CommandId,
@@ -134,11 +136,12 @@ pub(super) enum Advance {
     /// and awaits its answer on show.
     Rechecking(uuid::Uuid),
     /// The step on show may not be passed yet, so it stays: the Providers
-    /// step says why, and the Derivation step has nothing under Row Focus to
-    /// answer with.
+    /// step says why, and the Derivation and Icons steps have nothing under
+    /// Row Focus to answer with.
     Held,
-    /// The last step was confirmed, so the flow is over and closed.
-    Finished,
+    /// The last step was answered with this pin of the Setting it governs,
+    /// so the flow is over and closed.
+    Finished(SettingMutation),
 }
 
 /// What the flow reads of the Client's own Server, of which it keeps no copy:
@@ -838,20 +841,245 @@ fn pinned_selection(selection: AgentSelection) -> SettingMutation {
     derivation_pin(DerivationErrand::Pinned(selection))
 }
 
-/// The Icons step: whether this terminal draws Icons.
+/// The Icons step: a sample of Nerd Font glyphs, drawn whatever Show icons
+/// holds, and the reader's word on how this terminal draws them, which
+/// decides whether Suru shows Icons. On a first run neither answer is under
+/// Row Focus, so the reader looks before they answer; on a retake the answer
+/// Show icons already holds is. Finish pins the answer under Row Focus, and
+/// does nothing until there is one. While the answer is that the sample draws
+/// as boxes or blanks, a note beneath says how to get Icons.
+///
+/// A screen too short for all of it gives way its gaps and its introduction
+/// before the note, and the note before the sample and the answers. Finish
+/// pins only an answer the last frame drew.
 #[derive(Clone, Debug, Default)]
-struct IconsStep;
+struct IconsStep {
+    /// The answer under Row Focus, once the reader has moved to one or the
+    /// retake began on one.
+    focus: Option<IconsAnswer>,
+    /// How many of the answers the last frame drew, from the first; nothing
+    /// until a frame has been drawn since the step opened.
+    drawn: Cell<Option<usize>>,
+}
 
-impl IconsStep {
-    fn command_for_key(&self, _key: KeyEvent) -> Option<CommandId> {
-        None
+/// How the reader says this terminal draws the Icons step's sample.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IconsAnswer {
+    /// As icons, so Suru shows them.
+    Icons,
+    /// As boxes or blanks, for want of a Nerd Font, so Suru does not.
+    Boxes,
+}
+
+impl IconsAnswer {
+    const ALL: [Self; 2] = [Self::Icons, Self::Boxes];
+
+    /// The answer Show icons holding `show_icons` stands for.
+    fn of(show_icons: bool) -> Self {
+        if show_icons { Self::Icons } else { Self::Boxes }
     }
 
-    fn lines(&self, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-        vec![Line::styled(
-            truncate_to_width("Whether this terminal draws Icons.", width),
-            theme.text.subdued,
-        )]
+    /// Where the answer stands among the step's rows, from the first.
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|answer| *answer == self)
+            .expect("every answer is offered")
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Icons => "They draw as icons",
+            Self::Boxes => "They draw as boxes or blanks",
+        }
+    }
+
+    /// The pin of Show icons the answer makes.
+    fn pin(self) -> SettingMutation {
+        SettingMutation::AppearanceShowIcons {
+            value: Some(self == Self::Icons),
+        }
+    }
+}
+
+impl IconsStep {
+    const INTRODUCTION: &'static str = "How does this terminal draw the row below?";
+
+    const NOTE: &'static str = "To get Icons, install a Nerd Font and select it in your terminal, \
+                                then turn on Show icons in /settings.";
+
+    /// The keys this step teaches before the ones every step shares.
+    const KEYS: [&'static str; 1] = ["↑↓ Choose"];
+
+    /// The Icon Catalog names the sample draws, from both of the font
+    /// families the Catalog draws on, since a font may carry one and not the
+    /// other.
+    const SAMPLE_ICONS: [&'static str; 5] = [
+        "md-bug",
+        "md-rocket_launch",
+        "md-flask",
+        "dev-rust",
+        "dev-python",
+    ];
+
+    /// The sample and the answers beneath it, which the step keeps before
+    /// anything else it draws.
+    const KEPT: usize = 1 + IconsAnswer::ALL.len();
+
+    /// Opens the step afresh: a retake the reader asked for begins with the
+    /// answer Show icons holds under Row Focus, and a first run with none.
+    fn open(&mut self, opening: Opening, settings: &EffectiveSettings) {
+        self.focus = (opening == Opening::Requested)
+            .then(|| IconsAnswer::of(settings.appearance.show_icons));
+    }
+
+    fn command_for_key(&self, key: KeyEvent) -> Option<CommandId> {
+        let command = match (key.code, key.modifiers) {
+            (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                SemanticCommandId::OnboardingIconsPrevious
+            }
+            (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                SemanticCommandId::OnboardingIconsNext
+            }
+            _ => return None,
+        };
+        Some(CommandId::InvokeSemantic(command))
+    }
+
+    /// Moves Row Focus `distance` answers, wrapping past either end. From
+    /// neither answer, a move up lands on the last and a move down on the
+    /// first.
+    fn move_focus(&mut self, distance: isize) {
+        let answers = IconsAnswer::ALL.len() as isize;
+        let from = self
+            .focus
+            .map_or(if distance < 0 { answers } else { -1 }, |answer| {
+                answer.index() as isize
+            });
+        self.focus = Some(IconsAnswer::ALL[(from + distance).rem_euclid(answers) as usize]);
+    }
+
+    /// The pin Finish makes: the answer under Row Focus, where the last
+    /// frame drew it or no frame has been drawn since the step opened.
+    fn pin(&self) -> Option<SettingMutation> {
+        let answer = self.focus?;
+        self.drawn
+            .get()
+            .is_none_or(|drawn| answer.index() < drawn)
+            .then(|| answer.pin())
+    }
+
+    /// The sample as drawn: a handful of Icon Catalog glyphs, then the fixed
+    /// glyphs of the Providers, the folder, and the branch, two columns apart
+    /// so a glyph a font draws wider than its cell covers none of the next.
+    fn sample() -> String {
+        let glyphs = Self::SAMPLE_ICONS
+            .iter()
+            .filter_map(|name| icon_catalog::glyph(name))
+            .chain(
+                built_in_providers()
+                    .iter()
+                    .filter_map(|provider| provider.nerd_font_icon),
+            )
+            .chain([NF_COD_FOLDER, NF_COD_GIT_BRANCH])
+            .map(String::from)
+            .collect::<Vec<_>>();
+        // Stood in past the answers' focus marker, in line with their text.
+        format!("  {}", glyphs.join("  "))
+    }
+
+    /// The note laid out within `width` columns, while the answer under Row
+    /// Focus is that the sample draws as boxes or blanks.
+    fn note(&self, width: usize) -> Option<WrappedText<'static>> {
+        (self.focus == Some(IconsAnswer::Boxes))
+            .then(|| WrappedText::new(Self::NOTE, "", u16::try_from(width).unwrap_or(u16::MAX)))
+    }
+
+    /// How many lines the step draws within `width` columns with nothing
+    /// given way. The note is counted whichever answer is chosen, so the box
+    /// keeps its height as Row Focus moves.
+    fn rows_wanted(&self, width: usize) -> usize {
+        let note = WrappedText::new(Self::NOTE, "", u16::try_from(width).unwrap_or(u16::MAX));
+        // The gap beneath the header, the introduction and the gap beneath
+        // it, the sample and the gap beneath it, the answers, and the gap
+        // above the note.
+        5 + Self::KEPT + note.height()
+    }
+
+    /// The step drawn within `width` columns and `room` lines beneath the
+    /// header: the introduction, the sample, the answers, and the note. For
+    /// the sample and the answers to be drawn whole, the note gives way
+    /// from its end, after the gap above it, the gap beneath the sample,
+    /// the gap beneath the introduction, the gap beneath the header, and
+    /// the introduction. Records how many answers were drawn.
+    fn lines(
+        &self,
+        width: usize,
+        room: usize,
+        theme: &Theme,
+    ) -> (Vec<Line<'static>>, Vec<WrappedLine<'static>>) {
+        let note = self
+            .note(width)
+            .map(|note| note.first(room.saturating_sub(Self::KEPT)))
+            .filter(|note| note.height() > 0);
+        let said = note.as_ref().map_or(0, WrappedText::height);
+        let available = room.saturating_sub(said);
+        // The lines each of what gives way takes, in the order it gives way.
+        let gives_way = [usize::from(said > 0), 1, 1, 1, 1];
+        let given = (0..=gives_way.len())
+            .find(|given| Self::KEPT + gives_way[*given..].iter().sum::<usize>() <= available)
+            .unwrap_or(gives_way.len());
+        let note_gap = given < 1 && said > 0;
+        let sample_gap = given < 2;
+        let introduction_gap = given < 3;
+        let header_gap = given < 4;
+        let introduction = given < 5;
+
+        let mut lines = Vec::new();
+        if header_gap {
+            lines.push(Line::default());
+        }
+        if introduction {
+            lines.push(Line::styled(
+                truncate_to_width(Self::INTRODUCTION, width),
+                theme.text.subdued,
+            ));
+        }
+        if introduction_gap {
+            lines.push(Line::default());
+        }
+        lines.push(Line::styled(
+            truncate_to_width(&Self::sample(), width),
+            theme.text.primary,
+        ));
+        if sample_gap {
+            lines.push(Line::default());
+        }
+        let answers = lines.len();
+        for answer in IconsAnswer::ALL {
+            let focused = self.focus == Some(answer);
+            let marker = if focused { "› " } else { "  " };
+            lines.push(Line::styled(
+                truncate_to_width(&format!("{marker}{}", answer.label()), width),
+                if focused {
+                    theme.selection.focused
+                } else {
+                    theme.text.primary
+                },
+            ));
+        }
+        self.drawn.set(Some(
+            IconsAnswer::ALL.len().min(room.saturating_sub(answers)),
+        ));
+        let mut wrapped = Vec::new();
+        if note_gap {
+            lines.push(Line::default());
+        }
+        if let Some(note) = note {
+            wrapped.push(note.wrapped(lines.len()));
+            lines.extend(note.lines(theme.text.primary));
+        }
+        (lines, wrapped)
     }
 }
 
@@ -869,6 +1097,7 @@ impl Onboarding {
             ..Self::default()
         };
         self.derivation.open(server);
+        self.icons.open(opening, server.settings);
     }
 
     /// Follows the Client's own Server as the Client hears it change, while
@@ -892,9 +1121,9 @@ impl Onboarding {
     }
 
     /// Confirms the step on show: moves to the next, or on the last step
-    /// finishes the flow and closes it, unless the step may not be passed yet.
-    /// A step answering with a pin moves on as it is sent; one with more to
-    /// ask first stays on show.
+    /// finishes the flow with its answer and closes it, unless the step may
+    /// not be passed yet. A step answering with a pin moves on as it is
+    /// sent; one with more to ask first stays on show.
     pub(super) fn next(&mut self, server: OwnServer<'_>) -> Advance {
         match self.step {
             // Nor is a step passed whose rows the screen had no room for.
@@ -965,18 +1194,23 @@ impl Onboarding {
         }
     }
 
-    /// Shows the step after the one on show, or finishes the flow and closes
-    /// it from the last.
+    /// Shows the step after the one on show, or from the last finishes the
+    /// flow with its answer and closes it, once it is answered.
     fn move_on(&mut self) -> Advance {
         match self.step.and_then(Step::next) {
             Some(next) => {
                 self.step = Some(next);
                 Advance::Moved
             }
-            None => {
-                self.close();
-                Advance::Finished
-            }
+            // The last step is passed only once it is answered, and pins
+            // its answer as it finishes the flow.
+            None => match self.icons.pin() {
+                Some(pin) => {
+                    self.close();
+                    Advance::Finished(pin)
+                }
+                None => Advance::Held,
+            },
         }
     }
 
@@ -1033,13 +1267,14 @@ impl Onboarding {
         self.recheck = Recheck::Idle;
     }
 
-    /// Starts the record of which Providers were drawn over with the frame,
-    /// so one that draws none of them — the step not on show, or the
-    /// terminal too small to draw anything — leaves Space and Enter nothing
-    /// to act on.
+    /// Starts the record of which Providers and Icons answers were drawn
+    /// over with the frame, so one that draws none of them — the step not
+    /// on show, or the terminal too small to draw anything — leaves Space
+    /// and Enter nothing to act on.
     pub(super) fn forget_frame(&self) {
         if self.is_open() {
             self.providers.drawn.replace(Some(Vec::new()));
+            self.icons.drawn.set(Some(0));
         }
     }
 
@@ -1063,6 +1298,26 @@ impl Onboarding {
         self.shows_providers()
             .then(|| self.providers.toggle(settings))
             .flatten()
+    }
+
+    /// Whether the Icons step is on show, which is where its own commands act
+    /// and nowhere else.
+    fn shows_icons(&self) -> bool {
+        self.step == Some(Step::Icons)
+    }
+
+    /// Moves Row Focus on the Icons step to the answer above.
+    pub(super) fn select_previous_icons_answer(&mut self) {
+        if self.shows_icons() {
+            self.icons.move_focus(-1);
+        }
+    }
+
+    /// Moves Row Focus on the Icons step to the answer below.
+    pub(super) fn select_next_icons_answer(&mut self) {
+        if self.shows_icons() {
+            self.icons.move_focus(1);
+        }
     }
 
     /// What `event` asks of the flow: whatever the step on show makes of it
@@ -1150,15 +1405,22 @@ impl Onboarding {
                 }));
                 lines.extend(step_lines);
             }
+            // So does the Icons step, before its sample and its answers.
             Step::Icons => {
-                lines.push(Line::default());
-                lines.extend(self.icons.lines(width, theme));
+                let room = height.saturating_sub(lines.len() + 1);
+                let (step_lines, step_wrapped) = self.icons.lines(width, room, theme);
+                let top = lines.len();
+                wrapped.extend(step_wrapped.into_iter().map(|line| WrappedLine {
+                    row: top + line.row,
+                    ..line
+                }));
+                lines.extend(step_lines);
             }
         }
         let own_keys: &[&str] = match step {
             Step::Providers => &ProvidersStep::KEYS,
             Step::Derivation => &DerivationStep::KEYS,
-            Step::Icons => &[],
+            Step::Icons => &IconsStep::KEYS,
         };
         let footer = footer(step, own_keys, width);
         // The keys stay at the foot however much the step draws, and are
@@ -1183,7 +1445,7 @@ impl Onboarding {
                 .providers
                 .rows_wanted(width, theme, server, &self.recheck),
             Step::Derivation => 1 + self.derivation.rows_wanted(),
-            Step::Icons => 1 + self.icons.lines(width, theme).len(),
+            Step::Icons => self.icons.rows_wanted(width),
         };
         1 + step_rows + 1
     }

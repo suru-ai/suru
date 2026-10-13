@@ -363,9 +363,14 @@ fn finishing_the_third_step_marks_the_server_onboarded_and_closes() {
         press(&mut application, KeyCode::Enter),
         derivation_pin(DerivationErrand::FollowSession)
     );
+    assert!(screen(&application).contains("Step 3 of 3"));
+    press(&mut application, KeyCode::Down);
     assert_eq!(
         press(&mut application, KeyCode::Enter),
-        ApplicationTransition::MarkOnboarded
+        ApplicationTransition::FinishOnboarding {
+            pin: SettingMutation::AppearanceShowIcons { value: Some(true) },
+        },
+        "the answer is pinned beside the mark"
     );
     assert!(!onboarding_shown(&application), "{}", screen(&application));
 }
@@ -2835,5 +2840,338 @@ fn an_unrelated_settings_snapshot_leaves_row_focus_on_a_retry_row_and_the_window
         ),
         "and Enter retries rather than pinning: {}",
         screen(&application)
+    );
+}
+
+/// The glyphs the Icons step's sample draws, in order: Icon Catalog glyphs
+/// from both font families the Catalog draws on — Material Design's bug,
+/// rocket, and flask, Devicons' Rust and Python — then the fixed Codex,
+/// Copilot, and Claude glyphs, the folder, and the branch.
+const SAMPLE_GLYPHS: [char; 10] = [
+    '\u{f00e4}',
+    '\u{f14de}',
+    '\u{f0093}',
+    '\u{e7a8}',
+    '\u{e73c}',
+    '\u{ec81}',
+    '\u{ec1e}',
+    '\u{ec82}',
+    '\u{ea83}',
+    '\u{ec6f}',
+];
+
+const NERD_FONT_NOTE: &str = "To get Icons, install a Nerd Font and select it in your terminal, \
+                              then turn on Show icons in /settings.";
+
+/// Walks the flow on to its third step, drawn.
+fn on_the_icons_step(application: &mut Application) {
+    press(application, KeyCode::Enter);
+    press(application, KeyCode::Enter);
+    let shown = screen(application);
+    assert!(shown.contains("Step 3 of 3 · Icons"), "{shown}");
+}
+
+/// A Client that has been onboarded, holding `settings`, with the flow taken
+/// again from `/onboarding` and walked on to its third step.
+fn retaking_the_icons_step(workspace: &Path, settings: EffectiveSettings) -> Application {
+    let mut application = connected_application(workspace);
+    deliver_settings(&mut application, settings);
+    type_terminal_text(&mut application, "/onboarding");
+    press(&mut application, KeyCode::Enter);
+    on_the_icons_step(&mut application);
+    application
+}
+
+fn with_show_icons(show_icons: bool) -> EffectiveSettings {
+    let mut settings = EffectiveSettings::default();
+    settings.appearance.show_icons = show_icons;
+    settings
+}
+
+fn pins_show_icons(show_icons: bool) -> ApplicationTransition {
+    ApplicationTransition::FinishOnboarding {
+        pin: SettingMutation::AppearanceShowIcons {
+            value: Some(show_icons),
+        },
+    }
+}
+
+#[test]
+fn the_icons_step_draws_its_sample_glyphs_with_show_icons_off() {
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    deliver_settings(&mut application, with_show_icons(false));
+    on_the_icons_step(&mut application);
+
+    let rows = rendered_application_rows_at(&application, 100, 24);
+    let sample = rows
+        .iter()
+        .find(|row| row.contains(SAMPLE_GLYPHS[0]))
+        .unwrap_or_else(|| panic!("the sample is drawn: {}", rows.join("\n")));
+    let mut rest = sample.as_str();
+    for glyph in SAMPLE_GLYPHS {
+        let at = rest
+            .find(glyph)
+            .unwrap_or_else(|| panic!("{glyph:?} is drawn in its place: {sample}"));
+        rest = &rest[at + glyph.len_utf8()..];
+    }
+    let question = rows
+        .iter()
+        .position(|row| row.contains("How does this terminal draw the row below?"))
+        .unwrap_or_else(|| panic!("the step asks how they draw: {}", rows.join("\n")));
+    let answers = rows
+        .iter()
+        .position(|row| row.contains("They draw as icons"))
+        .unwrap_or_else(|| panic!("{}", rows.join("\n")));
+    let drawn_at = rows.iter().position(|row| row == sample).unwrap();
+    assert!(
+        question < drawn_at && drawn_at < answers,
+        "the sample stands between the question and its answers: {}",
+        rows.join("\n")
+    );
+    assert!(
+        rows[answers + 1].contains("They draw as boxes or blanks"),
+        "{}",
+        rows.join("\n")
+    );
+}
+
+#[test]
+fn nothing_is_chosen_on_a_first_run_and_finish_waits_for_a_choice() {
+    let workspace = workspace_dir();
+    // Even a Config Document already showing Icons leaves the first answer
+    // to the reader, who must look before they answer.
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    deliver_settings(&mut application, with_show_icons(true));
+    on_the_icons_step(&mut application);
+    let shown = screen(&application);
+    assert!(shown.contains("  They draw as icons"), "{shown}");
+    assert!(shown.contains("  They draw as boxes or blanks"), "{shown}");
+    assert!(!shown.contains("› They draw"), "nothing is chosen: {shown}");
+
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "Finish does nothing until a row is chosen"
+    );
+    assert!(screen(&application).contains("Step 3 of 3"));
+
+    press(&mut application, KeyCode::Down);
+    let chosen = screen(&application);
+    assert!(chosen.contains("› They draw as icons"), "{chosen}");
+    assert!(
+        chosen.contains("  They draw as boxes or blanks"),
+        "{chosen}"
+    );
+}
+
+#[test]
+fn choosing_the_icons_row_pins_show_icons_on_and_finishes() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    on_the_icons_step(&mut application);
+    press(&mut application, KeyCode::Down);
+    assert!(screen(&application).contains("› They draw as icons"));
+
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_show_icons(true)
+    );
+    assert!(!onboarding_shown(&application), "{}", screen(&application));
+    deliver_settings(&mut application, with_show_icons(true));
+    assert!(
+        !onboarding_shown(&application),
+        "finishing takes it for good: {}",
+        screen(&application)
+    );
+}
+
+#[test]
+fn choosing_the_boxes_row_pins_show_icons_off_and_finishes() {
+    let workspace = workspace_dir();
+    for keys in [&[KeyCode::Down, KeyCode::Down][..], &[KeyCode::Up]] {
+        let mut application = offered_onboarding(workspace.path());
+        on_the_icons_step(&mut application);
+        for key in keys {
+            press(&mut application, *key);
+        }
+        assert!(
+            screen(&application).contains("› They draw as boxes or blanks"),
+            "{keys:?}: {}",
+            screen(&application)
+        );
+
+        assert_eq!(
+            press(&mut application, KeyCode::Enter),
+            pins_show_icons(false)
+        );
+        assert!(!onboarding_shown(&application), "{}", screen(&application));
+    }
+}
+
+#[test]
+fn the_nerd_font_note_shows_only_while_the_boxes_row_is_chosen() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    on_the_icons_step(&mut application);
+    let note = "install a Nerd Font";
+    assert!(
+        !screen(&application).contains(note),
+        "{}",
+        screen(&application)
+    );
+
+    for (row, noted) in [
+        ("They draw as icons", false),
+        ("They draw as boxes or blanks", true),
+        ("They draw as icons", false),
+    ] {
+        press(&mut application, KeyCode::Down);
+        let shown = screen(&application);
+        assert!(shown.contains(&format!("› {row}")), "{shown}");
+        assert_eq!(shown.contains(note), noted, "{row}: {shown}");
+    }
+}
+
+#[test]
+fn a_retake_puts_the_current_value_under_row_focus() {
+    let workspace = workspace_dir();
+    for (show_icons, row) in [
+        (true, "They draw as icons"),
+        (false, "They draw as boxes or blanks"),
+    ] {
+        let mut application =
+            retaking_the_icons_step(workspace.path(), with_show_icons(show_icons));
+        let shown = screen(&application);
+        assert!(shown.contains(&format!("› {row}")), "{shown}");
+        assert_eq!(
+            shown.contains("install a Nerd Font"),
+            !show_icons,
+            "{shown}"
+        );
+
+        assert_eq!(
+            press(&mut application, KeyCode::Enter),
+            pins_show_icons(show_icons),
+            "Finish pins the value under Row Focus"
+        );
+    }
+}
+
+#[test]
+fn leaving_the_icons_step_pins_nothing() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    on_the_icons_step(&mut application);
+    press(&mut application, KeyCode::Down);
+    assert!(screen(&application).contains("› They draw as icons"));
+
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::MarkOnboarded
+    );
+    assert!(!onboarding_shown(&application), "{}", screen(&application));
+}
+
+#[test]
+fn the_icons_step_teaches_choosing_before_finish() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    on_the_icons_step(&mut application);
+    let shown = screen(&application);
+    assert!(
+        shown.contains("↑↓ Choose · Enter Finish · ← Back · Esc Leave"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn going_back_from_the_icons_step_finds_the_choice_as_left() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    on_the_icons_step(&mut application);
+    press(&mut application, KeyCode::Up);
+    press(&mut application, KeyCode::Left);
+    assert!(screen(&application).contains("Step 2 of 3"));
+    press(&mut application, KeyCode::Enter);
+    let shown = screen(&application);
+    assert!(shown.contains("› They draw as boxes or blanks"), "{shown}");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_show_icons(false)
+    );
+}
+
+/// The note wrapped beneath the answers copies as it was written, rather
+/// than as the rows it was drawn on (ADR-0020).
+#[test]
+fn the_nerd_font_note_wraps_and_copies_as_one_line() {
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    let mut settings = EffectiveSettings::default();
+    settings.text_selection.copy = TextSelectionCopy::Release;
+    settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    deliver_settings(&mut application, settings);
+    on_the_icons_step(&mut application);
+    press(&mut application, KeyCode::Up);
+
+    let buffer = rendered_application_buffer(&application, 40, 30);
+    let start = text_position(&buffer, "To get Icons,");
+    let tail = text_position(&buffer, "/settings.");
+    assert!(start.1 < tail.1, "the note wraps onto rows of its own");
+    assert_eq!(
+        drag(
+            &mut application,
+            start,
+            (tail.0 + "/settings.".len() as u16 - 1, tail.1)
+        ),
+        ApplicationTransition::CopyToClipboard(NERD_FONT_NOTE.into()),
+        "the note copies as one line"
+    );
+}
+
+/// A screen too short for all the step says keeps the sample and both
+/// answers, and the keys at the foot, giving way the rest.
+#[test]
+fn a_short_screen_keeps_the_sample_and_both_answers() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    on_the_icons_step(&mut application);
+    press(&mut application, KeyCode::Up);
+    for height in [10, 12, 14] {
+        let rows = rendered_application_rows_at(&application, 80, height);
+        let shown = rows.join("\n");
+        assert!(shown.contains("Step 3 of 3"), "{height}: {shown}");
+        assert!(shown.contains(SAMPLE_GLYPHS[9]), "{height}: {shown}");
+        assert!(shown.contains("  They draw as icons"), "{height}: {shown}");
+        assert!(
+            shown.contains("› They draw as boxes or blanks"),
+            "{height}: {shown}"
+        );
+        assert!(shown.contains("Enter Finish"), "{height}: {shown}");
+    }
+}
+
+/// Finish pins the answer under Row Focus only where the last frame drew
+/// it, so a terminal too small to draw the step pins nothing unseen.
+#[test]
+fn finish_on_a_terminal_too_small_to_draw_pins_nothing() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    on_the_icons_step(&mut application);
+    press(&mut application, KeyCode::Down);
+    assert!(screen(&application).contains("› They draw as icons"));
+
+    let skipped = rendered_application_rows_at(&application, 20, 10).join("\n");
+    assert!(!skipped.contains("They draw"), "{skipped}");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+
+    assert!(screen(&application).contains("› They draw as icons"));
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_show_icons(true)
     );
 }

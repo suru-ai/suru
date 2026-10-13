@@ -87,7 +87,7 @@ const LANDING_LOGO: [&str; 7] = [
     "     ▀▀             ▀▄▄▀▄▄▀",
 ];
 /// Nerd Fonts `nf-cod-folder` (Codicons folder).
-const NF_COD_FOLDER: char = '\u{ea83}';
+pub(super) const NF_COD_FOLDER: char = '\u{ea83}';
 /// Nerd Fonts `nf-cod-repo` (Codicons repo).
 const NF_COD_REPO: char = '\u{ea62}';
 /// Nerd Fonts `nf-fa-folder_tree` (Font Awesome folder tree).
@@ -95,7 +95,7 @@ const NF_FA_FOLDER_TREE: char = '\u{ef81}';
 /// Nerd Fonts `nf-md-monitor` (Material Design monitor).
 const NF_MD_MONITOR: char = '\u{f0379}';
 /// Nerd Fonts `nf-cod-git_branch` (Codicons git-branch).
-const NF_COD_GIT_BRANCH: char = '\u{ec6f}';
+pub(super) const NF_COD_GIT_BRANCH: char = '\u{ec6f}';
 /// Nerd Fonts `nf-cod-worktree` (Codicons worktree).
 const NF_COD_WORKTREE: char = '\u{ec7e}';
 /// Nerd Fonts `nf-cod-git_commit` (Codicons git-commit).
@@ -180,9 +180,10 @@ pub(super) fn render_with_slots(
     state.workspace_picker.forget_frame();
     // So are the Directory Browser's rows, and its box the wheel answers over.
     state.directory_browser.forget_frame();
-    // Onboarding acts on the Provider under its cursor only where a frame
-    // drew it, so its record of which it drew starts over with the frame,
-    // and a frame too small to draw anything leaves it drawing none.
+    // Onboarding acts on the Provider or the Icons answer under Row Focus
+    // only where a frame drew it, so its record of which it drew starts over
+    // with the frame, and a frame too small to draw anything leaves it
+    // drawing none.
     state.onboarding.forget_frame();
     *state.header_icon_area.borrow_mut() = None;
     // The Unreachable banner's "Try again" is pointable on the same terms, and

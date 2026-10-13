@@ -2771,13 +2771,16 @@ impl TuiState {
     }
 
     /// Closes Onboarding as taken, finished or left, so it is offered no
-    /// more; the run loop asks the Server to mark itself onboarded.
-    fn take_onboarding(&mut self) -> ApplicationTransition {
+    /// more; the run loop asks the Server to mark itself onboarded, writing
+    /// `pin` too where the flow was finished with one.
+    fn take_onboarding(&mut self, pin: Option<SettingMutation>) -> ApplicationTransition {
         self.onboarding.close();
         self.onboarding_taken = true;
         self.release_onboarding_options();
         self.local_onboarded = Some(true);
-        ApplicationTransition::MarkOnboarded
+        pin.map_or(ApplicationTransition::MarkOnboarded, |pin| {
+            ApplicationTransition::FinishOnboarding { pin }
+        })
     }
 
     fn remove_deleted_session(&mut self, deleted_session_id: SessionId) {
@@ -5470,9 +5473,15 @@ pub enum ApplicationTransition {
     },
     /// One Setting's typed edit, on its way to the server that owns the file.
     MutateSetting(SettingMutation),
-    /// Ask the Client's own Server to mark itself onboarded, as finishing or
-    /// leaving Onboarding does. Every attached Client hears that it is.
+    /// Ask the Client's own Server to mark itself onboarded, as leaving
+    /// Onboarding does. Every attached Client hears that it is.
     MarkOnboarded,
+    /// Write `pin`, the Setting Onboarding's last step was answered with,
+    /// and ask the Client's own Server to mark itself onboarded as leaving
+    /// does, which is what finishing the flow comes to.
+    FinishOnboarding {
+        pin: SettingMutation,
+    },
     /// Ask the Client's own Server to re-read every Provider's Availability
     /// for Onboarding, answering with [`ApplicationEvent::ProvidersRechecked`]
     /// under the same `recheck`. The flow's own request rather than one of
@@ -10330,6 +10339,14 @@ impl Application {
                 .map_or(ApplicationTransition::Continue, |recheck| {
                     ApplicationTransition::RecheckProviders { recheck }
                 })),
+            SemanticCommandId::OnboardingIconsPrevious => {
+                self.state.onboarding.select_previous_icons_answer();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::OnboardingIconsNext => {
+                self.state.onboarding.select_next_icons_answer();
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::OnboardingNext => {
                 if !self.state.onboarding.is_open() {
                     return Ok(ApplicationTransition::Continue);
@@ -10354,7 +10371,7 @@ impl Application {
                     Advance::Rechecking(recheck) => {
                         ApplicationTransition::RecheckProviders { recheck }
                     }
-                    Advance::Finished => self.state.take_onboarding(),
+                    Advance::Finished(pin) => self.state.take_onboarding(Some(pin)),
                 })
             }
             SemanticCommandId::OnboardingBack => {
@@ -10362,7 +10379,7 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::OnboardingLeave => Ok(if self.state.onboarding.is_open() {
-                self.state.take_onboarding()
+                self.state.take_onboarding(None)
             } else {
                 ApplicationTransition::Continue
             }),
