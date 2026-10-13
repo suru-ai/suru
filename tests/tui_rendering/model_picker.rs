@@ -1662,6 +1662,95 @@ fn model_picker_names_what_fixes_an_unavailable_provider_beneath_its_retry_row()
     );
 }
 
+/// The install page Copilot's fix names, which the narrow-terminal tests below
+/// expect to reach whole.
+const COPILOT_INSTALL_PAGE: &str =
+    "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli";
+
+/// A Model picker open over three Providers none of which is installed, each
+/// naming the fix its own check does.
+fn picker_over_three_uninstalled_providers() -> Application {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    let uninstalled = |provider: &str, name: &str, fix: String| ProviderModelCatalog {
+        provider: ProviderId::new(provider),
+        display_name: name.to_owned(),
+        models: Vec::new(),
+        status: ProviderCatalogStatus::Unavailable {
+            reason: ProviderUnavailability::NotInstalled,
+            message: format!("could not launch `{provider}`"),
+            fix,
+        },
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![
+                    uninstalled(
+                        "codex",
+                        "Codex",
+                        "install the Codex CLI from https://developers.openai.com/codex/cli/"
+                            .to_owned(),
+                    ),
+                    uninstalled(
+                        "copilot",
+                        "Copilot",
+                        format!("install the Copilot CLI from {COPILOT_INSTALL_PAGE}"),
+                    ),
+                    uninstalled(
+                        "claude",
+                        "Claude",
+                        "install the Claude Code CLI from https://code.claude.com/docs/en/setup"
+                            .to_owned(),
+                    ),
+                ],
+            },
+        })
+        .expect("load three uninstalled Providers");
+    application
+}
+
+/// A narrower terminal wraps every fix onto more lines, so the entries above
+/// the focused retry row grow taller while the picker keeps as many rows as it
+/// had. The window follows the focus it was showing, as it does when it grows
+/// shorter, rather than leaving the reader's row below its foot until they
+/// press a key.
+#[test]
+fn narrowing_the_terminal_keeps_the_focused_retry_row_and_its_fix_in_view() {
+    let mut application = picker_over_three_uninstalled_providers();
+    key(&mut application, KeyCode::Down);
+    key(&mut application, KeyCode::Down);
+    let wide = rendered_application_rows_at(&application, 80, 24);
+    assert!(
+        wide.iter().any(|row| row.contains("› Retry Copilot")),
+        "the reader stands on Copilot's retry row, got {}",
+        wide.join("\n")
+    );
+
+    let rows = rendered_application_rows_at(&application, 40, 24);
+    let screen = rows.join("\n");
+    let copilot = rows
+        .iter()
+        .position(|row| row.contains("› Retry Copilot"))
+        .unwrap_or_else(|| panic!("the focused retry row stays on screen, got {screen}"));
+    assert!(
+        rows[copilot + 1].contains("install the Copilot CLI from"),
+        "with the start of its fix beneath it, got {screen}"
+    );
+    assert!(
+        rows[copilot + 4].contains("pilot-cli"),
+        "and the end of it, got {screen}"
+    );
+}
+
 /// Issue #136: rows read as products, not wire identifiers. The catalog
 /// carries each Provider's runtime-declared display name, and the picker
 /// prints it on the Provider heading and the retry row alike.

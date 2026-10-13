@@ -71,8 +71,10 @@ impl WindowEntry {
 ///
 /// Anything else — the entries changing under focus, a terminal resizing —
 /// tells it nothing, and the window holds where it stands until the keys move
-/// focus again. The one exception is a window growing shorter under the focus
-/// it was showing, which moves only as far as keeps that focus in view.
+/// focus again. The one exception is a window about to lose the focus it was
+/// showing — because it grew shorter, or because the entries above that focus
+/// grew taller as a narrower terminal wrapped them — which moves only as far
+/// as keeps that focus in view.
 #[derive(Clone, Debug, Default)]
 pub(super) struct ListWindow {
     /// The entry the window opens on.
@@ -81,6 +83,10 @@ pub(super) struct ListWindow {
     carry: Cell<Carry>,
     /// The Rows the window was last settled over.
     capacity: Cell<usize>,
+    /// The entries the last settled frame drew, from first to one past last,
+    /// which says whether that frame showed the focus it had. Empty once the
+    /// reader has moved the window, since what they moved it to is theirs.
+    drawn: Cell<(usize, usize)>,
 }
 
 /// What a list that follows the open Session's entry remembers between frames
@@ -169,6 +175,7 @@ impl ListWindow {
     pub(super) fn scroll_to(&self, first: usize) {
         self.first.set(first);
         self.carry.set(Carry::Hold);
+        self.drawn.set((0, 0));
     }
 
     /// The entry the window opened on when it was last settled.
@@ -188,9 +195,10 @@ impl ListWindow {
     /// (see [`carried`]); a list with no entries yet, or no focus among them,
     /// keeps the ask for the frame that has them, so a list still loading
     /// opens on its focus once it lands. A window asked for nothing holds,
-    /// unless it has grown shorter than the last frame's and would lose the
-    /// focus that frame showed. Either way the window never opens so far down
-    /// that it trails blank Rows below a list that has since grown shorter.
+    /// unless it would lose the focus the last frame showed — the window grown
+    /// shorter, or the entries above that focus taller, since that frame.
+    /// Either way the window never opens so far down that it trails blank Rows
+    /// below a list that has since grown shorter.
     ///
     /// The window shows every entry from its first that fits whole, and at
     /// least its first — cut short — where that one alone is taller than the
@@ -205,7 +213,8 @@ impl ListWindow {
         if capacity == 0 || entries.is_empty() {
             return 0..0;
         }
-        let last_capacity = self.capacity.replace(capacity);
+        self.capacity.set(capacity);
+        let (drawn_first, drawn_end) = self.drawn.get();
         let mut first = self.first.get().min(furthest_opening(entries, capacity));
         let focus = focus.filter(|focus| *focus < entries.len());
         if self.carry.get() != Carry::Hold
@@ -214,14 +223,15 @@ impl ListWindow {
             first = carried(entries, capacity, first, focus);
             self.carry.set(Carry::Hold);
         } else if let Some(focus) = focus
-            && capacity < last_capacity
-            && focus < window_end(entries, first, last_capacity)
+            && (drawn_first..drawn_end).contains(&focus)
             && focus >= window_end(entries, first, capacity)
         {
             first = earliest_opening(entries, focus, capacity);
         }
         self.first.set(first);
-        first..window_end(entries, first, capacity)
+        let end = window_end(entries, first, capacity);
+        self.drawn.set((first, end));
+        first..end
     }
 
     /// [`Self::settle`] for a list whose entries are every one a single Row
@@ -616,6 +626,43 @@ mod tests {
         assert_eq!(
             window.settle(&entries, 3, Some(10)),
             0..3,
+            "focus it was not showing stays out of view"
+        );
+    }
+
+    #[test]
+    fn entries_growing_taller_keep_the_focus_the_window_was_showing_in_view() {
+        let narrow = [
+            WindowEntry::passive(1),
+            WindowEntry::focusable(2),
+            WindowEntry::passive(1),
+            WindowEntry::focusable(2),
+        ];
+        let window = opened_on(&narrow, 6, 3);
+        assert_eq!(window.first(), 0, "every entry fits");
+
+        let reflowed = [
+            WindowEntry::passive(1),
+            WindowEntry::focusable(4),
+            WindowEntry::passive(1),
+            WindowEntry::focusable(3),
+        ];
+        assert_eq!(
+            window.settle(&reflowed, 6, Some(3)),
+            2..4,
+            "entries wrapped onto more Rows give up the window's head rather than the focus \
+             at its foot, though the window has as many Rows as before"
+        );
+        assert_eq!(
+            window.settle(&narrow, 6, Some(3)),
+            0..4,
+            "and once they fit again the whole list shows, with no blank Rows at its foot"
+        );
+
+        let window = opened_on(&rows(10), 3, 0);
+        assert_eq!(
+            window.settle(&[WindowEntry::focusable(2); 10], 3, Some(5)),
+            0..1,
             "focus it was not showing stays out of view"
         );
     }
