@@ -1,9 +1,9 @@
 //! The model picker: listing, search, focus, and selection.
 
 use crate::support::{
-    deliver_settings, key, model_descriptor, navigable_session_snapshot, rendered_application_rows,
-    rendered_application_rows_at, rendered_row, selected_session_snapshot, type_terminal_text,
-    workspace_dir,
+    deliver_settings, key, model_descriptor, navigable_session_snapshot,
+    rendered_application_buffer, rendered_application_rows, rendered_application_rows_at,
+    rendered_row, selected_session_snapshot, text_position, type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
@@ -1748,6 +1748,37 @@ fn narrowing_the_terminal_keeps_the_focused_retry_row_and_its_fix_in_view() {
     assert!(
         rows[copilot + 4].contains("pilot-cli"),
         "and the end of it, got {screen}"
+    );
+}
+
+/// A retry row whose fix wraps taller than the picker has rows for is drawn
+/// from its end: the retry row the reader stands on, then as much of the
+/// fix's end as fits, which is where every fix names the page or command it
+/// sends the reader to. The install page stays whole on screen, and copies
+/// whole.
+#[test]
+fn a_retry_row_taller_than_the_picker_keeps_the_end_of_its_fix_in_view() {
+    let mut application = picker_over_three_uninstalled_providers();
+    let mut settings = EffectiveSettings::default();
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    deliver_settings(&mut application, settings);
+    key(&mut application, KeyCode::Down);
+    key(&mut application, KeyCode::Down);
+
+    let rows = rendered_application_rows_at(&application, 40, 9);
+    let screen = rows.join("\n");
+    assert!(
+        rows.iter().any(|row| row.contains("› Retry Copilot")),
+        "the reader's retry row stays on screen, got {screen}"
+    );
+    let buffer = rendered_application_buffer(&application, 40, 9);
+    let start = text_position(&buffer, "https://docs.github.com/en/");
+    let tail = text_position(&buffer, "pilot-cli");
+    let end = (tail.0 + "pilot-cli".len() as u16 - 1, tail.1);
+    assert_eq!(
+        super::selection::drag(&mut application, start, end),
+        ApplicationTransition::CopyToClipboard(COPILOT_INSTALL_PAGE.into()),
+        "the install page is drawn to its last row and copies whole, got {screen}"
     );
 }
 

@@ -2235,6 +2235,55 @@ fn the_fix_beneath_the_headline_copies_as_one_unbroken_line() {
     );
 }
 
+/// A panel too small for the whole fix beneath the headline gives up the
+/// headline's message, then the start of the fix, before the end of it: every
+/// fix ends with the page or command it sends the reader to, so that is what
+/// stays on screen, and it copies whole.
+#[test]
+fn a_panel_too_small_for_the_whole_fix_keeps_its_end_in_view() {
+    const INSTALL_PAGE: &str =
+        "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli";
+    let workspace = workspace_dir();
+    let mut settings = EffectiveSettings::default();
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    let mut application = client_showing(workspace.path(), settings, &[]);
+    let request = read_providers_tab(&mut application);
+    deliver_catalog(
+        &mut application,
+        request,
+        &[
+            ("codex", ProviderCatalogStatus::Fresh),
+            (
+                "copilot",
+                ProviderCatalogStatus::Unavailable {
+                    reason: ProviderUnavailability::NotInstalled,
+                    message: "could not launch `copilot`".to_owned(),
+                    fix: format!("install the Copilot CLI from {INSTALL_PAGE}"),
+                },
+            ),
+            ("claude", ProviderCatalogStatus::Fresh),
+        ],
+    );
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+
+    // Twenty-four columns and six rows inside the box.
+    let rows = rendered_application_rows_at(&application, 30, 10);
+    let screen = rows.join("\n");
+    assert!(
+        rows.iter().any(|row| row.contains("› ▸ Copilot")),
+        "the focused row stays on screen: {screen}"
+    );
+    let buffer = rendered_application_buffer(&application, 30, 10);
+    let start = text_position(&buffer, "https://docs.github.com/");
+    let tail = text_position(&buffer, "install-copilot-cli");
+    let end = (tail.0 + "install-copilot-cli".len() as u16 - 1, tail.1);
+    assert_eq!(
+        super::selection::drag(&mut application, start, end),
+        ApplicationTransition::CopyToClipboard(INSTALL_PAGE.into()),
+        "the install page is drawn to its last row and copies whole: {screen}"
+    );
+}
+
 /// A compatibility warning is guidance rather than Availability: the Provider
 /// remains enabled, while its row names the warning and the focused headline
 /// explains the action that clears it.

@@ -2754,7 +2754,13 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
                     } else {
                         theme.text.primary
                     };
-                    let parts = fix_rows(fix, content_width);
+                    // An entry taller than the picker has rows for is drawn
+                    // from its end: the retry row, then as much of the fix's
+                    // end as fits, which is where every fix names the page or
+                    // command it sends the reader to.
+                    let mut parts = fix_rows(fix, content_width);
+                    let room = usize::from(content_height).saturating_sub(lines.len());
+                    parts.drain(..parts.len().saturating_sub(room));
                     lines.extend(parts.iter().map(|part| {
                         Line::styled(format!("{FIX_INDENT}{}", &fix[part.clone()]), style)
                     }));
@@ -3005,7 +3011,14 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         });
         lines.push(Line::from(spans));
     }
-    if content_height >= 2 {
+    let footer_rows = usize::from(content_height >= 3);
+    // The Rows for the headline and the fix beneath it, leaving one for the
+    // focused row and the controls theirs. A fix that cannot go whole beneath
+    // the headline takes the headline's line too: the reader's row already
+    // names the condition, and what fixes it is what they came for.
+    let beneath_tabs = content_height.saturating_sub(lines.len() + footer_rows + 1);
+    let fix_takes_headline = !fix_parts.is_empty() && fix_parts.len() >= beneath_tabs;
+    if content_height >= 2 && !fix_takes_headline {
         // What the focused Setting does, what its Provider has to say for
         // itself, or why the last edit never reached the Config Document — a
         // failed edit is the most urgent of the three, so it takes the line,
@@ -3029,14 +3042,19 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
             style,
         ));
     }
-    let footer_rows = usize::from(content_height >= 3);
     // The fix gives way before the focused row does, which is the one thing a
-    // reader of it must still be able to see. A selection across its lines
-    // copies it as written rather than as wrapped.
+    // reader of it must still be able to see, and gives up its start before
+    // its end, where every fix names the page or command it sends the reader
+    // to. A selection across its lines copies it as written rather than as
+    // wrapped.
     let mut wrapped = Vec::new();
     if let Some(fix) = fix {
         let room = content_height.saturating_sub(lines.len() + footer_rows + 1);
-        let parts = fix_parts.into_iter().take(room).collect::<Vec<_>>();
+        let parts = fix_parts
+            .iter()
+            .skip(fix_parts.len().saturating_sub(room))
+            .cloned()
+            .collect::<Vec<_>>();
         lines.extend(
             parts
                 .iter()
