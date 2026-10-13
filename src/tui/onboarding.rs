@@ -259,6 +259,12 @@ fn fit_notes<'a>(
 ///
 /// `r` asks the Client's own Server to re-read every Provider, whichever
 /// Outlook is on screen, as a request of the flow's own.
+///
+/// A toggle the Server has not yet answered holds Next, so the step is never
+/// passed on the strength of a Provider about to be turned off: its row says
+/// the Provider is turning, its tick staying as the Server says, and Space
+/// turns it no further until the toggle's own answer comes back. One the
+/// Server refuses is said beneath the rows.
 #[derive(Clone, Debug, Default)]
 struct ProvidersStep {
     /// The row the cursor is on.
@@ -268,6 +274,21 @@ struct ProvidersStep {
     /// Space and Enter may act on; nothing until a frame has been drawn since
     /// the step opened.
     drawn: RefCell<Option<Vec<&'static ProviderId>>>,
+    /// The toggles sent and not yet answered.
+    toggles: Vec<Toggle>,
+    /// Why the newest toggle the Server refused never landed.
+    refusal: Option<String>,
+}
+
+/// One Provider's Enablement, sent under `request` and not yet answered.
+#[derive(Clone, Debug)]
+struct Toggle {
+    request: SettingRequest,
+    provider: &'static ProviderId,
+    /// The Provider's name as the reader reads it.
+    name: &'static str,
+    /// Whether it turns the Provider on rather than off.
+    enabling: bool,
 }
 
 /// Where the flow's own re-read of every Provider stands.
@@ -350,18 +371,63 @@ impl ProvidersStep {
         }
     }
 
-    /// The edit turning the Provider under the cursor off where it is on and
-    /// on where it is off, measured against the Settings in force.
-    fn toggle(&self, settings: &EffectiveSettings) -> Option<SettingMutation> {
+    /// Sends the edit turning the Provider under the cursor off where it is
+    /// on and on where it is off, measured against the Settings in force,
+    /// under a request of its own the step awaits. A Provider whose toggle is
+    /// unanswered is turned no further until it is.
+    fn toggle(
+        &mut self,
+        settings: &EffectiveSettings,
+    ) -> Option<(SettingMutation, SettingRequest)> {
         if !self.cursor_seen() {
             return None;
         }
         let provider = Self::providers().nth(self.cursor)?;
-        Some(
-            provider_enablement(&provider.id)?
-                .next_choice(settings)?
-                .mutation(),
-        )
+        if self.toggling(&provider.id).is_some() {
+            return None;
+        }
+        let mutation = provider_enablement(&provider.id)?
+            .next_choice(settings)?
+            .mutation();
+        let request = SettingRequest::new();
+        self.toggles.push(Toggle {
+            request,
+            provider: &provider.id,
+            name: &provider.display_name,
+            enabling: !settings.provider_enabled(&provider.id),
+        });
+        Some((mutation, request))
+    }
+
+    /// The unanswered toggle of `provider`, if it has one.
+    fn toggling(&self, provider: &ProviderId) -> Option<&Toggle> {
+        self.toggles
+            .iter()
+            .find(|toggle| toggle.provider == provider)
+    }
+
+    /// Whether some toggle is unanswered, while which Next waits.
+    fn is_saving(&self) -> bool {
+        !self.toggles.is_empty()
+    }
+
+    /// Takes the Server's answer to `request` where it is a toggle the step
+    /// awaits, answering whether it was; `refusal` is why the Server refused
+    /// it, if it did.
+    fn settle(&mut self, request: SettingRequest, refusal: Option<&str>) -> bool {
+        let Some(index) = self
+            .toggles
+            .iter()
+            .position(|toggle| toggle.request == request)
+        else {
+            return false;
+        };
+        let toggle = self.toggles.remove(index);
+        if let Some(error) = refusal {
+            let turn = if toggle.enabling { "on" } else { "off" };
+            self.refusal = Some(format!("Could not turn {} {turn}: {error}", toggle.name));
+        }
+        true
     }
 
     /// Why the step may not be passed yet, or nothing where some Provider is
@@ -395,6 +461,15 @@ impl ProvidersStep {
             .map(|(row, provider)| {
                 let selected = row == self.cursor;
                 let standing = Standing::of(&provider.id, server);
+                // A Provider turning says so until the Server answers, and is
+                // ticked as the Server says meanwhile.
+                let label = match self.toggling(&provider.id) {
+                    Some(Toggle { enabling: true, .. }) => "turning on…",
+                    Some(Toggle {
+                        enabling: false, ..
+                    }) => "turning off…",
+                    None => standing.label(),
+                };
                 let marker = if selected { "› " } else { "  " };
                 let tick = if matches!(standing, Standing::Disabled) {
                     "[ ]"
@@ -403,11 +478,7 @@ impl ProvidersStep {
                 };
                 let line = Line::styled(
                     truncate_to_width(
-                        &format!(
-                            "{marker}{tick} {} · {}",
-                            provider.display_name,
-                            standing.label()
-                        ),
+                        &format!("{marker}{tick} {} · {label}", provider.display_name),
                         width,
                     ),
                     match (selected, standing) {
@@ -456,14 +527,23 @@ impl ProvidersStep {
 
     /// What the step says beneath its rows, each line laid out within
     /// `width` columns in the style it is drawn in, the first said the most
-    /// needed: why Next is locked, and how the flow's own re-check stands.
+    /// needed: why Next is locked, why a toggle never landed, that toggles
+    /// are still being saved, and how the flow's own re-check stands.
     fn notes<'a>(
+        &'a self,
         width: usize,
         theme: &Theme,
         server: OwnServer<'_>,
         recheck: &'a Recheck,
     ) -> Vec<(WrappedText<'a>, Style)> {
         let width = u16::try_from(width).unwrap_or(u16::MAX);
+        let refusal = self
+            .refusal
+            .as_deref()
+            .map(|refusal| (refusal, theme.feedback.error));
+        let saving = self
+            .is_saving()
+            .then_some(("Saving your changes…", theme.text.subdued));
         let recheck = match recheck {
             Recheck::Idle => None,
             Recheck::Awaiting { .. } => Some(("Re-checking every Provider…", theme.text.subdued)),
@@ -472,6 +552,8 @@ impl ProvidersStep {
         Self::lock(server)
             .map(|lock| (lock, theme.feedback.warning))
             .into_iter()
+            .chain(refusal)
+            .chain(saving)
             .chain(recheck)
             .map(|(text, style)| (WrappedText::new(text, "", width), style))
             .collect()
@@ -486,7 +568,8 @@ impl ProvidersStep {
         server: OwnServer<'_>,
         recheck: &Recheck,
     ) -> usize {
-        let notes = Self::notes(width, theme, server, recheck)
+        let notes = self
+            .notes(width, theme, server, recheck)
             .iter()
             .map(|(note, _)| note.height())
             .sum::<usize>();
@@ -517,7 +600,7 @@ impl ProvidersStep {
         recheck: &'a Recheck,
     ) -> Drawn<'a> {
         let entries = self.entries(width, theme, server);
-        let (notes, said) = fit_notes(Self::notes(width, theme, server, recheck), room);
+        let (notes, said) = fit_notes(self.notes(width, theme, server, recheck), room);
         let rows = entries.iter().map(ProviderEntry::rows).sum::<usize>();
         let available = room.saturating_sub(said);
         // The lines each of what gives way takes, in the order it gives way.
@@ -1222,9 +1305,12 @@ impl Onboarding {
     /// on show.
     pub(super) fn next(&mut self, server: OwnServer<'_>) -> Advance {
         match self.step {
-            // Nor is a step passed whose rows the screen had no room for.
+            // Nor is a step passed whose rows the screen had no room for, or
+            // while a toggle is unanswered.
             Some(Step::Providers)
-                if ProvidersStep::lock(server).is_some() || !self.providers.cursor_seen() =>
+                if ProvidersStep::lock(server).is_some()
+                    || !self.providers.cursor_seen()
+                    || self.providers.is_saving() =>
             {
                 Advance::Held
             }
@@ -1305,11 +1391,30 @@ impl Onboarding {
         }
     }
 
+    /// Takes the Server's acceptance of the edit asked for under `request`,
+    /// where the flow awaits it, answering whether that finishes the flow: a
+    /// Provider's toggle is answered, and the Icons step's pin finishes it.
+    /// The answer to any other edit settles nothing the flow awaits.
+    pub(super) fn edit_landed(&mut self, request: SettingRequest) -> bool {
+        if self.providers.settle(request, None) {
+            return false;
+        }
+        self.awaits_pin(request)
+    }
+
+    /// Takes the Server's refusal of the edit asked for under `request`,
+    /// where the flow awaits it, saying why on the step that sent it;
+    /// answers whether it did. The refusal of any other edit is not the
+    /// flow's to say.
+    pub(super) fn edit_refused(&mut self, request: SettingRequest, error: &str) -> bool {
+        self.providers.settle(request, Some(error)) || self.fail_pin(request, error)
+    }
+
     /// Whether `request` is the pin the Icons step awaits: the Server
     /// accepting it finishes the flow, and its refusal is said on the step.
     /// The answer to any other edit leaves the pin awaited, whatever it
     /// holds.
-    pub(super) fn awaits_pin(&self, request: SettingRequest) -> bool {
+    fn awaits_pin(&self, request: SettingRequest) -> bool {
         matches!(self.icons.saving, Saving::Pending(awaited) if awaited == request)
     }
 
@@ -1317,7 +1422,7 @@ impl Onboarding {
     /// step awaits, answering whether it was: the step says why beneath its
     /// answers, and Finish may send it again. The refusal of any other edit
     /// leaves it awaited.
-    pub(super) fn fail_pin(&mut self, request: SettingRequest, error: &str) -> bool {
+    fn fail_pin(&mut self, request: SettingRequest, error: &str) -> bool {
         if !self.awaits_pin(request) {
             return false;
         }
@@ -1407,12 +1512,17 @@ impl Onboarding {
         }
     }
 
-    /// The edit that turns the Provider under the Providers step's cursor on
-    /// or off, while that step is on show.
-    pub(super) fn toggle_provider(&self, settings: &EffectiveSettings) -> Option<SettingMutation> {
-        self.shows_providers()
-            .then(|| self.providers.toggle(settings))
-            .flatten()
+    /// Sends the edit that turns the Provider under the Providers step's
+    /// cursor on or off, while that step is on show, under the request the
+    /// step awaits its answer by.
+    pub(super) fn toggle_provider(
+        &mut self,
+        settings: &EffectiveSettings,
+    ) -> Option<(SettingMutation, SettingRequest)> {
+        if !self.shows_providers() {
+            return None;
+        }
+        self.providers.toggle(settings)
     }
 
     /// Whether the Icons step is on show, which is where its own commands act

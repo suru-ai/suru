@@ -6243,10 +6243,11 @@ impl Application {
                 }
                 Ok(ApplicationTransition::Continue)
             }
-            // Onboarding finishes once the pin of its last answer lands, so
-            // the mark never runs ahead of an answer the Server refuses.
+            // Onboarding settles what it awaits by its own requests, and
+            // finishes once the pin of its last answer lands, so the mark
+            // never runs ahead of an answer the Server refuses.
             ApplicationEvent::SettingMutated { request, snapshot } => {
-                let finished = self.state.onboarding.awaits_pin(request);
+                let finished = self.state.onboarding.edit_landed(request);
                 self.state.adopt_settings(snapshot);
                 Ok(if finished {
                     self.state.take_onboarding()
@@ -6254,10 +6255,10 @@ impl Application {
                     ApplicationTransition::Continue
                 })
             }
-            // The refusal of the pin Onboarding awaits is said there, where
+            // The refusal of an edit Onboarding awaits is said there, where
             // the reader can try it again.
             ApplicationEvent::SettingMutationFailed { request, error } => {
-                if !self.state.onboarding.fail_pin(request, &error) {
+                if !self.state.onboarding.edit_refused(request, &error) {
                     self.state.settings_panel.report_failure(error);
                 }
                 Ok(ApplicationTransition::Continue)
@@ -10372,10 +10373,9 @@ impl Application {
                 .state
                 .onboarding
                 .toggle_provider(&self.state.settings)
-                .map_or(
-                    ApplicationTransition::Continue,
-                    ApplicationTransition::mutate_setting,
-                )),
+                .map_or(ApplicationTransition::Continue, |(mutation, request)| {
+                    ApplicationTransition::MutateSetting { mutation, request }
+                })),
             SemanticCommandId::OnboardingProvidersRecheck => Ok(self
                 .state
                 .onboarding

@@ -553,11 +553,16 @@ fn with_enablement(codex: bool, copilot: bool, claude: bool) -> EffectiveSetting
     settings
 }
 
-/// What an edit's round trip leaves in force, as the Server answers it.
-fn settle_mutation(application: &mut Application, settings: EffectiveSettings) {
+/// What the round trip of `edit`, a transition asking for a Setting
+/// mutation, leaves in force, as the Server answers it.
+fn settle_mutation(
+    application: &mut Application,
+    edit: &ApplicationTransition,
+    settings: EffectiveSettings,
+) {
     application
         .handle_event(ApplicationEvent::SettingMutated {
-            request: SettingRequest::new(),
+            request: request_of(edit),
             snapshot: SettingsSnapshot {
                 settings,
                 pinned: Vec::new(),
@@ -728,8 +733,9 @@ fn space_writes_the_provider_under_the_cursor_through_its_enablement_at_once() {
     let workspace = workspace_dir();
     let mut application = offered_onboarding(workspace.path());
 
+    let toggle = press(&mut application, KeyCode::Char(' '));
     assert_eq!(
-        press(&mut application, KeyCode::Char(' ')),
+        toggle,
         MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(false) }),
         "Space turns the Provider under the cursor off"
     );
@@ -737,7 +743,11 @@ fn space_writes_the_provider_under_the_cursor_through_its_enablement_at_once() {
         provider_row(&application, "Codex").contains("[x] Codex"),
         "the row waits on the Server rather than showing what the file has not taken"
     );
-    settle_mutation(&mut application, with_enablement(false, true, true));
+    settle_mutation(
+        &mut application,
+        &toggle,
+        with_enablement(false, true, true),
+    );
     assert!(
         provider_row(&application, "Codex").contains("[ ] Codex"),
         "and follows what the edit left in force: {}",
@@ -1405,10 +1415,16 @@ fn a_tiny_screen_acts_on_no_provider_it_does_not_draw() {
 
     let roomier = rendered_application_rows_at(&application, 40, 14).join("\n");
     assert!(roomier.contains("› [x] Codex"), "{roomier}");
+    let toggle = press(&mut application, KeyCode::Char(' '));
     assert_eq!(
-        press(&mut application, KeyCode::Char(' ')),
+        toggle,
         MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(false) }),
         "and toggles the one it does"
+    );
+    settle_mutation(
+        &mut application,
+        &toggle,
+        with_enablement(false, true, true),
     );
 
     push_catalog(&mut application, &[("codex", ProviderCatalogStatus::Fresh)]);
@@ -1598,11 +1614,16 @@ fn next_stays_locked_while_every_provider_is_disabled() {
     press(&mut application, KeyCode::Enter);
     assert!(screen(&application).contains("Step 1 of 3"));
 
+    let toggle = press(&mut application, KeyCode::Char(' '));
     assert_eq!(
-        press(&mut application, KeyCode::Char(' ')),
+        toggle,
         MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(true) })
     );
-    settle_mutation(&mut application, with_enablement(true, false, false));
+    settle_mutation(
+        &mut application,
+        &toggle,
+        with_enablement(true, false, false),
+    );
     assert!(
         !screen(&application).contains("Next is locked"),
         "an enabled Provider not found unavailable opens the way: {}",
@@ -1683,12 +1704,17 @@ fn slash_onboarding_shows_providers_turned_off_in_the_settings_panel() {
     press(&mut application, KeyCode::Char(','));
     press(&mut application, KeyCode::Right);
     press(&mut application, KeyCode::Down);
+    let toggle = press(&mut application, KeyCode::Char(' '));
     assert_eq!(
-        press(&mut application, KeyCode::Char(' ')),
+        toggle,
         MutatesSetting(SettingMutation::ProviderCopilotEnabled { value: Some(false) }),
         "the settings panel turns Copilot off"
     );
-    settle_mutation(&mut application, with_enablement(true, false, true));
+    settle_mutation(
+        &mut application,
+        &toggle,
+        with_enablement(true, false, true),
+    );
     press(&mut application, KeyCode::Esc);
 
     type_terminal_text(&mut application, "/onboarding");
@@ -3324,18 +3350,13 @@ fn leaving_while_the_pin_is_saved_still_marks_the_server_onboarded() {
     assert!(!onboarding_shown(&application), "{}", screen(&application));
 }
 
-/// What the Server says of another edit while the pin is awaited — a
-/// Provider toggled on the first step and refused late — is that edit's:
-/// the pin stays awaited, and its own landing still finishes the flow.
+/// What the Server says of another edit while the pin is awaited — one the
+/// flow never sent, refused late — is that edit's: the pin stays awaited, and
+/// its own landing still finishes the flow.
 #[test]
 fn a_refusal_of_another_edit_leaves_the_pin_saving_and_its_landing_still_finishes() {
     let workspace = workspace_dir();
     let mut application = offered_onboarding(workspace.path());
-    let toggle = press(&mut application, KeyCode::Char(' '));
-    assert_eq!(
-        toggle,
-        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(false) })
-    );
     on_the_icons_step(&mut application);
     press(&mut application, KeyCode::Down);
     let pin = finish_with(&mut application, true);
@@ -3343,7 +3364,7 @@ fn a_refusal_of_another_edit_leaves_the_pin_saving_and_its_landing_still_finishe
     assert_eq!(
         refuse(
             &mut application,
-            request_of(&toggle),
+            SettingRequest::new(),
             "Config Document is not editable"
         ),
         ApplicationTransition::Continue
@@ -3357,4 +3378,106 @@ fn a_refusal_of_another_edit_leaves_the_pin_saving_and_its_landing_still_finishe
         ApplicationTransition::MarkOnboarded
     );
     assert!(!onboarding_shown(&application), "{}", screen(&application));
+}
+
+/// A toggle the Server has not answered holds Next, so the reader never
+/// passes the step on the strength of a Provider about to be turned off: its
+/// row says it is turning while its tick stays as the Server says, and only
+/// the toggle's own answer settles it.
+#[test]
+fn next_waits_on_a_toggle_the_server_has_not_answered() {
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    deliver_settings(&mut application, with_enablement(true, false, false));
+    let toggle = press(&mut application, KeyCode::Char(' '));
+    assert_eq!(
+        toggle,
+        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(false) })
+    );
+    assert!(
+        provider_row(&application, "Codex").contains("› [x] Codex · turning off…"),
+        "{}",
+        screen(&application)
+    );
+    assert!(screen(&application).contains("Saving your changes…"));
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        screen(&application).contains("Step 1 of 3"),
+        "Next waits on the toggle: {}",
+        screen(&application)
+    );
+
+    // The Server's answer to another edit is not this toggle's.
+    application
+        .handle_event(ApplicationEvent::SettingMutated {
+            request: SettingRequest::new(),
+            snapshot: SettingsSnapshot {
+                settings: with_enablement(true, false, false),
+                pinned: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+        })
+        .expect("hear the Server answer another edit");
+    press(&mut application, KeyCode::Enter);
+    assert!(screen(&application).contains("Step 1 of 3"));
+    assert!(screen(&application).contains("Saving your changes…"));
+
+    settle_mutation(
+        &mut application,
+        &toggle,
+        with_enablement(false, false, false),
+    );
+    let locked = screen(&application);
+    assert!(
+        locked.contains("Next is locked: enable at least one Provider."),
+        "{locked}"
+    );
+    assert!(!locked.contains("Saving your changes…"), "{locked}");
+    assert!(
+        provider_row(&application, "Codex").contains("[ ] Codex · disabled"),
+        "{locked}"
+    );
+    press(&mut application, KeyCode::Enter);
+    assert!(screen(&application).contains("Step 1 of 3"));
+}
+
+/// A toggle the Server refuses is said beneath the rows, the row keeping the
+/// tick the Server says, and Next no longer waits on it.
+#[test]
+fn a_refused_toggle_is_said_beneath_the_rows_and_its_row_stays_as_the_server_says() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    let toggle = press(&mut application, KeyCode::Char(' '));
+    assert_eq!(
+        toggle,
+        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(false) })
+    );
+
+    assert_eq!(
+        refuse(
+            &mut application,
+            request_of(&toggle),
+            "Config Document is not editable"
+        ),
+        ApplicationTransition::Continue
+    );
+    let refused = screen(&application);
+    assert!(
+        refused.contains("Could not turn Codex off: Config Document is not editable"),
+        "{refused}"
+    );
+    assert!(!refused.contains("Saving your changes…"), "{refused}");
+    assert!(
+        provider_row(&application, "Codex").contains("› [x] Codex · checking"),
+        "{refused}"
+    );
+    press(&mut application, KeyCode::Enter);
+    assert!(
+        screen(&application).contains("Step 2 of 3"),
+        "{}",
+        screen(&application)
+    );
 }
