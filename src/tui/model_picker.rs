@@ -354,7 +354,7 @@ impl ModelPicker {
             return;
         }
         if request.outlook() == &self.outlook {
-            self.list.fail(error);
+            self.list.fail(&error);
         }
         self.active_request = None;
     }

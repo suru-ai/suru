@@ -2804,3 +2804,36 @@ fn a_listing_failure_stands_through_settings_until_a_catalog_supersedes_it() {
         "a catalog heard since is the newer word: {superseded}"
     );
 }
+
+#[test]
+fn an_unrelated_settings_snapshot_leaves_row_focus_on_a_retry_row_and_the_window_still() {
+    let workspace = workspace_dir();
+    let (mut application, recheck) =
+        awaiting_a_recheck_on_the_derivation_step(workspace.path(), claude_and_codex_listing());
+    answer_recheck(&mut application, recheck, Err("timed out".to_owned()));
+    press(&mut application, KeyCode::Up);
+    let focused = derivation_rows(&application);
+    assert!(
+        focused
+            .last()
+            .is_some_and(|row| row.starts_with("› Retry Codex: timed out")),
+        "{focused:#?}"
+    );
+
+    let mut settings = settings_deriving_with(DerivationErrand::FollowSession);
+    settings.text_selection.copy = TextSelectionCopy::Manual;
+    deliver_settings(&mut application, settings);
+    assert_eq!(
+        derivation_rows(&application),
+        focused,
+        "Row Focus stays on its retry row, and the window where it stood"
+    );
+    assert!(
+        matches!(
+            press(&mut application, KeyCode::Enter),
+            ApplicationTransition::RecheckProviders { .. }
+        ),
+        "and Enter retries rather than pinning: {}",
+        screen(&application)
+    );
+}

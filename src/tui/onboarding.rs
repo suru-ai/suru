@@ -39,7 +39,9 @@ use crate::{
 };
 
 use super::{
-    agent_selection_list::{AgentSelectionAction, AgentSelectionList, InForce, ProviderModels},
+    agent_selection_list::{
+        AgentSelectionAction, AgentSelectionList, InForce, ProviderModels, failed_listing,
+    },
     commands::SemanticCommandId,
     list_window::{ListWindow, WindowEntry},
     model_picker::{CatalogStatuses, ModelPicker, ModelPickerPurpose},
@@ -681,24 +683,26 @@ impl DerivationStep {
     /// or found unavailable since leaves the list, and Row Focus stays where
     /// the reader moved it. A failed reading stands until a catalog is
     /// `heard` after it, since the catalog in hand is the one it failed to
-    /// read past.
+    /// read past, so the rows are listed with its retry rows in one pass: a
+    /// retry row Row Focus stands on keeps it, and the window holds.
     fn adopt(&mut self, server: OwnServer<'_>, heard: Heard) {
         self.in_force = server.settings.derivation.errand.clone();
         if heard == Heard::Catalog {
             self.failure = None;
         }
-        self.list
-            .relist(usable_providers(server), in_force(&self.in_force));
-        if let Some(failure) = &self.failure {
-            self.list.fail(failure.clone());
-        }
+        let providers = usable_providers(server);
+        let providers = match &self.failure {
+            Some(failure) => failed_listing(providers, None, failure),
+            None => providers,
+        };
+        self.list.relist(providers, in_force(&self.in_force));
     }
 
     /// Takes in a reading of every Provider that failed, offering to retry it
     /// beneath each Provider listed.
     fn fail(&mut self, error: &str) {
         self.failure = Some(error.to_owned());
-        self.list.fail(error.to_owned());
+        self.list.fail(error);
     }
 
     fn command_for_key(&self, key: KeyEvent) -> Option<CommandId> {

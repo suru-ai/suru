@@ -309,26 +309,10 @@ impl AgentSelectionList {
     /// Takes in a listing that failed: a row a reader may retry where there
     /// were none, and otherwise every Provider's rows marked as what was last
     /// heard.
-    pub(super) fn fail(&mut self, error: String) {
+    pub(super) fn fail(&mut self, error: &str) {
         let (focused, from) = (self.selected.clone(), self.focus_entry());
-        if self.providers.is_empty() {
-            let provider = self
-                .provider_scope
-                .clone()
-                .unwrap_or_else(|| ProviderId::new("catalog"));
-            self.providers.push(ProviderModels {
-                display_name: provider.to_string(),
-                provider,
-                models: Vec::new(),
-                status: ProviderCatalogStatus::Failed { message: error },
-            });
-        } else {
-            for provider in &mut self.providers {
-                provider.status = ProviderCatalogStatus::Stale {
-                    message: error.clone(),
-                };
-            }
-        }
+        let providers = std::mem::take(&mut self.providers);
+        self.providers = failed_listing(providers, self.provider_scope.as_ref(), error);
         self.focus(None, true);
         self.follow_focus(focused, from);
     }
@@ -727,6 +711,35 @@ impl AgentSelectionList {
         }
         selectable
     }
+}
+
+/// `providers` as a listing that failed with `error` leaves them: every one
+/// marked as what was last heard, each with a row to retry beneath it, or —
+/// where there were none — one row for `scope`, or the whole catalog, to
+/// retry.
+pub(super) fn failed_listing(
+    mut providers: Vec<ProviderModels>,
+    scope: Option<&ProviderId>,
+    error: &str,
+) -> Vec<ProviderModels> {
+    if providers.is_empty() {
+        let provider = scope.cloned().unwrap_or_else(|| ProviderId::new("catalog"));
+        providers.push(ProviderModels {
+            display_name: provider.to_string(),
+            provider,
+            models: Vec::new(),
+            status: ProviderCatalogStatus::Failed {
+                message: error.to_owned(),
+            },
+        });
+    } else {
+        for provider in &mut providers {
+            provider.status = ProviderCatalogStatus::Stale {
+                message: error.to_owned(),
+            };
+        }
+    }
+    providers
 }
 
 /// The Provider's default Model, when the Provider can actually be used: a
