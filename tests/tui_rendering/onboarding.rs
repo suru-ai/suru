@@ -3774,3 +3774,46 @@ fn toggles_answered_out_of_order_leave_next_held_on_the_settings_in_force() {
     press(&mut application, KeyCode::Enter);
     assert!(screen(&application).contains("Step 1 of 3"));
 }
+
+/// What was said of a refused toggle stands until that Provider's next
+/// toggle lands, however another Provider's toggles fare meanwhile.
+#[test]
+fn a_refused_toggle_is_unsaid_once_that_providers_next_toggle_lands() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    let refused = press(&mut application, KeyCode::Char(' '));
+    refuse(
+        &mut application,
+        request_of(&refused),
+        "Config Document is not editable",
+    );
+    let refusal = "Could not turn Codex off: Config Document is not editable";
+    assert!(screen(&application).contains(refusal));
+
+    press(&mut application, KeyCode::Down);
+    let copilot = press(&mut application, KeyCode::Char(' '));
+    settle_mutation(
+        &mut application,
+        &copilot,
+        with_enablement(true, false, true),
+    );
+    assert!(
+        screen(&application).contains(refusal),
+        "another Provider's toggle unsays nothing: {}",
+        screen(&application)
+    );
+
+    press(&mut application, KeyCode::Up);
+    let again = press(&mut application, KeyCode::Char(' '));
+    assert_eq!(
+        again,
+        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(false) })
+    );
+    assert!(screen(&application).contains(refusal));
+    answer(&mut application, request_of(&again));
+    assert!(
+        !screen(&application).contains(refusal),
+        "{}",
+        screen(&application)
+    );
+}

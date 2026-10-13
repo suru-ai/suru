@@ -340,8 +340,9 @@ struct ProvidersStep {
     drawn: RefCell<Option<Vec<&'static ProviderId>>>,
     /// The toggles sent and not yet answered.
     toggles: Vec<Toggle>,
-    /// Why the newest toggle the Server refused never landed.
-    refusal: Option<String>,
+    /// The Provider whose toggle the Server refused newest, and why it never
+    /// landed, said until that Provider's next toggle lands.
+    refusal: Option<(&'static ProviderId, String)>,
 }
 
 /// One Provider's Enablement, sent under `request` and not yet settled.
@@ -500,7 +501,15 @@ impl ProvidersStep {
         let Some(index) = self.awaited(request) else {
             return false;
         };
-        self.toggles[index].answered = true;
+        let toggle = &mut self.toggles[index];
+        toggle.answered = true;
+        if self
+            .refusal
+            .as_ref()
+            .is_some_and(|(refused, _)| *refused == toggle.provider)
+        {
+            self.refusal = None;
+        }
         self.follow(settings);
         true
     }
@@ -514,7 +523,10 @@ impl ProvidersStep {
         };
         let toggle = self.toggles.remove(index);
         let turn = if toggle.enabling { "on" } else { "off" };
-        self.refusal = Some(format!("Could not turn {} {turn}: {error}", toggle.name));
+        self.refusal = Some((
+            toggle.provider,
+            format!("Could not turn {} {turn}: {error}", toggle.name),
+        ));
         true
     }
 
@@ -634,8 +646,8 @@ impl ProvidersStep {
         let width = u16::try_from(width).unwrap_or(u16::MAX);
         let refusal = self
             .refusal
-            .as_deref()
-            .map(|refusal| (refusal, theme.feedback.error));
+            .as_ref()
+            .map(|(_, refusal)| (refusal.as_str(), theme.feedback.error));
         let saving = self
             .is_saving()
             .then_some(("Saving your changes…", theme.text.subdued));
