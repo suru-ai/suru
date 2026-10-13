@@ -57,6 +57,10 @@ pub(super) struct Onboarding {
     providers: ProvidersStep,
     derivation: DerivationStep,
     icons: IconsStep,
+    /// The flow's own re-read of every Provider, which the Providers step's
+    /// `r` and the Derivation step's retry rows both ask for, and which the
+    /// newest of them is awaited under.
+    recheck: Recheck,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,9 +127,10 @@ pub(super) enum Advance {
         current: Option<AgentSelection>,
         purpose: ModelPickerPurpose,
     },
-    /// The step asks for the Model Catalog to be listed again, as a Provider
-    /// whose listing failed is retried; it stays on show.
-    Relist,
+    /// The step asked the Client's own Server to re-read every Provider
+    /// under this request, as a Provider whose listing failed is retried,
+    /// and awaits its answer on show.
+    Rechecking(uuid::Uuid),
     /// The step on show may not be passed yet, so it stays: the Providers
     /// step says why, and the Derivation step has nothing under Row Focus to
     /// answer with.
@@ -144,6 +149,9 @@ pub(super) struct OwnServer<'a> {
     catalog: CatalogStatuses<'a>,
     /// Each Provider as that catalog lists it, Models and all.
     providers: &'a [ProviderModels],
+    /// How many catalogs that Server has pushed, which a re-check asked of it
+    /// now is answered against.
+    pushes: u64,
 }
 
 impl<'a> OwnServer<'a> {
@@ -152,6 +160,7 @@ impl<'a> OwnServer<'a> {
             settings,
             catalog: model_picker.catalog_statuses(&Outlook::Local),
             providers: model_picker.catalog_of(&Outlook::Local),
+            pushes: model_picker.pushes(&Outlook::Local),
         }
     }
 }
@@ -178,7 +187,7 @@ pub(super) struct Drawn<'a> {
 /// under the cursor is one Space and Enter act on nothing from.
 ///
 /// `r` asks the Client's own Server to re-read every Provider, whichever
-/// Outlook is on screen, as a request of the step's own.
+/// Outlook is on screen, as a request of the flow's own.
 #[derive(Clone, Debug, Default)]
 struct ProvidersStep {
     /// The row the cursor is on.
@@ -188,10 +197,9 @@ struct ProvidersStep {
     /// Space and Enter may act on; nothing until a frame has been drawn since
     /// the step opened.
     drawn: RefCell<Option<Vec<&'static ProviderId>>>,
-    recheck: Recheck,
 }
 
-/// Where the step's own re-read of every Provider stands.
+/// Where the flow's own re-read of every Provider stands.
 #[derive(Clone, Debug, Default)]
 enum Recheck {
     #[default]
@@ -201,6 +209,17 @@ enum Recheck {
     Awaiting { recheck: uuid::Uuid, pushes: u64 },
     /// The newest re-check was not answered, for this reason.
     Failed(String),
+}
+
+impl Recheck {
+    /// Asks for a re-check, when the Client's own Server has pushed `pushes`
+    /// catalogs, in place of any still awaited, answering the request it is
+    /// asked under.
+    fn begin(&mut self, pushes: u64) -> uuid::Uuid {
+        let recheck = uuid::Uuid::new_v4();
+        *self = Self::Awaiting { recheck, pushes };
+        recheck
+    }
 }
 
 impl ProvidersStep {
@@ -366,15 +385,15 @@ impl ProvidersStep {
 
     /// What the step says beneath its rows, each line laid out within
     /// `width` columns in the style it is drawn in, the first said the most
-    /// needed: why Next is locked, and how the step's own re-check stands.
+    /// needed: why Next is locked, and how the flow's own re-check stands.
     fn notes<'a>(
-        &'a self,
         width: usize,
         theme: &Theme,
         server: OwnServer<'_>,
+        recheck: &'a Recheck,
     ) -> Vec<(WrappedText<'a>, Style)> {
         let width = u16::try_from(width).unwrap_or(u16::MAX);
-        let recheck = match &self.recheck {
+        let recheck = match recheck {
             Recheck::Idle => None,
             Recheck::Awaiting { .. } => Some(("Re-checking every Provider…", theme.text.subdued)),
             Recheck::Failed(failure) => Some((failure.as_str(), theme.feedback.error)),
@@ -389,9 +408,14 @@ impl ProvidersStep {
 
     /// How many lines the step draws within `width` columns with nothing
     /// given way.
-    fn rows_wanted(&self, width: usize, theme: &Theme, server: OwnServer<'_>) -> usize {
-        let notes = self
-            .notes(width, theme, server)
+    fn rows_wanted(
+        &self,
+        width: usize,
+        theme: &Theme,
+        server: OwnServer<'_>,
+        recheck: &Recheck,
+    ) -> usize {
+        let notes = Self::notes(width, theme, server, recheck)
             .iter()
             .map(|(note, _)| note.height())
             .sum::<usize>();
@@ -419,11 +443,11 @@ impl ProvidersStep {
         room: usize,
         theme: &Theme,
         server: OwnServer<'a>,
+        recheck: &'a Recheck,
     ) -> (Vec<Line<'static>>, Vec<WrappedLine<'a>>) {
         let entries = self.entries(width, theme, server);
         let mut said = 0;
-        let notes = self
-            .notes(width, theme, server)
+        let notes = Self::notes(width, theme, server, recheck)
             .into_iter()
             .map(|(note, style)| {
                 let note = note.first(room.saturating_sub(said));
@@ -667,8 +691,10 @@ impl DerivationStep {
 
     /// What confirming the row Row Focus stands on comes to: the pin of a
     /// named value or of a Model without Model Options, the Model Options of
-    /// one with any to choose first, or a failed listing to retry.
-    fn confirm(&self) -> Advance {
+    /// one with any to choose first, or a failed listing retried through the
+    /// flow's own `recheck`, asked when its Server had pushed `pushes`
+    /// catalogs.
+    fn confirm(&self, recheck: &mut Recheck, pushes: u64) -> Advance {
         match self.list.choose() {
             Some(AgentSelectionAction::Named(index)) => {
                 Advance::Pinned(derivation_pin(NAMED_DERIVATIONS[index].0.clone()))
@@ -689,7 +715,7 @@ impl DerivationStep {
                     purpose: ModelPickerPurpose::Setting(pinned_selection),
                 }
             }
-            Some(AgentSelectionAction::Retry) => Advance::Relist,
+            Some(AgentSelectionAction::Retry) => Advance::Rechecking(recheck.begin(pushes)),
             None => Advance::Held,
         }
     }
@@ -845,7 +871,7 @@ impl Onboarding {
                 Advance::Held
             }
             Some(Step::Derivation) => {
-                let advance = self.derivation.confirm();
+                let advance = self.derivation.confirm(&mut self.recheck, server.pushes);
                 if matches!(advance, Advance::Pinned(_)) {
                     self.move_on();
                 }
@@ -939,11 +965,7 @@ impl Onboarding {
     /// asked under; that Server has pushed `pushes` catalogs so far. A newer
     /// re-check takes the place of one still awaited.
     pub(super) fn begin_recheck(&mut self, pushes: u64) -> Option<uuid::Uuid> {
-        self.shows_providers().then(|| {
-            let recheck = uuid::Uuid::new_v4();
-            self.providers.recheck = Recheck::Awaiting { recheck, pushes };
-            recheck
-        })
+        self.shows_providers().then(|| self.recheck.begin(pushes))
     }
 
     /// Takes the Server's answer to `recheck` where it is the re-check
@@ -959,14 +981,14 @@ impl Onboarding {
         let Recheck::Awaiting {
             recheck: awaited,
             pushes,
-        } = self.providers.recheck
+        } = self.recheck
         else {
             return None;
         };
         if awaited != recheck {
             return None;
         }
-        self.providers.recheck = failure.map_or(Recheck::Idle, |error| {
+        self.recheck = failure.map_or(Recheck::Idle, |error| {
             Recheck::Failed(format!("Could not re-check the Providers: {error}"))
         });
         Some(pushes)
@@ -975,7 +997,7 @@ impl Onboarding {
     /// Gives up how the re-check stands, because the Client has reconnected
     /// to its own Server, which says what it is now itself.
     pub(super) fn forget_recheck(&mut self) {
-        self.providers.recheck = Recheck::Idle;
+        self.recheck = Recheck::Idle;
     }
 
     /// Starts the record of which Providers were drawn over with the frame,
@@ -1074,7 +1096,9 @@ impl Onboarding {
             // one of what gives way on a short screen before its rows.
             Step::Providers => {
                 let room = height.saturating_sub(lines.len() + 1);
-                let (step_lines, step_wrapped) = self.providers.lines(width, room, theme, server);
+                let (step_lines, step_wrapped) =
+                    self.providers
+                        .lines(width, room, theme, server, &self.recheck);
                 let top = lines.len();
                 wrapped.extend(step_wrapped.into_iter().map(|line| WrappedLine {
                     row: top + line.row,
@@ -1122,7 +1146,9 @@ impl Onboarding {
             return 0;
         };
         let step_rows = match step {
-            Step::Providers => self.providers.rows_wanted(width, theme, server),
+            Step::Providers => self
+                .providers
+                .rows_wanted(width, theme, server, &self.recheck),
             Step::Derivation => 1 + self.derivation.rows_wanted(),
             Step::Icons => 1 + self.icons.lines(width, theme).len(),
         };

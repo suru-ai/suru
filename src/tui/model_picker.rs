@@ -161,15 +161,8 @@ impl ModelPicker {
     }
 
     pub(super) fn begin_refresh(&mut self) -> ModelListRequest {
-        self.begin_refresh_of(self.outlook.clone())
-    }
-
-    /// Asks for `outlook`'s catalog anew, whichever Outlook is on screen, as
-    /// Onboarding does of the Client's own Server. A listing of another
-    /// Outlook than the one on screen feeds that Outlook's cache alone.
-    pub(super) fn begin_refresh_of(&mut self, outlook: Outlook) -> ModelListRequest {
         self.request_sequence = self.request_sequence.wrapping_add(1);
-        let request = ModelListRequest::new(self.request_sequence, outlook);
+        let request = ModelListRequest::new(self.request_sequence, self.outlook.clone());
         self.active_request = Some(request.clone());
         request
     }

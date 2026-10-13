@@ -2105,6 +2105,17 @@ fn taking_onboarding_again_rests_row_focus_on_the_derivation_value_in_force() {
     );
 }
 
+/// Confirms the retry row Row Focus stands on, which asks the Client's own
+/// Server to re-read every Provider, answering the request its answer must
+/// name.
+fn retry(application: &mut Application) -> uuid::Uuid {
+    let transition = press(application, KeyCode::Enter);
+    let ApplicationTransition::RecheckProviders { recheck } = transition else {
+        panic!("a retry row re-reads every Provider of the Client's own Server: {transition:?}");
+    };
+    recheck
+}
+
 #[test]
 fn a_provider_whose_listing_failed_is_retried_from_the_derivation_step() {
     let workspace = workspace_dir();
@@ -2128,16 +2139,9 @@ fn a_provider_whose_listing_failed_is_retried_from_the_derivation_step() {
         focused_row(&application)
     );
 
-    let ApplicationTransition::ListModels(request) = press(&mut application, KeyCode::Enter) else {
-        panic!("choosing the retry row lists the Model Catalog again");
-    };
+    let recheck = retry(&mut application);
     assert!(screen(&application).contains("Step 2 of 3"));
-    application
-        .handle_event(ApplicationEvent::ModelsListed {
-            request,
-            catalog: pushed_catalog(),
-        })
-        .expect("receive the catalog listed again");
+    answer_recheck(&mut application, recheck, Ok(pushed_catalog()));
     let listed = screen(&application);
     assert!(
         listed.contains("GPT-5 Mini") && !listed.contains("Retry Codex"),
@@ -2245,22 +2249,10 @@ fn retrying_on_the_derivation_step_viewing_studio(workspace: &Path) -> Applicati
 fn the_derivation_step_lists_and_retries_the_clients_own_server_while_a_remote_is_viewed() {
     let workspace = workspace_dir();
     let mut application = retrying_on_the_derivation_step_viewing_studio(workspace.path());
-    let ApplicationTransition::ListModels(request) = press(&mut application, KeyCode::Enter) else {
-        panic!("the retry row lists the Model Catalog again");
-    };
-    assert_eq!(
-        request.outlook(),
-        &Outlook::Local,
-        "and lists the Client's own Server's"
-    );
+    let recheck = retry(&mut application);
     let mut listed = pushed_catalog();
     listed.providers[2].status = ProviderCatalogStatus::Fresh;
-    application
-        .handle_event(ApplicationEvent::ModelsListed {
-            request,
-            catalog: listed,
-        })
-        .expect("receive the Local catalog listed again");
+    answer_recheck(&mut application, recheck, Ok(listed));
     let relisted = screen(&application);
     assert!(
         relisted.contains("Claude Model") && !relisted.contains("Studio Model"),
@@ -2558,15 +2550,12 @@ fn the_window_holds_while_rows_listed_above_row_focus_leave_it_in_view() {
 fn a_failed_retry_of_the_clients_own_server_shows_its_retry_rows_while_a_remote_is_viewed() {
     let workspace = workspace_dir();
     let mut application = retrying_on_the_derivation_step_viewing_studio(workspace.path());
-    let ApplicationTransition::ListModels(request) = press(&mut application, KeyCode::Enter) else {
-        panic!("the retry row lists the Model Catalog again");
-    };
-    application
-        .handle_event(ApplicationEvent::ModelListingFailed {
-            request,
-            error: "the Server did not answer".to_owned(),
-        })
-        .expect("hear that listing the Local catalog failed");
+    let recheck = retry(&mut application);
+    answer_recheck(
+        &mut application,
+        recheck,
+        Err("the Server did not answer".to_owned()),
+    );
 
     let failed = screen(&application);
     assert!(failed.contains("Step 2 of 3"), "{failed}");
@@ -2644,4 +2633,72 @@ fn the_agents_options_asked_for_earlier_do_not_replace_the_derivation_steps() {
         ])))
     );
     assert!(screen(&application).contains("Step 3 of 3"));
+}
+
+#[test]
+fn a_retry_from_the_derivation_step_leaves_a_remote_listing_in_flight_to_settle() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    deliver_settings(
+        &mut application,
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    deliver_catalog(&mut application, local_catalog_with_claude_failing());
+    turn_outlook(&mut application, KeyCode::Down);
+    let ApplicationTransition::ListModels(listing) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelList,
+        )))
+        .expect("open the Model picker")
+    else {
+        panic!("the picker asks the Remote for its Models");
+    };
+    assert_eq!(listing.outlook(), &Outlook::Remote("studio".to_owned()));
+    press(&mut application, KeyCode::Esc);
+
+    type_terminal_text(&mut application, "/onboarding");
+    press(&mut application, KeyCode::Enter);
+    press(&mut application, KeyCode::Enter);
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Down);
+    assert!(
+        focused_row(&application).contains("Retry Claude"),
+        "{}",
+        focused_row(&application)
+    );
+    retry(&mut application);
+
+    application
+        .handle_event(ApplicationEvent::ModelsRefreshed {
+            request: listing,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    display_name: "Codex".to_owned(),
+                    models: vec![model_descriptor(
+                        "codex",
+                        "studio-model",
+                        "Studio Model",
+                        true,
+                        ModelAvailability::Available,
+                    )],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("receive the Remote's Models");
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::MarkOnboarded
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelList,
+        )))
+        .expect("open the Model picker again");
+    assert!(
+        screen(&application).contains("Studio Model"),
+        "the Remote's listing settled as the picker asked for it: {}",
+        screen(&application)
+    );
 }

@@ -5957,15 +5957,19 @@ impl Application {
             // Only the re-check the flow awaits answers for the rows, and what
             // it read reaches the Local catalog as a push would, unless the
             // Server has pushed one since it was asked: that is its newer word.
+            // A failure is the Derivation step's to offer a retry of too.
             ApplicationEvent::ProvidersRechecked { recheck, result } => {
                 let failure = result.as_ref().err().cloned();
-                if let Some(pushes) = self.state.onboarding.settle_recheck(recheck, failure)
-                    && let Ok(catalog) = result
-                {
-                    self.state
-                        .model_picker
-                        .adopt_reading(Outlook::Local, catalog, pushes);
-                    self.state.refresh_onboarding();
+                if let Some(pushes) = self.state.onboarding.settle_recheck(recheck, failure) {
+                    match result {
+                        Ok(catalog) => {
+                            self.state
+                                .model_picker
+                                .adopt_reading(Outlook::Local, catalog, pushes);
+                            self.state.refresh_onboarding();
+                        }
+                        Err(error) => self.state.onboarding.fail_listing(&error),
+                    }
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -10345,9 +10349,9 @@ impl Application {
                         );
                         ApplicationTransition::Continue
                     }
-                    Advance::Relist => ApplicationTransition::ListModels(
-                        self.state.model_picker.begin_refresh_of(Outlook::Local),
-                    ),
+                    Advance::Rechecking(recheck) => {
+                        ApplicationTransition::RecheckProviders { recheck }
+                    }
                     Advance::Finished => self.state.take_onboarding(),
                 })
             }
