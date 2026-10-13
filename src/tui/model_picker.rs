@@ -1,6 +1,6 @@
 //! Searchable Model picker state and stable catalog reconciliation.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Range};
 
 use crate::protocol::{
     AgentSelection, ModelAvailability, ModelCatalog, ModelDescriptor, ModelId, ModelOptionKind,
@@ -179,16 +179,16 @@ pub(super) enum ModelPickerRow<'a> {
 
 /// How far a fix stands in beneath the retry row it belongs to: past the row's
 /// focus marker and two columns more, so it reads as the row's own.
-const FIX_INDENT: &str = "    ";
+pub(super) const FIX_INDENT: &str = "    ";
 
-/// The lines a fix takes beneath its retry row in a list `width` columns wide:
-/// as many as it needs, broken between words, so a page to install from is
-/// drawn whole rather than cut short at the edge.
-pub(super) fn fix_lines(fix: &str, width: u16) -> Vec<String> {
+/// The part of a fix each of its lines beneath its retry row draws, in a list
+/// `width` columns wide: as many lines as it needs, broken between words, so a
+/// page to install from is drawn whole rather than cut short at the edge.
+pub(super) fn fix_rows(fix: &str, width: u16) -> Vec<Range<usize>> {
     let indent = u16::try_from(FIX_INDENT.len()).unwrap_or(u16::MAX);
     TextLayout::new(fix, width.saturating_sub(indent))
         .rows()
-        .map(|row| format!("{FIX_INDENT}{}", row.text))
+        .map(|row| row.start..row.start + row.text.len())
         .collect()
 }
 
@@ -506,7 +506,7 @@ impl ModelPicker {
                 ModelPickerRow::Provider { .. } => WindowEntry::passive(1),
                 ModelPickerRow::Model { .. } | ModelPickerRow::Error { .. } => WindowEntry::ROW,
                 ModelPickerRow::Unavailable { fix, .. } => {
-                    WindowEntry::focusable(1 + fix_lines(fix, width).len())
+                    WindowEntry::focusable(1 + fix_rows(fix, width).len())
                 }
             })
             .collect::<Vec<_>>();

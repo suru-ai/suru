@@ -2188,6 +2188,53 @@ fn a_fix_too_long_for_its_row_is_given_whole_beneath_the_headline() {
     }
 }
 
+/// The fix beneath the headline copies as it was written, not as the panel
+/// wrapped it: an install page's address is copied unbroken, with nothing of
+/// the row it began on.
+#[test]
+fn the_fix_beneath_the_headline_copies_as_one_unbroken_line() {
+    const INSTALL_PAGE: &str =
+        "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli";
+    let workspace = workspace_dir();
+    let mut settings = EffectiveSettings::default();
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    let mut application = client_showing(workspace.path(), settings, &[]);
+    let request = read_providers_tab(&mut application);
+    deliver_catalog(
+        &mut application,
+        request,
+        &[
+            ("codex", ProviderCatalogStatus::Fresh),
+            (
+                "copilot",
+                ProviderCatalogStatus::Unavailable {
+                    reason: ProviderUnavailability::NotInstalled,
+                    message: "could not launch `copilot`".to_owned(),
+                    fix: format!("install the Copilot CLI from {INSTALL_PAGE}"),
+                },
+            ),
+            ("claude", ProviderCatalogStatus::Fresh),
+        ],
+    );
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+
+    let buffer = rendered_application_buffer(&application, 100, 32);
+    let start = text_position(&buffer, "install the Copilot CLI from");
+    let address = text_position(&buffer, INSTALL_PAGE);
+    assert_eq!(
+        address.1,
+        start.1 + 1,
+        "the address wraps onto a row of its own"
+    );
+    let end = (address.0 + INSTALL_PAGE.len() as u16 - 1, address.1);
+    assert_eq!(
+        super::selection::drag(&mut application, start, end),
+        ApplicationTransition::CopyToClipboard(
+            format!("install the Copilot CLI from {INSTALL_PAGE}").into()
+        )
+    );
+}
+
 /// A compatibility warning is guidance rather than Availability: the Provider
 /// remains enabled, while its row names the warning and the focused headline
 /// explains the action that clears it.

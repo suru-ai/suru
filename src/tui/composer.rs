@@ -140,7 +140,9 @@ impl ComposerMemory {
             scroll: usize::from(frame.scroll),
             rows: layout
                 .rows()
-                .map(|row| row.start..row.start + row.text.len())
+                .map(|row| {
+                    super::selection::SelectionRow::flush(row.start..row.start + row.text.len())
+                })
                 .collect(),
             text: text.to_owned(),
         })

@@ -182,7 +182,39 @@ pub(super) struct SelectionFrame {
     pub(super) area: Rect,
     pub(super) scroll: usize,
     pub(super) text: String,
-    pub(super) rows: Vec<std::ops::Range<usize>>,
+    pub(super) rows: Vec<SelectionRow>,
+}
+
+/// One drawn Row as a selection reads it: the part of the frame's text the Row
+/// shows, and the column of the area that text is drawn from.
+#[derive(Clone, Debug)]
+pub(super) struct SelectionRow {
+    pub(super) text: std::ops::Range<usize>,
+    pub(super) column: usize,
+}
+
+impl SelectionRow {
+    /// A Row whose text is drawn from the area's first column.
+    pub(super) fn flush(text: std::ops::Range<usize>) -> Self {
+        Self { text, column: 0 }
+    }
+}
+
+/// A line a surface wrapped over Rows of its own, as its draw laid the line
+/// out. A selection reads those Rows as the one line they were written as, so
+/// what it copies is the line's own text — without the breaks the wrap put in
+/// or whatever the surface drew beside it (ADR-0020).
+#[derive(Clone, Debug)]
+pub(super) struct WrappedLine<'a> {
+    /// The Row of the frame's area the first drawn part of the line is on.
+    pub(super) row: usize,
+    /// The column of the area every drawn part of the line begins at.
+    pub(super) column: usize,
+    /// The line as written.
+    pub(super) text: &'a str,
+    /// The part of `text` each Row draws, top to bottom. A line drawn only in
+    /// part leaves out the parts it did not draw.
+    pub(super) parts: Vec<std::ops::Range<usize>>,
 }
 
 impl SelectionFrame {
@@ -195,10 +227,15 @@ impl SelectionFrame {
         hash.finish()
     }
 
-    /// The draft bytes beneath a cell, including the whole glyph it paints.
+    /// The draft bytes beneath a cell, including the whole glyph it paints. A
+    /// cell before where its Row's text begins stands at that text's start.
     pub(super) fn cell_range(&self, cell: SelectionCell) -> Option<std::ops::Range<usize>> {
-        let range = self.rows.get(cell.row)?;
-        let mut column = 0;
+        let row = self.rows.get(cell.row)?;
+        let range = &row.text;
+        let mut column = row.column;
+        if cell.column < column {
+            return Some(range.start..range.start);
+        }
         for (offset, glyph) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(
             &self.text[range.clone()],
             true,
@@ -214,10 +251,12 @@ impl SelectionFrame {
 
     pub(super) fn highlight_range(&self, selected: std::ops::Range<usize>, buffer: &mut Buffer) {
         for y in self.area.y..self.area.bottom() {
-            let Some(row) = self.rows.get(self.scroll + usize::from(y - self.area.y)) else {
+            let Some(SelectionRow { text: row, column }) =
+                self.rows.get(self.scroll + usize::from(y - self.area.y))
+            else {
                 break;
             };
-            let mut column = 0;
+            let mut column = *column;
             let text = &self.text[row.clone()];
             // Composer rows map exactly to draft text: trailing spaces are editable
             // characters too. Other surfaces may carry layout padding.
@@ -270,10 +309,14 @@ impl SelectionFrame {
             if row > end.row {
                 break;
             }
-            let Some(range) = self.rows.get(row) else {
+            let Some(SelectionRow {
+                text: range,
+                column,
+            }) = self.rows.get(row)
+            else {
                 break;
             };
-            let mut column = 0;
+            let mut column = *column;
             for glyph in unicode_segmentation::UnicodeSegmentation::graphemes(
                 self.text[range.clone()].trim_end(),
                 true,
@@ -324,11 +367,38 @@ impl SelectionSurface {
 
 impl SelectionFrame {
     pub(super) fn painted(surface: SelectionSurface, buffer: &Buffer, area: Rect) -> Self {
+        Self::painted_around(surface, buffer, area, &[])
+    }
+
+    /// The Rows `area` painted, each read as it was painted save the Rows of
+    /// each of `wrapped`, which are read as the one line that was written.
+    pub(super) fn painted_around(
+        surface: SelectionSurface,
+        buffer: &Buffer,
+        area: Rect,
+        wrapped: &[WrappedLine<'_>],
+    ) -> Self {
         let mut text = String::new();
         let mut rows = Vec::new();
-        for y in area.y..area.bottom() {
+        let mut y = area.y;
+        while y < area.bottom() {
             if y > area.y {
                 text.push('\n');
+            }
+            let row = usize::from(y - area.y);
+            if let Some(line) = wrapped
+                .iter()
+                .find(|line| line.row == row && !line.parts.is_empty())
+            {
+                let start = text.len();
+                text.push_str(line.text);
+                let drawn = line.parts.len().min(usize::from(area.bottom() - y));
+                rows.extend(line.parts[..drawn].iter().map(|part| SelectionRow {
+                    text: start + part.start..start + part.end,
+                    column: line.column,
+                }));
+                y = y.saturating_add(u16::try_from(drawn).unwrap_or(u16::MAX));
+                continue;
             }
             let start = text.len();
             let mut x = area.x;
@@ -337,7 +407,8 @@ impl SelectionFrame {
                 text.push_str(symbol);
                 x = x.saturating_add(u16::try_from(symbol.width()).unwrap_or(1).max(1));
             }
-            rows.push(start..text.len());
+            rows.push(SelectionRow::flush(start..text.len()));
+            y += 1;
         }
         Self {
             surface,

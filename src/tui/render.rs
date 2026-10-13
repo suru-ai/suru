@@ -1,7 +1,7 @@
 //! Frame rendering: the landing and Session screens, the pickers and overlays,
 //! and the shared text and layout helpers they draw with.
 
-use super::selection::{SelectionFrame, SelectionSurface};
+use super::selection::{SelectionFrame, SelectionSurface, WrappedLine};
 
 use ratatui::{
     Frame,
@@ -38,7 +38,7 @@ use super::{
     keymap::binding_label,
     list_window::WindowEntry,
     model_options::ModelOptionChoiceRow,
-    model_picker::{ModelPickerRow, fix_lines},
+    model_picker::{FIX_INDENT, ModelPickerRow, fix_rows},
     relay_overlay::serve_through_status,
     serve_overlay::{CandidateWay, LISTENER_FAILED, LISTENER_OFF, ServeWays},
     session_picker::SessionPickerRow,
@@ -2663,6 +2663,7 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
     let content_width = area.width.saturating_sub(2);
     let content_height = area.height.saturating_sub(2);
     let mut lines = Vec::with_capacity(usize::from(content_height));
+    let mut wrapped = Vec::new();
     if content_height >= 3 {
         lines.push(Line::styled(
             picker_search_line(state.model_picker.query(), usize::from(content_width)),
@@ -2690,11 +2691,12 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
         let footer_rows = usize::from(content_height >= 3);
         let row_capacity = usize::from(content_height).saturating_sub(lines.len() + footer_rows);
         let current = state.agent_selection();
-        let rows = state
+        for row in state
             .model_picker
             .visible_rows(row_capacity, content_width, current)
-            .flat_map(|row| match row {
-                ModelPickerRow::Provider { name, refreshing } => vec![Line::styled(
+        {
+            match row {
+                ModelPickerRow::Provider { name, refreshing } => lines.push(Line::styled(
                     truncate_to_width(
                         &format!(
                             "Provider {name}{}",
@@ -2703,12 +2705,12 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
                         usize::from(content_width),
                     ),
                     theme.accent.primary.add_modifier(Modifier::BOLD),
-                )],
+                )),
                 ModelPickerRow::Model {
                     model,
                     selected,
                     current,
-                } => vec![Line::styled(
+                } => lines.push(Line::styled(
                     model_picker_row_text(model, selected, current, usize::from(content_width)),
                     if selected {
                         theme.selection.focused
@@ -2717,48 +2719,54 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
                     } else {
                         theme.text.primary
                     },
-                )],
+                )),
                 // A failing Provider and an unavailable one are the same row:
                 // the retry the reader may take, with what it is about to
                 // re-check. Only the account of the condition differs, and an
                 // unavailable one says beneath it what the reader does to fix
-                // it, on lines of its own so none of it is cut short.
+                // it, on lines of its own so none of it is cut short — and so
+                // that a selection across them copies the fix as written.
                 ModelPickerRow::Error {
                     name,
                     message,
                     selected,
-                } => vec![model_picker_retry_row(
+                } => lines.push(model_picker_retry_row(
                     &format!("Retry {name}: {message}"),
                     selected,
                     content_width,
                     theme,
-                )],
+                )),
                 ModelPickerRow::Unavailable {
                     name,
                     reason,
                     message,
                     fix,
                     selected,
-                } => std::iter::once(model_picker_retry_row(
-                    &format!("Retry {name}: {} · {message}", reason.label()),
-                    selected,
-                    content_width,
-                    theme,
-                ))
-                .chain(fix_lines(fix, content_width).into_iter().map(|line| {
-                    Line::styled(
-                        line,
-                        if selected {
-                            theme.selection.focused
-                        } else {
-                            theme.text.primary
-                        },
-                    )
-                }))
-                .collect(),
-            })
-            .collect::<Vec<_>>();
-        lines.extend(rows);
+                } => {
+                    lines.push(model_picker_retry_row(
+                        &format!("Retry {name}: {} · {message}", reason.label()),
+                        selected,
+                        content_width,
+                        theme,
+                    ));
+                    let style = if selected {
+                        theme.selection.focused
+                    } else {
+                        theme.text.primary
+                    };
+                    let parts = fix_rows(fix, content_width);
+                    lines.extend(parts.iter().map(|part| {
+                        Line::styled(format!("{FIX_INDENT}{}", &fix[part.clone()]), style)
+                    }));
+                    wrapped.push(WrappedLine {
+                        row: lines.len() - parts.len(),
+                        column: FIX_INDENT.width(),
+                        text: fix,
+                        parts,
+                    });
+                }
+            }
+        }
         if !state.model_picker.has_rows() && lines.len() < usize::from(content_height) {
             lines.push(Line::styled("No Models found", theme.text.subdued));
         }
@@ -2783,7 +2791,7 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
         ),
         area,
     );
-    record_overlay_selection(frame, state, area, SelectionSurface::Models, true);
+    record_overlay_selection_around(frame, state, area, SelectionSurface::Models, true, &wrapped);
 }
 
 fn render_approval_posture_picker(
@@ -2933,19 +2941,20 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     let fix = state
         .settings_panel
         .selected_fix(state.settings())
-        .filter(|_| state.settings_panel.error().is_none())
+        .filter(|_| state.settings_panel.error().is_none());
+    let fix_parts = fix
         .map(|fix| {
             TextLayout::new(fix, width.saturating_sub(2))
                 .rows()
-                .map(|row| row.text.to_owned())
+                .map(|row| row.start..row.start + row.text.len())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     // A tab lists a known number of rows, so the panel is exactly as tall as it
     // needs to be: two borders around the tab bar and the headline, whatever
     // fix goes beneath it, one row per Setting, and the controls.
-    let wanted =
-        u16::try_from(rows.len().saturating_add(5).saturating_add(fix.len())).unwrap_or(u16::MAX);
+    let wanted = u16::try_from(rows.len().saturating_add(5).saturating_add(fix_parts.len()))
+        .unwrap_or(u16::MAX);
     let area = centered_rect(main, width, main.height.saturating_sub(2).min(wanted));
     let content_width = usize::from(area.width.saturating_sub(2));
     let content_height = usize::from(area.height.saturating_sub(2));
@@ -3022,12 +3031,23 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     }
     let footer_rows = usize::from(content_height >= 3);
     // The fix gives way before the focused row does, which is the one thing a
-    // reader of it must still be able to see.
-    for line in fix {
-        if lines.len() + footer_rows + 1 >= content_height {
-            break;
-        }
-        lines.push(Line::styled(line, theme.text.primary));
+    // reader of it must still be able to see. A selection across its lines
+    // copies it as written rather than as wrapped.
+    let mut wrapped = Vec::new();
+    if let Some(fix) = fix {
+        let room = content_height.saturating_sub(lines.len() + footer_rows + 1);
+        let parts = fix_parts.into_iter().take(room).collect::<Vec<_>>();
+        lines.extend(
+            parts
+                .iter()
+                .map(|part| Line::styled(fix[part.clone()].to_owned(), theme.text.primary)),
+        );
+        wrapped.push(WrappedLine {
+            row: lines.len() - parts.len(),
+            column: 0,
+            text: fix,
+            parts,
+        });
     }
     let capacity = content_height.saturating_sub(lines.len() + footer_rows);
     let selected = rows.iter().position(|row| row.selected);
@@ -3137,14 +3157,14 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
             count: drawn_rows,
         }),
     ));
-    render_overlay_box(
+    draw_overlay_box(frame, state, area, lines, " Settings ", theme);
+    record_overlay_selection_around(
         frame,
         state,
-        SelectionSurface::Settings,
         area,
-        lines,
-        " Settings ",
-        theme,
+        SelectionSurface::Settings,
+        true,
+        &wrapped,
     );
 }
 
@@ -3356,22 +3376,48 @@ fn record_overlay_selection(
     surface: SelectionSurface,
     bordered: bool,
 ) {
+    record_overlay_selection_around(frame, state, area, surface, bordered, &[]);
+}
+
+/// [`record_overlay_selection`] for a box that wrapped lines of its own, each
+/// placed by the line of the box's content it begins on: a selection reads
+/// each of them as the one line it was written as.
+fn record_overlay_selection_around(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    area: Rect,
+    surface: SelectionSurface,
+    bordered: bool,
+    wrapped: &[WrappedLine<'_>],
+) {
     let mut content = if bordered {
         area.inner(ratatui::layout::Margin::new(1, 1))
     } else {
         area
     };
+    let mut skipped = 0;
     if surface == SelectionSurface::Settings && content.height >= 4 {
         content.y += 1;
         content.height -= 1;
+        skipped = 1;
     }
+    let wrapped = wrapped
+        .iter()
+        .filter_map(|line| {
+            Some(WrappedLine {
+                row: line.row.checked_sub(skipped)?,
+                ..line.clone()
+            })
+        })
+        .collect::<Vec<_>>();
     state.selection_overlay_area.set(Some(area));
     let mut surfaces = state.selection_frames.borrow_mut();
     surfaces.clear();
-    surfaces.push(SelectionFrame::painted(
+    surfaces.push(SelectionFrame::painted_around(
         surface,
         frame.buffer_mut(),
         content,
+        &wrapped,
     ));
 }
 
@@ -3392,6 +3438,20 @@ fn render_overlay_box(
     title: &str,
     theme: &Theme,
 ) {
+    draw_overlay_box(frame, state, area, lines, title, theme);
+    record_overlay_selection(frame, state, area, surface, true);
+}
+
+/// The bordered box [`render_overlay_box`] draws, for a surface that records
+/// its own selection.
+fn draw_overlay_box(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    title: &str,
+    theme: &Theme,
+) {
     clear_over(frame, state, area);
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -3403,7 +3463,6 @@ fn render_overlay_box(
         ),
         area,
     );
-    record_overlay_selection(frame, state, area, surface, true);
 }
 
 /// The row standing for a Provider's condition, which choosing re-checks.

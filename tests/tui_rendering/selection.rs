@@ -145,6 +145,80 @@ fn pickers_and_connection_overlays_copy_their_painted_rows() {
     }
 }
 
+/// What fixes an unavailable Provider, wrapped beneath its retry row, copies
+/// as it was written: the wrap that broke an install page's address across
+/// rows, and the indent that set it beneath the row, are the picker's layout
+/// rather than the text.
+#[test]
+fn a_wrapped_fix_in_the_model_picker_copies_as_one_unbroken_line() {
+    use suru::protocol::*;
+    const INSTALL_PAGE: &str =
+        "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli";
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    release_copy(&mut application);
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelList,
+        )))
+        .unwrap()
+    else {
+        panic!("the picker requests Models")
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("copilot"),
+                    display_name: "Copilot".to_owned(),
+                    models: Vec::new(),
+                    status: ProviderCatalogStatus::Unavailable {
+                        reason: ProviderUnavailability::NotInstalled,
+                        message: "could not launch `copilot`".to_owned(),
+                        fix: format!("install the Copilot CLI from {INSTALL_PAGE}"),
+                    },
+                }],
+            },
+        })
+        .unwrap();
+
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let start = text_position(&buffer, "install the Copilot CLI from");
+    let address = text_position(&buffer, "https://docs.github.com/en/");
+    let tail = text_position(&buffer, "install-copilot-cli");
+    assert!(
+        start.1 < address.1 && address.1 < tail.1,
+        "the address wraps onto a row of its own and breaks across another"
+    );
+    let end = (tail.0 + "install-copilot-cli".len() as u16 - 1, tail.1);
+    assert_eq!(
+        drag(&mut application, start, end),
+        ApplicationTransition::CopyToClipboard(
+            format!("install the Copilot CLI from {INSTALL_PAGE}").into()
+        ),
+        "the whole fix copies as written"
+    );
+    let highlighted = rendered_application_buffer(&application, 60, 24);
+    for cell in [start, address, end] {
+        assert!(
+            highlighted[cell].modifier.contains(Modifier::REVERSED),
+            "the fix's text lights up where it is drawn, at {cell:?}"
+        );
+    }
+    assert!(
+        !highlighted[(address.0 - 1, address.1)]
+            .modifier
+            .contains(Modifier::REVERSED),
+        "while the indent it is drawn beneath the retry row from does not"
+    );
+    assert_eq!(
+        drag(&mut application, address, end),
+        ApplicationTransition::CopyToClipboard(INSTALL_PAGE.into()),
+        "and the address alone copies unbroken"
+    );
+}
+
 #[test]
 fn composer_and_transcript_drags_stay_on_the_surface_they_started_on() {
     let workspace = workspace_dir();
