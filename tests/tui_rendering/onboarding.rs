@@ -293,6 +293,55 @@ fn a_stale_word_that_the_server_is_not_onboarded_does_not_reopen_what_the_reader
     );
 }
 
+/// The reader left in a Client whose mark never reached the Server, which
+/// reconnects still saying it has not been onboarded.
+fn left_then_reconnected_unmarked(workspace: &Path) -> Application {
+    let mut application = offered_onboarding(workspace);
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::MarkOnboarded
+    );
+    let reconnected = application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            unonboarded_health(),
+        )))
+        .expect("reconnect to a Server that says it is not onboarded");
+    assert_ne!(
+        reconnected,
+        ApplicationTransition::MarkOnboarded,
+        "no second mark is asked for"
+    );
+    deliver_settings(&mut application, EffectiveSettings::default());
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Onboarded(false)))
+        .expect("hear the reconnected stream's opening word on Onboarding");
+    application
+}
+
+#[test]
+fn a_reconnect_saying_the_server_is_not_onboarded_does_not_reopen_what_the_reader_left() {
+    let workspace = workspace_dir();
+    let application = left_then_reconnected_unmarked(workspace.path());
+    assert!(
+        !onboarding_shown(&application),
+        "leaving counts as taking it, so it never returns unasked: {}",
+        screen(&application)
+    );
+}
+
+#[test]
+fn slash_onboarding_still_opens_the_flow_the_reader_left() {
+    let workspace = workspace_dir();
+    let mut application = left_then_reconnected_unmarked(workspace.path());
+    type_terminal_text(&mut application, "/onboarding");
+    press(&mut application, KeyCode::Enter);
+    assert!(
+        screen(&application).contains("Step 1 of 3"),
+        "{}",
+        screen(&application)
+    );
+}
+
 #[test]
 fn finishing_the_third_step_marks_the_server_onboarded_and_closes() {
     let workspace = workspace_dir();

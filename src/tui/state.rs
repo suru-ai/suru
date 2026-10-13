@@ -790,6 +790,10 @@ pub struct TuiState {
     /// its health or its broadcast, or as this Client marked it; `None` until
     /// it has said.
     local_onboarded: Option<bool>,
+    /// Whether the reader finished or left Onboarding in this Client, which
+    /// counts as taking it: the Client never offers it again unasked, whatever
+    /// the Server later says — its mark may never have landed.
+    onboarding_taken: bool,
     pub(super) sidebar: Sidebar,
     /// The column on the far side of the main view from the Sidebar,
     /// answering for the open Session through its Sections.
@@ -1079,6 +1083,7 @@ impl TuiState {
             context_overlay: ContextOverlay::default(),
             onboarding: Onboarding::default(),
             local_onboarded: None,
+            onboarding_taken: false,
             sidebar: Sidebar::new(workspace),
             aside: Aside::new(),
             settings_panel: SettingsPanel::default(),
@@ -2695,9 +2700,11 @@ impl TuiState {
     /// Opens Onboarding once the Client holds both its own Server's word that
     /// it has not been onboarded and the effective-settings snapshot, and only
     /// while the Outlook is Local: a Remote's Onboarding is its own Server's
-    /// affair, so a Client viewing one offers it on turning back.
+    /// affair, so a Client viewing one offers it on turning back. Once the
+    /// reader has taken it here, it is never offered again unasked.
     fn offer_onboarding(&mut self) {
         if self.local_onboarded == Some(false)
+            && !self.onboarding_taken
             && self.settings_received
             && self.outlook == Outlook::Local
             && !self.onboarding.is_open()
@@ -2710,6 +2717,7 @@ impl TuiState {
     /// more; the run loop asks the Server to mark itself onboarded.
     fn take_onboarding(&mut self) -> ApplicationTransition {
         self.onboarding.close();
+        self.onboarding_taken = true;
         self.local_onboarded = Some(true);
         ApplicationTransition::MarkOnboarded
     }
