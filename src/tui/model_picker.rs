@@ -14,7 +14,7 @@ use crate::{
 use super::{
     ModelListRequest,
     agent_selection_list::{
-        AgentSelectionAction, AgentSelectionLines, AgentSelectionList, ProviderModels,
+        AgentSelectionAction, AgentSelectionLines, AgentSelectionList, InForce, ProviderModels,
         default_model, normalize_catalog,
     },
 };
@@ -179,8 +179,13 @@ impl ModelPicker {
 
     /// The latest catalog heard for the current Outlook, or nothing yet.
     fn cache(&self) -> &[ProviderModels] {
+        self.catalog_of(&self.outlook)
+    }
+
+    /// The latest catalog heard for `outlook`, or nothing yet.
+    pub(super) fn catalog_of(&self, outlook: &Outlook) -> &[ProviderModels] {
         self.cached_providers
-            .get(&self.outlook)
+            .get(outlook)
             .map_or(&[], Vec::as_slice)
     }
 
@@ -197,8 +202,11 @@ impl ModelPicker {
         self.open = true;
         self.purpose = purpose;
         self.opened_on = current.cloned();
-        self.list
-            .open(self.cache().to_vec(), provider_scope, current);
+        self.list.open(
+            self.cache().to_vec(),
+            provider_scope,
+            current.map(InForce::Model),
+        );
         self.begin_refresh()
     }
 
@@ -265,11 +273,7 @@ impl ModelPicker {
     /// How the latest catalog heard for `outlook` stands for each Provider,
     /// for a surface reporting Availability outside the picker.
     pub(super) fn catalog_statuses(&self, outlook: &Outlook) -> CatalogStatuses<'_> {
-        CatalogStatuses(
-            self.cached_providers
-                .get(outlook)
-                .map_or(&[], Vec::as_slice),
-        )
+        CatalogStatuses(self.catalog_of(outlook))
     }
 
     /// The Provider as the latest catalog lists it: the live list first, then
@@ -288,7 +292,7 @@ impl ModelPicker {
     pub(super) fn refocus(&mut self, current: Option<&AgentSelection>) {
         if self.open {
             let in_force = self.selection_in_force(current);
-            self.list.refocus(in_force.as_ref());
+            self.list.refocus(in_force.as_ref().map(InForce::Model));
         }
     }
 
@@ -305,7 +309,8 @@ impl ModelPicker {
         self.cached_providers
             .insert(self.outlook.clone(), providers.clone());
         let in_force = self.selection_in_force(current);
-        self.list.load(providers, in_force.as_ref());
+        self.list
+            .load(providers, in_force.as_ref().map(InForce::Model));
     }
 
     /// Takes in a catalog a server pushed unasked, for the Outlook it serves.
@@ -396,8 +401,13 @@ impl ModelPicker {
         theme: &Theme,
     ) -> AgentSelectionLines<'_> {
         let in_force = self.selection_in_force(current);
-        self.list
-            .draw(capacity, height, width, in_force.as_ref(), theme)
+        self.list.draw(
+            capacity,
+            height,
+            width,
+            in_force.as_ref().map(InForce::Model),
+            theme,
+        )
     }
 
     pub(super) fn has_rows(&self) -> bool {

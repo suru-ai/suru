@@ -30,8 +30,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     protocol::{
-        EffectiveSettings, Outlook, ProviderCatalogStatus, ProviderId, ProviderUnavailability,
-        SettingMutation,
+        AgentSelection, DerivationErrand, EffectiveSettings, ModelDescriptor, Outlook,
+        ProviderCatalogStatus, ProviderId, ProviderUnavailability, SettingMutation,
     },
     provider::{BuiltInProvider, built_in_providers},
     settings::provider_enablement,
@@ -39,9 +39,10 @@ use crate::{
 };
 
 use super::{
+    agent_selection_list::{AgentSelectionAction, AgentSelectionList, InForce, ProviderModels},
     commands::SemanticCommandId,
     list_window::{ListWindow, WindowEntry},
-    model_picker::{CatalogStatuses, ModelPicker},
+    model_picker::{CatalogStatuses, ModelPicker, ModelPickerPurpose},
     selection::WrappedLine,
     slots::truncate_to_width,
     state::CommandId,
@@ -107,14 +108,30 @@ pub(super) enum Opening {
 }
 
 /// What confirming the step on show came to.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(super) enum Advance {
     /// The next step is on show.
     Moved,
+    /// The step was answered with this pin of the Setting it governs, and the
+    /// next step is on show.
+    Pinned(SettingMutation),
+    /// The step's answer is `model`, whose Model Options the reader chooses
+    /// first at the Model Options overlay opened over the step for `purpose`,
+    /// seeded with `current`; applying them answers the step.
+    ChooseOptions {
+        model: ModelDescriptor,
+        current: Option<AgentSelection>,
+        purpose: ModelPickerPurpose,
+    },
+    /// The step asks for the Model Catalog to be listed again, as a Provider
+    /// whose listing failed is retried; it stays on show.
+    Relist,
+    /// The step on show may not be passed yet, so it stays: the Providers
+    /// step says why, and the Derivation step has nothing under the cursor
+    /// to answer with.
+    Held,
     /// The last step was confirmed, so the flow is over and closed.
     Finished,
-    /// The step on show may not be passed yet, and says why, so it stays.
-    Held,
 }
 
 /// What the flow reads of the Client's own Server, of which it keeps no copy:
@@ -125,6 +142,8 @@ pub(super) enum Advance {
 pub(super) struct OwnServer<'a> {
     settings: &'a EffectiveSettings,
     catalog: CatalogStatuses<'a>,
+    /// Each Provider as that catalog lists it, Models and all.
+    providers: &'a [ProviderModels],
 }
 
 impl<'a> OwnServer<'a> {
@@ -132,6 +151,7 @@ impl<'a> OwnServer<'a> {
         Self {
             settings,
             catalog: model_picker.catalog_statuses(&Outlook::Local),
+            providers: model_picker.catalog_of(&Outlook::Local),
         }
     }
 }
@@ -571,25 +591,198 @@ impl<'a> Standing<'a> {
     }
 }
 
+/// The derivation Setting's named values, in the order the Derivation step
+/// offers them above the Models, each beside the label its row reads. The
+/// Setting goes on spelling them as it always has; only the row says what the
+/// first of them means to a reader choosing it.
+const NAMED_DERIVATIONS: [(DerivationErrand, &str); 2] = [
+    (DerivationErrand::FollowSession, "Provider's default"),
+    (DerivationErrand::Off, "Off"),
+];
+
 /// The Derivation step: which Agent Selection derives Titles, Icons, and
-/// branch names.
-#[derive(Clone, Debug, Default)]
-struct DerivationStep;
+/// branch names. It pins the derivation Setting as the settings panel does —
+/// one of its named values, or a Model chosen with only the Model Options the
+/// reader picks — from the Agent Selection list, offering the Models only of
+/// Providers the user has left on and can use.
+#[derive(Clone, Debug)]
+struct DerivationStep {
+    list: AgentSelectionList,
+    /// The value the Setting holds, which the list marks and the cursor first
+    /// rests on.
+    in_force: DerivationErrand,
+    /// Whether the Model Options overlay stands over the step for the Model
+    /// the reader chose, so that applying them answers it.
+    choosing_options: bool,
+}
+
+impl Default for DerivationStep {
+    fn default() -> Self {
+        Self {
+            list: AgentSelectionList::with_named(
+                NAMED_DERIVATIONS.iter().map(|(_, label)| *label).collect(),
+            ),
+            in_force: DerivationErrand::default(),
+            choosing_options: false,
+        }
+    }
+}
 
 impl DerivationStep {
-    fn command_for_key(&self, _key: KeyEvent) -> Option<CommandId> {
-        None
+    const INTRODUCTION: &'static str =
+        "Which Agent Selection derives Titles, Icons, and branch names.";
+
+    /// The keys this step teaches before the ones every step shares.
+    const KEYS: [&'static str; 1] = ["↑↓ Move"];
+
+    /// Lists afresh what the Client's own Server offers, the cursor on the
+    /// value the Setting holds.
+    fn open(&mut self, server: OwnServer<'_>) {
+        self.in_force = server.settings.derivation.errand.clone();
+        self.list
+            .open(usable_providers(server), None, in_force(&self.in_force));
     }
 
-    fn lines(&self, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-        vec![Line::styled(
-            truncate_to_width(
-                "Which Agent Selection derives Titles, Icons, and branch names.",
-                width,
-            ),
-            theme.text.subdued,
-        )]
+    /// Follows the Client's own Server as it changes: a Provider turned off
+    /// or found unavailable since leaves the list, and the cursor stays where
+    /// the reader moved it.
+    fn adopt(&mut self, server: OwnServer<'_>) {
+        self.in_force = server.settings.derivation.errand.clone();
+        self.list
+            .relist(usable_providers(server), in_force(&self.in_force));
     }
+
+    fn command_for_key(&self, key: KeyEvent) -> Option<CommandId> {
+        let command = match (key.code, key.modifiers) {
+            (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                SemanticCommandId::OnboardingDerivationPrevious
+            }
+            (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                SemanticCommandId::OnboardingDerivationNext
+            }
+            (KeyCode::PageUp, KeyModifiers::NONE) => SemanticCommandId::OnboardingDerivationPageUp,
+            (KeyCode::PageDown, KeyModifiers::NONE) => {
+                SemanticCommandId::OnboardingDerivationPageDown
+            }
+            _ => return None,
+        };
+        Some(CommandId::InvokeSemantic(command))
+    }
+
+    /// What confirming the row under the cursor comes to: the pin of a named
+    /// value or of a Model without Model Options, the Model Options of one
+    /// with any to choose first, or a failed listing to retry.
+    fn confirm(&mut self) -> Advance {
+        self.choosing_options = false;
+        match self.list.choose() {
+            Some(AgentSelectionAction::Named(index)) => {
+                Advance::Pinned(derivation_pin(NAMED_DERIVATIONS[index].0.clone()))
+            }
+            Some(AgentSelectionAction::Select(model)) if model.options.is_empty() => {
+                Advance::Pinned(pinned_selection(model.default_agent_selection()))
+            }
+            Some(AgentSelectionAction::Select(model)) => {
+                self.choosing_options = true;
+                let current = match &self.in_force {
+                    DerivationErrand::Pinned(selection) => Some(selection.clone()),
+                    DerivationErrand::FollowSession | DerivationErrand::Off => None,
+                };
+                // The Setting purpose pins only the Model Options the reader
+                // chooses, so those left alone follow the Model's defaults.
+                Advance::ChooseOptions {
+                    model,
+                    current,
+                    purpose: ModelPickerPurpose::Setting(pinned_selection),
+                }
+            }
+            Some(AgentSelectionAction::Retry) => Advance::Relist,
+            None => Advance::Held,
+        }
+    }
+
+    /// How many lines the step draws above its list, which scrolls within
+    /// whatever room is left beneath them and so asks for none of its own.
+    fn rows_wanted(&self) -> usize {
+        2
+    }
+
+    /// The step drawn within `width` columns and `room` lines beneath the
+    /// header: the introduction, and the list through its window.
+    fn lines(
+        &self,
+        width: usize,
+        room: usize,
+        theme: &Theme,
+    ) -> (Vec<Line<'static>>, Vec<WrappedLine<'_>>) {
+        let mut lines = vec![
+            Line::styled(
+                truncate_to_width(Self::INTRODUCTION, width),
+                theme.text.subdued,
+            ),
+            Line::default(),
+        ];
+        let room = room.saturating_sub(lines.len());
+        let drawn = self.list.draw(
+            room,
+            room,
+            u16::try_from(width).unwrap_or(u16::MAX),
+            in_force(&self.in_force),
+            theme,
+        );
+        let top = lines.len();
+        lines.extend(drawn.lines);
+        let wrapped = drawn
+            .wrapped
+            .into_iter()
+            .map(|line| WrappedLine {
+                row: top + line.row,
+                ..line
+            })
+            .collect();
+        (lines, wrapped)
+    }
+}
+
+/// The Providers whose Models may derive: those the user has left on and
+/// that are not unavailable, read from the settings and catalog as they
+/// stand rather than from what the Providers step showed.
+fn usable_providers(server: OwnServer<'_>) -> Vec<ProviderModels> {
+    server
+        .providers
+        .iter()
+        .filter(|provider| {
+            server.settings.provider_enabled(&provider.provider)
+                && !matches!(
+                    provider.status,
+                    ProviderCatalogStatus::Disabled | ProviderCatalogStatus::Unavailable { .. }
+                )
+        })
+        .cloned()
+        .collect()
+}
+
+/// Where the Agent Selection list stands for `errand`: on the named row
+/// spelling it, or on the Model it pins.
+fn in_force(errand: &DerivationErrand) -> Option<InForce<'_>> {
+    match errand {
+        DerivationErrand::Pinned(selection) => Some(InForce::Model(selection)),
+        named => NAMED_DERIVATIONS
+            .iter()
+            .position(|(value, _)| value == named)
+            .map(InForce::Named),
+    }
+}
+
+fn derivation_pin(errand: DerivationErrand) -> SettingMutation {
+    SettingMutation::DerivationErrand {
+        value: Some(errand),
+    }
+}
+
+/// The pin deriving with `selection`, which is what the Model Options
+/// overlay hands the Selection it settles on.
+fn pinned_selection(selection: AgentSelection) -> SettingMutation {
+    derivation_pin(DerivationErrand::Pinned(selection))
 }
 
 /// The Icons step: whether this terminal draws Icons.
@@ -614,13 +807,23 @@ impl Onboarding {
         self.step.is_some()
     }
 
-    /// Opens the flow at its first step, every step afresh.
-    pub(super) fn open(&mut self, opening: Opening) {
+    /// Opens the flow at its first step, every step afresh with the values
+    /// the Client's own Server holds in place.
+    pub(super) fn open(&mut self, opening: Opening, server: OwnServer<'_>) {
         *self = Self {
             step: Some(Step::Providers),
             opening,
             ..Self::default()
         };
+        self.derivation.open(server);
+    }
+
+    /// Follows the Client's own Server as the Client hears it change, while
+    /// the flow is open.
+    pub(super) fn adopt(&mut self, server: OwnServer<'_>) {
+        if self.is_open() {
+            self.derivation.adopt(server);
+        }
     }
 
     pub(super) fn close(&mut self) {
@@ -637,17 +840,55 @@ impl Onboarding {
 
     /// Confirms the step on show: moves to the next, or on the last step
     /// finishes the flow and closes it, unless the step may not be passed yet.
+    /// A step answering with a pin moves on as it is sent; one with more to
+    /// ask first stays on show.
     pub(super) fn next(&mut self, server: OwnServer<'_>) -> Advance {
-        let held = match self.step {
+        match self.step {
             // Nor is a step passed whose rows the screen had no room for.
-            Some(Step::Providers) => {
-                ProvidersStep::lock(server).is_some() || !self.providers.cursor_seen()
+            Some(Step::Providers)
+                if ProvidersStep::lock(server).is_some() || !self.providers.cursor_seen() =>
+            {
+                Advance::Held
             }
-            Some(Step::Derivation | Step::Icons) | None => false,
-        };
-        if held {
-            return Advance::Held;
+            Some(Step::Derivation) => {
+                let advance = self.derivation.confirm();
+                if matches!(advance, Advance::Pinned(_)) {
+                    self.move_on();
+                }
+                advance
+            }
+            Some(Step::Providers | Step::Icons) | None => self.move_on(),
         }
+    }
+
+    /// Moves on from the Derivation step once the Model Options it opened
+    /// over itself are applied, which answers it as confirming a Model
+    /// without any does.
+    pub(super) fn settle_options(&mut self) {
+        if self.step == Some(Step::Derivation)
+            && std::mem::take(&mut self.derivation.choosing_options)
+        {
+            self.move_on();
+        }
+    }
+
+    /// Moves the cursor of the Derivation step's list, while it is on show.
+    pub(super) fn move_derivation(&mut self, movement: DerivationMove) {
+        if self.step != Some(Step::Derivation) {
+            return;
+        }
+        let list = &mut self.derivation.list;
+        match movement {
+            DerivationMove::Previous => list.select_previous(),
+            DerivationMove::Next => list.select_next(),
+            DerivationMove::PageUp => list.page_previous(),
+            DerivationMove::PageDown => list.page_next(),
+        }
+    }
+
+    /// Shows the step after the one on show, or finishes the flow and closes
+    /// it from the last.
+    fn move_on(&mut self) -> Advance {
         match self.step.and_then(Step::next) {
             Some(next) => {
                 self.step = Some(next);
@@ -823,7 +1064,14 @@ impl Onboarding {
             }
             Step::Derivation => {
                 lines.push(Line::default());
-                lines.extend(self.derivation.lines(width, theme));
+                let room = height.saturating_sub(lines.len() + 1);
+                let (step_lines, step_wrapped) = self.derivation.lines(width, room, theme);
+                let top = lines.len();
+                wrapped.extend(step_wrapped.into_iter().map(|line| WrappedLine {
+                    row: top + line.row,
+                    ..line
+                }));
+                lines.extend(step_lines);
             }
             Step::Icons => {
                 lines.push(Line::default());
@@ -832,7 +1080,8 @@ impl Onboarding {
         }
         let own_keys: &[&str] = match step {
             Step::Providers => &ProvidersStep::KEYS,
-            Step::Derivation | Step::Icons => &[],
+            Step::Derivation => &DerivationStep::KEYS,
+            Step::Icons => &[],
         };
         let footer = footer(step, own_keys, width);
         // The keys stay at the foot however much the step draws, and are
@@ -854,11 +1103,20 @@ impl Onboarding {
         };
         let step_rows = match step {
             Step::Providers => self.providers.rows_wanted(width, theme, server),
-            Step::Derivation => 1 + self.derivation.lines(width, theme).len(),
+            Step::Derivation => 1 + self.derivation.rows_wanted(),
             Step::Icons => 1 + self.icons.lines(width, theme).len(),
         };
         1 + step_rows + 1
     }
+}
+
+/// Which way the Derivation step's cursor moves.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DerivationMove {
+    Previous,
+    Next,
+    PageUp,
+    PageDown,
 }
 
 /// The keys at the foot of `step` within `width` columns: the step's own

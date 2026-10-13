@@ -74,7 +74,7 @@ use super::{
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
-    onboarding::{Advance, Onboarding, Opening, OwnServer},
+    onboarding::{Advance, DerivationMove, Onboarding, Opening, OwnServer},
     relay_overlay::{
         ListingLanded, RedemptionLoginLead, RelayLoginAct, RelayLoginFollow, RelayLoginLead,
         RelayOverlay, RelayRequest,
@@ -1861,6 +1861,7 @@ impl TuiState {
     fn apply_origin_catalog(&mut self, outlook: &Outlook, event: ManagedEvent) {
         if let ManagedEvent::ModelCatalog(catalog) = event {
             self.model_picker.adopt_catalog(outlook.clone(), catalog);
+            self.refresh_onboarding();
             return;
         }
         self.adopt_workspace_paths(outlook, &event);
@@ -2351,6 +2352,7 @@ impl TuiState {
             }
             ManagedEvent::SettingsSnapshot(snapshot) => {
                 self.adopt_settings(snapshot);
+                self.refresh_onboarding();
                 self.offer_onboarding();
             }
             // Within a connection a Server only ever comes to be onboarded, so
@@ -2366,6 +2368,7 @@ impl TuiState {
             // pushes is the Local Outlook's whichever Outlook is on screen.
             ManagedEvent::ModelCatalog(catalog) => {
                 self.model_picker.adopt_catalog(Outlook::Local, catalog);
+                self.refresh_onboarding();
             }
             ManagedEvent::SkillCatalogUpdated(catalog) => {
                 let request = SkillCatalogRequest {
@@ -2713,8 +2716,21 @@ impl TuiState {
             && self.outlook == Outlook::Local
             && !self.onboarding.is_open()
         {
-            self.onboarding.open(Opening::Offered);
+            self.open_onboarding(Opening::Offered);
         }
+    }
+
+    /// Opens Onboarding at its first step with the values in force in place.
+    fn open_onboarding(&mut self, opening: Opening) {
+        self.onboarding
+            .open(opening, OwnServer::of(&self.settings, &self.model_picker));
+    }
+
+    /// Lets an open Onboarding follow its own Server's settings and Model
+    /// Catalog as the Client hears them change.
+    fn refresh_onboarding(&mut self) {
+        self.onboarding
+            .adopt(OwnServer::of(&self.settings, &self.model_picker));
     }
 
     /// Closes Onboarding as taken, finished or left, so it is offered no
@@ -5911,6 +5927,7 @@ impl Application {
                     self.state
                         .model_picker
                         .adopt_reading(Outlook::Local, catalog, pushes);
+                    self.state.refresh_onboarding();
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -8537,7 +8554,8 @@ impl Application {
                     .open_for(model, current.as_ref(), purpose);
                 Ok(ApplicationTransition::Continue)
             }
-            None => Ok(ApplicationTransition::Continue),
+            // The picker names no rows of its own above the Models.
+            Some(AgentSelectionAction::Named(_)) | None => Ok(ApplicationTransition::Continue),
         }
     }
 
@@ -9402,6 +9420,7 @@ impl Application {
         self.state
             .model_picker
             .load(request, catalog, current.as_ref());
+        self.state.refresh_onboarding();
         if listing == CatalogListing::Complete {
             self.state.model_picker.finish(request);
         }
@@ -10230,7 +10249,7 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::OnboardingOpen => {
-                self.state.onboarding.open(Opening::Requested);
+                self.state.open_onboarding(Opening::Requested);
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::Continue)
             }
@@ -10264,6 +10283,20 @@ impl Application {
                 let server = OwnServer::of(&self.state.settings, &self.state.model_picker);
                 Ok(match self.state.onboarding.next(server) {
                     Advance::Moved | Advance::Held => ApplicationTransition::Continue,
+                    Advance::Pinned(pin) => ApplicationTransition::MutateSetting(pin),
+                    Advance::ChooseOptions {
+                        model,
+                        current,
+                        purpose,
+                    } => {
+                        self.state
+                            .model_options
+                            .open_for(model, current.as_ref(), purpose);
+                        ApplicationTransition::Continue
+                    }
+                    Advance::Relist => {
+                        ApplicationTransition::ListModels(self.state.model_picker.begin_refresh())
+                    }
                     Advance::Finished => self.state.take_onboarding(),
                 })
             }
@@ -10276,6 +10309,28 @@ impl Application {
             } else {
                 ApplicationTransition::Continue
             }),
+            SemanticCommandId::OnboardingDerivationPrevious => {
+                self.state
+                    .onboarding
+                    .move_derivation(DerivationMove::Previous);
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::OnboardingDerivationNext => {
+                self.state.onboarding.move_derivation(DerivationMove::Next);
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::OnboardingDerivationPageUp => {
+                self.state
+                    .onboarding
+                    .move_derivation(DerivationMove::PageUp);
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::OnboardingDerivationPageDown => {
+                self.state
+                    .onboarding
+                    .move_derivation(DerivationMove::PageDown);
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::RelayOpen => {
                 let request = self.state.relay_overlay.open();
                 self.state.command_mode = CommandMode::Composer;
@@ -11352,6 +11407,8 @@ impl Application {
         };
         let purpose = self.state.model_options.purpose();
         self.state.model_options.close();
+        // Options opened over Onboarding's Derivation step answer it.
+        self.state.onboarding.settle_options();
         self.apply_chosen_selection(selection, purpose)
     }
 

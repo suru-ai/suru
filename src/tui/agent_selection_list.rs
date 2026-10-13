@@ -1,10 +1,12 @@
 //! The list of Models a reader chooses an Agent Selection from: each Provider's
 //! heading over its Models, beside the retry row of a Provider that failed to
-//! list them or that the user cannot use yet. It is one list wherever it is
-//! hosted — the Model picker draws it inside its own chrome — so it keeps its
-//! rows, what narrows them, which row focus stands on, and the window it is
-//! read through, and draws its rows, leaving the box around them, and whatever
-//! the reader's choice is for, to its host.
+//! list them or that the user cannot use yet, beneath whatever rows its host
+//! names above them. It is one list wherever it is hosted — the Model picker
+//! draws it inside its own chrome, and Onboarding's Derivation step beneath
+//! the derivation Setting's named values — so it keeps its rows, what narrows
+//! them, which row focus stands on, and the window it is read through, and
+//! draws its rows, leaving the box around them, and whatever the reader's
+//! choice is for, to its host.
 
 use ratatui::{style::Modifier, text::Line};
 use unicode_width::UnicodeWidthStr;
@@ -47,8 +49,30 @@ impl ModelKey {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ListSelection {
+    Named(usize),
     Model(ModelKey),
     Retry(ProviderId),
+}
+
+/// The choice a list reads as the one in force: the row it marks as the
+/// reader's current choice, and the row focus goes to wherever the reader has
+/// not moved it.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum InForce<'a> {
+    /// One of the rows the host named above the Providers, by its place
+    /// among them.
+    Named(usize),
+    /// The Model a Selection names.
+    Model(&'a AgentSelection),
+}
+
+impl InForce<'_> {
+    fn selection(self) -> ListSelection {
+        match self {
+            Self::Named(index) => ListSelection::Named(index),
+            Self::Model(selection) => ListSelection::Model(ModelKey::from_selection(selection)),
+        }
+    }
 }
 
 /// One Provider as a catalog lists it: its name, its Models in the order the
@@ -66,6 +90,9 @@ pub(super) struct ProviderModels {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct AgentSelectionList {
+    /// The rows the host names above the Providers, each a choice that is no
+    /// Model. They stand whatever the query, being few and offered first.
+    named: Vec<&'static str>,
     providers: Vec<ProviderModels>,
     /// The one Provider whose Models are listed, where the host narrowed the
     /// list to it.
@@ -78,6 +105,11 @@ pub(super) struct AgentSelectionList {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum AgentSelectionRow<'a> {
+    Named {
+        label: &'a str,
+        selected: bool,
+        current: bool,
+    },
     Provider {
         name: &'a str,
         refreshing: bool,
@@ -107,6 +139,8 @@ pub(super) enum AgentSelectionRow<'a> {
 
 #[derive(Clone, Debug)]
 pub(super) enum AgentSelectionAction {
+    /// One of the rows the host named, by its place among them.
+    Named(usize),
     Select(ModelDescriptor),
     Retry,
 }
@@ -121,6 +155,14 @@ pub(super) struct AgentSelectionLines<'a> {
 }
 
 impl AgentSelectionList {
+    /// A list offering `named` rows, in that order, above every Provider.
+    pub(super) fn with_named(named: Vec<&'static str>) -> Self {
+        Self {
+            named,
+            ..Self::default()
+        }
+    }
+
     /// Lists `providers` afresh, narrowed to `provider_scope` where there is
     /// one, with an empty query and focus on `current` — the list opening at
     /// its head and carried to focus from there.
@@ -128,7 +170,7 @@ impl AgentSelectionList {
         &mut self,
         providers: Vec<ProviderModels>,
         provider_scope: Option<ProviderId>,
-        current: Option<&AgentSelection>,
+        current: Option<InForce<'_>>,
     ) {
         self.query.clear();
         self.provider_scope = provider_scope;
@@ -174,7 +216,7 @@ impl AgentSelectionList {
 
     /// Puts focus back on `current`, and the window follows focus there as
     /// the keys would carry it.
-    pub(super) fn refocus(&mut self, current: Option<&AgentSelection>) {
+    pub(super) fn refocus(&mut self, current: Option<InForce<'_>>) {
         self.cursor_moved = false;
         self.focus(current, false);
         self.window.reveal();
@@ -184,11 +226,7 @@ impl AgentSelectionList {
     /// show while there are none, and otherwise merged into them, so the rows
     /// a reader is looking at stay where they are. Focus stays where the
     /// reader moved it, and otherwise goes to `current`.
-    pub(super) fn load(
-        &mut self,
-        providers: Vec<ProviderModels>,
-        current: Option<&AgentSelection>,
-    ) {
+    pub(super) fn load(&mut self, providers: Vec<ProviderModels>, current: Option<InForce<'_>>) {
         if self.providers.is_empty() {
             self.providers = providers;
         } else {
@@ -210,6 +248,21 @@ impl AgentSelectionList {
             });
         }
         self.focus(current, self.cursor_moved);
+    }
+
+    /// Lists `providers` in place of the rows on show, for a host whose rows
+    /// follow every catalog it hears rather than one listing it asked for.
+    /// Focus stays where the reader moved it while that row is still listed,
+    /// and otherwise goes to `current`.
+    pub(super) fn relist(&mut self, providers: Vec<ProviderModels>, current: Option<InForce<'_>>) {
+        let focused = self.selected.clone();
+        self.providers = providers;
+        self.focus(current, self.cursor_moved);
+        // Focus carried to a choice the rows only now list brings the window
+        // along, as the keys would have.
+        if self.selected != focused {
+            self.window.reveal();
+        }
     }
 
     /// Takes in a listing that failed: a row a reader may retry where there
@@ -270,6 +323,7 @@ impl AgentSelectionList {
 
     pub(super) fn choose(&self) -> Option<AgentSelectionAction> {
         match self.selected.as_ref()? {
+            ListSelection::Named(index) => Some(AgentSelectionAction::Named(*index)),
             ListSelection::Model(key) => self
                 .providers
                 .iter()
@@ -289,11 +343,12 @@ impl AgentSelectionList {
         &self,
         capacity: usize,
         width: u16,
-        current: Option<&AgentSelection>,
+        current: Option<InForce<'_>>,
     ) -> impl Iterator<Item = AgentSelectionRow<'_>> {
         let rows = self.rows(current);
         let selected = rows.iter().position(|row| match row {
-            AgentSelectionRow::Model { selected, .. }
+            AgentSelectionRow::Named { selected, .. }
+            | AgentSelectionRow::Model { selected, .. }
             | AgentSelectionRow::Error { selected, .. }
             | AgentSelectionRow::Unavailable { selected, .. } => *selected,
             AgentSelectionRow::Provider { .. } => false,
@@ -304,9 +359,9 @@ impl AgentSelectionList {
             .iter()
             .map(|row| match row {
                 AgentSelectionRow::Provider { .. } => WindowEntry::passive(1),
-                AgentSelectionRow::Model { .. } | AgentSelectionRow::Error { .. } => {
-                    WindowEntry::ROW
-                }
+                AgentSelectionRow::Named { .. }
+                | AgentSelectionRow::Model { .. }
+                | AgentSelectionRow::Error { .. } => WindowEntry::ROW,
                 AgentSelectionRow::Unavailable { fix, .. } => {
                     WindowEntry::focusable(1 + WrappedText::new(fix, FIX_INDENT, width).height())
                 }
@@ -317,20 +372,38 @@ impl AgentSelectionList {
     }
 
     /// The rows the window shows, drawn in `capacity` lines of a list `width`
-    /// columns wide, with `current` marked as the Selection in force. An entry
+    /// columns wide, with `current` marked as the choice in force. An entry
     /// taller than the `height` lines left to draw in is drawn from its end.
     pub(super) fn draw(
         &self,
         capacity: usize,
         height: usize,
         width: u16,
-        current: Option<&AgentSelection>,
+        current: Option<InForce<'_>>,
         theme: &Theme,
     ) -> AgentSelectionLines<'_> {
         let mut lines = Vec::new();
         let mut wrapped = Vec::new();
         for row in self.visible_rows(capacity, width, current) {
             match row {
+                AgentSelectionRow::Named {
+                    label,
+                    selected,
+                    current,
+                } => lines.push(Line::styled(
+                    choice_row_text(
+                        label,
+                        None,
+                        &current_state(current),
+                        selected,
+                        usize::from(width),
+                    ),
+                    if selected {
+                        theme.selection.focused
+                    } else {
+                        theme.text.primary
+                    },
+                )),
                 AgentSelectionRow::Provider { name, refreshing } => lines.push(Line::styled(
                     truncate_to_width(
                         &format!(
@@ -454,7 +527,7 @@ impl AgentSelectionList {
         self.providers.extend(additions);
     }
 
-    fn focus(&mut self, current: Option<&AgentSelection>, preserve_selection: bool) {
+    fn focus(&mut self, current: Option<InForce<'_>>, preserve_selection: bool) {
         let visible = self.selectable();
         if preserve_selection
             && self
@@ -465,7 +538,7 @@ impl AgentSelectionList {
             return;
         }
         if let Some(current) = current {
-            let current = ListSelection::Model(ModelKey::from_selection(current));
+            let current = current.selection();
             if visible.contains(&current) {
                 self.selected = Some(current);
                 return;
@@ -478,14 +551,17 @@ impl AgentSelectionList {
         {
             return;
         }
-        self.selected = self
+        // A host naming rows of its own offers them first, so focus with
+        // nothing else to stand on stands on the first of them rather than on
+        // some Provider's default Model.
+        let default_model = self
             .providers
             .iter()
-            .filter(|provider| self.is_listed(provider))
+            .filter(|provider| self.named.is_empty() && self.is_listed(provider))
             .flat_map(|provider| &provider.models)
             .find(|model| model.is_default && model_matches(&self.query, model))
-            .map(|model| ListSelection::Model(ModelKey::from_model(model)))
-            .or_else(|| visible.first().cloned());
+            .map(|model| ListSelection::Model(ModelKey::from_model(model)));
+        self.selected = default_model.or_else(|| visible.first().cloned());
     }
 
     /// Whether this Provider belongs in the list at all: one the reader scoped
@@ -498,9 +574,21 @@ impl AgentSelectionList {
                 .is_none_or(|scope| *scope == provider.provider)
     }
 
-    fn rows(&self, current: Option<&AgentSelection>) -> Vec<AgentSelectionRow<'_>> {
-        let current = current.map(ModelKey::from_selection);
-        let mut rows = Vec::new();
+    fn rows(&self, current: Option<InForce<'_>>) -> Vec<AgentSelectionRow<'_>> {
+        let current = current.map(InForce::selection);
+        let mut rows = self
+            .named
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                let named = Some(ListSelection::Named(index));
+                AgentSelectionRow::Named {
+                    label,
+                    selected: self.selected == named,
+                    current: current == named,
+                }
+            })
+            .collect::<Vec<_>>();
         for provider in &self.providers {
             if !self.is_listed(provider) {
                 continue;
@@ -519,11 +607,11 @@ impl AgentSelectionList {
                 refreshing: matches!(provider.status, ProviderCatalogStatus::Refreshing),
             });
             rows.extend(models.into_iter().map(|model| {
-                let key = ModelKey::from_model(model);
+                let row = Some(ListSelection::Model(ModelKey::from_model(model)));
                 AgentSelectionRow::Model {
                     model,
-                    selected: self.selected == Some(ListSelection::Model(key.clone())),
-                    current: current.as_ref() == Some(&key),
+                    selected: self.selected == row,
+                    current: current == row,
                 }
             }));
             if let Some(condition) = condition {
@@ -578,7 +666,9 @@ impl AgentSelectionList {
     }
 
     fn selectable(&self) -> Vec<ListSelection> {
-        let mut selectable = Vec::new();
+        let mut selectable = (0..self.named.len())
+            .map(ListSelection::Named)
+            .collect::<Vec<_>>();
         for provider in &self.providers {
             if !self.is_listed(provider) {
                 continue;
@@ -713,30 +803,55 @@ fn retry_row<'a>(text: &str, selected: bool, width: u16, theme: &Theme) -> Line<
 }
 
 fn model_row_text(model: &ModelDescriptor, selected: bool, current: bool, width: usize) -> String {
-    let marker = if selected { "› " } else { "  " };
     let native = (model.display_name != model.id.as_str()).then_some(model.id.as_str());
-    let mut states = Vec::new();
-    let mut compact_states = Vec::new();
-    if current {
-        states.push("current");
-        compact_states.push("C");
-    }
+    let mut states = current_state(current);
     if model.is_default {
-        states.push("default");
-        compact_states.push("D");
+        states.push(("default", "D"));
     }
     if model.availability == ModelAvailability::Unavailable {
-        states.push("unavailable");
-        compact_states.push("U");
+        states.push(("unavailable", "U"));
     }
+    choice_row_text(&model.display_name, native, &states, selected, width)
+}
+
+/// The state a row is in for standing for the choice in force, as a row
+/// spells it in full and where it is pressed for room.
+fn current_state(current: bool) -> Vec<(&'static str, &'static str)> {
+    if current {
+        vec![("current", "C")]
+    } else {
+        Vec::new()
+    }
+}
+
+/// A row standing for one choice: its name, the identifier it goes by where
+/// that differs, and the states it is in, each spelled in full and compactly.
+/// A row pressed for room spells its states compactly before it cuts either
+/// name short.
+fn choice_row_text(
+    name: &str,
+    native: Option<&str>,
+    states: &[(&'static str, &'static str)],
+    selected: bool,
+    width: usize,
+) -> String {
+    let marker = if selected { "› " } else { "  " };
     let marker_width = marker.width();
     let available = width.saturating_sub(marker_width);
     let field_count = 1 + usize::from(native.is_some()) + usize::from(!states.is_empty());
     let wide_separator = " · ";
     let compact_separator = " ";
-    let full_state = (!states.is_empty()).then(|| format!("[{}]", states.join(", ")));
-    let compact_state =
-        (!compact_states.is_empty()).then(|| format!("[{}]", compact_states.join(",")));
+    let full_state = (!states.is_empty()).then(|| {
+        let full = states.iter().map(|(full, _)| *full).collect::<Vec<_>>();
+        format!("[{}]", full.join(", "))
+    });
+    let compact_state = (!states.is_empty()).then(|| {
+        let compact = states
+            .iter()
+            .map(|(_, compact)| *compact)
+            .collect::<Vec<_>>();
+        format!("[{}]", compact.join(","))
+    });
     let minimum_text_width = 4 * (1 + usize::from(native.is_some()));
     let full_fixed = full_state.as_ref().map_or(0, |state| state.width())
         + wide_separator.width() * field_count.saturating_sub(1);
@@ -752,7 +867,7 @@ fn model_row_text(model: &ModelDescriptor, selected: bool, current: bool, width:
         let native_width = native.width().min((flexible / 2).max(1));
         (flexible.saturating_sub(native_width), native_width)
     });
-    let mut fields = vec![truncate_to_width(&model.display_name, display_width)];
+    let mut fields = vec![truncate_to_width(name, display_width)];
     if let Some(native) = native {
         fields.push(truncate_to_width(native, native_width));
     }

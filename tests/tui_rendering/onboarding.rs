@@ -16,10 +16,13 @@ use ratatui::style::Modifier;
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        EffectiveSettings, Health, ModelAvailability, ModelCatalog, Outlook, ProviderCatalogStatus,
-        ProviderId, ProviderModelCatalog, ProviderUnavailability, RemoteHealth, RemoteStatus,
-        SettingMutation, SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot,
-        SidebarSettings, SidebarVisibility, TextSelectionCopy, Way,
+        AgentSelection, DerivationErrand, DerivationSettings, EffectiveSettings, Health,
+        ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId,
+        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
+        ModelOptionSelection, ModelOptionValue, Outlook, ProviderCatalogStatus, ProviderId,
+        ProviderModelCatalog, ProviderUnavailability, RemoteHealth, RemoteStatus, SettingMutation,
+        SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarSettings,
+        SidebarVisibility, TextSelectionCopy, Way,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -358,7 +361,7 @@ fn finishing_the_third_step_marks_the_server_onboarded_and_closes() {
     );
     assert_eq!(
         press(&mut application, KeyCode::Enter),
-        ApplicationTransition::Continue
+        derivation_pin(DerivationErrand::FollowSession)
     );
     assert_eq!(
         press(&mut application, KeyCode::Enter),
@@ -1714,5 +1717,430 @@ fn slash_onboarding_shows_providers_turned_off_in_the_settings_panel() {
     assert!(
         provider_row(&application, "Codex").contains("› [x] Codex"),
         "the cursor begins on the first row again"
+    );
+}
+
+/// The Model the Derivation step's tests pin, which carries Model Options so
+/// a pin can tell the options the reader chose from the ones they left be.
+fn cheap_model() -> suru::protocol::ModelDescriptor {
+    let mut cheap = model_descriptor(
+        "codex",
+        "gpt-5-mini",
+        "GPT-5 Mini",
+        false,
+        ModelAvailability::Available,
+    );
+    cheap.options = vec![
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("reasoning_effort"),
+            label: "Reasoning".to_owned(),
+            description: None,
+            role: ModelOptionRole::ReasoningEffort,
+            kind: ModelOptionKind::Select {
+                choices: ["low", "high"]
+                    .into_iter()
+                    .map(|choice| ModelOptionChoice {
+                        id: ModelOptionChoiceId::new(choice),
+                        label: choice.to_uppercase(),
+                        description: None,
+                        availability: ModelAvailability::Available,
+                    })
+                    .collect(),
+                default: ModelOptionChoiceId::new("low"),
+            },
+        },
+        ModelOptionDescriptor {
+            id: ModelOptionId::new("fast"),
+            label: "Speed".to_owned(),
+            description: None,
+            role: ModelOptionRole::Speed,
+            kind: ModelOptionKind::Toggle { default: false },
+        },
+    ];
+    cheap
+}
+
+/// The Model Catalog as the Server pushes it: Codex offering a configurable
+/// Model and its default, Copilot offering one Model, and Claude, which is
+/// not installed, still listing the Model it last offered.
+fn pushed_catalog() -> ModelCatalog {
+    ModelCatalog {
+        providers: vec![
+            ProviderModelCatalog {
+                provider: ProviderId::new("codex"),
+                display_name: "Codex".to_owned(),
+                models: vec![
+                    cheap_model(),
+                    model_descriptor(
+                        "codex",
+                        "gpt-5",
+                        "GPT-5",
+                        true,
+                        ModelAvailability::Available,
+                    ),
+                ],
+                status: ProviderCatalogStatus::Fresh,
+            },
+            ProviderModelCatalog {
+                provider: ProviderId::new("copilot"),
+                display_name: "Copilot".to_owned(),
+                models: vec![model_descriptor(
+                    "copilot",
+                    "copilot-model",
+                    "Copilot Model",
+                    true,
+                    ModelAvailability::Available,
+                )],
+                status: ProviderCatalogStatus::Fresh,
+            },
+            unavailable_claude(),
+        ],
+    }
+}
+
+fn unavailable_claude() -> ProviderModelCatalog {
+    ProviderModelCatalog {
+        provider: ProviderId::new("claude"),
+        display_name: "Claude".to_owned(),
+        models: vec![model_descriptor(
+            "claude",
+            "claude-model",
+            "Claude Model",
+            true,
+            ModelAvailability::Available,
+        )],
+        status: ProviderCatalogStatus::Unavailable {
+            reason: ProviderUnavailability::NotInstalled,
+            message: "claude was not found".to_owned(),
+            fix: "install Claude Code".to_owned(),
+        },
+    }
+}
+
+fn deliver_catalog(application: &mut Application, catalog: ModelCatalog) {
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::ModelCatalog(
+            catalog,
+        )))
+        .expect("receive the Model Catalog the Server pushes");
+}
+
+/// Settings deriving Titles, Icons, and branch names with `errand`, and with
+/// Copilot turned off.
+fn settings_deriving_with(errand: DerivationErrand) -> EffectiveSettings {
+    let mut settings = EffectiveSettings {
+        derivation: DerivationSettings { errand },
+        ..EffectiveSettings::default()
+    };
+    settings.provider.copilot.enabled = false;
+    settings
+}
+
+/// A fresh Server's Client on Onboarding's Derivation step, having heard
+/// `settings` and then the catalog the Server pushes after them.
+fn on_the_derivation_step(workspace: &Path, settings: EffectiveSettings) -> Application {
+    let mut application = attached_to_a_fresh_server(workspace);
+    deliver_settings(&mut application, settings);
+    deliver_catalog(&mut application, pushed_catalog());
+    press(&mut application, KeyCode::Enter);
+    assert!(
+        screen(&application).contains("Step 2 of 3"),
+        "{}",
+        screen(&application)
+    );
+    application
+}
+
+/// The row of the Derivation step focus stands on.
+fn focused_row(application: &Application) -> String {
+    let rows = rendered_application_rows_at(application, 100, 24);
+    rows.iter()
+        .find(|row| row.contains('›'))
+        .unwrap_or_else(|| panic!("the Derivation step focused nothing: {rows:#?}"))
+        .trim()
+        .to_owned()
+}
+
+/// What confirming the Derivation step on `errand` asks the Server to pin.
+fn derivation_pin(errand: DerivationErrand) -> ApplicationTransition {
+    ApplicationTransition::MutateSetting(SettingMutation::DerivationErrand {
+        value: Some(errand),
+    })
+}
+
+fn cheap_selection(options: Vec<ModelOptionSelection>) -> AgentSelection {
+    AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("gpt-5-mini"),
+        options,
+    }
+}
+
+#[test]
+fn the_derivation_step_offers_the_providers_default_and_off_above_the_models_of_usable_providers() {
+    let workspace = workspace_dir();
+    let application = on_the_derivation_step(
+        workspace.path(),
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    let rows = rendered_application_rows_at(&application, 100, 24);
+    let position = |needle: &str| {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row reads {needle:?}: {rows:#?}"))
+    };
+    assert!(
+        position("Provider's default") < position("  Off")
+            && position("  Off") < position("Provider Codex")
+            && position("Provider Codex") < position("GPT-5 Mini"),
+        "the two named values come first, above the Provider and its Models: {rows:#?}"
+    );
+    assert!(rows.iter().any(|row| row.contains("GPT-5 ·")), "{rows:#?}");
+    let shown = rows.join("\n");
+    assert!(
+        !shown.contains("Copilot"),
+        "a Provider the user turned off offers nothing: {shown}"
+    );
+    assert!(
+        !shown.contains("Claude"),
+        "nor does one that is unavailable: {shown}"
+    );
+    assert!(
+        !shown.contains("session"),
+        "the named value reads as the Provider's default, not the word it is spelled with: {shown}"
+    );
+}
+
+#[test]
+fn the_derivation_step_follows_enablement_and_availability_as_they_change() {
+    let workspace = workspace_dir();
+    let mut application = on_the_derivation_step(
+        workspace.path(),
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+
+    let mut catalog = pushed_catalog();
+    catalog.providers[2] = ProviderModelCatalog {
+        status: ProviderCatalogStatus::Fresh,
+        ..unavailable_claude()
+    };
+    deliver_catalog(&mut application, catalog);
+    let installed = screen(&application);
+    assert!(
+        installed.contains("Provider Claude") && installed.contains("Claude Model"),
+        "Claude, installed since, offers its Model: {installed}"
+    );
+
+    let mut settings = settings_deriving_with(DerivationErrand::FollowSession);
+    settings.provider.codex.enabled = false;
+    deliver_settings(&mut application, settings);
+    let turned_off = screen(&application);
+    assert!(
+        !turned_off.contains("Codex") && !turned_off.contains("GPT-5"),
+        "Codex, turned off on the step before, offers nothing: {turned_off}"
+    );
+    assert!(turned_off.contains("Claude Model"), "{turned_off}");
+}
+
+#[test]
+fn confirming_the_providers_default_or_off_pins_that_value_and_moves_on_to_icons() {
+    let workspace = workspace_dir();
+    let mut application = on_the_derivation_step(
+        workspace.path(),
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    assert!(
+        focused_row(&application).contains("Provider's default"),
+        "{}",
+        focused_row(&application)
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        derivation_pin(DerivationErrand::FollowSession)
+    );
+    assert!(screen(&application).contains("Step 3 of 3"));
+
+    press(&mut application, KeyCode::Left);
+    press(&mut application, KeyCode::Down);
+    assert!(
+        focused_row(&application).contains("Off"),
+        "{}",
+        focused_row(&application)
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        derivation_pin(DerivationErrand::Off)
+    );
+    assert!(screen(&application).contains("Step 3 of 3"));
+}
+
+#[test]
+fn confirming_a_model_without_model_options_pins_it_and_moves_on_to_icons() {
+    let workspace = workspace_dir();
+    let mut application = on_the_derivation_step(
+        workspace.path(),
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Down);
+    assert!(
+        focused_row(&application).contains("GPT-5 ·"),
+        "{}",
+        focused_row(&application)
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        derivation_pin(DerivationErrand::Pinned(AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("gpt-5"),
+            options: Vec::new(),
+        }))
+    );
+    assert!(screen(&application).contains("Step 3 of 3"));
+}
+
+#[test]
+fn a_model_with_model_options_opens_them_over_the_step_and_pins_only_what_was_chosen() {
+    let workspace = workspace_dir();
+    let mut application = on_the_derivation_step(
+        workspace.path(),
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    for _ in 0..3 {
+        press(&mut application, KeyCode::Down);
+    }
+    assert!(
+        focused_row(&application).contains("GPT-5 Mini"),
+        "{}",
+        focused_row(&application)
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "a Model with Model Options has them chosen before anything is pinned"
+    );
+    let options = screen(&application);
+    assert!(options.contains("Model Options"), "{options}");
+    assert!(
+        options.contains("Reasoning · Provider default")
+            && options.contains("Speed · Provider default"),
+        "nothing is pinned yet, so every option follows the Model's default: {options}"
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::Continue
+    );
+    let cancelled = screen(&application);
+    assert!(
+        cancelled.contains("Step 2 of 3") && !cancelled.contains("Model Options"),
+        "cancelling the options leaves the reader on the step: {cancelled}"
+    );
+
+    press(&mut application, KeyCode::Enter);
+    // Reasoning's choices, under "Provider default": Low, then High.
+    press(&mut application, KeyCode::Enter);
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Enter);
+    assert_eq!(
+        press_with(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
+        derivation_pin(DerivationErrand::Pinned(cheap_selection(vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("high"),
+                },
+            }
+        ]))),
+        "the chosen Reasoning is pinned, and the untouched Speed follows the Model's default"
+    );
+    let moved_on = screen(&application);
+    assert!(
+        moved_on.contains("Step 3 of 3") && !moved_on.contains("Model Options"),
+        "choosing the options answers the step: {moved_on}"
+    );
+}
+
+#[test]
+fn taking_onboarding_again_rests_the_cursor_on_the_derivation_value_in_force() {
+    let workspace = workspace_dir();
+    let pinned = cheap_selection(vec![ModelOptionSelection {
+        id: ModelOptionId::new("fast"),
+        value: ModelOptionValue::Toggle { enabled: true },
+    }]);
+    for (errand, focused) in [
+        (DerivationErrand::FollowSession, "Provider's default"),
+        (DerivationErrand::Off, "Off"),
+        (DerivationErrand::Pinned(pinned.clone()), "GPT-5 Mini"),
+    ] {
+        let mut application = connected_application(workspace.path());
+        deliver_settings(&mut application, settings_deriving_with(errand.clone()));
+        deliver_catalog(&mut application, pushed_catalog());
+        type_terminal_text(&mut application, "/onboarding");
+        press(&mut application, KeyCode::Enter);
+        press(&mut application, KeyCode::Enter);
+
+        let row = focused_row(&application);
+        assert!(
+            row.contains(focused) && row.contains("current"),
+            "{errand:?} is under the cursor and marked as the value in force: {row}"
+        );
+    }
+
+    let mut application = connected_application(workspace.path());
+    deliver_settings(
+        &mut application,
+        settings_deriving_with(DerivationErrand::Pinned(pinned)),
+    );
+    deliver_catalog(&mut application, pushed_catalog());
+    type_terminal_text(&mut application, "/onboarding");
+    press(&mut application, KeyCode::Enter);
+    press(&mut application, KeyCode::Enter);
+    press(&mut application, KeyCode::Enter);
+    let options = screen(&application);
+    assert!(
+        options.contains("Speed · On") && options.contains("Reasoning · Provider default"),
+        "the options open on what the pin already holds: {options}"
+    );
+}
+
+#[test]
+fn a_provider_whose_listing_failed_is_retried_from_the_derivation_step() {
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    deliver_settings(
+        &mut application,
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    let mut catalog = pushed_catalog();
+    catalog.providers[0].models.clear();
+    catalog.providers[0].status = ProviderCatalogStatus::Failed {
+        message: "codex timed out".to_owned(),
+    };
+    deliver_catalog(&mut application, catalog);
+    press(&mut application, KeyCode::Enter);
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Down);
+    assert!(
+        focused_row(&application).contains("Retry Codex: codex timed out"),
+        "{}",
+        focused_row(&application)
+    );
+
+    let ApplicationTransition::ListModels(request) = press(&mut application, KeyCode::Enter) else {
+        panic!("choosing the retry row lists the Model Catalog again");
+    };
+    assert!(screen(&application).contains("Step 2 of 3"));
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: pushed_catalog(),
+        })
+        .expect("receive the catalog listed again");
+    let listed = screen(&application);
+    assert!(
+        listed.contains("GPT-5 Mini") && !listed.contains("Retry Codex"),
+        "the step lists what the retry found: {listed}"
     );
 }
