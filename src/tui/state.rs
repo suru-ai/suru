@@ -8511,12 +8511,14 @@ impl Application {
     /// the picker alone.
     fn handle_model_picker_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
         match command {
-            CommandId::InsertModelSearch(text) => self.state.model_picker.insert(&text),
-            CommandId::DeleteModelSearchBackward => self.state.model_picker.delete_backward(),
-            CommandId::SelectPreviousModel => self.state.model_picker.select_previous(),
-            CommandId::SelectNextModel => self.state.model_picker.select_next(),
-            CommandId::PagePreviousModels => self.state.model_picker.page_previous(),
-            CommandId::PageNextModels => self.state.model_picker.page_next(),
+            CommandId::InsertModelSearch(text) => self.state.model_picker.list_mut().insert(&text),
+            CommandId::DeleteModelSearchBackward => {
+                self.state.model_picker.list_mut().delete_backward();
+            }
+            CommandId::SelectPreviousModel => self.state.model_picker.list_mut().select_previous(),
+            CommandId::SelectNextModel => self.state.model_picker.list_mut().select_next(),
+            CommandId::PagePreviousModels => self.state.model_picker.list_mut().page_previous(),
+            CommandId::PageNextModels => self.state.model_picker.list_mut().page_next(),
             CommandId::CloseModelPicker => self.state.model_picker.close(),
             CommandId::SelectModel => return self.choose_model(),
             _ => {}
@@ -8573,7 +8575,7 @@ impl Application {
 
     fn choose_model(&mut self) -> Result<ApplicationTransition> {
         let purpose = self.state.model_picker.purpose();
-        match self.state.model_picker.choose() {
+        match self.state.model_picker.list().choose() {
             Some(AgentSelectionAction::Retry) => Ok(self.state.model_picker.begin_retry().map_or(
                 ApplicationTransition::Continue,
                 ApplicationTransition::ListModels,

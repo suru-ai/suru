@@ -14,8 +14,8 @@ use crate::{
 use super::{
     ModelListRequest,
     agent_selection_list::{
-        AgentSelectionAction, AgentSelectionLines, AgentSelectionList, InForce, ProviderModels,
-        default_model, normalize_catalog,
+        AgentSelectionLines, AgentSelectionList, InForce, ProviderModels, default_model,
+        normalize_catalog,
     },
 };
 
@@ -255,12 +255,13 @@ impl ModelPicker {
         self.active_request.is_some() && self.list.is_empty()
     }
 
-    pub(super) fn query(&self) -> &str {
-        self.list.query()
+    /// The Agent Selection list on show, which the reader's keys drive.
+    pub(super) fn list(&self) -> &AgentSelectionList {
+        &self.list
     }
 
-    pub(super) fn provider_scope(&self) -> Option<&ProviderId> {
-        self.list.provider_scope()
+    pub(super) fn list_mut(&mut self) -> &mut AgentSelectionList {
+        &mut self.list
     }
 
     /// The Provider's name as the user reads it, from whichever catalog the
@@ -373,34 +374,6 @@ impl ModelPicker {
         })
     }
 
-    pub(super) fn insert(&mut self, text: &str) {
-        self.list.insert(text);
-    }
-
-    pub(super) fn delete_backward(&mut self) {
-        self.list.delete_backward();
-    }
-
-    pub(super) fn select_previous(&mut self) {
-        self.list.select_previous();
-    }
-
-    pub(super) fn select_next(&mut self) {
-        self.list.select_next();
-    }
-
-    pub(super) fn page_previous(&mut self) {
-        self.list.page_previous();
-    }
-
-    pub(super) fn page_next(&mut self) {
-        self.list.page_next();
-    }
-
-    pub(super) fn choose(&self) -> Option<AgentSelectionAction> {
-        self.list.choose()
-    }
-
     /// The Models the window shows, drawn in `capacity` lines of a list
     /// `width` columns wide with the Selection in force marked; see
     /// [`AgentSelectionList::draw`].
@@ -420,10 +393,6 @@ impl ModelPicker {
             in_force.as_ref().map(InForce::Model),
             theme,
         )
-    }
-
-    pub(super) fn has_rows(&self) -> bool {
-        self.list.has_rows()
     }
 
     pub(super) fn selection_summary(&self, selection: &AgentSelection, detailed: bool) -> String {

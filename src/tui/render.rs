@@ -2677,12 +2677,15 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
     let mut wrapped = Vec::new();
     if content_height >= 3 {
         lines.push(Line::styled(
-            picker_search_line(state.model_picker.query(), usize::from(content_width)),
+            picker_search_line(
+                state.model_picker.list().query(),
+                usize::from(content_width),
+            ),
             theme.text.subdued,
         ));
     }
     if content_height >= 3
-        && let Some(provider) = state.model_picker.provider_scope()
+        && let Some(provider) = state.model_picker.list().provider_scope()
         && lines.len() < usize::from(content_height)
     {
         lines.push(Line::styled(
@@ -2714,7 +2717,7 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
             row: above + line.row,
             ..line
         }));
-        if !state.model_picker.has_rows() && lines.len() < usize::from(content_height) {
+        if !state.model_picker.list().has_rows() && lines.len() < usize::from(content_height) {
             lines.push(Line::styled("No Models found", theme.text.subdued));
         }
     }
