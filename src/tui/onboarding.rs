@@ -188,6 +188,50 @@ pub(super) struct Drawn<'a> {
     pub(super) wrapped: Vec<WrappedLine<'a>>,
 }
 
+impl<'a> Drawn<'a> {
+    /// Draws a step beneath what is drawn so far, within the rows left above
+    /// the keys at the foot of `height`, each line it wrapped placed by where
+    /// it now begins.
+    fn draw_step(&mut self, height: usize, step: impl FnOnce(usize) -> Drawn<'a>) {
+        let top = self.lines.len();
+        let drawn = step(height.saturating_sub(top + 1));
+        self.wrapped
+            .extend(drawn.wrapped.into_iter().map(|line| WrappedLine {
+                row: top + line.row,
+                ..line
+            }));
+        self.lines.extend(drawn.lines);
+    }
+}
+
+/// How many of what a step may leave out give way, from the first, for
+/// `kept` lines and the rest to fit within `room` lines; `gives_way` holds
+/// the lines each takes, in the order it gives way.
+fn given_way(kept: usize, gives_way: &[usize], room: usize) -> usize {
+    (0..=gives_way.len())
+        .find(|given| kept + gives_way[*given..].iter().sum::<usize>() <= room)
+        .unwrap_or(gives_way.len())
+}
+
+/// What a step says beneath its rows, laid out within `room` lines: each
+/// keeps what the ones before it leave, from its start. Answers how many
+/// lines they take.
+fn fit_notes<'a>(
+    notes: Vec<(WrappedText<'a>, Style)>,
+    room: usize,
+) -> (Vec<(WrappedText<'a>, Style)>, usize) {
+    let mut said = 0;
+    let notes = notes
+        .into_iter()
+        .map(|(note, style)| {
+            let note = note.first(room.saturating_sub(said));
+            said += note.height();
+            (note, style)
+        })
+        .collect();
+    (notes, said)
+}
+
 /// The Providers step: one row for each built-in Provider, in their fixed
 /// order, ticked by its Enablement and beside its Availability. Space writes
 /// the Enablement of the Provider under the cursor at once, and the step
@@ -459,24 +503,13 @@ impl ProvidersStep {
         theme: &Theme,
         server: OwnServer<'a>,
         recheck: &'a Recheck,
-    ) -> (Vec<Line<'static>>, Vec<WrappedLine<'a>>) {
+    ) -> Drawn<'a> {
         let entries = self.entries(width, theme, server);
-        let mut said = 0;
-        let notes = Self::notes(width, theme, server, recheck)
-            .into_iter()
-            .map(|(note, style)| {
-                let note = note.first(room.saturating_sub(said));
-                said += note.height();
-                (note, style)
-            })
-            .collect::<Vec<_>>();
+        let (notes, said) = fit_notes(Self::notes(width, theme, server, recheck), room);
         let rows = entries.iter().map(ProviderEntry::rows).sum::<usize>();
         let available = room.saturating_sub(said);
         // The lines each of what gives way takes, in the order it gives way.
-        let gives_way = [usize::from(said > 0), 1, 1, 1];
-        let given = (0..=gives_way.len())
-            .find(|given| rows + gives_way[*given..].iter().sum::<usize>() <= available)
-            .unwrap_or(gives_way.len());
+        let given = given_way(rows, &[usize::from(said > 0), 1, 1, 1], available);
         let notes_gap = given < 1 && said > 0;
         let introduction_gap = given < 2;
         let header_gap = given < 3;
@@ -535,7 +568,7 @@ impl ProvidersStep {
                 lines.extend(note.lines(style));
             }
         }
-        (lines, wrapped)
+        Drawn { lines, wrapped }
     }
 }
 
@@ -764,12 +797,7 @@ impl DerivationStep {
 
     /// The step drawn within `width` columns and `room` lines beneath the
     /// header: the introduction, and the list through its window.
-    fn lines(
-        &self,
-        width: usize,
-        room: usize,
-        theme: &Theme,
-    ) -> (Vec<Line<'static>>, Vec<WrappedLine<'_>>) {
+    fn lines(&self, width: usize, room: usize, theme: &Theme) -> Drawn<'_> {
         let mut lines = vec![
             Line::styled(
                 truncate_to_width(Self::INTRODUCTION, width),
@@ -795,7 +823,7 @@ impl DerivationStep {
                 ..line
             })
             .collect();
-        (lines, wrapped)
+        Drawn { lines, wrapped }
     }
 }
 
@@ -988,11 +1016,15 @@ impl IconsStep {
         format!("  {}", glyphs.join("  "))
     }
 
-    /// The note laid out within `width` columns, while the answer under Row
-    /// Focus is that the sample draws as boxes or blanks.
-    fn note(&self, width: usize) -> Option<WrappedText<'static>> {
+    /// What the step says beneath its answers, laid out within `width`
+    /// columns in the style it is drawn in: how to get Icons, while the
+    /// answer under Row Focus is that the sample draws as boxes or blanks.
+    fn notes(&self, width: usize, theme: &Theme) -> Vec<(WrappedText<'_>, Style)> {
+        let width = u16::try_from(width).unwrap_or(u16::MAX);
         (self.focus == Some(IconsAnswer::Boxes))
-            .then(|| WrappedText::new(Self::NOTE, "", u16::try_from(width).unwrap_or(u16::MAX)))
+            .then(|| (WrappedText::new(Self::NOTE, "", width), theme.text.primary))
+            .into_iter()
+            .collect()
     }
 
     /// How many lines the step draws within `width` columns with nothing
@@ -1012,24 +1044,12 @@ impl IconsStep {
     /// from its end, after the gap above it, the gap beneath the sample,
     /// the gap beneath the introduction, the gap beneath the header, and
     /// the introduction. Records how many answers were drawn.
-    fn lines(
-        &self,
-        width: usize,
-        room: usize,
-        theme: &Theme,
-    ) -> (Vec<Line<'static>>, Vec<WrappedLine<'static>>) {
-        let note = self
-            .note(width)
-            .map(|note| note.first(room.saturating_sub(Self::KEPT)))
-            .filter(|note| note.height() > 0);
-        let said = note.as_ref().map_or(0, WrappedText::height);
+    fn lines<'a>(&'a self, width: usize, room: usize, theme: &Theme) -> Drawn<'a> {
+        let (notes, said) = fit_notes(self.notes(width, theme), room.saturating_sub(Self::KEPT));
         let available = room.saturating_sub(said);
         // The lines each of what gives way takes, in the order it gives way.
-        let gives_way = [usize::from(said > 0), 1, 1, 1, 1];
-        let given = (0..=gives_way.len())
-            .find(|given| Self::KEPT + gives_way[*given..].iter().sum::<usize>() <= available)
-            .unwrap_or(gives_way.len());
-        let note_gap = given < 1 && said > 0;
+        let given = given_way(Self::KEPT, &[usize::from(said > 0), 1, 1, 1, 1], available);
+        let notes_gap = given < 1 && said > 0;
         let sample_gap = given < 2;
         let introduction_gap = given < 3;
         let header_gap = given < 4;
@@ -1072,14 +1092,16 @@ impl IconsStep {
             IconsAnswer::ALL.len().min(room.saturating_sub(answers)),
         ));
         let mut wrapped = Vec::new();
-        if note_gap {
+        if notes_gap {
             lines.push(Line::default());
         }
-        if let Some(note) = note {
-            wrapped.push(note.wrapped(lines.len()));
-            lines.extend(note.lines(theme.text.primary));
+        for (note, style) in notes {
+            if note.height() > 0 {
+                wrapped.push(note.wrapped(lines.len()));
+                lines.extend(note.lines(style));
+            }
         }
-        (lines, wrapped)
+        Drawn { lines, wrapped }
     }
 }
 
@@ -1366,57 +1388,38 @@ impl Onboarding {
                 wrapped: Vec::new(),
             };
         };
-        let mut lines = vec![Line::styled(
-            truncate_to_width(
-                &format!(
-                    "Step {} of {} · {}",
-                    step.number(),
-                    Step::ALL.len(),
-                    step.title()
+        let mut drawn = Drawn {
+            lines: vec![Line::styled(
+                truncate_to_width(
+                    &format!(
+                        "Step {} of {} · {}",
+                        step.number(),
+                        Step::ALL.len(),
+                        step.title()
+                    ),
+                    width,
                 ),
-                width,
-            ),
-            theme.accent.primary.add_modifier(Modifier::BOLD),
-        )];
-        let mut wrapped = Vec::new();
+                theme.accent.primary.add_modifier(Modifier::BOLD),
+            )],
+            wrapped: Vec::new(),
+        };
         match step {
             // The Providers step draws the gap beneath the header itself, as
             // one of what gives way on a short screen before its rows.
             Step::Providers => {
-                let room = height.saturating_sub(lines.len() + 1);
-                let (step_lines, step_wrapped) =
+                drawn.draw_step(height, |room| {
                     self.providers
-                        .lines(width, room, theme, server, &self.recheck);
-                let top = lines.len();
-                wrapped.extend(step_wrapped.into_iter().map(|line| WrappedLine {
-                    row: top + line.row,
-                    ..line
-                }));
-                lines.extend(step_lines);
+                        .lines(width, room, theme, server, &self.recheck)
+                });
             }
             Step::Derivation => {
-                lines.push(Line::default());
-                let room = height.saturating_sub(lines.len() + 1);
-                let (step_lines, step_wrapped) = self.derivation.lines(width, room, theme);
-                let top = lines.len();
-                wrapped.extend(step_wrapped.into_iter().map(|line| WrappedLine {
-                    row: top + line.row,
-                    ..line
-                }));
-                lines.extend(step_lines);
+                drawn.lines.push(Line::default());
+                drawn.draw_step(height, |room| self.derivation.lines(width, room, theme));
             }
             // So does the Icons step, before its sample and its answers.
-            Step::Icons => {
-                let room = height.saturating_sub(lines.len() + 1);
-                let (step_lines, step_wrapped) = self.icons.lines(width, room, theme);
-                let top = lines.len();
-                wrapped.extend(step_wrapped.into_iter().map(|line| WrappedLine {
-                    row: top + line.row,
-                    ..line
-                }));
-                lines.extend(step_lines);
-            }
+            Step::Icons => drawn.draw_step(height, |room| self.icons.lines(width, room, theme)),
         }
+        let Drawn { mut lines, wrapped } = drawn;
         let own_keys: &[&str] = match step {
             Step::Providers => &ProvidersStep::KEYS,
             Step::Derivation => &DerivationStep::KEYS,
