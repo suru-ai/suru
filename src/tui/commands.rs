@@ -2762,33 +2762,30 @@ pub(super) fn command_matches(query: &str) -> Vec<SemanticCommandId> {
     // slash gives every command the same score. Pairing follows the existing
     // Model Options action there, choosing a Remote before forming a Pairing
     // with one; any typed part of `connect` or `pair` ranks normally.
+    // Onboarding is taken once, and again only on purpose, so it waits past
+    // that window rather than pushing Pairing out of it. Each command moves
+    // to just after the one it follows, in this order.
     if query.is_empty() {
-        for (index, id) in [SemanticCommandId::ConnectOpen, SemanticCommandId::PairOpen]
-            .into_iter()
-            .enumerate()
-        {
+        for (id, follows) in [
+            (
+                SemanticCommandId::ConnectOpen,
+                SemanticCommandId::ModelOptions,
+            ),
+            (SemanticCommandId::PairOpen, SemanticCommandId::ConnectOpen),
+            (
+                SemanticCommandId::OnboardingOpen,
+                SemanticCommandId::PairOpen,
+            ),
+        ] {
             let Some(position) = matches.iter().position(|(_, _, _, held)| *held == id) else {
                 continue;
             };
             let command = matches.remove(position);
-            let after_options = matches
+            let after = matches
                 .iter()
-                .position(|(_, _, _, held)| *held == SemanticCommandId::ModelOptions)
-                .map_or(matches.len(), |options| options + 1);
-            matches.insert((after_options + index).min(matches.len()), command);
-        }
-        // Onboarding is taken once, and again only on purpose, so it waits
-        // past that window rather than pushing Pairing out of it.
-        if let Some(position) = matches
-            .iter()
-            .position(|(_, _, _, held)| *held == SemanticCommandId::OnboardingOpen)
-        {
-            let command = matches.remove(position);
-            let after_pairing = matches
-                .iter()
-                .position(|(_, _, _, held)| *held == SemanticCommandId::PairOpen)
-                .map_or(matches.len(), |pairing| pairing + 1);
-            matches.insert(after_pairing, command);
+                .position(|(_, _, _, held)| *held == follows)
+                .map_or(matches.len(), |followed| followed + 1);
+            matches.insert(after, command);
         }
     }
     matches
