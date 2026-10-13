@@ -1455,14 +1455,6 @@ impl RunLoop {
             ApplicationTransition::MarkOnboarded => {
                 spawn_onboarded_mark(self.client.session_commands());
             }
-            ApplicationTransition::FinishOnboarding { pin } => {
-                spawn_setting_mutation(
-                    self.client.session_commands(),
-                    pin,
-                    self.channels.submissions.clone(),
-                );
-                spawn_onboarded_mark(self.client.session_commands());
-            }
             ApplicationTransition::RecheckProviders { recheck } => {
                 spawn_providers_recheck(
                     self.client.session_commands(),
@@ -1844,7 +1836,6 @@ impl RunLoop {
             | ApplicationTransition::UpdateApprovalPosture { .. }
             | ApplicationTransition::MutateSetting(_)
             | ApplicationTransition::MarkOnboarded
-            | ApplicationTransition::FinishOnboarding { .. }
             | ApplicationTransition::RecheckProviders { .. }
             | ApplicationTransition::BeginServing { .. }
             | ApplicationTransition::IssueInvite { .. }
@@ -2264,9 +2255,12 @@ impl RunLoop {
                 )?;
                 self.flush_agent_selection(transition);
             }
+            // A pin landing may finish Onboarding, which marks the Server.
             SubmissionResult::SettingMutated(snapshot) => {
-                self.application
+                let transition = self
+                    .application
                     .handle_event(ApplicationEvent::SettingMutated(*snapshot))?;
+                return Ok(self.dispatch_transition(transition));
             }
             SubmissionResult::SettingMutationFailed(error) => {
                 self.application

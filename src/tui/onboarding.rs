@@ -33,9 +33,10 @@ use crate::{
     protocol::{
         AgentSelection, DerivationErrand, EffectiveSettings, ModelDescriptor, ModelId, Outlook,
         ProviderCatalogStatus, ProviderId, ProviderUnavailability, SettingMutation,
+        SettingsSnapshot,
     },
     provider::{BuiltInProvider, built_in_providers},
-    settings::provider_enablement,
+    settings::{has_landed, provider_enablement},
     theme::Theme,
 };
 
@@ -121,7 +122,8 @@ pub(super) enum Advance {
     /// The next step is on show.
     Moved,
     /// The step was answered with this pin of the Setting it governs, and the
-    /// next step is on show.
+    /// next step is on show; the last step stays on show until the pin lands,
+    /// which finishes the flow.
     Pinned(SettingMutation),
     /// The step's answer is `model`, whose Model Options the reader chooses
     /// first at the Model Options overlay opened over the step for `purpose`,
@@ -139,9 +141,6 @@ pub(super) enum Advance {
     /// step says why, and the Derivation and Icons steps have nothing under
     /// Row Focus to answer with.
     Held,
-    /// The last step was answered with this pin of the Setting it governs,
-    /// so the flow is over and closed.
-    Finished(SettingMutation),
 }
 
 /// What the flow reads of the Client's own Server, of which it keeps no copy:
@@ -877,9 +876,14 @@ fn pinned_selection(selection: AgentSelection) -> SettingMutation {
 /// does nothing until there is one. While the answer is that the sample draws
 /// as boxes or blanks, a note beneath says how to get Icons.
 ///
+/// The flow finishes only once the pin has landed, so the answer is never
+/// lost behind a mark that closes every Client's flow. Until then the step
+/// holds still and says it is saving the answer; a pin the Server refuses
+/// is said beneath the answers, and Finish sends it again.
+///
 /// A screen too short for all of it gives way its gaps and its introduction
-/// before the note, and the note before the sample and the answers. Finish
-/// pins only an answer the last frame drew.
+/// before what it says beneath the answers, and that before the sample and
+/// the answers. Finish pins only an answer the last frame drew.
 #[derive(Clone, Debug, Default)]
 struct IconsStep {
     /// The answer under Row Focus, once the reader has moved to one or the
@@ -888,6 +892,18 @@ struct IconsStep {
     /// How many of the answers the last frame drew, from the first; nothing
     /// until a frame has been drawn since the step opened.
     drawn: Cell<Option<usize>>,
+    saving: Saving,
+}
+
+/// Where the pin Finish sent on the Icons step stands.
+#[derive(Clone, Debug, Default)]
+enum Saving {
+    #[default]
+    Idle,
+    /// Sent and not yet answered; the flow finishes once it lands.
+    Pending(SettingMutation),
+    /// Refused, for this reason, so Finish may send the pin again.
+    Failed(String),
 }
 
 /// How the reader says this terminal draws the Icons step's sample.
@@ -976,8 +992,11 @@ impl IconsStep {
 
     /// Moves Row Focus `distance` answers, wrapping past either end. From
     /// neither answer, a move up lands on the last and a move down on the
-    /// first.
+    /// first. It holds still while a pin is awaited.
     fn move_focus(&mut self, distance: isize) {
+        if self.is_saving() {
+            return;
+        }
         let answers = IconsAnswer::ALL.len() as isize;
         let from = self
             .focus
@@ -995,6 +1014,23 @@ impl IconsStep {
             .get()
             .is_none_or(|drawn| answer.index() < drawn)
             .then(|| answer.pin())
+    }
+
+    /// Whether a pin Finish sent is awaited, while which the step holds
+    /// still.
+    fn is_saving(&self) -> bool {
+        matches!(self.saving, Saving::Pending(_))
+    }
+
+    /// Sends the pin of the answer under Row Focus, unless one is already
+    /// awaited or there is no answer to pin.
+    fn finish(&mut self) -> Option<SettingMutation> {
+        if self.is_saving() {
+            return None;
+        }
+        let pin = self.pin()?;
+        self.saving = Saving::Pending(pin.clone());
+        Some(pin)
     }
 
     /// The sample as drawn: a handful of Icon Catalog glyphs, then the fixed
@@ -1016,34 +1052,56 @@ impl IconsStep {
         format!("  {}", glyphs.join("  "))
     }
 
-    /// What the step says beneath its answers, laid out within `width`
-    /// columns in the style it is drawn in: how to get Icons, while the
-    /// answer under Row Focus is that the sample draws as boxes or blanks.
+    /// How the pin Finish sent stands, as said beneath the answers in the
+    /// style it is drawn in.
+    fn saving_said(&self, theme: &Theme) -> Option<(&str, Style)> {
+        match &self.saving {
+            Saving::Idle => None,
+            Saving::Pending(_) => Some(("Saving your answer…", theme.text.subdued)),
+            Saving::Failed(failure) => Some((failure.as_str(), theme.feedback.error)),
+        }
+    }
+
+    /// What the step says beneath its answers, each line laid out within
+    /// `width` columns in the style it is drawn in, the first said the most
+    /// needed: how the pin Finish sent stands, and how to get Icons while
+    /// the answer under Row Focus is that the sample draws as boxes or
+    /// blanks.
     fn notes(&self, width: usize, theme: &Theme) -> Vec<(WrappedText<'_>, Style)> {
         let width = u16::try_from(width).unwrap_or(u16::MAX);
-        (self.focus == Some(IconsAnswer::Boxes))
-            .then(|| (WrappedText::new(Self::NOTE, "", width), theme.text.primary))
+        let note =
+            (self.focus == Some(IconsAnswer::Boxes)).then_some((Self::NOTE, theme.text.primary));
+        self.saving_said(theme)
             .into_iter()
+            .chain(note)
+            .map(|(text, style)| (WrappedText::new(text, "", width), style))
             .collect()
     }
 
     /// How many lines the step draws within `width` columns with nothing
-    /// given way. The note is counted whichever answer is chosen, so the box
-    /// keeps its height as Row Focus moves.
-    fn rows_wanted(&self, width: usize) -> usize {
-        let note = WrappedText::new(Self::NOTE, "", u16::try_from(width).unwrap_or(u16::MAX));
+    /// given way. The note on getting Icons is counted whichever answer is
+    /// chosen, so the box keeps its height as Row Focus moves.
+    fn rows_wanted(&self, width: usize, theme: &Theme) -> usize {
+        let width = u16::try_from(width).unwrap_or(u16::MAX);
+        let said = self
+            .saving_said(theme)
+            .into_iter()
+            .chain([(Self::NOTE, theme.text.primary)])
+            .map(|(text, _)| WrappedText::new(text, "", width).height())
+            .sum::<usize>();
         // The gap beneath the header, the introduction and the gap beneath
         // it, the sample and the gap beneath it, the answers, and the gap
-        // above the note.
-        5 + Self::KEPT + note.height()
+        // above what is said beneath them.
+        5 + Self::KEPT + said
     }
 
     /// The step drawn within `width` columns and `room` lines beneath the
-    /// header: the introduction, the sample, the answers, and the note. For
-    /// the sample and the answers to be drawn whole, the note gives way
-    /// from its end, after the gap above it, the gap beneath the sample,
-    /// the gap beneath the introduction, the gap beneath the header, and
-    /// the introduction. Records how many answers were drawn.
+    /// header: the introduction, the sample, the answers, and what is said
+    /// beneath them. For the sample and the answers to be drawn whole, what
+    /// is said beneath them gives way from its end, after the gap above it,
+    /// the gap beneath the sample, the gap beneath the introduction, the gap
+    /// beneath the header, and the introduction. Records how many answers
+    /// were drawn.
     fn lines<'a>(&'a self, width: usize, room: usize, theme: &Theme) -> Drawn<'a> {
         let (notes, said) = fit_notes(self.notes(width, theme), room.saturating_sub(Self::KEPT));
         let available = room.saturating_sub(said);
@@ -1143,9 +1201,10 @@ impl Onboarding {
     }
 
     /// Confirms the step on show: moves to the next, or on the last step
-    /// finishes the flow with its answer and closes it, unless the step may
-    /// not be passed yet. A step answering with a pin moves on as it is
-    /// sent; one with more to ask first stays on show.
+    /// pins its answer, unless the step may not be passed yet. A step
+    /// answering with a pin moves on as it is sent, save the last, which
+    /// stays on show until its pin lands; one with more to ask first stays
+    /// on show.
     pub(super) fn next(&mut self, server: OwnServer<'_>) -> Advance {
         match self.step {
             // Nor is a step passed whose rows the screen had no room for.
@@ -1216,28 +1275,47 @@ impl Onboarding {
         }
     }
 
-    /// Shows the step after the one on show, or from the last finishes the
-    /// flow with its answer and closes it, once it is answered.
+    /// Shows the step after the one on show, or from the last sends the pin
+    /// of its answer, once it is answered; the flow finishes once that pin
+    /// lands.
     fn move_on(&mut self) -> Advance {
         match self.step.and_then(Step::next) {
             Some(next) => {
                 self.step = Some(next);
                 Advance::Moved
             }
-            // The last step is passed only once it is answered, and pins
-            // its answer as it finishes the flow.
-            None => match self.icons.pin() {
-                Some(pin) => {
-                    self.close();
-                    Advance::Finished(pin)
-                }
-                None => Advance::Held,
-            },
+            // The last step is passed only once it is answered, and stays
+            // on show until the pin of its answer lands.
+            None => self.icons.finish().map_or(Advance::Held, Advance::Pinned),
         }
     }
 
-    /// Returns to the step before the one on show, where there is one.
+    /// Whether `snapshot`, the Server's answer to an edit of its Settings,
+    /// shows the pin the Icons step awaits landed, which finishes the flow.
+    pub(super) fn pin_landed(&self, snapshot: &SettingsSnapshot) -> bool {
+        match &self.icons.saving {
+            Saving::Pending(pin) => has_landed(snapshot, pin),
+            Saving::Idle | Saving::Failed(_) => false,
+        }
+    }
+
+    /// Takes the Server's refusal of an edit of its Settings as the refusal
+    /// of the pin the Icons step awaits, answering whether one was awaited:
+    /// the step says why beneath its answers, and Finish may send it again.
+    pub(super) fn fail_pin(&mut self, error: &str) -> bool {
+        if !self.icons.is_saving() {
+            return false;
+        }
+        self.icons.saving = Saving::Failed(format!("Could not save your answer: {error}"));
+        true
+    }
+
+    /// Returns to the step before the one on show, where there is one and
+    /// the Icons step awaits no pin.
     pub(super) fn back(&mut self) {
+        if self.icons.is_saving() {
+            return;
+        }
         if let Some(previous) = self.step.and_then(Step::previous) {
             self.step = Some(previous);
         }
@@ -1448,7 +1526,7 @@ impl Onboarding {
                 .providers
                 .rows_wanted(width, theme, server, &self.recheck),
             Step::Derivation => 1 + self.derivation.rows_wanted(),
-            Step::Icons => self.icons.rows_wanted(width),
+            Step::Icons => self.icons.rows_wanted(width, theme),
         };
         1 + step_rows + 1
     }

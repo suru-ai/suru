@@ -2771,16 +2771,13 @@ impl TuiState {
     }
 
     /// Closes Onboarding as taken, finished or left, so it is offered no
-    /// more; the run loop asks the Server to mark itself onboarded, writing
-    /// `pin` too where the flow was finished with one.
-    fn take_onboarding(&mut self, pin: Option<SettingMutation>) -> ApplicationTransition {
+    /// more; the run loop asks the Server to mark itself onboarded.
+    fn take_onboarding(&mut self) -> ApplicationTransition {
         self.onboarding.close();
         self.onboarding_taken = true;
         self.release_onboarding_options();
         self.local_onboarded = Some(true);
-        pin.map_or(ApplicationTransition::MarkOnboarded, |pin| {
-            ApplicationTransition::FinishOnboarding { pin }
-        })
+        ApplicationTransition::MarkOnboarded
     }
 
     fn remove_deleted_session(&mut self, deleted_session_id: SessionId) {
@@ -5473,15 +5470,9 @@ pub enum ApplicationTransition {
     },
     /// One Setting's typed edit, on its way to the server that owns the file.
     MutateSetting(SettingMutation),
-    /// Ask the Client's own Server to mark itself onboarded, as leaving
-    /// Onboarding does. Every attached Client hears that it is.
+    /// Ask the Client's own Server to mark itself onboarded, as finishing or
+    /// leaving Onboarding does. Every attached Client hears that it is.
     MarkOnboarded,
-    /// Write `pin`, the Setting Onboarding's last step was answered with,
-    /// and ask the Client's own Server to mark itself onboarded as leaving
-    /// does, which is what finishing the flow comes to.
-    FinishOnboarding {
-        pin: SettingMutation,
-    },
     /// Ask the Client's own Server to re-read every Provider's Availability
     /// for Onboarding, answering with [`ApplicationEvent::ProvidersRechecked`]
     /// under the same `recheck`. The flow's own request rather than one of
@@ -6210,12 +6201,23 @@ impl Application {
                 }
                 Ok(ApplicationTransition::Continue)
             }
+            // Onboarding finishes once the pin of its last answer lands, so
+            // the mark never runs ahead of an answer the Server refuses.
             ApplicationEvent::SettingMutated(snapshot) => {
+                let finished = self.state.onboarding.pin_landed(&snapshot);
                 self.state.adopt_settings(snapshot);
-                Ok(ApplicationTransition::Continue)
+                Ok(if finished {
+                    self.state.take_onboarding()
+                } else {
+                    ApplicationTransition::Continue
+                })
             }
+            // A refusal while Onboarding awaits its pin is said there, where
+            // the reader can try it again.
             ApplicationEvent::SettingMutationFailed(error) => {
-                self.state.settings_panel.report_failure(error);
+                if !self.state.onboarding.fail_pin(&error) {
+                    self.state.settings_panel.report_failure(error);
+                }
                 Ok(ApplicationTransition::Continue)
             }
             // A preparation the reader has moved past changes nothing: what
@@ -10371,7 +10373,6 @@ impl Application {
                     Advance::Rechecking(recheck) => {
                         ApplicationTransition::RecheckProviders { recheck }
                     }
-                    Advance::Finished(pin) => self.state.take_onboarding(Some(pin)),
                 })
             }
             SemanticCommandId::OnboardingBack => {
@@ -10379,7 +10380,7 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::OnboardingLeave => Ok(if self.state.onboarding.is_open() {
-                self.state.take_onboarding(None)
+                self.state.take_onboarding()
             } else {
                 ApplicationTransition::Continue
             }),

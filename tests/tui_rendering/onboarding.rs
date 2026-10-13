@@ -367,10 +367,13 @@ fn finishing_the_third_step_marks_the_server_onboarded_and_closes() {
     press(&mut application, KeyCode::Down);
     assert_eq!(
         press(&mut application, KeyCode::Enter),
-        ApplicationTransition::FinishOnboarding {
-            pin: SettingMutation::AppearanceShowIcons { value: Some(true) },
-        },
-        "the answer is pinned beside the mark"
+        pins_show_icons(true),
+        "the answer is pinned first"
+    );
+    assert_eq!(
+        acknowledge_pin(&mut application, true),
+        ApplicationTransition::MarkOnboarded,
+        "and the mark follows once it lands"
     );
     assert!(!onboarding_shown(&application), "{}", screen(&application));
 }
@@ -2888,12 +2891,23 @@ fn with_show_icons(show_icons: bool) -> EffectiveSettings {
     settings
 }
 
+/// The pin Finish sends on the Icons step, ahead of any mark.
 fn pins_show_icons(show_icons: bool) -> ApplicationTransition {
-    ApplicationTransition::FinishOnboarding {
-        pin: SettingMutation::AppearanceShowIcons {
-            value: Some(show_icons),
-        },
-    }
+    ApplicationTransition::MutateSetting(SettingMutation::AppearanceShowIcons {
+        value: Some(show_icons),
+    })
+}
+
+/// The Server's answer to a pin of Show icons: the Settings it left in
+/// force, with Show icons pinned at `show_icons`.
+fn acknowledge_pin(application: &mut Application, show_icons: bool) -> ApplicationTransition {
+    application
+        .handle_event(ApplicationEvent::SettingMutated(SettingsSnapshot {
+            settings: with_show_icons(show_icons),
+            pinned: vec!["appearance.showIcons".to_owned()],
+            diagnostics: Vec::new(),
+        }))
+        .expect("receive the Settings the pin left in force")
 }
 
 #[test]
@@ -2977,6 +2991,10 @@ fn choosing_the_icons_row_pins_show_icons_on_and_finishes() {
         press(&mut application, KeyCode::Enter),
         pins_show_icons(true)
     );
+    assert_eq!(
+        acknowledge_pin(&mut application, true),
+        ApplicationTransition::MarkOnboarded
+    );
     assert!(!onboarding_shown(&application), "{}", screen(&application));
     deliver_settings(&mut application, with_show_icons(true));
     assert!(
@@ -3004,6 +3022,10 @@ fn choosing_the_boxes_row_pins_show_icons_off_and_finishes() {
         assert_eq!(
             press(&mut application, KeyCode::Enter),
             pins_show_icons(false)
+        );
+        assert_eq!(
+            acknowledge_pin(&mut application, false),
+            ApplicationTransition::MarkOnboarded
         );
         assert!(!onboarding_shown(&application), "{}", screen(&application));
     }
@@ -3174,4 +3196,139 @@ fn finish_on_a_terminal_too_small_to_draw_pins_nothing() {
         press(&mut application, KeyCode::Enter),
         pins_show_icons(true)
     );
+}
+
+/// Finish sends the pin and waits on the Server's word that it landed
+/// before the flow ends, so an answer is never lost behind a mark that
+/// closed every Client's flow.
+#[test]
+fn the_flow_waits_on_the_icons_step_until_the_pin_lands() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    on_the_icons_step(&mut application);
+    press(&mut application, KeyCode::Down);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_show_icons(true)
+    );
+    let saving = screen(&application);
+    assert!(saving.contains("Step 3 of 3"), "{saving}");
+    assert!(saving.contains("Saving your answer…"), "{saving}");
+
+    // Finish, a move, and Back all wait on it.
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Left);
+    let waiting = screen(&application);
+    assert!(waiting.contains("Step 3 of 3"), "{waiting}");
+    assert!(waiting.contains("› They draw as icons"), "{waiting}");
+    assert!(waiting.contains("Saving your answer…"), "{waiting}");
+
+    // The Server's answer to another edit, which leaves Show icons
+    // unpinned, is not this pin landing.
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::SettingMutated(SettingsSnapshot {
+                settings: EffectiveSettings::default(),
+                pinned: vec!["provider.codex.enabled".to_owned()],
+                diagnostics: Vec::new(),
+            }))
+            .expect("receive the Settings another edit left in force"),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        screen(&application).contains("Saving your answer…"),
+        "{}",
+        screen(&application)
+    );
+
+    assert_eq!(
+        acknowledge_pin(&mut application, true),
+        ApplicationTransition::MarkOnboarded
+    );
+    assert!(!onboarding_shown(&application), "{}", screen(&application));
+}
+
+/// A pin the Server refuses keeps the flow on the Icons step, saying why
+/// beneath the answers, and asks no mark: Finish tries the pin again, and
+/// Esc leaves without it.
+#[test]
+fn a_refused_pin_keeps_the_flow_open_with_the_failure_and_finish_retries() {
+    const REFUSAL: &str = "Config Document is not editable";
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    on_the_icons_step(&mut application);
+    press(&mut application, KeyCode::Up);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_show_icons(false)
+    );
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::SettingMutationFailed(REFUSAL.to_owned()))
+            .expect("hear the pin was refused"),
+        ApplicationTransition::Continue,
+        "no mark is asked for"
+    );
+    let refused = screen(&application);
+    assert!(refused.contains("Step 3 of 3"), "{refused}");
+    assert!(
+        refused.contains(&format!("Could not save your answer: {REFUSAL}")),
+        "{refused}"
+    );
+    assert!(!refused.contains("Saving your answer…"), "{refused}");
+    assert!(
+        refused.contains("› They draw as boxes or blanks"),
+        "{refused}"
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_show_icons(false),
+        "Finish tries the pin again"
+    );
+    let retried = screen(&application);
+    assert!(retried.contains("Saving your answer…"), "{retried}");
+    assert!(!retried.contains("Could not save"), "{retried}");
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::SettingMutationFailed(REFUSAL.to_owned()))
+            .expect("hear the pin was refused again"),
+        ApplicationTransition::Continue
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::MarkOnboarded,
+        "Esc still leaves, without the pin"
+    );
+    assert!(!onboarding_shown(&application), "{}", screen(&application));
+}
+
+#[test]
+fn leaving_while_the_pin_is_saved_still_marks_the_server_onboarded() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    on_the_icons_step(&mut application);
+    press(&mut application, KeyCode::Down);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_show_icons(true)
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::MarkOnboarded
+    );
+    assert!(!onboarding_shown(&application), "{}", screen(&application));
+    assert_eq!(
+        acknowledge_pin(&mut application, true),
+        ApplicationTransition::Continue,
+        "the pin landing late asks no second mark"
+    );
+    assert!(!onboarding_shown(&application), "{}", screen(&application));
 }
