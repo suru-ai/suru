@@ -386,8 +386,9 @@ async fn a_server_sharing_one_root_makes_nothing_there_before_it_notices_the_roo
     let channel = "shared-root-removed-test";
     let config = ServerConfig::new(root.path(), channel).expect("configure server");
     // Long enough that it does not look again within the test, so what it
-    // does in the meantime is what is tested.
-    let server = server::spawn_with_timings(
+    // does in the meantime is what is tested. Taken as it comes, never
+    // onboarded: marking it so writes to the very root the test removes.
+    let server = server::not_onboarded::spawn_with_timings(
         config.clone(),
         ServerTimings::default().with_state_dir_check_interval(Duration::from_secs(60 * 60)),
     )

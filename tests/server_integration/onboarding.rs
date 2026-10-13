@@ -55,7 +55,7 @@ async fn a_fresh_server_is_onboarded_once_a_client_marks_it_and_stays_so_across_
     let config = ServerConfig::new(state_dir.path(), channel)
         .expect("configure server")
         .with_data_dir(data_dir.path());
-    let original = server::spawn_not_onboarded(config.clone())
+    let original = server::not_onboarded::spawn(config.clone())
         .await
         .expect("spawn server");
     let (mut marking, opening) = attach(state_dir.path(), channel).await;
@@ -77,7 +77,7 @@ async fn a_fresh_server_is_onboarded_once_a_client_marks_it_and_stays_so_across_
     drop(onlooker);
     original.shutdown().await.expect("stop original server");
 
-    let replacement = server::spawn_not_onboarded(config)
+    let replacement = server::not_onboarded::spawn(config)
         .await
         .expect("respawn server");
     let (client, reopening) = attach(state_dir.path(), channel).await;
@@ -99,7 +99,7 @@ async fn a_fresh_server_is_onboarded_once_a_client_marks_it_and_stays_so_across_
 #[tokio::test]
 async fn a_client_whose_health_was_read_before_another_marked_the_server_hears_it_on_attaching() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let server = server::spawn_not_onboarded(
+    let server = server::not_onboarded::spawn(
         ServerConfig::new(state_dir.path(), "onboarding-late-attach").expect("configure server"),
     )
     .await
@@ -149,7 +149,7 @@ async fn an_unreadable_onboarded_record_falls_back_to_not_onboarded_without_bloc
         .expect("configure server")
         .with_data_dir(data_dir.path());
     let database_path = config.data_dir().join("suru.db");
-    let original = server::spawn_not_onboarded(config.clone())
+    let original = server::not_onboarded::spawn(config.clone())
         .await
         .expect("spawn server to migrate database");
     original.shutdown().await.expect("stop original server");
@@ -158,7 +158,7 @@ async fn an_unreadable_onboarded_record_falls_back_to_not_onboarded_without_bloc
         "INSERT INTO onboarded (singleton, record) VALUES (1, 'not-json');",
     );
 
-    let replacement = server::spawn_not_onboarded(config)
+    let replacement = server::not_onboarded::spawn(config)
         .await
         .expect("an unreadable record must not block startup");
     assert!(
