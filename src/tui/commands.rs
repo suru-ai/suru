@@ -194,6 +194,15 @@ pub enum SemanticCommandId {
     /// Steps back to the Relay list from the address entry or the login
     /// display, and closes the list itself.
     RelayClose,
+    /// Opens Onboarding at its first step over whatever is on screen, the
+    /// Landing or a Session, every step showing the current values.
+    OnboardingOpen,
+    /// Confirms the Onboarding step on show and moves to the next, or
+    /// finishes the flow on its last.
+    OnboardingNext,
+    OnboardingBack,
+    /// Leaves Onboarding from any step, which counts as taking it.
+    OnboardingLeave,
     SidebarToggle,
     SidebarWiden,
     SidebarNarrow,
@@ -634,6 +643,10 @@ impl SemanticCommandId {
             Self::RelayRemove => "relay.remove",
             Self::RelayServeThroughToggle => "relay.serve-through.toggle",
             Self::RelayClose => "relay.close",
+            Self::OnboardingOpen => "onboarding.open",
+            Self::OnboardingNext => "onboarding.next",
+            Self::OnboardingBack => "onboarding.back",
+            Self::OnboardingLeave => "onboarding.leave",
             Self::SidebarToggle => "sidebar.toggle",
             Self::SidebarWiden => "sidebar.width.widen",
             Self::SidebarNarrow => "sidebar.width.narrow",
@@ -2086,6 +2099,44 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         keybinding: None,
     },
     SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingOpen,
+        title: "Onboarding",
+        // The flow onboards the Client's own Server whichever way the Outlook
+        // is turned, and opening it asks nothing of any Server.
+        reach: SemanticReach::Client,
+        description: "Take Onboarding again: Providers, derivation, and Icons",
+        slash: Some(SlashCommand {
+            name: "onboarding",
+            aliases: &[],
+            takes_text: false,
+        }),
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingNext,
+        title: "Next Onboarding Step",
+        reach: SemanticReach::Client,
+        description: "Confirm this step of Onboarding and go on to the next, or finish",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingBack,
+        title: "Previous Onboarding Step",
+        reach: SemanticReach::Client,
+        description: "Go back to the step of Onboarding before this one",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingLeave,
+        title: "Leave Onboarding",
+        reach: SemanticReach::Client,
+        description: "Leave Onboarding, which counts as taking it",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
         id: SemanticCommandId::SidebarToggle,
         title: "Toggle Sidebar",
         reach: SemanticReach::Client,
@@ -2725,6 +2776,19 @@ pub(super) fn command_matches(query: &str) -> Vec<SemanticCommandId> {
                 .position(|(_, _, _, held)| *held == SemanticCommandId::ModelOptions)
                 .map_or(matches.len(), |options| options + 1);
             matches.insert((after_options + index).min(matches.len()), command);
+        }
+        // Onboarding is taken once, and again only on purpose, so it waits
+        // past that window rather than pushing Pairing out of it.
+        if let Some(position) = matches
+            .iter()
+            .position(|(_, _, _, held)| *held == SemanticCommandId::OnboardingOpen)
+        {
+            let command = matches.remove(position);
+            let after_pairing = matches
+                .iter()
+                .position(|(_, _, _, held)| *held == SemanticCommandId::PairOpen)
+                .map_or(matches.len(), |pairing| pairing + 1);
+            matches.insert(after_pairing, command);
         }
     }
     matches

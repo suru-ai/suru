@@ -1436,6 +1436,9 @@ impl RunLoop {
                     self.channels.submissions.clone(),
                 );
             }
+            ApplicationTransition::MarkOnboarded => {
+                spawn_onboarded_mark(self.client.session_commands());
+            }
             ApplicationTransition::BeginServing {
                 request,
                 enable,
@@ -1809,6 +1812,7 @@ impl RunLoop {
             | ApplicationTransition::UpdateAgentSelection { .. }
             | ApplicationTransition::UpdateApprovalPosture { .. }
             | ApplicationTransition::MutateSetting(_)
+            | ApplicationTransition::MarkOnboarded
             | ApplicationTransition::BeginServing { .. }
             | ApplicationTransition::IssueInvite { .. }
             | ApplicationTransition::CopyToClipboard(_)
@@ -4110,6 +4114,17 @@ fn spawn_setting_mutation(
             Err(error) => SubmissionResult::SettingMutationFailed(error.to_string()),
         };
         let _ = results.send(result);
+    });
+}
+
+/// Asks the Client's own Server to mark itself onboarded. The flow is already
+/// closed and offered no more by this Client; a mark that fails costs only
+/// Onboarding offered again the next time a Client attaches.
+fn spawn_onboarded_mark(commands: SessionCommandClient) {
+    tokio::spawn(async move {
+        if let Err(error) = commands.mark_onboarded().await {
+            tracing::warn!("could not mark this Server onboarded: {error:#}");
+        }
     });
 }
 

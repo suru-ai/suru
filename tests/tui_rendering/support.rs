@@ -207,6 +207,9 @@ pub fn rendered_row(rows: &[String], needle: &str) -> usize {
         .unwrap_or_else(|| panic!("rendered frame did not contain {needle:?}"))
 }
 
+/// A ready Server's health. Its Server has already been onboarded, so no
+/// test opens on Onboarding; a test of Onboarding itself says otherwise with
+/// [`Health::with_onboarded`].
 pub fn ready_health(instance_id: Uuid, pid: u32) -> Health {
     Health::new(
         ServerIdentity {
@@ -217,6 +220,7 @@ pub fn ready_health(instance_id: Uuid, pid: u32) -> Health {
         },
         LifecycleState::Ready,
     )
+    .with_onboarded(true)
 }
 
 pub fn fixture_instance_id() -> Uuid {

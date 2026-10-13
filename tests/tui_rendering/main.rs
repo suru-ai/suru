@@ -29,6 +29,7 @@ mod landing_notice;
 mod model_options;
 mod model_picker;
 mod monitoring;
+mod onboarding;
 mod prompts;
 mod provisional_session;
 mod reasoning_cycle;

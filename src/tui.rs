@@ -24,6 +24,7 @@ mod markdown;
 mod model_options;
 mod model_picker;
 mod notice;
+mod onboarding;
 mod questionnaire;
 mod relay_overlay;
 mod render;

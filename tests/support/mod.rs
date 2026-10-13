@@ -39,6 +39,20 @@ pub fn read_runtime_descriptor(path: impl AsRef<std::path::Path>) -> RuntimeDesc
     .unwrap_or_else(|error| panic!("decode runtime descriptor {path:?}: {error}"))
 }
 
+/// Marks the Server `descriptor` names onboarded, as a Client does once its
+/// reader takes Onboarding. A test attaching a TUI to a fresh Server seeds
+/// this so the TUI opens on the Landing rather than on the flow.
+pub async fn mark_onboarded(descriptor: &RuntimeDescriptor) {
+    reqwest::Client::new()
+        .put(format!("{}/v1/onboarded", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("mark the Server onboarded")
+        .error_for_status()
+        .expect("the Server marks itself onboarded");
+}
+
 /// Begins a Session in the Sidekick Workspace through `client`, as `/sidekick` does, so its Agent
 /// is a Sidekick.
 pub async fn begin_sidekick(client: &ManagedClient) -> SessionId {

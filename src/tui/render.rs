@@ -390,6 +390,11 @@ pub(super) fn render_with_slots(
             render_directory_browser(frame, state, main, theme);
         }
     }
+    // Onboarding stands over the settings panel and whatever view is open,
+    // and beneath the choice pickers one of its steps may open over it.
+    if state.onboarding.is_open() && !state.reconnect_overlay_visible() {
+        render_onboarding(frame, state, main, theme);
+    }
     // Choice pickers can be opened by a settings row, so they are drawn over
     // the panel that asked and take the reader's answer first.
     if state.model_options.is_open() && !state.reconnect_overlay_visible() {
@@ -434,6 +439,7 @@ pub(super) fn render_with_slots(
         && !state.approval_posture_picker.is_open()
         && !state.theme_picker.is_open()
         && !state.model_options.is_open()
+        && !state.onboarding.is_open()
         && !state.settings_panel.is_open()
         && !state.serve_overlay.is_open()
         && !state.context_overlay.is_open()
@@ -3183,6 +3189,28 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         SelectionSurface::Settings,
         true,
         &wrapped,
+    );
+}
+
+fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
+    let area = centered_rect(
+        main,
+        main.width.saturating_sub(4).min(76),
+        main.height.saturating_sub(2).min(16),
+    );
+    let lines = state.onboarding.lines(
+        usize::from(area.width.saturating_sub(2)),
+        usize::from(area.height.saturating_sub(2)),
+        theme,
+    );
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::Onboarding,
+        area,
+        lines,
+        " Onboarding ",
+        theme,
     );
 }
 

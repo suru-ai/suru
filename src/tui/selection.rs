@@ -167,6 +167,7 @@ pub(super) enum SelectionSurface {
     Models,
     Themes,
     ModelOptions,
+    Onboarding,
     Completions,
     Subagents,
     SidebarMenu,

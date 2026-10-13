@@ -73,6 +73,7 @@ use super::{
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
+    onboarding::{Advance, Onboarding},
     relay_overlay::{
         ListingLanded, RedemptionLoginLead, RelayLoginAct, RelayLoginFollow, RelayLoginLead,
         RelayOverlay, RelayRequest,
@@ -783,6 +784,12 @@ pub struct TuiState {
     pub(super) serving_listener: ListenerState,
     pub(super) relay_overlay: RelayOverlay,
     pub(super) context_overlay: ContextOverlay,
+    /// Onboarding, open over whatever is on screen while the reader takes it.
+    pub(super) onboarding: Onboarding,
+    /// Whether the Client's own Server has been onboarded, as it last said in
+    /// its health or its broadcast, or as this Client marked it; `None` until
+    /// it has said.
+    local_onboarded: Option<bool>,
     pub(super) sidebar: Sidebar,
     /// The column on the far side of the main view from the Sidebar,
     /// answering for the open Session through its Sections.
@@ -1070,6 +1077,8 @@ impl TuiState {
             serving_listener: ListenerState::default(),
             relay_overlay: RelayOverlay::default(),
             context_overlay: ContextOverlay::default(),
+            onboarding: Onboarding::default(),
+            local_onboarded: None,
             sidebar: Sidebar::new(workspace),
             aside: Aside::new(),
             settings_panel: SettingsPanel::default(),
@@ -1365,6 +1374,7 @@ impl TuiState {
         self.command_mode = CommandMode::Composer;
         self.submission_error = None;
         self.sync_composer_completion();
+        self.offer_onboarding();
     }
 
     /// Remote catalog streams required by the current Outlook and independently
@@ -2317,12 +2327,23 @@ impl TuiState {
                     self.model_picker
                         .refocus(self.landing_agent_selection.as_ref());
                 }
+                self.local_onboarded = Some(health.onboarded);
                 self.identity = Some(health.identity);
                 self.end_recovery(&Outlook::Local);
                 self.manually_stopped = false;
                 self.fatal_error = None;
+                self.offer_onboarding();
             }
-            ManagedEvent::SettingsSnapshot(snapshot) => self.adopt_settings(snapshot),
+            ManagedEvent::SettingsSnapshot(snapshot) => {
+                self.adopt_settings(snapshot);
+                self.offer_onboarding();
+            }
+            // Another Client — or this one — took Onboarding, so whatever of
+            // it this Client has open closes.
+            ManagedEvent::Onboarded => {
+                self.local_onboarded = Some(true);
+                self.onboarding.close();
+            }
             // The lifecycle stream is the local server's, so the catalog it
             // pushes is the Local Outlook's whichever Outlook is on screen.
             ManagedEvent::ModelCatalog(catalog) => {
@@ -2347,8 +2368,6 @@ impl TuiState {
             ManagedEvent::RemoteRecovered => self.end_recovery(&Outlook::Local),
             ManagedEvent::Relays(listing) => self.receive_relays(listing),
             ManagedEvent::ServingListener(state) => self.serving_listener = state,
-            // Nothing of Onboarding is offered yet, so there is nothing to close.
-            ManagedEvent::Onboarded => {}
             ManagedEvent::RemoteFailed { message, .. } => self.settle_remote_failure(message),
             ManagedEvent::ServerShutdown(shutdown) => {
                 self.stop_opening_loading();
@@ -2649,6 +2668,28 @@ impl TuiState {
 
     pub(super) fn application_notice(&self) -> Option<&Notice> {
         self.application_notice.showing()
+    }
+
+    /// Opens Onboarding once the Client holds both its own Server's health
+    /// saying it has not been onboarded and the effective-settings snapshot,
+    /// and only while the Outlook is Local: a Remote's Onboarding is its own
+    /// Server's affair, so a Client viewing one offers it on turning back.
+    fn offer_onboarding(&mut self) {
+        if self.local_onboarded == Some(false)
+            && self.settings_received
+            && self.outlook == Outlook::Local
+            && !self.onboarding.is_open()
+        {
+            self.onboarding.open();
+        }
+    }
+
+    /// Closes Onboarding as taken, finished or left, so it is offered no
+    /// more; the run loop asks the Server to mark itself onboarded.
+    fn take_onboarding(&mut self) -> ApplicationTransition {
+        self.onboarding.close();
+        self.local_onboarded = Some(true);
+        ApplicationTransition::MarkOnboarded
     }
 
     fn remove_deleted_session(&mut self, deleted_session_id: SessionId) {
@@ -3757,6 +3798,8 @@ impl TuiState {
             Some(SelectionSurface::Models)
         } else if self.model_options.is_open() {
             Some(SelectionSurface::ModelOptions)
+        } else if self.onboarding.is_open() {
+            Some(SelectionSurface::Onboarding)
         } else if self.directory_browser.opened_from_list_editor() {
             Some(SelectionSurface::DirectoryBrowser)
         } else if self.settings_panel.numeric_editor_is_open() {
@@ -3818,6 +3861,7 @@ impl TuiState {
             || self.context_overlay.is_open()
             || self.settings_panel.is_open()
             || self.model_options.is_open()
+            || self.onboarding.is_open()
             || self.session_picker.is_open()
             || self.workspace_picker.is_open()
             || self.directory_browser.is_open()
@@ -5332,6 +5376,9 @@ pub enum ApplicationTransition {
     },
     /// One Setting's typed edit, on its way to the server that owns the file.
     MutateSetting(SettingMutation),
+    /// Ask the Client's own Server to mark itself onboarded, as finishing or
+    /// leaving Onboarding does. Every attached Client hears that it is.
+    MarkOnboarded,
     /// Prepare the `/serve` surface, enabling the durable Setting first when
     /// it was off — or asking for it on again where the Serving listener has
     /// failed, so the Server tries once more to Serve — before discovering
@@ -6713,8 +6760,11 @@ impl Application {
     fn handle_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
         // Every command is an interaction, whatever surface raised it and even
         // where an overlay is about to swallow it: the reader looked away from
-        // the Notice either way.
-        self.state.application_notice.dismiss();
+        // the Notice either way. Onboarding alone keeps it, beneath the flow,
+        // to be read once the flow closes.
+        if !self.state.onboarding.is_open() {
+            self.state.application_notice.dismiss();
+        }
         // This machine's own Server going away stands the whole frame down,
         // and only leaving is still answered: a reader must always be able to
         // quit whatever the connection is doing.
@@ -10117,6 +10167,29 @@ impl Application {
                 self.state.serve_overlay.close();
                 Ok(ApplicationTransition::Continue)
             }
+            SemanticCommandId::OnboardingOpen => {
+                self.state.onboarding.open();
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::OnboardingNext => {
+                if !self.state.onboarding.is_open() {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                Ok(match self.state.onboarding.next() {
+                    Advance::Moved => ApplicationTransition::Continue,
+                    Advance::Finished => self.state.take_onboarding(),
+                })
+            }
+            SemanticCommandId::OnboardingBack => {
+                self.state.onboarding.back();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::OnboardingLeave => Ok(if self.state.onboarding.is_open() {
+                self.state.take_onboarding()
+            } else {
+                ApplicationTransition::Continue
+            }),
             SemanticCommandId::RelayOpen => {
                 let request = self.state.relay_overlay.open();
                 self.state.command_mode = CommandMode::Composer;
@@ -11410,7 +11483,11 @@ impl Application {
     /// the Notice standing. Reports whether anything on screen changed, so a
     /// caller that draws on demand knows to redraw.
     pub fn note_interaction(&mut self, event: &InputEvent) -> bool {
-        is_reader_interaction(event) && self.state.application_notice.dismiss()
+        // A Notice stays beneath Onboarding, read once the flow has closed
+        // rather than put away by the keys the flow takes.
+        is_reader_interaction(event)
+            && !self.state.onboarding.is_open()
+            && self.state.application_notice.dismiss()
     }
 
     /// The lapses of a Relay's Login whose Notice this Client has heard asked
@@ -11616,6 +11693,9 @@ impl Application {
                 SelectionSurface::Themes => return command_for_theme_picker_event(event),
                 SelectionSurface::Models => return command_for_model_picker_event(event),
                 SelectionSurface::ModelOptions => return command_for_model_options_event(event),
+                SelectionSurface::Onboarding => {
+                    return self.state.onboarding.command_for_event(event);
+                }
                 SelectionSurface::NumericEditor => {
                     return command_for_numeric_editor_event(event);
                 }

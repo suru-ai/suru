@@ -44,8 +44,8 @@ use uuid::Uuid;
 mod support;
 
 use support::{
-    detached_servers::DetachedServers, read_runtime_descriptor, receive_initial_state,
-    request_server_shutdown, write_runtime_descriptor,
+    detached_servers::DetachedServers, mark_onboarded, read_runtime_descriptor,
+    receive_initial_state, request_server_shutdown, write_runtime_descriptor,
 };
 
 fn suru_binary_build_identity() -> String {
@@ -2136,12 +2136,7 @@ async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
 async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
     let servers = DetachedServers::new();
     let channel = "attached-tui-manual-stop-test";
-    let started = run_server_cli(&servers, channel, "start").await;
-    assert!(
-        started.status.success(),
-        "server start failed: {}",
-        String::from_utf8_lossy(&started.stderr)
-    );
+    start_server_for_tui(&servers, channel).await;
 
     let mut tui = AttachedTui::spawn(&servers, channel);
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2173,12 +2168,7 @@ async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
 async fn clean_tui_exit_restores_the_terminal() {
     let servers = DetachedServers::new();
     let channel = "clean-tui-exit-test";
-    let started = run_server_cli(&servers, channel, "start").await;
-    assert!(
-        started.status.success(),
-        "server start failed: {}",
-        String::from_utf8_lossy(&started.stderr)
-    );
+    start_server_for_tui(&servers, channel).await;
 
     let mut tui = AttachedTui::spawn(&servers, channel);
     // Raw mode is taken before the TUI draws anything, so a frame on the screen
@@ -2329,6 +2319,22 @@ async fn run_server_cli_with_env(
     let mut process = server_cli(servers, channel, command);
     process.env(key, value);
     settle_server_cli(process, servers.state_dir(), channel, command).await
+}
+
+/// Starts the detached Server an [`AttachedTui`] attaches to, marked onboarded
+/// as a Client marks it once its reader takes Onboarding, so the TUI opens on
+/// the Landing rather than on the flow.
+async fn start_server_for_tui(servers: &DetachedServers, channel: &str) {
+    let started = run_server_cli(servers, channel, "start").await;
+    assert!(
+        started.status.success(),
+        "server start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    mark_onboarded(&read_runtime_descriptor(
+        servers.state_dir().join(channel).join("runtime.json"),
+    ))
+    .await;
 }
 
 async fn run_server_cli(
