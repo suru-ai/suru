@@ -1,5 +1,7 @@
 //! A Server knows whether it has been onboarded, says so in its health, and
-//! tells every Client attached to it the moment a Client marks it so.
+//! tells every Client attached to it the moment a Client marks it so. These
+//! tests take their Servers as they come, never onboarded, rather than as the
+//! rest of the suite takes them.
 use super::*;
 use crate::support::PROGRESS_DEADLINE;
 use suru::protocol::RuntimeDescriptor;
@@ -53,7 +55,9 @@ async fn a_fresh_server_is_onboarded_once_a_client_marks_it_and_stays_so_across_
     let config = ServerConfig::new(state_dir.path(), channel)
         .expect("configure server")
         .with_data_dir(data_dir.path());
-    let original = server::spawn(config.clone()).await.expect("spawn server");
+    let original = server::spawn_not_onboarded(config.clone())
+        .await
+        .expect("spawn server");
     let (mut marking, opening) = attach(state_dir.path(), channel).await;
     let (mut onlooker, _) = attach(state_dir.path(), channel).await;
     assert!(!opening.onboarded, "a fresh Server has not been onboarded");
@@ -73,7 +77,9 @@ async fn a_fresh_server_is_onboarded_once_a_client_marks_it_and_stays_so_across_
     drop(onlooker);
     original.shutdown().await.expect("stop original server");
 
-    let replacement = server::spawn(config).await.expect("respawn server");
+    let replacement = server::spawn_not_onboarded(config)
+        .await
+        .expect("respawn server");
     let (client, reopening) = attach(state_dir.path(), channel).await;
     assert!(reopening.onboarded, "the fact survives a restart");
     client
@@ -95,7 +101,7 @@ async fn an_unreadable_onboarded_record_falls_back_to_not_onboarded_without_bloc
         .expect("configure server")
         .with_data_dir(data_dir.path());
     let database_path = config.data_dir().join("suru.db");
-    let original = server::spawn(config.clone())
+    let original = server::spawn_not_onboarded(config.clone())
         .await
         .expect("spawn server to migrate database");
     original.shutdown().await.expect("stop original server");
@@ -104,7 +110,7 @@ async fn an_unreadable_onboarded_record_falls_back_to_not_onboarded_without_bloc
         "INSERT INTO onboarded (singleton, record) VALUES (1, 'not-json');",
     );
 
-    let replacement = server::spawn(config)
+    let replacement = server::spawn_not_onboarded(config)
         .await
         .expect("an unreadable record must not block startup");
     assert!(

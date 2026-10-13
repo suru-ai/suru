@@ -23,13 +23,19 @@ use suru::{
         UpdateApprovalPostureRequest, Way, WorkspaceDescription,
     },
     provider::ProviderEvent,
-    server::{self, DirectProxies, ServerConfig, ServerTimings},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Duration, timeout};
 
 #[allow(dead_code)]
 mod support;
+
+// Every way of spawning a Server, each marking it onboarded unless a test of
+// Onboarding asks otherwise; not every one is used.
+#[allow(dead_code)]
+#[path = "server_integration/server.rs"]
+mod server;
+use server::{DirectProxies, ServerConfig, ServerTimings};
 
 #[path = "server_integration/checkouts.rs"]
 mod checkout_observation;
