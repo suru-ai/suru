@@ -1851,7 +1851,7 @@ fn on_the_derivation_step(workspace: &Path, settings: EffectiveSettings) -> Appl
     application
 }
 
-/// The row of the Derivation step focus stands on.
+/// The row of the Derivation step Row Focus stands on.
 fn focused_row(application: &Application) -> String {
     let rows = rendered_application_rows_at(application, 100, 24);
     rows.iter()
@@ -2063,7 +2063,7 @@ fn a_model_with_model_options_opens_them_over_the_step_and_pins_only_what_was_ch
 }
 
 #[test]
-fn taking_onboarding_again_rests_the_cursor_on_the_derivation_value_in_force() {
+fn taking_onboarding_again_rests_row_focus_on_the_derivation_value_in_force() {
     let workspace = workspace_dir();
     let pinned = cheap_selection(vec![ModelOptionSelection {
         id: ModelOptionId::new("fast"),
@@ -2084,7 +2084,7 @@ fn taking_onboarding_again_rests_the_cursor_on_the_derivation_value_in_force() {
         let row = focused_row(&application);
         assert!(
             row.contains(focused) && row.contains("current"),
-            "{errand:?} is under the cursor and marked as the value in force: {row}"
+            "{errand:?} has Row Focus and is marked as the value in force: {row}"
         );
     }
 
@@ -2142,5 +2142,353 @@ fn a_provider_whose_listing_failed_is_retried_from_the_derivation_step() {
     assert!(
         listed.contains("GPT-5 Mini") && !listed.contains("Retry Codex"),
         "the step lists what the retry found: {listed}"
+    );
+}
+
+#[test]
+fn a_warning_or_refreshing_provider_still_offers_its_models_on_the_derivation_step() {
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    deliver_settings(
+        &mut application,
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    let mut catalog = pushed_catalog();
+    catalog.providers[0].status = ProviderCatalogStatus::Warning {
+        message: "codex is older than Suru prefers".to_owned(),
+    };
+    catalog.providers[2] = ProviderModelCatalog {
+        status: ProviderCatalogStatus::Refreshing,
+        ..unavailable_claude()
+    };
+    deliver_catalog(&mut application, catalog);
+    press(&mut application, KeyCode::Enter);
+
+    let shown = screen(&application);
+    assert!(
+        shown.contains("Provider Codex") && shown.contains("GPT-5 Mini"),
+        "a Provider with a warning is usable, so its Models are offered: {shown}"
+    );
+    assert!(
+        shown.contains("Provider Claude · refreshing") && shown.contains("Claude Model"),
+        "as are those of one whose catalog is being read again: {shown}"
+    );
+}
+
+/// The Local Server's catalog with Claude's listing failed, so its row is a
+/// retry.
+fn local_catalog_with_claude_failing() -> ModelCatalog {
+    let mut catalog = pushed_catalog();
+    catalog.providers[2] = ProviderModelCatalog {
+        models: Vec::new(),
+        status: ProviderCatalogStatus::Failed {
+            message: "claude timed out".to_owned(),
+        },
+        ..unavailable_claude()
+    };
+    catalog
+}
+
+#[test]
+fn the_derivation_step_lists_and_retries_the_clients_own_server_while_a_remote_is_viewed() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    deliver_settings(
+        &mut application,
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    deliver_catalog(&mut application, local_catalog_with_claude_failing());
+    turn_outlook(&mut application, KeyCode::Down);
+    let studio = Outlook::Remote("studio".to_owned());
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: studio.clone(),
+            event: ManagedEvent::ModelCatalog(ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    display_name: "Codex".to_owned(),
+                    models: vec![model_descriptor(
+                        "codex",
+                        "studio-model",
+                        "Studio Model",
+                        true,
+                        ModelAvailability::Available,
+                    )],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            }),
+        })
+        .expect("hear the Remote's catalog");
+
+    type_terminal_text(&mut application, "/onboarding");
+    press(&mut application, KeyCode::Enter);
+    press(&mut application, KeyCode::Enter);
+    let shown = screen(&application);
+    assert!(shown.contains("Step 2 of 3"), "{shown}");
+    assert!(
+        shown.contains("GPT-5 Mini") && !shown.contains("Studio Model"),
+        "the Models offered are the Client's own Server's, whose Setting is pinned: {shown}"
+    );
+
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Down);
+    assert!(
+        focused_row(&application).contains("Retry Claude"),
+        "{}",
+        focused_row(&application)
+    );
+    let ApplicationTransition::ListModels(request) = press(&mut application, KeyCode::Enter) else {
+        panic!("the retry row lists the Model Catalog again");
+    };
+    assert_eq!(
+        request.outlook(),
+        &Outlook::Local,
+        "and lists the Client's own Server's"
+    );
+    let mut listed = pushed_catalog();
+    listed.providers[2].status = ProviderCatalogStatus::Fresh;
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: listed,
+        })
+        .expect("receive the Local catalog listed again");
+    let relisted = screen(&application);
+    assert!(
+        relisted.contains("Claude Model") && !relisted.contains("Studio Model"),
+        "what the retry found is the step's: {relisted}"
+    );
+
+    for _ in 0..3 {
+        press(&mut application, KeyCode::Down);
+    }
+    assert!(
+        focused_row(&application).contains("GPT-5 ·"),
+        "{}",
+        focused_row(&application)
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        derivation_pin(DerivationErrand::Pinned(AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("gpt-5"),
+            options: Vec::new(),
+        }))
+    );
+}
+
+/// A fresh Server's Client with the Model Options of GPT-5 Mini open over
+/// Onboarding's Derivation step.
+fn choosing_options_on_the_derivation_step(workspace: &Path) -> Application {
+    let mut application = on_the_derivation_step(
+        workspace,
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    for _ in 0..3 {
+        press(&mut application, KeyCode::Down);
+    }
+    press(&mut application, KeyCode::Enter);
+    assert!(
+        screen(&application).contains("Model Options"),
+        "{}",
+        screen(&application)
+    );
+    application
+}
+
+fn apply_options(application: &mut Application) -> ApplicationTransition {
+    press_with(application, KeyCode::Enter, KeyModifiers::CONTROL)
+}
+
+#[test]
+fn the_options_onboarding_opened_close_with_it_when_another_client_takes_it() {
+    let workspace = workspace_dir();
+    let mut application = choosing_options_on_the_derivation_step(workspace.path());
+
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Onboarded(true)))
+        .expect("hear that another Client onboarded the Server");
+    let after = screen(&application);
+    assert!(
+        !onboarding_shown(&application) && !after.contains("Model Options"),
+        "nothing the flow offered stands to be pinned: {after}"
+    );
+    assert_ne!(
+        apply_options(&mut application),
+        derivation_pin(DerivationErrand::Pinned(cheap_selection(Vec::new())))
+    );
+}
+
+#[test]
+fn the_options_onboarding_opened_close_with_it_when_it_is_left() {
+    let workspace = workspace_dir();
+    let mut application = choosing_options_on_the_derivation_step(workspace.path());
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::OnboardingLeave,
+            )))
+            .expect("leave Onboarding"),
+        ApplicationTransition::MarkOnboarded
+    );
+    let after = screen(&application);
+    assert!(
+        !onboarding_shown(&application) && !after.contains("Model Options"),
+        "{after}"
+    );
+}
+
+#[test]
+fn applying_options_opened_elsewhere_does_not_answer_the_derivation_step() {
+    let workspace = workspace_dir();
+    let mut application = choosing_options_on_the_derivation_step(workspace.path());
+    press(&mut application, KeyCode::Esc);
+    assert!(screen(&application).contains("Step 2 of 3"));
+
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelOptions,
+        )))
+        .expect("open the Agent's Model Options")
+    else {
+        panic!("the Agent's Model Options read the catalog first");
+    };
+    let mut cheap_by_default = cheap_model();
+    cheap_by_default.is_default = true;
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    display_name: "Codex".to_owned(),
+                    models: vec![cheap_by_default],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("receive the catalog");
+    assert!(
+        screen(&application).contains("Model Options"),
+        "{}",
+        screen(&application)
+    );
+
+    let applied = apply_options(&mut application);
+    assert!(
+        !matches!(applied, ApplicationTransition::MutateSetting(_)),
+        "the Agent's options pin nothing: {applied:?}"
+    );
+    assert!(
+        screen(&application).contains("Step 2 of 3"),
+        "and leave the Derivation step unanswered: {}",
+        screen(&application)
+    );
+}
+
+#[test]
+fn options_for_a_provider_turned_off_or_found_unavailable_meanwhile_refuse_to_apply() {
+    let workspace = workspace_dir();
+    let mut application = choosing_options_on_the_derivation_step(workspace.path());
+    let mut settings = settings_deriving_with(DerivationErrand::FollowSession);
+    settings.provider.codex.enabled = false;
+    deliver_settings(&mut application, settings);
+    assert!(
+        screen(&application).contains("unavailable"),
+        "{}",
+        screen(&application)
+    );
+    assert_eq!(
+        apply_options(&mut application),
+        ApplicationTransition::Continue,
+        "a Model of a Provider turned off cannot be pinned"
+    );
+
+    deliver_settings(
+        &mut application,
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    let mut catalog = pushed_catalog();
+    catalog.providers[0].status = ProviderCatalogStatus::Unavailable {
+        reason: ProviderUnavailability::NotSignedIn,
+        message: "codex is signed out".to_owned(),
+        fix: "run `codex login`".to_owned(),
+    };
+    deliver_catalog(&mut application, catalog);
+    assert_eq!(
+        apply_options(&mut application),
+        ApplicationTransition::Continue,
+        "nor one of a Provider found unavailable"
+    );
+
+    deliver_catalog(&mut application, pushed_catalog());
+    assert_eq!(
+        apply_options(&mut application),
+        derivation_pin(DerivationErrand::Pinned(cheap_selection(Vec::new()))),
+        "and once it is usable again the options apply"
+    );
+    assert!(screen(&application).contains("Step 3 of 3"));
+}
+
+#[test]
+fn an_acknowledged_pin_moves_the_mark_of_the_value_in_force() {
+    let workspace = workspace_dir();
+    let mut application = on_the_derivation_step(
+        workspace.path(),
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    press(&mut application, KeyCode::Down);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        derivation_pin(DerivationErrand::Off)
+    );
+    application
+        .handle_event(ApplicationEvent::SettingMutated(SettingsSnapshot {
+            settings: settings_deriving_with(DerivationErrand::Off),
+            pinned: Vec::new(),
+            diagnostics: Vec::new(),
+        }))
+        .expect("hear the Server accept the pin");
+
+    press(&mut application, KeyCode::Left);
+    let rows = rendered_application_rows_at(&application, 100, 24);
+    let row = |label: &str| {
+        rows.iter()
+            .find(|row| row.contains(label))
+            .unwrap_or_else(|| panic!("no row reads {label:?}: {rows:#?}"))
+            .clone()
+    };
+    assert!(row("Off").contains("current"), "{rows:#?}");
+    assert!(!row("Provider's default").contains("current"), "{rows:#?}");
+}
+
+#[test]
+fn row_focus_stays_in_view_when_models_are_listed_above_it() {
+    let workspace = workspace_dir();
+    let mut application = on_the_derivation_step(
+        workspace.path(),
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    for _ in 0..3 {
+        press(&mut application, KeyCode::Down);
+    }
+    assert!(focused_row(&application).contains("GPT-5 Mini"));
+
+    let mut catalog = pushed_catalog();
+    catalog.providers[0].models.extend((1..=12).map(|index| {
+        model_descriptor(
+            "codex",
+            &format!("alpha-{index:02}"),
+            &format!("Alpha {index:02}"),
+            false,
+            ModelAvailability::Available,
+        )
+    }));
+    deliver_catalog(&mut application, catalog);
+    assert!(
+        focused_row(&application).contains("GPT-5 Mini"),
+        "Row Focus stays on its Model, and in view: {}",
+        screen(&application)
     );
 }

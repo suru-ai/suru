@@ -213,9 +213,9 @@ pub enum SemanticCommandId {
     OnboardingBack,
     /// Leaves Onboarding from any step, which counts as taking it.
     OnboardingLeave,
-    /// Moves the cursor of Onboarding's Derivation step to the row above.
+    /// Moves Row Focus on Onboarding's Derivation step to the row above.
     OnboardingDerivationPrevious,
-    /// Moves the cursor of Onboarding's Derivation step to the row below.
+    /// Moves Row Focus on Onboarding's Derivation step to the row below.
     OnboardingDerivationNext,
     OnboardingDerivationPageUp,
     OnboardingDerivationPageDown,

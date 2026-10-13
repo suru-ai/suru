@@ -30,7 +30,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     protocol::{
-        AgentSelection, DerivationErrand, EffectiveSettings, ModelDescriptor, Outlook,
+        AgentSelection, DerivationErrand, EffectiveSettings, ModelDescriptor, ModelId, Outlook,
         ProviderCatalogStatus, ProviderId, ProviderUnavailability, SettingMutation,
     },
     provider::{BuiltInProvider, built_in_providers},
@@ -127,8 +127,8 @@ pub(super) enum Advance {
     /// whose listing failed is retried; it stays on show.
     Relist,
     /// The step on show may not be passed yet, so it stays: the Providers
-    /// step says why, and the Derivation step has nothing under the cursor
-    /// to answer with.
+    /// step says why, and the Derivation step has nothing under Row Focus to
+    /// answer with.
     Held,
     /// The last step was confirmed, so the flow is over and closed.
     Finished,
@@ -608,12 +608,9 @@ const NAMED_DERIVATIONS: [(DerivationErrand, &str); 2] = [
 #[derive(Clone, Debug)]
 struct DerivationStep {
     list: AgentSelectionList,
-    /// The value the Setting holds, which the list marks and the cursor first
+    /// The value the Setting holds, which the list marks and Row Focus first
     /// rests on.
     in_force: DerivationErrand,
-    /// Whether the Model Options overlay stands over the step for the Model
-    /// the reader chose, so that applying them answers it.
-    choosing_options: bool,
 }
 
 impl Default for DerivationStep {
@@ -623,7 +620,6 @@ impl Default for DerivationStep {
                 NAMED_DERIVATIONS.iter().map(|(_, label)| *label).collect(),
             ),
             in_force: DerivationErrand::default(),
-            choosing_options: false,
         }
     }
 }
@@ -635,8 +631,8 @@ impl DerivationStep {
     /// The keys this step teaches before the ones every step shares.
     const KEYS: [&'static str; 1] = ["↑↓ Move"];
 
-    /// Lists afresh what the Client's own Server offers, the cursor on the
-    /// value the Setting holds.
+    /// Lists afresh what the Client's own Server offers, with Row Focus on
+    /// the value the Setting holds.
     fn open(&mut self, server: OwnServer<'_>) {
         self.in_force = server.settings.derivation.errand.clone();
         self.list
@@ -644,7 +640,7 @@ impl DerivationStep {
     }
 
     /// Follows the Client's own Server as it changes: a Provider turned off
-    /// or found unavailable since leaves the list, and the cursor stays where
+    /// or found unavailable since leaves the list, and Row Focus stays where
     /// the reader moved it.
     fn adopt(&mut self, server: OwnServer<'_>) {
         self.in_force = server.settings.derivation.errand.clone();
@@ -669,11 +665,10 @@ impl DerivationStep {
         Some(CommandId::InvokeSemantic(command))
     }
 
-    /// What confirming the row under the cursor comes to: the pin of a named
-    /// value or of a Model without Model Options, the Model Options of one
-    /// with any to choose first, or a failed listing to retry.
-    fn confirm(&mut self) -> Advance {
-        self.choosing_options = false;
+    /// What confirming the row Row Focus stands on comes to: the pin of a
+    /// named value or of a Model without Model Options, the Model Options of
+    /// one with any to choose first, or a failed listing to retry.
+    fn confirm(&self) -> Advance {
         match self.list.choose() {
             Some(AgentSelectionAction::Named(index)) => {
                 Advance::Pinned(derivation_pin(NAMED_DERIVATIONS[index].0.clone()))
@@ -682,7 +677,6 @@ impl DerivationStep {
                 Advance::Pinned(pinned_selection(model.default_agent_selection()))
             }
             Some(AgentSelectionAction::Select(model)) => {
-                self.choosing_options = true;
                 let current = match &self.in_force {
                     DerivationErrand::Pinned(selection) => Some(selection.clone()),
                     DerivationErrand::FollowSession | DerivationErrand::Off => None,
@@ -864,15 +858,31 @@ impl Onboarding {
     /// Moves on from the Derivation step once the Model Options it opened
     /// over itself are applied, which answers it as confirming a Model
     /// without any does.
-    pub(super) fn settle_options(&mut self) {
-        if self.step == Some(Step::Derivation)
-            && std::mem::take(&mut self.derivation.choosing_options)
-        {
+    pub(super) fn answer_derivation(&mut self) {
+        if self.step == Some(Step::Derivation) {
             self.move_on();
         }
     }
 
-    /// Moves the cursor of the Derivation step's list, while it is on show.
+    /// The Model as the Derivation step offers it, while the flow is open and
+    /// its Provider is one the user has left on and can use.
+    pub(super) fn offered_model(
+        &self,
+        provider: &ProviderId,
+        model: &ModelId,
+    ) -> Option<&ModelDescriptor> {
+        if !self.is_open() {
+            return None;
+        }
+        self.derivation
+            .list
+            .provider(provider)?
+            .models
+            .iter()
+            .find(|candidate| &candidate.id == model)
+    }
+
+    /// Moves Row Focus on the Derivation step's list, while it is on show.
     pub(super) fn move_derivation(&mut self, movement: DerivationMove) {
         if self.step != Some(Step::Derivation) {
             return;
@@ -1110,7 +1120,7 @@ impl Onboarding {
     }
 }
 
-/// Which way the Derivation step's cursor moves.
+/// Which way Row Focus moves on the Derivation step.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum DerivationMove {
     Previous,

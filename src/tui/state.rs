@@ -71,7 +71,7 @@ use super::{
         command_for_theme_picker_event, command_for_workspace_description_editor_event,
         command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
     },
-    model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
+    model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
     onboarding::{Advance, DerivationMove, Onboarding, Opening, OwnServer},
@@ -1385,7 +1385,7 @@ impl TuiState {
         if self.outlook == Outlook::Local {
             self.offer_onboarding();
         } else {
-            self.onboarding.withdraw();
+            self.withdraw_onboarding();
         }
     }
 
@@ -1861,7 +1861,9 @@ impl TuiState {
     fn apply_origin_catalog(&mut self, outlook: &Outlook, event: ManagedEvent) {
         if let ManagedEvent::ModelCatalog(catalog) = event {
             self.model_picker.adopt_catalog(outlook.clone(), catalog);
-            self.refresh_onboarding();
+            if *outlook == Outlook::Local {
+                self.refresh_onboarding();
+            }
             return;
         }
         self.adopt_workspace_paths(outlook, &event);
@@ -2352,7 +2354,6 @@ impl TuiState {
             }
             ManagedEvent::SettingsSnapshot(snapshot) => {
                 self.adopt_settings(snapshot);
-                self.refresh_onboarding();
                 self.offer_onboarding();
             }
             // Within a connection a Server only ever comes to be onboarded, so
@@ -2677,6 +2678,7 @@ impl TuiState {
         self.session_picker.adopt_settings(&self.settings);
         self.aside.adopt_settings(&self.settings);
         self.application_notice.receive(&snapshot.diagnostics);
+        self.refresh_onboarding();
     }
 
     pub(super) fn settings(&self) -> &EffectiveSettings {
@@ -2698,7 +2700,7 @@ impl TuiState {
     fn learn_onboarded(&mut self, onboarded: bool) {
         self.local_onboarded = Some(onboarded);
         if onboarded {
-            self.onboarding.withdraw();
+            self.withdraw_onboarding();
         } else {
             self.offer_onboarding();
         }
@@ -2721,16 +2723,51 @@ impl TuiState {
     }
 
     /// Opens Onboarding at its first step with the values in force in place.
+    /// Onboarding settles the Client's own Server whichever Outlook is on
+    /// screen, so the Models it offers are that Server's too.
     fn open_onboarding(&mut self, opening: Opening) {
         self.onboarding
             .open(opening, OwnServer::of(&self.settings, &self.model_picker));
     }
 
     /// Lets an open Onboarding follow its own Server's settings and Model
-    /// Catalog as the Client hears them change.
+    /// Catalog as the Client hears them change. Model Options it opened over
+    /// itself choose among what it offers, so a Model it no longer offers —
+    /// its Provider turned off or found unavailable — refuses to apply until
+    /// it is offered again.
     fn refresh_onboarding(&mut self) {
         self.onboarding
             .adopt(OwnServer::of(&self.settings, &self.model_picker));
+        if self.model_options.owner() != ModelOptionsOwner::OnboardingDerivation {
+            return;
+        }
+        let Some(model) = self.model_options.model() else {
+            return;
+        };
+        match self.onboarding.offered_model(&model.provider, &model.id) {
+            Some(offered) => {
+                let offered = offered.clone();
+                self.model_options.refresh(offered);
+            }
+            None => self.model_options.mark_model_unavailable(),
+        }
+    }
+
+    /// Withdraws an Onboarding the Client offered, along with whatever it
+    /// opened over itself.
+    fn withdraw_onboarding(&mut self) {
+        self.onboarding.withdraw();
+        self.release_onboarding_options();
+    }
+
+    /// Closes the Model Options Onboarding opened over itself once it is no
+    /// longer open to be answered, so nothing it offered can still be pinned.
+    fn release_onboarding_options(&mut self) {
+        if !self.onboarding.is_open()
+            && self.model_options.owner() == ModelOptionsOwner::OnboardingDerivation
+        {
+            self.model_options.close();
+        }
     }
 
     /// Closes Onboarding as taken, finished or left, so it is offered no
@@ -2738,6 +2775,7 @@ impl TuiState {
     fn take_onboarding(&mut self) -> ApplicationTransition {
         self.onboarding.close();
         self.onboarding_taken = true;
+        self.release_onboarding_options();
         self.local_onboarded = Some(true);
         ApplicationTransition::MarkOnboarded
     }
@@ -8549,9 +8587,12 @@ impl Application {
                 if model.options.is_empty() {
                     return self.apply_chosen_selection(model.default_agent_selection(), purpose);
                 }
-                self.state
-                    .model_options
-                    .open_for(model, current.as_ref(), purpose);
+                self.state.model_options.open_for(
+                    model,
+                    current.as_ref(),
+                    purpose,
+                    ModelOptionsOwner::Standalone,
+                );
                 Ok(ApplicationTransition::Continue)
             }
             // The picker names no rows of its own above the Models.
@@ -10289,14 +10330,17 @@ impl Application {
                         current,
                         purpose,
                     } => {
-                        self.state
-                            .model_options
-                            .open_for(model, current.as_ref(), purpose);
+                        self.state.model_options.open_for(
+                            model,
+                            current.as_ref(),
+                            purpose,
+                            ModelOptionsOwner::OnboardingDerivation,
+                        );
                         ApplicationTransition::Continue
                     }
-                    Advance::Relist => {
-                        ApplicationTransition::ListModels(self.state.model_picker.begin_refresh())
-                    }
+                    Advance::Relist => ApplicationTransition::ListModels(
+                        self.state.model_picker.begin_refresh_of(Outlook::Local),
+                    ),
                     Advance::Finished => self.state.take_onboarding(),
                 })
             }
@@ -11406,9 +11450,11 @@ impl Application {
             return Ok(ApplicationTransition::Continue);
         };
         let purpose = self.state.model_options.purpose();
+        let owner = self.state.model_options.owner();
         self.state.model_options.close();
-        // Options opened over Onboarding's Derivation step answer it.
-        self.state.onboarding.settle_options();
+        if owner == ModelOptionsOwner::OnboardingDerivation {
+            self.state.onboarding.answer_derivation();
+        }
         self.apply_chosen_selection(selection, purpose)
     }
 
@@ -11504,7 +11550,11 @@ impl Application {
     }
 
     fn reconcile_model_options(&mut self, listing: CatalogListing) {
-        if self.state.model_options.is_open() {
+        // Options Onboarding opened over itself follow what it offers, which
+        // refreshing it reconciles; the cache on screen may be a Remote's.
+        if self.state.model_options.is_open()
+            && self.state.model_options.owner() == ModelOptionsOwner::Standalone
+        {
             let current_model = self
                 .state
                 .model_options

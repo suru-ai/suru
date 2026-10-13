@@ -137,6 +137,18 @@ pub(super) enum AgentSelectionRow<'a> {
     },
 }
 
+impl AgentSelectionRow<'_> {
+    fn is_selected(&self) -> bool {
+        match self {
+            Self::Named { selected, .. }
+            | Self::Model { selected, .. }
+            | Self::Error { selected, .. }
+            | Self::Unavailable { selected, .. } => *selected,
+            Self::Provider { .. } => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum AgentSelectionAction {
     /// One of the rows the host named, by its place among them.
@@ -255,12 +267,14 @@ impl AgentSelectionList {
     /// Focus stays where the reader moved it while that row is still listed,
     /// and otherwise goes to `current`.
     pub(super) fn relist(&mut self, providers: Vec<ProviderModels>, current: Option<InForce<'_>>) {
-        let focused = self.selected.clone();
+        let focused = self.focus_entry();
         self.providers = providers;
         self.focus(current, self.cursor_moved);
-        // Focus carried to a choice the rows only now list brings the window
-        // along, as the keys would have.
-        if self.selected != focused {
+        // Focus the new rows put elsewhere — carried to a choice they only
+        // now list, or pushed along by rows listed above it — brings the
+        // window along as the keys would have, so focus is never left out of
+        // view for Enter to act on.
+        if self.focus_entry() != focused {
             self.window.reveal();
         }
     }
@@ -346,13 +360,7 @@ impl AgentSelectionList {
         current: Option<InForce<'_>>,
     ) -> impl Iterator<Item = AgentSelectionRow<'_>> {
         let rows = self.rows(current);
-        let selected = rows.iter().position(|row| match row {
-            AgentSelectionRow::Named { selected, .. }
-            | AgentSelectionRow::Model { selected, .. }
-            | AgentSelectionRow::Error { selected, .. }
-            | AgentSelectionRow::Unavailable { selected, .. } => *selected,
-            AgentSelectionRow::Provider { .. } => false,
-        });
+        let selected = rows.iter().position(AgentSelectionRow::is_selected);
         // A Provider's heading is a Row the keys step over, so it comes into
         // view with the Models around it rather than counting as one of them.
         let entries = rows
@@ -474,6 +482,14 @@ impl AgentSelectionList {
             }
         }
         AgentSelectionLines { lines, wrapped }
+    }
+
+    /// Where focus stands among the entries the window counts, Provider
+    /// headings included.
+    fn focus_entry(&self) -> Option<usize> {
+        self.rows(None)
+            .iter()
+            .position(AgentSelectionRow::is_selected)
     }
 
     pub(super) fn has_rows(&self) -> bool {

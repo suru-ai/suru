@@ -20,9 +20,23 @@ struct ChoicePicker {
     selected: ChoiceValue,
 }
 
+/// The surface the open options answer beyond the Selection they settle on.
+/// The surface that opens them names it, and every way of closing them or
+/// opening them again forgets it, so applying options opened elsewhere never
+/// answers it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum ModelOptionsOwner {
+    /// Nothing beyond the Selection.
+    #[default]
+    Standalone,
+    /// Onboarding's Derivation step, which applying them answers.
+    OnboardingDerivation,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct ModelOptions {
     purpose: ModelPickerPurpose,
+    owner: ModelOptionsOwner,
     model: Option<ModelDescriptor>,
     staged: Option<AgentSelection>,
     selected: usize,
@@ -53,7 +67,12 @@ pub(super) struct ModelOptionChoiceRow {
 
 impl ModelOptions {
     pub(super) fn open(&mut self, model: ModelDescriptor, current: Option<&AgentSelection>) {
-        self.open_for(model, current, ModelPickerPurpose::AgentSelection);
+        self.open_for(
+            model,
+            current,
+            ModelPickerPurpose::AgentSelection,
+            ModelOptionsOwner::Standalone,
+        );
     }
 
     pub(super) fn open_for(
@@ -61,9 +80,11 @@ impl ModelOptions {
         model: ModelDescriptor,
         current: Option<&AgentSelection>,
         purpose: ModelPickerPurpose,
+        owner: ModelOptionsOwner,
     ) {
         let staged = stage_selection(&model, current, purpose);
         self.purpose = purpose;
+        self.owner = owner;
         self.model = Some(model);
         self.staged = Some(staged);
         self.selected = 0;
@@ -75,8 +96,13 @@ impl ModelOptions {
         self.purpose
     }
 
+    pub(super) fn owner(&self) -> ModelOptionsOwner {
+        self.owner
+    }
+
     pub(super) fn close(&mut self) {
         self.purpose = ModelPickerPurpose::default();
+        self.owner = ModelOptionsOwner::default();
         self.model = None;
         self.staged = None;
         self.selected = 0;
