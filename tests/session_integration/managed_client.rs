@@ -1277,8 +1277,9 @@ async fn reconnecting_fixture_catalog_events(
 }
 
 /// The lifecycle-stream opening every conforming server sends: the connected
-/// comment, the effective-settings snapshot, the Model Catalog, then the
-/// Server's Relays.
+/// comment, the effective-settings snapshot, the Model Catalog, the Server's
+/// Relays, how its Serving listener stands, then whether it has been
+/// onboarded.
 fn fixture_lifecycle_stream()
 -> impl futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static {
     stream::once(async move { Ok::<_, Infallible>(Event::default().comment("connected")) })
@@ -1318,6 +1319,14 @@ fn fixture_lifecycle_stream()
                     .event(suru::protocol::SERVING_LISTENER_EVENT)
                     .json_data(suru::protocol::ListenerState::Off)
                     .expect("serialize fixture Serving listener state"),
+            )
+        }))
+        .chain(stream::once(async move {
+            Ok::<_, Infallible>(
+                Event::default()
+                    .event(suru::protocol::ONBOARDED_EVENT)
+                    .json_data(true)
+                    .expect("serialize whether the fixture has been onboarded"),
             )
         }))
 }

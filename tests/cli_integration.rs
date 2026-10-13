@@ -3320,6 +3320,9 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
         .chain(stream::once(std::future::ready(Ok::<_, Infallible>(
             fixture_serving_listener_event(),
         ))))
+        .chain(stream::once(std::future::ready(Ok::<_, Infallible>(
+            fixture_onboarded_event(),
+        ))))
     };
     let response = match state.event_behavior {
         FixtureEventBehavior::StayConnected => {
@@ -3434,6 +3437,15 @@ fn fixture_serving_listener_event() -> Event {
         .event(suru::protocol::SERVING_LISTENER_EVENT)
         .json_data(suru::protocol::ListenerState::Off)
         .expect("serialize fixture Serving listener state")
+}
+
+/// Whether the Server has been onboarded, which follows how its Serving
+/// listener stands on every connect: a fixture has been.
+fn fixture_onboarded_event() -> Event {
+    Event::default()
+        .event(suru::protocol::ONBOARDED_EVENT)
+        .json_data(true)
+        .expect("serialize whether the fixture has been onboarded")
 }
 
 fn fixture_authenticated(headers: &HeaderMap, token: &str) -> bool {
@@ -3628,6 +3640,9 @@ async fn build_replacement_events(
             }))
             .chain(stream::once(async move {
                 Ok::<_, Infallible>(fixture_serving_listener_event())
+            }))
+            .chain(stream::once(async move {
+                Ok::<_, Infallible>(fixture_onboarded_event())
             }));
     let shutdowns = stream::unfold(
         state.shutdown_intent.subscribe(),
