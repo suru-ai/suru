@@ -242,7 +242,7 @@ fn the_header_counts_the_steps_as_next_and_back_move_between_them() {
     press(&mut application, KeyCode::Left);
     assert!(screen(&application).contains("Step 1 of 3"));
     press(&mut application, KeyCode::Enter);
-    press(&mut application, KeyCode::Enter);
+    pass_the_derivation_step(&mut application, EffectiveSettings::default());
     let third = screen(&application);
     assert!(third.contains("Step 3 of 3"), "{third}");
     assert!(third.contains("Icons"), "{third}");
@@ -256,8 +256,11 @@ fn leaving_at_any_step_marks_the_server_onboarded_and_closes_for_good() {
     let workspace = workspace_dir();
     for step in 0..3 {
         let mut application = offered_onboarding(workspace.path());
-        for _ in 0..step {
+        if step >= 1 {
             press(&mut application, KeyCode::Enter);
+        }
+        if step >= 2 {
+            pass_the_derivation_step(&mut application, EffectiveSettings::default());
         }
         assert!(screen(&application).contains(&format!("Step {} of 3", step + 1)));
 
@@ -359,10 +362,9 @@ fn finishing_the_third_step_marks_the_server_onboarded_and_closes() {
         press(&mut application, KeyCode::Enter),
         ApplicationTransition::Continue
     );
-    assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        derivation_pin(DerivationErrand::FollowSession)
-    );
+    let derivation = press(&mut application, KeyCode::Enter);
+    assert_eq!(derivation, derivation_pin(DerivationErrand::FollowSession));
+    settle_mutation(&mut application, &derivation, EffectiveSettings::default());
     assert!(screen(&application).contains("Step 3 of 3"));
     press(&mut application, KeyCode::Down);
     let pin = finish_with(&mut application, true);
@@ -1467,7 +1469,11 @@ fn a_narrow_terminal_teaches_next_or_finish_and_leave_whole_at_every_step() {
             foot.contains(&format!("{go_on} · Esc Leave")) && !foot.contains('…'),
             "step {step} teaches {go_on} beside it: {shown}"
         );
-        press(&mut application, KeyCode::Enter);
+        if step == 2 {
+            pass_the_derivation_step(&mut application, EffectiveSettings::default());
+        } else {
+            press(&mut application, KeyCode::Enter);
+        }
     }
 }
 
@@ -1967,9 +1973,12 @@ fn confirming_the_providers_default_or_off_pins_that_value_and_moves_on_to_icons
         "{}",
         focused_row(&application)
     );
-    assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        derivation_pin(DerivationErrand::FollowSession)
+    let pin = press(&mut application, KeyCode::Enter);
+    assert_eq!(pin, derivation_pin(DerivationErrand::FollowSession));
+    settle_mutation(
+        &mut application,
+        &pin,
+        settings_deriving_with(DerivationErrand::FollowSession),
     );
     assert!(screen(&application).contains("Step 3 of 3"));
 
@@ -1980,9 +1989,12 @@ fn confirming_the_providers_default_or_off_pins_that_value_and_moves_on_to_icons
         "{}",
         focused_row(&application)
     );
-    assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        derivation_pin(DerivationErrand::Off)
+    let pin = press(&mut application, KeyCode::Enter);
+    assert_eq!(pin, derivation_pin(DerivationErrand::Off));
+    settle_mutation(
+        &mut application,
+        &pin,
+        settings_deriving_with(DerivationErrand::Off),
     );
     assert!(screen(&application).contains("Step 3 of 3"));
 }
@@ -2001,13 +2013,23 @@ fn confirming_a_model_without_model_options_pins_it_and_moves_on_to_icons() {
         "{}",
         focused_row(&application)
     );
+    let pin = press(&mut application, KeyCode::Enter);
     assert_eq!(
-        press(&mut application, KeyCode::Enter),
+        pin,
         derivation_pin(DerivationErrand::Pinned(AgentSelection {
             provider: ProviderId::new("codex"),
             model: ModelId::new("gpt-5"),
             options: Vec::new(),
         }))
+    );
+    settle_mutation(
+        &mut application,
+        &pin,
+        settings_deriving_with(DerivationErrand::Pinned(AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("gpt-5"),
+            options: Vec::new(),
+        })),
     );
     assert!(screen(&application).contains("Step 3 of 3"));
 }
@@ -2056,8 +2078,9 @@ fn a_model_with_model_options_opens_them_over_the_step_and_pins_only_what_was_ch
     press(&mut application, KeyCode::Down);
     press(&mut application, KeyCode::Down);
     press(&mut application, KeyCode::Enter);
+    let pin = press_with(&mut application, KeyCode::Enter, KeyModifiers::CONTROL);
     assert_eq!(
-        press_with(&mut application, KeyCode::Enter, KeyModifiers::CONTROL),
+        pin,
         derivation_pin(DerivationErrand::Pinned(cheap_selection(vec![
             ModelOptionSelection {
                 id: ModelOptionId::new("reasoning_effort"),
@@ -2067,6 +2090,18 @@ fn a_model_with_model_options_opens_them_over_the_step_and_pins_only_what_was_ch
             }
         ]))),
         "the chosen Reasoning is pinned, and the untouched Speed follows the Model's default"
+    );
+    settle_mutation(
+        &mut application,
+        &pin,
+        settings_deriving_with(DerivationErrand::Pinned(cheap_selection(vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("high"),
+                },
+            },
+        ]))),
     );
     let moved_on = screen(&application);
     assert!(
@@ -2436,10 +2471,16 @@ fn options_for_a_provider_turned_off_or_found_unavailable_meanwhile_refuse_to_ap
     );
 
     deliver_catalog(&mut application, pushed_catalog());
+    let pin = apply_options(&mut application);
     assert_eq!(
-        apply_options(&mut application),
+        pin,
         derivation_pin(DerivationErrand::Pinned(cheap_selection(Vec::new()))),
         "and once it is usable again the options apply"
+    );
+    settle_mutation(
+        &mut application,
+        &pin,
+        settings_deriving_with(DerivationErrand::Pinned(cheap_selection(Vec::new()))),
     );
     assert!(screen(&application).contains("Step 3 of 3"));
 }
@@ -2635,8 +2676,9 @@ fn the_agents_options_asked_for_earlier_do_not_replace_the_derivation_steps() {
         "the step's options, and what the reader chose in them, stand: {}",
         screen(&application)
     );
+    let pin = apply_options(&mut application);
     assert_eq!(
-        apply_options(&mut application),
+        pin,
         derivation_pin(DerivationErrand::Pinned(cheap_selection(vec![
             ModelOptionSelection {
                 id: ModelOptionId::new("reasoning_effort"),
@@ -2645,6 +2687,18 @@ fn the_agents_options_asked_for_earlier_do_not_replace_the_derivation_steps() {
                 },
             }
         ])))
+    );
+    settle_mutation(
+        &mut application,
+        &pin,
+        settings_deriving_with(DerivationErrand::Pinned(cheap_selection(vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("high"),
+                },
+            },
+        ]))),
     );
     assert!(screen(&application).contains("Step 3 of 3"));
 }
@@ -2872,22 +2926,41 @@ const SAMPLE_GLYPHS: [char; 10] = [
 const NERD_FONT_NOTE: &str = "To get Icons, install a Nerd Font and select it in your terminal, \
                               then turn on Show icons in /settings.";
 
-/// Walks the flow on to its third step, drawn.
+/// Walks the flow on to its third step, drawn, the Server accepting the
+/// derivation pin with the default Settings in force.
 fn on_the_icons_step(application: &mut Application) {
+    on_the_icons_step_holding(application, EffectiveSettings::default());
+}
+
+/// Walks the flow on to its third step, drawn, the Server accepting the
+/// derivation pin with `settings` in force.
+fn on_the_icons_step_holding(application: &mut Application, settings: EffectiveSettings) {
     press(application, KeyCode::Enter);
-    press(application, KeyCode::Enter);
+    pass_the_derivation_step(application, settings);
     let shown = screen(application);
     assert!(shown.contains("Step 3 of 3 · Icons"), "{shown}");
+}
+
+/// Confirms the Derivation step on the row under Row Focus, the Server
+/// accepting the pin it sends with `settings` in force, which moves the
+/// flow on.
+fn pass_the_derivation_step(application: &mut Application, settings: EffectiveSettings) {
+    let pin = press(application, KeyCode::Enter);
+    assert!(
+        matches!(pin, ApplicationTransition::MutateSetting { .. }),
+        "the Derivation step pins its answer: {pin:?}"
+    );
+    settle_mutation(application, &pin, settings);
 }
 
 /// A Client that has been onboarded, holding `settings`, with the flow taken
 /// again from `/onboarding` and walked on to its third step.
 fn retaking_the_icons_step(workspace: &Path, settings: EffectiveSettings) -> Application {
     let mut application = connected_application(workspace);
-    deliver_settings(&mut application, settings);
+    deliver_settings(&mut application, settings.clone());
     type_terminal_text(&mut application, "/onboarding");
     press(&mut application, KeyCode::Enter);
-    on_the_icons_step(&mut application);
+    on_the_icons_step_holding(&mut application, settings);
     application
 }
 
@@ -3000,7 +3073,7 @@ fn nothing_is_chosen_on_a_first_run_and_finish_waits_for_a_choice() {
     // to the reader, who must look before they answer.
     let mut application = attached_to_a_fresh_server(workspace.path());
     deliver_settings(&mut application, with_show_icons(true));
-    on_the_icons_step(&mut application);
+    on_the_icons_step_holding(&mut application, with_show_icons(true));
     let shown = screen(&application);
     assert!(shown.contains("  They draw as icons"), "{shown}");
     assert!(shown.contains("  They draw as boxes or blanks"), "{shown}");
@@ -3152,7 +3225,7 @@ fn going_back_from_the_icons_step_finds_the_choice_as_left() {
     press(&mut application, KeyCode::Up);
     press(&mut application, KeyCode::Left);
     assert!(screen(&application).contains("Step 2 of 3"));
-    press(&mut application, KeyCode::Enter);
+    pass_the_derivation_step(&mut application, EffectiveSettings::default());
     let shown = screen(&application);
     assert!(shown.contains("› They draw as boxes or blanks"), "{shown}");
     assert_eq!(
@@ -3170,8 +3243,8 @@ fn the_nerd_font_note_wraps_and_copies_as_one_line() {
     let mut settings = EffectiveSettings::default();
     settings.text_selection.copy = TextSelectionCopy::Release;
     settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
-    deliver_settings(&mut application, settings);
-    on_the_icons_step(&mut application);
+    deliver_settings(&mut application, settings.clone());
+    on_the_icons_step_holding(&mut application, settings);
     press(&mut application, KeyCode::Up);
 
     let buffer = rendered_application_buffer(&application, 40, 30);
@@ -3477,6 +3550,181 @@ fn a_refused_toggle_is_said_beneath_the_rows_and_its_row_stays_as_the_server_say
     press(&mut application, KeyCode::Enter);
     assert!(
         screen(&application).contains("Step 2 of 3"),
+        "{}",
+        screen(&application)
+    );
+}
+
+/// The Derivation step waits on the Server's word that its pin landed before
+/// it moves on, holding still and saying it is saving the answer meanwhile.
+/// Only the pin's own answer moves it: another edit's, even one already
+/// holding the same value, or another edit's refusal, leaves it saving.
+#[test]
+fn the_derivation_step_waits_on_its_pin_landing_before_it_moves_on() {
+    let workspace = workspace_dir();
+    let settings = settings_deriving_with(DerivationErrand::FollowSession);
+    let mut application = on_the_derivation_step(workspace.path(), settings.clone());
+    let pin = press(&mut application, KeyCode::Enter);
+    assert_eq!(pin, derivation_pin(DerivationErrand::FollowSession));
+    let saving = screen(&application);
+    assert!(saving.contains("Step 2 of 3"), "{saving}");
+    assert!(saving.contains("Saving your answer…"), "{saving}");
+
+    // Its keys wait on it, save Esc.
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Left);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+    assert!(screen(&application).contains("Step 2 of 3"));
+    assert!(
+        focused_row(&application).contains("Provider's default"),
+        "{}",
+        focused_row(&application)
+    );
+
+    application
+        .handle_event(ApplicationEvent::SettingMutated {
+            request: SettingRequest::new(),
+            snapshot: SettingsSnapshot {
+                settings: settings.clone(),
+                pinned: vec!["derivation.errand".to_owned()],
+                diagnostics: Vec::new(),
+            },
+        })
+        .expect("hear the Server answer another edit");
+    refuse(
+        &mut application,
+        SettingRequest::new(),
+        "Config Document is not editable",
+    );
+    let waiting = screen(&application);
+    assert!(waiting.contains("Step 2 of 3"), "{waiting}");
+    assert!(waiting.contains("Saving your answer…"), "{waiting}");
+    assert!(!waiting.contains("Could not save"), "{waiting}");
+
+    settle_mutation(&mut application, &pin, settings);
+    assert!(
+        screen(&application).contains("Step 3 of 3"),
+        "the pin's own answer moves the flow on: {}",
+        screen(&application)
+    );
+}
+
+/// A derivation pin the Server refuses keeps the flow on the Derivation
+/// step, saying why, and Enter sends the answer under Row Focus again.
+#[test]
+fn a_refused_derivation_pin_keeps_the_step_open_with_the_failure_and_enter_retries() {
+    let workspace = workspace_dir();
+    let mut application = on_the_derivation_step(
+        workspace.path(),
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    press(&mut application, KeyCode::Down);
+    let pin = press(&mut application, KeyCode::Enter);
+    assert_eq!(pin, derivation_pin(DerivationErrand::Off));
+
+    assert_eq!(
+        refuse(
+            &mut application,
+            request_of(&pin),
+            "Config Document is not editable"
+        ),
+        ApplicationTransition::Continue,
+        "nothing moves on"
+    );
+    let refused = screen(&application);
+    assert!(refused.contains("Step 2 of 3"), "{refused}");
+    assert!(
+        refused.contains("Could not save your answer: Config Document is not editable"),
+        "{refused}"
+    );
+    assert!(!refused.contains("Saving your answer…"), "{refused}");
+    assert!(focused_row(&application).contains("Off"), "{refused}");
+
+    let retry = press(&mut application, KeyCode::Enter);
+    assert_eq!(retry, derivation_pin(DerivationErrand::Off));
+    let retried = screen(&application);
+    assert!(retried.contains("Saving your answer…"), "{retried}");
+    assert!(!retried.contains("Could not save"), "{retried}");
+    settle_mutation(
+        &mut application,
+        &retry,
+        settings_deriving_with(DerivationErrand::Off),
+    );
+    assert!(
+        screen(&application).contains("Step 3 of 3"),
+        "{}",
+        screen(&application)
+    );
+}
+
+#[test]
+fn leaving_while_the_derivation_pin_is_saved_still_marks_the_server_onboarded() {
+    let workspace = workspace_dir();
+    let mut application = on_the_derivation_step(
+        workspace.path(),
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    press(&mut application, KeyCode::Enter);
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::MarkOnboarded
+    );
+    assert!(!onboarding_shown(&application), "{}", screen(&application));
+}
+
+/// Model Options applied over the Derivation step answer it as confirming a
+/// Model without any does: their pin is awaited on the step, a refusal is
+/// said there and Enter opens the options again, and the pin's own landing
+/// moves the flow on.
+#[test]
+fn options_chosen_for_the_derivation_step_wait_on_their_pin_as_confirming_does() {
+    let workspace = workspace_dir();
+    let mut application = choosing_options_on_the_derivation_step(workspace.path());
+    let pin = apply_options(&mut application);
+    assert_eq!(
+        pin,
+        derivation_pin(DerivationErrand::Pinned(cheap_selection(Vec::new())))
+    );
+    let saving = screen(&application);
+    assert!(
+        saving.contains("Step 2 of 3") && !saving.contains("Model Options"),
+        "{saving}"
+    );
+    assert!(saving.contains("Saving your answer…"), "{saving}");
+
+    refuse(
+        &mut application,
+        request_of(&pin),
+        "Config Document is not editable",
+    );
+    let refused = screen(&application);
+    assert!(refused.contains("Step 2 of 3"), "{refused}");
+    assert!(
+        refused.contains("Could not save your answer: Config Document is not editable"),
+        "{refused}"
+    );
+
+    press(&mut application, KeyCode::Enter);
+    assert!(
+        screen(&application).contains("Model Options"),
+        "Enter opens the options again: {}",
+        screen(&application)
+    );
+    let retry = apply_options(&mut application);
+    assert_eq!(
+        retry,
+        derivation_pin(DerivationErrand::Pinned(cheap_selection(Vec::new())))
+    );
+    settle_mutation(
+        &mut application,
+        &retry,
+        settings_deriving_with(DerivationErrand::Pinned(cheap_selection(Vec::new()))),
+    );
+    assert!(
+        screen(&application).contains("Step 3 of 3"),
         "{}",
         screen(&application)
     );

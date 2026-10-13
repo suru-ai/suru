@@ -121,9 +121,9 @@ pub(super) enum Advance {
     /// The next step is on show.
     Moved,
     /// The step was answered with this pin of the Setting it governs, sent
-    /// under `request`, and the next step is on show; the last step stays on
-    /// show until the answer to that request says the pin landed, which
-    /// finishes the flow.
+    /// under `request`. It stays on show until the answer to that request
+    /// says the pin landed, which moves the flow on, or from the last step
+    /// finishes it.
     Pinned {
         pin: SettingMutation,
         request: SettingRequest,
@@ -144,16 +144,6 @@ pub(super) enum Advance {
     /// step says why, and the Derivation and Icons steps have nothing under
     /// Row Focus to answer with.
     Held,
-}
-
-impl Advance {
-    /// The step answered with `pin`, sent under a request of its own.
-    fn pinned(pin: SettingMutation) -> Self {
-        Self::Pinned {
-            pin,
-            request: SettingRequest::new(),
-        }
-    }
 }
 
 /// What the flow reads of the Client's own Server, of which it keeps no copy:
@@ -242,6 +232,77 @@ fn fit_notes<'a>(
         })
         .collect();
     (notes, said)
+}
+
+/// Where the pin a step answered with stands, for the steps that wait on the
+/// Server's word that their pin landed before the flow goes on: the
+/// Derivation step, which moves on once it lands, and the Icons step, whose
+/// landing finishes the flow. Until then the step holds still and says it is
+/// saving the answer; a pin the Server refuses is said beneath the step, and
+/// confirming the step again sends its answer again.
+#[derive(Clone, Debug, Default)]
+enum Saving {
+    #[default]
+    Idle,
+    /// Sent under this request and not yet answered.
+    Pending(SettingRequest),
+    /// Refused, for this reason.
+    Failed(String),
+}
+
+impl Saving {
+    /// Whether a pin is awaited, while which the step holds still.
+    fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending(_))
+    }
+
+    /// Sends `pin` under a request of its own, which is awaited.
+    fn send(&mut self, pin: SettingMutation) -> Advance {
+        let request = SettingRequest::new();
+        *self = Self::Pending(request);
+        Advance::Pinned { pin, request }
+    }
+
+    /// Takes the Server's acceptance of `request`, answering whether it was
+    /// the pin awaited, which is awaited no more.
+    fn land(&mut self, request: SettingRequest) -> bool {
+        let landed = matches!(self, Self::Pending(awaited) if *awaited == request);
+        if landed {
+            *self = Self::Idle;
+        }
+        landed
+    }
+
+    /// Takes the Server's refusal of `request`, answering whether it was the
+    /// pin awaited, which is said refused for `error`.
+    fn refuse(&mut self, request: SettingRequest, error: &str) -> bool {
+        let refused = matches!(self, Self::Pending(awaited) if *awaited == request);
+        if refused {
+            *self = Self::Failed(format!("Could not save your answer: {error}"));
+        }
+        refused
+    }
+
+    /// How the pin stands, as said beneath the step in the style it is drawn
+    /// in.
+    fn said(&self, theme: &Theme) -> Option<(&str, Style)> {
+        match self {
+            Self::Idle => None,
+            Self::Pending(_) => Some(("Saving your answer…", theme.text.subdued)),
+            Self::Failed(failure) => Some((failure.as_str(), theme.feedback.error)),
+        }
+    }
+
+    /// What is said of the pin beneath the step, laid out within `width`
+    /// columns in the style it is drawn in.
+    fn notes(&self, width: usize, theme: &Theme) -> Option<(WrappedText<'_>, Style)> {
+        self.said(theme).map(|(text, style)| {
+            (
+                WrappedText::new(text, "", u16::try_from(width).unwrap_or(u16::MAX)),
+                style,
+            )
+        })
+    }
 }
 
 /// The Providers step: one row for each built-in Provider, in their fixed
@@ -771,7 +832,9 @@ const NAMED_DERIVATIONS: [(DerivationErrand, &str); 2] = [
 /// branch names. It pins the derivation Setting as the settings panel does —
 /// one of its named values, or a Model chosen with only the Model Options the
 /// reader picks — from the Agent Selection list, offering the Models only of
-/// Providers the user has left on and can use.
+/// Providers the user has left on and can use. It moves on once its pin
+/// lands, holding still while it is saved and saying beneath the list why a
+/// pin the Server refused never landed.
 #[derive(Clone, Debug)]
 struct DerivationStep {
     list: AgentSelectionList,
@@ -781,6 +844,7 @@ struct DerivationStep {
     /// Why the last reading of every Provider failed, which the step offers
     /// to retry beneath each Provider until a catalog heard since says more.
     failure: Option<String>,
+    saving: Saving,
 }
 
 impl Default for DerivationStep {
@@ -791,6 +855,7 @@ impl Default for DerivationStep {
             ),
             in_force: DerivationErrand::default(),
             failure: None,
+            saving: Saving::default(),
         }
     }
 }
@@ -854,18 +919,18 @@ impl DerivationStep {
     }
 
     /// What confirming the row Row Focus stands on comes to: the pin of a
-    /// named value or of a Model without Model Options, the Model Options of
-    /// one with any to choose first, or a failed listing retried through the
-    /// flow's own `recheck`, asked when its Server had pushed `pushes`
-    /// catalogs.
-    fn confirm(&self, recheck: &mut Recheck, pushes: u64) -> Advance {
+    /// named value or of a Model without Model Options, sent and awaited,
+    /// the Model Options of one with any to choose first, or a failed
+    /// listing retried through the flow's own `recheck`, asked when its
+    /// Server had pushed `pushes` catalogs.
+    fn confirm(&mut self, recheck: &mut Recheck, pushes: u64) -> Advance {
         match self.list.choose() {
-            Some(AgentSelectionAction::Named(index)) => {
-                Advance::pinned(derivation_pin(NAMED_DERIVATIONS[index].0.clone()))
-            }
-            Some(AgentSelectionAction::Select(model)) if model.options.is_empty() => {
-                Advance::pinned(pinned_selection(model.default_agent_selection()))
-            }
+            Some(AgentSelectionAction::Named(index)) => self
+                .saving
+                .send(derivation_pin(NAMED_DERIVATIONS[index].0.clone())),
+            Some(AgentSelectionAction::Select(model)) if model.options.is_empty() => self
+                .saving
+                .send(pinned_selection(model.default_agent_selection())),
             Some(AgentSelectionAction::Select(model)) => {
                 let current = match &self.in_force {
                     DerivationErrand::Pinned(selection) => Some(selection.clone()),
@@ -884,15 +949,27 @@ impl DerivationStep {
         }
     }
 
-    /// How many lines the step draws above its list, which scrolls within
-    /// whatever room is left beneath them and so asks for none of its own.
-    fn rows_wanted(&self) -> usize {
-        2
+    /// How many lines the step draws above and beneath its list, which
+    /// scrolls within whatever room is left between them and so asks for
+    /// none of its own.
+    fn rows_wanted(&self, width: usize, theme: &Theme) -> usize {
+        let said = self
+            .saving
+            .notes(width, theme)
+            .map_or(0, |(note, _)| note.height());
+        // The introduction and the gap beneath it, and the gap above what is
+        // said of the pin.
+        2 + usize::from(said > 0) + said
     }
 
     /// The step drawn within `width` columns and `room` lines beneath the
-    /// header: the introduction, and the list through its window.
+    /// header: the introduction, the list through its window, and what is
+    /// said of its pin, which keeps its lines before the list does.
     fn lines(&self, width: usize, room: usize, theme: &Theme) -> Drawn<'_> {
+        let (notes, said) = fit_notes(
+            self.saving.notes(width, theme).into_iter().collect(),
+            room.saturating_sub(2),
+        );
         let mut lines = vec![
             Line::styled(
                 truncate_to_width(Self::INTRODUCTION, width),
@@ -900,7 +977,7 @@ impl DerivationStep {
             ),
             Line::default(),
         ];
-        let room = room.saturating_sub(lines.len());
+        let room = room.saturating_sub(lines.len() + usize::from(said > 0) + said);
         let drawn = self.list.draw(
             room,
             room,
@@ -910,14 +987,23 @@ impl DerivationStep {
         );
         let top = lines.len();
         lines.extend(drawn.lines);
-        let wrapped = drawn
+        let mut wrapped = drawn
             .wrapped
             .into_iter()
             .map(|line| WrappedLine {
                 row: top + line.row,
                 ..line
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if said > 0 {
+            lines.push(Line::default());
+        }
+        for (note, style) in notes {
+            if note.height() > 0 {
+                wrapped.push(note.wrapped(lines.len()));
+                lines.extend(note.lines(style));
+            }
+        }
         Drawn { lines, wrapped }
     }
 }
@@ -989,18 +1075,6 @@ struct IconsStep {
     /// until a frame has been drawn since the step opened.
     drawn: Cell<Option<usize>>,
     saving: Saving,
-}
-
-/// Where the pin Finish sent on the Icons step stands.
-#[derive(Clone, Debug, Default)]
-enum Saving {
-    #[default]
-    Idle,
-    /// Sent under this request and not yet answered; the flow finishes once
-    /// the answer to it says it landed.
-    Pending(SettingRequest),
-    /// Refused, for this reason, so Finish may send the pin again.
-    Failed(String),
 }
 
 /// How the reader says this terminal draws the Icons step's sample.
@@ -1091,7 +1165,7 @@ impl IconsStep {
     /// neither answer, a move up lands on the last and a move down on the
     /// first. It holds still while a pin is awaited.
     fn move_focus(&mut self, distance: isize) {
-        if self.is_saving() {
+        if self.saving.is_pending() {
             return;
         }
         let answers = IconsAnswer::ALL.len() as isize;
@@ -1113,22 +1187,14 @@ impl IconsStep {
             .then(|| answer.pin())
     }
 
-    /// Whether a pin Finish sent is awaited, while which the step holds
-    /// still.
-    fn is_saving(&self) -> bool {
-        matches!(self.saving, Saving::Pending(_))
-    }
-
-    /// Sends the pin of the answer under Row Focus under a request of its
-    /// own, unless one is already awaited or there is no answer to pin.
+    /// Sends the pin of the answer under Row Focus, unless one is already
+    /// awaited or there is no answer to pin.
     fn finish(&mut self) -> Option<Advance> {
-        if self.is_saving() {
+        if self.saving.is_pending() {
             return None;
         }
         let pin = self.pin()?;
-        let request = SettingRequest::new();
-        self.saving = Saving::Pending(request);
-        Some(Advance::Pinned { pin, request })
+        Some(self.saving.send(pin))
     }
 
     /// The sample as drawn: a handful of Icon Catalog glyphs, then the fixed
@@ -1150,43 +1216,35 @@ impl IconsStep {
         format!("  {}", glyphs.join("  "))
     }
 
-    /// How the pin Finish sent stands, as said beneath the answers in the
-    /// style it is drawn in.
-    fn saving_said(&self, theme: &Theme) -> Option<(&str, Style)> {
-        match &self.saving {
-            Saving::Idle => None,
-            Saving::Pending(_) => Some(("Saving your answer…", theme.text.subdued)),
-            Saving::Failed(failure) => Some((failure.as_str(), theme.feedback.error)),
-        }
-    }
-
     /// What the step says beneath its answers, each line laid out within
     /// `width` columns in the style it is drawn in, the first said the most
     /// needed: how the pin Finish sent stands, and how to get Icons while
     /// the answer under Row Focus is that the sample draws as boxes or
     /// blanks.
     fn notes(&self, width: usize, theme: &Theme) -> Vec<(WrappedText<'_>, Style)> {
-        let width = u16::try_from(width).unwrap_or(u16::MAX);
-        let note =
-            (self.focus == Some(IconsAnswer::Boxes)).then_some((Self::NOTE, theme.text.primary));
-        self.saving_said(theme)
+        let note = (self.focus == Some(IconsAnswer::Boxes))
+            .then(|| (Self::note(width), theme.text.primary));
+        self.saving
+            .notes(width, theme)
             .into_iter()
             .chain(note)
-            .map(|(text, style)| (WrappedText::new(text, "", width), style))
             .collect()
+    }
+
+    /// The note on getting Icons, laid out within `width` columns.
+    fn note(width: usize) -> WrappedText<'static> {
+        WrappedText::new(Self::NOTE, "", u16::try_from(width).unwrap_or(u16::MAX))
     }
 
     /// How many lines the step draws within `width` columns with nothing
     /// given way. The note on getting Icons is counted whichever answer is
     /// chosen, so the box keeps its height as Row Focus moves.
     fn rows_wanted(&self, width: usize, theme: &Theme) -> usize {
-        let width = u16::try_from(width).unwrap_or(u16::MAX);
         let said = self
-            .saving_said(theme)
-            .into_iter()
-            .chain([(Self::NOTE, theme.text.primary)])
-            .map(|(text, _)| WrappedText::new(text, "", width).height())
-            .sum::<usize>();
+            .saving
+            .notes(width, theme)
+            .map_or(0, |(note, _)| note.height())
+            + Self::note(width).height();
         // The gap beneath the header, the introduction and the gap beneath
         // it, the sample and the gap beneath it, the answers, and the gap
         // above what is said beneath them.
@@ -1298,11 +1356,10 @@ impl Onboarding {
         }
     }
 
-    /// Confirms the step on show: moves to the next, or on the last step
-    /// pins its answer, unless the step may not be passed yet. A step
-    /// answering with a pin moves on as it is sent, save the last, which
-    /// stays on show until its pin lands; one with more to ask first stays
-    /// on show.
+    /// Confirms the step on show: moves to the next, or sends the pin of its
+    /// answer, unless the step may not be passed yet. A step answering with
+    /// a pin stays on show until it lands, which moves the flow on, or from
+    /// the last step finishes it; one with more to ask first stays on show.
     pub(super) fn next(&mut self, server: OwnServer<'_>) -> Advance {
         match self.step {
             // Nor is a step passed whose rows the screen had no room for, or
@@ -1314,13 +1371,9 @@ impl Onboarding {
             {
                 Advance::Held
             }
-            Some(Step::Derivation) => {
-                let advance = self.derivation.confirm(&mut self.recheck, server.pushes);
-                if matches!(advance, Advance::Pinned { .. }) {
-                    self.move_on();
-                }
-                advance
-            }
+            // A step whose pin is awaited holds still until it lands.
+            Some(Step::Derivation) if self.derivation.saving.is_pending() => Advance::Held,
+            Some(Step::Derivation) => self.derivation.confirm(&mut self.recheck, server.pushes),
             Some(Step::Providers | Step::Icons) | None => self.move_on(),
         }
     }
@@ -1335,13 +1388,14 @@ impl Onboarding {
         }
     }
 
-    /// Moves on from the Derivation step once the Model Options it opened
-    /// over itself are applied, which answers it as confirming a Model
-    /// without any does.
-    pub(super) fn answer_derivation(&mut self) {
-        if self.step == Some(Step::Derivation) {
-            self.move_on();
-        }
+    /// Answers the Derivation step with `pin`, the Selection the Model
+    /// Options it opened over itself settled on, as confirming a Model
+    /// without any does: the pin is sent and awaited, and the flow moves on
+    /// once it lands. Nothing is sent where the step is not on show or
+    /// already awaits a pin.
+    pub(super) fn answer_derivation(&mut self, pin: SettingMutation) -> Option<Advance> {
+        (self.step == Some(Step::Derivation) && !self.derivation.saving.is_pending())
+            .then(|| self.derivation.saving.send(pin))
     }
 
     /// The Model as the Derivation step offers it, while the flow is open and
@@ -1362,9 +1416,10 @@ impl Onboarding {
             .find(|candidate| &candidate.id == model)
     }
 
-    /// Moves Row Focus on the Derivation step's list, while it is on show.
+    /// Moves Row Focus on the Derivation step's list, while it is on show
+    /// and awaits no pin.
     pub(super) fn move_derivation(&mut self, movement: DerivationMove) {
-        if self.step != Some(Step::Derivation) {
+        if self.step != Some(Step::Derivation) || self.derivation.saving.is_pending() {
             return;
         }
         let keys = self.derivation.list.keys();
@@ -1393,13 +1448,20 @@ impl Onboarding {
 
     /// Takes the Server's acceptance of the edit asked for under `request`,
     /// where the flow awaits it, answering whether that finishes the flow: a
-    /// Provider's toggle is answered, and the Icons step's pin finishes it.
-    /// The answer to any other edit settles nothing the flow awaits.
+    /// Provider's toggle is answered, the Derivation step's pin moves the
+    /// flow on, and the Icons step's finishes it. The answer to any other
+    /// edit settles nothing the flow awaits.
     pub(super) fn edit_landed(&mut self, request: SettingRequest) -> bool {
         if self.providers.settle(request, None) {
             return false;
         }
-        self.awaits_pin(request)
+        if self.derivation.saving.land(request) {
+            if self.step == Some(Step::Derivation) {
+                self.move_on();
+            }
+            return false;
+        }
+        self.icons.saving.land(request)
     }
 
     /// Takes the Server's refusal of the edit asked for under `request`,
@@ -1407,33 +1469,15 @@ impl Onboarding {
     /// answers whether it did. The refusal of any other edit is not the
     /// flow's to say.
     pub(super) fn edit_refused(&mut self, request: SettingRequest, error: &str) -> bool {
-        self.providers.settle(request, Some(error)) || self.fail_pin(request, error)
-    }
-
-    /// Whether `request` is the pin the Icons step awaits: the Server
-    /// accepting it finishes the flow, and its refusal is said on the step.
-    /// The answer to any other edit leaves the pin awaited, whatever it
-    /// holds.
-    fn awaits_pin(&self, request: SettingRequest) -> bool {
-        matches!(self.icons.saving, Saving::Pending(awaited) if awaited == request)
-    }
-
-    /// Takes the Server's refusal of `request` where it is the pin the Icons
-    /// step awaits, answering whether it was: the step says why beneath its
-    /// answers, and Finish may send it again. The refusal of any other edit
-    /// leaves it awaited.
-    fn fail_pin(&mut self, request: SettingRequest, error: &str) -> bool {
-        if !self.awaits_pin(request) {
-            return false;
-        }
-        self.icons.saving = Saving::Failed(format!("Could not save your answer: {error}"));
-        true
+        self.providers.settle(request, Some(error))
+            || self.derivation.saving.refuse(request, error)
+            || self.icons.saving.refuse(request, error)
     }
 
     /// Returns to the step before the one on show, where there is one and
-    /// the Icons step awaits no pin.
+    /// no step awaits its pin.
     pub(super) fn back(&mut self) {
-        if self.icons.is_saving() {
+        if self.derivation.saving.is_pending() || self.icons.saving.is_pending() {
             return;
         }
         if let Some(previous) = self.step.and_then(Step::previous) {
@@ -1650,7 +1694,7 @@ impl Onboarding {
             Step::Providers => self
                 .providers
                 .rows_wanted(width, theme, server, &self.recheck),
-            Step::Derivation => 1 + self.derivation.rows_wanted(),
+            Step::Derivation => 1 + self.derivation.rows_wanted(width, theme),
             Step::Icons => self.icons.rows_wanted(width, theme),
         };
         1 + step_rows + 1

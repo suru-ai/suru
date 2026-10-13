@@ -10396,29 +10396,8 @@ impl Application {
                     return Ok(ApplicationTransition::Continue);
                 }
                 let server = OwnServer::of(&self.state.settings, &self.state.model_picker);
-                Ok(match self.state.onboarding.next(server) {
-                    Advance::Moved | Advance::Held => ApplicationTransition::Continue,
-                    Advance::Pinned { pin, request } => ApplicationTransition::MutateSetting {
-                        mutation: pin,
-                        request,
-                    },
-                    Advance::ChooseOptions {
-                        model,
-                        current,
-                        purpose,
-                    } => {
-                        self.state.model_options.open_for(
-                            model,
-                            current.as_ref(),
-                            purpose,
-                            ModelOptionsOwner::OnboardingDerivation,
-                        );
-                        ApplicationTransition::Continue
-                    }
-                    Advance::Rechecking(recheck) => {
-                        ApplicationTransition::RecheckProviders { recheck }
-                    }
-                })
+                let advance = self.state.onboarding.next(server);
+                Ok(self.follow_onboarding(advance))
             }
             SemanticCommandId::OnboardingBack => {
                 self.state.onboarding.back();
@@ -11528,10 +11507,47 @@ impl Application {
         let purpose = self.state.model_options.purpose();
         let owner = self.state.model_options.owner();
         self.state.model_options.close();
-        if owner == ModelOptionsOwner::OnboardingDerivation {
-            self.state.onboarding.answer_derivation();
+        // Options chosen for Onboarding's Derivation step answer it, which
+        // waits on their pin landing before it moves on.
+        if owner == ModelOptionsOwner::OnboardingDerivation
+            && let ModelPickerPurpose::Setting(pin) = purpose
+        {
+            return Ok(self
+                .state
+                .onboarding
+                .answer_derivation(pin(selection))
+                .map_or(ApplicationTransition::Continue, |advance| {
+                    self.follow_onboarding(advance)
+                }));
         }
         self.apply_chosen_selection(selection, purpose)
+    }
+
+    /// What Onboarding's word on a step it was asked to confirm asks of the
+    /// run loop: a pin sent under the request the flow awaits it by, the
+    /// Model Options opened over the step, or the flow's own re-check.
+    fn follow_onboarding(&mut self, advance: Advance) -> ApplicationTransition {
+        match advance {
+            Advance::Moved | Advance::Held => ApplicationTransition::Continue,
+            Advance::Pinned { pin, request } => ApplicationTransition::MutateSetting {
+                mutation: pin,
+                request,
+            },
+            Advance::ChooseOptions {
+                model,
+                current,
+                purpose,
+            } => {
+                self.state.model_options.open_for(
+                    model,
+                    current.as_ref(),
+                    purpose,
+                    ModelOptionsOwner::OnboardingDerivation,
+                );
+                ApplicationTransition::Continue
+            }
+            Advance::Rechecking(recheck) => ApplicationTransition::RecheckProviders { recheck },
+        }
     }
 
     fn apply_chosen_selection(
