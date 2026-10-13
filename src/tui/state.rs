@@ -9482,6 +9482,11 @@ impl Application {
         self.state
             .settings_panel
             .report_read_failure(request, &error);
+        // A failed listing of the Client's own Server is Onboarding's to
+        // retry too, whichever Outlook is on screen.
+        if accepted && request.outlook() == &Outlook::Local {
+            self.state.onboarding.fail_listing(&error);
+        }
         self.state.model_picker.fail(request, error);
         if accepted {
             self.reconcile_model_options(CatalogListing::Complete);
@@ -11571,6 +11576,13 @@ impl Application {
             }
         }
         if !self.state.pending_model_options {
+            return;
+        }
+        // The reader has gone on to choose the Model Options Onboarding opened
+        // over itself since asking for the Agent's, so those asked for before
+        // are not opened over them, taking what the reader chose with them.
+        if self.state.model_options.owner() == ModelOptionsOwner::OnboardingDerivation {
+            self.state.pending_model_options = false;
             return;
         }
         let current = self.state.agent_selection().cloned();

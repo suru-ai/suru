@@ -267,15 +267,21 @@ impl AgentSelectionList {
     /// Focus stays where the reader moved it while that row is still listed,
     /// and otherwise goes to `current`.
     pub(super) fn relist(&mut self, providers: Vec<ProviderModels>, current: Option<InForce<'_>>) {
-        let focused = self.focus_entry();
+        let focused = self.selected.clone();
+        let from = self.focus_entry();
         self.providers = providers;
         self.focus(current, self.cursor_moved);
-        // Focus the new rows put elsewhere — carried to a choice they only
-        // now list, or pushed along by rows listed above it — brings the
-        // window along as the keys would have, so focus is never left out of
-        // view for Enter to act on.
-        if self.focus_entry() != focused {
+        if self.selected != focused {
+            // Focus carried to a choice the rows only now list brings the
+            // window along, as the keys would have.
             self.window.reveal();
+        } else if let (Some(from), Some(to)) = (from, self.focus_entry())
+            && from != to
+        {
+            // Rows listed or taken away above focus move no window while
+            // focus stays in view, and only as far as keeps it in view once
+            // it would not.
+            self.window.shift_focus(from, to);
         }
     }
 

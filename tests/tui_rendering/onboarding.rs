@@ -2189,10 +2189,11 @@ fn local_catalog_with_claude_failing() -> ModelCatalog {
     catalog
 }
 
-#[test]
-fn the_derivation_step_lists_and_retries_the_clients_own_server_while_a_remote_is_viewed() {
-    let workspace = workspace_dir();
-    let mut application = connected_application(workspace.path());
+/// A Client viewing the Remote studio, whose own Server lists Claude's
+/// listing as failed, on the Derivation step of the Onboarding it asked for,
+/// with Row Focus on Claude's retry row.
+fn retrying_on_the_derivation_step_viewing_studio(workspace: &Path) -> Application {
+    let mut application = connected_application(workspace);
     deliver_settings(
         &mut application,
         settings_deriving_with(DerivationErrand::FollowSession),
@@ -2237,6 +2238,13 @@ fn the_derivation_step_lists_and_retries_the_clients_own_server_while_a_remote_i
         "{}",
         focused_row(&application)
     );
+    application
+}
+
+#[test]
+fn the_derivation_step_lists_and_retries_the_clients_own_server_while_a_remote_is_viewed() {
+    let workspace = workspace_dir();
+    let mut application = retrying_on_the_derivation_step_viewing_studio(workspace.path());
     let ApplicationTransition::ListModels(request) = press(&mut application, KeyCode::Enter) else {
         panic!("the retry row lists the Model Catalog again");
     };
@@ -2463,32 +2471,177 @@ fn an_acknowledged_pin_moves_the_mark_of_the_value_in_force() {
     assert!(!row("Provider's default").contains("current"), "{rows:#?}");
 }
 
+/// The Codex catalog the viewport test lists: `before` Models named to sort
+/// above Model 01, then Models 01 to 12.
+fn codex_listing(before: usize) -> ModelCatalog {
+    let models = (1..=before)
+        .map(|index| (format!("alpha-{index:02}"), format!("Alpha {index:02}")))
+        .chain((1..=12).map(|index| (format!("m{index:02}"), format!("Model {index:02}"))))
+        .map(|(id, name)| {
+            model_descriptor("codex", &id, &name, false, ModelAvailability::Available)
+        })
+        .collect();
+    ModelCatalog {
+        providers: vec![ProviderModelCatalog {
+            provider: ProviderId::new("codex"),
+            display_name: "Codex".to_owned(),
+            models,
+            status: ProviderCatalogStatus::Fresh,
+        }],
+    }
+}
+
+/// The rows the Derivation step draws, from its first to its last.
+fn derivation_rows(application: &Application) -> Vec<String> {
+    let rows = rendered_application_rows_at(application, 100, 24);
+    let first = rows
+        .iter()
+        .position(|row| row.contains("Which Agent Selection derives"))
+        .expect("the Derivation step is drawn")
+        + 2;
+    let foot = rows
+        .iter()
+        .position(|row| row.contains("Esc Leave"))
+        .expect("the keys are drawn");
+    // Each row reads the Sidebar, the main view's margin, then the box.
+    rows[first..foot]
+        .iter()
+        .filter_map(|row| row.split('│').nth(2))
+        .map(|row| row.trim_end().to_owned())
+        .filter(|row| !row.is_empty())
+        .collect()
+}
+
 #[test]
-fn row_focus_stays_in_view_when_models_are_listed_above_it() {
+fn the_window_holds_while_rows_listed_above_row_focus_leave_it_in_view() {
     let workspace = workspace_dir();
-    let mut application = on_the_derivation_step(
-        workspace.path(),
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    deliver_settings(
+        &mut application,
         settings_deriving_with(DerivationErrand::FollowSession),
     );
+    deliver_catalog(&mut application, codex_listing(0));
+    press(&mut application, KeyCode::Enter);
+    for _ in 0..6 {
+        press(&mut application, KeyCode::Down);
+    }
+    let walked = derivation_rows(&application);
+    assert!(
+        walked.iter().any(|row| row.starts_with("› Model 05")),
+        "{walked:#?}"
+    );
+
+    deliver_catalog(&mut application, codex_listing(1));
+    let held = derivation_rows(&application);
+    assert_eq!(
+        held.first(),
+        walked.first(),
+        "a row listed above Row Focus that leaves it in view moves no window: {held:#?}"
+    );
+    assert!(
+        held.iter().any(|row| row.starts_with("› Model 05")),
+        "{held:#?}"
+    );
+
+    deliver_catalog(&mut application, codex_listing(13));
+    let moved = derivation_rows(&application);
+    assert!(
+        moved
+            .last()
+            .is_some_and(|row| row.starts_with("› Model 05")),
+        "rows that would push Row Focus out of view move the window only as far as keeps it \
+         in view: {moved:#?}"
+    );
+}
+
+#[test]
+fn a_failed_retry_of_the_clients_own_server_shows_its_retry_rows_while_a_remote_is_viewed() {
+    let workspace = workspace_dir();
+    let mut application = retrying_on_the_derivation_step_viewing_studio(workspace.path());
+    let ApplicationTransition::ListModels(request) = press(&mut application, KeyCode::Enter) else {
+        panic!("the retry row lists the Model Catalog again");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelListingFailed {
+            request,
+            error: "the Server did not answer".to_owned(),
+        })
+        .expect("hear that listing the Local catalog failed");
+
+    let failed = screen(&application);
+    assert!(failed.contains("Step 2 of 3"), "{failed}");
+    assert!(
+        failed.contains("Retry Codex: the Server did not answer")
+            && failed.contains("Retry Claude: the Server did not answer"),
+        "the failure is the Client's own Server's, retried from the step as the picker would: \
+         {failed}"
+    );
+    assert!(!failed.contains("Studio Model"), "{failed}");
+}
+
+#[test]
+fn the_agents_options_asked_for_earlier_do_not_replace_the_derivation_steps() {
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelOptions,
+        )))
+        .expect("ask for the Agent's Model Options")
+    else {
+        panic!("the Agent's Model Options read the catalog first");
+    };
+    deliver_settings(
+        &mut application,
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    deliver_catalog(&mut application, pushed_catalog());
+    press(&mut application, KeyCode::Enter);
     for _ in 0..3 {
         press(&mut application, KeyCode::Down);
     }
-    assert!(focused_row(&application).contains("GPT-5 Mini"));
-
-    let mut catalog = pushed_catalog();
-    catalog.providers[0].models.extend((1..=12).map(|index| {
-        model_descriptor(
-            "codex",
-            &format!("alpha-{index:02}"),
-            &format!("Alpha {index:02}"),
-            false,
-            ModelAvailability::Available,
-        )
-    }));
-    deliver_catalog(&mut application, catalog);
+    press(&mut application, KeyCode::Enter);
+    // Reasoning's choices, under "Provider default": Low, then High.
+    press(&mut application, KeyCode::Enter);
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Enter);
     assert!(
-        focused_row(&application).contains("GPT-5 Mini"),
-        "Row Focus stays on its Model, and in view: {}",
+        screen(&application).contains("Reasoning · HIGH"),
+        "{}",
         screen(&application)
     );
+
+    let mut cheap_by_default = cheap_model();
+    cheap_by_default.is_default = true;
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    display_name: "Codex".to_owned(),
+                    models: vec![cheap_by_default],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("receive the catalog the Agent's options asked for");
+    assert!(
+        screen(&application).contains("Reasoning · HIGH"),
+        "the step's options, and what the reader chose in them, stand: {}",
+        screen(&application)
+    );
+    assert_eq!(
+        apply_options(&mut application),
+        derivation_pin(DerivationErrand::Pinned(cheap_selection(vec![
+            ModelOptionSelection {
+                id: ModelOptionId::new("reasoning_effort"),
+                value: ModelOptionValue::Select {
+                    choice: ModelOptionChoiceId::new("high"),
+                },
+            }
+        ])))
+    );
+    assert!(screen(&application).contains("Step 3 of 3"));
 }

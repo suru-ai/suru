@@ -855,6 +855,16 @@ impl Onboarding {
         }
     }
 
+    /// Takes in a listing of its own Server's catalog that failed, which the
+    /// Derivation step offers to retry as the Model picker does: from a row
+    /// beneath each Provider it lists, or one for the whole catalog where it
+    /// lists none.
+    pub(super) fn fail_listing(&mut self, error: &str) {
+        if self.is_open() {
+            self.derivation.list.fail(error.to_owned());
+        }
+    }
+
     /// Moves on from the Derivation step once the Model Options it opened
     /// over itself are applied, which answers it as confirming a Model
     /// without any does.

@@ -170,6 +170,26 @@ impl ListWindow {
         }
     }
 
+    /// Notes that the entries changed around a focus that stood at `from`
+    /// and stands at `to` now — rows listed or taken away above it — rather
+    /// than that focus moved. Where the last frame showed that focus, the
+    /// window holds where it stands while it stays in view, and otherwise
+    /// gives way only as far as keeps it in view: to the window's foot where
+    /// it was pushed down, its head where it was drawn up.
+    pub(super) fn shift_focus(&self, from: usize, to: usize) {
+        let (drawn_first, drawn_end) = self.drawn.get();
+        if !(drawn_first..drawn_end).contains(&from) {
+            return;
+        }
+        // What the last frame drew moves with the focus it showed, so the
+        // frame settling next reads that focus as one it showed.
+        let shifted = |entry: usize| (entry + to).saturating_sub(from);
+        self.drawn.set((shifted(drawn_first), shifted(drawn_end)));
+        if to < self.first.get() {
+            self.first.set(to);
+        }
+    }
+
     /// Moves the window to open on `first`, where the reader put it, and holds
     /// it there.
     pub(super) fn scroll_to(&self, first: usize) {
