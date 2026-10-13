@@ -2344,7 +2344,15 @@ impl TuiState {
                 self.adopt_settings(snapshot);
                 self.offer_onboarding();
             }
-            ManagedEvent::Onboarded(onboarded) => self.learn_onboarded(onboarded),
+            // Within a connection a Server only ever comes to be onboarded, so
+            // the stream's opening word that it has not, read before this
+            // Client heard it had been or took it itself, moves nothing; only
+            // the health a reconnect reads may say otherwise.
+            ManagedEvent::Onboarded(onboarded) => {
+                if onboarded || self.local_onboarded != Some(true) {
+                    self.learn_onboarded(onboarded);
+                }
+            }
             // The lifecycle stream is the local server's, so the catalog it
             // pushes is the Local Outlook's whichever Outlook is on screen.
             ManagedEvent::ModelCatalog(catalog) => {

@@ -268,6 +268,31 @@ fn leaving_at_any_step_marks_the_server_onboarded_and_closes_for_good() {
     }
 }
 
+/// The stream's opening snapshot says what held when it was read, which may
+/// be before the reader left: it does not undo what they did since.
+#[test]
+fn a_stale_word_that_the_server_is_not_onboarded_does_not_reopen_what_the_reader_left() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::MarkOnboarded
+    );
+
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::Managed(ManagedEvent::Onboarded(false)))
+            .expect("hear the stream's opening word on Onboarding"),
+        ApplicationTransition::Continue,
+        "no second mark is asked for"
+    );
+    assert!(
+        !onboarding_shown(&application),
+        "leaving counts as taking it: {}",
+        screen(&application)
+    );
+}
+
 #[test]
 fn finishing_the_third_step_marks_the_server_onboarded_and_closes() {
     let workspace = workspace_dir();
