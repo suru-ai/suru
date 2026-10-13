@@ -3817,3 +3817,125 @@ fn a_refused_toggle_is_unsaid_once_that_providers_next_toggle_lands() {
         screen(&application)
     );
 }
+
+/// A retake opened before the Server's stream shows the answer just
+/// finished with takes it up once it does: Row Focus the reader has not
+/// touched follows Show icons as the Settings in force change.
+#[test]
+fn a_retake_opened_before_the_finished_answer_shows_follows_it_once_it_does() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    on_the_icons_step(&mut application);
+    press(&mut application, KeyCode::Down);
+    let pin = finish_with(&mut application, true);
+    assert_eq!(
+        answer(&mut application, pin),
+        ApplicationTransition::MarkOnboarded,
+        "the pin landed, though its Settings have yet to be pushed"
+    );
+
+    type_terminal_text(&mut application, "/onboarding");
+    press(&mut application, KeyCode::Enter);
+    assert!(screen(&application).contains("Step 1 of 3"));
+    deliver_settings(&mut application, with_show_icons(true));
+    on_the_icons_step_holding(&mut application, with_show_icons(true));
+    let shown = screen(&application);
+    assert!(shown.contains("› They draw as icons"), "{shown}");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_show_icons(true),
+        "Finish pins the answer in force rather than the one the retake opened on"
+    );
+}
+
+/// Row Focus the reader moved on a retake is theirs: a snapshot the Server
+/// pushes later does not move it.
+#[test]
+fn a_retake_row_focus_the_reader_moved_stays_where_they_moved_it() {
+    let workspace = workspace_dir();
+    let mut application = retaking_the_icons_step(workspace.path(), with_show_icons(false));
+    assert!(screen(&application).contains("› They draw as boxes or blanks"));
+    press(&mut application, KeyCode::Up);
+    assert!(screen(&application).contains("› They draw as icons"));
+
+    deliver_settings(&mut application, with_show_icons(false));
+    let shown = screen(&application);
+    assert!(shown.contains("› They draw as icons"), "{shown}");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_show_icons(true)
+    );
+}
+
+/// A first run selects nothing, whatever the Settings in force come to say
+/// while the reader looks.
+#[test]
+fn a_first_run_selects_nothing_whatever_snapshots_arrive_meanwhile() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    on_the_icons_step(&mut application);
+    deliver_settings(&mut application, with_show_icons(true));
+    let shown = screen(&application);
+    assert!(!shown.contains("› They draw"), "{shown}");
+}
+
+/// The Derivation step's Row Focus, untouched, follows the value the Setting
+/// holds as the Settings in force change; once the reader moves it, or
+/// chooses where it stands, it is theirs.
+#[test]
+fn the_derivation_steps_untouched_row_focus_follows_the_setting_in_force() {
+    let workspace = workspace_dir();
+    let mut application = on_the_derivation_step(
+        workspace.path(),
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    assert!(focused_row(&application).contains("Provider's default"));
+    deliver_settings(
+        &mut application,
+        settings_deriving_with(DerivationErrand::Off),
+    );
+    assert!(
+        focused_row(&application).contains("Off"),
+        "{}",
+        focused_row(&application)
+    );
+
+    press(&mut application, KeyCode::Down);
+    assert!(
+        focused_row(&application).contains("GPT-5 ·"),
+        "{}",
+        focused_row(&application)
+    );
+    deliver_settings(
+        &mut application,
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    assert!(
+        focused_row(&application).contains("GPT-5 ·"),
+        "Row Focus the reader moved stays: {}",
+        focused_row(&application)
+    );
+}
+
+/// A row the reader chose without moving to it is theirs as well: a
+/// snapshot another Client caused, arriving while the pin is saved, leaves
+/// Row Focus on it.
+#[test]
+fn the_derivation_row_the_reader_chose_stays_focused_while_its_pin_is_saved() {
+    let workspace = workspace_dir();
+    let mut application = on_the_derivation_step(
+        workspace.path(),
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    let pin = press(&mut application, KeyCode::Enter);
+    assert_eq!(pin, derivation_pin(DerivationErrand::FollowSession));
+    deliver_settings(
+        &mut application,
+        settings_deriving_with(DerivationErrand::Off),
+    );
+    assert!(
+        focused_row(&application).contains("Provider's default"),
+        "{}",
+        focused_row(&application)
+    );
+}

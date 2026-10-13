@@ -259,6 +259,13 @@ impl AgentSelectionList {
             .find(|candidate| &candidate.provider == provider)
     }
 
+    /// Takes focus where it stands as the reader's own, as moving it there
+    /// would: a host whose reader chose the row focus stands on keeps it
+    /// there however the rows or the choice in force change.
+    pub(super) fn hold_focus(&mut self) {
+        self.cursor_moved = true;
+    }
+
     /// Puts focus back on `current`, and the window follows focus there as
     /// the keys would carry it.
     pub(super) fn refocus(&mut self, current: Option<InForce<'_>>) {

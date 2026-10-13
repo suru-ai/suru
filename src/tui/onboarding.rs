@@ -970,7 +970,16 @@ impl DerivationStep {
     /// listing retried through the flow's own `recheck`, asked when its
     /// Server had pushed `pushes` catalogs.
     fn confirm(&mut self, recheck: &mut Recheck, pushes: u64) -> Advance {
-        match self.list.choose() {
+        let chosen = self.list.choose();
+        // The row the reader chose is theirs, as one they moved to is, so
+        // the value in force coming to differ moves focus off it no more.
+        if matches!(
+            chosen,
+            Some(AgentSelectionAction::Named(_) | AgentSelectionAction::Select(_))
+        ) {
+            self.list.hold_focus();
+        }
+        match chosen {
             Some(AgentSelectionAction::Named(index)) => self
                 .saving
                 .send(derivation_pin(NAMED_DERIVATIONS[index].0.clone())),
@@ -1100,7 +1109,8 @@ fn pinned_selection(selection: AgentSelection) -> SettingMutation {
 /// holds, and the reader's word on how this terminal draws them, which
 /// decides whether Suru shows Icons. On a first run neither answer is under
 /// Row Focus, so the reader looks before they answer; on a retake the answer
-/// Show icons already holds is. Finish pins the answer under Row Focus, and
+/// Show icons holds is, following the Settings in force until the reader
+/// moves Row Focus or chooses. Finish pins the answer under Row Focus, and
 /// does nothing until there is one. While the answer is that the sample draws
 /// as boxes or blanks, a note beneath says how to get Icons.
 ///
@@ -1117,6 +1127,9 @@ struct IconsStep {
     /// The answer under Row Focus, once the reader has moved to one or the
     /// retake began on one.
     focus: Option<IconsAnswer>,
+    /// Whether Row Focus follows Show icons as the Settings in force change:
+    /// on a retake, until the reader moves it or chooses.
+    follows: bool,
     /// How many of the answers the last frame drew, from the first; nothing
     /// until a frame has been drawn since the step opened.
     drawn: Cell<Option<usize>>,
@@ -1190,8 +1203,18 @@ impl IconsStep {
     /// Opens the step afresh: a retake the reader asked for begins with the
     /// answer Show icons holds under Row Focus, and a first run with none.
     fn open(&mut self, opening: Opening, settings: &EffectiveSettings) {
-        self.focus = (opening == Opening::Requested)
-            .then(|| IconsAnswer::of(settings.appearance.show_icons));
+        self.follows = opening == Opening::Requested;
+        self.adopt(settings);
+    }
+
+    /// Follows `settings`, those now in force: on a retake whose Row Focus
+    /// the reader has not touched, it rests on the answer Show icons holds,
+    /// so an answer saved just before the retake opened is the one it shows
+    /// once the Server's stream does.
+    fn adopt(&mut self, settings: &EffectiveSettings) {
+        if self.follows {
+            self.focus = Some(IconsAnswer::of(settings.appearance.show_icons));
+        }
     }
 
     fn command_for_key(&self, key: KeyEvent) -> Option<CommandId> {
@@ -1214,6 +1237,7 @@ impl IconsStep {
         if self.saving.is_pending() {
             return;
         }
+        self.follows = false;
         let answers = IconsAnswer::ALL.len() as isize;
         let from = self
             .focus
@@ -1240,6 +1264,7 @@ impl IconsStep {
             return None;
         }
         let pin = self.pin()?;
+        self.follows = false;
         Some(self.saving.send(pin))
     }
 
@@ -1388,6 +1413,7 @@ impl Onboarding {
         if self.is_open() {
             self.providers.follow(server.settings);
             self.derivation.adopt(server, heard);
+            self.icons.adopt(server.settings);
         }
     }
 
