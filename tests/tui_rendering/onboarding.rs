@@ -555,23 +555,24 @@ fn with_enablement(codex: bool, copilot: bool, claude: bool) -> EffectiveSetting
     settings
 }
 
-/// What the round trip of `edit`, a transition asking for a Setting
-/// mutation, leaves in force, as the Server answers it.
+/// The round trip of `edit`, a transition asking for a Setting mutation: the
+/// Server's stream pushes `settings`, what the edit left in force, and its
+/// answer to the edit says it landed.
 fn settle_mutation(
     application: &mut Application,
     edit: &ApplicationTransition,
     settings: EffectiveSettings,
 ) {
+    deliver_settings(application, settings);
+    answer(application, request_of(edit));
+}
+
+/// The Server's answer to the edit sent under `request`: that it landed.
+/// What it left in force reaches the Client on the Server's stream instead.
+fn answer(application: &mut Application, request: SettingRequest) -> ApplicationTransition {
     application
-        .handle_event(ApplicationEvent::SettingMutated {
-            request: request_of(edit),
-            snapshot: SettingsSnapshot {
-                settings,
-                pinned: Vec::new(),
-                diagnostics: Vec::new(),
-            },
-        })
-        .expect("receive the settings the edit left in force");
+        .handle_event(ApplicationEvent::SettingMutated { request })
+        .expect("hear the edit landed")
 }
 
 /// A catalog naming each Provider by its status alone, which is all a
@@ -2495,16 +2496,11 @@ fn an_acknowledged_pin_moves_the_mark_of_the_value_in_force() {
     press(&mut application, KeyCode::Down);
     let pin = press(&mut application, KeyCode::Enter);
     assert_eq!(pin, derivation_pin(DerivationErrand::Off));
-    application
-        .handle_event(ApplicationEvent::SettingMutated {
-            request: request_of(&pin),
-            snapshot: SettingsSnapshot {
-                settings: settings_deriving_with(DerivationErrand::Off),
-                pinned: Vec::new(),
-                diagnostics: Vec::new(),
-            },
-        })
-        .expect("hear the Server accept the pin");
+    settle_mutation(
+        &mut application,
+        &pin,
+        settings_deriving_with(DerivationErrand::Off),
+    );
 
     press(&mut application, KeyCode::Left);
     let rows = rendered_application_rows_at(&application, 100, 24);
@@ -3001,15 +2997,15 @@ fn acknowledge(
     show_icons: bool,
 ) -> ApplicationTransition {
     application
-        .handle_event(ApplicationEvent::SettingMutated {
-            request,
-            snapshot: SettingsSnapshot {
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
                 settings: with_show_icons(show_icons),
                 pinned: vec!["appearance.showIcons".to_owned()],
                 diagnostics: Vec::new(),
             },
-        })
-        .expect("receive the Settings the edit left in force")
+        )))
+        .expect("receive the Settings the edit left in force");
+    answer(application, request)
 }
 
 /// The Server's refusal of the mutation sent under `request`.
@@ -3484,16 +3480,7 @@ fn next_waits_on_a_toggle_the_server_has_not_answered() {
     );
 
     // The Server's answer to another edit is not this toggle's.
-    application
-        .handle_event(ApplicationEvent::SettingMutated {
-            request: SettingRequest::new(),
-            snapshot: SettingsSnapshot {
-                settings: with_enablement(true, false, false),
-                pinned: Vec::new(),
-                diagnostics: Vec::new(),
-            },
-        })
-        .expect("hear the Server answer another edit");
+    answer(&mut application, SettingRequest::new());
     press(&mut application, KeyCode::Enter);
     assert!(screen(&application).contains("Step 1 of 3"));
     assert!(screen(&application).contains("Saving your changes…"));
@@ -3585,15 +3572,15 @@ fn the_derivation_step_waits_on_its_pin_landing_before_it_moves_on() {
     );
 
     application
-        .handle_event(ApplicationEvent::SettingMutated {
-            request: SettingRequest::new(),
-            snapshot: SettingsSnapshot {
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
                 settings: settings.clone(),
                 pinned: vec!["derivation.errand".to_owned()],
                 diagnostics: Vec::new(),
             },
-        })
-        .expect("hear the Server answer another edit");
+        )))
+        .expect("hear the Server push the pin already in force");
+    answer(&mut application, SettingRequest::new());
     refuse(
         &mut application,
         SettingRequest::new(),
@@ -3728,4 +3715,62 @@ fn options_chosen_for_the_derivation_step_wait_on_their_pin_as_confirming_does()
         "{}",
         screen(&application)
     );
+}
+
+/// Two Providers turned off together are answered in whatever order the
+/// Server's answers arrive, but the Settings in force follow the Server's own
+/// stream, which never goes back: answers in reverse order leave both rows
+/// off and Next locked, and a toggle the Server has answered holds Next
+/// until the Settings in force show it.
+#[test]
+fn toggles_answered_out_of_order_leave_next_held_on_the_settings_in_force() {
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    deliver_settings(&mut application, with_enablement(true, true, false));
+    let codex = press(&mut application, KeyCode::Char(' '));
+    assert_eq!(
+        codex,
+        MutatesSetting(SettingMutation::ProviderCodexEnabled { value: Some(false) })
+    );
+    press(&mut application, KeyCode::Down);
+    let copilot = press(&mut application, KeyCode::Char(' '));
+    assert_eq!(
+        copilot,
+        MutatesSetting(SettingMutation::ProviderCopilotEnabled { value: Some(false) })
+    );
+
+    // The stream pushes Codex turned off; the answer to the later toggle
+    // arrives before the Settings in force show it.
+    deliver_settings(&mut application, with_enablement(false, true, false));
+    answer(&mut application, request_of(&copilot));
+    assert!(
+        provider_row(&application, "Copilot").contains("[x] Copilot · turning off…"),
+        "{}",
+        screen(&application)
+    );
+    press(&mut application, KeyCode::Enter);
+    let held = screen(&application);
+    assert!(held.contains("Step 1 of 3"), "{held}");
+    assert!(held.contains("Saving your changes…"), "{held}");
+
+    // Then the stream pushes both off, and the older toggle's answer comes
+    // last of all.
+    deliver_settings(&mut application, with_enablement(false, false, false));
+    answer(&mut application, request_of(&codex));
+    let locked = screen(&application);
+    assert!(
+        provider_row(&application, "Codex").contains("[ ] Codex · disabled"),
+        "{locked}"
+    );
+    assert!(
+        provider_row(&application, "Copilot").contains("[ ] Copilot · disabled"),
+        "{locked}"
+    );
+    assert!(
+        locked.contains("Next is locked: enable at least one Provider."),
+        "{locked}"
+    );
+    assert!(!locked.contains("Saving your changes…"), "{locked}");
+    press(&mut application, KeyCode::Enter);
+    assert!(screen(&application).contains("Step 1 of 3"));
 }

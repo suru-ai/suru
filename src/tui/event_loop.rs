@@ -2257,13 +2257,10 @@ impl RunLoop {
                 self.flush_agent_selection(transition);
             }
             // A pin landing may finish Onboarding, which marks the Server.
-            SubmissionResult::SettingMutated { request, snapshot } => {
-                let transition =
-                    self.application
-                        .handle_event(ApplicationEvent::SettingMutated {
-                            request,
-                            snapshot: *snapshot,
-                        })?;
+            SubmissionResult::SettingMutated { request } => {
+                let transition = self
+                    .application
+                    .handle_event(ApplicationEvent::SettingMutated { request })?;
                 return Ok(self.dispatch_transition(transition));
             }
             SubmissionResult::SettingMutationFailed { request, error } => {
@@ -3530,9 +3527,9 @@ enum SubmissionResult {
         operation_id: AgentSelectionOperationId,
         error: String,
     },
+    /// What the edit left in force follows on the Server's own stream.
     SettingMutated {
         request: SettingRequest,
-        snapshot: Box<SettingsSnapshot>,
     },
     SettingMutationFailed {
         request: SettingRequest,
@@ -4166,10 +4163,7 @@ fn spawn_setting_mutation(
 ) {
     tokio::spawn(async move {
         let result = match commands.mutate_setting(mutation).await {
-            Ok(snapshot) => SubmissionResult::SettingMutated {
-                request,
-                snapshot: Box::new(snapshot),
-            },
+            Ok(_) => SubmissionResult::SettingMutated { request },
             Err(error) => SubmissionResult::SettingMutationFailed {
                 request,
                 error: error.to_string(),

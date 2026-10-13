@@ -4994,11 +4994,13 @@ pub enum ApplicationEvent {
         snapshot: Option<SessionSnapshot>,
         error: Option<String>,
     },
-    /// The effective settings an accepted edit, asked for under `request`,
-    /// left in force.
+    /// The Server's word that the edit asked for under `request` landed.
+    /// What it left in force reaches the Client on the Server's own stream,
+    /// which carries every change in the order the Server made them, whereas
+    /// answers to edits arrive in no order of their own; so an answer is
+    /// never taken for the settings in force.
     SettingMutated {
         request: SettingRequest,
-        snapshot: SettingsSnapshot,
     },
     /// Why the edit asked for under `request` never landed.
     SettingMutationFailed {
@@ -5831,7 +5833,6 @@ impl Application {
         let carries_settings = matches!(
             &event,
             ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(_))
-                | ApplicationEvent::SettingMutated { .. }
                 | ApplicationEvent::ServingPrepared {
                     settings: Some(_),
                     ..
@@ -6246,9 +6247,11 @@ impl Application {
             // Onboarding settles what it awaits by its own requests, and
             // finishes once the pin of its last answer lands, so the mark
             // never runs ahead of an answer the Server refuses.
-            ApplicationEvent::SettingMutated { request, snapshot } => {
-                let finished = self.state.onboarding.edit_landed(request);
-                self.state.adopt_settings(snapshot);
+            ApplicationEvent::SettingMutated { request } => {
+                let finished = self
+                    .state
+                    .onboarding
+                    .edit_landed(request, &self.state.settings);
                 Ok(if finished {
                     self.state.take_onboarding()
                 } else {

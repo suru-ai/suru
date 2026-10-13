@@ -1985,9 +1985,8 @@ fn space_on_a_provider_row_toggles_that_providers_enablement() {
     );
 
     application
-        .handle_event(ApplicationEvent::SettingMutated {
-            request: SettingRequest::new(),
-            snapshot: snapshot(
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            snapshot(
                 EffectiveSettings {
                     provider: ProviderSettings {
                         codex: CodexSettings {
@@ -2000,7 +1999,7 @@ fn space_on_a_provider_row_toggles_that_providers_enablement() {
                 },
                 &["provider.codex.enabled"],
             ),
-        })
+        )))
         .expect("receive the settings the edit left in force");
     let codex = row(&application, "Codex");
     assert!(
@@ -2931,13 +2930,12 @@ fn choosing_a_value_pins_it_and_the_row_follows_the_refreshed_snapshot() {
     );
 
     application
-        .handle_event(ApplicationEvent::SettingMutated {
-            request: SettingRequest::new(),
-            snapshot: snapshot(
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            snapshot(
                 opening_at(FoldPosture::Expanded),
                 &["transcript.defaultFoldPosture"],
             ),
-        })
+        )))
         .expect("receive the settings the edit left in force");
     assert!(
         row(&application, "Default Fold posture").contains("expanded [pinned]"),
@@ -3577,10 +3575,9 @@ fn resetting_a_pinned_setting_unpins_it_and_the_row_returns_to_the_default() {
         "the reset action emits the unset mutation"
     );
     application
-        .handle_event(ApplicationEvent::SettingMutated {
-            request: SettingRequest::new(),
-            snapshot: snapshot(EffectiveSettings::default(), &[]),
-        })
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            snapshot(EffectiveSettings::default(), &[]),
+        )))
         .expect("receive the settings the reset left in force");
     assert!(
         row(&application, "Default Fold posture").contains("folded [default]"),

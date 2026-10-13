@@ -321,11 +321,14 @@ impl Saving {
 /// `r` asks the Client's own Server to re-read every Provider, whichever
 /// Outlook is on screen, as a request of the flow's own.
 ///
-/// A toggle the Server has not yet answered holds Next, so the step is never
-/// passed on the strength of a Provider about to be turned off: its row says
-/// the Provider is turning, its tick staying as the Server says, and Space
-/// turns it no further until the toggle's own answer comes back. One the
-/// Server refuses is said beneath the rows.
+/// A toggle not yet settled holds Next, so the step is never passed on the
+/// strength of a Provider about to be turned off: its row says the Provider
+/// is turning, its tick staying as the Server says, and Space turns it no
+/// further until the toggle's own answer comes back. Answers arrive in no
+/// order of their own and carry no settings, so a toggle answered waits on
+/// the Settings in force — which the Server's stream carries in the order it
+/// made them — to show what it asked before it is settled. One the Server
+/// refuses is said beneath the rows.
 #[derive(Clone, Debug, Default)]
 struct ProvidersStep {
     /// The row the cursor is on.
@@ -341,7 +344,7 @@ struct ProvidersStep {
     refusal: Option<String>,
 }
 
-/// One Provider's Enablement, sent under `request` and not yet answered.
+/// One Provider's Enablement, sent under `request` and not yet settled.
 #[derive(Clone, Debug)]
 struct Toggle {
     request: SettingRequest,
@@ -350,6 +353,9 @@ struct Toggle {
     name: &'static str,
     /// Whether it turns the Provider on rather than off.
     enabling: bool,
+    /// Whether the Server has said it landed, after which it waits only on
+    /// the Settings in force to show it.
+    answered: bool,
 }
 
 /// Where the flow's own re-read of every Provider stands.
@@ -435,7 +441,9 @@ impl ProvidersStep {
     /// Sends the edit turning the Provider under the cursor off where it is
     /// on and on where it is off, measured against the Settings in force,
     /// under a request of its own the step awaits. A Provider whose toggle is
-    /// unanswered is turned no further until it is.
+    /// unanswered is turned no further until it is; one answered but not yet
+    /// shown is sent again in its place, so a Provider another Client turned
+    /// back meanwhile never leaves the step waiting for good.
     fn toggle(
         &mut self,
         settings: &EffectiveSettings,
@@ -444,51 +452,77 @@ impl ProvidersStep {
             return None;
         }
         let provider = Self::providers().nth(self.cursor)?;
-        if self.toggling(&provider.id).is_some() {
+        if self
+            .toggling(&provider.id)
+            .is_some_and(|toggle| !toggle.answered)
+        {
             return None;
         }
         let mutation = provider_enablement(&provider.id)?
             .next_choice(settings)?
             .mutation();
         let request = SettingRequest::new();
+        self.toggles
+            .retain(|toggle| toggle.provider != &provider.id);
         self.toggles.push(Toggle {
             request,
             provider: &provider.id,
             name: &provider.display_name,
             enabling: !settings.provider_enabled(&provider.id),
+            answered: false,
         });
         Some((mutation, request))
     }
 
-    /// The unanswered toggle of `provider`, if it has one.
+    /// The toggle of `provider` not yet settled, if it has one.
     fn toggling(&self, provider: &ProviderId) -> Option<&Toggle> {
         self.toggles
             .iter()
             .find(|toggle| toggle.provider == provider)
     }
 
-    /// Whether some toggle is unanswered, while which Next waits.
+    /// Whether some toggle is not yet settled, while which Next waits.
     fn is_saving(&self) -> bool {
         !self.toggles.is_empty()
     }
 
-    /// Takes the Server's answer to `request` where it is a toggle the step
-    /// awaits, answering whether it was; `refusal` is why the Server refused
-    /// it, if it did.
-    fn settle(&mut self, request: SettingRequest, refusal: Option<&str>) -> bool {
-        let Some(index) = self
-            .toggles
+    /// Where the toggle sent under `request` stands among those awaited.
+    fn awaited(&self, request: SettingRequest) -> Option<usize> {
+        self.toggles
             .iter()
             .position(|toggle| toggle.request == request)
-        else {
+    }
+
+    /// Takes the Server's word that the toggle sent under `request` landed,
+    /// where the step awaits it, answering whether it does; it is settled
+    /// once `settings`, those in force, show it.
+    fn answer(&mut self, request: SettingRequest, settings: &EffectiveSettings) -> bool {
+        let Some(index) = self.awaited(request) else {
+            return false;
+        };
+        self.toggles[index].answered = true;
+        self.follow(settings);
+        true
+    }
+
+    /// Takes the Server's refusal of the toggle sent under `request`, where
+    /// the step awaits it, answering whether it does: the toggle is settled,
+    /// and why it never landed is said beneath the rows.
+    fn refuse(&mut self, request: SettingRequest, error: &str) -> bool {
+        let Some(index) = self.awaited(request) else {
             return false;
         };
         let toggle = self.toggles.remove(index);
-        if let Some(error) = refusal {
-            let turn = if toggle.enabling { "on" } else { "off" };
-            self.refusal = Some(format!("Could not turn {} {turn}: {error}", toggle.name));
-        }
+        let turn = if toggle.enabling { "on" } else { "off" };
+        self.refusal = Some(format!("Could not turn {} {turn}: {error}", toggle.name));
         true
+    }
+
+    /// Settles each answered toggle `settings`, those now in force, show.
+    fn follow(&mut self, settings: &EffectiveSettings) {
+        self.toggles.retain(|toggle| {
+            !toggle.answered || settings.provider_enabled(toggle.provider) != toggle.enabling
+        });
     }
 
     /// Why the step may not be passed yet, or nothing where some Provider is
@@ -1340,6 +1374,7 @@ impl Onboarding {
     /// the flow is open.
     pub(super) fn adopt(&mut self, server: OwnServer<'_>, heard: Heard) {
         if self.is_open() {
+            self.providers.follow(server.settings);
             self.derivation.adopt(server, heard);
         }
     }
@@ -1448,11 +1483,16 @@ impl Onboarding {
 
     /// Takes the Server's acceptance of the edit asked for under `request`,
     /// where the flow awaits it, answering whether that finishes the flow: a
-    /// Provider's toggle is answered, the Derivation step's pin moves the
-    /// flow on, and the Icons step's finishes it. The answer to any other
-    /// edit settles nothing the flow awaits.
-    pub(super) fn edit_landed(&mut self, request: SettingRequest) -> bool {
-        if self.providers.settle(request, None) {
+    /// Provider's toggle is answered, settling once `settings`, those in
+    /// force, show it, the Derivation step's pin moves the flow on, and the
+    /// Icons step's finishes it. The answer to any other edit settles
+    /// nothing the flow awaits.
+    pub(super) fn edit_landed(
+        &mut self,
+        request: SettingRequest,
+        settings: &EffectiveSettings,
+    ) -> bool {
+        if self.providers.answer(request, settings) {
             return false;
         }
         if self.derivation.saving.land(request) {
@@ -1469,7 +1509,7 @@ impl Onboarding {
     /// answers whether it did. The refusal of any other edit is not the
     /// flow's to say.
     pub(super) fn edit_refused(&mut self, request: SettingRequest, error: &str) -> bool {
-        self.providers.settle(request, Some(error))
+        self.providers.refuse(request, error)
             || self.derivation.saving.refuse(request, error)
             || self.icons.saving.refuse(request, error)
     }
