@@ -74,7 +74,7 @@ use super::{
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
-    onboarding::{Advance, DerivationMove, Onboarding, Opening, OwnServer},
+    onboarding::{Advance, DerivationMove, Heard, Onboarding, Opening, OwnServer},
     relay_overlay::{
         ListingLanded, RedemptionLoginLead, RelayLoginAct, RelayLoginFollow, RelayLoginLead,
         RelayOverlay, RelayRequest,
@@ -1862,7 +1862,7 @@ impl TuiState {
         if let ManagedEvent::ModelCatalog(catalog) = event {
             self.model_picker.adopt_catalog(outlook.clone(), catalog);
             if *outlook == Outlook::Local {
-                self.refresh_onboarding();
+                self.refresh_onboarding(Heard::Catalog);
             }
             return;
         }
@@ -2369,7 +2369,7 @@ impl TuiState {
             // pushes is the Local Outlook's whichever Outlook is on screen.
             ManagedEvent::ModelCatalog(catalog) => {
                 self.model_picker.adopt_catalog(Outlook::Local, catalog);
-                self.refresh_onboarding();
+                self.refresh_onboarding(Heard::Catalog);
             }
             ManagedEvent::SkillCatalogUpdated(catalog) => {
                 let request = SkillCatalogRequest {
@@ -2678,7 +2678,7 @@ impl TuiState {
         self.session_picker.adopt_settings(&self.settings);
         self.aside.adopt_settings(&self.settings);
         self.application_notice.receive(&snapshot.diagnostics);
-        self.refresh_onboarding();
+        self.refresh_onboarding(Heard::Settings);
     }
 
     pub(super) fn settings(&self) -> &EffectiveSettings {
@@ -2730,14 +2730,14 @@ impl TuiState {
             .open(opening, OwnServer::of(&self.settings, &self.model_picker));
     }
 
-    /// Lets an open Onboarding follow its own Server's settings and Model
-    /// Catalog as the Client hears them change. Model Options it opened over
-    /// itself choose among what it offers, so a Model it no longer offers —
-    /// its Provider turned off or found unavailable — refuses to apply until
-    /// it is offered again.
-    fn refresh_onboarding(&mut self) {
+    /// Lets an open Onboarding follow what the Client has `heard` of its own
+    /// Server's settings or Model Catalog. Model Options it opened over itself
+    /// choose among what it offers, so a Model it no longer offers — its
+    /// Provider turned off or found unavailable — refuses to apply until it
+    /// is offered again.
+    fn refresh_onboarding(&mut self, heard: Heard) {
         self.onboarding
-            .adopt(OwnServer::of(&self.settings, &self.model_picker));
+            .adopt(OwnServer::of(&self.settings, &self.model_picker), heard);
         if self.model_options.owner() != ModelOptionsOwner::OnboardingDerivation {
             return;
         }
@@ -5966,7 +5966,7 @@ impl Application {
                             self.state
                                 .model_picker
                                 .adopt_reading(Outlook::Local, catalog, pushes);
-                            self.state.refresh_onboarding();
+                            self.state.refresh_onboarding(Heard::Catalog);
                         }
                         Err(error) => self.state.onboarding.fail_listing(&error),
                     }
@@ -9467,7 +9467,9 @@ impl Application {
         self.state
             .model_picker
             .load(request, catalog, current.as_ref());
-        self.state.refresh_onboarding();
+        if accepted && request.outlook() == &Outlook::Local {
+            self.state.refresh_onboarding(Heard::Catalog);
+        }
         if listing == CatalogListing::Complete {
             self.state.model_picker.finish(request);
         }

@@ -165,6 +165,16 @@ impl<'a> OwnServer<'a> {
     }
 }
 
+/// What the Client heard of its own Server, which the flow follows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Heard {
+    /// Its Settings, which say nothing of how its catalog was last read.
+    Settings,
+    /// Its Model Catalog, pushed or read anew: a newer word than any reading
+    /// of it that failed before.
+    Catalog,
+}
+
 /// The flow as one frame draws it: its lines, and the lines among them it
 /// wrapped itself, each placed by the line it begins on, which a selection
 /// reads as they were written.
@@ -635,6 +645,9 @@ struct DerivationStep {
     /// The value the Setting holds, which the list marks and Row Focus first
     /// rests on.
     in_force: DerivationErrand,
+    /// Why the last reading of every Provider failed, which the step offers
+    /// to retry beneath each Provider until a catalog heard since says more.
+    failure: Option<String>,
 }
 
 impl Default for DerivationStep {
@@ -644,6 +657,7 @@ impl Default for DerivationStep {
                 NAMED_DERIVATIONS.iter().map(|(_, label)| *label).collect(),
             ),
             in_force: DerivationErrand::default(),
+            failure: None,
         }
     }
 }
@@ -665,11 +679,26 @@ impl DerivationStep {
 
     /// Follows the Client's own Server as it changes: a Provider turned off
     /// or found unavailable since leaves the list, and Row Focus stays where
-    /// the reader moved it.
-    fn adopt(&mut self, server: OwnServer<'_>) {
+    /// the reader moved it. A failed reading stands until a catalog is
+    /// `heard` after it, since the catalog in hand is the one it failed to
+    /// read past.
+    fn adopt(&mut self, server: OwnServer<'_>, heard: Heard) {
         self.in_force = server.settings.derivation.errand.clone();
+        if heard == Heard::Catalog {
+            self.failure = None;
+        }
         self.list
             .relist(usable_providers(server), in_force(&self.in_force));
+        if let Some(failure) = &self.failure {
+            self.list.fail(failure.clone());
+        }
+    }
+
+    /// Takes in a reading of every Provider that failed, offering to retry it
+    /// beneath each Provider listed.
+    fn fail(&mut self, error: &str) {
+        self.failure = Some(error.to_owned());
+        self.list.fail(error.to_owned());
     }
 
     fn command_for_key(&self, key: KeyEvent) -> Option<CommandId> {
@@ -840,9 +869,9 @@ impl Onboarding {
 
     /// Follows the Client's own Server as the Client hears it change, while
     /// the flow is open.
-    pub(super) fn adopt(&mut self, server: OwnServer<'_>) {
+    pub(super) fn adopt(&mut self, server: OwnServer<'_>, heard: Heard) {
         if self.is_open() {
-            self.derivation.adopt(server);
+            self.derivation.adopt(server, heard);
         }
     }
 
@@ -887,7 +916,7 @@ impl Onboarding {
     /// lists none.
     pub(super) fn fail_listing(&mut self, error: &str) {
         if self.is_open() {
-            self.derivation.list.fail(error.to_owned());
+            self.derivation.fail(error);
         }
     }
 

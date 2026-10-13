@@ -2702,3 +2702,105 @@ fn a_retry_from_the_derivation_step_leaves_a_remote_listing_in_flight_to_settle(
         screen(&application)
     );
 }
+
+/// The pushed catalog once Claude is installed, which the Derivation step
+/// lists whole on a screen of its usual size.
+fn claude_installed() -> ModelCatalog {
+    let mut catalog = pushed_catalog();
+    catalog.providers[2].status = ProviderCatalogStatus::Fresh;
+    catalog
+}
+
+/// Claude offering one Model, and Codex Models 01 to 12.
+fn claude_and_codex_listing() -> ModelCatalog {
+    let mut catalog = codex_listing(0);
+    catalog.providers.insert(
+        0,
+        ProviderModelCatalog {
+            status: ProviderCatalogStatus::Fresh,
+            ..unavailable_claude()
+        },
+    );
+    catalog
+}
+
+/// A fresh Server's Client on the Derivation step listing `catalog`, with a
+/// re-check of every Provider asked from the Providers step and not yet
+/// answered.
+fn awaiting_a_recheck_on_the_derivation_step(
+    workspace: &Path,
+    catalog: ModelCatalog,
+) -> (Application, uuid::Uuid) {
+    let mut application = attached_to_a_fresh_server(workspace);
+    deliver_settings(
+        &mut application,
+        settings_deriving_with(DerivationErrand::FollowSession),
+    );
+    deliver_catalog(&mut application, catalog);
+    let recheck = recheck(&mut application);
+    press(&mut application, KeyCode::Enter);
+    assert!(
+        screen(&application).contains("Step 2 of 3"),
+        "{}",
+        screen(&application)
+    );
+    (application, recheck)
+}
+
+#[test]
+fn retry_rows_a_failure_lists_above_row_focus_leave_it_in_view() {
+    let workspace = workspace_dir();
+    let (mut application, recheck) =
+        awaiting_a_recheck_on_the_derivation_step(workspace.path(), claude_and_codex_listing());
+    press(&mut application, KeyCode::Up);
+    let walked = derivation_rows(&application);
+    assert!(
+        walked
+            .last()
+            .is_some_and(|row| row.starts_with("› Model 12")),
+        "{walked:#?}"
+    );
+
+    answer_recheck(&mut application, recheck, Err("timed out".to_owned()));
+    let failed = derivation_rows(&application);
+    assert!(
+        failed
+            .last()
+            .is_some_and(|row| row.starts_with("› Model 12")),
+        "a retry row listed above Row Focus moves the window only as far as keeps it in view: \
+         {failed:#?}"
+    );
+}
+
+#[test]
+fn a_listing_failure_stands_through_settings_until_a_catalog_supersedes_it() {
+    let workspace = workspace_dir();
+    let (mut application, recheck) =
+        awaiting_a_recheck_on_the_derivation_step(workspace.path(), claude_installed());
+    answer_recheck(&mut application, recheck, Err("timed out".to_owned()));
+    let failed = screen(&application);
+    assert!(
+        failed.contains("Retry Claude: timed out") && failed.contains("Retry Codex: timed out"),
+        "{failed}"
+    );
+
+    let mut settings = settings_deriving_with(DerivationErrand::FollowSession);
+    settings.provider.codex.enabled = false;
+    deliver_settings(&mut application, settings);
+    let turned_off = screen(&application);
+    assert!(
+        turned_off.contains("Retry Claude: timed out"),
+        "a snapshot of the settings says nothing of the listing: {turned_off}"
+    );
+    assert!(
+        !turned_off.contains("Codex"),
+        "though a Provider turned off since still leaves the list: {turned_off}"
+    );
+
+    deliver_catalog(&mut application, claude_installed());
+    let superseded = screen(&application);
+    assert!(
+        !superseded.contains("Retry Claude"),
+        "a catalog heard since is the newer word: {superseded}"
+    );
+}

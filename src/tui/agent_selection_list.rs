@@ -300,28 +300,17 @@ impl AgentSelectionList {
     /// Focus stays where the reader moved it while that row is still listed,
     /// and otherwise goes to `current`.
     pub(super) fn relist(&mut self, providers: Vec<ProviderModels>, current: Option<InForce<'_>>) {
-        let focused = self.selected.clone();
-        let from = self.focus_entry();
+        let (focused, from) = (self.selected.clone(), self.focus_entry());
         self.providers = providers;
         self.focus(current, self.cursor_moved);
-        if self.selected != focused {
-            // Focus carried to a choice the rows only now list brings the
-            // window along, as the keys would have.
-            self.window.reveal();
-        } else if let (Some(from), Some(to)) = (from, self.focus_entry())
-            && from != to
-        {
-            // Rows listed or taken away above focus move no window while
-            // focus stays in view, and only as far as keeps it in view once
-            // it would not.
-            self.window.shift_focus(from, to);
-        }
+        self.follow_focus(focused, from);
     }
 
     /// Takes in a listing that failed: a row a reader may retry where there
     /// were none, and otherwise every Provider's rows marked as what was last
     /// heard.
     pub(super) fn fail(&mut self, error: String) {
+        let (focused, from) = (self.selected.clone(), self.focus_entry());
         if self.providers.is_empty() {
             let provider = self
                 .provider_scope
@@ -341,6 +330,24 @@ impl AgentSelectionList {
             }
         }
         self.focus(None, true);
+        self.follow_focus(focused, from);
+    }
+
+    /// Brings the window along once the rows changed under focus, which
+    /// stood on `focused`, at entry `from`, before they did.
+    fn follow_focus(&self, focused: Option<ListSelection>, from: Option<usize>) {
+        if self.selected != focused {
+            // Focus carried to another row comes into view as the keys would
+            // have carried it there.
+            self.window.reveal();
+        } else if let (Some(from), Some(to)) = (from, self.focus_entry())
+            && from != to
+        {
+            // Rows listed or taken away above focus move no window while
+            // focus stays in view, and only as far as keeps it in view once
+            // it would not.
+            self.window.shift_focus(from, to);
+        }
     }
 
     /// Whether focus stands on a row that re-lists the catalog.
