@@ -1,18 +1,22 @@
-//! Searchable Model picker state and stable catalog reconciliation.
+//! The Model picker: the Agent Selection list in an overlay of its own, the
+//! catalog listings it asks for, and the latest catalog heard for each Outlook.
 
 use std::collections::HashMap;
 
-use crate::protocol::{
-    AgentSelection, ModelAvailability, ModelCatalog, ModelDescriptor, ModelId, ModelOptionKind,
-    ModelOptionRole, ModelOptionValue, Outlook, ProviderCatalogStatus, ProviderId,
-    ProviderModelCatalog, ProviderUnavailability, SettingMutation,
+use crate::{
+    protocol::{
+        AgentSelection, ModelCatalog, ModelDescriptor, ModelId, ModelOptionKind, ModelOptionRole,
+        ModelOptionValue, Outlook, ProviderCatalogStatus, ProviderId, SettingMutation,
+    },
+    theme::Theme,
 };
 
 use super::{
     ModelListRequest,
-    fuzzy::fuzzy_matches,
-    list_window::{ListWindow, WindowEntry},
-    wrapped_text::{FIX_INDENT, WrappedText},
+    agent_selection_list::{
+        AgentSelectionAction, AgentSelectionLines, AgentSelectionList, ProviderModels,
+        default_model, normalize_catalog,
+    },
 };
 
 /// What the Model a reader picks here is for. The picker is one list of Models
@@ -27,43 +31,6 @@ pub(super) enum ModelPickerPurpose {
     /// Setting itself supplied. The picker knows nothing about which Setting:
     /// it carries the pin and hands the choice to it.
     Setting(fn(AgentSelection) -> SettingMutation),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ModelKey {
-    provider: ProviderId,
-    model: ModelId,
-}
-
-impl ModelKey {
-    fn new(provider: ProviderId, model: ModelId) -> Self {
-        Self { provider, model }
-    }
-
-    fn from_model(model: &ModelDescriptor) -> Self {
-        Self::new(model.provider.clone(), model.id.clone())
-    }
-
-    fn from_selection(selection: &AgentSelection) -> Self {
-        Self::new(selection.provider.clone(), selection.model.clone())
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum PickerSelection {
-    Model(ModelKey),
-    Retry(ProviderId),
-}
-
-#[derive(Clone, Debug)]
-struct ProviderModels {
-    provider: ProviderId,
-    /// The Provider's name as the user reads it. Catalog-served rows carry the
-    /// runtime-declared name; rows the picker invents for a Provider no catalog
-    /// answered for fall back to the wire identifier, the only name it has.
-    display_name: String,
-    models: Vec<ModelDescriptor>,
-    status: ProviderCatalogStatus,
 }
 
 /// The presentation metadata known when an Outlook's current Agent Selection
@@ -92,8 +59,6 @@ pub(super) struct ModelPicker {
     /// choose a Setting's value must not be dragged onto the Model the reader
     /// happens to be conversing at when the catalog lands.
     opened_on: Option<AgentSelection>,
-    provider_scope: Option<ProviderId>,
-    query: String,
     /// The latest catalog heard for each Outlook, whether a listing this
     /// picker asked for or one the server pushed. Kept per Outlook so turning
     /// back to one names its Models again without waiting to hear the catalog
@@ -102,13 +67,12 @@ pub(super) struct ModelPicker {
     /// How many catalogs each Outlook's Server has pushed, which tells a
     /// reading asked of it earlier whether a newer word has landed since.
     pushes: HashMap<Outlook, u64>,
-    providers: Vec<ProviderModels>,
+    /// The Models on show, which outlive the overlay so a Provider the picker
+    /// last listed goes on being named by it.
+    list: AgentSelectionList,
     /// One current presentation per Outlook, retained while another Outlook is
     /// visible so returning to it restores the label it previously showed.
     selection_presentations: Vec<SelectionPresentation>,
-    selected: Option<PickerSelection>,
-    cursor_moved: bool,
-    window: ListWindow,
 }
 
 /// How the latest catalog heard for each Outlook names its Providers and
@@ -169,41 +133,6 @@ impl<'a> CatalogStatuses<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) enum ModelPickerRow<'a> {
-    Provider {
-        name: &'a str,
-        refreshing: bool,
-    },
-    Model {
-        model: &'a ModelDescriptor,
-        selected: bool,
-        current: bool,
-    },
-    Error {
-        name: &'a str,
-        message: &'a str,
-        selected: bool,
-    },
-    /// A Provider the user cannot use yet. It keeps its place in the list with
-    /// its reason on show and what fixes it beneath, its Models render
-    /// unselectable, and choosing the row re-lists the catalog for a user who
-    /// has just fixed the condition.
-    Unavailable {
-        name: &'a str,
-        reason: ProviderUnavailability,
-        message: &'a str,
-        fix: &'a str,
-        selected: bool,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub(super) enum ModelPickerAction {
-    Select(ModelDescriptor),
-    Retry,
-}
-
 impl ModelPicker {
     pub(super) fn cached_model_for_options(
         &self,
@@ -245,8 +174,7 @@ impl ModelPicker {
         self.outlook = outlook;
         self.close();
         self.active_request = None;
-        self.providers.clear();
-        self.provider_scope = None;
+        self.list.clear();
     }
 
     /// The latest catalog heard for the current Outlook, or nothing yet.
@@ -267,25 +195,18 @@ impl ModelPicker {
         purpose: ModelPickerPurpose,
     ) -> ModelListRequest {
         self.open = true;
-        self.query.clear();
         self.purpose = purpose;
         self.opened_on = current.cloned();
-        self.provider_scope = provider_scope;
-        self.providers = self.cache().to_vec();
-        self.cursor_moved = false;
-        self.window.open();
-        let request = self.begin_refresh();
-        self.focus(current, false);
-        request
+        self.list
+            .open(self.cache().to_vec(), provider_scope, current);
+        self.begin_refresh()
     }
 
     pub(super) fn close(&mut self) {
         self.open = false;
-        self.query.clear();
         self.purpose = ModelPickerPurpose::default();
         self.opened_on = None;
-        self.selected = None;
-        self.cursor_moved = false;
+        self.list.close();
     }
 
     pub(super) fn purpose(&self) -> ModelPickerPurpose {
@@ -316,15 +237,15 @@ impl ModelPicker {
     }
 
     pub(super) fn is_loading(&self) -> bool {
-        self.active_request.is_some() && self.providers.is_empty()
+        self.active_request.is_some() && self.list.is_empty()
     }
 
     pub(super) fn query(&self) -> &str {
-        &self.query
+        self.list.query()
     }
 
     pub(super) fn provider_scope(&self) -> Option<&ProviderId> {
-        self.provider_scope.as_ref()
+        self.list.provider_scope()
     }
 
     /// The Provider's name as the user reads it, from whichever catalog the
@@ -354,10 +275,11 @@ impl ModelPicker {
     /// The Provider as the latest catalog lists it: the live list first, then
     /// the current Outlook's cache. Nothing while no catalog has named it.
     fn listed_provider(&self, provider: &ProviderId) -> Option<&ProviderModels> {
-        self.providers
-            .iter()
-            .chain(self.cache().iter())
-            .find(|candidate| &candidate.provider == provider)
+        self.list.provider(provider).or_else(|| {
+            self.cache()
+                .iter()
+                .find(|candidate| &candidate.provider == provider)
+        })
     }
 
     /// Puts focus back on the Selection in force, which another client
@@ -365,10 +287,8 @@ impl ModelPicker {
     /// would carry it.
     pub(super) fn refocus(&mut self, current: Option<&AgentSelection>) {
         if self.open {
-            self.cursor_moved = false;
             let in_force = self.selection_in_force(current);
-            self.focus(in_force.as_ref(), false);
-            self.window.reveal();
+            self.list.refocus(in_force.as_ref());
         }
     }
 
@@ -384,28 +304,8 @@ impl ModelPicker {
         let providers = normalize_catalog(catalog.providers);
         self.cached_providers
             .insert(self.outlook.clone(), providers.clone());
-        if self.providers.is_empty() {
-            self.providers = providers;
-        } else {
-            self.merge(providers);
-        }
-        if let Some(scope) = self.provider_scope.as_ref()
-            && !self
-                .providers
-                .iter()
-                .any(|provider| provider.provider == *scope)
-        {
-            self.providers.push(ProviderModels {
-                display_name: scope.to_string(),
-                provider: scope.clone(),
-                models: Vec::new(),
-                status: ProviderCatalogStatus::Failed {
-                    message: "Provider catalog is unavailable".to_owned(),
-                },
-            });
-        }
         let in_force = self.selection_in_force(current);
-        self.focus(in_force.as_ref(), self.cursor_moved);
+        self.list.load(providers, in_force.as_ref());
     }
 
     /// Takes in a catalog a server pushed unasked, for the Outlook it serves.
@@ -443,30 +343,12 @@ impl ModelPicker {
         if self.active_request.as_ref() != Some(request) {
             return;
         }
-        if self.providers.is_empty() {
-            let provider = self
-                .provider_scope
-                .clone()
-                .unwrap_or_else(|| ProviderId::new("catalog"));
-            self.providers.push(ProviderModels {
-                display_name: provider.to_string(),
-                provider,
-                models: Vec::new(),
-                status: ProviderCatalogStatus::Failed { message: error },
-            });
-        } else {
-            for provider in &mut self.providers {
-                provider.status = ProviderCatalogStatus::Stale {
-                    message: error.clone(),
-                };
-            }
-        }
+        self.list.fail(error);
         self.active_request = None;
-        self.focus(None, true);
     }
 
     pub(super) fn begin_retry(&mut self) -> Option<ModelListRequest> {
-        matches!(self.selected, Some(PickerSelection::Retry(_))).then(|| {
+        self.list.is_retry_selected().then(|| {
             self.request_sequence = self.request_sequence.wrapping_add(1);
             let request = ModelListRequest::new(self.request_sequence, self.outlook.clone());
             self.active_request = Some(request.clone());
@@ -475,79 +357,51 @@ impl ModelPicker {
     }
 
     pub(super) fn insert(&mut self, text: &str) {
-        self.query.push_str(text);
-        self.select_first_visible();
+        self.list.insert(text);
     }
 
     pub(super) fn delete_backward(&mut self) {
-        self.query.pop();
-        self.select_first_visible();
+        self.list.delete_backward();
     }
 
     pub(super) fn select_previous(&mut self) {
-        self.move_selection(-1);
+        self.list.select_previous();
     }
 
     pub(super) fn select_next(&mut self) {
-        self.move_selection(1);
+        self.list.select_next();
     }
 
     pub(super) fn page_previous(&mut self) {
-        self.move_selection(-10);
+        self.list.page_previous();
     }
 
     pub(super) fn page_next(&mut self) {
-        self.move_selection(10);
+        self.list.page_next();
     }
 
-    pub(super) fn choose(&self) -> Option<ModelPickerAction> {
-        match self.selected.as_ref()? {
-            PickerSelection::Model(key) => self
-                .providers
-                .iter()
-                .flat_map(|provider| &provider.models)
-                .find(|model| ModelKey::from_model(model) == *key)
-                .filter(|model| model.availability == ModelAvailability::Available)
-                .cloned()
-                .map(ModelPickerAction::Select),
-            PickerSelection::Retry(_) => Some(ModelPickerAction::Retry),
-        }
+    pub(super) fn choose(&self) -> Option<AgentSelectionAction> {
+        self.list.choose()
     }
 
-    /// The rows the window shows in `capacity` lines of a list `width`
-    /// columns wide, which decides how many lines each fix beneath a retry
-    /// row takes.
-    pub(super) fn visible_rows(
+    /// The Models the window shows, drawn in `capacity` lines of a list
+    /// `width` columns wide with the Selection in force marked; see
+    /// [`AgentSelectionList::draw`].
+    pub(super) fn draw_rows(
         &self,
         capacity: usize,
+        height: usize,
         width: u16,
         current: Option<&AgentSelection>,
-    ) -> impl Iterator<Item = ModelPickerRow<'_>> {
-        let rows = self.rows(self.selection_in_force(current).as_ref());
-        let selected = rows.iter().position(|row| match row {
-            ModelPickerRow::Model { selected, .. }
-            | ModelPickerRow::Error { selected, .. }
-            | ModelPickerRow::Unavailable { selected, .. } => *selected,
-            ModelPickerRow::Provider { .. } => false,
-        });
-        // A Provider's heading is a Row the keys step over, so it comes into
-        // view with the Models around it rather than counting as one of them.
-        let entries = rows
-            .iter()
-            .map(|row| match row {
-                ModelPickerRow::Provider { .. } => WindowEntry::passive(1),
-                ModelPickerRow::Model { .. } | ModelPickerRow::Error { .. } => WindowEntry::ROW,
-                ModelPickerRow::Unavailable { fix, .. } => {
-                    WindowEntry::focusable(1 + WrappedText::new(fix, FIX_INDENT, width).height())
-                }
-            })
-            .collect::<Vec<_>>();
-        let shown = self.window.settle(&entries, capacity, selected);
-        rows.into_iter().skip(shown.start).take(shown.len())
+        theme: &Theme,
+    ) -> AgentSelectionLines<'_> {
+        let in_force = self.selection_in_force(current);
+        self.list
+            .draw(capacity, height, width, in_force.as_ref(), theme)
     }
 
     pub(super) fn has_rows(&self) -> bool {
-        !self.selectable().is_empty()
+        self.list.has_rows()
     }
 
     pub(super) fn selection_summary(&self, selection: &AgentSelection, detailed: bool) -> String {
@@ -659,293 +513,4 @@ impl ModelPicker {
             self.selection_presentations.push(presentation);
         }
     }
-
-    fn merge(&mut self, incoming: Vec<ProviderModels>) {
-        for provider in &mut self.providers {
-            let Some(update) = incoming
-                .iter()
-                .find(|catalog| catalog.provider == provider.provider)
-            else {
-                for model in &mut provider.models {
-                    model.availability = ModelAvailability::Unavailable;
-                }
-                continue;
-            };
-            provider.status = update.status.clone();
-            provider.display_name.clone_from(&update.display_name);
-            for existing in &mut provider.models {
-                if let Some(model) = update.models.iter().find(|model| model.id == existing.id) {
-                    *existing = model.clone();
-                } else {
-                    existing.availability = ModelAvailability::Unavailable;
-                }
-            }
-            let mut additions = update
-                .models
-                .iter()
-                .filter(|model| {
-                    !provider
-                        .models
-                        .iter()
-                        .any(|existing| existing.id == model.id)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            sort_models(&mut additions);
-            provider.models.extend(additions);
-        }
-        let mut additions = incoming
-            .into_iter()
-            .filter(|incoming| {
-                !self
-                    .providers
-                    .iter()
-                    .any(|existing| existing.provider == incoming.provider)
-            })
-            .collect::<Vec<_>>();
-        additions.sort_by(|left, right| left.provider.as_str().cmp(right.provider.as_str()));
-        self.providers.extend(additions);
-    }
-
-    fn focus(&mut self, current: Option<&AgentSelection>, preserve_selection: bool) {
-        let visible = self.selectable();
-        if preserve_selection
-            && self
-                .selected
-                .as_ref()
-                .is_some_and(|selected| visible.contains(selected))
-        {
-            return;
-        }
-        if let Some(current) = current {
-            let current = PickerSelection::Model(ModelKey::from_selection(current));
-            if visible.contains(&current) {
-                self.selected = Some(current);
-                return;
-            }
-        }
-        if self
-            .selected
-            .as_ref()
-            .is_some_and(|selected| visible.contains(selected))
-        {
-            return;
-        }
-        self.selected = self
-            .providers
-            .iter()
-            .filter(|provider| self.is_listed(provider))
-            .flat_map(|provider| &provider.models)
-            .find(|model| model.is_default && model_matches(&self.query, model))
-            .map(|model| PickerSelection::Model(ModelKey::from_model(model)))
-            .or_else(|| visible.first().cloned());
-    }
-
-    /// Whether this Provider belongs in the list at all: one the reader scoped
-    /// away is somebody else's row, and one the user turned off is nobody's.
-    fn is_listed(&self, provider: &ProviderModels) -> bool {
-        !is_disabled(&provider.status)
-            && self
-                .provider_scope
-                .as_ref()
-                .is_none_or(|scope| *scope == provider.provider)
-    }
-
-    fn rows(&self, current: Option<&AgentSelection>) -> Vec<ModelPickerRow<'_>> {
-        let current = current.map(ModelKey::from_selection);
-        let mut rows = Vec::new();
-        for provider in &self.providers {
-            if !self.is_listed(provider) {
-                continue;
-            }
-            let models = provider
-                .models
-                .iter()
-                .filter(|model| model_matches(&self.query, model))
-                .collect::<Vec<_>>();
-            let condition = provider_condition(&provider.status);
-            if models.is_empty() && condition.is_none() {
-                continue;
-            }
-            rows.push(ModelPickerRow::Provider {
-                name: &provider.display_name,
-                refreshing: matches!(provider.status, ProviderCatalogStatus::Refreshing),
-            });
-            rows.extend(models.into_iter().map(|model| {
-                let key = ModelKey::from_model(model);
-                ModelPickerRow::Model {
-                    model,
-                    selected: self.selected == Some(PickerSelection::Model(key.clone())),
-                    current: current.as_ref() == Some(&key),
-                }
-            }));
-            if let Some(condition) = condition {
-                let selected =
-                    self.selected == Some(PickerSelection::Retry(provider.provider.clone()));
-                rows.push(match condition {
-                    ProviderCondition::Failing(message) => ModelPickerRow::Error {
-                        name: &provider.display_name,
-                        message,
-                        selected,
-                    },
-                    ProviderCondition::Unavailable {
-                        reason,
-                        message,
-                        fix,
-                    } => ModelPickerRow::Unavailable {
-                        name: &provider.display_name,
-                        reason,
-                        message,
-                        fix,
-                        selected,
-                    },
-                });
-            }
-        }
-        rows
-    }
-
-    /// Puts focus on the first Model a new query leaves, which makes the
-    /// results another list: it opens at its head.
-    fn select_first_visible(&mut self) {
-        self.selected = self.selectable().first().cloned();
-        self.cursor_moved = false;
-        self.window.open();
-    }
-
-    fn move_selection(&mut self, distance: isize) {
-        let visible = self.selectable();
-        if visible.is_empty() {
-            self.selected = None;
-            return;
-        }
-        let current = self
-            .selected
-            .as_ref()
-            .and_then(|selected| visible.iter().position(|candidate| candidate == selected))
-            .unwrap_or(0);
-        let next = (current as isize + distance).rem_euclid(visible.len() as isize) as usize;
-        self.selected = Some(visible[next].clone());
-        self.cursor_moved = true;
-        self.window.reveal();
-    }
-
-    fn selectable(&self) -> Vec<PickerSelection> {
-        let mut selectable = Vec::new();
-        for provider in &self.providers {
-            if !self.is_listed(provider) {
-                continue;
-            }
-            selectable.extend(
-                provider
-                    .models
-                    .iter()
-                    .filter(|model| model_matches(&self.query, model))
-                    .map(|model| PickerSelection::Model(ModelKey::from_model(model))),
-            );
-            if provider_condition(&provider.status).is_some() {
-                selectable.push(PickerSelection::Retry(provider.provider.clone()));
-            }
-        }
-        selectable
-    }
-}
-
-/// The Provider's default Model, when the Provider can actually be used: a
-/// Model nothing may select is no basis for the options editor's implicit
-/// choice either.
-fn default_model(provider: &ProviderModels) -> Option<&ModelDescriptor> {
-    if is_unavailable(&provider.status) || is_disabled(&provider.status) {
-        return None;
-    }
-    provider.models.iter().find(|model| model.is_default)
-}
-
-fn normalize_catalog(mut catalog: Vec<ProviderModelCatalog>) -> Vec<ProviderModels> {
-    catalog.sort_by(|left, right| left.provider.as_str().cmp(right.provider.as_str()));
-    catalog.into_iter().map(normalize_provider).collect()
-}
-
-fn normalize_provider(mut catalog: ProviderModelCatalog) -> ProviderModels {
-    sort_models(&mut catalog.models);
-    if is_unavailable(&catalog.status) {
-        // No Model of a Provider the user cannot use can start a Session, so
-        // the whole Provider renders — and refuses selection — as unavailable.
-        // A disabled Provider needs nothing of the sort: Enablement is not
-        // Availability, and a Provider Suru never consulted serves no Model to
-        // mark either way.
-        for model in &mut catalog.models {
-            model.availability = ModelAvailability::Unavailable;
-        }
-    }
-    ProviderModels {
-        provider: catalog.provider,
-        display_name: catalog.display_name,
-        models: catalog.models,
-        status: catalog.status,
-    }
-}
-
-fn sort_models(models: &mut [ModelDescriptor]) {
-    models.sort_by(|left, right| {
-        left.display_name
-            .to_lowercase()
-            .cmp(&right.display_name.to_lowercase())
-            .then_with(|| left.id.as_str().cmp(right.id.as_str()))
-    });
-}
-
-fn model_matches(query: &str, model: &ModelDescriptor) -> bool {
-    fuzzy_matches(query, &model.display_name) || fuzzy_matches(query, model.id.as_str())
-}
-
-/// What a Provider's catalog status puts in the list beyond its Models: the
-/// failure a reader may retry, or the condition making the Provider unusable.
-/// Either way the row it becomes is the Provider's retry target.
-#[derive(Clone, Copy, Debug)]
-enum ProviderCondition<'a> {
-    Failing(&'a str),
-    Unavailable {
-        reason: ProviderUnavailability,
-        message: &'a str,
-        fix: &'a str,
-    },
-}
-
-fn provider_condition(status: &ProviderCatalogStatus) -> Option<ProviderCondition<'_>> {
-    match status {
-        ProviderCatalogStatus::Stale { message } | ProviderCatalogStatus::Failed { message } => {
-            Some(ProviderCondition::Failing(message))
-        }
-        ProviderCatalogStatus::Unavailable {
-            reason,
-            message,
-            fix,
-        } => Some(ProviderCondition::Unavailable {
-            reason: *reason,
-            message,
-            fix,
-        }),
-        // A Provider the user turned off puts nothing in the list — not even a
-        // reason, because Suru never looked for one.
-        ProviderCatalogStatus::Fresh
-        | ProviderCatalogStatus::Warning { .. }
-        | ProviderCatalogStatus::Refreshing
-        | ProviderCatalogStatus::Disabled => None,
-    }
-}
-
-fn is_unavailable(status: &ProviderCatalogStatus) -> bool {
-    matches!(
-        provider_condition(status),
-        Some(ProviderCondition::Unavailable { .. })
-    )
-}
-
-/// A Provider the user turned off leaves the list outright, rather than keeping
-/// its place the way an unavailable one does: decluttering is half of what the
-/// Setting is for, and a row reporting a Provider Suru never consulted would
-/// replace one message with another.
-fn is_disabled(status: &ProviderCatalogStatus) -> bool {
-    matches!(status, ProviderCatalogStatus::Disabled)
 }

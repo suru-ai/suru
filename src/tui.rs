@@ -1,5 +1,6 @@
 //! Ratatui view state and terminal lifecycle.
 
+mod agent_selection_list;
 mod approval;
 mod approval_posture_picker;
 mod aside;

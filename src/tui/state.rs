@@ -37,6 +37,7 @@ use crate::{
 };
 
 use super::{
+    agent_selection_list::AgentSelectionAction,
     approval_posture_picker::ApprovalPosturePicker,
     aside::{Aside, AsidePresentation, AsidePress},
     attachment_check::{AttachmentCheckId, AttachmentChecks},
@@ -71,7 +72,7 @@ use super::{
         command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
-    model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
+    model_picker::{ModelPicker, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
     onboarding::{Advance, Onboarding, Opening, OwnServer},
     relay_overlay::{
@@ -8518,11 +8519,11 @@ impl Application {
     fn choose_model(&mut self) -> Result<ApplicationTransition> {
         let purpose = self.state.model_picker.purpose();
         match self.state.model_picker.choose() {
-            Some(ModelPickerAction::Retry) => Ok(self.state.model_picker.begin_retry().map_or(
+            Some(AgentSelectionAction::Retry) => Ok(self.state.model_picker.begin_retry().map_or(
                 ApplicationTransition::Continue,
                 ApplicationTransition::ListModels,
             )),
-            Some(ModelPickerAction::Select(model)) => {
+            Some(AgentSelectionAction::Select(model)) => {
                 let current = self
                     .state
                     .model_picker

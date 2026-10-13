@@ -17,8 +17,8 @@ use crate::{
     managed_client::SessionProjection,
     protocol::{
         Author, CostTotal, LandingPage, ListenerState, MAX_WORKSPACE_DESCRIPTION_CHARS,
-        ModelAvailability, ModelDescriptor, RelayState, ServerIdentity, SessionContentWidth,
-        SessionSnapshot, SessionStatus, SessionTimestamp, WatchSummary, Way,
+        ModelAvailability, RelayState, ServerIdentity, SessionContentWidth, SessionSnapshot,
+        SessionStatus, SessionTimestamp, WatchSummary, Way,
     },
     provider::built_in_providers,
     theme::Theme,
@@ -38,7 +38,6 @@ use super::{
     keymap::binding_label,
     list_window::WindowEntry,
     model_options::ModelOptionChoiceRow,
-    model_picker::ModelPickerRow,
     onboarding::OwnServer,
     relay_overlay::serve_through_status,
     serve_overlay::{CandidateWay, LISTENER_FAILED, LISTENER_OFF, ServeWays},
@@ -71,7 +70,7 @@ use super::{
     unreachable_reason,
     usage::{compact_cost, compact_count},
     workspace_picker::{WorkspacePickerMenuGeometry, WorkspacePickerRowKind, WorkspaceRow},
-    wrapped_text::{FIX_INDENT, WrappedText},
+    wrapped_text::WrappedText,
 };
 
 const NARROW_TERMINAL_WIDTH: u16 = 44;
@@ -2702,81 +2701,19 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
     } else {
         let footer_rows = usize::from(content_height >= 3);
         let row_capacity = usize::from(content_height).saturating_sub(lines.len() + footer_rows);
-        let current = state.agent_selection();
-        for row in state
-            .model_picker
-            .visible_rows(row_capacity, content_width, current)
-        {
-            match row {
-                ModelPickerRow::Provider { name, refreshing } => lines.push(Line::styled(
-                    truncate_to_width(
-                        &format!(
-                            "Provider {name}{}",
-                            if refreshing { " · refreshing" } else { "" }
-                        ),
-                        usize::from(content_width),
-                    ),
-                    theme.accent.primary.add_modifier(Modifier::BOLD),
-                )),
-                ModelPickerRow::Model {
-                    model,
-                    selected,
-                    current,
-                } => lines.push(Line::styled(
-                    model_picker_row_text(model, selected, current, usize::from(content_width)),
-                    if selected {
-                        theme.selection.focused
-                    } else if model.availability == ModelAvailability::Unavailable {
-                        theme.text.subdued
-                    } else {
-                        theme.text.primary
-                    },
-                )),
-                // A failing Provider and an unavailable one are the same row:
-                // the retry the reader may take, with what it is about to
-                // re-check. Only the account of the condition differs, and an
-                // unavailable one says beneath it what the reader does to fix
-                // it, on lines of its own so none of it is cut short — and so
-                // that a selection across them copies the fix as written.
-                ModelPickerRow::Error {
-                    name,
-                    message,
-                    selected,
-                } => lines.push(model_picker_retry_row(
-                    &format!("Retry {name}: {message}"),
-                    selected,
-                    content_width,
-                    theme,
-                )),
-                ModelPickerRow::Unavailable {
-                    name,
-                    reason,
-                    message,
-                    fix,
-                    selected,
-                } => {
-                    lines.push(model_picker_retry_row(
-                        &format!("Retry {name}: {} · {message}", reason.label()),
-                        selected,
-                        content_width,
-                        theme,
-                    ));
-                    let style = if selected {
-                        theme.selection.focused
-                    } else {
-                        theme.text.primary
-                    };
-                    // An entry taller than the picker has rows for is drawn
-                    // from its end: the retry row, then as much of the fix's
-                    // end as fits, which is where every fix names the page or
-                    // command it sends the reader to.
-                    let room = usize::from(content_height).saturating_sub(lines.len());
-                    let fix = WrappedText::new(fix, FIX_INDENT, content_width).last(room);
-                    wrapped.push(fix.wrapped(lines.len()));
-                    lines.extend(fix.lines(style));
-                }
-            }
-        }
+        let drawn = state.model_picker.draw_rows(
+            row_capacity,
+            usize::from(content_height).saturating_sub(lines.len()),
+            content_width,
+            state.agent_selection(),
+            theme,
+        );
+        let above = lines.len();
+        lines.extend(drawn.lines);
+        wrapped.extend(drawn.wrapped.into_iter().map(|line| WrappedLine {
+            row: above + line.row,
+            ..line
+        }));
         if !state.model_picker.has_rows() && lines.len() < usize::from(content_height) {
             lines.push(Line::styled("No Models found", theme.text.subdued));
         }
@@ -3502,81 +3439,6 @@ fn draw_overlay_box(
         ),
         area,
     );
-}
-
-/// The row standing for a Provider's condition, which choosing re-checks.
-fn model_picker_retry_row<'a>(
-    text: &str,
-    selected: bool,
-    content_width: u16,
-    theme: &Theme,
-) -> Line<'a> {
-    Line::styled(
-        truncate_to_width(
-            &format!("{}{text}", if selected { "› " } else { "  " }),
-            usize::from(content_width),
-        ),
-        if selected {
-            theme.selection.focused
-        } else {
-            theme.feedback.error
-        },
-    )
-}
-
-fn model_picker_row_text(
-    model: &ModelDescriptor,
-    selected: bool,
-    current: bool,
-    width: usize,
-) -> String {
-    let marker = if selected { "› " } else { "  " };
-    let native = (model.display_name != model.id.as_str()).then_some(model.id.as_str());
-    let mut states = Vec::new();
-    let mut compact_states = Vec::new();
-    if current {
-        states.push("current");
-        compact_states.push("C");
-    }
-    if model.is_default {
-        states.push("default");
-        compact_states.push("D");
-    }
-    if model.availability == ModelAvailability::Unavailable {
-        states.push("unavailable");
-        compact_states.push("U");
-    }
-    let marker_width = marker.width();
-    let available = width.saturating_sub(marker_width);
-    let field_count = 1 + usize::from(native.is_some()) + usize::from(!states.is_empty());
-    let wide_separator = " · ";
-    let compact_separator = " ";
-    let full_state = (!states.is_empty()).then(|| format!("[{}]", states.join(", ")));
-    let compact_state =
-        (!compact_states.is_empty()).then(|| format!("[{}]", compact_states.join(",")));
-    let minimum_text_width = 4 * (1 + usize::from(native.is_some()));
-    let full_fixed = full_state.as_ref().map_or(0, |state| state.width())
-        + wide_separator.width() * field_count.saturating_sub(1);
-    let (separator, state) = if available >= full_fixed.saturating_add(minimum_text_width) {
-        (wide_separator, full_state)
-    } else {
-        (compact_separator, compact_state)
-    };
-    let fixed = state.as_ref().map_or(0, |state| state.width())
-        + separator.width() * field_count.saturating_sub(1);
-    let flexible = available.saturating_sub(fixed);
-    let (display_width, native_width) = native.map_or((flexible, 0), |native| {
-        let native_width = native.width().min((flexible / 2).max(1));
-        (flexible.saturating_sub(native_width), native_width)
-    });
-    let mut fields = vec![truncate_to_width(&model.display_name, display_width)];
-    if let Some(native) = native {
-        fields.push(truncate_to_width(native, native_width));
-    }
-    if let Some(state) = state {
-        fields.push(state);
-    }
-    truncate_to_width(&format!("{marker}{}", fields.join(separator)), width)
 }
 
 fn session_picker_row_text(
