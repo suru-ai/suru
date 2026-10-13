@@ -12,6 +12,7 @@ use super::{
     ModelListRequest,
     fuzzy::fuzzy_matches,
     list_window::{ListWindow, WindowEntry},
+    text_layout::TextLayout,
 };
 
 /// What the Model a reader picks here is for. The picker is one list of Models
@@ -164,14 +165,31 @@ pub(super) enum ModelPickerRow<'a> {
         selected: bool,
     },
     /// A Provider the user cannot use yet. It keeps its place in the list with
-    /// its reason on show, its Models render unselectable, and choosing the row
-    /// re-lists the catalog for a user who has just fixed the condition.
+    /// its reason on show and what fixes it beneath, its Models render
+    /// unselectable, and choosing the row re-lists the catalog for a user who
+    /// has just fixed the condition.
     Unavailable {
         name: &'a str,
         reason: ProviderUnavailability,
         message: &'a str,
+        fix: &'a str,
         selected: bool,
     },
+}
+
+/// How far a fix stands in beneath the retry row it belongs to: past the row's
+/// focus marker and two columns more, so it reads as the row's own.
+const FIX_INDENT: &str = "    ";
+
+/// The lines a fix takes beneath its retry row in a list `width` columns wide:
+/// as many as it needs, broken between words, so a page to install from is
+/// drawn whole rather than cut short at the edge.
+pub(super) fn fix_lines(fix: &str, width: u16) -> Vec<String> {
+    let indent = u16::try_from(FIX_INDENT.len()).unwrap_or(u16::MAX);
+    TextLayout::new(fix, width.saturating_sub(indent))
+        .rows()
+        .map(|row| format!("{FIX_INDENT}{}", row.text))
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -464,9 +482,13 @@ impl ModelPicker {
         }
     }
 
+    /// The rows the window shows in `capacity` lines of a list `width`
+    /// columns wide, which decides how many lines each fix beneath a retry
+    /// row takes.
     pub(super) fn visible_rows(
         &self,
         capacity: usize,
+        width: u16,
         current: Option<&AgentSelection>,
     ) -> impl Iterator<Item = ModelPickerRow<'_>> {
         let rows = self.rows(self.selection_in_force(current).as_ref());
@@ -482,9 +504,10 @@ impl ModelPicker {
             .iter()
             .map(|row| match row {
                 ModelPickerRow::Provider { .. } => WindowEntry::passive(1),
-                ModelPickerRow::Model { .. }
-                | ModelPickerRow::Error { .. }
-                | ModelPickerRow::Unavailable { .. } => WindowEntry::ROW,
+                ModelPickerRow::Model { .. } | ModelPickerRow::Error { .. } => WindowEntry::ROW,
+                ModelPickerRow::Unavailable { fix, .. } => {
+                    WindowEntry::focusable(1 + fix_lines(fix, width).len())
+                }
             })
             .collect::<Vec<_>>();
         let shown = self.window.settle(&entries, capacity, selected);
@@ -733,14 +756,17 @@ impl ModelPicker {
                         message,
                         selected,
                     },
-                    ProviderCondition::Unavailable { reason, message } => {
-                        ModelPickerRow::Unavailable {
-                            name: &provider.display_name,
-                            reason,
-                            message,
-                            selected,
-                        }
-                    }
+                    ProviderCondition::Unavailable {
+                        reason,
+                        message,
+                        fix,
+                    } => ModelPickerRow::Unavailable {
+                        name: &provider.display_name,
+                        reason,
+                        message,
+                        fix,
+                        selected,
+                    },
                 });
             }
         }
@@ -850,6 +876,7 @@ enum ProviderCondition<'a> {
     Unavailable {
         reason: ProviderUnavailability,
         message: &'a str,
+        fix: &'a str,
     },
 }
 
@@ -859,10 +886,13 @@ fn provider_condition(status: &ProviderCatalogStatus) -> Option<ProviderConditio
             Some(ProviderCondition::Failing(message))
         }
         ProviderCatalogStatus::Unavailable {
-            reason, message, ..
+            reason,
+            message,
+            fix,
         } => Some(ProviderCondition::Unavailable {
             reason: *reason,
             message,
+            fix,
         }),
         // A Provider the user turned off puts nothing in the list — not even a
         // reason, because Suru never looked for one.

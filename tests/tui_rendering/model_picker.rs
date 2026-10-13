@@ -1330,7 +1330,7 @@ fn model_picker_shows_an_unavailable_provider_with_its_reason_and_refuses_select
                     status: ProviderCatalogStatus::Unavailable {
                         reason: ProviderUnavailability::NotInstalled,
                         message: "could not launch Codex app-server `codex`".to_owned(),
-                        fix: "fix the CLI".to_owned(),
+                        fix: "install the Codex CLI".to_owned(),
                     },
                 }],
             },
@@ -1456,7 +1456,7 @@ fn model_picker_draws_no_row_at_all_for_a_provider_the_user_turned_off() {
                         status: ProviderCatalogStatus::Unavailable {
                             reason: ProviderUnavailability::NotInstalled,
                             message: "could not launch the Copilot CLI".to_owned(),
-                            fix: "fix the CLI".to_owned(),
+                            fix: "install the Copilot CLI".to_owned(),
                         },
                     },
                     ProviderModelCatalog {
@@ -1550,7 +1550,7 @@ fn model_picker_keeps_an_unavailable_provider_with_no_models_in_the_list() {
                         status: ProviderCatalogStatus::Unavailable {
                             reason: ProviderUnavailability::NotInstalled,
                             message: "could not launch Codex app-server `codex`".to_owned(),
-                            fix: "fix the CLI".to_owned(),
+                            fix: "install the Codex CLI".to_owned(),
                         },
                     },
                     ProviderModelCatalog {
@@ -1594,6 +1594,74 @@ fn model_picker_keeps_an_unavailable_provider_with_no_models_in_the_list() {
     );
 }
 
+/// An unavailable Provider's retry row says what fixes it on a line of its
+/// own beneath the reason, rather than trailing it off the end of the row:
+/// a fix too long for one line wraps between words, so an install page's
+/// address is drawn whole where the terminal can make a link of it.
+#[test]
+fn model_picker_names_what_fixes_an_unavailable_provider_beneath_its_retry_row() {
+    const INSTALL_PAGE: &str =
+        "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli";
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("claude"),
+                        display_name: "Claude".to_owned(),
+                        models: Vec::new(),
+                        status: ProviderCatalogStatus::Unavailable {
+                            reason: ProviderUnavailability::NotSignedIn,
+                            message: "sign in with the Claude Code CLI".to_owned(),
+                            fix: "run `claude auth login`".to_owned(),
+                        },
+                    },
+                    ProviderModelCatalog {
+                        provider: ProviderId::new("copilot"),
+                        display_name: "Copilot".to_owned(),
+                        models: Vec::new(),
+                        status: ProviderCatalogStatus::Unavailable {
+                            reason: ProviderUnavailability::NotInstalled,
+                            message: "could not launch Copilot CLI server `copilot`: No such \
+                                      file or directory (os error 2)"
+                                .to_owned(),
+                            fix: format!("install the Copilot CLI from {INSTALL_PAGE}"),
+                        },
+                    },
+                ],
+            },
+        })
+        .expect("load two unavailable Providers");
+
+    let rows = rendered_application_rows(&application);
+    let screen = rows.join("\n");
+    let claude = rendered_row(&rows, "Retry Claude: not signed in");
+    assert!(
+        rows[claude + 1].contains("run `claude auth login`")
+            && !rows[claude].contains("claude auth login"),
+        "the fix stands on the line beneath its retry row rather than on it, got {screen}"
+    );
+    let copilot = rendered_row(&rows, "Retry Copilot: not installed");
+    assert!(
+        rows[copilot + 1].contains("install the Copilot CLI from"),
+        "a fix too long for one line begins beneath its retry row, got {screen}"
+    );
+    assert!(
+        rows[copilot + 2].contains(INSTALL_PAGE),
+        "and goes on to the next, with the address unbroken, got {screen}"
+    );
+}
+
 /// Issue #136: rows read as products, not wire identifiers. The catalog
 /// carries each Provider's runtime-declared display name, and the picker
 /// prints it on the Provider heading and the retry row alike.
@@ -1632,7 +1700,7 @@ fn model_picker_shows_provider_display_names_from_the_catalog() {
                         status: ProviderCatalogStatus::Unavailable {
                             reason: ProviderUnavailability::NotSignedIn,
                             message: "run `copilot` to sign in".to_owned(),
-                            fix: "fix the CLI".to_owned(),
+                            fix: "run `copilot login`".to_owned(),
                         },
                     },
                 ],

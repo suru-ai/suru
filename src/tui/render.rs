@@ -38,7 +38,7 @@ use super::{
     keymap::binding_label,
     list_window::WindowEntry,
     model_options::ModelOptionChoiceRow,
-    model_picker::ModelPickerRow,
+    model_picker::{ModelPickerRow, fix_lines},
     relay_overlay::serve_through_status,
     serve_overlay::{CandidateWay, LISTENER_FAILED, LISTENER_OFF, ServeWays},
     session_picker::SessionPickerRow,
@@ -2692,9 +2692,9 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
         let current = state.agent_selection();
         let rows = state
             .model_picker
-            .visible_rows(row_capacity, current)
-            .map(|row| match row {
-                ModelPickerRow::Provider { name, refreshing } => Line::styled(
+            .visible_rows(row_capacity, content_width, current)
+            .flat_map(|row| match row {
+                ModelPickerRow::Provider { name, refreshing } => vec![Line::styled(
                     truncate_to_width(
                         &format!(
                             "Provider {name}{}",
@@ -2703,12 +2703,12 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
                         usize::from(content_width),
                     ),
                     theme.accent.primary.add_modifier(Modifier::BOLD),
-                ),
+                )],
                 ModelPickerRow::Model {
                     model,
                     selected,
                     current,
-                } => Line::styled(
+                } => vec![Line::styled(
                     model_picker_row_text(model, selected, current, usize::from(content_width)),
                     if selected {
                         theme.selection.focused
@@ -2717,31 +2717,45 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
                     } else {
                         theme.text.primary
                     },
-                ),
+                )],
                 // A failing Provider and an unavailable one are the same row:
                 // the retry the reader may take, with what it is about to
-                // re-check. Only the account of the condition differs.
+                // re-check. Only the account of the condition differs, and an
+                // unavailable one says beneath it what the reader does to fix
+                // it, on lines of its own so none of it is cut short.
                 ModelPickerRow::Error {
                     name,
                     message,
                     selected,
-                } => model_picker_retry_row(
+                } => vec![model_picker_retry_row(
                     &format!("Retry {name}: {message}"),
                     selected,
                     content_width,
                     theme,
-                ),
+                )],
                 ModelPickerRow::Unavailable {
                     name,
                     reason,
                     message,
+                    fix,
                     selected,
-                } => model_picker_retry_row(
+                } => std::iter::once(model_picker_retry_row(
                     &format!("Retry {name}: {} · {message}", reason.label()),
                     selected,
                     content_width,
                     theme,
-                ),
+                ))
+                .chain(fix_lines(fix, content_width).into_iter().map(|line| {
+                    Line::styled(
+                        line,
+                        if selected {
+                            theme.selection.focused
+                        } else {
+                            theme.text.primary
+                        },
+                    )
+                }))
+                .collect(),
             })
             .collect::<Vec<_>>();
         lines.extend(rows);
@@ -2895,6 +2909,10 @@ fn render_theme_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
 /// the drawing does.
 const SETTINGS_TAB_GAP: &str = "  ";
 
+/// What stands between an unavailable Provider's condition and its fix on the
+/// Provider's row.
+const SETTINGS_FIX_GAP: &str = " · ";
+
 /// The settings panel: the tab bar, the rows of the tab being shown, what each
 /// is worth right now, and whether that value is the reader's own pin or the
 /// built-in default. Rows come straight from the latest effective-settings
@@ -2909,15 +2927,26 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     let rows = state
         .settings_panel
         .rows(state.settings(), state.pinned_settings());
+    let width = main.width.saturating_sub(4).min(76);
+    // What fixes the focused Provider, whole, on as many lines as it takes
+    // beneath the headline: its row has room for the start of it at most.
+    let fix = state
+        .settings_panel
+        .selected_fix(state.settings())
+        .filter(|_| state.settings_panel.error().is_none())
+        .map(|fix| {
+            TextLayout::new(fix, width.saturating_sub(2))
+                .rows()
+                .map(|row| row.text.to_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     // A tab lists a known number of rows, so the panel is exactly as tall as it
-    // needs to be: two borders around the tab bar and the headline, one row per
-    // Setting, and the controls.
-    let wanted = u16::try_from(rows.len().saturating_add(5)).unwrap_or(u16::MAX);
-    let area = centered_rect(
-        main,
-        main.width.saturating_sub(4).min(76),
-        main.height.saturating_sub(2).min(wanted),
-    );
+    // needs to be: two borders around the tab bar and the headline, whatever
+    // fix goes beneath it, one row per Setting, and the controls.
+    let wanted =
+        u16::try_from(rows.len().saturating_add(5).saturating_add(fix.len())).unwrap_or(u16::MAX);
+    let area = centered_rect(main, width, main.height.saturating_sub(2).min(wanted));
     let content_width = usize::from(area.width.saturating_sub(2));
     let content_height = usize::from(area.height.saturating_sub(2));
     let content_left = area.x.saturating_add(1);
@@ -2992,6 +3021,14 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         ));
     }
     let footer_rows = usize::from(content_height >= 3);
+    // The fix gives way before the focused row does, which is the one thing a
+    // reader of it must still be able to see.
+    for line in fix {
+        if lines.len() + footer_rows + 1 >= content_height {
+            break;
+        }
+        lines.push(Line::styled(line, theme.text.primary));
+    }
     let capacity = content_height.saturating_sub(lines.len() + footer_rows);
     let selected = rows.iter().position(|row| row.selected);
     // Read before the window narrows the rows, and read off the focused row:
@@ -3041,24 +3078,38 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         // What Suru has found out about the Provider, which is a word at most:
         // a Spinner while the read runs, the condition's name once it lands,
         // and nothing at all from a Provider still serving its catalog.
-        let availability = match row.availability {
-            RowAvailability::Quiet => String::new(),
-            RowAvailability::Reading => {
-                format!(" · {}", spinner::frame(state.spinner_frame / 3))
+        let (availability, fix) = match &row.availability {
+            RowAvailability::Quiet => (String::new(), None),
+            RowAvailability::Reading => (
+                format!(" · {}", spinner::frame(state.spinner_frame / 3)),
+                None,
+            ),
+            RowAvailability::Warning => (" · warning".to_owned(), None),
+            RowAvailability::Unavailable { reason, fix } => {
+                (format!(" · {}", reason.label()), Some(fix.as_str()))
             }
-            RowAvailability::Warning => " · warning".to_owned(),
-            RowAvailability::Unavailable(reason) => format!(" · {}", reason.label()),
-            RowAvailability::Failed => " · error".to_owned(),
+            RowAvailability::Failed => (" · error".to_owned(), None),
         };
         let label = row.provider.map_or_else(
             || row.label.to_owned(),
             |provider| provider_label(show_icons, provider, row.label),
         );
+        let named = format!("{marker}{expansion}{label}{value}{availability}");
+        let origin = format!(" [{origin}]");
+        // Beside the condition, as much of what fixes it as the row has room
+        // for, cut short before the provenance rather than taking it: the
+        // whole fix is beneath the headline once the row is focused.
+        let fix = fix
+            .map(|fix| {
+                let room = content_width
+                    .saturating_sub(named.width() + SETTINGS_FIX_GAP.width() + origin.width());
+                truncate_to_width(fix, room)
+            })
+            .filter(|fix| !fix.is_empty() && fix != "…")
+            .map(|fix| format!("{SETTINGS_FIX_GAP}{fix}"))
+            .unwrap_or_default();
         lines.push(Line::styled(
-            truncate_to_width(
-                &format!("{marker}{expansion}{label}{value}{availability} [{origin}]"),
-                content_width,
-            ),
+            truncate_to_width(&format!("{named}{fix}{origin}"), content_width),
             match (row.selected, &row.value) {
                 (true, _) => theme.selection.focused,
                 (false, RowValue::ProviderDisabled) => theme.text.subdued,

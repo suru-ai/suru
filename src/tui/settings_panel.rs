@@ -322,7 +322,7 @@ pub(super) enum AvailabilityRead {
 /// What a Provider row says about Availability. Every state but the quiet one
 /// asks something of the reader, which is why the quiet one is what a Provider
 /// still serving its catalog gets: Suru reports a condition, not a heartbeat.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum RowAvailability {
     /// Nothing to report: a catalog that answered, a Provider nothing has been
     /// read about, and every row that is not a Provider's.
@@ -331,8 +331,12 @@ pub(super) enum RowAvailability {
     Reading,
     /// Usable, with a compatibility condition worth fixing.
     Warning,
-    /// Unusable until the reader fixes this outside Suru.
-    Unavailable(ProviderUnavailability),
+    /// Unusable until the reader fixes `reason` outside Suru, which they do
+    /// as the Provider's own `fix` says.
+    Unavailable {
+        reason: ProviderUnavailability,
+        fix: String,
+    },
     /// The read itself failed, which is Suru's problem to report rather than a
     /// condition of the Provider.
     Failed,
@@ -640,8 +644,16 @@ impl SettingsPanel {
                     (RowAvailability::Warning, Some(message.clone()))
                 }
                 ProviderCatalogStatus::Unavailable {
-                    reason, message, ..
-                } => (RowAvailability::Unavailable(*reason), Some(message.clone())),
+                    reason,
+                    message,
+                    fix,
+                } => (
+                    RowAvailability::Unavailable {
+                        reason: *reason,
+                        fix: fix.clone(),
+                    },
+                    Some(message.clone()),
+                ),
                 ProviderCatalogStatus::Failed { message } => {
                     (RowAvailability::Failed, Some(message.clone()))
                 }
@@ -684,12 +696,29 @@ impl SettingsPanel {
     /// What the focused Provider's Availability says in full, which the
     /// headline carries because a row has room only for the condition's name.
     pub(super) fn selected_message(&self, settings: &EffectiveSettings) -> Option<&str> {
+        self.selected_reading(settings)?.message.as_deref()
+    }
+
+    /// What fixes the focused Provider's condition, in full, which goes
+    /// beneath the headline because the row it is named on may have room for
+    /// only the start of it.
+    pub(super) fn selected_fix(&self, settings: &EffectiveSettings) -> Option<&str> {
+        match &self.selected_reading(settings)?.availability {
+            RowAvailability::Unavailable { fix, .. } => Some(fix),
+            RowAvailability::Quiet
+            | RowAvailability::Reading
+            | RowAvailability::Warning
+            | RowAvailability::Failed => None,
+        }
+    }
+
+    fn selected_reading(&self, settings: &EffectiveSettings) -> Option<&ProviderReading> {
         if !self.open {
             return None;
         }
         let entries = self.entries();
         let provider = entries.get(self.selected_row(entries.len()))?.provider?;
-        self.reading(provider, settings)?.message.as_deref()
+        self.reading(provider, settings)
     }
 
     /// The tab bar: every tab, always, with the one being shown marked as such.
@@ -729,7 +758,9 @@ impl SettingsPanel {
                     Some(provider) if settings.provider_enabled(provider) => (
                         RowValue::ProviderEnabled,
                         self.reading(provider, settings)
-                            .map_or(RowAvailability::Quiet, |reading| reading.availability),
+                            .map_or(RowAvailability::Quiet, |reading| {
+                                reading.availability.clone()
+                            }),
                     ),
                     // A Provider the reader turned off is one Suru leaves
                     // entirely alone, so its row reports that choice and never

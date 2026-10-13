@@ -2092,11 +2092,11 @@ fn entering_the_providers_tab_reads_availability_every_time() {
     );
 }
 
-/// A Provider Suru cannot use names the condition on its row and spells it out
-/// in full where the reader is looking, because every way a Provider can be
-/// unavailable is something they fix outside Suru.
+/// A Provider Suru cannot use names the condition on its row with what fixes
+/// it beside, and spells both out in full where the reader is looking, because
+/// every way a Provider can be unavailable is something they fix outside Suru.
 #[test]
-fn an_unavailable_provider_names_its_reason_and_the_headline_carries_the_message() {
+fn an_unavailable_provider_names_its_reason_and_fix_and_the_headline_carries_both() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     let request = read_providers_tab(&mut application);
@@ -2107,23 +2107,85 @@ fn an_unavailable_provider_names_its_reason_and_the_headline_carries_the_message
         &[(
             "codex",
             ProviderCatalogStatus::Unavailable {
-                reason: ProviderUnavailability::NotInstalled,
-                message: "The codex CLI is not on PATH; install it and try again".to_owned(),
-                fix: "fix the CLI".to_owned(),
+                reason: ProviderUnavailability::NotSignedIn,
+                message: "The codex CLI holds no credentials".to_owned(),
+                fix: "run `codex login`".to_owned(),
             },
         )],
     );
 
     let codex = row(&application, "Codex");
     assert!(
-        codex.contains("not installed"),
-        "the row names the reason: {codex:?}"
+        codex.contains("not signed in · run `codex login` [default]"),
+        "the row names the reason and what fixes it, and keeps its provenance: {codex:?}"
     );
-    let panel = rendered_application_rows(&application).join("\n");
+    let rows = rendered_application_rows(&application);
+    let panel = rows.join("\n");
+    let message = rows
+        .iter()
+        .position(|line| line.contains("holds no credentials"))
+        .unwrap_or_else(|| {
+            panic!("the headline carries the whole message while that row is selected: {panel}")
+        });
     assert!(
-        panel.contains("install it and try again"),
-        "and the headline carries the whole message while that row is selected: {panel}"
+        rows[message + 1].contains("run `codex login`") && !is_row_for(&rows[message + 1], "Codex"),
+        "and what fixes it on the line beneath: {panel}"
     );
+}
+
+/// A fix too long for the row is cut short there, never at the cost of the
+/// row's reason or provenance, and is given whole beneath the headline —
+/// wrapped between words, so an install page's address stays unbroken.
+#[test]
+fn a_fix_too_long_for_its_row_is_given_whole_beneath_the_headline() {
+    const INSTALL_PAGE: &str =
+        "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli";
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let request = read_providers_tab(&mut application);
+    deliver_catalog(
+        &mut application,
+        request,
+        &[
+            ("codex", ProviderCatalogStatus::Fresh),
+            (
+                "copilot",
+                ProviderCatalogStatus::Unavailable {
+                    reason: ProviderUnavailability::NotInstalled,
+                    message: "could not launch Copilot CLI server `copilot`: No such file or \
+                              directory (os error 2)"
+                        .to_owned(),
+                    fix: format!("install the Copilot CLI from {INSTALL_PAGE}"),
+                },
+            ),
+            ("claude", ProviderCatalogStatus::Fresh),
+        ],
+    );
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+
+    let copilot = row(&application, "Copilot");
+    assert!(
+        copilot.contains("Copilot · not installed · install the")
+            && copilot.contains("… [default]"),
+        "the row begins the fix and cuts it short before its provenance: {copilot:?}"
+    );
+    let rows = rendered_application_rows(&application);
+    let panel = rows.join("\n");
+    assert!(
+        rows.iter()
+            .any(|line| line.contains("could not launch Copilot CLI server")),
+        "the headline carries the message: {panel}"
+    );
+    assert!(
+        rows.iter().any(|line| line.contains(INSTALL_PAGE)),
+        "and beneath it the whole fix, the address drawn unbroken: {panel}"
+    );
+    for provider in ["Codex", "Copilot", "Claude"] {
+        assert!(
+            has_row(&application, provider),
+            "the box grows to fit the fix rather than hiding a Provider: {panel}"
+        );
+    }
 }
 
 /// A compatibility warning is guidance rather than Availability: the Provider
