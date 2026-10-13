@@ -274,7 +274,7 @@ fn hearing_the_server_was_onboarded_elsewhere_closes_the_flow() {
     assert!(screen(&application).contains("Step 2 of 3"));
 
     application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Onboarded))
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Onboarded(true)))
         .expect("hear that another Client onboarded the Server");
     assert!(!onboarding_shown(&application), "{}", screen(&application));
     deliver_settings(&mut application, EffectiveSettings::default());

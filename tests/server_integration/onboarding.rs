@@ -4,7 +4,7 @@
 //! rest of the suite takes them.
 use super::*;
 use crate::support::PROGRESS_DEADLINE;
-use suru::protocol::RuntimeDescriptor;
+use suru::protocol::{ONBOARDED_EVENT, RuntimeDescriptor};
 
 async fn health(descriptor: &RuntimeDescriptor) -> Health {
     reqwest::Client::new()
@@ -38,7 +38,7 @@ async fn hears_onboarded(client: &mut ManagedClient) {
             .expect("the onboarded broadcast arrives")
             .expect("managed client remains open");
         match event {
-            ManagedEvent::Onboarded => return,
+            ManagedEvent::Onboarded(true) => return,
             ManagedEvent::ModelCatalog(_)
             | ManagedEvent::Relays(_)
             | ManagedEvent::ServingListener(_) => continue,
@@ -91,6 +91,54 @@ async fn a_fresh_server_is_onboarded_once_a_client_marks_it_and_stays_so_across_
         .shutdown()
         .await
         .expect("stop replacement server");
+}
+
+/// A Client reads its Server's health before it opens its event stream, so
+/// another Client may mark the Server onboarded between the two; the stream
+/// it then opens says so, so it closes what it offered all the same.
+#[tokio::test]
+async fn a_client_whose_health_was_read_before_another_marked_the_server_hears_it_on_attaching() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = server::spawn_not_onboarded(
+        ServerConfig::new(state_dir.path(), "onboarding-late-attach").expect("configure server"),
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    assert!(
+        !health(&descriptor).await.onboarded,
+        "the late Client reads that the Server is not onboarded"
+    );
+
+    crate::support::mark_onboarded(&descriptor).await;
+
+    let stream = reqwest::Client::new()
+        .get(format!("{}/v1/events", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("open the late Client's event stream")
+        .error_for_status()
+        .expect("the event stream opens");
+    let mut events = stream.bytes_stream().eventsource();
+    let told = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let event = events
+                .next()
+                .await
+                .expect("the event stream remains open")
+                .expect("the event is well formed");
+            if event.event == ONBOARDED_EVENT {
+                return event.data;
+            }
+        }
+    })
+    .await
+    .expect("the stream says whether the Server has been onboarded");
+    assert_eq!(told, "true", "the late Client hears it was onboarded");
+
+    drop(events);
+    server.shutdown().await.expect("stop server");
 }
 
 #[tokio::test]

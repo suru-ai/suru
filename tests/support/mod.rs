@@ -127,7 +127,22 @@ pub async fn receive_connect_state(
     );
     receive_model_catalog(client).await;
     let relays = receive_relays(client).await;
-    (identity, relays, receive_serving_listener(client).await)
+    let listener = receive_serving_listener(client).await;
+    receive_onboarded(client).await;
+    (identity, relays, listener)
+}
+
+/// Reads whether the Server has been onboarded, which follows how its Serving
+/// listener stands on every connect.
+pub async fn receive_onboarded(client: &mut ManagedClient) -> bool {
+    let event = timeout(PROGRESS_DEADLINE, client.next())
+        .await
+        .expect("whether the Server has been onboarded arrives")
+        .expect("managed client remains open");
+    let ManagedEvent::Onboarded(onboarded) = event else {
+        panic!("expected whether the Server has been onboarded, got {event:?}");
+    };
+    onboarded
 }
 
 /// Reads how the Server's Serving listener stands, which follows its Relays

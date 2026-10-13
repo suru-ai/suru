@@ -2340,9 +2340,13 @@ impl TuiState {
             }
             // Another Client — or this one — took Onboarding, so whatever of
             // it this Client has open closes.
-            ManagedEvent::Onboarded => {
-                self.local_onboarded = Some(true);
-                self.onboarding.close();
+            ManagedEvent::Onboarded(onboarded) => {
+                self.local_onboarded = Some(onboarded);
+                if onboarded {
+                    self.onboarding.close();
+                } else {
+                    self.offer_onboarding();
+                }
             }
             // The lifecycle stream is the local server's, so the catalog it
             // pushes is the Local Outlook's whichever Outlook is on screen.
@@ -2540,7 +2544,7 @@ impl TuiState {
             | ManagedEvent::Recovering(_)
             | ManagedEvent::Relays(_)
             | ManagedEvent::ServingListener(_)
-            | ManagedEvent::Onboarded
+            | ManagedEvent::Onboarded(_)
             | ManagedEvent::RemoteRecovered
             | ManagedEvent::RemoteFailed { .. }
             | ManagedEvent::ServerShutdown(_)
@@ -2620,7 +2624,7 @@ impl TuiState {
             | ManagedEvent::Recovering(_)
             | ManagedEvent::Relays(_)
             | ManagedEvent::ServingListener(_)
-            | ManagedEvent::Onboarded
+            | ManagedEvent::Onboarded(_)
             | ManagedEvent::RemoteRecovered
             | ManagedEvent::RemoteFailed { .. }
             | ManagedEvent::ServerShutdown(_)

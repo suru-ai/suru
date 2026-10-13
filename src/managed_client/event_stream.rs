@@ -85,12 +85,9 @@ fn decode_event(event: Event, expected_instance_id: uuid::Uuid) -> Result<Manage
             Ok(ManagedEvent::ServingListener(state))
         }
         ONBOARDED_EVENT => {
-            let onboarded: bool =
-                serde_json::from_str(&event.data).context("decode the onboarded fact")?;
-            if !onboarded {
-                bail!("server said it is not onboarded, which it only ever comes to be");
-            }
-            Ok(ManagedEvent::Onboarded)
+            let onboarded: bool = serde_json::from_str(&event.data)
+                .context("decode whether the server has been onboarded")?;
+            Ok(ManagedEvent::Onboarded(onboarded))
         }
         SERVER_SHUTDOWN_EVENT => {
             let shutdown: ServerShutdown =

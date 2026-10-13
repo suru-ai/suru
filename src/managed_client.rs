@@ -244,10 +244,12 @@ pub enum ManagedEvent {
     /// every connect, and again whenever it changes, so a client offers the
     /// machine's own addresses in an Invite only while the listener listens.
     ServingListener(crate::protocol::ListenerState),
-    /// The Server has been onboarded: pushed the moment any Client marks it
-    /// so, so each closes the Onboarding it offered. Whether it already was
-    /// as a Client connects is in the health it connected with.
-    Onboarded,
+    /// Whether the Server has been onboarded: pushed after how its Serving
+    /// listener stands on every connect, and again the moment any Client marks
+    /// it so, so each closes the Onboarding it offered. A Client reads it in
+    /// its health too, but that is read before the stream opens; this is the
+    /// word that holds from then on.
+    Onboarded(bool),
     /// A Remote catalog stream resumed after a transient link failure.
     RemoteRecovered,
     /// A Remote rejected further use of its Pairing. Unlike a transient drop,

@@ -2268,6 +2268,13 @@ fn relays_event(listing: &RelayListing) -> Event {
         .expect("Relay listings always serialize")
 }
 
+fn onboarded_event(onboarded: bool) -> Event {
+    Event::default()
+        .event(ONBOARDED_EVENT)
+        .json_data(onboarded)
+        .expect("whether the Server has been onboarded always serializes")
+}
+
 fn serving_listener_event(state: &ListenerState) -> Event {
     Event::default()
         .event(SERVING_LISTENER_EVENT)
@@ -2284,10 +2291,6 @@ fn event_stream(
     mut onboarded: watch::Receiver<bool>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
-    // Whether the Server has been onboarded reaches a connecting Client in
-    // its health; the stream says so only as it comes to be, so every
-    // attached Client closes the Onboarding it offered.
-    onboarded.mark_unchanged();
     // Every connecting client receives the effective-settings snapshot before
     // any other protocol event; later replacements re-push through the watch.
     let snapshot = settings_snapshot_event(&settings.borrow_and_update());
@@ -2305,6 +2308,11 @@ fn event_stream(
     // How the Serving listener stands comes last, and then each change of
     // it, so a Client offers this machine's addresses only while it listens.
     let listening = serving_listener_event(&listener.borrow_and_update());
+    // Whether the Server has been onboarded comes last, and then each change
+    // of it. A Client read it in its health before the stream opened, so
+    // another Client may have marked the Server between the two: what the
+    // stream says is what holds.
+    let onboarding = onboarded_event(*onboarded.borrow_and_update());
     let first = stream::once(async move {
         Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
     })
@@ -2319,6 +2327,9 @@ fn event_stream(
     }))
     .chain(stream::once(async move {
         Ok::<_, std::convert::Infallible>(listening)
+    }))
+    .chain(stream::once(async move {
+        Ok::<_, std::convert::Infallible>(onboarding)
     }));
     let state = EventStreamState {
         shutdown,
@@ -2394,13 +2405,7 @@ fn event_stream(
                     if changed.is_err() {
                         return None;
                     }
-                    if !*state.onboarded.borrow_and_update() {
-                        continue;
-                    }
-                    let event = Event::default()
-                        .event(ONBOARDED_EVENT)
-                        .json_data(true)
-                        .expect("the onboarded fact always serializes");
+                    let event = onboarded_event(*state.onboarded.borrow_and_update());
                     return Some((Ok::<_, std::convert::Infallible>(event), state));
                 }
                 _ = state.keepalive.tick() => return Some((
@@ -4989,6 +4994,10 @@ mod tests {
         assert!(first.next().await.is_some(), "first Relays arrive");
         assert!(first.next().await.is_some(), "first listener state arrives");
         assert!(
+            first.next().await.is_some(),
+            "whether the Server has been onboarded arrives first"
+        );
+        assert!(
             second.next().await.is_some(),
             "second connected comment arrives"
         );
@@ -5004,6 +5013,10 @@ mod tests {
         assert!(
             second.next().await.is_some(),
             "second listener state arrives"
+        );
+        assert!(
+            second.next().await.is_some(),
+            "whether the Server has been onboarded arrives second"
         );
 
         let intent = ServerShutdown {

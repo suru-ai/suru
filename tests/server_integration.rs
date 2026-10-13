@@ -5945,6 +5945,15 @@ async fn managed_client_connects_without_periodic_domain_events() {
         "how the Serving listener stands follows the Relays"
     );
     assert!(
+        matches!(
+            timeout(PROGRESS_DEADLINE, client.next())
+                .await
+                .expect("whether the Server has been onboarded arrives"),
+            Some(ManagedEvent::Onboarded(true))
+        ),
+        "whether the Server has been onboarded follows how the Serving listener stands"
+    );
+    assert!(
         timeout(Duration::from_millis(1_100), client.next())
             .await
             .is_err(),

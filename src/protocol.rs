@@ -38,7 +38,8 @@ pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const MODEL_CATALOG_EVENT: &str = "model_catalog";
 /// How the Serving listener stands, pushed to the Server's own Clients.
 pub const SERVING_LISTENER_EVENT: &str = "serving_listener";
-/// That the Server has been onboarded, pushed to the Server's own Clients the
+/// Whether the Server has been onboarded, pushed to the Server's own Clients
+/// after how its Serving listener stands on every connect, and again the
 /// moment a Client marks it so, so each closes the Onboarding it offered.
 pub const ONBOARDED_EVENT: &str = "onboarded";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
@@ -5297,7 +5298,6 @@ struct HealthWire {
     build_identity: String,
     #[serde(default)]
     landing_agent_selection: Option<AgentSelection>,
-    #[serde(default)]
     onboarded: bool,
 }
 
