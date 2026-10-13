@@ -9,6 +9,10 @@
 //! much as finishing does, so either asks the Server to mark itself
 //! onboarded.
 //!
+//! The Client offers the flow while its own Server has not been onboarded,
+//! and withdraws what it offered once the Server has been or the Client
+//! turns to a Remote; a flow the reader asked for is theirs to leave.
+//!
 //! Which step is on show is the overlay's own business. Each step keeps its
 //! state in a place of its own beside the others, so going Back and then Next
 //! again finds a step as it was left, and opening the flow again starts every
@@ -26,6 +30,7 @@ use super::{commands::SemanticCommandId, slots::truncate_to_width, state::Comman
 pub(super) struct Onboarding {
     /// The step on show, while the flow is open.
     step: Option<Step>,
+    opening: Opening,
     providers: ProvidersStep,
     derivation: DerivationStep,
     icons: IconsStep,
@@ -67,6 +72,16 @@ impl Step {
             Self::Icons => "Icons",
         }
     }
+}
+
+/// How the flow came to be open.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum Opening {
+    /// The Client offered it, its own Server not having been onboarded.
+    #[default]
+    Offered,
+    /// The reader asked for it.
+    Requested,
 }
 
 /// What confirming the step on show came to.
@@ -143,15 +158,24 @@ impl Onboarding {
     }
 
     /// Opens the flow at its first step, every step afresh.
-    pub(super) fn open(&mut self) {
+    pub(super) fn open(&mut self, opening: Opening) {
         *self = Self {
             step: Some(Step::Providers),
+            opening,
             ..Self::default()
         };
     }
 
     pub(super) fn close(&mut self) {
         *self = Self::default();
+    }
+
+    /// Closes the flow where the Client offered it, untaken; one the reader
+    /// asked for stays open.
+    pub(super) fn withdraw(&mut self) {
+        if self.opening == Opening::Offered {
+            self.close();
+        }
     }
 
     /// Confirms the step on show: moves to the next, or on the last step

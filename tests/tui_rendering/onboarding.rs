@@ -104,10 +104,9 @@ fn a_client_of_an_onboarded_server_offers_nothing() {
     assert!(!onboarding_shown(&application), "{}", screen(&application));
 }
 
-/// Turns the Outlook through `/connect`, as a reader does, to the row `key`
-/// moves to from the Outlook on screen: the Local row stands first, and the
+/// Opens `/connect`, as a reader does, listing the Local row first and the
 /// Remote `studio` beneath it.
-fn turn_outlook(application: &mut Application, key: KeyCode) -> ApplicationTransition {
+fn open_connect(application: &mut Application) {
     type_terminal_text(application, "/connect");
     press(application, KeyCode::Enter);
     application
@@ -130,8 +129,43 @@ fn turn_outlook(application: &mut Application, key: KeyCode) -> ApplicationTrans
             }),
         })
         .unwrap();
+}
+
+/// Turns the Outlook through `/connect` to the row `key` moves to from the
+/// Outlook on screen.
+fn turn_outlook(application: &mut Application, key: KeyCode) -> ApplicationTransition {
+    open_connect(application);
     press(application, key);
     press(application, KeyCode::Enter)
+}
+
+#[test]
+fn onboarding_offered_beneath_connect_is_withdrawn_once_a_remote_is_chosen() {
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    open_connect(&mut application);
+    deliver_settings(&mut application, EffectiveSettings::default());
+
+    press(&mut application, KeyCode::Down);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::TurnOutlook {
+            outlook: Outlook::Remote("studio".to_owned()),
+            catalog_origins: HashSet::from([Outlook::Remote("studio".to_owned())]),
+        }
+    );
+    assert!(
+        !onboarding_shown(&application),
+        "what was offered beneath Connect is not left over the Remote: {}",
+        screen(&application)
+    );
+
+    turn_outlook(&mut application, KeyCode::Up);
+    assert!(
+        screen(&application).contains("Step 1 of 3"),
+        "back on its own Server, the Client offers it again: {}",
+        screen(&application)
+    );
 }
 
 #[test]
@@ -279,6 +313,48 @@ fn hearing_the_server_was_onboarded_elsewhere_closes_the_flow() {
     assert!(!onboarding_shown(&application), "{}", screen(&application));
     deliver_settings(&mut application, EffectiveSettings::default());
     assert!(!onboarding_shown(&application), "{}", screen(&application));
+}
+
+#[test]
+fn a_reconnect_saying_the_server_was_onboarded_meanwhile_closes_the_offered_flow() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    press(&mut application, KeyCode::Enter);
+    assert!(screen(&application).contains("Step 2 of 3"));
+
+    connect(
+        &mut application,
+        ready_health(fixture_instance_id(), 42_424),
+    );
+    assert!(
+        !onboarding_shown(&application),
+        "another Client took it while this one was away: {}",
+        screen(&application)
+    );
+}
+
+#[test]
+fn a_retake_the_reader_asked_for_stays_open_whatever_the_server_says() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    deliver_settings(&mut application, EffectiveSettings::default());
+    type_terminal_text(&mut application, "/onboarding");
+    press(&mut application, KeyCode::Enter);
+    press(&mut application, KeyCode::Enter);
+    assert!(screen(&application).contains("Step 2 of 3"));
+
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Onboarded(true)))
+        .expect("hear that the Server has been onboarded");
+    connect(
+        &mut application,
+        ready_health(fixture_instance_id(), 42_424),
+    );
+    assert!(
+        screen(&application).contains("Step 2 of 3"),
+        "the reader asked for it, so it is theirs to leave: {}",
+        screen(&application)
+    );
 }
 
 #[test]

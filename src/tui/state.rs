@@ -73,7 +73,7 @@ use super::{
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
-    onboarding::{Advance, Onboarding},
+    onboarding::{Advance, Onboarding, Opening},
     relay_overlay::{
         ListingLanded, RedemptionLoginLead, RelayLoginAct, RelayLoginFollow, RelayLoginLead,
         RelayOverlay, RelayRequest,
@@ -1374,7 +1374,13 @@ impl TuiState {
         self.command_mode = CommandMode::Composer;
         self.submission_error = None;
         self.sync_composer_completion();
-        self.offer_onboarding();
+        // Onboarding is the Client's own Server's, so what was offered is
+        // withdrawn on turning to a Remote and offered again on turning back.
+        if self.outlook == Outlook::Local {
+            self.offer_onboarding();
+        } else {
+            self.onboarding.withdraw();
+        }
     }
 
     /// Remote catalog streams required by the current Outlook and independently
@@ -2327,27 +2333,18 @@ impl TuiState {
                     self.model_picker
                         .refocus(self.landing_agent_selection.as_ref());
                 }
-                self.local_onboarded = Some(health.onboarded);
+                let onboarded = health.onboarded;
                 self.identity = Some(health.identity);
                 self.end_recovery(&Outlook::Local);
                 self.manually_stopped = false;
                 self.fatal_error = None;
-                self.offer_onboarding();
+                self.learn_onboarded(onboarded);
             }
             ManagedEvent::SettingsSnapshot(snapshot) => {
                 self.adopt_settings(snapshot);
                 self.offer_onboarding();
             }
-            // Another Client — or this one — took Onboarding, so whatever of
-            // it this Client has open closes.
-            ManagedEvent::Onboarded(onboarded) => {
-                self.local_onboarded = Some(onboarded);
-                if onboarded {
-                    self.onboarding.close();
-                } else {
-                    self.offer_onboarding();
-                }
-            }
+            ManagedEvent::Onboarded(onboarded) => self.learn_onboarded(onboarded),
             // The lifecycle stream is the local server's, so the catalog it
             // pushes is the Local Outlook's whichever Outlook is on screen.
             ManagedEvent::ModelCatalog(catalog) => {
@@ -2674,17 +2671,30 @@ impl TuiState {
         self.application_notice.showing()
     }
 
-    /// Opens Onboarding once the Client holds both its own Server's health
-    /// saying it has not been onboarded and the effective-settings snapshot,
-    /// and only while the Outlook is Local: a Remote's Onboarding is its own
-    /// Server's affair, so a Client viewing one offers it on turning back.
+    /// Takes what the Client's own Server says of whether it has been
+    /// onboarded, in its health or on its event stream. Once it has been — by
+    /// another Client, perhaps while this one was away — what this Client
+    /// offered is withdrawn; a retake the reader asked for stays theirs.
+    fn learn_onboarded(&mut self, onboarded: bool) {
+        self.local_onboarded = Some(onboarded);
+        if onboarded {
+            self.onboarding.withdraw();
+        } else {
+            self.offer_onboarding();
+        }
+    }
+
+    /// Opens Onboarding once the Client holds both its own Server's word that
+    /// it has not been onboarded and the effective-settings snapshot, and only
+    /// while the Outlook is Local: a Remote's Onboarding is its own Server's
+    /// affair, so a Client viewing one offers it on turning back.
     fn offer_onboarding(&mut self) {
         if self.local_onboarded == Some(false)
             && self.settings_received
             && self.outlook == Outlook::Local
             && !self.onboarding.is_open()
         {
-            self.onboarding.open();
+            self.onboarding.open(Opening::Offered);
         }
     }
 
@@ -10172,7 +10182,7 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::OnboardingOpen => {
-                self.state.onboarding.open();
+                self.state.onboarding.open(Opening::Requested);
                 self.state.command_mode = CommandMode::Composer;
                 Ok(ApplicationTransition::Continue)
             }
