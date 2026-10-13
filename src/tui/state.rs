@@ -8511,14 +8511,14 @@ impl Application {
     /// the picker alone.
     fn handle_model_picker_command(&mut self, command: CommandId) -> Result<ApplicationTransition> {
         match command {
-            CommandId::InsertModelSearch(text) => self.state.model_picker.list_mut().insert(&text),
+            CommandId::InsertModelSearch(text) => self.state.model_picker.keys().insert(&text),
             CommandId::DeleteModelSearchBackward => {
-                self.state.model_picker.list_mut().delete_backward();
+                self.state.model_picker.keys().delete_backward();
             }
-            CommandId::SelectPreviousModel => self.state.model_picker.list_mut().select_previous(),
-            CommandId::SelectNextModel => self.state.model_picker.list_mut().select_next(),
-            CommandId::PagePreviousModels => self.state.model_picker.list_mut().page_previous(),
-            CommandId::PageNextModels => self.state.model_picker.list_mut().page_next(),
+            CommandId::SelectPreviousModel => self.state.model_picker.keys().select_previous(),
+            CommandId::SelectNextModel => self.state.model_picker.keys().select_next(),
+            CommandId::PagePreviousModels => self.state.model_picker.keys().page_previous(),
+            CommandId::PageNextModels => self.state.model_picker.keys().page_next(),
             CommandId::CloseModelPicker => self.state.model_picker.close(),
             CommandId::SelectModel => return self.choose_model(),
             _ => {}

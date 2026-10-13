@@ -897,12 +897,12 @@ impl Onboarding {
         if self.step != Some(Step::Derivation) {
             return;
         }
-        let list = &mut self.derivation.list;
+        let keys = self.derivation.list.keys();
         match movement {
-            DerivationMove::Previous => list.select_previous(),
-            DerivationMove::Next => list.select_next(),
-            DerivationMove::PageUp => list.page_previous(),
-            DerivationMove::PageDown => list.page_next(),
+            DerivationMove::Previous => keys.select_previous(),
+            DerivationMove::Next => keys.select_next(),
+            DerivationMove::PageUp => keys.page_previous(),
+            DerivationMove::PageDown => keys.page_next(),
         }
     }
 

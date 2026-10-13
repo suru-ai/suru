@@ -137,6 +137,39 @@ pub(super) enum AgentSelectionRow<'a> {
     },
 }
 
+/// The reader's keys on an Agent Selection list: they move Row Focus and edit
+/// the query narrowing it, and nothing more, so whatever hosts the list can
+/// lend them out without anything listing other rows behind its back.
+pub(super) struct ListKeys<'a>(&'a mut AgentSelectionList);
+
+impl ListKeys<'_> {
+    pub(super) fn insert(self, text: &str) {
+        self.0.query.push_str(text);
+        self.0.select_first_visible();
+    }
+
+    pub(super) fn delete_backward(self) {
+        self.0.query.pop();
+        self.0.select_first_visible();
+    }
+
+    pub(super) fn select_previous(self) {
+        self.0.move_selection(-1);
+    }
+
+    pub(super) fn select_next(self) {
+        self.0.move_selection(1);
+    }
+
+    pub(super) fn page_previous(self) {
+        self.0.move_selection(-10);
+    }
+
+    pub(super) fn page_next(self) {
+        self.0.move_selection(10);
+    }
+}
+
 impl AgentSelectionRow<'_> {
     fn is_selected(&self) -> bool {
         match self {
@@ -315,30 +348,9 @@ impl AgentSelectionList {
         matches!(self.selected, Some(ListSelection::Retry(_)))
     }
 
-    pub(super) fn insert(&mut self, text: &str) {
-        self.query.push_str(text);
-        self.select_first_visible();
-    }
-
-    pub(super) fn delete_backward(&mut self) {
-        self.query.pop();
-        self.select_first_visible();
-    }
-
-    pub(super) fn select_previous(&mut self) {
-        self.move_selection(-1);
-    }
-
-    pub(super) fn select_next(&mut self) {
-        self.move_selection(1);
-    }
-
-    pub(super) fn page_previous(&mut self) {
-        self.move_selection(-10);
-    }
-
-    pub(super) fn page_next(&mut self) {
-        self.move_selection(10);
+    /// What the reader's keys may do to the list.
+    pub(super) fn keys(&mut self) -> ListKeys<'_> {
+        ListKeys(self)
     }
 
     pub(super) fn choose(&self) -> Option<AgentSelectionAction> {

@@ -14,7 +14,7 @@ use crate::{
 use super::{
     ModelListRequest,
     agent_selection_list::{
-        AgentSelectionLines, AgentSelectionList, InForce, ProviderModels, default_model,
+        AgentSelectionLines, AgentSelectionList, InForce, ListKeys, ProviderModels, default_model,
         normalize_catalog,
     },
 };
@@ -255,13 +255,14 @@ impl ModelPicker {
         self.active_request.is_some() && self.list.is_empty()
     }
 
-    /// The Agent Selection list on show, which the reader's keys drive.
+    /// The Agent Selection list on show, and what the reader's keys may do
+    /// to it.
     pub(super) fn list(&self) -> &AgentSelectionList {
         &self.list
     }
 
-    pub(super) fn list_mut(&mut self) -> &mut AgentSelectionList {
-        &mut self.list
+    pub(super) fn keys(&mut self) -> ListKeys<'_> {
+        self.list.keys()
     }
 
     /// The Provider's name as the user reads it, from whichever catalog the
