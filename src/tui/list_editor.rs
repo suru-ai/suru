@@ -9,6 +9,10 @@
 //! hands the whole list to the Setting, which makes it one mutation or names
 //! the first entry it refuses. A row the reader emptied is no entry at all, so
 //! clearing a row and removing it come to the same list.
+//!
+//! A list whose entries name directories on the Server is also edited by
+//! browsing: a directory chosen in the Directory Browser stands in the focused
+//! entry's place, or, chosen from the row past the last entry, is added there.
 
 use crate::{
     protocol::{EffectiveSettings, SettingMutation},
@@ -37,6 +41,9 @@ pub(super) struct ListEditorView<'a> {
     pub(super) label: &'static str,
     /// What the row a new entry is added at reads before anything is typed.
     pub(super) placeholder: &'static str,
+    /// Whether each entry names a directory, which the Directory Browser
+    /// may choose.
+    pub(super) names_directories: bool,
     pub(super) entries: &'a [String],
     /// The focused row, where `entries.len()` is the row a new entry is added
     /// at.
@@ -63,11 +70,31 @@ impl ListEditor {
         ListEditorView {
             label: self.choice.label(),
             placeholder: self.choice.placeholder(),
+            names_directories: self.names_directories(),
             entries: &self.entries,
             focus: self.focus,
             error: self.error.as_deref(),
             window: &self.window,
         }
+    }
+
+    /// Whether each entry names a directory, which the Directory Browser
+    /// may choose.
+    pub(super) fn names_directories(&self) -> bool {
+        self.choice.names_directories()
+    }
+
+    /// Puts the directory the reader chose in the Directory Browser in the
+    /// focused entry's place, or, where focus stands on the row past the last
+    /// entry, adds it there, which opens a new row to add at beneath it as
+    /// typing does. Either way focus stays on the directory chosen.
+    pub(super) fn choose_directory(&mut self, directory: String) {
+        self.error = None;
+        match self.entries.get_mut(self.focus) {
+            Some(entry) => *entry = directory,
+            None => self.entries.push(directory),
+        }
+        self.window.reveal();
     }
 
     pub(super) fn select_previous(&mut self) {

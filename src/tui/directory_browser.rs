@@ -1,5 +1,6 @@
-//! Directory Browser state: the tree of the Outlook's Server's directories a
-//! Client chooses a directory to work in from, read one directory at a time as
+//! Directory Browser state: the tree of one Server's directories a Client
+//! chooses a directory from — the Outlook's, to work in, or the Client's own,
+//! for a Setting naming directories there — read one directory at a time as
 //! the reader opens it, and never from the Client's own disk.
 
 use std::{
@@ -12,7 +13,7 @@ use std::{
 use ratatui::layout::{Position, Rect};
 
 use crate::protocol::{
-    DRIVE_LIST, DirectoryListing, DirectorySourceControl, ListDirectoryRequest, PathStyle,
+    DRIVE_LIST, DirectoryListing, DirectorySourceControl, ListDirectoryRequest, Outlook, PathStyle,
     ResolveWorkspaceRequest,
 };
 
@@ -22,13 +23,13 @@ use super::{
     state::ScrollDirection,
 };
 
-/// One listing request the Directory Browser sent the Outlook's Server, told
+/// One listing request the Directory Browser sent the Server it browses, told
 /// apart from every other so its answer reaches only the opening that asked
 /// for it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DirectoryListingId(u64);
 
-/// One listing the browser wants from the Outlook's Server: the identity its
+/// One listing the browser wants from the Server it browses: the identity its
 /// answer will carry, and the directory it names.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DirectoryListingAsk {
@@ -46,12 +47,19 @@ pub(super) enum DirectoryBrowserProvenance {
     /// goes back to the picker as the reader left it, and a choice closes
     /// the picker as well as the browser.
     FromWorkspacePicker,
+    /// Opened from the settings panel's editor of a list of directories, so
+    /// it stands over the panel, Esc goes back to the editor, and a choice is
+    /// an entry of the list rather than where the next Session works.
+    FromListEditor,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct DirectoryBrowser {
     open: bool,
     provenance: DirectoryBrowserProvenance,
+    /// The Server whose directories the tree lists, which every listing it
+    /// asks for is asked of.
+    server: Outlook,
     /// The text of the path field, in the Server's own syntax, which names the
     /// tree's root by its leading part and narrows the root's children by its
     /// tail. What the reader typed stays as they typed it.
@@ -181,6 +189,34 @@ impl RowKey {
     }
 }
 
+/// A directory the reader chose in the browser, and where the browser was
+/// opened from, which says what the choice is for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ChosenDirectory {
+    /// The directory chosen, by the Server's own path.
+    pub(super) path: PathBuf,
+    pub(super) provenance: DirectoryBrowserProvenance,
+    /// The Landing's Execution Directory as the browser opened, which the
+    /// listings it asked for were read from.
+    base: PathBuf,
+}
+
+impl ChosenDirectory {
+    /// The Workspace resolution that lands the reader in the directory chosen
+    /// — read from the Landing's Execution Directory, with no Workspace or
+    /// remembered directory beside it, because the directory chosen is itself
+    /// where the next Session works.
+    pub(super) fn into_workspace_resolution(self) -> ResolveWorkspaceRequest {
+        ResolveWorkspaceRequest {
+            checkout_id: None,
+            remembered_execution_directory: None,
+            workspace_id: None,
+            base: Some(self.base),
+            path: self.path,
+        }
+    }
+}
+
 /// What one listing the browser awaits was asked for.
 #[derive(Clone, Debug)]
 enum Asked {
@@ -238,18 +274,21 @@ impl DirectoryBrowserRowKind {
 }
 
 impl DirectoryBrowser {
-    /// Opens the browser afresh, rooted at `execution_directory` with the
-    /// root open and focused, and asks for the root's children. The path
-    /// field names the root, ready for a name beneath it. Nothing is kept
-    /// from an earlier opening, including any answer it still awaits.
+    /// Opens the browser afresh on `server`'s directories, rooted at
+    /// `execution_directory` with the root open and focused, and asks for the
+    /// root's children. The path field names the root, ready for a name
+    /// beneath it. Nothing is kept from an earlier opening, including any
+    /// answer it still awaits.
     pub(super) fn open(
         &mut self,
+        server: Outlook,
         execution_directory: PathBuf,
         provenance: DirectoryBrowserProvenance,
     ) -> DirectoryListingAsk {
         self.close();
         self.open = true;
         self.provenance = provenance;
+        self.server = server;
         self.base.clone_from(&execution_directory);
         self.field = self.beneath(&execution_directory.to_string_lossy());
         self.leading = self.field_leading().to_owned();
@@ -283,6 +322,11 @@ impl DirectoryBrowser {
 
     pub(super) const fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// The Server whose directories the tree lists.
+    pub(super) fn server(&self) -> &Outlook {
+        &self.server
     }
 
     pub(super) fn field(&self) -> &str {
@@ -479,30 +523,28 @@ impl DirectoryBrowser {
     }
 
     /// Chooses the focused row, closing the browser since a choice is done
-    /// with it, and answers the Workspace resolution that lands the reader in
-    /// the row's directory — named by the Server's own path and read from the
-    /// Landing's Execution Directory, with no Workspace or remembered
-    /// directory beside it, because the directory chosen is itself where the
-    /// next Session works — and where the browser was opened from, which the
-    /// choice is done with too. The drive list is no directory to work in, so
-    /// focus standing on it chooses nothing and leaves the browser open.
-    pub(super) fn choose_focused(
-        &mut self,
-    ) -> Option<(ResolveWorkspaceRequest, DirectoryBrowserProvenance)> {
+    /// with it, and answers the directory chosen, by the Server's own path,
+    /// with where the browser was opened from, which the choice is done with
+    /// too. The drive list is no directory, so focus standing on it chooses
+    /// nothing and leaves the browser open.
+    pub(super) fn choose_focused(&mut self) -> Option<ChosenDirectory> {
         let path = self.focused.directory().to_owned();
         if is_drive_list(&path) {
             return None;
         }
         let base = self.base.clone();
         let provenance = self.close();
-        let request = ResolveWorkspaceRequest {
-            checkout_id: None,
-            remembered_execution_directory: None,
-            workspace_id: None,
-            base: Some(base),
+        Some(ChosenDirectory {
             path,
-        };
-        Some((request, provenance))
+            provenance,
+            base,
+        })
+    }
+
+    /// Whether the browser is open, opened from the settings panel's list
+    /// editor.
+    pub(super) fn opened_from_list_editor(&self) -> bool {
+        self.open && self.provenance == DirectoryBrowserProvenance::FromListEditor
     }
 
     /// Shows the directories the Server flagged hidden, each in its place
@@ -990,7 +1032,7 @@ impl DirectoryBrowser {
         path
     }
 
-    /// The Outlook's Server's path syntax, read from the Execution Directory
+    /// The browsed Server's path syntax, read from the Execution Directory
     /// as that Server spelled it rather than from this Client's platform,
     /// which a Remote need not share.
     fn style(&self) -> PathStyle {

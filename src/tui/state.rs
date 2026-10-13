@@ -3707,6 +3707,34 @@ impl TuiState {
         })
     }
 
+    /// Where the Directory Browser is rooted as it opens on `outlook`'s
+    /// Server: the directory the Landing would begin a Session in there.
+    fn browse_root(&self, outlook: &Outlook) -> PathBuf {
+        if *outlook == self.outlook {
+            return self
+                .execution_directory
+                .clone()
+                .unwrap_or_else(|| self.workspace.path.clone());
+        }
+        self.outlook_execution_directories
+            .get(outlook)
+            .cloned()
+            .flatten()
+            .or_else(|| {
+                self.outlook_workspaces
+                    .get(outlook)
+                    .map(|workspace| workspace.path.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether choosing in the Directory Browser lands the reader in the
+    /// directory chosen, as it does from everywhere but the list editor,
+    /// whose choice is an entry of its draft.
+    fn browser_choice_lands(&self) -> bool {
+        !self.directory_browser.opened_from_list_editor()
+    }
+
     /// The top painted overlay owns selection and pointer/key dispatch alike.
     fn top_selection_overlay(&self) -> Option<SelectionSurface> {
         if self.icon_picker.is_open() {
@@ -3725,6 +3753,8 @@ impl TuiState {
             Some(SelectionSurface::Models)
         } else if self.model_options.is_open() {
             Some(SelectionSurface::ModelOptions)
+        } else if self.directory_browser.opened_from_list_editor() {
+            Some(SelectionSurface::DirectoryBrowser)
         } else if self.settings_panel.numeric_editor_is_open() {
             Some(SelectionSurface::NumericEditor)
         } else if self.settings_panel.list_editor_is_open() {
@@ -7007,13 +7037,17 @@ impl Application {
     /// directory in the Directory Browser, is one of them: it opens the
     /// Landing, which takes over the Agent Selection from the Session being
     /// left. Choosing the Workspace Picker's Browse row only opens the
-    /// browser, so it does not wait.
+    /// browser, so it does not wait, and nor does a directory chosen for the
+    /// list editor, which lands nowhere.
     fn defers_for_agent_selection(&self, command: &CommandId) -> bool {
         if !self.state.selection_update_pending() {
             return false;
         }
         match command {
             CommandId::SelectWorkspace => !self.state.workspace_picker.browse_is_selected(),
+            CommandId::InvokeSemantic(SemanticCommandId::DirectoryBrowserChoose) => {
+                self.state.browser_choice_lands()
+            }
             command => matches!(
                 command,
                 CommandId::SubmitSteer
@@ -7025,7 +7059,6 @@ impl Application {
                             | SemanticCommandId::SessionNew
                             | SemanticCommandId::SessionSidekick
                             | SemanticCommandId::ModelOptionsApply
-                            | SemanticCommandId::DirectoryBrowserChoose
                     )
             ),
         }
@@ -7216,6 +7249,11 @@ impl Application {
     /// the Outlook's.
     fn semantic_origin(&self, id: SemanticCommandId, subject: &SemanticSubject) -> Option<Outlook> {
         if super::commands::descriptor(id).reach != super::commands::SemanticReach::Origin {
+            return None;
+        }
+        // A directory chosen for the list editor is an entry of its draft,
+        // which asks nothing of any Server.
+        if id == SemanticCommandId::DirectoryBrowserChoose && !self.state.browser_choice_lands() {
             return None;
         }
         Some(match subject {
@@ -7882,19 +7920,28 @@ impl Application {
             // reader chose is the directory itself, so that is what the
             // Landing names while it waits.
             SemanticCommandId::DirectoryBrowserChoose => {
-                let Some((request, provenance)) = browser.choose_focused() else {
+                let Some(chosen) = browser.choose_focused() else {
                     return ApplicationTransition::Continue;
                 };
-                match provenance {
+                match chosen.provenance {
                     DirectoryBrowserProvenance::Standalone => {}
                     // A choice is done with the picker the browser was
                     // opened from as well, so nothing is left to dismiss.
                     DirectoryBrowserProvenance::FromWorkspacePicker => {
                         self.state.workspace_picker.close();
                     }
+                    // A directory chosen for a list is an entry of its
+                    // draft, which lands nowhere until the list is saved.
+                    DirectoryBrowserProvenance::FromListEditor => {
+                        if let Some(editor) = self.state.settings_panel.edit_list() {
+                            editor.choose_directory(chosen.path.to_string_lossy().into_owned());
+                        }
+                        return ApplicationTransition::Continue;
+                    }
                 }
-                let directory = Workspace::directory(request.path.clone());
-                return self.land_in_chosen_workspace(directory, request);
+                let directory = Workspace::directory(chosen.path.clone());
+                return self
+                    .land_in_chosen_workspace(directory, chosen.into_workspace_resolution());
             }
             SemanticCommandId::DirectoryBrowserClose => {
                 match browser.close() {
@@ -7904,6 +7951,9 @@ impl Application {
                     DirectoryBrowserProvenance::FromWorkspacePicker => {
                         self.state.workspace_picker.step_back();
                     }
+                    // The list editor stood beneath the browser all along,
+                    // its draft as the reader left it.
+                    DirectoryBrowserProvenance::FromListEditor => {}
                 }
                 None
             }
@@ -7918,11 +7968,11 @@ impl Application {
         })
     }
 
-    /// The listing the Directory Browser asks for, of the Server the Outlook
-    /// is turned toward.
+    /// The listing the Directory Browser asks for, of the Server whose
+    /// directories it lists.
     fn list_directory(&self, ask: DirectoryListingAsk) -> ApplicationTransition {
         ApplicationTransition::ListDirectory {
-            outlook: self.state.outlook.clone(),
+            outlook: self.state.directory_browser.server().clone(),
             listing_id: ask.listing_id,
             request: ask.request,
         }
@@ -9703,13 +9753,13 @@ impl Application {
             return Ok(ApplicationTransition::Continue);
         }
         if self.state.selection_update_pending()
-            && matches!(
-                command,
+            && match command {
                 SemanticCommandId::SessionList
-                    | SemanticCommandId::SessionNew
-                    | SemanticCommandId::SessionSidekick
-                    | SemanticCommandId::DirectoryBrowserChoose
-            )
+                | SemanticCommandId::SessionNew
+                | SemanticCommandId::SessionSidekick => true,
+                SemanticCommandId::DirectoryBrowserChoose => self.state.browser_choice_lands(),
+                _ => false,
+            }
         {
             return Ok(ApplicationTransition::Continue);
         }
@@ -9738,6 +9788,7 @@ impl Application {
                 | SemanticCommandId::SettingsListInsert
                 | SemanticCommandId::SettingsListDeleteBackward
                 | SemanticCommandId::SettingsListRemove
+                | SemanticCommandId::SettingsListBrowse
                 | SemanticCommandId::SettingsListSave
                 | SemanticCommandId::SettingsListCancel
         ) && !matches!(
@@ -10241,6 +10292,7 @@ impl Application {
             | SemanticCommandId::SettingsListInsert
             | SemanticCommandId::SettingsListDeleteBackward
             | SemanticCommandId::SettingsListRemove
+            | SemanticCommandId::SettingsListBrowse
             | SemanticCommandId::SettingsListSave
             | SemanticCommandId::SettingsListCancel) => {
                 Ok(self.handle_list_editor_command(command, invocation.subject))
@@ -10405,21 +10457,18 @@ impl Application {
             // Workspace Picker — by its Browse row or its key — it stands in
             // the picker's place, which steps aside until the browser is done.
             SemanticCommandId::WorkspaceBrowse => {
-                let execution_directory = self
-                    .state
-                    .execution_directory
-                    .clone()
-                    .unwrap_or_else(|| self.state.workspace.path.clone());
+                let outlook = self.state.outlook.clone();
+                let execution_directory = self.state.browse_root(&outlook);
                 let provenance = if self.state.workspace_picker.is_open() {
                     self.state.workspace_picker.step_aside();
                     DirectoryBrowserProvenance::FromWorkspacePicker
                 } else {
                     DirectoryBrowserProvenance::Standalone
                 };
-                let ask = self
-                    .state
-                    .directory_browser
-                    .open(execution_directory, provenance);
+                let ask =
+                    self.state
+                        .directory_browser
+                        .open(outlook, execution_directory, provenance);
                 self.state.command_mode = CommandMode::Composer;
                 Ok(self.list_directory(ask))
             }
@@ -10976,6 +11025,23 @@ impl Application {
                 );
             }
             SemanticCommandId::SettingsListCancel => panel.cancel_list_edit(),
+            // The panel's Settings are the Client's own Server's, whose
+            // directories the browser lists however the Outlook is turned,
+            // starting where `/browse` would there. It stands over the editor
+            // until a choice or Esc hands the keys back to it.
+            SemanticCommandId::SettingsListBrowse => {
+                if panel
+                    .edit_list()
+                    .is_some_and(|editor| editor.names_directories())
+                {
+                    let ask = self.state.directory_browser.open(
+                        Outlook::Local,
+                        self.state.browse_root(&Outlook::Local),
+                        DirectoryBrowserProvenance::FromListEditor,
+                    );
+                    return self.list_directory(ask);
+                }
+            }
             command => {
                 if let Some(editor) = panel.edit_list() {
                     match (command, subject) {

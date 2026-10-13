@@ -368,7 +368,10 @@ pub(super) fn render_with_slots(
             render_workspace_description_editor(frame, state, main, theme);
         }
     }
-    if state.directory_browser.is_open() && !state.reconnect_overlay_visible() {
+    if state.directory_browser.is_open()
+        && !state.directory_browser.opened_from_list_editor()
+        && !state.reconnect_overlay_visible()
+    {
         render_directory_browser(frame, state, main, theme);
     }
     if state.worktree_picker.open && !state.reconnect_overlay_visible() {
@@ -381,6 +384,10 @@ pub(super) fn render_with_slots(
         }
         if state.settings_panel.list_editor_is_open() {
             render_list_editor(frame, state, main, theme);
+        }
+        // Opened from the list editor, the browser stands over it.
+        if state.directory_browser.opened_from_list_editor() {
+            render_directory_browser(frame, state, main, theme);
         }
     }
     // Choice pickers can be opened by a settings row, so they are drawn over
@@ -1572,9 +1579,10 @@ fn render_numeric_editor(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
 
 /// The list editor over the settings panel: what the list holds above its
 /// rows — every entry, then the row a new one is added at — and why the last
-/// save pinned nothing and the keys beneath. The rows are windowed over the
-/// room the view leaves, keeping focus in view, and the focused row shows the
-/// end of a long entry, which is where typing lands.
+/// save pinned nothing and the keys beneath, Tab among them where the
+/// entries name directories the Directory Browser may choose. The rows are
+/// windowed over the room the view leaves, keeping focus in view, and the
+/// focused row shows the end of a long entry, which is where typing lands.
 fn render_list_editor(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
     let editor = state
         .settings_panel
@@ -1615,11 +1623,14 @@ fn render_list_editor(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme
         truncate_to_width(editor.error.unwrap_or(""), content_width),
         theme.feedback.error,
     ));
+    let browse = if editor.names_directories {
+        " · Tab browse"
+    } else {
+        ""
+    };
+    let keys = format!("↑↓ move{browse} · Ctrl+D remove · Enter save · Esc cancel");
     lines.push(Line::styled(
-        truncate_to_width(
-            "↑↓ move · Ctrl+D remove · Enter save · Esc cancel",
-            content_width,
-        ),
+        truncate_to_width(&keys, content_width),
         theme.text.subdued,
     ));
     render_overlay_box(
@@ -2100,10 +2111,16 @@ fn render_directory_browser(frame: &mut Frame<'_>, state: &TuiState, main: Rect,
     let root_name = if browser.stands_on_drive_list() {
         "Drives".to_owned()
     } else {
-        state.workspace_name(&state.outlook, browser.root())
+        state.workspace_name(browser.server(), browser.root())
     };
+    // The Workspaces the Client knows are the Outlook's, which mark nothing
+    // in another Server's tree.
     let known = KnownWorkspaces {
-        workspaces: state.known_workspaces(),
+        workspaces: if *browser.server() == state.outlook {
+            state.known_workspaces()
+        } else {
+            Vec::new()
+        },
         current: &state.workspace.id,
         show_icons: state.settings().appearance.show_icons,
     };

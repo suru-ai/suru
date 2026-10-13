@@ -243,6 +243,10 @@ pub enum SemanticCommandId {
     SettingsListDeleteBackward,
     /// Removes the list editor's focused entry from the draft.
     SettingsListRemove,
+    /// Opens the Directory Browser over the list editor of a list of
+    /// directories, whose choice stands in the focused entry's place or is
+    /// added at the row past the last entry.
+    SettingsListBrowse,
     /// Pins the list editor's whole draft as one mutation, or names the entry
     /// its Setting refuses.
     SettingsListSave,
@@ -277,7 +281,8 @@ pub enum SemanticCommandId {
     /// Completes the Directory Browser's path field to the focused row.
     DirectoryBrowserPathComplete,
     /// Chooses the Directory Browser's focused row as where the next Session
-    /// works, as choosing a Workspace in the Workspace Picker does.
+    /// works, as choosing a Workspace in the Workspace Picker does — or, for
+    /// a browser the list editor opened, as an entry of its draft.
     DirectoryBrowserChoose,
     DirectoryBrowserClose,
     /// Shows the Directory Browser's hidden directories among the others, or
@@ -670,6 +675,7 @@ impl SemanticCommandId {
             Self::SettingsListInsert => "settings.list.insert",
             Self::SettingsListDeleteBackward => "settings.list.delete-backward",
             Self::SettingsListRemove => "settings.list.remove",
+            Self::SettingsListBrowse => "settings.list.browse",
             Self::SettingsListSave => "settings.list.save",
             Self::SettingsListCancel => "settings.list.cancel",
             Self::SubagentBrowse => "subagent.browse",
@@ -2581,6 +2587,16 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Remove List Row",
         reach: SemanticReach::Client,
         description: "Remove the focused entry from the open list Setting editor",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SettingsListBrowse,
+        title: "Browse for a List Entry",
+        // The browser lists the Client's own Server's directories, whose
+        // Settings the panel edits, so no Remote's loss refuses it.
+        reach: SemanticReach::Client,
+        description: "Choose the focused entry of the open list of directories in the Directory Browser",
         slash: None,
         keybinding: None,
     },

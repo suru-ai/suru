@@ -962,6 +962,7 @@ pub(super) fn command_for_list_editor_event(event: InputEvent) -> Option<Command
         }
         (KeyCode::Backspace, KeyModifiers::NONE) => SemanticCommandId::SettingsListDeleteBackward,
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => SemanticCommandId::SettingsListRemove,
+        (KeyCode::Tab, KeyModifiers::NONE) => SemanticCommandId::SettingsListBrowse,
         (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::SettingsListSave,
         (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::SettingsListCancel,
         (KeyCode::Char(character), modifiers)

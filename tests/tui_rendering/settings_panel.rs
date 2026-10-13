@@ -1,7 +1,8 @@
 //! The settings panel: the tabs it splits its Settings across, and editing a
 //! Setting from any of them.
 
-use std::path::Path;
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
+use std::time::Duration;
 
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -12,18 +13,20 @@ use ratatui::{
 };
 
 use crate::support::{
-    connected_application, model_descriptor, rendered_application_buffer,
-    rendered_application_rows, rendered_application_rows_at, selected_session_snapshot,
-    text_position, type_terminal_text, workspace_dir,
+    application_looking_at_studio, connected_application, model_descriptor,
+    rendered_application_buffer, rendered_application_rows, rendered_application_rows_at,
+    selected_session_snapshot, studio_stops_answering, text_position, type_terminal_text,
+    workspace_dir,
 };
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
         AgentSelection, AppearanceMode, AppearanceSettings, AsideSettings, AsideVisibility,
-        AutoReclaim, AutoSettle, BrokerSettings, CodexSettings, CopilotSettings, DerivationErrand,
-        DerivationSettings, EffectiveSettings, FoldPosture, ModelAvailability, ModelCatalog,
-        ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
-        ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
+        AutoReclaim, AutoSettle, BrokerSettings, ChildDirectory, CodexSettings, CopilotSettings,
+        DerivationErrand, DerivationSettings, DirectoryListing, DirectorySourceControl,
+        EffectiveSettings, FoldPosture, ModelAvailability, ModelCatalog, ModelId,
+        ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
+        ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue, Outlook,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
         ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
         SessionId, SessionSettings, SettingMutation, SettingScope, SettingsSnapshot, SidebarScope,
@@ -32,8 +35,8 @@ use suru::{
     },
     settings::SettingGroup,
     tui::{
-        Application, ApplicationEvent, ApplicationTransition, CommandId, ModelListRequest,
-        NumericDigit, SemanticCommandId,
+        Application, ApplicationEvent, ApplicationTransition, CommandId, DirectoryListingId,
+        ModelListRequest, NumericDigit, SemanticCommandId,
     },
 };
 
@@ -1030,6 +1033,243 @@ fn a_list_editor_closes_with_its_panel_and_takes_no_input_while_another_overlay_
         ),
         ApplicationTransition::Continue,
         "input aimed at the closed editor changes nothing"
+    );
+}
+
+/// The listing a Directory Browser asked the Outlook's Server for, out of the
+/// transition its opening or a step through it answered with.
+fn expect_listing(transition: ApplicationTransition) -> (DirectoryListingId, PathBuf) {
+    let ApplicationTransition::ListDirectory {
+        outlook,
+        listing_id,
+        request,
+    } = transition
+    else {
+        panic!("the browser asks the Server for a directory's children, not {transition:?}");
+    };
+    assert_eq!(
+        outlook,
+        Outlook::Local,
+        "the Server whose Settings are edited is the one browsed"
+    );
+    (listing_id, request.path)
+}
+
+/// The Server's listing of `root` with plain child directories named
+/// `children`.
+fn answer_listing(
+    application: &mut Application,
+    listing_id: DirectoryListingId,
+    root: &Path,
+    children: &[&str],
+) -> ApplicationTransition {
+    application
+        .handle_event(ApplicationEvent::DirectoryListed {
+            listing_id,
+            result: Ok(DirectoryListing {
+                root: root.to_owned(),
+                parent: root.parent().map(Path::to_owned),
+                source_control: DirectorySourceControl::Plain,
+                children: children
+                    .iter()
+                    .map(|name| ChildDirectory {
+                        name: (*name).to_owned(),
+                        path: root.join(name),
+                        source_control: DirectorySourceControl::Plain,
+                        hidden: false,
+                    })
+                    .collect(),
+            }),
+        })
+        .expect("deliver the Server's listing")
+}
+
+/// Whether the list editor's focused row is an entry ending in the directory
+/// `name`, which a long path shows the end of.
+fn focuses_entry_ending(screen: &str, name: &str) -> bool {
+    let entry = format!("{MAIN_SEPARATOR}{name}│");
+    screen
+        .lines()
+        .any(|line| line.contains("│› ") && line.contains(&entry))
+}
+
+/// Tab in the Workspace Roots' editor browses the Server's directories, the
+/// way `/browse` does, rooted where the Landing works; the browser stands
+/// over the panel and holds the keys until a choice or Esc hands them back.
+#[test]
+fn tab_in_the_workspace_roots_editor_opens_the_directory_browser_over_the_panel() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        with_workspace_roots(&[WORK_ROOT]),
+        &["workspace.roots"],
+    );
+    open_workspace_roots_editor(&mut application);
+    assert!(
+        screen(&application).contains("Tab browse"),
+        "the editor teaches that Tab browses for a directory: {}",
+        screen(&application)
+    );
+
+    let (listing_id, root) =
+        expect_listing(press(&mut application, KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        root,
+        workspace.path(),
+        "the browser is rooted where the Landing works"
+    );
+    answer_listing(&mut application, listing_id, &root, &["projects"]);
+    let browsing = screen(&application);
+    assert!(
+        browsing.contains("Path:") && browsing.contains("projects"),
+        "the browser is drawn over the panel: {browsing}"
+    );
+
+    type_terminal_text(&mut application, "x");
+    press(&mut application, KeyCode::Backspace, KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Esc, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "backing out of the browser asks for nothing"
+    );
+    let back = screen(&application);
+    assert!(
+        !back.contains("Path:")
+            && back.contains(ROOTS_EDITOR)
+            && back.contains(&format!("› {WORK_ROOT}")),
+        "Esc goes back to the editor as the reader left it: {back}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+            value: Some(vec![WORK_ROOT.to_owned()]),
+        }),
+        "nothing typed while the browser held the keys reached the draft"
+    );
+}
+
+/// Choosing a directory in the browser the Roots' editor opened lands in no
+/// Workspace: from the row a new entry is added at it adds the directory, by
+/// the Server's own path, and from an entry it stands in that entry's place.
+#[test]
+fn a_directory_chosen_in_the_browser_adds_a_root_or_replaces_the_focused_one() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        with_workspace_roots(&["~/src", WORK_ROOT]),
+        &["workspace.roots"],
+    );
+    open_workspace_roots_editor(&mut application);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert!(screen(&application).contains("› add a Root"));
+
+    let (listing_id, root) =
+        expect_listing(press(&mut application, KeyCode::Tab, KeyModifiers::NONE));
+    answer_listing(&mut application, listing_id, &root, &["projects", "notes"]);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "a Root chosen is a draft, and no Workspace is resolved"
+    );
+    let added = screen(&application);
+    assert!(
+        !added.contains("Path:") && focuses_entry_ending(&added, "projects"),
+        "the choice closes the browser and adds the directory as a Root: {added}"
+    );
+
+    press(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    let (listing_id, root) =
+        expect_listing(press(&mut application, KeyCode::Tab, KeyModifiers::NONE));
+    answer_listing(&mut application, listing_id, &root, &["projects", "notes"]);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        focuses_entry_ending(&screen(&application), "notes"),
+        "a choice made from an entry replaces it: {}",
+        screen(&application)
+    );
+    let [notes, projects] = ["notes", "projects"].map(|name| root.join(name).display().to_string());
+
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+            value: Some(vec!["~/src".to_owned(), notes, projects]),
+        }),
+        "the browsed Roots are saved with the rest as one mutation"
+    );
+}
+
+/// Browsing is offered to the Roots' editor through a semantic command, so a
+/// plugin or the pointer reaches the browser as Tab does; with no list editor
+/// open the command does nothing.
+#[test]
+fn the_list_editor_browses_through_a_semantic_command() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    assert_eq!(
+        invoke(
+            &mut application,
+            CommandId::InvokeSemantic(SemanticCommandId::SettingsListBrowse)
+        ),
+        ApplicationTransition::Continue,
+        "nothing is browsed for without an editor to take the choice"
+    );
+
+    open_workspace_roots_editor(&mut application);
+    let (listing_id, root) = expect_listing(invoke(
+        &mut application,
+        CommandId::InvokeSemantic(SemanticCommandId::SettingsListBrowse),
+    ));
+    answer_listing(&mut application, listing_id, &root, &[]);
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+            value: Some(vec![root.display().to_string()]),
+        }),
+        "Enter on the root chooses the directory the tree stands on"
+    );
+}
+
+/// The panel's Settings are the Client's own Server's, so browsing for a Root
+/// lists that Server's directories however the Outlook is turned — even
+/// toward a Remote that has stopped answering, which neither the browsing nor
+/// the choice waits on.
+#[test]
+fn browsing_for_a_root_lists_the_client_s_own_server_while_looking_at_a_remote() {
+    let mut application = application_looking_at_studio();
+    open_workspace_roots_editor(&mut application);
+    studio_stops_answering(&mut application, 1, Duration::from_secs(5));
+
+    let (listing_id, root) =
+        expect_listing(press(&mut application, KeyCode::Tab, KeyModifiers::NONE));
+    answer_listing(&mut application, listing_id, &root, &["projects"]);
+    press(&mut application, KeyCode::Right, KeyModifiers::NONE);
+    let (listing_id, projects) =
+        expect_listing(press(&mut application, KeyCode::Right, KeyModifiers::NONE));
+    assert_eq!(
+        projects,
+        root.join("projects"),
+        "every listing the tree asks for is asked of the Client's own Server"
+    );
+    answer_listing(&mut application, listing_id, &projects, &[]);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::Continue
+    );
+    let chosen = screen(&application);
+    assert!(
+        !chosen.contains("Path:") && !chosen.contains("studio is unreachable"),
+        "the choice is no work for the Remote: {chosen}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::WorkspaceRoots {
+            value: Some(vec![projects.display().to_string()]),
+        })
     );
 }
 

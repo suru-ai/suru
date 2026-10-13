@@ -363,6 +363,9 @@ pub struct TextListSettingChoice {
     admits: fn(&str) -> bool,
     seed: fn(&EffectiveSettings) -> Vec<String>,
     pin: fn(Vec<String>) -> SettingMutation,
+    /// Whether each entry names a directory on the Server, which the editor
+    /// may then choose in the Directory Browser rather than have typed.
+    names_directories: bool,
 }
 
 /// An entry a list Setting refuses: where it stands in the list, and why,
@@ -389,7 +392,22 @@ impl TextListSettingChoice {
             admits,
             seed,
             pin,
+            names_directories: false,
         }
+    }
+
+    /// The same list, each entry of which names a directory on the Server.
+    pub const fn of_directories(self) -> Self {
+        Self {
+            names_directories: true,
+            ..self
+        }
+    }
+
+    /// Whether each entry names a directory on the Server, so the editor
+    /// offers the Directory Browser to choose one.
+    pub fn names_directories(self) -> bool {
+        self.names_directories
     }
 
     /// What the list holds, for the editor's heading.
@@ -465,7 +483,8 @@ const WORKSPACE_ROOTS_LIST: TextListSettingChoice = TextListSettingChoice::new(
     admits_workspace_root,
     |settings| settings.workspace.roots.clone(),
     |roots| SettingMutation::WorkspaceRoots { value: Some(roots) },
-);
+)
+.of_directories();
 
 fn spell_session_content_width(maximum: u64) -> String {
     format!("max {maximum} columns")
