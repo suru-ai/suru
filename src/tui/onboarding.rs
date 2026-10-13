@@ -20,7 +20,11 @@
 //! is read as one of the keys every step shares.
 
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::{style::Modifier, text::Line};
+use ratatui::{
+    style::{Modifier, Style},
+    text::Line,
+};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     protocol::{
@@ -34,9 +38,13 @@ use crate::{
 
 use super::{
     commands::SemanticCommandId,
-    model_picker::{CatalogStatuses, FIX_INDENT, ModelPicker, fix_rows},
+    fix_lines::{FIX_INDENT, FixLines},
+    list_window::{ListWindow, WindowEntry},
+    model_picker::{CatalogStatuses, ModelPicker},
+    selection::WrappedLine,
     slots::truncate_to_width,
     state::CommandId,
+    text_layout::TextLayout,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -116,15 +124,32 @@ pub(super) enum Advance {
 pub(super) struct OwnServer<'a> {
     settings: &'a EffectiveSettings,
     catalog: CatalogStatuses<'a>,
+    /// Whether it is the Outlook on screen. Only then is the Model catalog
+    /// listing the Client waits on its own, so only then may the flow ask
+    /// for one; over a Remote it reads what the Server pushes.
+    viewed: bool,
 }
 
 impl<'a> OwnServer<'a> {
-    pub(super) fn of(settings: &'a EffectiveSettings, model_picker: &'a ModelPicker) -> Self {
+    pub(super) fn of(
+        settings: &'a EffectiveSettings,
+        model_picker: &'a ModelPicker,
+        outlook: &Outlook,
+    ) -> Self {
         Self {
             settings,
             catalog: model_picker.catalog_statuses(&Outlook::Local),
+            viewed: *outlook == Outlook::Local,
         }
     }
+}
+
+/// The flow as one frame draws it: its lines, and the lines among them it
+/// wrapped itself, each placed by the line it begins on, which a selection
+/// reads as they were written.
+pub(super) struct Drawn<'a> {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) wrapped: Vec<WrappedLine<'a>>,
 }
 
 /// The Providers step: one row for each built-in Provider, in their fixed
@@ -133,15 +158,32 @@ impl<'a> OwnServer<'a> {
 /// draws only what the Server answers, so a row is never ticked that the
 /// Config Document does not say is. The step is passed only while some
 /// Provider is enabled and not found unavailable.
+///
+/// A screen too short for every row with what goes beneath it shows them
+/// through a window that follows the cursor, so the Provider Space would
+/// toggle is always on screen, and why Next is locked keeps its rows beneath
+/// the window however few there are.
 #[derive(Clone, Debug, Default)]
 struct ProvidersStep {
     /// The row the cursor is on.
     cursor: usize,
+    window: ListWindow,
 }
 
 impl ProvidersStep {
-    /// The keys this step teaches before the ones every step shares.
-    const KEYS: &'static str = "↑↓ Move · Space Toggle · r Re-check";
+    const INTRODUCTION: &'static str = "Which Providers Suru may use, and whether each works here.";
+
+    /// The keys this step teaches before the ones every step shares, the
+    /// most needed first, since a narrow screen gives up the last of them
+    /// first. The re-check is taught only where it may be asked.
+    fn keys(server: OwnServer<'_>) -> Vec<&'static str> {
+        let mut keys = vec!["Space Toggle"];
+        if server.viewed {
+            keys.push("r Re-check");
+        }
+        keys.push("↑↓ Move");
+        keys
+    }
 
     fn command_for_key(&self, key: KeyEvent) -> Option<CommandId> {
         let command = match (key.code, key.modifiers) {
@@ -178,6 +220,7 @@ impl ProvidersStep {
             return;
         }
         self.cursor = (self.cursor as isize + distance).rem_euclid(rows as isize) as usize;
+        self.window.reveal();
     }
 
     /// The edit turning the Provider under the cursor off where it is on and
@@ -209,82 +252,198 @@ impl ProvidersStep {
         }
     }
 
-    fn lines(&self, width: usize, theme: &Theme, server: OwnServer<'_>) -> Vec<Line<'static>> {
-        let mut lines = vec![
-            Line::styled(
-                truncate_to_width(
-                    "Which Providers Suru may use, and whether each works here.",
-                    width,
-                ),
-                theme.text.subdued,
-            ),
-            Line::default(),
-        ];
-        for (row, provider) in Self::providers().enumerate() {
-            let selected = row == self.cursor;
-            let standing = Standing::of(&provider.id, server);
-            let marker = if selected { "› " } else { "  " };
-            let tick = if matches!(standing, Standing::Disabled) {
-                "[ ]"
-            } else {
-                "[x]"
-            };
-            lines.push(Line::styled(
-                truncate_to_width(
-                    &format!(
-                        "{marker}{tick} {} · {}",
-                        provider.display_name,
-                        standing.label()
-                    ),
-                    width,
-                ),
-                match (selected, standing) {
-                    (true, _) => theme.selection.focused,
-                    (false, Standing::Disabled) => theme.text.subdued,
-                    (false, _) => theme.text.primary,
-                },
-            ));
-            // What fixes an unavailable Provider is drawn whole beneath its
-            // row, broken between words, as the Model picker draws it beneath
-            // its retry row; what a warning or failed read says is a line.
-            match standing {
-                Standing::Unavailable { fix, .. } => {
-                    let style = if selected {
-                        theme.selection.focused
-                    } else {
-                        theme.text.primary
-                    };
-                    let columns = u16::try_from(width).unwrap_or(u16::MAX);
-                    lines.extend(
-                        fix_rows(fix, columns)
-                            .into_iter()
-                            .map(|part| Line::styled(format!("{FIX_INDENT}{}", &fix[part]), style)),
-                    );
-                }
-                Standing::Warning(message) | Standing::Failed(message) => {
-                    lines.push(Line::styled(
-                        format!(
-                            "{FIX_INDENT}{}",
-                            truncate_to_width(message, width.saturating_sub(FIX_INDENT.len()))
+    /// Each Provider's row as drawn within `width` columns, with what goes
+    /// beneath it.
+    fn entries<'a>(
+        &self,
+        width: usize,
+        theme: &Theme,
+        server: OwnServer<'a>,
+    ) -> Vec<ProviderEntry<'a>> {
+        Self::providers()
+            .enumerate()
+            .map(|(row, provider)| {
+                let selected = row == self.cursor;
+                let standing = Standing::of(&provider.id, server);
+                let marker = if selected { "› " } else { "  " };
+                let tick = if matches!(standing, Standing::Disabled) {
+                    "[ ]"
+                } else {
+                    "[x]"
+                };
+                let line = Line::styled(
+                    truncate_to_width(
+                        &format!(
+                            "{marker}{tick} {} · {}",
+                            provider.display_name,
+                            standing.label()
                         ),
-                        theme.text.subdued,
-                    ));
+                        width,
+                    ),
+                    match (selected, standing) {
+                        (true, _) => theme.selection.focused,
+                        (false, Standing::Disabled) => theme.text.subdued,
+                        (false, _) => theme.text.primary,
+                    },
+                );
+                // What fixes an unavailable Provider is drawn whole beneath
+                // its row, as every surface naming one draws it; what a
+                // warning or failed read says is a line.
+                let beneath = match standing {
+                    Standing::Unavailable { fix, .. } => Beneath::Fix(
+                        FixLines::new(fix, FIX_INDENT, u16::try_from(width).unwrap_or(u16::MAX)),
+                        if selected {
+                            theme.selection.focused
+                        } else {
+                            theme.text.primary
+                        },
+                    ),
+                    Standing::Warning(message) | Standing::Failed(message) => {
+                        Beneath::Message(Line::styled(
+                            format!(
+                                "{FIX_INDENT}{}",
+                                truncate_to_width(
+                                    message,
+                                    width.saturating_sub(FIX_INDENT.width())
+                                )
+                            ),
+                            theme.text.subdued,
+                        ))
+                    }
+                    Standing::Disabled
+                    | Standing::Checking
+                    | Standing::Available
+                    | Standing::Refreshing => Beneath::Nothing,
+                };
+                ProviderEntry { line, beneath }
+            })
+            .collect()
+    }
+
+    /// Why Next is locked, broken between words over as many lines as
+    /// `width` columns need, or nothing where it is not.
+    fn lock_lines(width: usize, server: OwnServer<'_>) -> Vec<String> {
+        Self::lock(server).map_or_else(Vec::new, |lock| {
+            TextLayout::new(lock, u16::try_from(width).unwrap_or(u16::MAX))
+                .rows()
+                .map(|row| row.text.to_owned())
+                .collect()
+        })
+    }
+
+    /// How many lines the step draws within `width` columns with nothing
+    /// given way.
+    fn rows_wanted(&self, width: usize, theme: &Theme, server: OwnServer<'_>) -> usize {
+        let lock = Self::lock_lines(width, server);
+        let rows = self
+            .entries(width, theme, server)
+            .iter()
+            .map(ProviderEntry::rows)
+            .sum::<usize>();
+        // The introduction and the gap beneath it, the rows, and the gap
+        // above why Next is locked with that beneath it.
+        2 + rows + usize::from(!lock.is_empty()) + lock.len()
+    }
+
+    /// The step drawn within `width` columns and `room` lines: the
+    /// introduction, the Providers' rows through the window, and why Next is
+    /// locked. Why Next is locked keeps its lines whatever the room; for the
+    /// rows to be drawn whole the gap above it gives way first, then the gap
+    /// beneath the introduction, then the introduction, and past that the
+    /// window shows the rows around the cursor.
+    fn lines<'a>(
+        &self,
+        width: usize,
+        room: usize,
+        theme: &Theme,
+        server: OwnServer<'a>,
+    ) -> (Vec<Line<'static>>, Vec<WrappedLine<'a>>) {
+        let entries = self.entries(width, theme, server);
+        let lock = Self::lock_lines(width, server);
+        let rows = entries.iter().map(ProviderEntry::rows).sum::<usize>();
+        let available = room.saturating_sub(lock.len());
+        // The lines each of what gives way takes, in the order it gives way.
+        let gives_way = [usize::from(!lock.is_empty()), 1, 1];
+        let given = (0..=gives_way.len())
+            .find(|given| rows + gives_way[*given..].iter().sum::<usize>() <= available)
+            .unwrap_or(gives_way.len());
+        let lock_gap = given < 1 && !lock.is_empty();
+        let introduction_gap = given < 2;
+        let introduction = given < 3;
+
+        let mut lines = Vec::new();
+        if introduction {
+            lines.push(Line::styled(
+                truncate_to_width(Self::INTRODUCTION, width),
+                theme.text.subdued,
+            ));
+        }
+        if introduction_gap {
+            lines.push(Line::default());
+        }
+        let capacity = available.saturating_sub(lines.len() + usize::from(lock_gap));
+        let window = entries
+            .iter()
+            .map(|entry| WindowEntry::focusable(entry.rows()))
+            .collect::<Vec<_>>();
+        let shown = self.window.settle(&window, capacity, Some(self.cursor));
+        let end = lines.len() + capacity;
+        let mut wrapped = Vec::new();
+        for entry in entries.into_iter().skip(shown.start).take(shown.len()) {
+            // Only a row taller than the whole window is cut short, and then
+            // from what goes beneath it.
+            let room = end.saturating_sub(lines.len());
+            if room == 0 {
+                break;
+            }
+            lines.push(entry.line);
+            match entry.beneath {
+                Beneath::Fix(fix, style) => {
+                    let fix = fix.last(room - 1);
+                    if fix.height() > 0 {
+                        wrapped.push(fix.wrapped(lines.len()));
+                        lines.extend(fix.lines(style));
+                    }
                 }
-                Standing::Disabled
-                | Standing::Checking
-                | Standing::Available
-                | Standing::Refreshing => {}
+                Beneath::Message(line) if room > 1 => lines.push(line),
+                Beneath::Message(_) | Beneath::Nothing => {}
             }
         }
-        if let Some(lock) = Self::lock(server) {
+        if lock_gap {
             lines.push(Line::default());
-            lines.push(Line::styled(
-                truncate_to_width(lock, width),
-                theme.feedback.warning,
-            ));
         }
-        lines
+        lines.extend(
+            lock.into_iter()
+                .map(|line| Line::styled(line, theme.feedback.warning)),
+        );
+        (lines, wrapped)
     }
+}
+
+/// One Provider's row as the step lays it out, and what goes beneath it.
+struct ProviderEntry<'a> {
+    line: Line<'static>,
+    beneath: Beneath<'a>,
+}
+
+impl ProviderEntry<'_> {
+    /// The lines the row takes with what goes beneath it.
+    fn rows(&self) -> usize {
+        1 + match &self.beneath {
+            Beneath::Nothing => 0,
+            Beneath::Fix(fix, _) => fix.height(),
+            Beneath::Message(_) => 1,
+        }
+    }
+}
+
+/// What a Provider's row has beneath it.
+enum Beneath<'a> {
+    Nothing,
+    /// What fixes it, drawn whole in the style given.
+    Fix(FixLines<'a>, Style),
+    /// What a warning or a failed read says, on a line.
+    Message(Line<'static>),
 }
 
 /// Where one Provider stands on the Providers step: off, or on and as the
@@ -446,8 +605,14 @@ impl Onboarding {
 
     /// Whether the Providers step is on show, which is where its own commands
     /// act and nowhere else.
-    pub(super) fn shows_providers(&self) -> bool {
+    fn shows_providers(&self) -> bool {
         self.step == Some(Step::Providers)
+    }
+
+    /// Whether the Providers step may re-read every Provider's Availability
+    /// now: while it is on show over the Client's own Server.
+    pub(super) fn rechecks(&self, server: OwnServer<'_>) -> bool {
+        self.shows_providers() && server.viewed
     }
 
     /// Moves the Providers step's cursor to the Provider above.
@@ -504,49 +669,20 @@ impl Onboarding {
 
     /// The flow as drawn within `width` columns and `height` rows: the header
     /// naming the step, what the step on show draws, and the keys at the
-    /// foot.
-    pub(super) fn lines(
+    /// foot, which stay there however much the step draws.
+    pub(super) fn lines<'a>(
         &self,
         width: usize,
         height: usize,
         theme: &Theme,
-        server: OwnServer<'_>,
-    ) -> Vec<Line<'static>> {
+        server: OwnServer<'a>,
+    ) -> Drawn<'a> {
         let Some(step) = self.step else {
-            return Vec::new();
+            return Drawn {
+                lines: Vec::new(),
+                wrapped: Vec::new(),
+            };
         };
-        let mut lines = self.body(step, width, theme, server);
-        let own_keys = match step {
-            Step::Providers => Some(ProvidersStep::KEYS),
-            Step::Derivation | Step::Icons => None,
-        };
-        let footer = footer(step, own_keys);
-        // The keys stay at the foot however much the step draws, and are
-        // what gives way last.
-        lines.truncate(height.saturating_sub(1));
-        lines.resize(height.saturating_sub(1), Line::default());
-        lines.push(Line::styled(
-            truncate_to_width(&footer, width),
-            theme.text.subdued,
-        ));
-        lines
-    }
-
-    /// How many rows the flow draws within `width` columns with nothing cut
-    /// short, the keys at the foot included.
-    pub(super) fn rows_wanted(&self, width: usize, theme: &Theme, server: OwnServer<'_>) -> usize {
-        self.step
-            .map_or(0, |step| self.body(step, width, theme, server).len() + 1)
-    }
-
-    /// The header naming `step`, and what the step draws beneath it.
-    fn body(
-        &self,
-        step: Step,
-        width: usize,
-        theme: &Theme,
-        server: OwnServer<'_>,
-    ) -> Vec<Line<'static>> {
         let mut lines = vec![
             Line::styled(
                 truncate_to_width(
@@ -562,27 +698,82 @@ impl Onboarding {
             ),
             Line::default(),
         ];
-        lines.extend(match step {
-            Step::Providers => self.providers.lines(width, theme, server),
-            Step::Derivation => self.derivation.lines(width, theme),
-            Step::Icons => self.icons.lines(width, theme),
-        });
-        lines
+        let room = height.saturating_sub(lines.len() + 1);
+        let mut wrapped = Vec::new();
+        match step {
+            Step::Providers => {
+                let (step_lines, step_wrapped) = self.providers.lines(width, room, theme, server);
+                let top = lines.len();
+                wrapped.extend(step_wrapped.into_iter().map(|line| WrappedLine {
+                    row: top + line.row,
+                    ..line
+                }));
+                lines.extend(step_lines);
+            }
+            Step::Derivation => lines.extend(self.derivation.lines(width, theme)),
+            Step::Icons => lines.extend(self.icons.lines(width, theme)),
+        }
+        let own_keys = match step {
+            Step::Providers => ProvidersStep::keys(server),
+            Step::Derivation | Step::Icons => Vec::new(),
+        };
+        let footer = footer(step, &own_keys, width);
+        // The keys stay at the foot however much the step draws, and are
+        // what gives way last.
+        lines.truncate(height.saturating_sub(1));
+        lines.resize(height.saturating_sub(1), Line::default());
+        lines.push(Line::styled(
+            truncate_to_width(&footer, width),
+            theme.text.subdued,
+        ));
+        Drawn { lines, wrapped }
+    }
+
+    /// How many rows the flow draws within `width` columns with nothing
+    /// given way, the header and the keys at the foot included.
+    pub(super) fn rows_wanted(&self, width: usize, theme: &Theme, server: OwnServer<'_>) -> usize {
+        let Some(step) = self.step else {
+            return 0;
+        };
+        let step_rows = match step {
+            Step::Providers => self.providers.rows_wanted(width, theme, server),
+            Step::Derivation => self.derivation.lines(width, theme).len(),
+            Step::Icons => self.icons.lines(width, theme).len(),
+        };
+        2 + step_rows + 1
     }
 }
 
-/// The keys at the foot of `step`: the step's own keys first, where it has
-/// any, then Next, or Finish on the last step, Back where there is a step
-/// before, and how to leave.
-fn footer(step: Step, own_keys: Option<&str>) -> String {
-    let own = own_keys
-        .map(|keys| format!("{keys} · "))
-        .unwrap_or_default();
+/// The keys at the foot of `step` within `width` columns: the step's own
+/// keys first, then Next, or Finish on the last step, Back where there is a
+/// step before, and how to leave. Where they do not all fit, the step's own
+/// give way first, the last of them first, and then Back, since Next and
+/// Leave are what the reader cannot do without.
+fn footer(step: Step, own_keys: &[&str], width: usize) -> String {
     let next = if step.next().is_some() {
         "Enter Next"
     } else {
         "Enter Finish"
     };
-    let back = step.previous().map(|_| " · ← Back").unwrap_or_default();
-    format!("{own}{next}{back} · Esc Leave")
+    let back = step.previous().map(|_| "← Back");
+    let mut own = own_keys.len();
+    let mut with_back = back.is_some();
+    loop {
+        let keys = own_keys[..own]
+            .iter()
+            .copied()
+            .chain([next])
+            .chain(back.filter(|_| with_back))
+            .chain(["Esc Leave"])
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if keys.width() <= width || (own == 0 && !with_back) {
+            return keys;
+        }
+        if own > 0 {
+            own -= 1;
+        } else {
+            with_back = false;
+        }
+    }
 }

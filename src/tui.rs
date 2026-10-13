@@ -14,6 +14,7 @@ mod connect_overlay;
 mod context_overlay;
 mod directory_browser;
 mod event_loop;
+mod fix_lines;
 mod fuzzy;
 mod hyperlink;
 mod icon_picker;

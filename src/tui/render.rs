@@ -34,11 +34,12 @@ use super::{
     connect_overlay::LoginStep,
     context_overlay::{ContextOverlayView, ContextRow},
     directory_browser::{DirectoryBrowserRow, DirectoryBrowserRowKind},
+    fix_lines::{FIX_INDENT, FixLines},
     icon_picker,
     keymap::binding_label,
     list_window::WindowEntry,
     model_options::ModelOptionChoiceRow,
-    model_picker::{FIX_INDENT, ModelPickerRow, fix_rows},
+    model_picker::ModelPickerRow,
     onboarding::OwnServer,
     relay_overlay::serve_through_status,
     serve_overlay::{CandidateWay, LISTENER_FAILED, LISTENER_OFF, ServeWays},
@@ -2765,18 +2766,10 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
                     // from its end: the retry row, then as much of the fix's
                     // end as fits, which is where every fix names the page or
                     // command it sends the reader to.
-                    let mut parts = fix_rows(fix, content_width);
                     let room = usize::from(content_height).saturating_sub(lines.len());
-                    parts.drain(..parts.len().saturating_sub(room));
-                    lines.extend(parts.iter().map(|part| {
-                        Line::styled(format!("{FIX_INDENT}{}", &fix[part.clone()]), style)
-                    }));
-                    wrapped.push(WrappedLine {
-                        row: lines.len() - parts.len(),
-                        column: FIX_INDENT.width(),
-                        text: fix,
-                        parts,
-                    });
+                    let fix = FixLines::new(fix, FIX_INDENT, content_width).last(room);
+                    wrapped.push(fix.wrapped(lines.len()));
+                    lines.extend(fix.lines(style));
                 }
             }
         }
@@ -2955,19 +2948,13 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         .settings_panel
         .selected_fix(state.settings())
         .filter(|_| state.settings_panel.error().is_none());
-    let fix_parts = fix
-        .map(|fix| {
-            TextLayout::new(fix, width.saturating_sub(2))
-                .rows()
-                .map(|row| row.start..row.start + row.text.len())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let fix = fix.map(|fix| FixLines::new(fix, "", width.saturating_sub(2)));
+    let fix_height = fix.as_ref().map_or(0, FixLines::height);
     // A tab lists a known number of rows, so the panel is exactly as tall as it
     // needs to be: two borders around the tab bar and the headline, whatever
     // fix goes beneath it, one row per Setting, and the controls.
-    let wanted = u16::try_from(rows.len().saturating_add(5).saturating_add(fix_parts.len()))
-        .unwrap_or(u16::MAX);
+    let wanted =
+        u16::try_from(rows.len().saturating_add(5).saturating_add(fix_height)).unwrap_or(u16::MAX);
     let area = centered_rect(main, width, main.height.saturating_sub(2).min(wanted));
     let content_width = usize::from(area.width.saturating_sub(2));
     let content_height = usize::from(area.height.saturating_sub(2));
@@ -3024,7 +3011,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     // the headline takes the headline's line too: the reader's row already
     // names the condition, and what fixes it is what they came for.
     let beneath_tabs = content_height.saturating_sub(lines.len() + footer_rows + 1);
-    let fix_takes_headline = !fix_parts.is_empty() && fix_parts.len() >= beneath_tabs;
+    let fix_takes_headline = fix_height > 0 && fix_height >= beneath_tabs;
     if content_height >= 2 && !fix_takes_headline {
         // What the focused Setting does, what its Provider has to say for
         // itself, or why the last edit never reached the Config Document — a
@@ -3057,22 +3044,9 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     let mut wrapped = Vec::new();
     if let Some(fix) = fix {
         let room = content_height.saturating_sub(lines.len() + footer_rows + 1);
-        let parts = fix_parts
-            .iter()
-            .skip(fix_parts.len().saturating_sub(room))
-            .cloned()
-            .collect::<Vec<_>>();
-        lines.extend(
-            parts
-                .iter()
-                .map(|part| Line::styled(fix[part.clone()].to_owned(), theme.text.primary)),
-        );
-        wrapped.push(WrappedLine {
-            row: lines.len() - parts.len(),
-            column: 0,
-            text: fix,
-            parts,
-        });
+        let fix = fix.last(room);
+        wrapped.push(fix.wrapped(lines.len()));
+        lines.extend(fix.lines(theme.text.primary));
     }
     let capacity = content_height.saturating_sub(lines.len() + footer_rows);
     let selected = rows.iter().position(|row| row.selected);
@@ -3194,7 +3168,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
 }
 
 fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
-    let server = OwnServer::of(state.settings(), &state.model_picker);
+    let server = OwnServer::of(state.settings(), &state.model_picker, &state.outlook);
     let width = main.width.saturating_sub(4).min(76);
     // The box keeps one height from step to step, and grows past it only for
     // a step with more to draw — every Provider's fix beneath its row — as
@@ -3211,20 +3185,21 @@ fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme:
             .max(16)
             .min(main.height.saturating_sub(2)),
     );
-    let lines = state.onboarding.lines(
+    let drawn = state.onboarding.lines(
         usize::from(area.width.saturating_sub(2)),
         usize::from(area.height.saturating_sub(2)),
         theme,
         server,
     );
-    render_overlay_box(
+    draw_overlay_box(frame, state, area, drawn.lines, " Onboarding ", theme);
+    // A fix wrapped beneath a Provider's row copies as it was written.
+    record_overlay_selection_around(
         frame,
         state,
-        SelectionSurface::Onboarding,
         area,
-        lines,
-        " Onboarding ",
-        theme,
+        SelectionSurface::Onboarding,
+        true,
+        &drawn.wrapped,
     );
 }
 

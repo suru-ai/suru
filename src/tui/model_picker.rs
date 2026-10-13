@@ -1,6 +1,6 @@
 //! Searchable Model picker state and stable catalog reconciliation.
 
-use std::{collections::HashMap, ops::Range};
+use std::collections::HashMap;
 
 use crate::protocol::{
     AgentSelection, ModelAvailability, ModelCatalog, ModelDescriptor, ModelId, ModelOptionKind,
@@ -10,9 +10,9 @@ use crate::protocol::{
 
 use super::{
     ModelListRequest,
+    fix_lines::{FIX_INDENT, FixLines},
     fuzzy::fuzzy_matches,
     list_window::{ListWindow, WindowEntry},
-    text_layout::TextLayout,
 };
 
 /// What the Model a reader picks here is for. The picker is one list of Models
@@ -195,21 +195,6 @@ pub(super) enum ModelPickerRow<'a> {
     },
 }
 
-/// How far a fix stands in beneath the retry row it belongs to: past the row's
-/// focus marker and two columns more, so it reads as the row's own.
-pub(super) const FIX_INDENT: &str = "    ";
-
-/// The part of a fix each of its lines beneath its retry row draws, in a list
-/// `width` columns wide: as many lines as it needs, broken between words, so a
-/// page to install from is drawn whole rather than cut short at the edge.
-pub(super) fn fix_rows(fix: &str, width: u16) -> Vec<Range<usize>> {
-    let indent = u16::try_from(FIX_INDENT.len()).unwrap_or(u16::MAX);
-    TextLayout::new(fix, width.saturating_sub(indent))
-        .rows()
-        .map(|row| row.start..row.start + row.text.len())
-        .collect()
-}
-
 #[derive(Clone, Debug)]
 pub(super) enum ModelPickerAction {
     Select(ModelDescriptor),
@@ -248,18 +233,6 @@ impl ModelPicker {
         let request = ModelListRequest::new(self.request_sequence, self.outlook.clone());
         self.active_request = Some(request.clone());
         request
-    }
-
-    /// Mints the listing that re-reads every Provider of `outlook`'s Server.
-    /// One of the picker's own Outlook is the listing it waits on and loads,
-    /// as [`Self::begin_refresh`] mints; one of another Outlook is only asked
-    /// for, and what it finds reaches the cache as that Server pushes it.
-    pub(super) fn begin_refresh_of(&mut self, outlook: &Outlook) -> ModelListRequest {
-        if *outlook == self.outlook {
-            return self.begin_refresh();
-        }
-        self.request_sequence = self.request_sequence.wrapping_add(1);
-        ModelListRequest::new(self.request_sequence, outlook.clone())
     }
 
     pub(super) fn adopt_outlook(&mut self, outlook: Outlook) {
@@ -546,7 +519,7 @@ impl ModelPicker {
                 ModelPickerRow::Provider { .. } => WindowEntry::passive(1),
                 ModelPickerRow::Model { .. } | ModelPickerRow::Error { .. } => WindowEntry::ROW,
                 ModelPickerRow::Unavailable { fix, .. } => {
-                    WindowEntry::focusable(1 + fix_rows(fix, width).len())
+                    WindowEntry::focusable(1 + FixLines::new(fix, FIX_INDENT, width).height())
                 }
             })
             .collect::<Vec<_>>();

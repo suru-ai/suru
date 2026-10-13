@@ -10219,12 +10219,17 @@ impl Application {
                     ApplicationTransition::MutateSetting,
                 )),
             // The same listing of every Provider the Model picker's retry row
-            // asks for, of the Client's own Server whose Onboarding this is.
+            // asks for, and asked only while the Client's own Server is on
+            // screen: over a Remote, the listing the picker waits on is that
+            // Remote's, which one for the Client's own Server would supersede.
             SemanticCommandId::OnboardingProvidersRecheck => {
-                Ok(if self.state.onboarding.shows_providers() {
-                    ApplicationTransition::ListModels(
-                        self.state.model_picker.begin_refresh_of(&Outlook::Local),
-                    )
+                let rechecks = self.state.onboarding.rechecks(OwnServer::of(
+                    &self.state.settings,
+                    &self.state.model_picker,
+                    &self.state.outlook,
+                ));
+                Ok(if rechecks {
+                    ApplicationTransition::ListModels(self.state.model_picker.begin_refresh())
                 } else {
                     ApplicationTransition::Continue
                 })
@@ -10233,7 +10238,11 @@ impl Application {
                 if !self.state.onboarding.is_open() {
                     return Ok(ApplicationTransition::Continue);
                 }
-                let server = OwnServer::of(&self.state.settings, &self.state.model_picker);
+                let server = OwnServer::of(
+                    &self.state.settings,
+                    &self.state.model_picker,
+                    &self.state.outlook,
+                );
                 Ok(match self.state.onboarding.next(server) {
                     Advance::Moved | Advance::Held => ApplicationTransition::Continue,
                     Advance::Finished => self.state.take_onboarding(),

@@ -6,16 +6,20 @@ use std::{collections::HashSet, path::Path};
 
 use crate::support::{
     connected_application, deliver_settings, enter_session, fixture_instance_id, ready_health,
-    rendered_application_rows_at, type_terminal_text, workspace_dir,
+    rendered_application_buffer, rendered_application_rows_at, text_position, type_terminal_text,
+    workspace_dir,
 };
-use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::style::Modifier;
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
         EffectiveSettings, Health, ModelCatalog, Outlook, ProviderCatalogStatus, ProviderId,
         ProviderModelCatalog, ProviderUnavailability, RemoteHealth, RemoteStatus, SettingMutation,
         SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarSettings,
-        SidebarVisibility, Way,
+        SidebarVisibility, TextSelectionCopy, Way,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -611,6 +615,62 @@ fn nothing_installed() -> [(&'static str, ProviderCatalogStatus); 3] {
     ]
 }
 
+/// Every Provider not installed, each with the fix its own check names, as
+/// on a machine with none of their CLIs.
+fn every_cli_missing() -> [(&'static str, ProviderCatalogStatus); 3] {
+    [
+        (
+            "codex",
+            unavailable(
+                ProviderUnavailability::NotInstalled,
+                "install the Codex CLI from https://developers.openai.com/codex/cli/",
+            ),
+        ),
+        (
+            "copilot",
+            unavailable(
+                ProviderUnavailability::NotInstalled,
+                "install the Copilot CLI from \
+                 https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli",
+            ),
+        ),
+        (
+            "claude",
+            unavailable(
+                ProviderUnavailability::NotInstalled,
+                "install the Claude Code CLI from https://code.claude.com/docs/en/setup",
+            ),
+        ),
+    ]
+}
+
+fn mouse(
+    application: &mut Application,
+    kind: MouseEventKind,
+    (column, row): (u16, u16),
+) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("handle a mouse event")
+}
+
+/// Drags across the screen from `start` to `end`, answering what letting go
+/// asks for.
+fn drag(
+    application: &mut Application,
+    start: (u16, u16),
+    end: (u16, u16),
+) -> ApplicationTransition {
+    mouse(application, MouseEventKind::Down(MouseButton::Left), start);
+    mouse(application, MouseEventKind::Drag(MouseButton::Left), end);
+    mouse(application, MouseEventKind::Up(MouseButton::Left), end)
+}
+
 /// The line the Providers step draws for `provider`'s row.
 fn provider_row(application: &Application, provider: &str) -> String {
     let rows = rendered_application_rows_at(application, 100, 24);
@@ -914,8 +974,12 @@ fn the_recheck_key_issues_the_all_providers_refresh_and_its_answer_reaches_the_r
     );
 }
 
+/// While a Remote is viewed, the Model catalog listing the Client waits on
+/// is the Remote's, so a retake asks nothing of the Client's own Server: its
+/// rows follow what that Server pushes, and `r` is neither taught nor heeded
+/// until the Client's own Server is on screen again.
 #[test]
-fn the_recheck_asks_the_clients_own_server_while_a_remote_is_viewed() {
+fn the_recheck_asks_nothing_while_a_remote_is_viewed() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     deliver_settings(&mut application, EffectiveSettings::default());
@@ -923,15 +987,172 @@ fn the_recheck_asks_the_clients_own_server_while_a_remote_is_viewed() {
     type_terminal_text(&mut application, "/onboarding");
     press(&mut application, KeyCode::Enter);
     assert!(screen(&application).contains("Step 1 of 3"));
+    push_catalog(&mut application, &nothing_installed());
 
+    let over_remote = screen(&application);
+    assert!(
+        !over_remote.contains("Re-check"),
+        "the key is not taught: {over_remote}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char('r')),
+        ApplicationTransition::Continue,
+        "nor heeded"
+    );
+    assert!(
+        provider_row_text(&application, "Copilot").contains("not signed in"),
+        "the rows still say what the Client's own Server last pushed: {}",
+        screen(&application)
+    );
+
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::MarkOnboarded
+    );
+    turn_outlook(&mut application, KeyCode::Up);
+    type_terminal_text(&mut application, "/onboarding");
+    press(&mut application, KeyCode::Enter);
+    assert!(screen(&application).contains("r Re-check"));
     let ApplicationTransition::ListModels(request) = press(&mut application, KeyCode::Char('r'))
     else {
-        panic!("r re-reads every Provider's Availability");
+        panic!("back on its own Server, r re-reads every Provider");
     };
+    assert_eq!(request.outlook(), &Outlook::Local);
+}
+
+/// A terminal too short for every Provider with its fix beneath it shows a
+/// window over them that follows the cursor, so the Provider Space would
+/// toggle is always one on screen, while why Next is locked and the keys at
+/// the foot keep their place beneath it.
+#[test]
+fn a_short_screen_keeps_the_lock_line_and_keys_and_follows_the_cursor() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    push_catalog(&mut application, &every_cli_missing());
+    let short =
+        |application: &Application| rendered_application_rows_at(application, 80, 16).join("\n");
+
+    let first = short(&application);
+    assert!(first.contains("› [x] Codex · not installed"), "{first}");
+    assert!(
+        !first.contains("Claude"),
+        "the last Provider is out of view to begin with: {first}"
+    );
+    for kept in ["Next is locked:", "Enter Next", "Esc Leave"] {
+        assert!(first.contains(kept), "{kept:?} keeps its place: {first}");
+    }
+
+    press(&mut application, KeyCode::Down);
+    press(&mut application, KeyCode::Down);
+    let last = short(&application);
+    assert!(
+        last.contains("› [x] Claude · not installed"),
+        "the cursor brings the last Provider into view: {last}"
+    );
+    assert!(
+        last.contains("https://code.claude.com/docs/en/setup"),
+        "with its fix: {last}"
+    );
+    for kept in ["Next is locked:", "Enter Next", "Esc Leave"] {
+        assert!(last.contains(kept), "{kept:?} keeps its place: {last}");
+    }
     assert_eq!(
-        request.outlook(),
-        &Outlook::Local,
-        "Onboarding is the Client's own Server's, whichever Outlook is turned"
+        press(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderClaudeEnabled {
+            value: Some(false),
+        }),
+        "Space toggles the Provider on screen under the cursor"
+    );
+
+    press(&mut application, KeyCode::Down);
+    assert!(
+        short(&application).contains("› [x] Codex · not installed"),
+        "and wrapping to the first brings it back: {}",
+        short(&application)
+    );
+}
+
+/// On a narrow terminal the keys at the foot give up the step's own hints
+/// before Next and Leave, and why Next is locked wraps rather than being cut.
+#[test]
+fn a_narrow_screen_keeps_next_and_leave_and_the_whole_lock_line() {
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    let mut settings = EffectiveSettings::default();
+    settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    deliver_settings(&mut application, settings);
+    push_catalog(&mut application, &every_cli_missing());
+
+    let rows = rendered_application_rows_at(&application, 40, 30);
+    let narrow = rows.join("\n");
+    let foot = rows
+        .iter()
+        .find(|row| row.contains("Esc Leave"))
+        .unwrap_or_else(|| panic!("Leave is taught: {narrow}"));
+    assert!(foot.contains("Enter Next"), "and Next beside it: {narrow}");
+    assert!(
+        !foot.contains('…'),
+        "hints give way whole rather than being cut: {narrow}"
+    );
+    let lock = rows
+        .iter()
+        .position(|row| row.contains("Next is locked:"))
+        .unwrap_or_else(|| panic!("why Next is locked is drawn: {narrow}"));
+    let explanation = rows[lock..=lock + 1]
+        .iter()
+        .map(|row| row.trim_matches(|c: char| c == '│' || c.is_whitespace()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        explanation.contains("Next is locked: no enabled Provider is available."),
+        "whole, over as many rows as it takes: {narrow}"
+    );
+}
+
+/// What fixes an unavailable Provider, wrapped beneath its row, copies as it
+/// was written: the wrap that broke an install page's address across rows,
+/// and the indent that set it beneath the row, are the step's layout rather
+/// than the text (ADR-0020).
+#[test]
+fn a_wrapped_fix_on_the_providers_step_copies_as_one_unbroken_line() {
+    const INSTALL_PAGE: &str =
+        "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli";
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    let mut settings = EffectiveSettings::default();
+    settings.text_selection.copy = TextSelectionCopy::Release;
+    settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    deliver_settings(&mut application, settings);
+    push_catalog(&mut application, &every_cli_missing());
+    press(&mut application, KeyCode::Down);
+
+    let buffer = rendered_application_buffer(&application, 60, 30);
+    let start = text_position(&buffer, "install the Copilot CLI from");
+    let address = text_position(&buffer, "https://docs.github.com/en/");
+    let tail = text_position(&buffer, "install-copilot-cli");
+    assert!(
+        start.1 < address.1 && address.1 < tail.1,
+        "the address wraps onto a row of its own and breaks across another"
+    );
+    let end = (tail.0 + "install-copilot-cli".len() as u16 - 1, tail.1);
+    assert_eq!(
+        drag(&mut application, start, end),
+        ApplicationTransition::CopyToClipboard(
+            format!("install the Copilot CLI from {INSTALL_PAGE}").into()
+        ),
+        "the whole fix copies as written"
+    );
+    let highlighted = rendered_application_buffer(&application, 60, 30);
+    assert!(
+        !highlighted[(address.0 - 1, address.1)]
+            .modifier
+            .contains(Modifier::REVERSED),
+        "the indent it is drawn beneath its row from is not lit"
+    );
+    assert_eq!(
+        drag(&mut application, address, end),
+        ApplicationTransition::CopyToClipboard(INSTALL_PAGE.into()),
+        "and the address alone copies unbroken"
     );
 }
 
@@ -978,33 +1199,7 @@ fn next_stays_locked_while_no_enabled_provider_is_available_and_unlocks_once_one
 fn every_fix_and_the_lock_line_are_drawn_with_no_provider_installed() {
     let workspace = workspace_dir();
     let mut application = offered_onboarding(workspace.path());
-    push_catalog(
-        &mut application,
-        &[
-            (
-                "codex",
-                unavailable(
-                    ProviderUnavailability::NotInstalled,
-                    "install the Codex CLI from https://developers.openai.com/codex/cli/",
-                ),
-            ),
-            (
-                "copilot",
-                unavailable(
-                    ProviderUnavailability::NotInstalled,
-                    "install the Copilot CLI from \
-                     https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli",
-                ),
-            ),
-            (
-                "claude",
-                unavailable(
-                    ProviderUnavailability::NotInstalled,
-                    "install the Claude Code CLI from https://code.claude.com/docs/en/setup",
-                ),
-            ),
-        ],
-    );
+    push_catalog(&mut application, &every_cli_missing());
 
     let shown = screen(&application);
     for drawn in [
