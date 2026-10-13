@@ -19,6 +19,8 @@
 //! step afresh. Each step is handed the keys first, and only what it leaves
 //! is read as one of the keys every step shares.
 
+use std::cell::Cell;
+
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     style::{Modifier, Style},
@@ -38,13 +40,12 @@ use crate::{
 
 use super::{
     commands::SemanticCommandId,
-    fix_lines::{FIX_INDENT, FixLines},
     list_window::{ListWindow, WindowEntry},
     model_picker::{CatalogStatuses, ModelPicker},
     selection::WrappedLine,
     slots::truncate_to_width,
     state::CommandId,
-    text_layout::TextLayout,
+    wrapped_text::{FIX_INDENT, WrappedText},
 };
 
 #[derive(Clone, Debug, Default)]
@@ -124,22 +125,13 @@ pub(super) enum Advance {
 pub(super) struct OwnServer<'a> {
     settings: &'a EffectiveSettings,
     catalog: CatalogStatuses<'a>,
-    /// Whether it is the Outlook on screen. Only then is the Model catalog
-    /// listing the Client waits on its own, so only then may the flow ask
-    /// for one; over a Remote it reads what the Server pushes.
-    viewed: bool,
 }
 
 impl<'a> OwnServer<'a> {
-    pub(super) fn of(
-        settings: &'a EffectiveSettings,
-        model_picker: &'a ModelPicker,
-        outlook: &Outlook,
-    ) -> Self {
+    pub(super) fn of(settings: &'a EffectiveSettings, model_picker: &'a ModelPicker) -> Self {
         Self {
             settings,
             catalog: model_picker.catalog_statuses(&Outlook::Local),
-            viewed: *outlook == Outlook::Local,
         }
     }
 }
@@ -162,12 +154,31 @@ pub(super) struct Drawn<'a> {
 /// A screen too short for every row with what goes beneath it shows them
 /// through a window that follows the cursor, so the Provider Space would
 /// toggle is always on screen, and why Next is locked keeps its rows beneath
-/// the window however few there are.
+/// the window however few there are. A screen with no room left for the row
+/// under the cursor is one Space and Enter act on nothing from.
+///
+/// `r` asks the Client's own Server to re-read every Provider, whichever
+/// Outlook is on screen, as a request of the step's own.
 #[derive(Clone, Debug, Default)]
 struct ProvidersStep {
     /// The row the cursor is on.
     cursor: usize,
     window: ListWindow,
+    /// Whether the last frame drew the row under the cursor, which is what
+    /// Space and Enter may act on; nothing until a frame has drawn the step.
+    cursor_drawn: Cell<Option<bool>>,
+    recheck: Recheck,
+}
+
+/// Where the step's own re-read of every Provider stands.
+#[derive(Clone, Debug, Default)]
+enum Recheck {
+    #[default]
+    Idle,
+    /// Asked for, under this request, and not yet answered.
+    Awaiting(uuid::Uuid),
+    /// The newest re-check was not answered, for this reason.
+    Failed(String),
 }
 
 impl ProvidersStep {
@@ -175,15 +186,8 @@ impl ProvidersStep {
 
     /// The keys this step teaches before the ones every step shares, the
     /// most needed first, since a narrow screen gives up the last of them
-    /// first. The re-check is taught only where it may be asked.
-    fn keys(server: OwnServer<'_>) -> Vec<&'static str> {
-        let mut keys = vec!["Space Toggle"];
-        if server.viewed {
-            keys.push("r Re-check");
-        }
-        keys.push("↑↓ Move");
-        keys
-    }
+    /// first.
+    const KEYS: [&'static str; 3] = ["Space Toggle", "r Re-check", "↑↓ Move"];
 
     fn command_for_key(&self, key: KeyEvent) -> Option<CommandId> {
         let command = match (key.code, key.modifiers) {
@@ -223,9 +227,18 @@ impl ProvidersStep {
         self.window.reveal();
     }
 
+    /// Whether the row under the cursor is one the reader can see: the last
+    /// frame drew it, or no frame has drawn the step yet.
+    fn cursor_seen(&self) -> bool {
+        self.cursor_drawn.get() != Some(false)
+    }
+
     /// The edit turning the Provider under the cursor off where it is on and
     /// on where it is off, measured against the Settings in force.
     fn toggle(&self, settings: &EffectiveSettings) -> Option<SettingMutation> {
+        if !self.cursor_seen() {
+            return None;
+        }
         let provider = Self::providers().nth(self.cursor)?;
         Some(
             provider_enablement(&provider.id)?
@@ -291,7 +304,7 @@ impl ProvidersStep {
                 // warning or failed read says is a line.
                 let beneath = match standing {
                     Standing::Unavailable { fix, .. } => Beneath::Fix(
-                        FixLines::new(fix, FIX_INDENT, u16::try_from(width).unwrap_or(u16::MAX)),
+                        WrappedText::new(fix, FIX_INDENT, u16::try_from(width).unwrap_or(u16::MAX)),
                         if selected {
                             theme.selection.focused
                         } else {
@@ -320,58 +333,89 @@ impl ProvidersStep {
             .collect()
     }
 
-    /// Why Next is locked, broken between words over as many lines as
-    /// `width` columns need, or nothing where it is not.
-    fn lock_lines(width: usize, server: OwnServer<'_>) -> Vec<String> {
-        Self::lock(server).map_or_else(Vec::new, |lock| {
-            TextLayout::new(lock, u16::try_from(width).unwrap_or(u16::MAX))
-                .rows()
-                .map(|row| row.text.to_owned())
-                .collect()
-        })
+    /// What the step says beneath its rows, each line laid out within
+    /// `width` columns in the style it is drawn in, the first said the most
+    /// needed: why Next is locked, and how the step's own re-check stands.
+    fn notes<'a>(
+        &'a self,
+        width: usize,
+        theme: &Theme,
+        server: OwnServer<'_>,
+    ) -> Vec<(WrappedText<'a>, Style)> {
+        let width = u16::try_from(width).unwrap_or(u16::MAX);
+        let recheck = match &self.recheck {
+            Recheck::Idle => None,
+            Recheck::Awaiting(_) => Some(("Re-checking every Provider…", theme.text.subdued)),
+            Recheck::Failed(failure) => Some((failure.as_str(), theme.feedback.error)),
+        };
+        Self::lock(server)
+            .map(|lock| (lock, theme.feedback.warning))
+            .into_iter()
+            .chain(recheck)
+            .map(|(text, style)| (WrappedText::new(text, "", width), style))
+            .collect()
     }
 
     /// How many lines the step draws within `width` columns with nothing
     /// given way.
     fn rows_wanted(&self, width: usize, theme: &Theme, server: OwnServer<'_>) -> usize {
-        let lock = Self::lock_lines(width, server);
+        let notes = self
+            .notes(width, theme, server)
+            .iter()
+            .map(|(note, _)| note.height())
+            .sum::<usize>();
         let rows = self
             .entries(width, theme, server)
             .iter()
             .map(ProviderEntry::rows)
             .sum::<usize>();
-        // The introduction and the gap beneath it, the rows, and the gap
-        // above why Next is locked with that beneath it.
-        2 + rows + usize::from(!lock.is_empty()) + lock.len()
+        // The gap beneath the header, the introduction and the gap beneath
+        // it, the rows, and the gap above what is said beneath them.
+        3 + rows + usize::from(notes > 0) + notes
     }
 
-    /// The step drawn within `width` columns and `room` lines: the
-    /// introduction, the Providers' rows through the window, and why Next is
-    /// locked. Why Next is locked keeps its lines whatever the room; for the
-    /// rows to be drawn whole the gap above it gives way first, then the gap
-    /// beneath the introduction, then the introduction, and past that the
-    /// window shows the rows around the cursor.
+    /// The step drawn within `width` columns and `room` lines beneath the
+    /// header: the introduction, the Providers' rows through the window, and
+    /// what is said beneath them, which keeps its lines before any row does.
+    /// For the rows to be drawn whole, the gap above what is said beneath
+    /// them gives way first, then the gap beneath the introduction, then the
+    /// gap beneath the header, then the introduction; past that the window
+    /// shows the rows around the cursor. Records whether the row under the
+    /// cursor was drawn.
     fn lines<'a>(
-        &self,
+        &'a self,
         width: usize,
         room: usize,
         theme: &Theme,
         server: OwnServer<'a>,
     ) -> (Vec<Line<'static>>, Vec<WrappedLine<'a>>) {
         let entries = self.entries(width, theme, server);
-        let lock = Self::lock_lines(width, server);
+        let mut said = 0;
+        let notes = self
+            .notes(width, theme, server)
+            .into_iter()
+            .map(|(note, style)| {
+                let note = note.first(room.saturating_sub(said));
+                said += note.height();
+                (note, style)
+            })
+            .collect::<Vec<_>>();
         let rows = entries.iter().map(ProviderEntry::rows).sum::<usize>();
-        let available = room.saturating_sub(lock.len());
+        let available = room.saturating_sub(said);
         // The lines each of what gives way takes, in the order it gives way.
-        let gives_way = [usize::from(!lock.is_empty()), 1, 1];
+        let gives_way = [usize::from(said > 0), 1, 1, 1];
         let given = (0..=gives_way.len())
             .find(|given| rows + gives_way[*given..].iter().sum::<usize>() <= available)
             .unwrap_or(gives_way.len());
-        let lock_gap = given < 1 && !lock.is_empty();
+        let notes_gap = given < 1 && said > 0;
         let introduction_gap = given < 2;
-        let introduction = given < 3;
+        let header_gap = given < 3;
+        let introduction = given < 4;
 
         let mut lines = Vec::new();
+        if header_gap {
+            lines.push(Line::default());
+        }
         if introduction {
             lines.push(Line::styled(
                 truncate_to_width(Self::INTRODUCTION, width),
@@ -381,7 +425,7 @@ impl ProvidersStep {
         if introduction_gap {
             lines.push(Line::default());
         }
-        let capacity = available.saturating_sub(lines.len() + usize::from(lock_gap));
+        let capacity = available.saturating_sub(lines.len() + usize::from(notes_gap));
         let window = entries
             .iter()
             .map(|entry| WindowEntry::focusable(entry.rows()))
@@ -389,13 +433,20 @@ impl ProvidersStep {
         let shown = self.window.settle(&window, capacity, Some(self.cursor));
         let end = lines.len() + capacity;
         let mut wrapped = Vec::new();
-        for entry in entries.into_iter().skip(shown.start).take(shown.len()) {
+        let mut cursor_drawn = false;
+        for (row, entry) in entries
+            .into_iter()
+            .enumerate()
+            .skip(shown.start)
+            .take(shown.len())
+        {
             // Only a row taller than the whole window is cut short, and then
             // from what goes beneath it.
             let room = end.saturating_sub(lines.len());
             if room == 0 {
                 break;
             }
+            cursor_drawn |= row == self.cursor;
             lines.push(entry.line);
             match entry.beneath {
                 Beneath::Fix(fix, style) => {
@@ -409,13 +460,16 @@ impl ProvidersStep {
                 Beneath::Message(_) | Beneath::Nothing => {}
             }
         }
-        if lock_gap {
+        self.cursor_drawn.set(Some(cursor_drawn));
+        if notes_gap {
             lines.push(Line::default());
         }
-        lines.extend(
-            lock.into_iter()
-                .map(|line| Line::styled(line, theme.feedback.warning)),
-        );
+        for (note, style) in notes {
+            if note.height() > 0 {
+                wrapped.push(note.wrapped(lines.len()));
+                lines.extend(note.lines(style));
+            }
+        }
         (lines, wrapped)
     }
 }
@@ -441,7 +495,7 @@ impl ProviderEntry<'_> {
 enum Beneath<'a> {
     Nothing,
     /// What fixes it, drawn whole in the style given.
-    Fix(FixLines<'a>, Style),
+    Fix(WrappedText<'a>, Style),
     /// What a warning or a failed read says, on a line.
     Message(Line<'static>),
 }
@@ -578,7 +632,10 @@ impl Onboarding {
     /// finishes the flow and closes it, unless the step may not be passed yet.
     pub(super) fn next(&mut self, server: OwnServer<'_>) -> Advance {
         let held = match self.step {
-            Some(Step::Providers) => ProvidersStep::lock(server).is_some(),
+            // Nor is a step passed whose rows the screen had no room for.
+            Some(Step::Providers) => {
+                ProvidersStep::lock(server).is_some() || !self.providers.cursor_seen()
+            }
             Some(Step::Derivation | Step::Icons) | None => false,
         };
         if held {
@@ -609,10 +666,27 @@ impl Onboarding {
         self.step == Some(Step::Providers)
     }
 
-    /// Whether the Providers step may re-read every Provider's Availability
-    /// now: while it is on show over the Client's own Server.
-    pub(super) fn rechecks(&self, server: OwnServer<'_>) -> bool {
-        self.shows_providers() && server.viewed
+    /// Begins a re-read of every Provider from the Providers step, while it
+    /// is on show, answering the request the Client's own Server is to be
+    /// asked under. A newer re-check takes the place of one still awaited.
+    pub(super) fn begin_recheck(&mut self) -> Option<uuid::Uuid> {
+        self.shows_providers().then(|| {
+            let recheck = uuid::Uuid::new_v4();
+            self.providers.recheck = Recheck::Awaiting(recheck);
+            recheck
+        })
+    }
+
+    /// Takes the Server's answer to `recheck`: what it read reaches the rows
+    /// through the catalog, and here only whether the newest re-check failed.
+    /// An answer to one since superseded settles nothing.
+    pub(super) fn settle_recheck(&mut self, recheck: uuid::Uuid, failure: Option<String>) {
+        if !matches!(self.providers.recheck, Recheck::Awaiting(awaited) if awaited == recheck) {
+            return;
+        }
+        self.providers.recheck = failure.map_or(Recheck::Idle, |error| {
+            Recheck::Failed(format!("Could not re-check the Providers: {error}"))
+        });
     }
 
     /// Moves the Providers step's cursor to the Provider above.
@@ -671,7 +745,7 @@ impl Onboarding {
     /// naming the step, what the step on show draws, and the keys at the
     /// foot, which stay there however much the step draws.
     pub(super) fn lines<'a>(
-        &self,
+        &'a self,
         width: usize,
         height: usize,
         theme: &Theme,
@@ -683,25 +757,24 @@ impl Onboarding {
                 wrapped: Vec::new(),
             };
         };
-        let mut lines = vec![
-            Line::styled(
-                truncate_to_width(
-                    &format!(
-                        "Step {} of {} · {}",
-                        step.number(),
-                        Step::ALL.len(),
-                        step.title()
-                    ),
-                    width,
+        let mut lines = vec![Line::styled(
+            truncate_to_width(
+                &format!(
+                    "Step {} of {} · {}",
+                    step.number(),
+                    Step::ALL.len(),
+                    step.title()
                 ),
-                theme.accent.primary.add_modifier(Modifier::BOLD),
+                width,
             ),
-            Line::default(),
-        ];
-        let room = height.saturating_sub(lines.len() + 1);
+            theme.accent.primary.add_modifier(Modifier::BOLD),
+        )];
         let mut wrapped = Vec::new();
         match step {
+            // The Providers step draws the gap beneath the header itself, as
+            // one of what gives way on a short screen before its rows.
             Step::Providers => {
+                let room = height.saturating_sub(lines.len() + 1);
                 let (step_lines, step_wrapped) = self.providers.lines(width, room, theme, server);
                 let top = lines.len();
                 wrapped.extend(step_wrapped.into_iter().map(|line| WrappedLine {
@@ -710,14 +783,20 @@ impl Onboarding {
                 }));
                 lines.extend(step_lines);
             }
-            Step::Derivation => lines.extend(self.derivation.lines(width, theme)),
-            Step::Icons => lines.extend(self.icons.lines(width, theme)),
+            Step::Derivation => {
+                lines.push(Line::default());
+                lines.extend(self.derivation.lines(width, theme));
+            }
+            Step::Icons => {
+                lines.push(Line::default());
+                lines.extend(self.icons.lines(width, theme));
+            }
         }
-        let own_keys = match step {
-            Step::Providers => ProvidersStep::keys(server),
-            Step::Derivation | Step::Icons => Vec::new(),
+        let own_keys: &[&str] = match step {
+            Step::Providers => &ProvidersStep::KEYS,
+            Step::Derivation | Step::Icons => &[],
         };
-        let footer = footer(step, &own_keys, width);
+        let footer = footer(step, own_keys, width);
         // The keys stay at the foot however much the step draws, and are
         // what gives way last.
         lines.truncate(height.saturating_sub(1));
@@ -737,43 +816,39 @@ impl Onboarding {
         };
         let step_rows = match step {
             Step::Providers => self.providers.rows_wanted(width, theme, server),
-            Step::Derivation => self.derivation.lines(width, theme).len(),
-            Step::Icons => self.icons.lines(width, theme).len(),
+            Step::Derivation => 1 + self.derivation.lines(width, theme).len(),
+            Step::Icons => 1 + self.icons.lines(width, theme).len(),
         };
-        2 + step_rows + 1
+        1 + step_rows + 1
     }
 }
 
 /// The keys at the foot of `step` within `width` columns: the step's own
 /// keys first, then Next, or Finish on the last step, Back where there is a
 /// step before, and how to leave. Where they do not all fit, the step's own
-/// give way first, the last of them first, and then Back, since Next and
-/// Leave are what the reader cannot do without.
+/// give way first, the last of them first, then Back, and then Enter is
+/// named by its glyph, since going on and leaving are what the reader cannot
+/// do without.
 fn footer(step: Step, own_keys: &[&str], width: usize) -> String {
-    let next = if step.next().is_some() {
-        "Enter Next"
+    let (next, glyph_next) = if step.next().is_some() {
+        ("Enter Next", "↵ Next")
     } else {
-        "Enter Finish"
+        ("Enter Finish", "↵ Finish")
     };
     let back = step.previous().map(|_| "← Back");
-    let mut own = own_keys.len();
-    let mut with_back = back.is_some();
-    loop {
-        let keys = own_keys[..own]
-            .iter()
+    let keys = |own: &[&str], next: &str, back: Option<&str>| {
+        own.iter()
             .copied()
             .chain([next])
-            .chain(back.filter(|_| with_back))
+            .chain(back)
             .chain(["Esc Leave"])
             .collect::<Vec<_>>()
-            .join(" · ");
-        if keys.width() <= width || (own == 0 && !with_back) {
-            return keys;
-        }
-        if own > 0 {
-            own -= 1;
-        } else {
-            with_back = false;
-        }
-    }
+            .join(" · ")
+    };
+    (0..=own_keys.len())
+        .rev()
+        .map(|own| keys(&own_keys[..own], next, back))
+        .chain([keys(&[], next, None)])
+        .find(|keys| keys.width() <= width)
+        .unwrap_or_else(|| keys(&[], glyph_next, None))
 }

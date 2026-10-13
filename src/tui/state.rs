@@ -5135,6 +5135,12 @@ pub enum ApplicationEvent {
         request_id: uuid::Uuid,
         result: std::result::Result<crate::protocol::ContextBreakdown, ContextBreakdownRefusal>,
     },
+    /// The Client's own Server's answer to Onboarding's re-check `recheck`:
+    /// the Model Catalog as every Provider was read anew, or why it was not.
+    ProvidersRechecked {
+        recheck: uuid::Uuid,
+        result: std::result::Result<ModelCatalog, String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5409,6 +5415,14 @@ pub enum ApplicationTransition {
     /// Ask the Client's own Server to mark itself onboarded, as finishing or
     /// leaving Onboarding does. Every attached Client hears that it is.
     MarkOnboarded,
+    /// Ask the Client's own Server to re-read every Provider's Availability
+    /// for Onboarding, answering with [`ApplicationEvent::ProvidersRechecked`]
+    /// under the same `recheck`. The flow's own request rather than one of
+    /// the Model picker's listings, so it supersedes none of them whichever
+    /// Outlook is on screen.
+    RecheckProviders {
+        recheck: uuid::Uuid,
+    },
     /// Prepare the `/serve` surface, enabling the durable Setting first when
     /// it was off — or asking for it on again where the Serving listener has
     /// failed, so the Server tries once more to Serve — before discovering
@@ -5880,6 +5894,22 @@ impl Application {
             }
             ApplicationEvent::ContextBreakdownRead { request_id, result } => {
                 self.state.context_overlay.receive(request_id, result);
+                Ok(ApplicationTransition::Continue)
+            }
+            // What a re-check read is the Client's own Server's catalog as it
+            // now stands, as good as one it pushed, whether or not the flow
+            // still awaits that re-check.
+            ApplicationEvent::ProvidersRechecked { recheck, result } => {
+                let failure = match result {
+                    Ok(catalog) => {
+                        self.state
+                            .model_picker
+                            .adopt_catalog(Outlook::Local, catalog);
+                        None
+                    }
+                    Err(error) => Some(error),
+                };
+                self.state.onboarding.settle_recheck(recheck, failure);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::AttachmentUploadFailed { paste, reason } => {
@@ -10218,31 +10248,18 @@ impl Application {
                     ApplicationTransition::Continue,
                     ApplicationTransition::MutateSetting,
                 )),
-            // The same listing of every Provider the Model picker's retry row
-            // asks for, and asked only while the Client's own Server is on
-            // screen: over a Remote, the listing the picker waits on is that
-            // Remote's, which one for the Client's own Server would supersede.
-            SemanticCommandId::OnboardingProvidersRecheck => {
-                let rechecks = self.state.onboarding.rechecks(OwnServer::of(
-                    &self.state.settings,
-                    &self.state.model_picker,
-                    &self.state.outlook,
-                ));
-                Ok(if rechecks {
-                    ApplicationTransition::ListModels(self.state.model_picker.begin_refresh())
-                } else {
-                    ApplicationTransition::Continue
-                })
-            }
+            SemanticCommandId::OnboardingProvidersRecheck => Ok(self
+                .state
+                .onboarding
+                .begin_recheck()
+                .map_or(ApplicationTransition::Continue, |recheck| {
+                    ApplicationTransition::RecheckProviders { recheck }
+                })),
             SemanticCommandId::OnboardingNext => {
                 if !self.state.onboarding.is_open() {
                     return Ok(ApplicationTransition::Continue);
                 }
-                let server = OwnServer::of(
-                    &self.state.settings,
-                    &self.state.model_picker,
-                    &self.state.outlook,
-                );
+                let server = OwnServer::of(&self.state.settings, &self.state.model_picker);
                 Ok(match self.state.onboarding.next(server) {
                     Advance::Moved | Advance::Held => ApplicationTransition::Continue,
                     Advance::Finished => self.state.take_onboarding(),

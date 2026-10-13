@@ -608,6 +608,9 @@ struct TaskChannels {
     /// What the Outlook's Server listed of each directory the Directory
     /// Browser opened, or why it would not.
     directories: UnboundedSender<ApplicationEvent>,
+    /// What the Client's own Server read of every Provider each time
+    /// Onboarding asked it to re-check them, or why it would not.
+    providers: UnboundedSender<ApplicationEvent>,
 }
 
 /// The run loop's mutable world: the Application it feeds, the client it sends
@@ -668,6 +671,7 @@ async fn run_loop(
     let (context_breakdowns, mut context_breakdown_rx) = tokio::sync::mpsc::unbounded_channel();
     let (relays, mut relay_rx) = tokio::sync::mpsc::unbounded_channel();
     let (directories, mut directory_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (providers, mut provider_rx) = tokio::sync::mpsc::unbounded_channel();
     let application = Application::new(workspace, terminal_facts);
     let application = match config_root {
         Some(config_root) => application.with_config_root(config_root),
@@ -695,6 +699,7 @@ async fn run_loop(
             context_breakdowns,
             relays,
             directories,
+            providers,
         },
         reconnect_grace: Vec::new(),
         opening_loading_delay: None,
@@ -768,6 +773,7 @@ async fn run_loop(
             breakdown = context_breakdown_rx.recv() => run.receive_context_breakdown(breakdown)?,
             relay = relay_rx.recv() => run.receive_relay_answer(relay)?,
             directory = directory_rx.recv() => run.receive_directory_listing(directory)?,
+            recheck = provider_rx.recv() => run.receive_providers_recheck(recheck)?,
             input_event = input.next() => match input_event {
                 Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut(), &mut clipboard, &mut delivery)?,
                 Some(Err(error)) => return Err(error.into()),
@@ -1004,6 +1010,16 @@ impl RunLoop {
         answer: Option<ApplicationEvent>,
     ) -> Result<ControlFlow<Exit>> {
         let answer = answer.ok_or_else(|| anyhow!("Directory listing task channel stopped"))?;
+        self.needs_redraw = true;
+        let transition = self.application.handle_event(answer)?;
+        Ok(self.dispatch_transition(transition))
+    }
+
+    fn receive_providers_recheck(
+        &mut self,
+        answer: Option<ApplicationEvent>,
+    ) -> Result<ControlFlow<Exit>> {
+        let answer = answer.ok_or_else(|| anyhow!("Providers re-check task channel stopped"))?;
         self.needs_redraw = true;
         let transition = self.application.handle_event(answer)?;
         Ok(self.dispatch_transition(transition))
@@ -1439,6 +1455,13 @@ impl RunLoop {
             ApplicationTransition::MarkOnboarded => {
                 spawn_onboarded_mark(self.client.session_commands());
             }
+            ApplicationTransition::RecheckProviders { recheck } => {
+                spawn_providers_recheck(
+                    self.client.session_commands(),
+                    recheck,
+                    self.channels.providers.clone(),
+                );
+            }
             ApplicationTransition::BeginServing {
                 request,
                 enable,
@@ -1813,6 +1836,7 @@ impl RunLoop {
             | ApplicationTransition::UpdateApprovalPosture { .. }
             | ApplicationTransition::MutateSetting(_)
             | ApplicationTransition::MarkOnboarded
+            | ApplicationTransition::RecheckProviders { .. }
             | ApplicationTransition::BeginServing { .. }
             | ApplicationTransition::IssueInvite { .. }
             | ApplicationTransition::CopyToClipboard(_)
@@ -3286,6 +3310,24 @@ fn spawn_directory_listing(
             .await
             .map_err(|error| error.to_string());
         let _ = answers.send(ApplicationEvent::DirectoryListed { listing_id, result });
+    });
+}
+
+/// Asks the Client's own Server to re-read every Provider for Onboarding, the
+/// same refresh of them all the Model picker's listings end with. It runs to
+/// its answer apart from those listings, superseding none of them, and the
+/// Application keeps only the answer to its newest ask.
+fn spawn_providers_recheck(
+    commands: SessionCommandClient,
+    recheck: uuid::Uuid,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let result = commands
+            .refresh_models()
+            .await
+            .map_err(|error| error.to_string());
+        let _ = answers.send(ApplicationEvent::ProvidersRechecked { recheck, result });
     });
 }
 
@@ -6671,10 +6713,10 @@ mod ready_event_tests {
     use crate::{
         managed_client::{ManagedClient, SessionEvent},
         protocol::{
-            ModelAvailability, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
-            SessionStatus, SessionUpdate, Workspace,
+            ModelAvailability, Outlook, Session, SessionChange, SessionId, SessionRevision,
+            SessionSnapshot, SessionStatus, SessionUpdate, Workspace,
         },
-        tui::composer::ComposerKey,
+        tui::{ApplicationTransition, ModelListRequest, composer::ComposerKey},
     };
 
     /// A clipboard nothing in these tests copies to.
@@ -6714,6 +6756,7 @@ mod ready_event_tests {
                 context_breakdowns: sender(),
                 relays: sender(),
                 directories: sender(),
+                providers: sender(),
             },
             reconnect_grace: Vec::new(),
             opening_loading_delay: None,
@@ -6813,6 +6856,29 @@ mod ready_event_tests {
 
     fn no_input() -> stream::Pending<std::io::Result<TerminalInput>> {
         stream::pending()
+    }
+
+    /// Onboarding's re-check of every Provider is the Client's own Server's
+    /// and runs beside the one Model catalog listing the picker waits on —
+    /// a Remote's, while one is viewed — rather than in its place, so that
+    /// listing is neither superseded nor cancelled and still settles.
+    #[tokio::test]
+    async fn a_providers_recheck_leaves_the_model_listing_in_flight_alone() {
+        let mut run = offline_run_loop(Application::default());
+        let listing = ModelListRequest::new(1, Outlook::Remote("studio".to_owned()));
+        run.tasks.listing_models = Some((listing.clone(), tokio::spawn(std::future::pending())));
+
+        let _ = run.dispatch_transition(ApplicationTransition::RecheckProviders {
+            recheck: uuid::Uuid::new_v4(),
+        });
+
+        let (in_flight, task) = run
+            .tasks
+            .listing_models
+            .as_ref()
+            .expect("the picker's listing is still in flight");
+        assert_eq!(in_flight, &listing, "and is the one the picker asked for");
+        assert!(!task.is_finished(), "which nothing cancelled");
     }
 
     /// A streaming Turn arrives as a run of small Session events. Every one

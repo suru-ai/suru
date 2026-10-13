@@ -14,7 +14,6 @@ mod connect_overlay;
 mod context_overlay;
 mod directory_browser;
 mod event_loop;
-mod fix_lines;
 mod fuzzy;
 mod hyperlink;
 mod icon_picker;
@@ -50,6 +49,7 @@ mod unreachable_reason;
 mod usage;
 mod workspace_picker;
 mod worktree_picker;
+mod wrapped_text;
 
 pub use crate::terminal::{
     CellSize, GraphicsProtocol, TerminalColor, TerminalColorProbe, TerminalFacts,

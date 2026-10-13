@@ -10,9 +10,9 @@ use crate::protocol::{
 
 use super::{
     ModelListRequest,
-    fix_lines::{FIX_INDENT, FixLines},
     fuzzy::fuzzy_matches,
     list_window::{ListWindow, WindowEntry},
+    wrapped_text::{FIX_INDENT, WrappedText},
 };
 
 /// What the Model a reader picks here is for. The picker is one list of Models
@@ -519,7 +519,7 @@ impl ModelPicker {
                 ModelPickerRow::Provider { .. } => WindowEntry::passive(1),
                 ModelPickerRow::Model { .. } | ModelPickerRow::Error { .. } => WindowEntry::ROW,
                 ModelPickerRow::Unavailable { fix, .. } => {
-                    WindowEntry::focusable(1 + FixLines::new(fix, FIX_INDENT, width).height())
+                    WindowEntry::focusable(1 + WrappedText::new(fix, FIX_INDENT, width).height())
                 }
             })
             .collect::<Vec<_>>();

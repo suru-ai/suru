@@ -2156,8 +2156,8 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
         id: SemanticCommandId::OnboardingProvidersRecheck,
         title: "Re-check Providers",
-        // It asks the Client's own Server, whose Onboarding this is, and only
-        // while that Server is the Outlook on screen, so no Origin refuses it.
+        // It asks the Client's own Server, whose Onboarding this is, whichever
+        // Origin is on screen, so no Origin out of reach refuses it.
         reach: SemanticReach::Client,
         description: "Read every Provider's Availability again",
         slash: None,

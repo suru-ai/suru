@@ -34,7 +34,6 @@ use super::{
     connect_overlay::LoginStep,
     context_overlay::{ContextOverlayView, ContextRow},
     directory_browser::{DirectoryBrowserRow, DirectoryBrowserRowKind},
-    fix_lines::{FIX_INDENT, FixLines},
     icon_picker,
     keymap::binding_label,
     list_window::WindowEntry,
@@ -72,6 +71,7 @@ use super::{
     unreachable_reason,
     usage::{compact_cost, compact_count},
     workspace_picker::{WorkspacePickerMenuGeometry, WorkspacePickerRowKind, WorkspaceRow},
+    wrapped_text::{FIX_INDENT, WrappedText},
 };
 
 const NARROW_TERMINAL_WIDTH: u16 = 44;
@@ -2767,7 +2767,7 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
                     // end as fits, which is where every fix names the page or
                     // command it sends the reader to.
                     let room = usize::from(content_height).saturating_sub(lines.len());
-                    let fix = FixLines::new(fix, FIX_INDENT, content_width).last(room);
+                    let fix = WrappedText::new(fix, FIX_INDENT, content_width).last(room);
                     wrapped.push(fix.wrapped(lines.len()));
                     lines.extend(fix.lines(style));
                 }
@@ -2948,8 +2948,8 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         .settings_panel
         .selected_fix(state.settings())
         .filter(|_| state.settings_panel.error().is_none());
-    let fix = fix.map(|fix| FixLines::new(fix, "", width.saturating_sub(2)));
-    let fix_height = fix.as_ref().map_or(0, FixLines::height);
+    let fix = fix.map(|fix| WrappedText::new(fix, "", width.saturating_sub(2)));
+    let fix_height = fix.as_ref().map_or(0, WrappedText::height);
     // A tab lists a known number of rows, so the panel is exactly as tall as it
     // needs to be: two borders around the tab bar and the headline, whatever
     // fix goes beneath it, one row per Setting, and the controls.
@@ -3168,7 +3168,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
 }
 
 fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
-    let server = OwnServer::of(state.settings(), &state.model_picker, &state.outlook);
+    let server = OwnServer::of(state.settings(), &state.model_picker);
     let width = main.width.saturating_sub(4).min(76);
     // The box keeps one height from step to step, and grows past it only for
     // a step with more to draw — every Provider's fix beneath its row — as

@@ -5,9 +5,9 @@
 use std::{collections::HashSet, path::Path};
 
 use crate::support::{
-    connected_application, deliver_settings, enter_session, fixture_instance_id, ready_health,
-    rendered_application_buffer, rendered_application_rows_at, text_position, type_terminal_text,
-    workspace_dir,
+    connected_application, deliver_settings, enter_session, fixture_instance_id, model_descriptor,
+    ready_health, rendered_application_buffer, rendered_application_rows_at, text_position,
+    type_terminal_text, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -16,10 +16,10 @@ use ratatui::style::Modifier;
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        EffectiveSettings, Health, ModelCatalog, Outlook, ProviderCatalogStatus, ProviderId,
-        ProviderModelCatalog, ProviderUnavailability, RemoteHealth, RemoteStatus, SettingMutation,
-        SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarSettings,
-        SidebarVisibility, TextSelectionCopy, Way,
+        EffectiveSettings, Health, ModelAvailability, ModelCatalog, Outlook, ProviderCatalogStatus,
+        ProviderId, ProviderModelCatalog, ProviderUnavailability, RemoteHealth, RemoteStatus,
+        SettingMutation, SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot,
+        SidebarSettings, SidebarVisibility, TextSelectionCopy, Way,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -936,30 +936,31 @@ fn the_recheck_key_issues_the_all_providers_refresh_and_its_answer_reaches_the_r
         "the key is taught at the foot: {footer}"
     );
 
-    let ApplicationTransition::ListModels(request) = press(&mut application, KeyCode::Char('r'))
+    let ApplicationTransition::RecheckProviders { recheck } =
+        press(&mut application, KeyCode::Char('r'))
     else {
         panic!(
             "r re-reads every Provider's Availability: {}",
             screen(&application)
         );
     };
-    assert_eq!(
-        request.outlook(),
-        &Outlook::Local,
-        "of the Client's own Server"
+    assert!(
+        screen(&application).contains("Re-checking every Provider…"),
+        "and says so while it does: {}",
+        screen(&application)
     );
 
     application
-        .handle_event(ApplicationEvent::ModelsListed {
-            request,
-            catalog: catalog(&[
+        .handle_event(ApplicationEvent::ProvidersRechecked {
+            recheck,
+            result: Ok(catalog(&[
                 ("codex", ProviderCatalogStatus::Fresh),
                 (
                     "copilot",
                     unavailable(ProviderUnavailability::NotSignedIn, "run `copilot login`"),
                 ),
                 ("claude", ProviderCatalogStatus::Refreshing),
-            ]),
+            ])),
         })
         .expect("receive what the re-check found");
     assert_eq!(
@@ -972,52 +973,126 @@ fn the_recheck_key_issues_the_all_providers_refresh_and_its_answer_reaches_the_r
         provider_row_text(&application, "Claude"),
         "[x] Claude · refreshing"
     );
+    assert!(
+        !screen(&application).contains("Re-checking"),
+        "{}",
+        screen(&application)
+    );
 }
 
-/// While a Remote is viewed, the Model catalog listing the Client waits on
-/// is the Remote's, so a retake asks nothing of the Client's own Server: its
-/// rows follow what that Server pushes, and `r` is neither taught nor heeded
-/// until the Client's own Server is on screen again.
 #[test]
-fn the_recheck_asks_nothing_while_a_remote_is_viewed() {
+fn a_recheck_the_server_did_not_answer_says_so_and_leaves_the_rows() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    push_catalog(&mut application, &nothing_installed());
+    let ApplicationTransition::RecheckProviders { recheck } =
+        press(&mut application, KeyCode::Char('r'))
+    else {
+        panic!("r re-reads every Provider's Availability");
+    };
+    application
+        .handle_event(ApplicationEvent::ProvidersRechecked {
+            recheck,
+            result: Err("the Server did not answer".to_owned()),
+        })
+        .expect("hear that the re-check failed");
+
+    let failed = screen(&application);
+    assert!(
+        failed.contains("Could not re-check the Providers: the Server did not answer"),
+        "{failed}"
+    );
+    assert!(!failed.contains("Re-checking"), "{failed}");
+    assert!(
+        provider_row_text(&application, "Copilot").contains("not signed in"),
+        "the rows keep what was last heard: {failed}"
+    );
+}
+
+/// Onboarding's rows are the Client's own Server's whichever Outlook is
+/// turned, so `r` re-reads that Server's Providers over a Remote too — and
+/// as a request of the flow's own, beside rather than in place of the
+/// listing the Model picker is waiting on from the Remote, which still
+/// settles.
+#[test]
+fn the_recheck_reads_the_clients_own_server_over_a_remote_and_its_listing_still_settles() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     deliver_settings(&mut application, EffectiveSettings::default());
     turn_outlook(&mut application, KeyCode::Down);
+    let ApplicationTransition::ListModels(listing) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelList,
+        )))
+        .expect("open the Model picker")
+    else {
+        panic!("the picker asks the Remote for its Models");
+    };
+    assert_eq!(listing.outlook(), &Outlook::Remote("studio".to_owned()));
+    press(&mut application, KeyCode::Esc);
+
     type_terminal_text(&mut application, "/onboarding");
     press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("Step 1 of 3"));
     push_catalog(&mut application, &nothing_installed());
-
-    let over_remote = screen(&application);
     assert!(
-        !over_remote.contains("Re-check"),
-        "the key is not taught: {over_remote}"
+        screen(&application).contains("r Re-check"),
+        "{}",
+        screen(&application)
     );
+    let ApplicationTransition::RecheckProviders { recheck } =
+        press(&mut application, KeyCode::Char('r'))
+    else {
+        panic!(
+            "r re-reads the Client's own Server's Providers over a Remote: {}",
+            screen(&application)
+        );
+    };
+    application
+        .handle_event(ApplicationEvent::ProvidersRechecked {
+            recheck,
+            result: Ok(catalog(&[("codex", ProviderCatalogStatus::Fresh)])),
+        })
+        .expect("receive what the re-check found");
     assert_eq!(
-        press(&mut application, KeyCode::Char('r')),
-        ApplicationTransition::Continue,
-        "nor heeded"
-    );
-    assert!(
-        provider_row_text(&application, "Copilot").contains("not signed in"),
-        "the rows still say what the Client's own Server last pushed: {}",
+        provider_row_text(&application, "Codex"),
+        "[x] Codex · available",
+        "{}",
         screen(&application)
     );
 
+    application
+        .handle_event(ApplicationEvent::ModelsRefreshed {
+            request: listing,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("codex"),
+                    display_name: "Codex".to_owned(),
+                    models: vec![model_descriptor(
+                        "codex",
+                        "studio-model",
+                        "Studio Model",
+                        true,
+                        ModelAvailability::Available,
+                    )],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("receive the Remote's Models");
     assert_eq!(
         press(&mut application, KeyCode::Esc),
         ApplicationTransition::MarkOnboarded
     );
-    turn_outlook(&mut application, KeyCode::Up);
-    type_terminal_text(&mut application, "/onboarding");
-    press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("r Re-check"));
-    let ApplicationTransition::ListModels(request) = press(&mut application, KeyCode::Char('r'))
-    else {
-        panic!("back on its own Server, r re-reads every Provider");
-    };
-    assert_eq!(request.outlook(), &Outlook::Local);
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelList,
+        )))
+        .expect("open the Model picker again");
+    assert!(
+        screen(&application).contains("Studio Model"),
+        "the Remote's listing settled as the picker asked for it: {}",
+        screen(&application)
+    );
 }
 
 /// A terminal too short for every Provider with its fix beneath it shows a
@@ -1109,6 +1184,89 @@ fn a_narrow_screen_keeps_next_and_leave_and_the_whole_lock_line() {
     );
 }
 
+/// A terminal too small to draw the row under the cursor acts on no
+/// Provider the reader cannot see: Space toggles nothing and Enter passes
+/// nothing until a frame has room for that row. Why Next is locked is given
+/// whole before any row, the gap beneath the header giving way first.
+#[test]
+fn a_tiny_screen_acts_on_no_provider_it_does_not_draw() {
+    let workspace = workspace_dir();
+    let mut application = attached_to_a_fresh_server(workspace.path());
+    let mut settings = EffectiveSettings::default();
+    settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    deliver_settings(&mut application, settings);
+    push_catalog(&mut application, &every_cli_missing());
+
+    let tiny = rendered_application_rows_at(&application, 40, 8).join("\n");
+    assert!(tiny.contains("Step 1 of 3"), "{tiny}");
+    assert!(
+        tiny.contains("Next is locked: no enabled") && tiny.contains("Provider is available."),
+        "why Next is locked is given whole: {tiny}"
+    );
+    assert!(
+        !tiny.contains("Codex"),
+        "with no room left for a row: {tiny}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::Continue,
+        "Space toggles no Provider the screen does not draw"
+    );
+
+    let roomier = rendered_application_rows_at(&application, 40, 14).join("\n");
+    assert!(roomier.contains("› [x] Codex"), "{roomier}");
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' ')),
+        ApplicationTransition::MutateSetting(SettingMutation::ProviderCodexEnabled {
+            value: Some(false),
+        }),
+        "and toggles the one it does"
+    );
+
+    push_catalog(&mut application, &[("codex", ProviderCatalogStatus::Fresh)]);
+    let headless = rendered_application_rows_at(&application, 40, 6).join("\n");
+    assert!(!headless.contains("Codex"), "{headless}");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        rendered_application_rows_at(&application, 40, 8)
+            .join("\n")
+            .contains("Step 1 of 3"),
+        "Enter passes no step whose rows the screen did not draw"
+    );
+    press(&mut application, KeyCode::Enter);
+    assert!(
+        screen(&application).contains("Step 2 of 3"),
+        "and passes it once they are drawn: {}",
+        screen(&application)
+    );
+}
+
+/// However narrow the terminal, every step's keys at the foot teach how to
+/// go on and how to leave, whole rather than cut short.
+#[test]
+fn a_narrow_terminal_teaches_next_or_finish_and_leave_whole_at_every_step() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    push_catalog(&mut application, &[("codex", ProviderCatalogStatus::Fresh)]);
+    for (step, go_on) in [(1, "Next"), (2, "Next"), (3, "Finish")] {
+        let rows = rendered_application_rows_at(&application, 28, 24);
+        let shown = rows.join("\n");
+        assert!(shown.contains(&format!("Step {step} of 3")), "{shown}");
+        let foot = rows
+            .iter()
+            .find(|row| row.contains("Esc Leave"))
+            .unwrap_or_else(|| panic!("step {step} teaches Leave whole: {shown}"));
+        assert!(
+            foot.contains(&format!("{go_on} · Esc Leave")) && !foot.contains('…'),
+            "step {step} teaches {go_on} beside it: {shown}"
+        );
+        press(&mut application, KeyCode::Enter);
+    }
+}
+
 /// What fixes an unavailable Provider, wrapped beneath its row, copies as it
 /// was written: the wrap that broke an install page's address across rows,
 /// and the indent that set it beneath the row, are the step's layout rather
@@ -1153,6 +1311,23 @@ fn a_wrapped_fix_on_the_providers_step_copies_as_one_unbroken_line() {
         drag(&mut application, address, end),
         ApplicationTransition::CopyToClipboard(INSTALL_PAGE.into()),
         "and the address alone copies unbroken"
+    );
+
+    // Why Next is locked, wrapped beneath the rows, copies as written too.
+    let narrow = rendered_application_buffer(&application, 40, 30);
+    let lock = text_position(&narrow, "Next is locked:");
+    let tail = text_position(&narrow, "available.");
+    assert!(lock.1 < tail.1, "the explanation wraps onto a second row");
+    assert_eq!(
+        drag(
+            &mut application,
+            lock,
+            (tail.0 + "available.".len() as u16 - 1, tail.1)
+        ),
+        ApplicationTransition::CopyToClipboard(
+            "Next is locked: no enabled Provider is available.".into()
+        ),
+        "the explanation copies as one line"
     );
 }
 
