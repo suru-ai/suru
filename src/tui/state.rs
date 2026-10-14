@@ -74,7 +74,7 @@ use super::{
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
-    onboarding::{Advance, DerivationMove, Heard, Onboarding, Opening, OwnServer},
+    onboarding::{Advance, DerivationMove, Heard, Onboarding, Opening, OwnServer, RootsEdit},
     relay_overlay::{
         ListingLanded, RedemptionLoginLead, RelayLoginAct, RelayLoginFollow, RelayLoginLead,
         RelayOverlay, RelayRequest,
@@ -2760,13 +2760,18 @@ impl TuiState {
         self.release_onboarding_options();
     }
 
-    /// Closes the Model Options Onboarding opened over itself once it is no
-    /// longer open to be answered, so nothing it offered can still be pinned.
+    /// Closes the Model Options and the Directory Browser Onboarding opened
+    /// over itself once it is no longer open to be answered, so nothing it
+    /// offered can still be pinned or chosen.
     fn release_onboarding_options(&mut self) {
-        if !self.onboarding.is_open()
-            && self.model_options.owner() == ModelOptionsOwner::OnboardingDerivation
-        {
+        if self.onboarding.is_open() {
+            return;
+        }
+        if self.model_options.owner() == ModelOptionsOwner::OnboardingDerivation {
             self.model_options.close();
+        }
+        if self.directory_browser.opened_from_onboarding() {
+            self.directory_browser.close();
         }
     }
 
@@ -3862,10 +3867,12 @@ impl TuiState {
     }
 
     /// Whether choosing in the Directory Browser lands the reader in the
-    /// directory chosen, as it does from everywhere but the list editor,
-    /// whose choice is an entry of its draft.
+    /// directory chosen, as it does from everywhere but the list editor and
+    /// Onboarding's Workspace Roots step, whose choice is an entry of a
+    /// draft.
     fn browser_choice_lands(&self) -> bool {
         !self.directory_browser.opened_from_list_editor()
+            && !self.directory_browser.opened_from_onboarding()
     }
 
     /// The top painted overlay owns selection and pointer/key dispatch alike.
@@ -3886,6 +3893,8 @@ impl TuiState {
             Some(SelectionSurface::Models)
         } else if self.model_options.is_open() {
             Some(SelectionSurface::ModelOptions)
+        } else if self.directory_browser.opened_from_onboarding() {
+            Some(SelectionSurface::DirectoryBrowser)
         } else if self.onboarding.is_open() {
             Some(SelectionSurface::Onboarding)
         } else if self.directory_browser.opened_from_list_editor() {
@@ -8170,6 +8179,12 @@ impl Application {
                         }
                         return ApplicationTransition::Continue;
                     }
+                    DirectoryBrowserProvenance::FromOnboarding => {
+                        self.state.onboarding.edit_roots(RootsEdit::Choose(
+                            chosen.path.to_string_lossy().into_owned(),
+                        ));
+                        return ApplicationTransition::Continue;
+                    }
                 }
                 let directory = Workspace::directory(chosen.path.clone());
                 return self
@@ -8183,9 +8198,10 @@ impl Application {
                     DirectoryBrowserProvenance::FromWorkspacePicker => {
                         self.state.workspace_picker.step_back();
                     }
-                    // The list editor stood beneath the browser all along,
-                    // its draft as the reader left it.
-                    DirectoryBrowserProvenance::FromListEditor => {}
+                    // The list editor, or Onboarding's step, stood beneath
+                    // the browser all along, its draft as the reader left it.
+                    DirectoryBrowserProvenance::FromListEditor
+                    | DirectoryBrowserProvenance::FromOnboarding => {}
                 }
                 None
             }
@@ -10394,6 +10410,14 @@ impl Application {
                 self.state.onboarding.select_next_icons_answer();
                 Ok(ApplicationTransition::Continue)
             }
+            // Nor is a step confirmed, or left for the one before, from
+            // beneath the browser it opened over itself, whose choice would
+            // then find no step to land on.
+            SemanticCommandId::OnboardingNext | SemanticCommandId::OnboardingBack
+                if self.state.directory_browser.opened_from_onboarding() =>
+            {
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::OnboardingNext => {
                 if !self.state.onboarding.is_open() {
                     return Ok(ApplicationTransition::Continue);
@@ -10432,6 +10456,14 @@ impl Application {
                     .onboarding
                     .move_derivation(DerivationMove::PageDown);
                 Ok(ApplicationTransition::Continue)
+            }
+            command @ (SemanticCommandId::OnboardingRootsPrevious
+            | SemanticCommandId::OnboardingRootsNext
+            | SemanticCommandId::OnboardingRootsInsert
+            | SemanticCommandId::OnboardingRootsDeleteBackward
+            | SemanticCommandId::OnboardingRootsRemove
+            | SemanticCommandId::OnboardingRootsBrowse) => {
+                Ok(self.handle_onboarding_roots_command(command, invocation.subject))
             }
             SemanticCommandId::RelayOpen => {
                 let request = self.state.relay_overlay.open();
@@ -11379,6 +11411,53 @@ impl Application {
                 }
             }
         }
+        ApplicationTransition::Continue
+    }
+
+    /// Edits the draft of Onboarding's Workspace Roots step, or opens the
+    /// Directory Browser over it, while the step holds the keys: an edit
+    /// reaching it from beneath the browser, or with the step not on show,
+    /// changes nothing the reader cannot see.
+    fn handle_onboarding_roots_command(
+        &mut self,
+        command: SemanticCommandId,
+        subject: SemanticSubject,
+    ) -> ApplicationTransition {
+        if !self.state.onboarding.shows_roots()
+            || !matches!(
+                self.state.surface_above_interventions(),
+                Some(SurfaceAboveInterventions::Selection(
+                    SelectionSurface::Onboarding
+                ))
+            )
+        {
+            return ApplicationTransition::Continue;
+        }
+        let edit = match (command, subject) {
+            // The Roots are the Client's own Server's, whose directories the
+            // browser lists however the Outlook is turned, starting where
+            // `/browse` would there.
+            (SemanticCommandId::OnboardingRootsBrowse, _) => {
+                if !self.state.onboarding.browses_roots() {
+                    return ApplicationTransition::Continue;
+                }
+                let ask = self.state.directory_browser.open(
+                    Outlook::Local,
+                    self.state.browse_root(&Outlook::Local),
+                    DirectoryBrowserProvenance::FromOnboarding,
+                );
+                return self.list_directory(ask);
+            }
+            (SemanticCommandId::OnboardingRootsPrevious, _) => RootsEdit::Previous,
+            (SemanticCommandId::OnboardingRootsNext, _) => RootsEdit::Next,
+            (SemanticCommandId::OnboardingRootsInsert, SemanticSubject::Text(text)) => {
+                RootsEdit::Insert(text)
+            }
+            (SemanticCommandId::OnboardingRootsDeleteBackward, _) => RootsEdit::DeleteBackward,
+            (SemanticCommandId::OnboardingRootsRemove, _) => RootsEdit::Remove,
+            _ => return ApplicationTransition::Continue,
+        };
+        self.state.onboarding.edit_roots(edit);
         ApplicationTransition::Continue
     }
 

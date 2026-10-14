@@ -476,7 +476,7 @@ fn admits_workspace_root(root: &str) -> bool {
     root.starts_with('~') || Path::new(root).is_absolute()
 }
 
-const WORKSPACE_ROOTS_LIST: TextListSettingChoice = TextListSettingChoice::new(
+pub(crate) const WORKSPACE_ROOTS_LIST: TextListSettingChoice = TextListSettingChoice::new(
     "Directories your work lives in",
     "add a Root",
     "an absolute path or a path beginning with ~",

@@ -51,6 +51,10 @@ pub(super) enum DirectoryBrowserProvenance {
     /// it stands over the panel, Esc goes back to the editor, and a choice is
     /// an entry of the list rather than where the next Session works.
     FromListEditor,
+    /// Opened from Onboarding's Workspace Roots step, so it stands over the
+    /// flow, Esc goes back to the step, and a choice is an entry of the
+    /// step's draft.
+    FromOnboarding,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -545,6 +549,12 @@ impl DirectoryBrowser {
     /// editor.
     pub(super) fn opened_from_list_editor(&self) -> bool {
         self.open && self.provenance == DirectoryBrowserProvenance::FromListEditor
+    }
+
+    /// Whether the browser is open, opened from Onboarding's Workspace Roots
+    /// step.
+    pub(super) fn opened_from_onboarding(&self) -> bool {
+        self.open && self.provenance == DirectoryBrowserProvenance::FromOnboarding
     }
 
     /// Shows the directories the Server flagged hidden, each in its place

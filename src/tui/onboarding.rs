@@ -2,10 +2,10 @@
 //! Landing of its own Server until that Server has been onboarded, and that
 //! `/onboarding` opens again at its first step whenever the reader asks.
 //!
-//! It walks three steps in a fixed order — Providers, Derivation, Icons —
-//! under a "Step N of 3" header. Enter confirms the step on show and moves to
-//! the next, finishing the flow on the last; Back returns to the step before;
-//! Esc leaves the whole flow from any step. Leaving counts as taking it as
+//! It walks four steps in a fixed order — Providers, Derivation, Workspace
+//! Roots, Icons — under a "Step N of 4" header. Enter confirms the step on
+//! show and moves to the next, finishing the flow on the last; Back returns
+//! to the step before; Esc leaves the whole flow from any step. Leaving counts as taking it as
 //! much as finishing does, so either asks the Server to mark itself
 //! onboarded.
 //!
@@ -35,7 +35,7 @@ use crate::{
         ProviderCatalogStatus, ProviderId, ProviderUnavailability, SettingMutation,
     },
     provider::{BuiltInProvider, built_in_providers},
-    settings::provider_enablement,
+    settings::{WORKSPACE_ROOTS_LIST, provider_enablement},
     theme::Theme,
 };
 
@@ -44,6 +44,7 @@ use super::{
         AgentSelectionAction, AgentSelectionList, InForce, ProviderModels, failed_listing,
     },
     commands::SemanticCommandId,
+    list_editor::ListEditor,
     list_window::{ListWindow, WindowEntry},
     model_picker::{CatalogStatuses, ModelPicker, ModelPickerPurpose},
     render::{NF_COD_FOLDER, NF_COD_GIT_BRANCH},
@@ -60,6 +61,7 @@ pub(super) struct Onboarding {
     opening: Opening,
     providers: ProvidersStep,
     derivation: DerivationStep,
+    roots: RootsStep,
     icons: IconsStep,
     /// The flow's own re-read of every Provider, which the Providers step's
     /// `r` and the Derivation step's retry rows both ask for, and which the
@@ -71,11 +73,12 @@ pub(super) struct Onboarding {
 enum Step {
     Providers,
     Derivation,
+    Roots,
     Icons,
 }
 
 impl Step {
-    const ALL: [Self; 3] = [Self::Providers, Self::Derivation, Self::Icons];
+    const ALL: [Self; 4] = [Self::Providers, Self::Derivation, Self::Roots, Self::Icons];
 
     /// Where the step stands in the flow, counted from one.
     fn number(self) -> usize {
@@ -100,6 +103,7 @@ impl Step {
         match self {
             Self::Providers => "Providers",
             Self::Derivation => "Derivation",
+            Self::Roots => "Workspace Roots",
             Self::Icons => "Icons",
         }
     }
@@ -236,10 +240,11 @@ fn fit_notes<'a>(
 
 /// Where the pin a step answered with stands, for the steps that wait on the
 /// Server's word that their pin landed before the flow goes on: the
-/// Derivation step, which moves on once it lands, and the Icons step, whose
-/// landing finishes the flow. Until then the step holds still and says it is
-/// saving the answer; a pin the Server refuses is said beneath the step, and
-/// confirming the step again sends its answer again.
+/// Derivation and Workspace Roots steps, which move on once it lands, and
+/// the Icons step, whose landing finishes the flow. Until then the step
+/// holds still and says it is saving the answer; a pin the Server refuses is
+/// said beneath the step, and confirming the step again sends its answer
+/// again.
 #[derive(Clone, Debug, Default)]
 enum Saving {
     #[default]
@@ -1105,6 +1110,219 @@ fn pinned_selection(selection: AgentSelection) -> SettingMutation {
     derivation_pin(DerivationErrand::Pinned(selection))
 }
 
+/// The Workspace Roots step: which directories the user's work lives in,
+/// edited as the settings panel's list editor edits them — typed, or chosen
+/// in the Directory Browser among the Client's own Server's directories —
+/// and answered as one list when the reader moves on. None is an answer as
+/// good as any, so the step never locks Next.
+///
+/// The draft is the step's own until Next pins it whole; Back keeps it as
+/// left without saving it, and leaving the flow drops it. A draft no one has
+/// edited follows the Roots in force, so moving on from a list that still
+/// holds them pins nothing. Next names the first entry the Setting refuses
+/// rather than moving on, and once a pin is sent the step holds still until
+/// it lands, saying beneath the list why one the Server refused never did.
+#[derive(Clone, Debug)]
+struct RootsStep {
+    editor: ListEditor,
+    /// Whether the draft follows the Roots in force, which it does until the
+    /// reader edits it.
+    follows: bool,
+    saving: Saving,
+}
+
+impl Default for RootsStep {
+    fn default() -> Self {
+        Self {
+            editor: ListEditor::open(WORKSPACE_ROOTS_LIST, &EffectiveSettings::default()),
+            follows: true,
+            saving: Saving::default(),
+        }
+    }
+}
+
+/// An edit of the Workspace Roots step's draft.
+#[derive(Clone, Debug)]
+pub(super) enum RootsEdit {
+    Previous,
+    Next,
+    /// Adds typed or pasted text to the end of the focused row.
+    Insert(String),
+    DeleteBackward,
+    Remove,
+    /// Puts a directory chosen in the Directory Browser in the focused
+    /// entry's place, or adds it from the row past the last.
+    Choose(String),
+}
+
+impl RootsStep {
+    const INTRODUCTION: &'static str = "Directories your work lives in. Suru lists each \
+                                        Repository directly inside one as a Workspace, and a \
+                                        Sidekick clones into them.";
+
+    const NOTE: &'static str = "None is fine: add Roots whenever you like in /settings, \
+                                under Source Control.";
+
+    /// The keys this step teaches before the ones every step shares.
+    const KEYS: [&'static str; 3] = ["Tab Browse", "Ctrl+D Remove", "↑↓ Move"];
+
+    /// The focused row, which the step keeps before anything else it draws.
+    const KEPT: usize = 1;
+
+    /// Opens the step afresh on the Roots in force, which the draft follows.
+    fn open(&mut self, settings: &EffectiveSettings) {
+        *self = Self {
+            editor: ListEditor::open(WORKSPACE_ROOTS_LIST, settings),
+            ..Self::default()
+        };
+    }
+
+    /// Follows `settings`, those now in force, while the reader has edited
+    /// nothing.
+    fn adopt(&mut self, settings: &EffectiveSettings) {
+        if self.follows {
+            self.editor.follow(settings);
+        }
+    }
+
+    fn command_for_key(&self, key: KeyEvent) -> Option<CommandId> {
+        let command = match (key.code, key.modifiers) {
+            (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                SemanticCommandId::OnboardingRootsPrevious
+            }
+            (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                SemanticCommandId::OnboardingRootsNext
+            }
+            (KeyCode::Backspace, KeyModifiers::NONE) => {
+                SemanticCommandId::OnboardingRootsDeleteBackward
+            }
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => SemanticCommandId::OnboardingRootsRemove,
+            (KeyCode::Tab, KeyModifiers::NONE) => SemanticCommandId::OnboardingRootsBrowse,
+            (KeyCode::Char(character), modifiers)
+                if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                return Some(CommandId::InvokeSemanticText(
+                    SemanticCommandId::OnboardingRootsInsert,
+                    character.to_string(),
+                ));
+            }
+            _ => return None,
+        };
+        Some(CommandId::InvokeSemantic(command))
+    }
+
+    /// Edits the draft, unless a pin of it is awaited. Any edit but a move
+    /// makes the draft the reader's, which follows the Roots in force no
+    /// more.
+    fn edit(&mut self, edit: RootsEdit) {
+        if self.saving.is_pending() {
+            return;
+        }
+        if !matches!(edit, RootsEdit::Previous | RootsEdit::Next) {
+            self.follows = false;
+        }
+        match edit {
+            RootsEdit::Previous => self.editor.select_previous(),
+            RootsEdit::Next => self.editor.select_next(),
+            RootsEdit::Insert(text) => self.editor.insert(&text),
+            RootsEdit::DeleteBackward => self.editor.delete_backward(),
+            RootsEdit::Remove => self.editor.remove(),
+            RootsEdit::Choose(directory) => self.editor.choose_directory(directory),
+        }
+    }
+
+    /// What confirming the step comes to: nothing to pin where the draft
+    /// holds the Roots in `settings`, those in force, which leaves no earlier
+    /// refusal standing; the draft's pin, sent and awaited; or the step held
+    /// where the Setting refuses an entry.
+    fn confirm(&mut self, settings: &EffectiveSettings) -> Option<Advance> {
+        if self.editor.holds(settings) {
+            self.saving = Saving::Idle;
+            return None;
+        }
+        Some(match self.editor.save() {
+            Some(pin) => self.saving.send(pin),
+            None => Advance::Held,
+        })
+    }
+
+    /// What is said beneath the rows: why the draft was refused or how its
+    /// pin stands, then where Roots may be added later.
+    fn notes(&self, width: usize, theme: &Theme) -> Vec<(WrappedText<'_>, Style)> {
+        let columns = u16::try_from(width).unwrap_or(u16::MAX);
+        self.editor
+            .view()
+            .error
+            .map(|error| (WrappedText::new(error, "", columns), theme.feedback.error))
+            .into_iter()
+            .chain(self.saving.notes(width, theme))
+            .chain([(
+                WrappedText::new(Self::NOTE, "", columns),
+                theme.text.subdued,
+            )])
+            .collect()
+    }
+
+    fn introduction(width: usize) -> WrappedText<'static> {
+        WrappedText::new(
+            Self::INTRODUCTION,
+            "",
+            u16::try_from(width).unwrap_or(u16::MAX),
+        )
+    }
+
+    /// How many lines the step draws with every row in view.
+    fn rows_wanted(&self, width: usize, theme: &Theme) -> usize {
+        let said = self
+            .notes(width, theme)
+            .iter()
+            .map(|(note, _)| note.height())
+            .sum::<usize>();
+        // The introduction and the gap beneath it, every entry and the row
+        // a new one is added at, and the gap above what is said beneath.
+        Self::introduction(width).height() + 1 + self.editor.view().entries.len() + 1 + 1 + said
+    }
+
+    /// The step drawn within `width` columns and `room` lines beneath the
+    /// header: the introduction, the rows through their window, and what is
+    /// said beneath them. The focused row is kept above all; what is said
+    /// beneath keeps its lines from its start before the introduction does,
+    /// and the rows scroll within whatever room is left.
+    fn lines(&self, width: usize, room: usize, theme: &Theme) -> Drawn<'_> {
+        // What is said beneath leaves room for the focused row and the gap
+        // above itself.
+        let (notes, said) = fit_notes(
+            self.notes(width, theme),
+            room.saturating_sub(Self::KEPT + 1),
+        );
+        let introduction = Self::introduction(width);
+        let available = room.saturating_sub(said + usize::from(said > 0));
+        // The gap beneath the introduction gives way before it does.
+        let given = given_way(Self::KEPT, &[1, introduction.height()], available);
+        let mut lines = Vec::new();
+        let mut wrapped = Vec::new();
+        if given < 2 {
+            wrapped.push(introduction.wrapped(0));
+            lines.extend(introduction.lines(theme.text.subdued));
+        }
+        if given < 1 {
+            lines.push(Line::default());
+        }
+        let capacity = available.saturating_sub(lines.len()).max(Self::KEPT);
+        lines.extend(self.editor.view().rows(width, capacity, theme));
+        if said > 0 {
+            lines.push(Line::default());
+        }
+        for (note, style) in notes {
+            if note.height() > 0 {
+                wrapped.push(note.wrapped(lines.len()));
+                lines.extend(note.lines(style));
+            }
+        }
+        Drawn { lines, wrapped }
+    }
+}
+
 /// The Icons step: a sample of Nerd Font glyphs, drawn whatever Show icons
 /// holds, and the reader's word on how this terminal draws them, which
 /// decides whether Suru shows Icons. On a first run neither answer is under
@@ -1404,6 +1622,7 @@ impl Onboarding {
             ..Self::default()
         };
         self.derivation.open(server);
+        self.roots.open(server.settings);
         self.icons.open(opening, server.settings);
     }
 
@@ -1413,6 +1632,7 @@ impl Onboarding {
         if self.is_open() {
             self.providers.follow(server.settings);
             self.derivation.adopt(server, heard);
+            self.roots.adopt(server.settings);
             self.icons.adopt(server.settings);
         }
     }
@@ -1447,6 +1667,11 @@ impl Onboarding {
             // A step whose pin is awaited holds still until it lands.
             Some(Step::Derivation) if self.derivation.saving.is_pending() => Advance::Held,
             Some(Step::Derivation) => self.derivation.confirm(&mut self.recheck, server.pushes),
+            Some(Step::Roots) if self.roots.saving.is_pending() => Advance::Held,
+            Some(Step::Roots) => match self.roots.confirm(server.settings) {
+                Some(advance) => advance,
+                None => self.move_on(),
+            },
             Some(Step::Providers | Step::Icons) | None => self.move_on(),
         }
     }
@@ -1522,9 +1747,9 @@ impl Onboarding {
     /// Takes the Server's acceptance of the edit asked for under `request`,
     /// where the flow awaits it, answering whether that finishes the flow: a
     /// Provider's toggle is answered, settling once `settings`, those in
-    /// force, show it, the Derivation step's pin moves the flow on, and the
-    /// Icons step's finishes it. The answer to any other edit settles
-    /// nothing the flow awaits.
+    /// force, show it, the Derivation and Workspace Roots steps' pins move
+    /// the flow on, and the Icons step's finishes it. The answer to any other
+    /// edit settles nothing the flow awaits.
     pub(super) fn edit_landed(
         &mut self,
         request: SettingRequest,
@@ -1539,6 +1764,12 @@ impl Onboarding {
             }
             return false;
         }
+        if self.roots.saving.land(request) {
+            if self.step == Some(Step::Roots) {
+                self.move_on();
+            }
+            return false;
+        }
         self.icons.saving.land(request)
     }
 
@@ -1549,13 +1780,17 @@ impl Onboarding {
     pub(super) fn edit_refused(&mut self, request: SettingRequest, error: &str) -> bool {
         self.providers.refuse(request, error)
             || self.derivation.saving.refuse(request, error)
+            || self.roots.saving.refuse(request, error)
             || self.icons.saving.refuse(request, error)
     }
 
     /// Returns to the step before the one on show, where there is one and
     /// no step awaits its pin.
     pub(super) fn back(&mut self) {
-        if self.derivation.saving.is_pending() || self.icons.saving.is_pending() {
+        if self.derivation.saving.is_pending()
+            || self.roots.saving.is_pending()
+            || self.icons.saving.is_pending()
+        {
             return;
         }
         if let Some(previous) = self.step.and_then(Step::previous) {
@@ -1647,6 +1882,26 @@ impl Onboarding {
         self.providers.toggle(settings)
     }
 
+    /// Whether the Workspace Roots step is on show, which is where its own
+    /// commands act and nowhere else.
+    pub(super) fn shows_roots(&self) -> bool {
+        self.step == Some(Step::Roots)
+    }
+
+    /// Whether a Root may be chosen in the Directory Browser for the
+    /// Workspace Roots step: while it is on show and awaits no pin, whose
+    /// draft is held still.
+    pub(super) fn browses_roots(&self) -> bool {
+        self.shows_roots() && !self.roots.saving.is_pending()
+    }
+
+    /// Edits the Workspace Roots step's draft, while that step is on show.
+    pub(super) fn edit_roots(&mut self, edit: RootsEdit) {
+        if self.shows_roots() {
+            self.roots.edit(edit);
+        }
+    }
+
     /// Whether the Icons step is on show, which is where its own commands act
     /// and nowhere else.
     fn shows_icons(&self) -> bool {
@@ -1669,11 +1924,19 @@ impl Onboarding {
 
     /// What `event` asks of the flow: whatever the step on show makes of it
     /// first, and otherwise one of the keys every step shares — Enter for
-    /// Next, Left or Shift+Tab for Back, and Esc to leave.
+    /// Next, Left or Shift+Tab for Back, and Esc to leave. A paste is text
+    /// for the Workspace Roots step's focused row, and nothing elsewhere.
     pub(super) fn command_for_event(&self, event: InputEvent) -> Option<CommandId> {
         let step = self.step?;
-        let InputEvent::Key(key) = event else {
-            return None;
+        let key = match event {
+            InputEvent::Key(key) => key,
+            InputEvent::Paste(text) if step == Step::Roots => {
+                return Some(CommandId::InvokeSemanticText(
+                    SemanticCommandId::OnboardingRootsInsert,
+                    text,
+                ));
+            }
+            _ => return None,
         };
         if key.kind != KeyEventKind::Press {
             return None;
@@ -1681,6 +1944,7 @@ impl Onboarding {
         let own = match step {
             Step::Providers => self.providers.command_for_key(key),
             Step::Derivation => self.derivation.command_for_key(key),
+            Step::Roots => self.roots.command_for_key(key),
             Step::Icons => self.icons.command_for_key(key),
         };
         own.or_else(|| {
@@ -1741,6 +2005,10 @@ impl Onboarding {
                 drawn.lines.push(Line::default());
                 drawn.draw_step(height, |room| self.derivation.lines(width, room, theme));
             }
+            Step::Roots => {
+                drawn.lines.push(Line::default());
+                drawn.draw_step(height, |room| self.roots.lines(width, room, theme));
+            }
             // So does the Icons step, before its sample and its answers.
             Step::Icons => drawn.draw_step(height, |room| self.icons.lines(width, room, theme)),
         }
@@ -1748,6 +2016,7 @@ impl Onboarding {
         let own_keys: &[&str] = match step {
             Step::Providers => &ProvidersStep::KEYS,
             Step::Derivation => &DerivationStep::KEYS,
+            Step::Roots => &RootsStep::KEYS,
             Step::Icons => &IconsStep::KEYS,
         };
         let footer = footer(step, own_keys, width);
@@ -1773,6 +2042,7 @@ impl Onboarding {
                 .providers
                 .rows_wanted(width, theme, server, &self.recheck),
             Step::Derivation => 1 + self.derivation.rows_wanted(width, theme),
+            Step::Roots => 1 + self.roots.rows_wanted(width, theme),
             Step::Icons => self.icons.rows_wanted(width, theme),
         };
         1 + step_rows + 1

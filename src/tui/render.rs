@@ -56,7 +56,7 @@ use super::{
         ApplicationNoticeSlotContext, LandingFooterSlotContext, PromptContextSlotContext,
         PromptFooterSlotContext, RenderSlots, RenderedSlot, SessionComposerTopSlotContext,
         SlotText, WorkingIndicatorInterrupt, WorkingIndicatorSlotContext, WorkingIndicatorState,
-        truncate_slot_text, truncate_to_width,
+        truncate_from_left_to_width, truncate_slot_text, truncate_to_width,
     },
     spinner,
     state::{
@@ -376,6 +376,7 @@ pub(super) fn render_with_slots(
     }
     if state.directory_browser.is_open()
         && !state.directory_browser.opened_from_list_editor()
+        && !state.directory_browser.opened_from_onboarding()
         && !state.reconnect_overlay_visible()
     {
         render_directory_browser(frame, state, main, theme);
@@ -400,6 +401,10 @@ pub(super) fn render_with_slots(
     // and beneath the choice pickers one of its steps may open over it.
     if state.onboarding.is_open() && !state.reconnect_overlay_visible() {
         render_onboarding(frame, state, main, theme);
+        // Opened from the Workspace Roots step, the browser stands over it.
+        if state.directory_browser.opened_from_onboarding() {
+            render_directory_browser(frame, state, main, theme);
+        }
     }
     // Choice pickers can be opened by a settings row, so they are drawn over
     // the panel that asked and take the reader's answer first.
@@ -1613,24 +1618,7 @@ fn render_list_editor(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme
         truncate_to_width(editor.label, content_width),
         theme.text.subdued,
     )];
-    let shown = editor
-        .window
-        .settle_rows(rows, capacity, Some(editor.focus));
-    for index in shown {
-        let focused = index == editor.focus;
-        let marker = if focused { "› " } else { "  " };
-        let text_width = content_width.saturating_sub(marker.width());
-        let (text, style) = match editor.entries.get(index) {
-            Some(entry) if focused => (
-                truncate_from_left_to_width(entry, text_width),
-                theme.selection.focused,
-            ),
-            Some(entry) => (truncate_to_width(entry, text_width), theme.form_field.text),
-            None if focused => (editor.placeholder.to_owned(), theme.selection.focused),
-            None => (editor.placeholder.to_owned(), theme.text.subdued),
-        };
-        lines.push(Line::styled(format!("{marker}{text}"), style));
-    }
+    lines.extend(editor.rows(content_width, capacity, theme));
     lines.push(Line::styled(
         truncate_to_width(editor.error.unwrap_or(""), content_width),
         theme.feedback.error,
@@ -3567,30 +3555,6 @@ fn session_picker_row_line(
         Span::styled(content[start..end].to_owned(), tag_style),
         Span::styled(content[end..].to_owned(), row_style),
     ])
-}
-
-fn truncate_from_left_to_width(value: &str, width: usize) -> String {
-    if value.width() <= width {
-        return value.to_owned();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    if width == 1 {
-        return "…".to_owned();
-    }
-    let suffix_width = width - 1;
-    let mut suffix = String::new();
-    let mut used = 0_usize;
-    for character in value.chars().rev() {
-        let character_width = character.width().unwrap_or(1);
-        if used.saturating_add(character_width) > suffix_width {
-            break;
-        }
-        suffix.insert(0, character);
-        used += character_width;
-    }
-    format!("…{suffix}")
 }
 
 fn relative_update_time(updated_at: SessionTimestamp, now: u64) -> String {

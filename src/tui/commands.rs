@@ -224,6 +224,20 @@ pub enum SemanticCommandId {
     OnboardingDerivationNext,
     OnboardingDerivationPageUp,
     OnboardingDerivationPageDown,
+    /// Moves focus on Onboarding's Workspace Roots step to the row above, or
+    /// below, wrapping past either end.
+    OnboardingRootsPrevious,
+    OnboardingRootsNext,
+    /// Adds the typed or pasted text its invocation carries to the end of
+    /// the focused row of Onboarding's Workspace Roots step.
+    OnboardingRootsInsert,
+    OnboardingRootsDeleteBackward,
+    /// Removes the focused entry from Onboarding's Workspace Roots step.
+    OnboardingRootsRemove,
+    /// Opens the Directory Browser over Onboarding's Workspace Roots step,
+    /// whose choice stands in the focused entry's place or is added at the
+    /// row past the last entry.
+    OnboardingRootsBrowse,
     SidebarToggle,
     SidebarWiden,
     SidebarNarrow,
@@ -678,6 +692,12 @@ impl SemanticCommandId {
             Self::OnboardingDerivationNext => "onboarding.derivation.next",
             Self::OnboardingDerivationPageUp => "onboarding.derivation.page-up",
             Self::OnboardingDerivationPageDown => "onboarding.derivation.page-down",
+            Self::OnboardingRootsPrevious => "onboarding.roots.previous",
+            Self::OnboardingRootsNext => "onboarding.roots.next",
+            Self::OnboardingRootsInsert => "onboarding.roots.insert",
+            Self::OnboardingRootsDeleteBackward => "onboarding.roots.delete-backward",
+            Self::OnboardingRootsRemove => "onboarding.roots.remove",
+            Self::OnboardingRootsBrowse => "onboarding.roots.browse",
             Self::SidebarToggle => "sidebar.toggle",
             Self::SidebarWiden => "sidebar.width.widen",
             Self::SidebarNarrow => "sidebar.width.narrow",
@@ -2135,7 +2155,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         // The flow onboards the Client's own Server whichever way the Outlook
         // is turned, and opening it asks nothing of any Server.
         reach: SemanticReach::Client,
-        description: "Take Onboarding again: Providers, derivation, and Icons",
+        description: "Take Onboarding again: Providers, derivation, Workspace Roots, and Icons",
         slash: Some(SlashCommand {
             name: "onboarding",
             aliases: &[],
@@ -2249,6 +2269,56 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Page Derivation Choices Down",
         reach: SemanticReach::Client,
         description: "Move a page down the choices in Onboarding's derivation step",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingRootsPrevious,
+        title: "Previous Onboarding Root",
+        reach: SemanticReach::Client,
+        description: "Focus the row above on Onboarding's Workspace Roots step",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingRootsNext,
+        title: "Next Onboarding Root",
+        reach: SemanticReach::Client,
+        description: "Focus the row below on Onboarding's Workspace Roots step",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingRootsInsert,
+        title: "Insert Onboarding Root Text",
+        reach: SemanticReach::Client,
+        description: "Add typed or pasted text to the focused row on Onboarding's Workspace Roots step",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingRootsDeleteBackward,
+        title: "Delete Onboarding Root Text",
+        reach: SemanticReach::Client,
+        description: "Take the last character back from the focused row on Onboarding's Workspace Roots step",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingRootsRemove,
+        title: "Remove Onboarding Root",
+        reach: SemanticReach::Client,
+        description: "Remove the focused entry on Onboarding's Workspace Roots step",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::OnboardingRootsBrowse,
+        title: "Browse for an Onboarding Root",
+        // The browser lists the Client's own Server's directories, whose
+        // Onboarding this is, so no Remote's loss refuses it.
+        reach: SemanticReach::Client,
+        description: "Choose the focused Workspace Root on Onboarding's step in the Directory Browser",
         slash: None,
         keybinding: None,
     },

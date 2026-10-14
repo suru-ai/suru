@@ -432,6 +432,32 @@ pub(super) fn truncate_slot_text(items: Vec<SlotText>, width: usize) -> Vec<Slot
     result
 }
 
+/// `value` cut from its start to fit `width` columns, an ellipsis standing
+/// for what was cut, so its end stays in view.
+pub(super) fn truncate_from_left_to_width(value: &str, width: usize) -> String {
+    if value.width() <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    let suffix_width = width - 1;
+    let mut suffix = String::new();
+    let mut used = 0_usize;
+    for character in value.chars().rev() {
+        let character_width = character.width().unwrap_or(1);
+        if used.saturating_add(character_width) > suffix_width {
+            break;
+        }
+        suffix.insert(0, character);
+        used += character_width;
+    }
+    format!("…{suffix}")
+}
+
 pub(super) fn truncate_to_width(value: &str, width: usize) -> String {
     truncate_slot_text(vec![SlotText::new(value, Style::default())], width)
         .into_iter()

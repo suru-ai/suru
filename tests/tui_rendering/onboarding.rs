@@ -1,8 +1,11 @@
-//! Onboarding: the three-step pass a Client offers over the Landing of its
+//! Onboarding: the four-step pass a Client offers over the Landing of its
 //! own Server until that Server has been onboarded, and `/onboarding` takes
 //! again whenever the reader likes.
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use crate::support::{
     MutatesSetting, connected_application, deliver_settings, enter_session, fixture_instance_id,
@@ -16,17 +19,18 @@ use ratatui::style::Modifier;
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AgentSelection, DerivationErrand, DerivationSettings, EffectiveSettings, Health,
-        ModelAvailability, ModelCatalog, ModelId, ModelOptionChoice, ModelOptionChoiceId,
-        ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
-        ModelOptionSelection, ModelOptionValue, Outlook, ProviderCatalogStatus, ProviderId,
-        ProviderModelCatalog, ProviderUnavailability, RemoteHealth, RemoteStatus, SettingMutation,
-        SettingsDiagnostic, SettingsDiagnosticSeverity, SettingsSnapshot, SidebarSettings,
-        SidebarVisibility, TextSelectionCopy, Way,
+        AgentSelection, ChildDirectory, DerivationErrand, DerivationSettings, DirectoryListing,
+        DirectorySourceControl, EffectiveSettings, Health, ModelAvailability, ModelCatalog,
+        ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
+        ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue, Outlook,
+        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderUnavailability,
+        RemoteHealth, RemoteStatus, SettingMutation, SettingsDiagnostic,
+        SettingsDiagnosticSeverity, SettingsSnapshot, SidebarSettings, SidebarVisibility,
+        TextSelectionCopy, Way, WorkspaceSettings,
     },
     tui::{
-        Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
-        SettingRequest, TerminalFacts,
+        Application, ApplicationEvent, ApplicationTransition, CommandId, DirectoryListingId,
+        SemanticCommandId, SettingRequest, TerminalFacts,
     },
 };
 
@@ -76,7 +80,7 @@ fn press_with(
 }
 
 fn onboarding_shown(application: &Application) -> bool {
-    screen(application).contains(" of 3")
+    screen(application).contains(" of 4")
 }
 
 #[test]
@@ -91,7 +95,7 @@ fn a_client_offers_onboarding_over_the_landing_once_it_holds_health_and_settings
 
     deliver_settings(&mut application, EffectiveSettings::default());
     let offered = screen(&application);
-    assert!(offered.contains("Step 1 of 3"), "{offered}");
+    assert!(offered.contains("Step 1 of 4"), "{offered}");
     assert!(offered.contains("Providers"), "{offered}");
     assert!(
         offered.contains("Agent unavailable"),
@@ -102,7 +106,7 @@ fn a_client_offers_onboarding_over_the_landing_once_it_holds_health_and_settings
     deliver_settings(&mut settings_first, EffectiveSettings::default());
     assert!(!onboarding_shown(&settings_first), "nor are settings alone");
     connect(&mut settings_first, unonboarded_health());
-    assert!(screen(&settings_first).contains("Step 1 of 3"));
+    assert!(screen(&settings_first).contains("Step 1 of 4"));
 }
 
 #[test]
@@ -171,7 +175,7 @@ fn onboarding_offered_beneath_connect_is_withdrawn_once_a_remote_is_chosen() {
 
     turn_outlook(&mut application, KeyCode::Up);
     assert!(
-        screen(&application).contains("Step 1 of 3"),
+        screen(&application).contains("Step 1 of 4"),
         "back on its own Server, the Client offers it again: {}",
         screen(&application)
     );
@@ -210,7 +214,7 @@ fn a_client_viewing_a_remote_offers_no_onboarding_there() {
         }
     );
     assert!(
-        screen(&application).contains("Step 1 of 3"),
+        screen(&application).contains("Step 1 of 4"),
         "back on its own Server, the Client offers it: {}",
         screen(&application)
     );
@@ -221,40 +225,53 @@ fn the_header_counts_the_steps_as_next_and_back_move_between_them() {
     let workspace = workspace_dir();
     let mut application = offered_onboarding(workspace.path());
     let first = screen(&application);
-    assert!(first.contains("Step 1 of 3"), "{first}");
+    assert!(first.contains("Step 1 of 4"), "{first}");
     assert!(first.contains("Next"), "{first}");
     assert!(!first.contains("Back"), "the first step has none: {first}");
     assert_eq!(
         press(&mut application, KeyCode::Left),
         ApplicationTransition::Continue
     );
-    assert!(screen(&application).contains("Step 1 of 3"));
+    assert!(screen(&application).contains("Step 1 of 4"));
 
     assert_eq!(
         press(&mut application, KeyCode::Enter),
         ApplicationTransition::Continue
     );
     let second = screen(&application);
-    assert!(second.contains("Step 2 of 3"), "{second}");
+    assert!(second.contains("Step 2 of 4"), "{second}");
     assert!(second.contains("Derivation"), "{second}");
     assert!(second.contains("Back"), "{second}");
 
     press(&mut application, KeyCode::Left);
-    assert!(screen(&application).contains("Step 1 of 3"));
+    assert!(screen(&application).contains("Step 1 of 4"));
     press(&mut application, KeyCode::Enter);
     pass_the_derivation_step(&mut application, EffectiveSettings::default());
     let third = screen(&application);
-    assert!(third.contains("Step 3 of 3"), "{third}");
-    assert!(third.contains("Icons"), "{third}");
-    assert!(third.contains("Finish"), "the last step finishes: {third}");
+    assert!(third.contains("Step 3 of 4 · Workspace Roots"), "{third}");
+    assert!(third.contains("Next"), "{third}");
+
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "Roots left as they stand pin nothing"
+    );
+    let fourth = screen(&application);
+    assert!(fourth.contains("Step 4 of 4 · Icons"), "{fourth}");
+    assert!(
+        fourth.contains("Finish"),
+        "the last step finishes: {fourth}"
+    );
     press_with(&mut application, KeyCode::BackTab, KeyModifiers::SHIFT);
-    assert!(screen(&application).contains("Step 2 of 3"));
+    assert!(screen(&application).contains("Step 3 of 4"));
+    press(&mut application, KeyCode::Left);
+    assert!(screen(&application).contains("Step 2 of 4"));
 }
 
 #[test]
 fn leaving_at_any_step_marks_the_server_onboarded_and_closes_for_good() {
     let workspace = workspace_dir();
-    for step in 0..3 {
+    for step in 0..4 {
         let mut application = offered_onboarding(workspace.path());
         if step >= 1 {
             press(&mut application, KeyCode::Enter);
@@ -262,7 +279,10 @@ fn leaving_at_any_step_marks_the_server_onboarded_and_closes_for_good() {
         if step >= 2 {
             pass_the_derivation_step(&mut application, EffectiveSettings::default());
         }
-        assert!(screen(&application).contains(&format!("Step {} of 3", step + 1)));
+        if step >= 3 {
+            press(&mut application, KeyCode::Enter);
+        }
+        assert!(screen(&application).contains(&format!("Step {} of 4", step + 1)));
 
         assert_eq!(
             press(&mut application, KeyCode::Esc),
@@ -348,14 +368,14 @@ fn slash_onboarding_still_opens_the_flow_the_reader_left() {
     type_terminal_text(&mut application, "/onboarding");
     press(&mut application, KeyCode::Enter);
     assert!(
-        screen(&application).contains("Step 1 of 3"),
+        screen(&application).contains("Step 1 of 4"),
         "{}",
         screen(&application)
     );
 }
 
 #[test]
-fn finishing_the_third_step_marks_the_server_onboarded_and_closes() {
+fn finishing_the_last_step_marks_the_server_onboarded_and_closes() {
     let workspace = workspace_dir();
     let mut application = offered_onboarding(workspace.path());
     assert_eq!(
@@ -365,7 +385,12 @@ fn finishing_the_third_step_marks_the_server_onboarded_and_closes() {
     let derivation = press(&mut application, KeyCode::Enter);
     assert_eq!(derivation, derivation_pin(DerivationErrand::FollowSession));
     settle_mutation(&mut application, &derivation, EffectiveSettings::default());
-    assert!(screen(&application).contains("Step 3 of 3"));
+    assert!(screen(&application).contains("Step 3 of 4"));
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+    assert!(screen(&application).contains("Step 4 of 4"));
     press(&mut application, KeyCode::Down);
     let pin = finish_with(&mut application, true);
     assert_eq!(
@@ -394,7 +419,7 @@ fn hearing_the_server_was_onboarded_elsewhere_closes_the_flow() {
     let workspace = workspace_dir();
     let mut application = offered_onboarding(workspace.path());
     press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("Step 2 of 3"));
+    assert!(screen(&application).contains("Step 2 of 4"));
 
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Onboarded(true)))
@@ -409,7 +434,7 @@ fn a_reconnect_saying_the_server_was_onboarded_meanwhile_closes_the_offered_flow
     let workspace = workspace_dir();
     let mut application = offered_onboarding(workspace.path());
     press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("Step 2 of 3"));
+    assert!(screen(&application).contains("Step 2 of 4"));
 
     connect(
         &mut application,
@@ -430,7 +455,7 @@ fn a_retake_the_reader_asked_for_stays_open_whatever_the_server_says() {
     type_terminal_text(&mut application, "/onboarding");
     press(&mut application, KeyCode::Enter);
     press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("Step 2 of 3"));
+    assert!(screen(&application).contains("Step 2 of 4"));
 
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Onboarded(true)))
@@ -440,7 +465,7 @@ fn a_retake_the_reader_asked_for_stays_open_whatever_the_server_says() {
         ready_health(fixture_instance_id(), 42_424),
     );
     assert!(
-        screen(&application).contains("Step 2 of 3"),
+        screen(&application).contains("Step 2 of 4"),
         "the reader asked for it, so it is theirs to leave: {}",
         screen(&application)
     );
@@ -454,9 +479,9 @@ fn slash_onboarding_takes_the_flow_again_from_the_first_step() {
 
     type_terminal_text(&mut application, "/onboarding");
     press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("Step 1 of 3"));
+    assert!(screen(&application).contains("Step 1 of 4"));
     press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("Step 2 of 3"));
+    assert!(screen(&application).contains("Step 2 of 4"));
     assert_eq!(
         press(&mut application, KeyCode::Esc),
         ApplicationTransition::MarkOnboarded
@@ -468,7 +493,7 @@ fn slash_onboarding_takes_the_flow_again_from_the_first_step() {
         )))
         .expect("invoke onboarding.open");
     assert!(
-        screen(&application).contains("Step 1 of 3"),
+        screen(&application).contains("Step 1 of 4"),
         "it opens again at the first step: {}",
         screen(&application)
     );
@@ -485,7 +510,7 @@ fn slash_onboarding_opens_over_an_open_session() {
     type_terminal_text(&mut application, "/onboarding");
     press(&mut application, KeyCode::Enter);
     let over_session = screen(&application);
-    assert!(over_session.contains("Step 1 of 3"), "{over_session}");
+    assert!(over_session.contains("Step 1 of 4"), "{over_session}");
     assert!(over_session.contains("Initial Prompt"), "{over_session}");
 }
 
@@ -519,7 +544,7 @@ fn the_launch_notice_waits_beneath_onboarding_and_is_read_once_it_closes() {
         .expect("receive the settings snapshot with a startup diagnostic");
     let notice = |application: &Application| screen(application).contains("see the Log");
     let offered = screen(&application);
-    assert!(offered.contains("Step 1 of 3"), "{offered}");
+    assert!(offered.contains("Step 1 of 4"), "{offered}");
     assert!(notice(&application), "{offered}");
 
     press(&mut application, KeyCode::Enter);
@@ -779,7 +804,7 @@ fn space_writes_the_provider_under_the_cursor_through_its_enablement_at_once() {
         "and Space turns a Provider back on"
     );
     assert!(
-        screen(&application).contains("Step 1 of 3"),
+        screen(&application).contains("Step 1 of 4"),
         "toggling moves no step"
     );
 }
@@ -1164,7 +1189,7 @@ fn only_the_newest_recheck_answers_for_the_rows() {
     assert!(!after.contains("Could not re-check"), "{after}");
     press(&mut application, KeyCode::Enter);
     assert!(
-        screen(&application).contains("Step 2 of 3"),
+        screen(&application).contains("Step 2 of 4"),
         "{}",
         screen(&application)
     );
@@ -1401,7 +1426,7 @@ fn a_tiny_screen_acts_on_no_provider_it_does_not_draw() {
     push_catalog(&mut application, &every_cli_missing());
 
     let tiny = rendered_application_rows_at(&application, 40, 8).join("\n");
-    assert!(tiny.contains("Step 1 of 3"), "{tiny}");
+    assert!(tiny.contains("Step 1 of 4"), "{tiny}");
     assert!(
         tiny.contains("Next is locked: no enabled") && tiny.contains("Provider is available."),
         "why Next is locked is given whole: {tiny}"
@@ -1440,12 +1465,12 @@ fn a_tiny_screen_acts_on_no_provider_it_does_not_draw() {
     assert!(
         rendered_application_rows_at(&application, 40, 8)
             .join("\n")
-            .contains("Step 1 of 3"),
+            .contains("Step 1 of 4"),
         "Enter passes no step whose rows the screen did not draw"
     );
     press(&mut application, KeyCode::Enter);
     assert!(
-        screen(&application).contains("Step 2 of 3"),
+        screen(&application).contains("Step 2 of 4"),
         "and passes it once they are drawn: {}",
         screen(&application)
     );
@@ -1458,10 +1483,10 @@ fn a_narrow_terminal_teaches_next_or_finish_and_leave_whole_at_every_step() {
     let workspace = workspace_dir();
     let mut application = offered_onboarding(workspace.path());
     push_catalog(&mut application, &[("codex", ProviderCatalogStatus::Fresh)]);
-    for (step, go_on) in [(1, "Next"), (2, "Next"), (3, "Finish")] {
+    for (step, go_on) in [(1, "Next"), (2, "Next"), (3, "Next"), (4, "Finish")] {
         let rows = rendered_application_rows_at(&application, 28, 24);
         let shown = rows.join("\n");
-        assert!(shown.contains(&format!("Step {step} of 3")), "{shown}");
+        assert!(shown.contains(&format!("Step {step} of 4")), "{shown}");
         let foot = rows
             .iter()
             .find(|row| row.contains("Esc Leave"))
@@ -1558,7 +1583,7 @@ fn next_stays_locked_while_no_enabled_provider_is_available_and_unlocks_once_one
         ApplicationTransition::Continue
     );
     assert!(
-        screen(&application).contains("Step 1 of 3"),
+        screen(&application).contains("Step 1 of 4"),
         "Enter moves nowhere: {}",
         screen(&application)
     );
@@ -1572,7 +1597,7 @@ fn next_stays_locked_while_no_enabled_provider_is_available_and_unlocks_once_one
     assert!(!unlocked.contains("Next is locked"), "{unlocked}");
     press(&mut application, KeyCode::Enter);
     assert!(
-        screen(&application).contains("Step 2 of 3"),
+        screen(&application).contains("Step 2 of 4"),
         "one available Provider is enough: {}",
         screen(&application)
     );
@@ -1619,7 +1644,7 @@ fn next_stays_locked_while_every_provider_is_disabled() {
         "{locked}"
     );
     press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("Step 1 of 3"));
+    assert!(screen(&application).contains("Step 1 of 4"));
 
     let toggle = press(&mut application, KeyCode::Char(' '));
     assert_eq!(
@@ -1658,7 +1683,7 @@ fn an_available_provider_that_is_disabled_does_not_unlock_next() {
         screen(&application)
     );
     press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("Step 1 of 3"));
+    assert!(screen(&application).contains("Step 1 of 4"));
 }
 
 #[test]
@@ -1680,7 +1705,7 @@ fn a_warning_or_refreshing_provider_does_not_lock_next() {
         );
         press(&mut application, KeyCode::Enter);
         assert!(
-            screen(&application).contains("Step 2 of 3"),
+            screen(&application).contains("Step 2 of 4"),
             "{}",
             screen(&application)
         );
@@ -1726,7 +1751,7 @@ fn slash_onboarding_shows_providers_turned_off_in_the_settings_panel() {
 
     type_terminal_text(&mut application, "/onboarding");
     press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("Step 1 of 3"));
+    assert!(screen(&application).contains("Step 1 of 4"));
     assert!(provider_row(&application, "Codex").contains("[x] Codex"));
     assert!(
         provider_row(&application, "Copilot").contains("[ ] Copilot"),
@@ -1864,7 +1889,7 @@ fn on_the_derivation_step(workspace: &Path, settings: EffectiveSettings) -> Appl
     deliver_catalog(&mut application, pushed_catalog());
     press(&mut application, KeyCode::Enter);
     assert!(
-        screen(&application).contains("Step 2 of 3"),
+        screen(&application).contains("Step 2 of 4"),
         "{}",
         screen(&application)
     );
@@ -1981,7 +2006,7 @@ fn confirming_the_providers_default_or_off_pins_that_value_and_moves_on_to_icons
         &pin,
         settings_deriving_with(DerivationErrand::FollowSession),
     );
-    assert!(screen(&application).contains("Step 3 of 3"));
+    assert!(screen(&application).contains("Step 3 of 4"));
 
     press(&mut application, KeyCode::Left);
     press(&mut application, KeyCode::Down);
@@ -1997,7 +2022,7 @@ fn confirming_the_providers_default_or_off_pins_that_value_and_moves_on_to_icons
         &pin,
         settings_deriving_with(DerivationErrand::Off),
     );
-    assert!(screen(&application).contains("Step 3 of 3"));
+    assert!(screen(&application).contains("Step 3 of 4"));
 }
 
 #[test]
@@ -2032,7 +2057,7 @@ fn confirming_a_model_without_model_options_pins_it_and_moves_on_to_icons() {
             options: Vec::new(),
         })),
     );
-    assert!(screen(&application).contains("Step 3 of 3"));
+    assert!(screen(&application).contains("Step 3 of 4"));
 }
 
 #[test]
@@ -2069,7 +2094,7 @@ fn a_model_with_model_options_opens_them_over_the_step_and_pins_only_what_was_ch
     );
     let cancelled = screen(&application);
     assert!(
-        cancelled.contains("Step 2 of 3") && !cancelled.contains("Model Options"),
+        cancelled.contains("Step 2 of 4") && !cancelled.contains("Model Options"),
         "cancelling the options leaves the reader on the step: {cancelled}"
     );
 
@@ -2106,7 +2131,7 @@ fn a_model_with_model_options_opens_them_over_the_step_and_pins_only_what_was_ch
     );
     let moved_on = screen(&application);
     assert!(
-        moved_on.contains("Step 3 of 3") && !moved_on.contains("Model Options"),
+        moved_on.contains("Step 3 of 4") && !moved_on.contains("Model Options"),
         "choosing the options answers the step: {moved_on}"
     );
 }
@@ -2189,7 +2214,7 @@ fn a_provider_whose_listing_failed_is_retried_from_the_derivation_step() {
     );
 
     let recheck = retry(&mut application);
-    assert!(screen(&application).contains("Step 2 of 3"));
+    assert!(screen(&application).contains("Step 2 of 4"));
     answer_recheck(&mut application, recheck, Ok(pushed_catalog()));
     let listed = screen(&application);
     assert!(
@@ -2278,7 +2303,7 @@ fn retrying_on_the_derivation_step_viewing_studio(workspace: &Path) -> Applicati
     press(&mut application, KeyCode::Enter);
     press(&mut application, KeyCode::Enter);
     let shown = screen(&application);
-    assert!(shown.contains("Step 2 of 3"), "{shown}");
+    assert!(shown.contains("Step 2 of 4"), "{shown}");
     assert!(
         shown.contains("GPT-5 Mini") && !shown.contains("Studio Model"),
         "the Models offered are the Client's own Server's, whose Setting is pinned: {shown}"
@@ -2393,7 +2418,7 @@ fn applying_options_opened_elsewhere_does_not_answer_the_derivation_step() {
     let workspace = workspace_dir();
     let mut application = choosing_options_on_the_derivation_step(workspace.path());
     press(&mut application, KeyCode::Esc);
-    assert!(screen(&application).contains("Step 2 of 3"));
+    assert!(screen(&application).contains("Step 2 of 4"));
 
     let ApplicationTransition::ListModels(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
@@ -2430,7 +2455,7 @@ fn applying_options_opened_elsewhere_does_not_answer_the_derivation_step() {
         "the Agent's options pin nothing: {applied:?}"
     );
     assert!(
-        screen(&application).contains("Step 2 of 3"),
+        screen(&application).contains("Step 2 of 4"),
         "and leave the Derivation step unanswered: {}",
         screen(&application)
     );
@@ -2483,7 +2508,7 @@ fn options_for_a_provider_turned_off_or_found_unavailable_meanwhile_refuse_to_ap
         &pin,
         settings_deriving_with(DerivationErrand::Pinned(cheap_selection(Vec::new()))),
     );
-    assert!(screen(&application).contains("Step 3 of 3"));
+    assert!(screen(&application).contains("Step 3 of 4"));
 }
 
 #[test]
@@ -2609,7 +2634,7 @@ fn a_failed_retry_of_the_clients_own_server_shows_its_retry_rows_while_a_remote_
     );
 
     let failed = screen(&application);
-    assert!(failed.contains("Step 2 of 3"), "{failed}");
+    assert!(failed.contains("Step 2 of 4"), "{failed}");
     assert!(
         failed.contains("Retry Codex: the Server did not answer")
             && failed.contains("Retry Claude: the Server did not answer"),
@@ -2696,7 +2721,7 @@ fn the_agents_options_asked_for_earlier_do_not_replace_the_derivation_steps() {
             },
         ]))),
     );
-    assert!(screen(&application).contains("Step 3 of 3"));
+    assert!(screen(&application).contains("Step 3 of 4"));
 }
 
 #[test]
@@ -2804,7 +2829,7 @@ fn awaiting_a_recheck_on_the_derivation_step(
     let recheck = recheck(&mut application);
     press(&mut application, KeyCode::Enter);
     assert!(
-        screen(&application).contains("Step 2 of 3"),
+        screen(&application).contains("Step 2 of 4"),
         "{}",
         screen(&application)
     );
@@ -2922,19 +2947,25 @@ const SAMPLE_GLYPHS: [char; 10] = [
 const NERD_FONT_NOTE: &str = "To get Icons, install a Nerd Font and select it in your terminal, \
                               then turn on Show icons in /settings.";
 
-/// Walks the flow on to its third step, drawn, the Server accepting the
+/// Walks the flow on to its last step, drawn, the Server accepting the
 /// derivation pin with the default Settings in force.
 fn on_the_icons_step(application: &mut Application) {
     on_the_icons_step_holding(application, EffectiveSettings::default());
 }
 
-/// Walks the flow on to its third step, drawn, the Server accepting the
-/// derivation pin with `settings` in force.
+/// Walks the flow on to its last step, drawn, the Server accepting the
+/// derivation pin with `settings` in force and the Workspace Roots passed as
+/// they stand.
 fn on_the_icons_step_holding(application: &mut Application, settings: EffectiveSettings) {
     press(application, KeyCode::Enter);
     pass_the_derivation_step(application, settings);
+    assert_eq!(
+        press(application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "the Roots in force pin nothing"
+    );
     let shown = screen(application);
-    assert!(shown.contains("Step 3 of 3 · Icons"), "{shown}");
+    assert!(shown.contains("Step 4 of 4 · Icons"), "{shown}");
 }
 
 /// Confirms the Derivation step on the row under Row Focus, the Server
@@ -2950,7 +2981,7 @@ fn pass_the_derivation_step(application: &mut Application, settings: EffectiveSe
 }
 
 /// A Client that has been onboarded, holding `settings`, with the flow taken
-/// again from `/onboarding` and walked on to its third step.
+/// again from `/onboarding` and walked on to its last step.
 fn retaking_the_icons_step(workspace: &Path, settings: EffectiveSettings) -> Application {
     let mut application = connected_application(workspace);
     deliver_settings(&mut application, settings.clone());
@@ -3080,7 +3111,7 @@ fn nothing_is_chosen_on_a_first_run_and_finish_waits_for_a_choice() {
         ApplicationTransition::Continue,
         "Finish does nothing until a row is chosen"
     );
-    assert!(screen(&application).contains("Step 3 of 3"));
+    assert!(screen(&application).contains("Step 4 of 4"));
 
     press(&mut application, KeyCode::Down);
     let chosen = screen(&application);
@@ -3220,8 +3251,10 @@ fn going_back_from_the_icons_step_finds_the_choice_as_left() {
     on_the_icons_step(&mut application);
     press(&mut application, KeyCode::Up);
     press(&mut application, KeyCode::Left);
-    assert!(screen(&application).contains("Step 2 of 3"));
+    press(&mut application, KeyCode::Left);
+    assert!(screen(&application).contains("Step 2 of 4"));
     pass_the_derivation_step(&mut application, EffectiveSettings::default());
+    press(&mut application, KeyCode::Enter);
     let shown = screen(&application);
     assert!(shown.contains("› They draw as boxes or blanks"), "{shown}");
     assert_eq!(
@@ -3269,7 +3302,7 @@ fn a_short_screen_keeps_the_sample_and_both_answers() {
     for height in [10, 12, 14] {
         let rows = rendered_application_rows_at(&application, 80, height);
         let shown = rows.join("\n");
-        assert!(shown.contains("Step 3 of 3"), "{height}: {shown}");
+        assert!(shown.contains("Step 4 of 4"), "{height}: {shown}");
         assert!(shown.contains(SAMPLE_GLYPHS[9]), "{height}: {shown}");
         assert!(shown.contains("  They draw as icons"), "{height}: {shown}");
         assert!(
@@ -3315,7 +3348,7 @@ fn the_flow_waits_on_the_icons_step_until_the_pin_lands() {
     press(&mut application, KeyCode::Down);
     let pin = finish_with(&mut application, true);
     let saving = screen(&application);
-    assert!(saving.contains("Step 3 of 3"), "{saving}");
+    assert!(saving.contains("Step 4 of 4"), "{saving}");
     assert!(saving.contains("Saving your answer…"), "{saving}");
 
     // Finish, a move, and Back all wait on it.
@@ -3326,7 +3359,7 @@ fn the_flow_waits_on_the_icons_step_until_the_pin_lands() {
     press(&mut application, KeyCode::Down);
     press(&mut application, KeyCode::Left);
     let waiting = screen(&application);
-    assert!(waiting.contains("Step 3 of 3"), "{waiting}");
+    assert!(waiting.contains("Step 4 of 4"), "{waiting}");
     assert!(waiting.contains("› They draw as icons"), "{waiting}");
     assert!(waiting.contains("Saving your answer…"), "{waiting}");
 
@@ -3369,7 +3402,7 @@ fn a_refused_pin_keeps_the_flow_open_with_the_failure_and_finish_retries() {
         "no mark is asked for"
     );
     let refused = screen(&application);
-    assert!(refused.contains("Step 3 of 3"), "{refused}");
+    assert!(refused.contains("Step 4 of 4"), "{refused}");
     assert!(
         refused.contains(&format!("Could not save your answer: {REFUSAL}")),
         "{refused}"
@@ -3474,7 +3507,7 @@ fn next_waits_on_a_toggle_the_server_has_not_answered() {
         ApplicationTransition::Continue
     );
     assert!(
-        screen(&application).contains("Step 1 of 3"),
+        screen(&application).contains("Step 1 of 4"),
         "Next waits on the toggle: {}",
         screen(&application)
     );
@@ -3482,7 +3515,7 @@ fn next_waits_on_a_toggle_the_server_has_not_answered() {
     // The Server's answer to another edit is not this toggle's.
     answer(&mut application, SettingRequest::new());
     press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("Step 1 of 3"));
+    assert!(screen(&application).contains("Step 1 of 4"));
     assert!(screen(&application).contains("Saving your changes…"));
 
     settle_mutation(
@@ -3501,7 +3534,7 @@ fn next_waits_on_a_toggle_the_server_has_not_answered() {
         "{locked}"
     );
     press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("Step 1 of 3"));
+    assert!(screen(&application).contains("Step 1 of 4"));
 }
 
 /// A toggle the Server refuses is said beneath the rows, the row keeping the
@@ -3536,7 +3569,7 @@ fn a_refused_toggle_is_said_beneath_the_rows_and_its_row_stays_as_the_server_say
     );
     press(&mut application, KeyCode::Enter);
     assert!(
-        screen(&application).contains("Step 2 of 3"),
+        screen(&application).contains("Step 2 of 4"),
         "{}",
         screen(&application)
     );
@@ -3554,7 +3587,7 @@ fn the_derivation_step_waits_on_its_pin_landing_before_it_moves_on() {
     let pin = press(&mut application, KeyCode::Enter);
     assert_eq!(pin, derivation_pin(DerivationErrand::FollowSession));
     let saving = screen(&application);
-    assert!(saving.contains("Step 2 of 3"), "{saving}");
+    assert!(saving.contains("Step 2 of 4"), "{saving}");
     assert!(saving.contains("Saving your answer…"), "{saving}");
 
     // Its keys wait on it, save Esc.
@@ -3564,7 +3597,7 @@ fn the_derivation_step_waits_on_its_pin_landing_before_it_moves_on() {
         press(&mut application, KeyCode::Enter),
         ApplicationTransition::Continue
     );
-    assert!(screen(&application).contains("Step 2 of 3"));
+    assert!(screen(&application).contains("Step 2 of 4"));
     assert!(
         focused_row(&application).contains("Provider's default"),
         "{}",
@@ -3587,13 +3620,13 @@ fn the_derivation_step_waits_on_its_pin_landing_before_it_moves_on() {
         "Config Document is not editable",
     );
     let waiting = screen(&application);
-    assert!(waiting.contains("Step 2 of 3"), "{waiting}");
+    assert!(waiting.contains("Step 2 of 4"), "{waiting}");
     assert!(waiting.contains("Saving your answer…"), "{waiting}");
     assert!(!waiting.contains("Could not save"), "{waiting}");
 
     settle_mutation(&mut application, &pin, settings);
     assert!(
-        screen(&application).contains("Step 3 of 3"),
+        screen(&application).contains("Step 3 of 4"),
         "the pin's own answer moves the flow on: {}",
         screen(&application)
     );
@@ -3622,7 +3655,7 @@ fn a_refused_derivation_pin_keeps_the_step_open_with_the_failure_and_enter_retri
         "nothing moves on"
     );
     let refused = screen(&application);
-    assert!(refused.contains("Step 2 of 3"), "{refused}");
+    assert!(refused.contains("Step 2 of 4"), "{refused}");
     assert!(
         refused.contains("Could not save your answer: Config Document is not editable"),
         "{refused}"
@@ -3641,7 +3674,7 @@ fn a_refused_derivation_pin_keeps_the_step_open_with_the_failure_and_enter_retri
         settings_deriving_with(DerivationErrand::Off),
     );
     assert!(
-        screen(&application).contains("Step 3 of 3"),
+        screen(&application).contains("Step 3 of 4"),
         "{}",
         screen(&application)
     );
@@ -3677,7 +3710,7 @@ fn options_chosen_for_the_derivation_step_wait_on_their_pin_as_confirming_does()
     );
     let saving = screen(&application);
     assert!(
-        saving.contains("Step 2 of 3") && !saving.contains("Model Options"),
+        saving.contains("Step 2 of 4") && !saving.contains("Model Options"),
         "{saving}"
     );
     assert!(saving.contains("Saving your answer…"), "{saving}");
@@ -3688,7 +3721,7 @@ fn options_chosen_for_the_derivation_step_wait_on_their_pin_as_confirming_does()
         "Config Document is not editable",
     );
     let refused = screen(&application);
-    assert!(refused.contains("Step 2 of 3"), "{refused}");
+    assert!(refused.contains("Step 2 of 4"), "{refused}");
     assert!(
         refused.contains("Could not save your answer: Config Document is not editable"),
         "{refused}"
@@ -3711,7 +3744,7 @@ fn options_chosen_for_the_derivation_step_wait_on_their_pin_as_confirming_does()
         settings_deriving_with(DerivationErrand::Pinned(cheap_selection(Vec::new()))),
     );
     assert!(
-        screen(&application).contains("Step 3 of 3"),
+        screen(&application).contains("Step 3 of 4"),
         "{}",
         screen(&application)
     );
@@ -3750,7 +3783,7 @@ fn toggles_answered_out_of_order_leave_next_held_on_the_settings_in_force() {
     );
     press(&mut application, KeyCode::Enter);
     let held = screen(&application);
-    assert!(held.contains("Step 1 of 3"), "{held}");
+    assert!(held.contains("Step 1 of 4"), "{held}");
     assert!(held.contains("Saving your changes…"), "{held}");
 
     // Then the stream pushes both off, and the older toggle's answer comes
@@ -3772,7 +3805,7 @@ fn toggles_answered_out_of_order_leave_next_held_on_the_settings_in_force() {
     );
     assert!(!locked.contains("Saving your changes…"), "{locked}");
     press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("Step 1 of 3"));
+    assert!(screen(&application).contains("Step 1 of 4"));
 }
 
 /// What was said of a refused toggle stands until that Provider's next
@@ -3836,7 +3869,7 @@ fn a_retake_opened_before_the_finished_answer_shows_follows_it_once_it_does() {
 
     type_terminal_text(&mut application, "/onboarding");
     press(&mut application, KeyCode::Enter);
-    assert!(screen(&application).contains("Step 1 of 3"));
+    assert!(screen(&application).contains("Step 1 of 4"));
     deliver_settings(&mut application, with_show_icons(true));
     on_the_icons_step_holding(&mut application, with_show_icons(true));
     let shown = screen(&application);
@@ -3937,5 +3970,494 @@ fn the_derivation_row_the_reader_chose_stays_focused_while_its_pin_is_saved() {
         focused_row(&application).contains("Provider's default"),
         "{}",
         focused_row(&application)
+    );
+}
+
+/// Workspace Roots rooted the way the platform under test roots an absolute
+/// path: a POSIX path is relative to Windows, which is given drive-rooted
+/// ones instead.
+#[cfg(windows)]
+const WORK_ROOT: &str = r"D:\work";
+#[cfg(not(windows))]
+const WORK_ROOT: &str = "/srv/work";
+#[cfg(windows)]
+const ARCHIVE_ROOT: &str = r"E:\archive";
+#[cfg(not(windows))]
+const ARCHIVE_ROOT: &str = "/mnt/archive";
+
+/// Effective settings naming `roots` as the Workspace Roots.
+fn with_workspace_roots(roots: &[&str]) -> EffectiveSettings {
+    EffectiveSettings {
+        workspace: WorkspaceSettings {
+            roots: roots.iter().map(|root| (*root).to_owned()).collect(),
+        },
+        ..EffectiveSettings::default()
+    }
+}
+
+/// The pin Next sends on the Workspace Roots step for a draft of `roots`.
+fn pins_roots(roots: &[&str]) -> MutatesSetting {
+    MutatesSetting(SettingMutation::WorkspaceRoots {
+        value: Some(roots.iter().map(|root| (*root).to_owned()).collect()),
+    })
+}
+
+/// A fresh Server's Client holding `settings`, with the flow walked on to
+/// its Workspace Roots step.
+fn on_the_roots_step(workspace: &Path, settings: EffectiveSettings) -> Application {
+    let mut application = attached_to_a_fresh_server(workspace);
+    deliver_settings(&mut application, settings.clone());
+    press(&mut application, KeyCode::Enter);
+    pass_the_derivation_step(&mut application, settings);
+    let shown = screen(&application);
+    assert!(shown.contains("Step 3 of 4 · Workspace Roots"), "{shown}");
+    application
+}
+
+/// The Directory Browser's ask of the Client's own Server for the children
+/// of the directory it is rooted at.
+fn expect_listing(transition: ApplicationTransition) -> (DirectoryListingId, PathBuf) {
+    let ApplicationTransition::ListDirectory {
+        outlook,
+        listing_id,
+        request,
+    } = transition
+    else {
+        panic!("the browser asks the Server for a directory's children, not {transition:?}");
+    };
+    assert_eq!(
+        outlook,
+        Outlook::Local,
+        "the Server whose Roots are named is the one browsed"
+    );
+    (listing_id, request.path)
+}
+
+/// The Server's listing of `root` with plain child directories named
+/// `children`.
+fn answer_listing(
+    application: &mut Application,
+    listing_id: DirectoryListingId,
+    root: &Path,
+    children: &[&str],
+) {
+    application
+        .handle_event(ApplicationEvent::DirectoryListed {
+            listing_id,
+            result: Ok(DirectoryListing {
+                root: root.to_owned(),
+                parent: root.parent().map(Path::to_owned),
+                source_control: DirectorySourceControl::Plain,
+                children: children
+                    .iter()
+                    .map(|name| ChildDirectory {
+                        name: (*name).to_owned(),
+                        path: root.join(name),
+                        source_control: DirectorySourceControl::Plain,
+                        hidden: false,
+                    })
+                    .collect(),
+            }),
+        })
+        .expect("deliver the Server's listing");
+}
+
+#[test]
+fn the_roots_step_says_what_roots_are_for_and_teaches_its_keys() {
+    let workspace = workspace_dir();
+    let application = on_the_roots_step(workspace.path(), EffectiveSettings::default());
+    let shown = screen(&application);
+    assert!(shown.contains("Directories your work lives in."), "{shown}");
+    assert!(shown.contains("› add a Root"), "{shown}");
+    assert!(shown.contains("None is fine"), "{shown}");
+    let wide = rendered_application_rows_at(&application, 140, 24).join("\n");
+    assert!(
+        wide.contains("Tab Browse · Ctrl+D Remove · ↑↓ Move · Enter Next · ← Back · Esc Leave"),
+        "{wide}"
+    );
+}
+
+/// Next pins the whole draft as one list and waits on the Server's word that
+/// it landed, holding the draft still meanwhile, before the flow goes on.
+#[test]
+fn roots_typed_on_the_step_are_pinned_as_one_list_once_next_is_pressed() {
+    let workspace = workspace_dir();
+    let mut application = on_the_roots_step(workspace.path(), EffectiveSettings::default());
+    type_terminal_text(&mut application, "~/code");
+    press(&mut application, KeyCode::Down);
+    type_terminal_text(&mut application, WORK_ROOT);
+    let drafted = screen(&application);
+    assert!(drafted.contains("~/code"), "{drafted}");
+    assert!(drafted.contains(&format!("› {WORK_ROOT}")), "{drafted}");
+
+    let pin = press(&mut application, KeyCode::Enter);
+    assert_eq!(pin, pins_roots(&["~/code", WORK_ROOT]));
+    let saving = screen(&application);
+    assert!(saving.contains("Step 3 of 4"), "{saving}");
+    assert!(saving.contains("Saving your answer…"), "{saving}");
+
+    // Edits, Next and Back all wait on it.
+    type_terminal_text(&mut application, "x");
+    press_with(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+    press(&mut application, KeyCode::Left);
+    let waiting = screen(&application);
+    assert!(waiting.contains("Step 3 of 4"), "{waiting}");
+    assert!(waiting.contains(&format!("› {WORK_ROOT}")), "{waiting}");
+    assert!(!waiting.contains(&format!("{WORK_ROOT}x")), "{waiting}");
+
+    settle_mutation(
+        &mut application,
+        &pin,
+        with_workspace_roots(&["~/code", WORK_ROOT]),
+    );
+    let moved_on = screen(&application);
+    assert!(moved_on.contains("Step 4 of 4 · Icons"), "{moved_on}");
+}
+
+/// No Roots is an answer as good as any, and Roots left as they stand are
+/// not pinned again.
+#[test]
+fn the_roots_in_force_fill_the_step_and_pass_unpinned_until_edited() {
+    let workspace = workspace_dir();
+    let mut application = on_the_roots_step(workspace.path(), with_workspace_roots(&[WORK_ROOT]));
+    let shown = screen(&application);
+    assert!(shown.contains(&format!("› {WORK_ROOT}")), "{shown}");
+
+    // A draft no one has edited follows the Roots in force.
+    deliver_settings(
+        &mut application,
+        with_workspace_roots(&[WORK_ROOT, ARCHIVE_ROOT]),
+    );
+    let followed = screen(&application);
+    assert!(followed.contains(ARCHIVE_ROOT), "{followed}");
+
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "Roots left as they stand pin nothing"
+    );
+    assert!(screen(&application).contains("Step 4 of 4 · Icons"));
+
+    let mut application = on_the_roots_step(workspace.path(), EffectiveSettings::default());
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "no Roots passes the step"
+    );
+    assert!(screen(&application).contains("Step 4 of 4 · Icons"));
+}
+
+/// Once the reader has edited the draft it is theirs, and the Roots in force
+/// changing elsewhere leaves it as they left it.
+#[test]
+fn an_edited_roots_draft_follows_the_roots_in_force_no_more() {
+    let workspace = workspace_dir();
+    let mut application = on_the_roots_step(workspace.path(), with_workspace_roots(&[WORK_ROOT]));
+    press_with(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    deliver_settings(
+        &mut application,
+        with_workspace_roots(&[WORK_ROOT, ARCHIVE_ROOT]),
+    );
+    let shown = screen(&application);
+    assert!(
+        !shown.contains(WORK_ROOT) && !shown.contains(ARCHIVE_ROOT),
+        "{shown}"
+    );
+    assert_eq!(press(&mut application, KeyCode::Enter), pins_roots(&[]));
+}
+
+#[test]
+fn a_root_neither_absolute_nor_beginning_with_a_tilde_holds_the_step_naming_it() {
+    let workspace = workspace_dir();
+    let mut application = on_the_roots_step(workspace.path(), EffectiveSettings::default());
+    type_terminal_text(&mut application, "projects");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+    let refused = screen(&application);
+    assert!(refused.contains("Step 3 of 4"), "{refused}");
+    assert!(
+        refused.contains("\"projects\" is not an absolute path or a path beginning with ~"),
+        "{refused}"
+    );
+
+    for _ in "projects".chars() {
+        press(&mut application, KeyCode::Backspace);
+    }
+    type_terminal_text(&mut application, "~/projects");
+    assert!(!screen(&application).contains("is not an absolute path"));
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_roots(&["~/projects"])
+    );
+}
+
+/// Back keeps the draft as left without saving it, and leaving the flow
+/// drops it unsaved.
+#[test]
+fn going_back_keeps_the_roots_draft_unsaved_and_leaving_drops_it() {
+    let workspace = workspace_dir();
+    let mut application = on_the_roots_step(workspace.path(), EffectiveSettings::default());
+    type_terminal_text(&mut application, "~/code");
+    assert_eq!(
+        press(&mut application, KeyCode::Left),
+        ApplicationTransition::Continue,
+        "Back saves nothing"
+    );
+    assert!(screen(&application).contains("Step 2 of 4"));
+
+    pass_the_derivation_step(&mut application, EffectiveSettings::default());
+    let shown = screen(&application);
+    assert!(shown.contains("› ~/code"), "{shown}");
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::MarkOnboarded
+    );
+    assert!(!onboarding_shown(&application), "{}", screen(&application));
+}
+
+#[test]
+fn ctrl_d_removes_the_focused_root_and_a_paste_lands_in_the_focused_row() {
+    let workspace = workspace_dir();
+    let mut application = on_the_roots_step(
+        workspace.path(),
+        with_workspace_roots(&[WORK_ROOT, ARCHIVE_ROOT]),
+    );
+    press_with(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    press(&mut application, KeyCode::Down);
+    assert!(screen(&application).contains("› add a Root"));
+    application
+        .handle_terminal_event(InputEvent::Paste("~/code\n".to_owned()))
+        .expect("paste a Root");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_roots(&[ARCHIVE_ROOT, "~/code"])
+    );
+}
+
+/// Each edit of the draft is a semantic command, so a plugin or the pointer
+/// reaches it as the keys do, and only while the step is on show.
+#[test]
+fn roots_step_commands_can_be_invoked_semantically() {
+    let workspace = workspace_dir();
+    let mut application = offered_onboarding(workspace.path());
+    invoke(
+        &mut application,
+        CommandId::InvokeSemanticText(
+            SemanticCommandId::OnboardingRootsInsert,
+            "~/early".to_owned(),
+        ),
+    );
+    press(&mut application, KeyCode::Enter);
+    pass_the_derivation_step(&mut application, EffectiveSettings::default());
+    assert!(!screen(&application).contains("~/early"));
+
+    for command in [
+        CommandId::InvokeSemanticText(
+            SemanticCommandId::OnboardingRootsInsert,
+            "~/code".to_owned(),
+        ),
+        CommandId::InvokeSemantic(SemanticCommandId::OnboardingRootsDeleteBackward),
+        CommandId::InvokeSemantic(SemanticCommandId::OnboardingRootsNext),
+        CommandId::InvokeSemanticText(SemanticCommandId::OnboardingRootsInsert, "~/x".to_owned()),
+        CommandId::InvokeSemantic(SemanticCommandId::OnboardingRootsRemove),
+        CommandId::InvokeSemantic(SemanticCommandId::OnboardingRootsPrevious),
+    ] {
+        assert_eq!(
+            invoke(&mut application, command),
+            ApplicationTransition::Continue
+        );
+    }
+    assert!(
+        screen(&application).contains("› ~/cod"),
+        "{}",
+        screen(&application)
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_roots(&["~/cod"])
+    );
+}
+
+fn invoke(application: &mut Application, command: CommandId) -> ApplicationTransition {
+    application
+        .handle_event(ApplicationEvent::Command(command))
+        .expect("invoke an Onboarding command")
+}
+
+/// Tab browses the Client's own Server's directories over the step, rooted
+/// where the Landing works; a choice is an entry of the draft, and Esc goes
+/// back to the step rather than leaving the flow.
+#[test]
+fn tab_on_the_roots_step_browses_for_a_root_over_the_flow() {
+    let workspace = workspace_dir();
+    let mut application = on_the_roots_step(workspace.path(), EffectiveSettings::default());
+    let (listing_id, root) = expect_listing(press(&mut application, KeyCode::Tab));
+    assert_eq!(root, workspace.path());
+    answer_listing(&mut application, listing_id, &root, &["projects", "notes"]);
+    let browsing = screen(&application);
+    assert!(
+        browsing.contains("Path:") && browsing.contains("projects"),
+        "the browser stands over the flow: {browsing}"
+    );
+
+    press(&mut application, KeyCode::Down);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "a Root chosen is a draft, and no Workspace is resolved"
+    );
+    let chosen = screen(&application);
+    let projects = root.join("projects").display().to_string();
+    assert!(
+        !chosen.contains("Path:") && chosen.contains("Step 3 of 4"),
+        "{chosen}"
+    );
+    assert!(chosen.contains("projects"), "{chosen}");
+
+    let (listing_id, root) = expect_listing(press(&mut application, KeyCode::Tab));
+    answer_listing(&mut application, listing_id, &root, &["projects", "notes"]);
+    type_terminal_text(&mut application, "x");
+    assert_eq!(
+        press(&mut application, KeyCode::Esc),
+        ApplicationTransition::Continue,
+        "Esc backs out of the browser alone"
+    );
+    let back = screen(&application);
+    assert!(
+        !back.contains("Path:") && back.contains("Step 3 of 4"),
+        "{back}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_roots(&[&projects]),
+        "nothing typed while the browser held the keys reached the draft"
+    );
+}
+
+#[test]
+fn the_browser_onboarding_opened_closes_with_it_when_another_client_takes_it() {
+    let workspace = workspace_dir();
+    let mut application = on_the_roots_step(workspace.path(), EffectiveSettings::default());
+    let (listing_id, root) = expect_listing(press(&mut application, KeyCode::Tab));
+    answer_listing(&mut application, listing_id, &root, &["projects"]);
+
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Onboarded(true)))
+        .expect("hear that another Client onboarded the Server");
+    let after = screen(&application);
+    assert!(
+        !onboarding_shown(&application) && !after.contains("Path:"),
+        "nothing the flow offered stands to be chosen: {after}"
+    );
+}
+
+/// A pin the Server refuses keeps the flow on the step, saying why beneath
+/// the rows, and Next sends it again.
+#[test]
+fn a_refused_roots_pin_keeps_the_step_open_with_the_failure_and_next_retries() {
+    const REFUSAL: &str = "Config Document is not editable";
+    let workspace = workspace_dir();
+    let mut application = on_the_roots_step(workspace.path(), EffectiveSettings::default());
+    type_terminal_text(&mut application, "~/code");
+    let pin = press(&mut application, KeyCode::Enter);
+    assert_eq!(pin, pins_roots(&["~/code"]));
+    assert_eq!(
+        refuse(&mut application, request_of(&pin), REFUSAL),
+        ApplicationTransition::Continue
+    );
+    let refused = screen(&application);
+    assert!(refused.contains("Step 3 of 4"), "{refused}");
+    assert!(
+        refused.contains(&format!("Could not save your answer: {REFUSAL}")),
+        "{refused}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_roots(&["~/code"])
+    );
+}
+
+/// A screen too short for all the step says keeps the focused row and the
+/// keys at the foot, giving way the rest.
+#[test]
+fn a_short_screen_keeps_the_focused_root_and_the_keys() {
+    let workspace = workspace_dir();
+    let mut application = on_the_roots_step(
+        workspace.path(),
+        with_workspace_roots(&["~/a", "~/b", "~/c", "~/d", "~/e", "~/f"]),
+    );
+    for _ in 0..4 {
+        press(&mut application, KeyCode::Down);
+    }
+    for height in [9, 12, 16] {
+        let shown = rendered_application_rows_at(&application, 80, height).join("\n");
+        assert!(shown.contains("Step 3 of 4"), "{height}: {shown}");
+        assert!(shown.contains("› ~/e"), "{height}: {shown}");
+        assert!(shown.contains("Enter Next"), "{height}: {shown}");
+    }
+}
+
+/// Tab browses for nothing while the draft's pin is saved, since a choice
+/// would land on a draft held still.
+#[test]
+fn tab_browses_for_nothing_while_the_roots_pin_is_saved() {
+    let workspace = workspace_dir();
+    let mut application = on_the_roots_step(workspace.path(), EffectiveSettings::default());
+    type_terminal_text(&mut application, "~/code");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        pins_roots(&["~/code"])
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Tab),
+        ApplicationTransition::Continue
+    );
+    assert!(!screen(&application).contains("Path:"));
+}
+
+/// A refusal is said only until the step is passed: a draft taken back to
+/// the Roots in force passes unpinned, leaving no failure to find on return.
+#[test]
+fn passing_the_roots_step_unpinned_leaves_no_earlier_refusal_standing() {
+    const REFUSAL: &str = "Config Document is not editable";
+    let workspace = workspace_dir();
+    let mut application = on_the_roots_step(workspace.path(), EffectiveSettings::default());
+    type_terminal_text(&mut application, "~/code");
+    let pin = press(&mut application, KeyCode::Enter);
+    refuse(&mut application, request_of(&pin), REFUSAL);
+    press_with(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
+    assert!(screen(&application).contains("Step 4 of 4"));
+    press(&mut application, KeyCode::Left);
+    let back = screen(&application);
+    assert!(!back.contains("Could not save"), "{back}");
+}
+
+/// Taking the flow again opens the step on the Roots in force.
+#[test]
+fn taking_onboarding_again_opens_the_roots_step_on_the_roots_in_force() {
+    let workspace = workspace_dir();
+    let settings = with_workspace_roots(&[WORK_ROOT]);
+    let mut application = connected_application(workspace.path());
+    deliver_settings(&mut application, settings.clone());
+    type_terminal_text(&mut application, "/onboarding");
+    press(&mut application, KeyCode::Enter);
+    press(&mut application, KeyCode::Enter);
+    pass_the_derivation_step(&mut application, settings);
+    let shown = screen(&application);
+    assert!(shown.contains("Step 3 of 4 · Workspace Roots"), "{shown}");
+    assert!(shown.contains(&format!("› {WORK_ROOT}")), "{shown}");
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
     );
 }

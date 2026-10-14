@@ -1,7 +1,7 @@
-//! The list editor: the settings panel's surface for a Setting holding a list
-//! of strings, which the Setting declares whole as a
-//! [`TextListSettingChoice`], so the editor never knows which Setting it
-//! edits.
+//! The list editor: the surface for a Setting holding a list of strings,
+//! which the Setting declares whole as a [`TextListSettingChoice`], so the
+//! editor never knows which Setting it edits. The settings panel opens it over
+//! itself, and Onboarding's Workspace Roots step draws it within the step.
 //!
 //! Its rows are the list's entries, with one more beneath them to add an entry
 //! at, and the focused row is the one typing lands on, as each line of a text
@@ -14,12 +14,19 @@
 //! browsing: a directory chosen in the Directory Browser stands in the focused
 //! entry's place, or, chosen from the row past the last entry, is added there.
 
+use ratatui::text::Line;
+use unicode_width::UnicodeWidthStr;
+
 use crate::{
     protocol::{EffectiveSettings, SettingMutation},
     settings::TextListSettingChoice,
+    theme::Theme,
 };
 
-use super::list_window::ListWindow;
+use super::{
+    list_window::ListWindow,
+    slots::{truncate_from_left_to_width, truncate_to_width},
+};
 
 /// An open list editor and the draft it holds.
 #[derive(Clone, Debug)]
@@ -52,6 +59,34 @@ pub(super) struct ListEditorView<'a> {
     pub(super) window: &'a ListWindow,
 }
 
+impl ListEditorView<'_> {
+    /// The rows the window shows within `capacity` lines of `width` columns:
+    /// each entry, and the row a new entry is added at, the focused one
+    /// marked and cut from its start so the end being typed stays in view.
+    pub(super) fn rows(&self, width: usize, capacity: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let shown = self
+            .window
+            .settle_rows(self.entries.len() + 1, capacity, Some(self.focus));
+        shown
+            .map(|index| {
+                let focused = index == self.focus;
+                let marker = if focused { "› " } else { "  " };
+                let text_width = width.saturating_sub(marker.width());
+                let (text, style) = match self.entries.get(index) {
+                    Some(entry) if focused => (
+                        truncate_from_left_to_width(entry, text_width),
+                        theme.selection.focused,
+                    ),
+                    Some(entry) => (truncate_to_width(entry, text_width), theme.form_field.text),
+                    None if focused => (self.placeholder.to_owned(), theme.selection.focused),
+                    None => (self.placeholder.to_owned(), theme.text.subdued),
+                };
+                Line::styled(format!("{marker}{text}"), style)
+            })
+            .collect()
+    }
+}
+
 impl ListEditor {
     /// Opens on the entries in force, focused on the first row.
     pub(super) fn open(choice: TextListSettingChoice, settings: &EffectiveSettings) -> Self {
@@ -64,6 +99,15 @@ impl ListEditor {
             error: None,
             window,
         }
+    }
+
+    /// Takes the entries in force as the draft once more, for a draft no one
+    /// has edited that follows what the Setting holds; focus stays on its
+    /// row where the list still reaches it.
+    pub(super) fn follow(&mut self, settings: &EffectiveSettings) {
+        self.entries = self.choice.seed(settings);
+        self.focus = self.focus.min(self.entries.len());
+        self.error = None;
     }
 
     pub(super) fn view(&self) -> ListEditorView<'_> {
@@ -139,6 +183,15 @@ impl ListEditor {
             self.entries.remove(self.focus);
             self.error = None;
         }
+    }
+
+    /// Whether the draft holds just the entries `settings` hold, so saving
+    /// it would change nothing.
+    pub(super) fn holds(&self, settings: &EffectiveSettings) -> bool {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.is_empty())
+            .eq(self.choice.seed(settings).iter())
     }
 
     /// The one mutation pinning every entry the draft holds, or nothing where
