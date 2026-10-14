@@ -38,12 +38,12 @@ use jsonc_parser::{
 use serde_json::Value;
 
 use crate::protocol::{
-    AgentSelection, AppearanceMode, AsideVisibility, AutoReclaim, AutoSettle, ClaudePermissionMode,
-    CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand, CopilotPermissions, DerivationErrand,
-    EffectiveSettings, FoldPosture, GroupPosture, LandingPage, ProviderId, ReasoningSummaryDetail,
-    ReasoningVisibility, SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
-    SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility,
-    TextSelectionCopy, ToolCallVisibility,
+    AfterWorktreeCreation, AgentSelection, AppearanceMode, AsideVisibility, AutoReclaim,
+    AutoSettle, ClaudePermissionMode, CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand,
+    CopilotPermissions, DerivationErrand, EffectiveSettings, FoldPosture, GroupPosture,
+    LandingPage, ProviderId, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
+    SettingMutation, SettingScope, SettingsDiagnostic, SettingsDiagnosticSeverity,
+    SettingsSnapshot, SidebarScope, SidebarVisibility, TextSelectionCopy, ToolCallVisibility,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -77,6 +77,7 @@ const ASIDE_INITIAL_VISIBILITY: &str = "aside.initialVisibility";
 const ASIDE_INITIAL_WIDTH: &str = "aside.initialWidth";
 const SIDEKICK_HIDE_SUBSESSIONS: &str = "sidekick.hideSubsessions";
 const WORKTREE_AUTO_RECLAIM: &str = "worktree.autoReclaim";
+const WORKTREE_AFTER_CREATION: &str = "worktree.afterCreation";
 const WORKSPACE_ROOTS: &str = "workspace.roots";
 const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
 const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary";
@@ -943,6 +944,9 @@ fn in_force(mutation: &SettingMutation, settings: &EffectiveSettings) -> Setting
         SettingMutation::WorktreeAutoReclaim { .. } => SettingMutation::WorktreeAutoReclaim {
             value: Some(settings.worktree.auto_reclaim),
         },
+        SettingMutation::WorktreeAfterCreation { .. } => SettingMutation::WorktreeAfterCreation {
+            value: Some(settings.worktree.after_creation),
+        },
         SettingMutation::WorkspaceRoots { .. } => SettingMutation::WorkspaceRoots {
             value: Some(settings.workspace.roots.clone()),
         },
@@ -1638,6 +1642,34 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         },
     },
     SettingDescriptor {
+        key: WORKTREE_AFTER_CREATION,
+        label: "After creating a Worktree",
+        description: "Return the Landing to where it stood, or stay in the Worktree created on submit",
+        group: SettingGroup::SourceControl,
+        scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "return",
+                build_mutation: || SettingMutation::WorktreeAfterCreation {
+                    value: Some(AfterWorktreeCreation::Return),
+                },
+            },
+            SettingChoice {
+                value: "stay",
+                build_mutation: || SettingMutation::WorktreeAfterCreation {
+                    value: Some(AfterWorktreeCreation::Stay),
+                },
+            },
+        ]),
+        reset: SettingMutation::WorktreeAfterCreation { value: None },
+        apply: |settings, value| {
+            apply_value(value, |after_creation| {
+                settings.worktree.after_creation = after_creation;
+            })
+        },
+    },
+    SettingDescriptor {
         key: WORKSPACE_ROOTS,
         label: "Workspace Roots",
         description: "The directories your work lives in, each an absolute path or one beginning with ~",
@@ -2290,6 +2322,9 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
             (SIDEKICK_HIDE_SUBSESSIONS, pinned(value))
         }
         SettingMutation::WorktreeAutoReclaim { value } => (WORKTREE_AUTO_RECLAIM, pinned(value)),
+        SettingMutation::WorktreeAfterCreation { value } => {
+            (WORKTREE_AFTER_CREATION, pinned(value))
+        }
         SettingMutation::WorkspaceRoots { value } => (WORKSPACE_ROOTS, pinned(value)),
         SettingMutation::ProviderCodexEnabled { value } => (PROVIDER_CODEX_ENABLED, pinned(value)),
         SettingMutation::ProviderCodexReasoningSummary { value } => {
@@ -2984,6 +3019,7 @@ mod tests {
                 // `false`, unquoted, because that is what the reader must type.
                 "one of \"release\" or \"manual\"".to_owned(),
                 "one of \"off\" or a whole number of days, at least 1".to_owned(),
+                "one of \"return\" or \"stay\"".to_owned(),
                 // A list names what each of its entries must be.
                 "a list of absolute paths or paths beginning with ~".to_owned(),
                 "one of true or false".to_owned(),

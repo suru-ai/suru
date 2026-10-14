@@ -21,11 +21,11 @@ use crate::support::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AgentSelection, AppearanceMode, AppearanceSettings, AsideSettings, AsideVisibility,
-        AutoReclaim, AutoSettle, BrokerSettings, ChildDirectory, CodexSettings, CopilotSettings,
-        DerivationErrand, DerivationSettings, DirectoryListing, DirectorySourceControl,
-        EffectiveSettings, FoldPosture, ModelAvailability, ModelCatalog, ModelId,
-        ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
+        AfterWorktreeCreation, AgentSelection, AppearanceMode, AppearanceSettings, AsideSettings,
+        AsideVisibility, AutoReclaim, AutoSettle, BrokerSettings, ChildDirectory, CodexSettings,
+        CopilotSettings, DerivationErrand, DerivationSettings, DirectoryListing,
+        DirectorySourceControl, EffectiveSettings, FoldPosture, ModelAvailability, ModelCatalog,
+        ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
         ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue, Outlook,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
         ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
@@ -638,12 +638,45 @@ fn source_control_tab_presents_the_server_reclaim_setting_between_providers_and_
         EffectiveSettings {
             worktree: suru::protocol::WorktreeSettings {
                 auto_reclaim: AutoReclaim::Off,
+                ..Default::default()
             },
             ..EffectiveSettings::default()
         },
         &["worktree.autoReclaim"],
     );
     assert!(row(&application, "Reclaim Managed Worktrees").contains("off [pinned]"));
+}
+
+#[test]
+fn source_control_tab_offers_whether_the_landing_returns_from_a_worktree_it_created() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    click_tab(&mut application, "Source Control");
+
+    let rows = rendered_application_rows(&application);
+    assert!(
+        row_index(&rows, "Reclaim Managed Worktrees")
+            < row_index(&rows, "After creating a Worktree")
+            && row_index(&rows, "After creating a Worktree") < row_index(&rows, "Workspace Roots"),
+        "it keeps the other worktree Setting company: {rows:?}"
+    );
+    let after = row(&application, "After creating a Worktree");
+    assert!(after.contains("return [default]"), "{after}");
+    let descriptor = suru::settings::SCHEMA
+        .iter()
+        .find(|descriptor| descriptor.key == "worktree.afterCreation")
+        .expect("the schema declares it");
+    assert_eq!(descriptor.group, SettingGroup::SourceControl);
+    assert_eq!(descriptor.scope, SettingScope::Client);
+
+    focus_setting(&mut application, "worktree.afterCreation");
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        MutatesSetting(SettingMutation::WorktreeAfterCreation {
+            value: Some(AfterWorktreeCreation::Stay),
+        }),
+    );
 }
 
 /// Workspace Roots rooted the way the platform under test roots an absolute

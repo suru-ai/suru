@@ -1347,6 +1347,20 @@ impl<'de> Deserialize<'de> for AutoReclaim {
 #[serde(deny_unknown_fields)]
 pub struct WorktreeSettings {
     pub auto_reclaim: AutoReclaim,
+    pub after_creation: AfterWorktreeCreation,
+}
+
+/// Where the Landing stands once a Session has begun in a Worktree created
+/// for it on submit.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AfterWorktreeCreation {
+    /// Back where it stood when the new Worktree was asked for, so only the
+    /// one Session begins there.
+    #[default]
+    Return,
+    /// In the new Worktree, where the next Session begins too.
+    Stay,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -2177,6 +2191,9 @@ pub enum SettingMutation {
     },
     WorktreeAutoReclaim {
         value: Option<AutoReclaim>,
+    },
+    WorktreeAfterCreation {
+        value: Option<AfterWorktreeCreation>,
     },
     /// Pins the whole list of Workspace Roots at once, so adding, editing and
     /// removing Roots is one change.

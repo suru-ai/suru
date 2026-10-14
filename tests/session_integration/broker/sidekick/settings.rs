@@ -858,6 +858,7 @@ async fn a_sidekick_reads_the_workspace_roots_but_is_refused_changing_them() {
         list_settings(&mut sidekick, json!({ "group": "source_control" })).await,
         vec![
             json!({ "key": "worktree.autoReclaim", "value": 14 }),
+            json!({ "key": "worktree.afterCreation", "value": "return" }),
             json!({ "key": "workspace.roots", "value": ["~/src", UNPLUGGED_ROOT] }),
         ],
         "the Roots are listed as the user named them, whether or not anything is there"

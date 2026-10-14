@@ -21,14 +21,15 @@ use crate::{
         ManagedEvent, RecoveryStatus, SessionEvent, SessionProjection, SubagentTreeEvent,
     },
     protocol::{
-        Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentSelection,
-        AgentSelectionOperationId, ApprovalId, AttachmentId, Author, CreateSessionRequest,
-        EffectiveSettings, InitialPrompt, ListenerState, MessageId, ModelCatalog, Outlook, Prompt,
-        PromptDelivery, PromptId, PromptStatus, PromptWithdrawal, QuestionnaireId, RelayState,
-        ResolveWorkspaceRequest, ServerIdentity, SessionChange, SessionErrorCode, SessionId,
-        SessionListItem, SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot,
-        ShutdownReason, SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TranscriptSettings,
-        TurnId, TurnStatus, UnreachableReason, UpdateAgentSelectionRequest, Workspace, WorkspaceId,
+        Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AfterWorktreeCreation,
+        AgentSelection, AgentSelectionOperationId, ApprovalId, AttachmentId, Author,
+        CreateSessionRequest, EffectiveSettings, InitialPrompt, ListenerState, MessageId,
+        ModelCatalog, Outlook, Prompt, PromptDelivery, PromptId, PromptStatus, PromptWithdrawal,
+        QuestionnaireId, RelayState, ResolveWorkspaceRequest, ServerIdentity, SessionChange,
+        SessionErrorCode, SessionId, SessionListItem, SessionReference, SessionSnapshot,
+        SettingMutation, SettingsSnapshot, ShutdownReason, SkillCatalog, SkillCatalogRequest,
+        TextSelectionCopy, TranscriptSettings, TurnId, TurnStatus, UnreachableReason,
+        UpdateAgentSelectionRequest, Workspace, WorkspaceId,
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
@@ -535,6 +536,15 @@ impl ResolvedCheckout {
     }
 }
 
+/// Where one Outlook's Landing stood: enough to stand it there again.
+#[derive(Clone, Debug)]
+struct LandingLocation {
+    outlook: Outlook,
+    workspace: WorkspaceId,
+    remembered: RememberedExecutionContext,
+    checkout: Option<ResolvedCheckout>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TuiState {
     hyperlinks: bool,
@@ -551,6 +561,12 @@ pub struct TuiState {
         HashMap<(Outlook, crate::protocol::WorkspaceId), RememberedExecutionContext>,
     pub(super) execution_status: crate::protocol::ExecutionDirectoryStatus,
     pub(super) new_worktree: Option<crate::protocol::PrepareCheckoutRequest>,
+    /// Where the Landing stood before it moved into the Worktree prepared for
+    /// the Provisional Session, which draws its location from the Landing's.
+    /// The Landing returns here once that claim is let go, unless the Setting
+    /// in force then keeps it in the new Worktree; choosing a location outright
+    /// forgets it.
+    landing_return: Option<LandingLocation>,
     pub(super) worktree_picker: super::worktree_picker::WorktreePicker,
     initial_context_resolved: bool,
     workspace_resolution_sequence: u64,
@@ -991,6 +1007,7 @@ impl TuiState {
             remembered_execution_directories: HashMap::new(),
             execution_status: crate::protocol::ExecutionDirectoryStatus::Available,
             new_worktree: None,
+            landing_return: None,
             worktree_picker: Default::default(),
             initial_context_resolved: false,
             workspace_resolution_sequence: 0,
@@ -1100,6 +1117,56 @@ impl TuiState {
                 "Worktree preparation left in its previous context; draft retained".to_owned(),
             );
         }
+    }
+
+    /// Whether the Landing goes on standing in a Worktree created for the
+    /// Session begun from it, rather than returning to where it stood.
+    fn landing_stays_in_new_worktrees(&self) -> bool {
+        self.settings.worktree.after_creation == AfterWorktreeCreation::Stay
+    }
+
+    fn landing_location(&self) -> LandingLocation {
+        LandingLocation {
+            outlook: self.outlook.clone(),
+            workspace: self.workspace.id.clone(),
+            remembered: RememberedExecutionContext {
+                directory: self.execution_directory.clone(),
+                status: self.execution_status.clone(),
+            },
+            checkout: self.outlook_execution_checkouts.get(&self.outlook).cloned(),
+        }
+    }
+
+    /// Stands the Landing back where it was before it moved into a Worktree
+    /// prepared for a claim now let go, and remembers that location for its
+    /// Workspace, so every way back to the Landing begins there. An Outlook
+    /// turned meanwhile has its own Landing left as it is, and the one the
+    /// claim was made on is put back for the reader's return.
+    fn return_landing(&mut self) {
+        let Some(stood) = self.landing_return.take() else {
+            return;
+        };
+        if self.landing_stays_in_new_worktrees() {
+            return;
+        }
+        self.outlook_execution_directories
+            .insert(stood.outlook.clone(), stood.remembered.directory.clone());
+        match stood.checkout {
+            Some(checkout) => {
+                self.outlook_execution_checkouts
+                    .insert(stood.outlook.clone(), checkout);
+            }
+            None => {
+                self.outlook_execution_checkouts.remove(&stood.outlook);
+            }
+        }
+        if self.outlook == stood.outlook && self.workspace.id == stood.workspace {
+            self.execution_directory = stood.remembered.directory.clone();
+            self.execution_status = stood.remembered.status.clone();
+            self.sync_composer_completion();
+        }
+        self.remembered_execution_directories
+            .insert((stood.outlook, stood.workspace), stood.remembered);
     }
 
     /// Takes the Workspace this client works in, which the reader moved by
@@ -4361,6 +4428,7 @@ impl TuiState {
         if let Some(reference) = reference {
             self.session_interactions.remove(&reference);
         }
+        self.return_landing();
         self.aside.drop_stand_in();
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         Some(released)
@@ -6558,6 +6626,19 @@ impl Application {
                             self.state.worktree_picker.load(workspace);
                             return Ok(ApplicationTransition::Continue);
                         }
+                        // A Worktree chosen outright is where the reader now
+                        // stands. Another Workspace leaves the one they were
+                        // in to remember where they stood before the claim,
+                        // since adopting it lets go of the claim. An Outlook's
+                        // answer belongs to a turn that already let go of any
+                        // claim before it, so it settles nothing here.
+                        match surface {
+                            WorkspaceResolutionSurface::WorktreeSelection => {
+                                self.state.landing_return = None;
+                            }
+                            WorkspaceResolutionSurface::Outlook => {}
+                            _ => self.state.return_landing(),
+                        }
                         self.state.adopt_context(workspace.clone());
                         match surface {
                             WorkspaceResolutionSurface::WorktreeList => {
@@ -6701,6 +6782,16 @@ impl Application {
                             {
                                 remembered.status = status.clone();
                             }
+                            if let Some(stood) = &mut self.state.landing_return
+                                && stood.workspace == checkout.repository.workspace_id()
+                                && stood
+                                    .remembered
+                                    .directory
+                                    .as_ref()
+                                    .is_some_and(|path| path.starts_with(&checkout.root))
+                            {
+                                stood.remembered.status = status.clone();
+                            }
                             if let Some(context) = &mut picker.context {
                                 if context
                                     .checkout
@@ -6763,7 +6854,17 @@ impl Application {
                 }
                 let intent = self.state.new_worktree.take();
                 if let Some(location) = result.location {
-                    self.state.adopt_context(location);
+                    // The claim draws its location from the Landing's, so the
+                    // Landing moves into the Worktree for as long as the claim
+                    // stands. A reader who has already left it is on a
+                    // Landing the new Worktree moves only if they keep to it.
+                    let claimed = self.state.provisional.is_some();
+                    if claimed && self.state.landing_return.is_none() {
+                        self.state.landing_return = Some(self.state.landing_location());
+                    }
+                    if claimed || self.state.landing_stays_in_new_worktrees() {
+                        self.state.adopt_context(location);
+                    }
                 }
                 self.state.new_worktree = intent.clone();
                 if result.preparation.checkout_created
@@ -7981,6 +8082,7 @@ impl Application {
                         if self.state.worktree_picker.current_checkout()
                             == Some(&checkout.association.id)
                         {
+                            self.state.landing_return = None;
                             self.state.cancel_worktree_intent();
                             self.state.worktree_picker.close();
                             return ApplicationTransition::Continue;

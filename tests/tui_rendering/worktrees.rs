@@ -2015,12 +2015,86 @@ fn navigating_away_does_not_cancel_background_preparation_or_restore_its_route()
     assert!(!text(&app).contains("Finish in the background"));
 }
 
+/// Begins a Session from the Landing in a new Worktree and lets it arrive,
+/// answering with the Worktree it was begun in.
+fn begin_in_new_worktree(app: &mut Application, layout: &Layout, prompt: &str) -> PathBuf {
+    choose_new(app, layout);
+    type_terminal_text(app, prompt);
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request,
+    } = key(app, KeyCode::Enter)
+    else {
+        panic!("first submit prepares")
+    };
+    let result = prepared(layout, &request);
+    let destination = result.preparation.destination.path.clone();
+    let ApplicationTransition::CreateSession(create) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id,
+            prompt_id,
+            result,
+        })
+        .unwrap()
+    else {
+        panic!("a prepared Worktree continues to creation")
+    };
+    app.handle_event(ApplicationEvent::SessionCreated(
+        crate::provisional_session::created_session_snapshot(
+            SessionId::new(),
+            &create.prompt,
+            &destination,
+            SessionTimestamp::now(),
+        ),
+    ))
+    .unwrap();
+    destination
+}
+
+/// Opens a fresh Landing with `/new` and submits from it, answering with
+/// the Session that submission asks for.
+fn submit_from_next_landing(app: &mut Application) -> CreateSessionRequest {
+    command(app, SemanticCommandId::SessionNew);
+    type_terminal_text(app, "The next one");
+    let ApplicationTransition::CreateSession(next) = key(app, KeyCode::Enter) else {
+        panic!("the next Prompt begins a Session where the Landing stands")
+    };
+    next
+}
+
 #[test]
-fn leaving_failed_preparation_restores_its_prompt_and_reuses_the_worktree_intent() {
+fn a_session_begun_in_a_new_worktree_leaves_the_next_landing_where_the_intent_was_made() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    begin_in_new_worktree(&mut app, &layout, "Work elsewhere");
+
+    let next = submit_from_next_landing(&mut app);
+    assert_eq!(next.execution_directory.path, layout.nested);
+    assert_eq!(next.preparation_id, None);
+}
+
+#[test]
+fn a_landing_set_to_stay_follows_its_new_worktree_into_the_next_session() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    let mut settings = EffectiveSettings::default();
+    settings.worktree.after_creation = AfterWorktreeCreation::Stay;
+    deliver_settings(&mut app, settings);
+    let destination = begin_in_new_worktree(&mut app, &layout, "Work elsewhere");
+
+    let next = submit_from_next_landing(&mut app);
+    assert_eq!(next.execution_directory.path, destination);
+    assert_eq!(next.preparation_id, None);
+}
+
+#[test]
+fn leaving_failed_preparation_restores_its_prompt_and_returns_the_landing_with_its_worktree_still_asked_for()
+ {
     let layout = Layout::new();
     let mut app = layout.app();
     choose_new(&mut app, &layout);
-    type_terminal_text(&mut app, "Restore this failed preparation");
+    type_terminal_text(&mut app, "Retry from the Landing");
     let ApplicationTransition::PrepareCheckout {
         attempt_id,
         prompt_id,
@@ -2030,6 +2104,7 @@ fn leaving_failed_preparation_restores_its_prompt_and_reuses_the_worktree_intent
         panic!("prepare")
     };
     let mut result = prepared(&layout, &request);
+    let retained = result.preparation.destination.clone();
     result.preparation.ready = false;
     result.error = Some("Destination Skills unavailable".to_owned());
     app.handle_event(ApplicationEvent::CheckoutPrepared {
@@ -2039,13 +2114,300 @@ fn leaving_failed_preparation_restores_its_prompt_and_reuses_the_worktree_intent
     })
     .unwrap();
     command(&mut app, SemanticCommandId::SessionNew);
-    assert!(text(&app).contains("Restore this failed preparation"));
-    let ApplicationTransition::PrepareCheckout { request: retry, .. } =
-        key(&mut app, KeyCode::Enter)
+    let landing = text(&app);
+    assert!(landing.contains("Retry from the Landing"), "{landing}");
+    assert!(landing.contains("New Worktree on submit"), "{landing}");
+    assert!(landing.contains("nested"), "{landing}");
+
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request: retry,
+    } = key(&mut app, KeyCode::Enter)
     else {
-        panic!("the restored failure remains retryable")
+        panic!("the restored draft prepares again")
     };
     assert_eq!(retry.id, request.id);
+    assert_eq!(retry.source, retained, "the retained Worktree is resumed");
+    let ApplicationTransition::CreateSession(create) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id,
+            prompt_id,
+            result: prepared(&layout, &retry),
+        })
+        .unwrap()
+    else {
+        panic!("a prepared retry continues to creation")
+    };
+    assert_eq!(create.execution_directory, retained);
+    app.handle_event(ApplicationEvent::SessionCreated(
+        crate::provisional_session::created_session_snapshot(
+            SessionId::new(),
+            &create.prompt,
+            &retained.path,
+            SessionTimestamp::now(),
+        ),
+    ))
+    .unwrap();
+    assert_eq!(
+        submit_from_next_landing(&mut app).execution_directory.path,
+        layout.nested
+    );
+}
+
+#[test]
+fn returning_to_the_workspace_resumes_where_the_new_worktree_was_asked_for() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    begin_in_new_worktree(&mut app, &layout, "Work elsewhere");
+    let other = ResolvedWorkspace::directory(layout.main.parent().unwrap().join("other"));
+    let transition = pick_other_workspace(&mut app, &[layout.context.clone(), other.clone()]);
+    answer(&mut app, transition, other.clone());
+
+    let transition = pick_other_workspace(&mut app, &[layout.context.clone(), other]);
+    let (_, _, _, request) =
+        workspace_resolution(&transition).expect("returning resolves the Workspace");
+    assert_eq!(
+        request
+            .remembered_execution_directory
+            .as_ref()
+            .expect("the Workspace remembers a directory")
+            .path,
+        layout.nested
+    );
+}
+
+#[test]
+fn choosing_the_new_worktree_outright_makes_it_where_the_landing_stays() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    let destination = begin_in_new_worktree(&mut app, &layout, "Work elsewhere");
+    command(&mut app, SemanticCommandId::SessionNew);
+
+    let mut context = layout.at(&layout.nested);
+    let prepared_checkout = prepared(
+        &layout,
+        &PrepareCheckoutRequest {
+            intended_session: None,
+            id: Default::default(),
+            source: ExecutionDirectory {
+                path: layout.nested.clone(),
+            },
+            prompt: Default::default(),
+            provider: ProviderId::new("codex"),
+        },
+    )
+    .location
+    .unwrap();
+    context.checkouts = prepared_checkout.checkouts.clone();
+    open(&mut app, context);
+    // New Worktree, main, linked, then the prepared one.
+    for _ in 0..3 {
+        key(&mut app, KeyCode::Down);
+    }
+    let transition = key(&mut app, KeyCode::Enter);
+    answer(&mut app, transition, prepared_checkout);
+
+    assert_eq!(
+        submit_from_next_landing(&mut app).execution_directory.path,
+        destination
+    );
+}
+
+/// Submits a Prompt from the Landing into a new Worktree that is prepared
+/// but whose Session the Server refuses, leaving the reader on the refused
+/// claim; answers with the location the claim stands in, its Worktree
+/// Selector able to create another.
+fn refused_in_new_worktree(app: &mut Application, layout: &Layout) -> ResolvedWorkspace {
+    choose_new(app, layout);
+    type_terminal_text(app, "Refused in its Worktree");
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request,
+    } = key(app, KeyCode::Enter)
+    else {
+        panic!("first submit prepares")
+    };
+    let result = prepared(layout, &request);
+    let mut claimed = result.location.clone().unwrap();
+    let ApplicationTransition::CreateSession(create) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id,
+            prompt_id,
+            result,
+        })
+        .unwrap()
+    else {
+        panic!("a prepared Worktree continues to creation")
+    };
+    app.handle_event(ApplicationEvent::SessionCreationFailed {
+        prompt_id: create.prompt.id,
+        code: None,
+        error: "Provider unavailable".to_owned(),
+    })
+    .unwrap();
+    claimed
+        .workspace
+        .repository
+        .as_mut()
+        .unwrap()
+        .capabilities
+        .create_checkout = SourceControlCapability::Available;
+    claimed
+}
+
+#[test]
+fn a_worktree_chosen_from_a_refused_claim_is_where_the_landing_stays() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    let claimed = refused_in_new_worktree(&mut app, &layout);
+
+    // From the claim, the reader chooses the main Worktree outright.
+    open(&mut app, claimed);
+    key(&mut app, KeyCode::Down);
+    let transition = key(&mut app, KeyCode::Enter);
+    answer(&mut app, transition, layout.at(&layout.main));
+
+    assert_eq!(
+        submit_from_next_landing(&mut app).execution_directory.path,
+        layout.main
+    );
+}
+
+#[test]
+fn a_worktree_prepared_after_the_reader_left_its_claim_never_moves_their_landing() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    choose_new(&mut app, &layout);
+    type_terminal_text(&mut app, "Finish in the background");
+    let ApplicationTransition::PrepareCheckout {
+        attempt_id,
+        prompt_id,
+        request,
+    } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("prepare")
+    };
+    command(&mut app, SemanticCommandId::SessionNew);
+    let ApplicationTransition::CreateSession(create) = app
+        .handle_event(ApplicationEvent::CheckoutPrepared {
+            attempt_id,
+            prompt_id,
+            result: prepared(&layout, &request),
+        })
+        .unwrap()
+    else {
+        panic!("background creation goes on")
+    };
+    app.handle_event(ApplicationEvent::SessionCreated(
+        crate::provisional_session::created_session_snapshot(
+            SessionId::new(),
+            &create.prompt,
+            &create.execution_directory.path,
+            SessionTimestamp::now(),
+        ),
+    ))
+    .unwrap();
+
+    assert_eq!(
+        submit_from_next_landing(&mut app).execution_directory.path,
+        layout.nested
+    );
+}
+
+#[test]
+fn the_sidekick_opened_from_a_refused_claim_leaves_its_workspace_remembering_the_original_location()
+{
+    let layout = Layout::new();
+    let mut app = layout.app();
+    refused_in_new_worktree(&mut app, &layout);
+    let ApplicationTransition::ResolveSidekickWorkspace {
+        outlook,
+        request_id,
+    } = command(&mut app, SemanticCommandId::SessionSidekick)
+    else {
+        panic!("/sidekick asks its Server for the Sidekick Workspace")
+    };
+    let sidekick = layout.root.join("sidekick");
+    std::fs::create_dir(&sidekick).unwrap();
+    app.handle_event(ApplicationEvent::WorkspaceResolved {
+        outlook,
+        surface: suru::tui::WorkspaceResolutionSurface::Sidekick,
+        request_id,
+        result: Ok(ResolvedWorkspace::directory(sidekick)),
+    })
+    .unwrap();
+
+    let transition = pick_other_workspace(&mut app, std::slice::from_ref(&layout.context));
+    let (_, _, _, request) =
+        workspace_resolution(&transition).expect("returning resolves the Workspace");
+    assert_eq!(
+        request
+            .remembered_execution_directory
+            .as_ref()
+            .expect("the Workspace remembers a directory")
+            .path,
+        layout.nested
+    );
+}
+
+#[test]
+fn removing_the_original_worktree_from_a_refused_claim_returns_the_landing_to_it_unavailable() {
+    let layout = Layout::new();
+    let mut app = layout.app();
+    let claimed = refused_in_new_worktree(&mut app, &layout);
+    open(&mut app, claimed);
+    // Walk past the New Worktree row and the main Worktree onto the linked one.
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    let ApplicationTransition::PreviewCheckoutRemoval { request_id, target } =
+        key(&mut app, KeyCode::Char('d'))
+    else {
+        panic!("preview linked");
+    };
+    let preview = CheckoutRemovalPreview {
+        target: *target,
+        inspection: CheckoutRemovalInspection {
+            checkout: layout.context.checkouts[1].clone(),
+            tracked: vec![],
+            untracked: vec![],
+            ignored: vec![],
+            lock: None,
+            initialized_submodules: vec![],
+        },
+        branch_outcome: CheckoutBranchOutcome::Deleted,
+        affected_sessions: 0,
+        working_sessions: 0,
+    };
+    app.handle_event(ApplicationEvent::CheckoutRemoval {
+        request_id,
+        result: Ok(RemoveCheckoutResult {
+            preview: preview.clone(),
+            removed: false,
+            error: None,
+        }),
+    })
+    .unwrap();
+    let ApplicationTransition::RemoveCheckout { request_id, .. } = key(&mut app, KeyCode::Enter)
+    else {
+        panic!("ordinary removal confirmation");
+    };
+    app.handle_event(ApplicationEvent::CheckoutRemoval {
+        request_id,
+        result: Ok(RemoveCheckoutResult {
+            preview,
+            removed: true,
+            error: None,
+        }),
+    })
+    .unwrap();
+    key(&mut app, KeyCode::Esc);
+
+    command(&mut app, SemanticCommandId::SessionNew);
+    let landing = text(&app);
+    assert!(landing.contains("nested"), "{landing}");
+    assert!(landing.contains("unavailable"), "{landing}");
 }
 
 fn offer_review(app: &mut Application, path: &Path, id: &str) {
