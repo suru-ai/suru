@@ -2852,7 +2852,7 @@ fn moving_workspace_while_a_session_is_opening_reports_the_client_letting_go() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request: listing,
-            workspaces: vec![Workspace::directory(atlas.clone())],
+            listing: crate::support::workspace_listing(vec![Workspace::directory(atlas.clone())]),
         })
         .expect("hydrate the Workspace Picker");
     press_sidebar_key(&mut application, KeyCode::Down);
@@ -7834,7 +7834,7 @@ fn the_workspace_the_reader_moved_to_stands_among_the_selectors_entries() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request: listing,
-            workspaces: vec![Workspace::directory(notes.clone())],
+            listing: crate::support::workspace_listing(vec![Workspace::directory(notes.clone())]),
         })
         .expect("hydrate the Workspace Picker");
     press_sidebar_key(&mut application, KeyCode::Down);

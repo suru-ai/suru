@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 105;
+pub const PROTOCOL_VERSION: u32 = 106;
 mod attachment;
 mod reading;
 mod relay;
@@ -5000,12 +5000,38 @@ pub struct ClonedWorkspace {
 /// on another machine names each in the owning Server's own syntax, as the
 /// Session catalog's snapshot lets it name the Workspaces Sessions work in.
 /// The Workspaces are its Workspace Registry's entries: those its Sessions
-/// work in, most recently worked in first, then the rest, by path.
+/// work in, most recently worked in first, then the rest, by path. The same
+/// listing is pushed on its Session catalog stream (ADR 0052), and its
+/// revision says which of the two a Client heard last is the newer.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceListing {
+    pub revision: WorkspaceListingRevision,
     pub workspace_paths: WorkspacePaths,
     pub workspaces: Vec<Workspace>,
+}
+
+/// Where a Workspace listing stands among those its Server gives during one
+/// run: the run, told apart from every other by an identity it draws as it
+/// starts, and how many times the listing had changed during that run when
+/// it was given. Within a run, a listing at a later revision is the newer,
+/// and two at the same revision list the same; between runs the count says
+/// nothing, so a Client takes the run its Server's Session catalog stream
+/// speaks for.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceListingRevision {
+    pub run: Uuid,
+    pub changes: u64,
+}
+
+impl WorkspaceListingRevision {
+    /// Whether a listing at this revision is no older than one at `held`:
+    /// given during the same run, once the listing had changed as often or
+    /// more.
+    pub fn is_no_older_than(&self, held: &Self) -> bool {
+        self.run == held.run && self.changes >= held.changes
+    }
 }
 
 /// One Session as its Server holds it, as

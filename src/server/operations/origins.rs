@@ -44,8 +44,7 @@ use crate::{
     protocol::{
         ACT_HEADER, ActId, Author, Outlook, ReadRequest, Remote, RemoteStatus, SessionError,
         SessionErrorCode, SessionId, SessionListItem, SessionReadingAnswer, SessionReadingQuery,
-        SnapshotWithSummary, WorkspaceId, WorkspaceListing, WorkspacePaths,
-        WorkspaceUnavailability,
+        SnapshotWithSummary, Workspace, WorkspaceId, WorkspaceListing, WorkspaceUnavailability,
     },
     serving::{PairingFailure, ServingController},
     session_projection::agent_reading::{self, KnownRemote, ReadAt},
@@ -1042,10 +1041,12 @@ impl SessionOperations {
     }
 
     /// Every Workspace this Server knows, as [`Self::workspace_listing`]
-    /// lists them, reading nothing afresh: what is pushed whenever it moves
-    /// (see [`Self::workspace_listing_moves`]).
+    /// lists them, reading nothing afresh, at the revision this Server gives
+    /// it (see [`super::workspace_listings`]): what is pushed whenever it
+    /// moves (see [`Self::workspace_listing_moves`]).
     pub(crate) fn workspace_listing_now(&self) -> WorkspaceListing {
-        self.listing_of_registry(self.registry_standing.remembered())
+        self.workspace_listings
+            .give(|| self.workspaces_of_registry(self.registry_standing.remembered()))
     }
 
     /// Announces whatever may move what [`Self::workspace_listing_now`]
@@ -1054,6 +1055,7 @@ impl SessionOperations {
         WorkspaceListingMoves {
             registry: self.sessions.registry_moves().follow(),
             repositories: self.source_control.repository_moves().follow(),
+            given: self.workspace_listings.follow(),
         }
     }
 
@@ -1062,17 +1064,17 @@ impl SessionOperations {
     /// cannot be opened, nor having anything read afresh: for a Clone just
     /// entered, whose directory has just been made, whatever was found of
     /// one there before.
-    pub(crate) fn registered_workspace_listing(&self) -> WorkspaceListing {
-        self.listing_of_registry(HashMap::new())
+    pub(crate) fn registered_workspaces(&self) -> Vec<Workspace> {
+        self.workspaces_of_registry(HashMap::new())
     }
 
     /// Every Workspace the Registry holds now, each whose Repository source
     /// control has read during this run presented as that Repository is,
     /// and each `unavailable` names saying why it cannot be opened.
-    fn listing_of_registry(
+    fn workspaces_of_registry(
         &self,
         mut unavailable: HashMap<WorkspaceId, WorkspaceUnavailability>,
-    ) -> WorkspaceListing {
+    ) -> Vec<Workspace> {
         let repositories = self.source_control.repositories();
         let mut workspaces = self.sessions.listed_workspaces();
         for workspace in &mut workspaces {
@@ -1085,10 +1087,7 @@ impl SessionOperations {
                 workspace.repository = Some(Box::new(repository.clone()));
             }
         }
-        WorkspaceListing {
-            workspace_paths: WorkspacePaths::discover(),
-            workspaces,
-        }
+        workspaces
     }
 
     /// What a reading of the Session `session_id` at `origin` finds,
@@ -1265,12 +1264,14 @@ impl SessionOperations {
 
 /// Whatever may move the Workspace listing a Server pushes: its Workspace
 /// Registry's entries, the Sessions that order them, and what was last found
-/// of each entry's directory; and the Repositories source control has read,
-/// which present them. A move may leave the listing as it was, so whatever
-/// pushes it pushes only what differs from what it pushed last.
+/// of each entry's directory; the Repositories source control has read,
+/// which present them; and a listing given at a revision of its own to
+/// anyone, an answer included. A move may leave the listing as it was, so
+/// whatever pushes it pushes only a listing at a revision it has not.
 pub(crate) struct WorkspaceListingMoves {
     registry: watch::Receiver<u64>,
     repositories: watch::Receiver<u64>,
+    given: watch::Receiver<WorkspaceListing>,
 }
 
 impl WorkspaceListingMoves {
@@ -1279,6 +1280,7 @@ impl WorkspaceListingMoves {
         tokio::select! {
             changed = self.registry.changed() => changed,
             changed = self.repositories.changed() => changed,
+            changed = self.given.changed() => changed,
         }
     }
 }

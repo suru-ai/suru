@@ -1004,8 +1004,7 @@ impl SessionOperations {
         };
         match settled {
             Ok(workspace) => Ok(self
-                .registered_workspace_listing()
-                .workspaces
+                .registered_workspaces()
                 .into_iter()
                 .find(|listed| listed.id == workspace.id)
                 .unwrap_or(workspace)),

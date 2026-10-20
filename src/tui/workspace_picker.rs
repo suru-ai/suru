@@ -13,7 +13,8 @@ use ratatui::layout::Position;
 
 use crate::protocol::{
     MAX_WORKSPACE_DESCRIPTION_CHARS, Outlook, Workspace, WorkspaceDescription, WorkspaceId,
-    WorkspacePaths, WorkspaceUnavailability, description_too_long, one_line_description,
+    WorkspaceListing, WorkspacePaths, WorkspaceUnavailability, description_too_long,
+    one_line_description,
 };
 
 use super::{
@@ -80,8 +81,9 @@ pub(super) struct WorkspacePicker {
 /// most recently worked in first, then the rest. The picker draws the
 /// Outlook's Server's. Each opening asks that Server again, and only the
 /// answer to the latest request lands; each Server pushes its listing too,
-/// as it connects and as what it lists moves (ADR 0052), and every push
-/// lands.
+/// as it connects and as what it lists moves (ADR 0052). Whichever reaches
+/// the client first, only a listing no older than the one held lands, by
+/// the revision its Server gave it.
 #[derive(Clone, Debug)]
 struct RegistryListing {
     /// The Server the picker asks, which is the Outlook's.
@@ -94,10 +96,10 @@ struct RegistryListing {
     /// The request whose reply the picker is waiting for. Any other reply is
     /// a straggler from an opening the reader has moved past.
     pending_request: Option<WorkspaceListRequest>,
-    /// The latest listing heard from each Server, pushed or answering the
-    /// picker, which the picker opens on at once and which each later one
+    /// The newest listing heard from each Server, pushed or answering the
+    /// picker, which the picker opens on at once and which each newer one
     /// replaces in place. A Server not yet heard from has none.
-    heard: HashMap<Outlook, Vec<Workspace>>,
+    heard: HashMap<Outlook, WorkspaceListing>,
     /// Whether the picker waits on a listing with none of its Server's to
     /// draw meanwhile.
     loading: bool,
@@ -133,22 +135,44 @@ impl RegistryListing {
         self.pending_request.as_ref() == Some(request)
     }
 
-    fn load(&mut self, request: &WorkspaceListRequest, workspaces: Vec<Workspace>) -> bool {
+    /// Takes the answer to `request`, where it is the one the picker
+    /// awaits, answering whether it was: the request is answered either
+    /// way, but what it answered replaces what is held only where it is no
+    /// older — of the run held, and as new or newer. One from another run
+    /// is let go, since only the Server's Session catalog stream says
+    /// which run is its Server's now.
+    fn load(&mut self, request: &WorkspaceListRequest, listing: WorkspaceListing) -> bool {
         if !self.awaits(request) {
             return false;
         }
-        self.heard.insert(self.outlook.clone(), workspaces);
+        let newer = self
+            .heard
+            .get(&self.outlook)
+            .is_none_or(|held| listing.revision.is_no_older_than(&held.revision));
+        if newer {
+            self.heard.insert(self.outlook.clone(), listing);
+        }
         self.loading = false;
         self.pending_request = None;
         true
     }
 
-    /// Takes the listing `outlook`'s Server pushed, in place of what was
-    /// heard from it before, answering whether it is the one the picker
-    /// draws. A request still in flight stands: its answer lands too.
-    fn hear(&mut self, outlook: Outlook, workspaces: Vec<Workspace>) -> bool {
+    /// Takes the listing `outlook`'s Server pushed in place of what was
+    /// heard from it before, where it is no older — or where it is of
+    /// another run, the stream it came on speaking for the run its Server
+    /// is in now — answering whether it is the one the picker draws. A
+    /// request still in flight stands: its answer lands too, where it is
+    /// no older still.
+    fn hear(&mut self, outlook: Outlook, listing: WorkspaceListing) -> bool {
+        let newer = self.heard.get(&outlook).is_none_or(|held| {
+            held.revision.run != listing.revision.run
+                || listing.revision.is_no_older_than(&held.revision)
+        });
+        if !newer {
+            return false;
+        }
         let drawn = outlook == self.outlook;
-        self.heard.insert(outlook, workspaces);
+        self.heard.insert(outlook, listing);
         if drawn {
             self.loading = false;
         }
@@ -177,7 +201,9 @@ impl RegistryListing {
     /// What was last heard from the Outlook's Server: nothing, where it has
     /// not been heard from.
     fn held(&self) -> &[Workspace] {
-        self.heard.get(&self.outlook).map_or(&[], Vec::as_slice)
+        self.heard
+            .get(&self.outlook)
+            .map_or(&[], |listing| listing.workspaces.as_slice())
     }
 
     /// Every copy of the Workspace `workspace_id` this listing holds of
@@ -195,7 +221,7 @@ impl RegistryListing {
         self.heard
             .get_mut(outlook)
             .into_iter()
-            .flatten()
+            .flat_map(|listing| listing.workspaces.iter_mut())
             .chain(current)
             .filter(move |workspace| &workspace.id == workspace_id)
     }
@@ -577,19 +603,20 @@ impl WorkspacePicker {
     /// picker drew, leaving the query as typed and the reader on the
     /// Workspace they were on where it is still offered, and on the first
     /// row — the current Workspace — otherwise.
-    pub(super) fn load(&mut self, request: &WorkspaceListRequest, workspaces: Vec<Workspace>) {
-        if !self.listing.load(request, workspaces) {
+    pub(super) fn load(&mut self, request: &WorkspaceListRequest, listing: WorkspaceListing) {
+        if !self.listing.load(request, listing) {
             return;
         }
         self.keep_selection_offered();
     }
 
-    /// Takes the Workspaces `outlook`'s Server pushed, as it connected or as
-    /// what it lists moved: kept for the next opening, and — where they are
-    /// the Outlook's and the picker stands open or aside — in place of those
-    /// it drew, on the terms [`Self::load`] takes an answer on.
-    pub(super) fn hear(&mut self, outlook: Outlook, workspaces: Vec<Workspace>) {
-        if self.listing.hear(outlook, workspaces) && (self.open || self.stepped_aside) {
+    /// Takes the listing `outlook`'s Server pushed, as it connected or as
+    /// what it lists moved, where it is no older than the one held: kept
+    /// for the next opening, and — where it is the Outlook's and the picker
+    /// stands open or aside — in place of the rows it drew, on the terms
+    /// [`Self::load`] takes an answer on.
+    pub(super) fn hear(&mut self, outlook: Outlook, listing: WorkspaceListing) {
+        if self.listing.hear(outlook, listing) && (self.open || self.stepped_aside) {
             self.keep_selection_offered();
         }
     }

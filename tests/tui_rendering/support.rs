@@ -49,6 +49,21 @@ impl WorkspaceDir {
     }
 }
 
+/// `workspaces` as a Server lists them, at a revision any other listing
+/// the test gives of the same run replaces.
+pub fn workspace_listing(
+    workspaces: Vec<suru::protocol::Workspace>,
+) -> suru::protocol::WorkspaceListing {
+    suru::protocol::WorkspaceListing {
+        revision: suru::protocol::WorkspaceListingRevision {
+            run: uuid::Uuid::nil(),
+            changes: 0,
+        },
+        workspace_paths: suru::protocol::WorkspacePaths::default(),
+        workspaces,
+    }
+}
+
 /// A Workspace directory for a rendering test, held canonical per
 /// [`WorkspaceDir`]. It lives as long as the binding, the way a tempdir does.
 pub fn workspace_dir() -> WorkspaceDir {

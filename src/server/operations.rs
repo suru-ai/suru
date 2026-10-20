@@ -77,6 +77,7 @@ mod memories;
 mod origins;
 mod remote_entries;
 mod settings;
+mod workspace_listings;
 mod workspaces;
 
 pub(crate) use acts_at::ActRefusal;
@@ -443,11 +444,14 @@ pub(crate) struct SessionOperations {
     /// Where a change of a Setting is written, and everything that adopts it.
     settings_adoption: SettingsAdoption,
     /// What discovers the Repositories within the Workspace Roots into the
-    /// Workspace Registry before the Registry is listed.
+    /// Workspace Registry behind each listing of it.
     root_discovery: RootDiscovery,
     /// What keeps the Workspace Registry in step with the disk and the Roots
-    /// as it is listed.
+    /// behind each listing of it.
     registry_standing: RegistryStanding,
+    /// The Workspace listing as this Server gives it, to whoever asks and to
+    /// every Session catalog stream alike.
+    workspace_listings: workspace_listings::WorkspaceListings,
     /// The Memories this Server keeps for its Sidekicks.
     memories: MemoryStore,
     /// The Remotes kept in view for the trees listing their Sessions.
@@ -497,6 +501,7 @@ impl SessionOperations {
             settings_adoption,
             root_discovery,
             registry_standing,
+            workspace_listings: workspace_listings::WorkspaceListings::new(),
             memories,
             remote_watches,
         }

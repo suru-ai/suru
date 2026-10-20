@@ -1934,8 +1934,7 @@ impl TuiState {
             return;
         }
         if let ManagedEvent::WorkspaceListing(listing) = event {
-            self.workspace_picker
-                .hear(outlook.clone(), listing.workspaces);
+            self.workspace_picker.hear(outlook.clone(), listing);
             return;
         }
         self.adopt_workspace_paths(outlook, &event);
@@ -2463,9 +2462,9 @@ impl TuiState {
             // The managed catalog stream is the local Server's, so the
             // listing it pushes is the Local Outlook's whichever Outlook is
             // on screen; a Remote's is taken in `apply_origin_catalog`.
-            ManagedEvent::WorkspaceListing(listing) => self
-                .workspace_picker
-                .hear(Outlook::Local, listing.workspaces),
+            ManagedEvent::WorkspaceListing(listing) => {
+                self.workspace_picker.hear(Outlook::Local, listing);
+            }
             ManagedEvent::Relays(listing) => self.receive_relays(listing),
             ManagedEvent::ServingListener(state) => self.serving_listener = state,
             ManagedEvent::RemoteFailed { message, .. } => self.settle_remote_failure(message),
@@ -5008,11 +5007,12 @@ pub enum ApplicationEvent {
         request: SessionListRequest,
         error: String,
     },
-    /// The Workspaces the Workspace Picker's Outlook's Server lists, in the
-    /// order it lists them.
+    /// The Workspace listing the Workspace Picker's Outlook's Server
+    /// answered with: its Workspaces, in the order it lists them, at the
+    /// revision it gave them.
     WorkspacesListed {
         request: WorkspaceListRequest,
-        workspaces: Vec<Workspace>,
+        listing: crate::protocol::WorkspaceListing,
     },
     WorkspaceListingFailed {
         request: WorkspaceListRequest,
@@ -6987,11 +6987,8 @@ impl Application {
                 }
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::WorkspacesListed {
-                request,
-                workspaces,
-            } => {
-                self.state.workspace_picker.load(&request, workspaces);
+            ApplicationEvent::WorkspacesListed { request, listing } => {
+                self.state.workspace_picker.load(&request, listing);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::WorkspaceListingFailed { request, error } => {

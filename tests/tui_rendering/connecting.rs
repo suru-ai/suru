@@ -530,7 +530,9 @@ fn a_fresh_landing_lets_go_of_a_remote_workspace_still_resolving() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            workspaces: vec![Workspace::directory(remote_only.clone())],
+            listing: crate::support::workspace_listing(vec![Workspace::directory(
+                remote_only.clone(),
+            )]),
         })
         .unwrap();
     press(&mut application, KeyCode::Down);
@@ -696,7 +698,9 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            workspaces: vec![Workspace::directory(remote_only.clone())],
+            listing: crate::support::workspace_listing(vec![Workspace::directory(
+                remote_only.clone(),
+            )]),
         })
         .unwrap();
     press(&mut application, KeyCode::Down);

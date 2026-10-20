@@ -69,7 +69,7 @@ fn picker_over(here: &Path, workspaces: Vec<Workspace>, show_icons: bool) -> App
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            workspaces,
+            listing: crate::support::workspace_listing(workspaces),
         })
         .expect("hydrate the Workspace Picker");
     application
@@ -633,7 +633,7 @@ fn a_remote_workspace_s_description_is_saved_to_that_remote() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            workspaces: vec![registered(&studio_work, None)],
+            listing: crate::support::workspace_listing(vec![registered(&studio_work, None)]),
         })
         .expect("hydrate the Workspace Picker");
     let buffer = rendered_application_buffer(&application, WIDE, TALL);
@@ -709,7 +709,7 @@ fn a_local_description_never_reaches_a_remote_workspace_of_the_same_identity() {
         application
             .handle_event(ApplicationEvent::WorkspacesListed {
                 request,
-                workspaces: vec![registered(&shared, None)],
+                listing: crate::support::workspace_listing(vec![registered(&shared, None)]),
             })
             .expect("hydrate the Workspace Picker");
     };

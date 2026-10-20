@@ -2441,16 +2441,10 @@ impl RunLoop {
                 self.application
                     .handle_event(ApplicationEvent::SessionListingFailed { request, error })?;
             }
-            SessionPickerResult::WorkspacesListed {
-                request,
-                workspaces,
-            } => {
+            SessionPickerResult::WorkspacesListed { request, listing } => {
                 self.tasks.finish_listing_workspaces(&request);
                 self.application
-                    .handle_event(ApplicationEvent::WorkspacesListed {
-                        request,
-                        workspaces,
-                    })?;
+                    .handle_event(ApplicationEvent::WorkspacesListed { request, listing })?;
             }
             SessionPickerResult::WorkspaceListingFailed { request, error } => {
                 self.tasks.finish_listing_workspaces(&request);
@@ -3732,7 +3726,7 @@ enum SessionPickerResult {
     },
     WorkspacesListed {
         request: WorkspaceListRequest,
-        workspaces: Vec<crate::protocol::Workspace>,
+        listing: crate::protocol::WorkspaceListing,
     },
     WorkspaceListingFailed {
         request: WorkspaceListRequest,
@@ -3804,10 +3798,7 @@ fn spawn_workspace_listing(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let result = match commands.list_workspaces().await {
-            Ok(listing) => SessionPickerResult::WorkspacesListed {
-                request,
-                workspaces: listing.workspaces,
-            },
+            Ok(listing) => SessionPickerResult::WorkspacesListed { request, listing },
             Err(error) => SessionPickerResult::WorkspaceListingFailed {
                 request,
                 error: error.to_string(),
@@ -4862,6 +4853,10 @@ mod tests {
     fn a_background_origins_workspace_listing_is_taken() {
         let application = Application::default();
         let event = ManagedEvent::WorkspaceListing(crate::protocol::WorkspaceListing {
+            revision: crate::protocol::WorkspaceListingRevision {
+                run: uuid::Uuid::nil(),
+                changes: 0,
+            },
             workspace_paths: crate::protocol::WorkspacePaths::default(),
             workspaces: Vec::new(),
         });

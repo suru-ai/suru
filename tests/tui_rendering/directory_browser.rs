@@ -1829,10 +1829,10 @@ fn a_workspace_the_workspace_picker_listed_wears_its_icon_while_the_sidebar_is_h
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            workspaces: vec![
+            listing: crate::support::workspace_listing(vec![
                 workspace_with_icon(&here, Some("dev-python")),
                 workspace_with_icon(&here.join("iconed"), Some("dev-rust")),
-            ],
+            ]),
         })
         .expect("list the Workspace Picker's Workspaces");
     let children = [

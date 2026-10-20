@@ -220,10 +220,12 @@ fn pick_other_workspace(
     };
     app.handle_event(ApplicationEvent::WorkspacesListed {
         request,
-        workspaces: contexts
-            .iter()
-            .map(|context| context.workspace.clone())
-            .collect(),
+        listing: crate::support::workspace_listing(
+            contexts
+                .iter()
+                .map(|context| context.workspace.clone())
+                .collect(),
+        ),
     })
     .unwrap();
     key(app, KeyCode::Down);

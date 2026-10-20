@@ -1358,6 +1358,9 @@ fn an_act_on_a_peer_names_itself_and_an_intervention_says_when() {
     );
 }
 
+/// A Server's listing of its Workspaces carries the paths they are spelled
+/// in, and the revision it was given at (ADR 0052): a listing without one
+/// is no listing this protocol reads.
 #[test]
 fn a_servers_workspace_listing_carries_the_paths_its_workspaces_are_spelled_in() {
     const {
@@ -1365,10 +1368,16 @@ fn a_servers_workspace_listing_carries_the_paths_its_workspaces_are_spelled_in()
             PROTOCOL_VERSION >= 77,
             "a Server's listing of its Workspaces is asked of it by a Peer"
         );
+        assert!(
+            PROTOCOL_VERSION >= 106,
+            "a Server's listing of its Workspaces is pushed, at a revision of its own"
+        );
     }
-    use suru::protocol::{PathStyle, WorkspaceListing, WorkspacePaths};
+    use suru::protocol::{PathStyle, WorkspaceListing, WorkspaceListingRevision, WorkspacePaths};
     let workspace = Workspace::directory(std::env::temp_dir().join("atlas"));
+    let run = Uuid::from_u128(1);
     let listing = WorkspaceListing {
+        revision: WorkspaceListingRevision { run, changes: 3 },
         workspace_paths: WorkspacePaths {
             home: None,
             style: PathStyle::Windows,
@@ -1376,17 +1385,27 @@ fn a_servers_workspace_listing_carries_the_paths_its_workspaces_are_spelled_in()
         },
         workspaces: vec![workspace.clone()],
     };
-    let encoded = serde_json::to_value(&listing).expect("encode a Workspace listing");
+    let mut encoded = serde_json::to_value(&listing).expect("encode a Workspace listing");
     assert_eq!(
         encoded,
         json!({
+            "revision": { "run": run, "changes": 3 },
             "workspace_paths": { "home": null, "style": "windows" },
             "workspaces": [workspace],
         })
     );
     assert_eq!(
-        serde_json::from_value::<WorkspaceListing>(encoded).expect("decode a Workspace listing"),
+        serde_json::from_value::<WorkspaceListing>(encoded.clone())
+            .expect("decode a Workspace listing"),
         listing
+    );
+    encoded
+        .as_object_mut()
+        .expect("a listing is an object")
+        .remove("revision");
+    assert!(
+        serde_json::from_value::<WorkspaceListing>(encoded).is_err(),
+        "a listing that gives no revision is refused"
     );
 }
 

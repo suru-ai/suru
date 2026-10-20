@@ -580,10 +580,10 @@ fn workspace_picker_with_two_workspaces(
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            workspaces: vec![
+            listing: crate::support::workspace_listing(vec![
                 Workspace::directory(acorn.clone()),
                 Workspace::directory(birch),
-            ],
+            ]),
         })
         .expect("hydrate the Workspace Picker");
     (application, WorkspaceId::directory(&acorn))

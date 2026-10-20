@@ -1011,19 +1011,57 @@ async fn what_a_reading_behind_a_listing_finds_is_pushed_once_it_lands() {
         [None],
         "the listing answers before the directory is read, as it was last found"
     );
+    let read = next_pushed(&mut pushed).await;
     assert_eq!(
-        next_pushed(&mut pushed)
-            .await
-            .workspaces
+        read.workspaces
             .iter()
             .map(|workspace| workspace.unavailable)
             .collect::<Vec<_>>(),
         [Some(WorkspaceUnavailability::Gone)],
         "what the reading behind it found is pushed once it lands"
     );
+    assert!(
+        read.revision.is_no_older_than(&answered.revision)
+            && !answered.revision.is_no_older_than(&read.revision),
+        "at a revision newer than the answer's, so a client hearing both in either order keeps \
+         it: {:?} then {:?}",
+        answered.revision,
+        read.revision
+    );
 
     drop(client);
     server.shutdown().await.expect("shut down server");
+}
+
+/// Listings given while nothing they list moves stand at one revision; a
+/// Server started again gives its listings in a run of its own, so no
+/// count of the run before is read against them.
+#[tokio::test]
+async fn a_server_started_again_gives_its_listings_in_a_run_of_its_own() {
+    const CHANNEL: &str = "workspace-registry-runs";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config = ServerConfig::new(state_dir.path(), CHANNEL).expect("configure");
+    let revision = async || {
+        let server = spawn_with_failing_provider(config.clone())
+            .await
+            .expect("spawn server");
+        server.workspace_discovery_settled().await;
+        let client = connected_client(state_dir.path(), CHANNEL).await;
+        let first = client.list_workspaces().await.expect("list Workspaces");
+        let again = client.list_workspaces().await.expect("list Workspaces");
+        assert_eq!(
+            first.revision, again.revision,
+            "nothing listed moved between the two"
+        );
+        drop(client);
+        server.shutdown().await.expect("shut down server");
+        first.revision
+    };
+
+    let before = revision().await;
+    let after = revision().await;
+
+    assert_ne!(before.run, after.run);
 }
 
 /// A client hears its Server's Workspace listing as the Server pushes it,

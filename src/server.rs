@@ -50,7 +50,7 @@ use crate::protocol::{
     SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
     SkillCatalogRequest, SubagentTreeRevision, SubagentTreeUpdate, TurnId,
     UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
-    WORKSPACE_LISTING_EVENT, WorkspaceListing,
+    WORKSPACE_LISTING_EVENT, WorkspaceListing, WorkspaceListingRevision,
 };
 use crate::provider::{
     ContextBreakdownError, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate,
@@ -2738,9 +2738,9 @@ struct SessionCatalogEventStreamState {
     pushed_models: ModelCatalog,
     operations: SessionOperations,
     workspace_moves: operations::WorkspaceListingMoves,
-    /// The Workspace listing this stream last pushed, so a move that leaves
-    /// it as the client already has it is not pushed again.
-    pushed_workspaces: WorkspaceListing,
+    /// The revision of the Workspace listing this stream last pushed, so a
+    /// move that leaves the listing at it is not pushed again.
+    pushed_workspaces: WorkspaceListingRevision,
 }
 
 fn workspace_listing_event(listing: &WorkspaceListing) -> Event {
@@ -2778,8 +2778,9 @@ fn session_catalog_event_stream(
     // The Workspace listing follows, its moves heard of from before it is
     // read, so none landing meanwhile is lost.
     let workspace_moves = operations.workspace_listing_moves();
-    let pushed_workspaces = operations.workspace_listing_now();
-    let workspace_snapshot = workspace_listing_event(&pushed_workspaces);
+    let listing = operations.workspace_listing_now();
+    let pushed_workspaces = listing.revision;
+    let workspace_snapshot = workspace_listing_event(&listing);
     let state = SessionCatalogEventStreamState {
         keepalive: tokio::time::interval_at(
             Instant::now() + keepalive_interval,
@@ -2855,12 +2856,11 @@ fn session_catalog_event_stream(
                     // has it — a reading finding what the last one did, a
                     // Description set as it stood — is not worth a push.
                     let listing = state.operations.workspace_listing_now();
-                    if listing == state.pushed_workspaces {
+                    if listing.revision == state.pushed_workspaces {
                         continue;
                     }
-                    let event = workspace_listing_event(&listing);
-                    state.pushed_workspaces = listing;
-                    event
+                    state.pushed_workspaces = listing.revision;
+                    workspace_listing_event(&listing)
                 }
                 _ = state.keepalive.tick() => Event::default().comment("keep-alive"),
             };

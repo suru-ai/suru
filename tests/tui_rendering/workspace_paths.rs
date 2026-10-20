@@ -257,7 +257,10 @@ fn the_workspace_picker_offers_no_remotes_sidekick_workspace() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            workspaces: vec![listed(ids[0], sidekick), listed(ids[1], other)],
+            listing: crate::support::workspace_listing(vec![
+                listed(ids[0], sidekick),
+                listed(ids[1], other),
+            ]),
         })
         .unwrap();
 
@@ -335,7 +338,9 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
                 ApplicationTransition::ListWorkspaces(request) => {
                     ApplicationEvent::WorkspacesListed {
                         request,
-                        workspaces: vec![snapshot.session.workspace],
+                        listing: crate::support::workspace_listing(vec![
+                            snapshot.session.workspace,
+                        ]),
                     }
                 }
                 ApplicationTransition::ListSessions(request) => ApplicationEvent::SessionsListed {
