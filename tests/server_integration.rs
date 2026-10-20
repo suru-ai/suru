@@ -1761,8 +1761,8 @@ async fn outlook_client_lists_its_remotes_workspace_registry() {
     pair.shutdown().await;
 }
 
-/// A Client keeping Workspace listings hears a Remote's as the Remote
-/// pushes it on the Session catalog stream it follows through the Pairing
+/// A Client hears a Remote's Workspace listing as the Remote pushes it on
+/// the Session catalog stream the Client follows through the Pairing
 /// (ADR 0052): as that stream connects, and again once a Workspace is made
 /// known there — so a Client's Workspace Picker turned toward a Remote
 /// opens on that Remote's Workspaces before it asks for them.
@@ -1791,14 +1791,8 @@ async fn a_remotes_workspace_listing_reaches_a_client_through_the_pairing() {
     };
     let notes = tempfile::tempdir().expect("create a Serving Workspace");
     let notes = described(notes.path(), "Where the notes are kept.").await;
-    let client = ManagedClient::connect(
-        pair.connecting_client_config
-            .clone()
-            .with_workspace_listings(),
-    )
-    .await
-    .expect("attach a Client keeping Workspace listings");
-    let mut catalog = client
+    let mut catalog = pair
+        .connecting_client
         .outlook(Outlook::Remote("workstation".to_owned()))
         .subscribe_catalog();
     let mut next_heard = async || {
@@ -1839,7 +1833,6 @@ async fn a_remotes_workspace_listing_reaches_a_client_through_the_pairing() {
     );
 
     drop(catalog);
-    drop(client);
     pair.shutdown().await;
 }
 
@@ -5976,12 +5969,12 @@ async fn managed_client_connects_without_periodic_domain_events() {
     .expect("connect managed client");
 
     assert!(matches!(
-        timeout(PROGRESS_DEADLINE, client.next())
+        timeout(PROGRESS_DEADLINE, support::next_event(&mut client))
             .await
             .expect("connecting event arrives"),
         Some(ManagedEvent::Connecting)
     ));
-    let connected = timeout(PROGRESS_DEADLINE, client.next())
+    let connected = timeout(PROGRESS_DEADLINE, support::next_event(&mut client))
         .await
         .expect("connected event arrives")
         .expect("managed client remains open");
@@ -5992,7 +5985,7 @@ async fn managed_client_connects_without_periodic_domain_events() {
     assert_eq!(identity.pid, descriptor.pid);
     assert!(
         matches!(
-            timeout(PROGRESS_DEADLINE, client.next())
+            timeout(PROGRESS_DEADLINE, support::next_event(&mut client))
                 .await
                 .expect("settings snapshot arrives"),
             Some(ManagedEvent::SettingsSnapshot(_))
@@ -6001,7 +5994,7 @@ async fn managed_client_connects_without_periodic_domain_events() {
     );
     assert!(
         matches!(
-            timeout(PROGRESS_DEADLINE, client.next())
+            timeout(PROGRESS_DEADLINE, support::next_event(&mut client))
                 .await
                 .expect("Model Catalog arrives"),
             Some(ManagedEvent::ModelCatalog(_))
@@ -6010,7 +6003,7 @@ async fn managed_client_connects_without_periodic_domain_events() {
     );
     assert!(
         matches!(
-            timeout(PROGRESS_DEADLINE, client.next())
+            timeout(PROGRESS_DEADLINE, support::next_event(&mut client))
                 .await
                 .expect("the Server's Relays arrive"),
             Some(ManagedEvent::Relays(_))
@@ -6019,7 +6012,7 @@ async fn managed_client_connects_without_periodic_domain_events() {
     );
     assert!(
         matches!(
-            timeout(PROGRESS_DEADLINE, client.next())
+            timeout(PROGRESS_DEADLINE, support::next_event(&mut client))
                 .await
                 .expect("the Serving listener's state arrives"),
             Some(ManagedEvent::ServingListener(ListenerState::Off))
@@ -6028,7 +6021,7 @@ async fn managed_client_connects_without_periodic_domain_events() {
     );
     assert!(
         matches!(
-            timeout(PROGRESS_DEADLINE, client.next())
+            timeout(PROGRESS_DEADLINE, support::next_event(&mut client))
                 .await
                 .expect("whether the Server has been onboarded arrives"),
             Some(ManagedEvent::Onboarded(true))
@@ -6036,9 +6029,12 @@ async fn managed_client_connects_without_periodic_domain_events() {
         "whether the Server has been onboarded follows how the Serving listener stands"
     );
     assert!(
-        timeout(Duration::from_millis(1_100), client.next())
-            .await
-            .is_err(),
+        timeout(
+            Duration::from_millis(1_100),
+            support::next_event(&mut client)
+        )
+        .await
+        .is_err(),
         "the lifecycle stream must stay quiet while the server remains ready"
     );
 
@@ -6193,7 +6189,7 @@ async fn next_session_catalog_event(
 ) -> Option<ManagedEvent> {
     loop {
         match subscription.next().await {
-            Some(ManagedEvent::ModelCatalog(_)) => continue,
+            Some(ManagedEvent::ModelCatalog(_) | ManagedEvent::WorkspaceListing(_)) => continue,
             event => return event,
         }
     }

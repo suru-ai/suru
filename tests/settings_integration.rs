@@ -41,8 +41,9 @@ async fn attach(state_dir: &Path, channel: &str) -> (ManagedClient, SettingsSnap
 }
 
 /// The next Settings snapshot, read past the Model Catalog, the Relays, the
-/// Serving listener's state, and whether the Server has been onboarded, which
-/// the server pushes beside it: on every connect, and again as any changes.
+/// Serving listener's state, whether the Server has been onboarded, and its
+/// Workspace listing, which the server pushes beside it: on every connect,
+/// and again as any changes.
 async fn next_snapshot(client: &mut ManagedClient) -> SettingsSnapshot {
     loop {
         let event = timeout(PROGRESS_DEADLINE, client.next())
@@ -54,7 +55,8 @@ async fn next_snapshot(client: &mut ManagedClient) -> SettingsSnapshot {
             ManagedEvent::ModelCatalog(_)
             | ManagedEvent::Relays(_)
             | ManagedEvent::ServingListener(_)
-            | ManagedEvent::Onboarded(_) => continue,
+            | ManagedEvent::Onboarded(_)
+            | ManagedEvent::WorkspaceListing(_) => continue,
             event => panic!("expected a settings snapshot event, got {event:?}"),
         }
     }

@@ -95,6 +95,19 @@ pub async fn receive_initial_state_and_relays(
     (identity, relays)
 }
 
+/// The next event `client` hears, past the Workspace listings its Server
+/// pushes — as the client connects, and again whenever what it lists moves
+/// (ADR 0052) — which a strict reading of everything else a Server says has
+/// no stake in.
+pub async fn next_event(client: &mut ManagedClient) -> Option<ManagedEvent> {
+    loop {
+        match client.next().await {
+            Some(ManagedEvent::WorkspaceListing(_)) => {}
+            event => return event,
+        }
+    }
+}
+
 /// Reads what every connect is told, answering the Server's identity, its
 /// Relays, and how its Serving listener stands, which follows them.
 pub async fn receive_connect_state(
@@ -105,19 +118,19 @@ pub async fn receive_connect_state(
     suru::protocol::ListenerState,
 ) {
     assert!(matches!(
-        timeout(PROGRESS_DEADLINE, client.next())
+        timeout(PROGRESS_DEADLINE, next_event(client))
             .await
             .expect("connecting event arrives"),
         Some(ManagedEvent::Connecting)
     ));
-    let connected = timeout(PROGRESS_DEADLINE, client.next())
+    let connected = timeout(PROGRESS_DEADLINE, next_event(client))
         .await
         .expect("connected event arrives")
         .expect("managed client remains open");
     let ManagedEvent::Connected(identity) = connected else {
         panic!("expected connected event, got {connected:?}");
     };
-    let settings = timeout(PROGRESS_DEADLINE, client.next())
+    let settings = timeout(PROGRESS_DEADLINE, next_event(client))
         .await
         .expect("settings snapshot arrives")
         .expect("managed client remains open");
@@ -135,7 +148,7 @@ pub async fn receive_connect_state(
 /// Reads whether the Server has been onboarded, which follows how its Serving
 /// listener stands on every connect.
 pub async fn receive_onboarded(client: &mut ManagedClient) -> bool {
-    let event = timeout(PROGRESS_DEADLINE, client.next())
+    let event = timeout(PROGRESS_DEADLINE, next_event(client))
         .await
         .expect("whether the Server has been onboarded arrives")
         .expect("managed client remains open");
@@ -148,7 +161,7 @@ pub async fn receive_onboarded(client: &mut ManagedClient) -> bool {
 /// Reads how the Server's Serving listener stands, which follows its Relays
 /// on every connect.
 pub async fn receive_serving_listener(client: &mut ManagedClient) -> suru::protocol::ListenerState {
-    let event = timeout(PROGRESS_DEADLINE, client.next())
+    let event = timeout(PROGRESS_DEADLINE, next_event(client))
         .await
         .expect("the Serving listener's state arrives")
         .expect("managed client remains open");
@@ -160,7 +173,7 @@ pub async fn receive_serving_listener(client: &mut ManagedClient) -> suru::proto
 
 /// Reads the Server's Relays that follow every connect's Model Catalog.
 pub async fn receive_relays(client: &mut ManagedClient) -> suru::protocol::RelayListing {
-    let event = timeout(PROGRESS_DEADLINE, client.next())
+    let event = timeout(PROGRESS_DEADLINE, next_event(client))
         .await
         .expect("the Server's Relays arrive")
         .expect("managed client remains open");
@@ -174,7 +187,7 @@ pub async fn receive_relays(client: &mut ManagedClient) -> suru::protocol::Relay
 /// A managed client connecting asks nothing of any Provider — a TUI does, by
 /// a request of its own — so this is the whole of the connect-time catalog.
 pub async fn receive_model_catalog(client: &mut ManagedClient) -> ModelCatalog {
-    let event = timeout(PROGRESS_DEADLINE, client.next())
+    let event = timeout(PROGRESS_DEADLINE, next_event(client))
         .await
         .expect("Model Catalog arrives")
         .expect("managed client remains open");

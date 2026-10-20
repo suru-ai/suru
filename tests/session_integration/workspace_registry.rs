@@ -1026,11 +1026,10 @@ async fn what_a_reading_behind_a_listing_finds_is_pushed_once_it_lands() {
     server.shutdown().await.expect("shut down server");
 }
 
-/// A client keeping Workspace listings hears its Server's listing as the
-/// Server pushes it, and again as it moves; one that does not hears none
-/// of it, as every other test's client shows.
+/// A client hears its Server's Workspace listing as the Server pushes it,
+/// once it hears it is connected, and again as it moves.
 #[tokio::test]
-async fn a_client_keeping_workspace_listings_hears_each_one_its_server_pushes() {
+async fn a_client_hears_each_workspace_listing_its_server_pushes() {
     const CHANNEL: &str = "workspace-registry-client-keeps";
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let notes = tempfile::tempdir().expect("create the notes Workspace");
@@ -1040,12 +1039,18 @@ async fn a_client_keeping_workspace_listings_hears_each_one_its_server_pushes() 
     .await
     .expect("spawn server");
     let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir.path(), CHANNEL)
-            .expect("configure client")
-            .with_workspace_listings(),
+        ManagedClientConfig::new(state_dir.path(), CHANNEL).expect("configure client"),
     )
     .await
     .expect("connect client");
+    assert!(matches!(
+        client.next().await,
+        Some(ManagedEvent::Connecting)
+    ));
+    assert!(
+        matches!(client.next().await, Some(ManagedEvent::Connected(_))),
+        "the client hears it is connected before any Workspace listing"
+    );
     let mut next_heard = async || {
         tokio::time::timeout(crate::server_support::PROGRESS_DEADLINE, async {
             loop {

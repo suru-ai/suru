@@ -77,9 +77,6 @@ pub struct ManagedClientConfig {
     /// How long a server this client launches waits for the channel's
     /// election lock, where a test holds one in its election.
     election_handoff: Option<Duration>,
-    /// Whether this client hears each Server's Workspace listing as the
-    /// Server pushes it (see [`Self::with_workspace_listings`]).
-    workspace_listings: bool,
 }
 
 impl ManagedClientConfig {
@@ -96,7 +93,6 @@ impl ManagedClientConfig {
             initial_recovery_backoff: INITIAL_RECOVERY_BACKOFF,
             max_recovery_backoff: MAX_RECOVERY_BACKOFF,
             attachment_fetch_timeout: ATTACHMENT_FETCH_TIMEOUT,
-            workspace_listings: false,
             election_handoff: None,
         })
     }
@@ -162,17 +158,6 @@ impl ManagedClientConfig {
     /// good; injectable so tests can meet the deadline in milliseconds.
     pub fn with_attachment_fetch_timeout(mut self, timeout: Duration) -> Self {
         self.attachment_fetch_timeout = timeout;
-        self
-    }
-
-    /// Has this client hear each Server's Workspace listing — its own, and
-    /// each Remote's it follows the Session catalog of — as the Server
-    /// pushes it on that catalog's stream (ADR 0052), as
-    /// [`ManagedEvent::WorkspaceListing`]. A client that lists Workspaces
-    /// only when it asks leaves it off, and hears nothing it did not ask
-    /// for.
-    pub fn with_workspace_listings(mut self) -> Self {
-        self.workspace_listings = true;
         self
     }
 
@@ -263,9 +248,7 @@ pub enum ManagedEvent {
     /// it: pushed on its Session catalog stream after the Model Catalog on
     /// every connect, and again whenever what it lists moves (ADR 0052), so
     /// a client holds each Server's listing before it asks. It arrives from
-    /// whichever Server's catalog the client follows, and only for a client
-    /// that asked to hear it (see
-    /// [`ManagedClientConfig::with_workspace_listings`]).
+    /// whichever Server's catalog the client follows.
     WorkspaceListing(crate::protocol::WorkspaceListing),
     /// Whether the Server has been onboarded: pushed after how its Serving
     /// listener stands on every connect, and again the moment any Client marks
@@ -396,9 +379,6 @@ pub struct ManagedClient {
     initial_recovery_backoff: Duration,
     max_recovery_backoff: Duration,
     attachment_fetch_timeout: Duration,
-    /// Whether this client hears each Server's Workspace listing as the
-    /// Server pushes it.
-    workspace_listings: bool,
     config_dir: Option<PathBuf>,
     task: JoinHandle<()>,
 }
@@ -411,9 +391,6 @@ pub(crate) struct SessionCommandClient {
     initial_recovery_backoff: Duration,
     max_recovery_backoff: Duration,
     attachment_fetch_timeout: Duration,
-    /// Whether the catalog this follows forwards the Workspace listing its
-    /// Server pushes.
-    workspace_listings: bool,
 }
 
 /// Commands addressed to the one Server a Client's Outlook names. Remote
@@ -499,7 +476,6 @@ impl ManagedClient {
             initial_recovery_backoff: Duration::from_millis(1),
             max_recovery_backoff: Duration::from_millis(1),
             attachment_fetch_timeout: ATTACHMENT_FETCH_TIMEOUT,
-            workspace_listings: false,
             config_dir: None,
             task: tokio::spawn(std::future::ready(())),
         }
@@ -912,7 +888,6 @@ impl ManagedClient {
             initial_recovery_backoff: self.initial_recovery_backoff,
             max_recovery_backoff: self.max_recovery_backoff,
             attachment_fetch_timeout: self.attachment_fetch_timeout,
-            workspace_listings: self.workspace_listings,
         }
     }
 }
@@ -1187,7 +1162,6 @@ impl SessionCommandClient {
             self.outlook.clone(),
             self.initial_recovery_backoff,
             self.max_recovery_backoff,
-            self.workspace_listings,
         )
     }
 
@@ -2400,7 +2374,6 @@ mod tests {
                 initial_recovery_backoff: Duration::from_millis(1),
                 max_recovery_backoff: Duration::from_millis(1),
                 attachment_fetch_timeout: ATTACHMENT_FETCH_TIMEOUT,
-                workspace_listings: false,
             };
             (client, server)
         }

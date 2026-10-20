@@ -263,14 +263,20 @@ async fn managed_clients_observe_durable_session_deletion() {
     ));
 
     assert_eq!(
-        timeout(PROGRESS_DEADLINE, observing_client.next())
-            .await
-            .expect("creation reaches connected client"),
+        timeout(
+            PROGRESS_DEADLINE,
+            crate::server_support::next_event(&mut observing_client),
+        )
+        .await
+        .expect("creation reaches connected client"),
         Some(ManagedEvent::SessionCreated(SessionCreated { session_id })),
         "a Session one client made is announced to every other client listing Sessions"
     );
     assert!(matches!(
-        timeout(PROGRESS_DEADLINE, observing_client.next())
+        timeout(
+            PROGRESS_DEADLINE,
+            crate::server_support::next_event(&mut observing_client),
+        )
             .await
             .expect("the failed Turn outcome reaches the connected client"),
         Some(ManagedEvent::SessionStandingInputsChanged(changed))
@@ -283,9 +289,12 @@ async fn managed_clients_observe_durable_session_deletion() {
     // The failed startup ends the Working the admission began, which every
     // listing client hears before anything else moves (ADR 0024).
     assert_eq!(
-        timeout(PROGRESS_DEADLINE, observing_client.next())
-            .await
-            .expect("the end of Working reaches the connected client"),
+        timeout(
+            PROGRESS_DEADLINE,
+            crate::server_support::next_event(&mut observing_client),
+        )
+        .await
+        .expect("the end of Working reaches the connected client"),
         Some(ManagedEvent::SessionWorkingChanged(
             suru::protocol::SessionWorkingChanged {
                 session_id,
@@ -300,9 +309,12 @@ async fn managed_clients_observe_durable_session_deletion() {
         .expect("delete Session through managed client");
 
     assert_eq!(
-        timeout(PROGRESS_DEADLINE, observing_client.next())
-            .await
-            .expect("deletion reaches connected client"),
+        timeout(
+            PROGRESS_DEADLINE,
+            crate::server_support::next_event(&mut observing_client),
+        )
+        .await
+        .expect("deletion reaches connected client"),
         Some(ManagedEvent::SessionDeleted(SessionDeleted { session_id }))
     );
     let stream_error = timeout(PROGRESS_DEADLINE, subscription.next())

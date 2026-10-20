@@ -65,7 +65,6 @@ impl SessionCatalogSubscription {
         outlook: Outlook,
         initial_backoff: Duration,
         max_backoff: Duration,
-        workspace_listings: bool,
     ) -> Self {
         let (events_tx, events_rx) = mpsc::channel(32);
         let task = tokio::spawn(run_attached(
@@ -74,10 +73,6 @@ impl SessionCatalogSubscription {
             outlook,
             events_tx,
             RecoveryBackoff::new(initial_backoff, max_backoff),
-            Heard {
-                models: true,
-                workspaces: workspace_listings,
-            },
         ));
         Self {
             events: events_rx,
@@ -160,7 +155,6 @@ async fn run_attached(
     outlook: Outlook,
     events: mpsc::Sender<ManagedEvent>,
     backoff: RecoveryBackoff,
-    heard: Heard,
 ) {
     // An attached Outlook has no separately hydrated local catalog. Treat its
     // first snapshot as reconciliation so the TUI refreshes any listing that
@@ -200,7 +194,14 @@ async fn run_attached(
             }
         };
         let (hydrated, hydration) = oneshot::channel();
-        let consumption = consume(response, &events, &mut known_session_ids, hydrated, heard);
+        let consumption = consume(
+            response,
+            &events,
+            &mut known_session_ids,
+            hydrated,
+            true,
+            None,
+        );
         tokio::pin!(consumption);
         tokio::pin!(hydration);
         let outcome = tokio::select! {
@@ -257,22 +258,19 @@ pub(super) enum StreamOutcome {
     ReceiverClosed,
 }
 
-/// What a catalog stream's reader hears of it beside the Session catalog
-/// and its Skill Catalogs.
-#[derive(Clone, Copy)]
-pub(super) struct Heard {
-    /// The Model Catalog the stream pushes.
-    pub(super) models: bool,
-    /// The Workspace listing the stream pushes.
-    pub(super) workspaces: bool,
-}
-
+/// Reads the Session catalog stream `response` opened into `events`, saying
+/// through `hydrated` when its snapshot has been taken. The Model Catalog it
+/// pushes is passed on only where `forward_models` says so. Where
+/// `announced` is given, nothing after the snapshot is passed on until it
+/// says the connection the snapshot hydrates has been announced, so a reader
+/// hears it is connected before anything the stream pushes.
 pub(super) async fn consume(
     response: reqwest::Response,
     events: &mpsc::Sender<ManagedEvent>,
     known_session_ids: &mut Option<HashSet<SessionId>>,
     hydrated: oneshot::Sender<Vec<crate::protocol::CheckoutSummary>>,
-    heard: Heard,
+    forward_models: bool,
+    mut announced: Option<oneshot::Receiver<()>>,
 ) -> Result<StreamOutcome> {
     let mut stream = response.bytes_stream().eventsource();
     let mut revision = None;
@@ -309,6 +307,11 @@ pub(super) async fn consume(
                 }
                 if let Some(hydrated) = hydrated.take() {
                     let _ = hydrated.send(initial_checkout_states);
+                    if let Some(announced) = announced.take() {
+                        // A connection given up on before it was announced
+                        // lets the stream go on all the same.
+                        let _ = announced.await;
+                    }
                 }
             }
             CatalogEvent::Update(update) => {
@@ -319,7 +322,7 @@ pub(super) async fn consume(
                 }
             }
             CatalogEvent::Models(catalog) => {
-                if heard.models
+                if forward_models
                     && events
                         .send(ManagedEvent::ModelCatalog(catalog))
                         .await
@@ -338,11 +341,10 @@ pub(super) async fn consume(
                 }
             }
             CatalogEvent::Workspaces(listing) => {
-                if heard.workspaces
-                    && events
-                        .send(ManagedEvent::WorkspaceListing(listing))
-                        .await
-                        .is_err()
+                if events
+                    .send(ManagedEvent::WorkspaceListing(listing))
+                    .await
+                    .is_err()
                 {
                     return Ok(StreamOutcome::ReceiverClosed);
                 }

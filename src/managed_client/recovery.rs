@@ -71,7 +71,6 @@ pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient
     let initial_recovery_backoff = config.initial_recovery_backoff;
     let max_recovery_backoff = config.max_recovery_backoff;
     let attachment_fetch_timeout = config.attachment_fetch_timeout;
-    let workspace_listings = config.workspace_listings;
     let config_dir = config.runtime.config_dir().map(ToOwned::to_owned);
     let task = tokio::spawn(run_managed_client(
         config,
@@ -88,7 +87,6 @@ pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient
         initial_recovery_backoff,
         max_recovery_backoff,
         attachment_fetch_timeout,
-        workspace_listings,
         config_dir,
         task,
     })
@@ -182,17 +180,16 @@ async fn run_managed_client(
         let active_instance_id = connection.descriptor.instance_id;
         let active_build_identity = connection.health.build_identity.clone();
         let (catalog_hydrated, catalog_hydration) = tokio::sync::oneshot::channel();
+        let (connection_announced, catalog_announced) = tokio::sync::oneshot::channel();
         let catalog = session_catalog_stream::consume(
             connection.catalog_response,
             &events,
             &mut known_session_ids,
             catalog_hydrated,
-            session_catalog_stream::Heard {
-                // The lifecycle stream already carries the Model Catalog,
-                // after Connected and Settings.
-                models: false,
-                workspaces: config.workspace_listings,
-            },
+            // The lifecycle stream already carries the Model Catalog, after
+            // Connected and Settings.
+            false,
+            Some(catalog_announced),
         );
         tokio::pin!(catalog);
         let mut initial_checkout_states = Vec::new();
@@ -235,6 +232,9 @@ async fn run_managed_client(
                         return;
                     }
                 }
+                // Only now does the catalog pass on what it pushed after its
+                // snapshot — the Workspace listing first among it.
+                let _ = connection_announced.send(());
                 let lifecycle = event_stream::consume(
                     connection.lifecycle_response,
                     &events,

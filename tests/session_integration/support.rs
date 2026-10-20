@@ -392,15 +392,15 @@ pub fn git_output_mentions_path(haystack: &str, path: &std::path::Path) -> bool 
 
 pub async fn receive_managed_client_initial_state(client: &mut ManagedClient) {
     assert!(matches!(
-        client.next().await,
+        crate::server_support::next_event(client).await,
         Some(suru::managed_client::ManagedEvent::Connecting)
     ));
     assert!(matches!(
-        client.next().await,
+        crate::server_support::next_event(client).await,
         Some(suru::managed_client::ManagedEvent::Connected(_))
     ));
     assert!(matches!(
-        client.next().await,
+        crate::server_support::next_event(client).await,
         Some(suru::managed_client::ManagedEvent::SettingsSnapshot(_))
     ));
     crate::server_support::receive_model_catalog(client).await;
