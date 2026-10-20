@@ -1837,11 +1837,11 @@ impl TuiState {
 
     /// The Outlook's Workspaces as this client knows them, each once: every
     /// one a listing it holds there has heard of from the Server — the
-    /// Sidebar's, and the Workspace Picker's while it holds one — then the
-    /// one it works in. A hidden Sidebar never lists, so a picker's answer
-    /// may be all the client knows; and each listing reads the Outlook in
-    /// view alone, so turning toward another Server leaves the last one's
-    /// behind.
+    /// Sidebar's, and the Workspace listing the Workspace Picker last heard
+    /// from that Server, open or not — then the one it works in. A hidden
+    /// Sidebar never lists, so the picker's listing may be all the client
+    /// knows; and each is read for the Outlook in view alone, so turning
+    /// toward another Server leaves the last one's behind.
     pub(super) fn known_workspaces(&self) -> Vec<Workspace> {
         let sidebar = self.sidebar.listed_workspaces();
         let picker = self.workspace_picker.listed_workspaces();
@@ -1931,6 +1931,11 @@ impl TuiState {
             if *outlook == Outlook::Local {
                 self.refresh_onboarding(Heard::Catalog);
             }
+            return;
+        }
+        if let ManagedEvent::WorkspaceListing(listing) = event {
+            self.workspace_picker
+                .hear(outlook.clone(), listing.workspaces);
             return;
         }
         self.adopt_workspace_paths(outlook, &event);
@@ -2455,7 +2460,12 @@ impl TuiState {
                 self.fatal_error = None;
             }
             ManagedEvent::RemoteRecovered => self.end_recovery(&Outlook::Local),
-            ManagedEvent::WorkspaceListing(_) => {}
+            // The managed catalog stream is the local Server's, so the
+            // listing it pushes is the Local Outlook's whichever Outlook is
+            // on screen; a Remote's is taken in `apply_origin_catalog`.
+            ManagedEvent::WorkspaceListing(listing) => self
+                .workspace_picker
+                .hear(Outlook::Local, listing.workspaces),
             ManagedEvent::Relays(listing) => self.receive_relays(listing),
             ManagedEvent::ServingListener(state) => self.serving_listener = state,
             ManagedEvent::RemoteFailed { message, .. } => self.settle_remote_failure(message),
@@ -9587,12 +9597,15 @@ impl Application {
     /// The current Outlook takes every event; a background Origin participates
     /// only while Everywhere includes it, for catalog movement and the Remote
     /// reachability transitions represented beside its cached rows — or, for
-    /// its Model Catalog alone, while the Aside names a Session there.
+    /// its Model Catalog alone, while the Aside names a Session there. The
+    /// Workspace listing of every Origin followed is kept, so the Workspace
+    /// Picker turned toward it opens on it at once.
     pub(super) fn accepts_catalog_event(&self, outlook: &Outlook, event: &ManagedEvent) -> bool {
         let listed_by_sidebar = self.state.sidebar.includes_origin(outlook);
         let listed_by_picker = self.state.session_picker.includes_origin(outlook);
         let named_by_aside = self.state.aside.catalog_origins().contains(outlook);
         outlook == &self.state.outlook
+            || matches!(event, ManagedEvent::WorkspaceListing(_))
             || (matches!(event, ManagedEvent::ModelCatalog(_))
                 && (listed_by_sidebar || listed_by_picker || named_by_aside))
             || (event.moves_the_session_catalog() && (listed_by_sidebar || listed_by_picker))

@@ -4855,6 +4855,20 @@ mod tests {
         }
     }
 
+    /// Every followed Origin's Workspace listing is kept, so the Workspace
+    /// Picker turned toward it opens on it at once, whether or not anything
+    /// lists that Origin's Sessions.
+    #[test]
+    fn a_background_origins_workspace_listing_is_taken() {
+        let application = Application::default();
+        let event = ManagedEvent::WorkspaceListing(crate::protocol::WorkspaceListing {
+            workspace_paths: crate::protocol::WorkspacePaths::default(),
+            workspaces: Vec::new(),
+        });
+
+        assert!(application.accepts_catalog_event(&Outlook::Remote("studio".to_owned()), &event));
+    }
+
     #[test]
     fn an_ignored_background_lifecycle_event_does_not_request_a_frame() {
         let application = Application::default();

@@ -4,6 +4,7 @@
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -73,11 +74,14 @@ pub(super) struct WorkspacePicker {
     window: ListWindow,
 }
 
-/// The Workspaces the Outlook's Server lists from its Workspace Registry,
-/// as the picker last asked for them: every one it has known, whether or not
-/// a Session works there now, in the order it lists them — those its
-/// Sessions work in, most recently worked in first, then the rest. Each
-/// opening asks again, and only the answer to the latest request lands.
+/// The Workspaces each Server lists from its Workspace Registry, as this
+/// client last heard them: every one it has known, whether or not a Session
+/// works there now, in the order it lists them — those its Sessions work in,
+/// most recently worked in first, then the rest. The picker draws the
+/// Outlook's Server's. Each opening asks that Server again, and only the
+/// answer to the latest request lands; each Server pushes its listing too,
+/// as it connects and as what it lists moves (ADR 0052), and every push
+/// lands.
 #[derive(Clone, Debug)]
 struct RegistryListing {
     /// The Server the picker asks, which is the Outlook's.
@@ -90,7 +94,12 @@ struct RegistryListing {
     /// The request whose reply the picker is waiting for. Any other reply is
     /// a straggler from an opening the reader has moved past.
     pending_request: Option<WorkspaceListRequest>,
-    workspaces: Vec<Workspace>,
+    /// The latest listing heard from each Server, pushed or answering the
+    /// picker, which the picker opens on at once and which each later one
+    /// replaces in place. A Server not yet heard from has none.
+    heard: HashMap<Outlook, Vec<Workspace>>,
+    /// Whether the picker waits on a listing with none of its Server's to
+    /// draw meanwhile.
     loading: bool,
     error: Option<String>,
 }
@@ -102,20 +111,20 @@ impl RegistryListing {
             current_workspace,
             request_sequence: 0,
             pending_request: None,
-            workspaces: Vec::new(),
+            heard: HashMap::new(),
             loading: false,
             error: None,
         }
     }
 
-    /// Asks the Outlook's Server for its Workspaces, dropping what the
-    /// picker holds, which answered an opening the reader has moved past.
+    /// Asks the Outlook's Server for its Workspaces afresh, keeping what
+    /// was last heard from it to draw until the answer lands, and loading
+    /// only where nothing was.
     fn refresh(&mut self) -> WorkspaceListRequest {
         self.request_sequence += 1;
         let request = WorkspaceListRequest::new(self.request_sequence, self.outlook.clone());
         self.pending_request = Some(request.clone());
-        self.workspaces.clear();
-        self.loading = true;
+        self.loading = !self.heard.contains_key(&self.outlook);
         self.error = None;
         request
     }
@@ -128,10 +137,22 @@ impl RegistryListing {
         if !self.awaits(request) {
             return false;
         }
-        self.workspaces = workspaces;
+        self.heard.insert(self.outlook.clone(), workspaces);
         self.loading = false;
         self.pending_request = None;
         true
+    }
+
+    /// Takes the listing `outlook`'s Server pushed, in place of what was
+    /// heard from it before, answering whether it is the one the picker
+    /// draws. A request still in flight stands: its answer lands too.
+    fn hear(&mut self, outlook: Outlook, workspaces: Vec<Workspace>) -> bool {
+        let drawn = outlook == self.outlook;
+        self.heard.insert(outlook, workspaces);
+        if drawn {
+            self.loading = false;
+        }
+        drawn
     }
 
     fn fail(&mut self, request: &WorkspaceListRequest, error: String) {
@@ -143,39 +164,47 @@ impl RegistryListing {
         self.pending_request = None;
     }
 
-    /// Drops what the picker holds and any request still in flight, so a
-    /// picker closing leaves no reply to land behind its back. The request
-    /// sequence survives: reopening must never make an earlier request valid
-    /// again.
+    /// Drops any request still in flight, so a picker closing leaves no
+    /// reply to land behind its back, keeping what was heard from each
+    /// Server for the next opening. The request sequence survives:
+    /// reopening must never make an earlier request valid again.
     fn clear(&mut self) {
-        self.workspaces.clear();
         self.loading = false;
         self.error = None;
         self.pending_request = None;
     }
 
+    /// What was last heard from the Outlook's Server: nothing, where it has
+    /// not been heard from.
+    fn held(&self) -> &[Workspace] {
+        self.heard.get(&self.outlook).map_or(&[], Vec::as_slice)
+    }
+
     /// Every copy of the Workspace `workspace_id` this listing holds of
-    /// `outlook`'s, the client's own current Workspace among them. A
-    /// Workspace's identity is only unique within its Origin — the same
-    /// directory may be a Workspace on two machines — so a change another
-    /// Origin announces reaches none of them.
+    /// `outlook`'s, the client's own current Workspace among them where
+    /// `outlook` is the picker's. A Workspace's identity is only unique
+    /// within its Origin — the same directory may be a Workspace on two
+    /// machines — so a change another Origin announces reaches none of
+    /// them.
     fn copies_mut<'a>(
         &'a mut self,
         outlook: &Outlook,
         workspace_id: &'a WorkspaceId,
     ) -> impl Iterator<Item = &'a mut Workspace> {
-        let ours = outlook == &self.outlook;
-        self.workspaces
-            .iter_mut()
-            .chain(std::iter::once(&mut self.current_workspace))
-            .filter(move |workspace| ours && &workspace.id == workspace_id)
+        let current = (outlook == &self.outlook).then_some(&mut self.current_workspace);
+        self.heard
+            .get_mut(outlook)
+            .into_iter()
+            .flatten()
+            .chain(current)
+            .filter(move |workspace| &workspace.id == workspace_id)
     }
 
     /// The Workspaces on offer: every one the Server lists, in its order,
     /// and the one this client works in after them where the Server does not
     /// list it.
     fn workspaces(&self) -> Vec<Workspace> {
-        let mut workspaces = self.workspaces.clone();
+        let mut workspaces = self.held().to_vec();
         if !workspaces
             .iter()
             .any(|listed| listed.id == self.current_workspace.id)
@@ -413,6 +442,10 @@ impl WorkspacePicker {
         }
     }
 
+    /// Opens the picker on the Workspaces last heard from the Outlook's
+    /// Server, the reader on the Workspace they are in, and asks that Server
+    /// for them afresh. Where nothing was heard from it yet it loads, and no
+    /// row is the reader's until a listing lands.
     pub(super) fn open(&mut self) -> WorkspaceListRequest {
         self.open = true;
         self.stepped_aside = false;
@@ -423,7 +456,11 @@ impl WorkspacePicker {
         self.description_editor = None;
         self.submitted_description = None;
         self.window.open();
-        self.listing.refresh()
+        let request = self.listing.refresh();
+        if !self.listing.loading {
+            self.keep_selection_offered();
+        }
+        request
     }
 
     pub(super) fn close(&mut self) {
@@ -536,14 +573,25 @@ impl WorkspacePicker {
         self.close();
     }
 
-    /// Takes the Workspaces the server answered with, leaving the reader on
-    /// the Workspace they were on where it is still offered and on the first
+    /// Takes the Workspaces the server answered with in place of those the
+    /// picker drew, leaving the query as typed and the reader on the
+    /// Workspace they were on where it is still offered, and on the first
     /// row — the current Workspace — otherwise.
     pub(super) fn load(&mut self, request: &WorkspaceListRequest, workspaces: Vec<Workspace>) {
         if !self.listing.load(request, workspaces) {
             return;
         }
         self.keep_selection_offered();
+    }
+
+    /// Takes the Workspaces `outlook`'s Server pushed, as it connected or as
+    /// what it lists moved: kept for the next opening, and — where they are
+    /// the Outlook's and the picker stands open or aside — in place of those
+    /// it drew, on the terms [`Self::load`] takes an answer on.
+    pub(super) fn hear(&mut self, outlook: Outlook, workspaces: Vec<Workspace>) {
+        if self.listing.hear(outlook, workspaces) && (self.open || self.stepped_aside) {
+            self.keep_selection_offered();
+        }
     }
 
     pub(super) fn fail_listing(&mut self, request: &WorkspaceListRequest, error: String) {
@@ -577,17 +625,16 @@ impl WorkspacePicker {
         }
     }
 
-    /// The Outlook's Workspaces the picker has heard of from its Server, for
-    /// as long as it holds that listing — open, or standing aside for the
-    /// Directory Browser.
+    /// The Outlook's Workspaces as the picker last heard them from its
+    /// Server, open or not.
     pub(super) fn listed_workspaces(&self) -> Vec<Workspace> {
-        self.listing.workspaces.clone()
+        self.listing.held().to_vec()
     }
 
     /// Whether a reply the server sent answers the listing this surface is
-    /// still waiting for. The picker asks for one listing, when it opens, and
-    /// is loading until that listing lands, so the one reply it awaits always
-    /// has a loading line to replace.
+    /// still waiting for. The picker asks for one listing, when it opens,
+    /// and the one reply it awaits replaces its loading line or the rows it
+    /// opened on.
     pub(super) fn awaits_listing(&self, request: &WorkspaceListRequest) -> bool {
         self.listing.awaits(request)
     }

@@ -23,12 +23,12 @@ use suru::{
     managed_client::ManagedEvent,
     protocol::{
         AgentSelection, ChildDirectory, DirectoryListing, DirectorySourceControl,
-        EffectiveSettings, ListDirectoryRequest, ModelAvailability, ModelCatalog, ModelId,
+        EffectiveSettings, ListDirectoryRequest, ModelAvailability, ModelCatalog, ModelId, Outlook,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, RepositoryId, ResolvedWorkspace,
         Session, SessionId, SessionListItem, SessionStatus, SessionSummary, SessionTimestamp,
         SidebarSettings, SidebarVisibility, SkillCatalog, SkillCatalogCapabilities,
         SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery,
-        Workspace, WorkspaceUnavailability,
+        Workspace, WorkspaceListing, WorkspacePaths, WorkspaceUnavailability,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, DirectoryListingId,
@@ -2352,6 +2352,261 @@ fn opening_the_browser_from_the_picker_is_refused_for_an_unreachable_remote() {
             "{way}: the Landing goes on saying it: {landing}"
         );
     }
+}
+
+/// A Server's Workspace listing reaches the client before the picker is
+/// opened — pushed as its Session catalog connects, and again as what it
+/// lists moves (ADR 0052) — so the picker opens on it at once, the reader
+/// on the Workspace they are in, and still asks the Server afresh.
+#[test]
+fn the_picker_opens_at_once_on_the_listing_its_server_pushed() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["work", "atlas"]);
+    let mut application = connected_application(&here);
+    hear_listing(
+        &mut application,
+        vec![registered(&atlas), registered(&here)],
+    );
+
+    expect_workspace_listing(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::WorkspaceList,
+            )))
+            .expect("open the Workspace Picker"),
+    );
+
+    let drawn = rendered_application_rows(&application).join("\n");
+    assert!(
+        !drawn.contains("Loading Workspaces"),
+        "nothing is loading where the Server's listing is in hand: {drawn}"
+    );
+    let rows = picker_rows(&application);
+    assert!(
+        rows.len() == 2 && rows[0].contains("here") && rows[1].contains("atlas"),
+        "the picker draws the listing the Server pushed: {rows:?}"
+    );
+    assert_eq!(selected_row(&application), "here");
+}
+
+/// The Server's answer replaces the rows the picker opened on in place: the
+/// reader stays on the Workspace they were on, wherever it now stands, and
+/// the query stays as typed.
+#[test]
+fn an_answer_replaces_the_rows_in_place_keeping_the_selection_and_the_query() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["work", "atlas"]);
+    let ledger = workspace(&["work", "ledger"]);
+    let relay = workspace(&["work", "relay"]);
+    let mut application = connected_application(&here);
+    hear_listing(
+        &mut application,
+        vec![registered(&atlas), registered(&ledger)],
+    );
+    let request = expect_workspace_listing(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::WorkspaceList,
+            )))
+            .expect("open the Workspace Picker"),
+    );
+    type_terminal_text(&mut application, "l");
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "ledger");
+
+    application
+        .handle_event(ApplicationEvent::WorkspacesListed {
+            request,
+            workspaces: vec![registered(&relay), registered(&atlas), registered(&ledger)],
+        })
+        .expect("answer the picker");
+
+    assert_eq!(
+        selected_row(&application),
+        "ledger",
+        "the reader stays on the Workspace they were on"
+    );
+    let rows = picker_rows(&application);
+    assert!(
+        rows.iter().any(|row| row.contains("relay")),
+        "the answer's rows replace those the picker opened on: {rows:?}"
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .iter()
+            .any(|row| row.contains("Search: l")),
+        "the query stays as typed"
+    );
+}
+
+/// A listing the Server pushes while the picker stands open replaces its
+/// rows in place, as its answer does, and so does one that lands while the
+/// answer to the picker's own request is still on its way — which lands
+/// after it all the same.
+#[test]
+fn a_push_replaces_an_open_pickers_rows_in_place() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["work", "atlas"]);
+    let ledger = workspace(&["work", "ledger"]);
+    let mut application = connected_application(&here);
+    let request = expect_workspace_listing(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::WorkspaceList,
+            )))
+            .expect("open the Workspace Picker"),
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("Loading Workspaces"),
+        "the picker loads while nothing has been heard from its Server"
+    );
+
+    hear_listing(&mut application, vec![registered(&atlas)]);
+    press(&mut application, KeyCode::Down);
+    assert_eq!(selected_row(&application), "atlas");
+    hear_listing(
+        &mut application,
+        vec![registered(&ledger), registered(&atlas)],
+    );
+    assert_eq!(
+        selected_row(&application),
+        "atlas",
+        "a push leaves the reader on the Workspace they were on"
+    );
+    assert!(
+        picker_rows(&application)
+            .iter()
+            .any(|row| row.contains("ledger"))
+    );
+
+    application
+        .handle_event(ApplicationEvent::WorkspacesListed {
+            request,
+            workspaces: vec![registered(&atlas)],
+        })
+        .expect("answer the picker");
+    assert!(
+        !picker_rows(&application)
+            .iter()
+            .any(|row| row.contains("ledger")),
+        "the answer to the picker's request lands after a push"
+    );
+}
+
+/// An answer to an opening the reader has moved past lands nowhere, though
+/// the picker opened again on rows the Server pushed since; a push still
+/// does land, and the answer to the latest opening too.
+#[test]
+fn an_answer_to_an_opening_moved_past_lands_nowhere_beside_the_pushes() {
+    let here = workspace(&["work", "here"]);
+    let atlas = workspace(&["work", "atlas"]);
+    let ledger = workspace(&["work", "ledger"]);
+    let maps = workspace(&["work", "maps"]);
+    let mut application = connected_application(&here);
+    hear_listing(&mut application, vec![registered(&atlas)]);
+    let open = |application: &mut Application| {
+        expect_workspace_listing(
+            application
+                .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                    SemanticCommandId::WorkspaceList,
+                )))
+                .expect("open the Workspace Picker"),
+        )
+    };
+    let earlier = open(&mut application);
+    press(&mut application, KeyCode::Esc);
+    let latest = open(&mut application);
+
+    application
+        .handle_event(ApplicationEvent::WorkspacesListed {
+            request: earlier,
+            workspaces: vec![registered(&maps)],
+        })
+        .expect("answer an opening moved past");
+    let rows = picker_rows(&application);
+    assert!(
+        rows.iter().any(|row| row.contains("atlas"))
+            && !rows.iter().any(|row| row.contains("maps")),
+        "the straggler lands nowhere: {rows:?}"
+    );
+
+    hear_listing(&mut application, vec![registered(&ledger)]);
+    assert!(
+        picker_rows(&application)
+            .iter()
+            .any(|row| row.contains("ledger")),
+        "a push lands"
+    );
+    application
+        .handle_event(ApplicationEvent::WorkspacesListed {
+            request: latest,
+            workspaces: vec![registered(&maps)],
+        })
+        .expect("answer the latest opening");
+    assert!(
+        picker_rows(&application)
+            .iter()
+            .any(|row| row.contains("maps")),
+        "and so does the answer to the latest opening"
+    );
+}
+
+/// What a Remote pushes is kept as that Remote's: it draws nothing in a
+/// picker turned toward another Server, and the picker turned toward the
+/// Remote opens on it at once.
+#[test]
+fn a_remotes_listing_is_kept_for_the_picker_turned_toward_it() {
+    let studio_work = workspace(&["studio", "work"]);
+    let mut application = application_looking_at_studio();
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Local,
+            event: ManagedEvent::WorkspaceListing(WorkspaceListing {
+                workspace_paths: WorkspacePaths::default(),
+                workspaces: vec![registered(&workspace(&["local", "notes"]))],
+            }),
+        })
+        .expect("hear the local Server's listing");
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::WorkspaceListing(WorkspaceListing {
+                workspace_paths: WorkspacePaths::default(),
+                workspaces: vec![registered(&studio_work)],
+            }),
+        })
+        .expect("hear the Remote's listing");
+
+    let request = expect_workspace_listing(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::WorkspaceList,
+            )))
+            .expect("open the Workspace Picker"),
+    );
+
+    assert_eq!(request.outlook(), &Outlook::Remote("studio".to_owned()));
+    let rows = picker_rows(&application);
+    assert!(
+        rows.iter().any(|row| row.contains("work"))
+            && !rows.iter().any(|row| row.contains("notes")),
+        "the picker turned toward the Remote opens on the Remote's listing alone: {rows:?}"
+    );
+}
+
+/// Has the client hear its own Server push `workspaces` as its Workspace
+/// listing.
+fn hear_listing(application: &mut Application, workspaces: Vec<Workspace>) {
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::WorkspaceListing(
+            WorkspaceListing {
+                workspace_paths: WorkspacePaths::default(),
+                workspaces,
+            },
+        )))
+        .expect("hear the Server's Workspace listing");
 }
 
 /// The Workspaces the narrowing tests narrow: the client works in `here`, and

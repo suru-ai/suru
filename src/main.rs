@@ -230,7 +230,9 @@ async fn main() -> Result<()> {
             let config = default_client_config()?;
             let _log_guard = logging::init(config.runtime(), logging::Role::Client)
                 .context("initialize client logging")?;
-            let client = ManagedClient::connect(config)
+            // The Workspace Picker opens on the listing each Server last
+            // pushed, so the client hears them all (ADR 0052).
+            let client = ManagedClient::connect(config.with_workspace_listings())
                 .await
                 .context("prepare the managed Suru server connection")?;
             tui::run(client).await
