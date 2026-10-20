@@ -25,6 +25,7 @@ mod monitoring;
 mod multi_provider;
 mod prompts;
 mod provider_enablement;
+mod renames;
 mod selection;
 mod settlement;
 mod skills;

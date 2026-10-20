@@ -629,6 +629,34 @@ pub fn description_too_long(chars: usize) -> String {
     )
 }
 
+/// The most characters a Session's Title runs to, ellipsis included, counted
+/// on it as it is kept (see [`one_line_title`]). A Title the user writes
+/// running longer is refused in [`title_too_long`]'s words; a derived one is
+/// cut to it. Derivation asks for well under 50, so a Title reaching the cap
+/// reads as a bug rather than as normal.
+///
+/// The ellipsis counts toward the cap here, unlike
+/// `concise_remote_message`, which appends it beyond one.
+/// The difference is what the cap is for: a Title is the cell a Session
+/// picker draws and lays out against, so what it costs a row is the whole of
+/// it, while a Provider-authored failure is only bounded against a Provider
+/// that will not stop talking.
+pub const MAX_TITLE_CHARS: usize = 80;
+
+/// A Title the user wrote as it is kept and counted: on one line, every run
+/// of whitespace collapsed to a single space, and none at either end — the
+/// same rule, and for the same reason, as [`one_line_description`]. Text with
+/// nothing left once collapsed is no Title at all.
+pub fn one_line_title(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The sentence a Title `chars` long — counted as [`one_line_title`] keeps it
+/// — is refused with, whoever refuses it.
+pub fn title_too_long(chars: usize) -> String {
+    format!("A Title runs to at most {MAX_TITLE_CHARS} characters, and this one runs to {chars}")
+}
+
 /// A sentence or two saying what a Workspace is for (see the **Description**
 /// glossary entry), and whether the user or a Sidekick set it rather than an
 /// Errand deriving it. A set Description stands against every later
@@ -4928,6 +4956,34 @@ pub struct SetSessionIconRequest {
     pub icon: String,
 }
 
+/// A Title the user wrote for a Session. Folded to one line and trimmed
+/// before it stands; refused where nothing is left or more than a Title may
+/// carry is. A Title set this way replaces whatever stood, and a derivation
+/// still in flight never overwrites it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetSessionTitleRequest {
+    pub title: String,
+}
+
+/// Whether the Session's Origin would derive a Title proposal for it if
+/// asked: as the derivation Setting in force there decides, and only where
+/// that Setting has a Provider to derive with.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTitleProposalOffer {
+    pub offered: bool,
+}
+
+/// A Title derived anew from a Session's Prompts so far, at the user's
+/// asking. Only a proposal: nothing about the Session changes until the user
+/// keeps it by setting it as the Title.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTitleProposal {
+    pub title: String,
+}
+
 /// The user's own choice of a Workspace's Icon, by Icon Catalog name and the
 /// Workspace's identity — carried in the body rather than a URL path segment,
 /// since a [`WorkspaceId`]'s inner string may itself contain path characters.
@@ -5100,6 +5156,14 @@ pub enum SessionErrorCode {
     InvalidIcon,
     /// A set Description runs longer than a Description may.
     InvalidDescription,
+    /// A Title a user wrote is blank, or runs longer than a Title may.
+    InvalidTitle,
+    /// A Title proposal was asked of a Session Suru derives none for: the
+    /// derivation Setting is off, or follows a Session with no Provider.
+    TitleProposalWithheld,
+    /// A Title proposal's Errand failed, timed out, or answered with nothing
+    /// usable.
+    TitleProposalFailed,
     SessionNotFound,
     SubagentSession,
     /// The request needs the Session idle — deleting it, or compacting its

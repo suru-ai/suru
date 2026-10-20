@@ -94,7 +94,7 @@ pub(crate) use settlement::{
     TrailingCommandOutput,
 };
 pub(crate) use subagents::{DeliveredDelegation, StoredSubagent, opening_subagent_row};
-pub(crate) use title::{Derivation, SetIconError};
+pub(crate) use title::{Derivation, ProposalRefusal, SetIconError, SetTitleError};
 pub(crate) use viewed::ViewSessionError;
 pub(crate) use workspace_description::SetWorkspaceDescriptionError;
 pub(crate) use workspace_icon::SetWorkspaceIconError;

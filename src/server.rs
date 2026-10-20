@@ -46,7 +46,8 @@ use crate::protocol::{
     SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT,
     SUBAGENT_TREE_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision,
     SessionChange, SessionError, SessionErrorCode, SessionId, SessionReadingQuery, SessionRevision,
-    SessionUpdate, SetSessionIconRequest, SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest,
+    SessionTitleProposal, SessionTitleProposalOffer, SessionUpdate, SetSessionIconRequest,
+    SetSessionTitleRequest, SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest,
     SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
     SkillCatalogRequest, SubagentTreeRevision, SubagentTreeUpdate, TurnId,
     UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
@@ -60,8 +61,9 @@ use crate::runtime::protect_current_user_file;
 use crate::serving::{ForgedAuthor, ServingController};
 use crate::sessions::{
     AgentSelectionMutationError, ApprovalPostureMutationError, CompactSessionError,
-    DeleteSessionError, Derivation, PromptMutationError, SessionCatalogFeed, SessionFeed,
-    SessionStore, SetIconError, SetWorkspaceDescriptionError, SetWorkspaceIconError, StoreOutcome,
+    DeleteSessionError, Derivation, PromptMutationError, ProposalRefusal, SessionCatalogFeed,
+    SessionFeed, SessionStore, SetIconError, SetTitleError, SetWorkspaceDescriptionError,
+    SetWorkspaceIconError, StoreOutcome,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
@@ -1984,6 +1986,11 @@ async fn start(
                 )
                 .route("/v1/sessions/{session_id}/settlement", post(settle_session))
                 .route("/v1/sessions/{session_id}/icon", post(set_session_icon))
+                .route("/v1/sessions/{session_id}/title", post(set_session_title))
+                .route(
+                    "/v1/sessions/{session_id}/title/proposal",
+                    get(title_proposal_offer).post(propose_session_title),
+                )
                 .route("/v1/sessions/{session_id}/viewed", post(view_session))
                 .route("/v1/sessions/{session_id}/prompts", post(admit_prompt))
                 .route(
@@ -4246,6 +4253,99 @@ async fn set_session_icon(
             format!("`{}` is not an Icon Catalog name", request.icon),
         ),
         Err(SetIconError::Storage) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Renames a Session to a Title the user wrote, refused where nothing is left
+/// of it once folded to one line or more than a Title may carry is. Answers
+/// with the same `TitleChanged` catalog change a derived Title publishes.
+async fn set_session_title(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    request: Request,
+) -> Response {
+    let request =
+        match decode_session_command::<SetSessionTitleRequest>(&state, request, "Session Title")
+            .await
+        {
+            Ok(request) => request,
+            Err(response) => return response,
+        };
+    match state
+        .operations
+        .rename_session(session_id, &request.title)
+        .await
+    {
+        Ok(summary) => Json(summary).into_response(),
+        Err(SetTitleError::SessionNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        Err(SetTitleError::Blank) => session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidTitle,
+            "A Title cannot be blank",
+        ),
+        Err(SetTitleError::TooLong(chars)) => session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidTitle,
+            crate::protocol::title_too_long(chars),
+        ),
+        Err(SetTitleError::Storage) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Answers whether this Server would derive a Title proposal for a Session if
+/// asked, as its own derivation Setting decides — which a Client reaching a
+/// Remote's Session cannot read for itself.
+async fn title_proposal_offer(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.operations.title_proposal_offered(session_id).await {
+        Some(offered) => Json(SessionTitleProposalOffer { offered }).into_response(),
+        None => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+    }
+}
+
+/// Derives a Title proposal from a Session's Prompts so far and answers it,
+/// storing nothing: the user keeps it by renaming the Session to it. The
+/// Errand runs while the request waits, so a Client that stops waiting
+/// abandons it.
+async fn propose_session_title(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.operations.propose_title(session_id).await {
+        Some(Ok(title)) => Json(SessionTitleProposal { title }).into_response(),
+        Some(Err(ProposalRefusal::Withheld)) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::TitleProposalWithheld,
+            "Title derivation is turned off for this Session",
+        ),
+        Some(Err(ProposalRefusal::Failed(message))) => session_error_response(
+            StatusCode::BAD_GATEWAY,
+            SessionErrorCode::TitleProposalFailed,
+            message,
+        ),
+        None => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
     }
 }
 

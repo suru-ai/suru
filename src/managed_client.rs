@@ -25,8 +25,9 @@ use crate::{
         SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated, SessionDeleted,
         SessionError, SessionErrorCode, SessionId, SessionListItem, SessionMonitoringChanged,
         SessionRemoteSubsessionsChanged, SessionSettlementChanged, SessionSnapshot,
-        SessionStandingInputsChanged, SessionSummary, SessionTitleChanged, SessionUsageChanged,
-        SessionWorkingChanged, SetSessionIconRequest, SetWorkspaceDescriptionRequest,
+        SessionStandingInputsChanged, SessionSummary, SessionTitleChanged, SessionTitleProposal,
+        SessionTitleProposalOffer, SessionUsageChanged, SessionWorkingChanged,
+        SetSessionIconRequest, SetSessionTitleRequest, SetWorkspaceDescriptionRequest,
         SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot, SettleSessionRequest,
         ShutdownReason, SkillCatalog, SkillCatalogRequest, UpdateAgentSelectionRequest,
         UpdateApprovalPostureRequest, ViewSessionRequest, WorkspaceDescriptionChanged,
@@ -795,6 +796,33 @@ impl ManagedClient {
             .await
     }
 
+    /// Renames a Session to a Title the user wrote, refused where it is blank
+    /// or runs past what a Title may carry.
+    pub async fn set_session_title(
+        &self,
+        session_id: SessionId,
+        title: &str,
+    ) -> Result<SessionSummary> {
+        self.session_commands()
+            .set_session_title(session_id, title)
+            .await
+    }
+
+    /// Whether the Session's Origin would derive a Title proposal for it.
+    pub async fn session_title_proposal_offered(&self, session_id: SessionId) -> Result<bool> {
+        self.session_commands()
+            .session_title_proposal_offered(session_id)
+            .await
+    }
+
+    /// Derives a Title proposal from a Session's Prompts so far, changing
+    /// nothing about the Session.
+    pub async fn propose_session_title(&self, session_id: SessionId) -> Result<String> {
+        self.session_commands()
+            .propose_session_title(session_id)
+            .await
+    }
+
     /// Sets a Workspace's Icon to a user's own choice from the Icon Catalog by
     /// name, refused where the Catalog does not carry it or where this Client's
     /// own local server does not know the Workspace. A Remote Workspace's own
@@ -1089,6 +1117,29 @@ impl OutlookClient {
         icon: &str,
     ) -> Result<SessionSummary> {
         self.commands.set_session_icon(session_id, icon).await
+    }
+
+    /// Renames a Session to a Title the user wrote, refused where it is blank
+    /// or runs past what a Title may carry.
+    pub async fn set_session_title(
+        &self,
+        session_id: SessionId,
+        title: &str,
+    ) -> Result<SessionSummary> {
+        self.commands.set_session_title(session_id, title).await
+    }
+
+    /// Whether the Session's Origin would derive a Title proposal for it.
+    pub async fn session_title_proposal_offered(&self, session_id: SessionId) -> Result<bool> {
+        self.commands
+            .session_title_proposal_offered(session_id)
+            .await
+    }
+
+    /// Derives a Title proposal from a Session's Prompts so far, changing
+    /// nothing about the Session.
+    pub async fn propose_session_title(&self, session_id: SessionId) -> Result<String> {
+        self.commands.propose_session_title(session_id).await
     }
 
     /// Sets a Workspace's Icon to a user's own choice from the Icon Catalog by
@@ -2016,6 +2067,67 @@ impl SessionCommandClient {
             "Session Icon",
         )
         .await
+    }
+
+    /// Renames a Session to a Title the user wrote. Routed like every other
+    /// Session command, to the Session's Origin.
+    pub(crate) async fn set_session_title(
+        &self,
+        session_id: SessionId,
+        title: &str,
+    ) -> Result<SessionSummary> {
+        self.post_session_command(
+            &format!("/v1/sessions/{session_id}/title"),
+            &SetSessionTitleRequest {
+                title: title.to_owned(),
+            },
+            "Session Title",
+        )
+        .await
+    }
+
+    /// Asks the Session's Origin whether it would derive a Title proposal
+    /// for it, as the derivation Setting in force there decides.
+    pub(crate) async fn session_title_proposal_offered(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bool> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .get(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                &format!("/v1/sessions/{session_id}/title/proposal"),
+            )?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Title proposal offer request")?;
+        decode_api_response::<SessionTitleProposalOffer>(response, "Title proposal offer")
+            .await
+            .map(|offer| offer.offered)
+    }
+
+    /// Asks the Session's Origin to derive a Title proposal from its Prompts
+    /// so far. Dropping the future abandons the request, and the Errand
+    /// behind it with it.
+    pub(crate) async fn propose_session_title(&self, session_id: SessionId) -> Result<String> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                &format!("/v1/sessions/{session_id}/title/proposal"),
+            )?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Title proposal request")?;
+        decode_api_response::<SessionTitleProposal>(response, "Title proposal")
+            .await
+            .map(|proposal| proposal.title)
     }
 
     /// Sets a Workspace's Icon to a user's own choice from the Icon Catalog by

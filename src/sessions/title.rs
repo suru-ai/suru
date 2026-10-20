@@ -81,9 +81,9 @@ use crate::{
     icon_catalog,
     model_catalog::ModelCatalogService,
     protocol::{
-        AgentSelection, AttachmentBinding, DerivationErrand, Prompt, ProviderId,
-        SessionCatalogChange, SessionChange, SessionId, SessionSummary, SettingsSnapshot,
-        SkillInvocation, Workspace,
+        AgentSelection, AttachmentBinding, DerivationErrand, MAX_TITLE_CHARS, Prompt, PromptStatus,
+        ProviderId, SessionCatalogChange, SessionChange, SessionId, SessionSnapshot,
+        SessionSummary, SettingsSnapshot, SkillInvocation, Workspace, one_line_title,
     },
     provider::ProviderErrand,
     source_control::{BranchRename, CreatedBranch, PreparationStore, SourceControlService, naming},
@@ -95,18 +95,6 @@ use super::{SessionStore, workspace_icon};
 /// than the ending because a first Prompt states its intent up front and trails
 /// off into detail, and titling should not cost a full-context call.
 const MAX_ERRAND_PROMPT_CHARS: usize = 2_000;
-
-/// The most characters a stored Title runs to, ellipsis included. The Errand
-/// asks for well under 50, so the gap is deliberate: a Title that reaches this
-/// cap reads as a bug rather than as normal.
-///
-/// The ellipsis counts toward the cap here, unlike
-/// [`crate::provider::concise_remote_message`], which appends it beyond one.
-/// The difference is what the cap is for: a Title is the cell a Session picker
-/// draws and lays out against, so what it costs a row is the whole of it,
-/// while a Provider-authored failure is only bounded against a Provider that
-/// will not stop talking.
-const MAX_TITLE_CHARS: usize = 80;
 
 /// The pairs a Model may wrap a Title in when it answers with one. Stripped in
 /// matched pairs only, so a Title that legitimately opens with a quote keeps it.
@@ -424,6 +412,73 @@ impl Derivation {
         });
     }
 
+    /// Whether a Title proposal would be derived for the Session at
+    /// `session_id`, whose Agent Selection names `provider` where it names
+    /// one: as the Setting in force decides, and for no Session it would not
+    /// title of its own accord.
+    pub(crate) fn offers_proposal(
+        &self,
+        session_id: SessionId,
+        provider: Option<ProviderId>,
+    ) -> bool {
+        self.errand_at(session_id, provider).is_some()
+    }
+
+    /// Derives a Title proposal from `snapshot`'s Prompts so far, at the
+    /// user's asking, and answers it without storing anything: the user keeps
+    /// it by renaming the Session to it. Runs while its caller waits, so a
+    /// caller that stops waiting abandons the Errand with it. Asks for the
+    /// Title alone — an Icon or a branch name is never proposed.
+    pub(crate) async fn propose(
+        &self,
+        snapshot: &SessionSnapshot,
+    ) -> Result<String, ProposalRefusal> {
+        let session_id = snapshot.session.id;
+        let provider = snapshot
+            .session
+            .agent_selection
+            .as_ref()
+            .map(|selection| selection.provider.clone());
+        let Some(errand_at) = self.errand_at(session_id, provider) else {
+            return Err(ProposalRefusal::Withheld);
+        };
+        let (provider, pinned) = match &errand_at {
+            ErrandAt::Provider(provider) => (provider, None),
+            ErrandAt::Selection(selection) => (&selection.provider, Some(selection)),
+        };
+        let Some(selection) = self
+            .models
+            .resolved_errand_selection(provider, pinned)
+            .await
+        else {
+            return Err(ProposalRefusal::Failed(format!(
+                "`{provider}` offers no Model to derive a Title at"
+            )));
+        };
+        let prompts = snapshot
+            .prompts
+            .iter()
+            .filter(|prompt| prompt.status != PromptStatus::Cancelled)
+            .collect::<Vec<_>>();
+        let errand = ProviderErrand {
+            prompt: proposal_prompt(&prompts),
+            schema: proposal_schema(),
+            selection,
+            execution_directory: snapshot.session.execution_directory.path.clone(),
+        };
+        let answer = self
+            .errands
+            .run(errand)
+            .await
+            .map_err(|failure| ProposalRefusal::Failed(failure.to_string()))?;
+        serde_json::from_value::<DerivedTitleReply>(answer)
+            .ok()
+            .and_then(|reply| sanitized_title(&reply.title))
+            .ok_or_else(|| {
+                ProposalRefusal::Failed("the Provider answered with no usable Title".to_owned())
+            })
+    }
+
     /// The Workspace Errand `workspace` asks for — its identity and the
     /// Prompt asking for its Icon and Description — where it still lacks
     /// either. The Sidekick Workspace is Suru's own: it wears a standing Icon
@@ -580,6 +635,17 @@ enum ErrandAt {
     Selection(AgentSelection),
 }
 
+/// Why no Title proposal was derived.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ProposalRefusal {
+    /// The Setting in force derives no Title for this Session: it is off, or
+    /// follows a Session with no Provider.
+    Withheld,
+    /// The Errand failed, timed out, or answered with no usable Title, as the
+    /// message says.
+    Failed(String),
+}
+
 impl SessionStore {
     /// The Session's Title as it stands, or `None` for a Session this server
     /// does not hold.
@@ -705,6 +771,78 @@ impl SessionStore {
         });
         Ok(summary)
     }
+
+    /// Renames a Session: sets its Title to a line the user wrote, folded to
+    /// one line and trimmed, replacing whatever stood — the Prompt's text, a
+    /// derived Title, or an earlier rename. A derivation still in flight was
+    /// derived from the Title this replaces, so
+    /// [`Self::replace_derived_title`]'s guard discards its answer.
+    ///
+    /// Publishes the same `TitleChanged` change a derived Title does, carrying
+    /// the Session's Icon unchanged, and follows it to the trees and
+    /// Sidekick listings a derived Title reaches.
+    pub(crate) fn set_title(
+        &self,
+        session_id: SessionId,
+        title: &str,
+    ) -> Result<SessionSummary, SetTitleError> {
+        let title = written_title(title)?;
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let (icon, summary) = {
+            let Some(record) = state.sessions.get_mut(&session_id) else {
+                return Err(SetTitleError::SessionNotFound);
+            };
+            let icon = record.summary.icon.clone();
+            record
+                .commit_derived(
+                    &self.storage,
+                    session_id,
+                    vec![SessionChange::TitleChanged {
+                        title: title.clone(),
+                        icon: icon.clone(),
+                    }],
+                )
+                .map_err(|_| SetTitleError::Storage)?;
+            (icon, record.summary.clone())
+        };
+        state.publish_catalog_change(SessionCatalogChange::TitleChanged {
+            session_id,
+            title,
+            icon,
+        });
+        state.follow_subsession_title(&self.storage, session_id);
+        state.announce_subagent_tree(session_id);
+        Ok(summary)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SetTitleError {
+    SessionNotFound,
+    /// Nothing is left once the written Title is folded and trimmed.
+    Blank,
+    /// The written Title runs past [`MAX_TITLE_CHARS`], this many characters
+    /// long.
+    TooLong(usize),
+    Storage,
+}
+
+/// A Title the user wrote, as it stands: kept as [`one_line_title`] keeps it.
+/// Refused rather than cut short where it runs past the cap, since a user's
+/// own words are theirs to shorten.
+fn written_title(raw: &str) -> Result<String, SetTitleError> {
+    let folded = one_line_title(raw);
+    if folded.is_empty() {
+        return Err(SetTitleError::Blank);
+    }
+    let chars = folded.chars().count();
+    if chars > MAX_TITLE_CHARS {
+        return Err(SetTitleError::TooLong(chars));
+    }
+    Ok(folded)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -715,14 +853,12 @@ pub(crate) enum SetIconError {
     Storage,
 }
 
-/// The Prompt one Title Errand carries: what to write, and the first Prompt to
-/// write it about. `asks_branch` adds the branch name a fresh Managed Worktree
-/// is renamed to.
-fn errand_prompt(
+/// A Prompt's text as a title writer reads it: Skill sigils and Attachment
+/// labels taken out.
+fn titling_text(
     prompt: &str,
     skill_invocations: &[SkillInvocation],
     attachments: &[AttachmentBinding],
-    asks_branch: bool,
 ) -> String {
     // Admission already proved each bound `$skill-name` begins at its span and
     // each Attachment label reads as bound at its own. Removing only a Skill's
@@ -751,7 +887,19 @@ fn errand_prompt(
             prompt.replace_range(cut, "");
         }
     }
+    prompt
+}
 
+/// The Prompt one Title Errand carries: what to write, and the first Prompt to
+/// write it about. `asks_branch` adds the branch name a fresh Managed Worktree
+/// is renamed to.
+fn errand_prompt(
+    prompt: &str,
+    skill_invocations: &[SkillInvocation],
+    attachments: &[AttachmentBinding],
+    asks_branch: bool,
+) -> String {
+    let prompt = titling_text(prompt, skill_invocations, attachments);
     let mut characters = prompt.chars();
     let opening = characters
         .by_ref()
@@ -772,6 +920,70 @@ fn errand_prompt(
          rather than fitted to it afterwards.{branch}\n\n\
          The request:\n{opening}"
     )
+}
+
+/// The Prompt a Title proposal's Errand carries: what to write, and the
+/// Session's Prompts so far to write it about, within the one budget a first
+/// Prompt is held to. The first Prompt opens the work and the latest say where
+/// it went, so where they cannot all be carried the first keeps up to half the
+/// budget and the latest fill the rest, those between them giving way.
+fn proposal_prompt(prompts: &[&Prompt]) -> String {
+    let texts = prompts
+        .iter()
+        .map(|prompt| titling_text(&prompt.text, &prompt.skill_invocations, &prompt.attachments))
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    let opening = |text: &str, budget: usize| text.chars().take(budget).collect::<String>();
+    let mut carried = Vec::new();
+    if let Some((first, later)) = texts.split_first() {
+        let first_budget = if later.is_empty() {
+            MAX_ERRAND_PROMPT_CHARS
+        } else {
+            MAX_ERRAND_PROMPT_CHARS / 2
+        };
+        let first = opening(first, first_budget);
+        let mut remaining = MAX_ERRAND_PROMPT_CHARS - first.chars().count();
+        let mut latest = Vec::new();
+        for text in later.iter().rev() {
+            if remaining == 0 {
+                break;
+            }
+            let kept = opening(text, remaining);
+            remaining -= kept.chars().count();
+            latest.push(kept);
+        }
+        let skipped = later.len() - latest.len();
+        carried.push(first);
+        if skipped > 0 {
+            carried.push(format!("({skipped} more requests)"));
+        }
+        carried.extend(latest.into_iter().rev());
+    }
+    format!(
+        "Name the piece of work the requests below have carried out so far, in the order \
+         they were made.\n\n\
+         Answer with a title of 3 to 8 words, under 50 characters, naming the subject of \
+         the work and what it is meant to achieve. Do not echo the wording of the requests, \
+         do not address the reader, and do not end with a full stop.\n\n\
+         The requests:\n{}",
+        carried.join("\n\n---\n\n")
+    )
+}
+
+/// The shape a Title proposal's Errand answers in: the Title alone.
+fn proposal_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "3 to 8 words under 50 characters naming the subject of the work and what it is meant to achieve",
+            },
+        },
+        "required": ["title"],
+        "additionalProperties": false,
+    })
 }
 
 /// The shape Suru asks an Errand to answer in. A request rather than a
