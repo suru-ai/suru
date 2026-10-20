@@ -184,7 +184,7 @@ async fn codex_skill_changes_force_refresh_server_authority() {
     .expect("connect client");
     receive_initial_state(&mut client).await;
     assert!(matches!(
-        client.next().await,
+        crate::server_support::next_event(&mut client).await,
         Some(ManagedEvent::SettingsSnapshot(_))
     ));
     let request = suru::protocol::SkillCatalogRequest {

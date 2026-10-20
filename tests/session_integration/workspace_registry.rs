@@ -17,9 +17,8 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
         CreateSessionRequest, ExecutionDirectory, InitialPrompt, Outlook, PromptId,
-        ResolveWorkspaceRequest, RuntimeDescriptor, SessionId, SessionListItem,
-        WORKSPACE_LISTING_EVENT, Workspace, WorkspaceDescription, WorkspaceId, WorkspaceListing,
-        WorkspaceUnavailability,
+        ResolveWorkspaceRequest, SessionId, SessionListItem, WORKSPACE_LISTING_EVENT, Workspace,
+        WorkspaceDescription, WorkspaceId, WorkspaceListing, WorkspaceUnavailability,
     },
     server::{self, RunningServer, ServerConfig, ServerTimings},
 };
@@ -866,15 +865,6 @@ async fn an_entry_whose_main_checkout_is_unknown_is_named_so_without_its_reposit
     }
 }
 
-/// The Workspace listings a Server pushes on a Session catalog stream
-/// opened now: the one its connect snapshot carries, then each it pushes
-/// as what it lists moves (ADR 0052).
-async fn pushed_listings(
-    descriptor: &RuntimeDescriptor,
-) -> impl futures_util::Stream<Item = WorkspaceListing> + Unpin + use<> {
-    crate::server_support::open_catalog_events(descriptor, WORKSPACE_LISTING_EVENT).await
-}
-
 /// The next Workspace listing `pushed` carries.
 async fn next_pushed(
     pushed: &mut (impl futures_util::Stream<Item = WorkspaceListing> + Unpin),
@@ -903,7 +893,11 @@ async fn the_catalog_stream_carries_the_listing_and_pushes_each_change_of_it_onc
     .await
     .expect("spawn server");
     let client = connected_client(state_dir.path(), CHANNEL).await;
-    let mut pushed = pushed_listings(server.descriptor()).await;
+    let mut pushed = crate::server_support::open_catalog_events::<WorkspaceListing>(
+        server.descriptor(),
+        WORKSPACE_LISTING_EVENT,
+    )
+    .await;
 
     assert_eq!(
         next_pushed(&mut pushed).await,
@@ -972,7 +966,11 @@ async fn what_a_reading_behind_a_listing_finds_is_pushed_once_it_lands() {
         .create_session(quiet_request(notes.path(), "Keep the notes"))
         .await
         .expect("create a Session in the notes Workspace");
-    let mut pushed = pushed_listings(server.descriptor()).await;
+    let mut pushed = crate::server_support::open_catalog_events::<WorkspaceListing>(
+        server.descriptor(),
+        WORKSPACE_LISTING_EVENT,
+    )
+    .await;
     next_pushed(&mut pushed).await;
 
     notes
@@ -1159,7 +1157,11 @@ async fn work_that_moves_a_workspace_ahead_pushes_the_listing_in_its_new_order()
         settled(&client, session.id).await;
         sessions.push(session);
     }
-    let mut pushed = pushed_listings(server.descriptor()).await;
+    let mut pushed = crate::server_support::open_catalog_events::<WorkspaceListing>(
+        server.descriptor(),
+        WORKSPACE_LISTING_EVENT,
+    )
+    .await;
     let order = |listing: &WorkspaceListing| {
         listing
             .workspaces

@@ -3823,7 +3823,7 @@ async fn suru_config_dir_steers_a_real_server_and_config_problems_reach_the_log(
             .expect("connected event arrives"),
         Some(ManagedEvent::Connected(_))
     ));
-    let event = timeout(PROGRESS_DEADLINE, client.next())
+    let event = timeout(PROGRESS_DEADLINE, support::next_event(&mut client))
         .await
         .expect("settings snapshot arrives")
         .expect("managed client remains open");

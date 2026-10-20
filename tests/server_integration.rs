@@ -5972,59 +5972,46 @@ async fn managed_client_connects_without_periodic_domain_events() {
     };
     assert_eq!(identity.instance_id, descriptor.instance_id);
     assert_eq!(identity.pid, descriptor.pid);
-    assert!(
-        matches!(
-            timeout(PROGRESS_DEADLINE, support::next_event(&mut client))
+    // What a connect is told after Connected: the lifecycle stream's own
+    // events, in their order, and — anywhere among them — the one Workspace
+    // listing the Session catalog's snapshot carries.
+    let mut told = Vec::new();
+    for _ in 0..6 {
+        told.push(
+            timeout(PROGRESS_DEADLINE, client.next())
                 .await
-                .expect("settings snapshot arrives"),
-            Some(ManagedEvent::SettingsSnapshot(_))
-        ),
-        "the one-time settings snapshot follows the connection"
+                .expect("what a connect is told arrives")
+                .expect("managed client remains open"),
+        );
+    }
+    let (listings, lifecycle): (Vec<_>, Vec<_>) = told
+        .into_iter()
+        .partition(|event| matches!(event, ManagedEvent::WorkspaceListing(_)));
+    assert_eq!(
+        listings.len(),
+        1,
+        "the catalog's snapshot carries one Workspace listing: {listings:?}"
     );
     assert!(
         matches!(
-            timeout(PROGRESS_DEADLINE, support::next_event(&mut client))
-                .await
-                .expect("Model Catalog arrives"),
-            Some(ManagedEvent::ModelCatalog(_))
+            lifecycle.as_slice(),
+            [
+                ManagedEvent::SettingsSnapshot(_),
+                ManagedEvent::ModelCatalog(_),
+                ManagedEvent::Relays(_),
+                ManagedEvent::ServingListener(ListenerState::Off),
+                ManagedEvent::Onboarded(true),
+            ]
         ),
-        "the Model Catalog follows the settings snapshot"
+        "the one-time settings snapshot, then the Model Catalog, the Server's Relays, how its \
+         Serving listener stands, and whether it has been onboarded: {lifecycle:?}"
     );
     assert!(
-        matches!(
-            timeout(PROGRESS_DEADLINE, support::next_event(&mut client))
-                .await
-                .expect("the Server's Relays arrive"),
-            Some(ManagedEvent::Relays(_))
-        ),
-        "the Server's Relays follow the Model Catalog"
-    );
-    assert!(
-        matches!(
-            timeout(PROGRESS_DEADLINE, support::next_event(&mut client))
-                .await
-                .expect("the Serving listener's state arrives"),
-            Some(ManagedEvent::ServingListener(ListenerState::Off))
-        ),
-        "how the Serving listener stands follows the Relays"
-    );
-    assert!(
-        matches!(
-            timeout(PROGRESS_DEADLINE, support::next_event(&mut client))
-                .await
-                .expect("whether the Server has been onboarded arrives"),
-            Some(ManagedEvent::Onboarded(true))
-        ),
-        "whether the Server has been onboarded follows how the Serving listener stands"
-    );
-    assert!(
-        timeout(
-            Duration::from_millis(1_100),
-            support::next_event(&mut client)
-        )
-        .await
-        .is_err(),
-        "the lifecycle stream must stay quiet while the server remains ready"
+        timeout(Duration::from_millis(1_100), client.next())
+            .await
+            .is_err(),
+        "both streams must stay quiet while the server remains ready, no Workspace listing \
+         pushed with nothing listed moving"
     );
 
     drop(client);

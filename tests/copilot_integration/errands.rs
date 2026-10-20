@@ -400,9 +400,12 @@ async fn an_errand_answered_outside_its_schema_leaves_the_prompt_derived_title_s
         .expect("delete the Session");
     assert!(
         !matches!(
-            timeout(PROGRESS_DEADLINE, client.next())
-                .await
-                .expect("the deletion reaches the client"),
+            timeout(
+                PROGRESS_DEADLINE,
+                crate::server_support::next_event(&mut client)
+            )
+            .await
+            .expect("the deletion reaches the client"),
             Some(ManagedEvent::SessionTitleChanged(
                 SessionTitleChanged { .. }
             ))
