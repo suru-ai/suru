@@ -975,7 +975,7 @@ mod tests {
                 }
             }),
         );
-        let mut moves = registry.sessions.registry_moves();
+        let mut moves = registry.sessions.registry_moves().follow();
         let unreadable = [(
             WorkspaceId::directory(&atlas),
             WorkspaceUnavailability::HolderUnreadable,

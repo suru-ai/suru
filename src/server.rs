@@ -823,15 +823,19 @@ pub struct RunningServer {
     shutdown: ShutdownController,
     serving: ServingController,
     workspace_discovery: watch::Receiver<bool>,
-    /// What discovers the Workspace Roots into the Workspace Registry, and
-    /// what reads where each entry is presented, behind every listing.
-    workspace_reads: (
-        root_discovery::RootDiscovery,
-        registry_standing::RegistryStanding,
-    ),
+    /// What a Workspace listing has read behind its answer.
+    workspace_reads: WorkspaceReads,
     /// How many outlines of its Session trees this Server has served.
     outlines_served: Arc<std::sync::atomic::AtomicU64>,
     task: JoinHandle<Result<()>>,
+}
+
+/// What a Workspace listing has read behind its answer (ADR 0052).
+struct WorkspaceReads {
+    /// What discovers the Workspace Roots into the Workspace Registry.
+    discovery: root_discovery::RootDiscovery,
+    /// What reads where each Registry entry is presented.
+    standing: registry_standing::RegistryStanding,
 }
 
 #[derive(Clone)]
@@ -873,22 +877,25 @@ impl RunningServer {
         let _ = discovery.wait_for(|settled| *settled).await;
     }
 
-    /// Resolves once the Workspace Roots have been discovered into the
-    /// Workspace Registry and every entry's directory read, as a listing has
-    /// them done behind its answer (ADR 0052), so a listing asked after says
-    /// what they found. A scan or a reading still running is let finish
-    /// first, since it may have read the disk before whatever the caller is
-    /// catching up with changed it; each is then joined or begun as a
-    /// listing would, a scan only moments old reused. Neither is waited on
-    /// past `root_discovery_wait`.
+    /// For tests: resolves once the Workspace Roots have been discovered
+    /// into the Workspace Registry and every entry's directory read, as a
+    /// listing has them done behind its answer (ADR 0052), so a listing
+    /// asked after says what they found — as a listing said when it waited
+    /// on them. Neither is waited on past `root_discovery_wait`.
     pub async fn workspace_listing_caught_up(&self) {
-        let (discovery, standing) = &self.workspace_reads;
-        for _ in 0..2 {
-            discovery.settled(discovery.discover()).await;
-        }
-        for _ in 0..2 {
-            standing.check().await;
-        }
+        let WorkspaceReads {
+            discovery,
+            standing,
+        } = &self.workspace_reads;
+        // A scan still running may have read the Roots before whatever the
+        // caller is catching up with changed them, so it is joined and let
+        // finish first, and a fresh one begun after it, a scan only moments
+        // old reused as a listing reuses it.
+        discovery.settled(discovery.discover()).await;
+        discovery.settled(discovery.discover()).await;
+        // Likewise the check still reading the entries, then a fresh one.
+        standing.check().await;
+        standing.check().await;
     }
     pub fn descriptor(&self) -> &RuntimeDescriptor {
         &self.descriptor
@@ -2189,7 +2196,10 @@ async fn start(
         shutdown,
         serving,
         workspace_discovery: workspace_discovery_rx,
-        workspace_reads: (root_discovery, registry_standing),
+        workspace_reads: WorkspaceReads {
+            discovery: root_discovery,
+            standing: registry_standing,
+        },
         outlines_served,
         task,
     })
@@ -2726,7 +2736,7 @@ struct SessionCatalogEventStreamState {
     models: ModelCatalogService,
     model_changes: watch::Receiver<u64>,
     pushed_models: ModelCatalog,
-    workspaces: SessionOperations,
+    operations: SessionOperations,
     workspace_moves: operations::WorkspaceListingMoves,
     /// The Workspace listing this stream last pushed, so a move that leaves
     /// it as the client already has it is not pushed again.
@@ -2749,7 +2759,7 @@ fn session_catalog_event_stream(
     feed: SessionCatalogFeed,
     skills: broadcast::Receiver<SkillCatalog>,
     models: ModelCatalogService,
-    workspaces: SessionOperations,
+    operations: SessionOperations,
     shutdown: watch::Receiver<Option<ServerShutdown>>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
@@ -2767,8 +2777,8 @@ fn session_catalog_event_stream(
     let model_snapshot = model_catalog_event(&pushed_models);
     // The Workspace listing follows, its moves heard of from before it is
     // read, so none landing meanwhile is lost.
-    let workspace_moves = workspaces.workspace_listing_moves();
-    let pushed_workspaces = workspaces.workspace_listing_now();
+    let workspace_moves = operations.workspace_listing_moves();
+    let pushed_workspaces = operations.workspace_listing_now();
     let workspace_snapshot = workspace_listing_event(&pushed_workspaces);
     let state = SessionCatalogEventStreamState {
         keepalive: tokio::time::interval_at(
@@ -2782,7 +2792,7 @@ fn session_catalog_event_stream(
         models,
         model_changes,
         pushed_models,
-        workspaces,
+        operations,
         workspace_moves,
         pushed_workspaces,
     };
@@ -2844,7 +2854,7 @@ fn session_catalog_event_stream(
                     // A move that leaves the listing as this client already
                     // has it — a reading finding what the last one did, a
                     // Description set as it stood — is not worth a push.
-                    let listing = state.workspaces.workspace_listing_now();
+                    let listing = state.operations.workspace_listing_now();
                     if listing == state.pushed_workspaces {
                         continue;
                     }

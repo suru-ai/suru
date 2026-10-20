@@ -10,6 +10,7 @@ pub mod logging;
 pub mod managed_client;
 mod memories;
 mod model_catalog;
+mod moves;
 pub mod paths;
 pub mod pricing;
 mod process_tree;

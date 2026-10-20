@@ -73,7 +73,7 @@ impl SessionCatalogSubscription {
             descriptor,
             outlook,
             events_tx,
-            (initial_backoff, max_backoff),
+            RecoveryBackoff::new(initial_backoff, max_backoff),
             Heard {
                 models: true,
                 workspaces: workspace_listings,
@@ -103,10 +103,10 @@ struct RemoteRecovery {
 }
 
 impl RemoteRecovery {
-    fn new(initial_backoff: Duration, max_backoff: Duration) -> Self {
+    fn new(backoff: RecoveryBackoff) -> Self {
         Self {
             attempt: 0,
-            backoff: RecoveryBackoff::new(initial_backoff, max_backoff),
+            backoff,
             active: false,
         }
     }
@@ -159,14 +159,14 @@ async fn run_attached(
     mut descriptor: watch::Receiver<RuntimeDescriptor>,
     outlook: Outlook,
     events: mpsc::Sender<ManagedEvent>,
-    (initial_backoff, max_backoff): (Duration, Duration),
+    backoff: RecoveryBackoff,
     heard: Heard,
 ) {
     // An attached Outlook has no separately hydrated local catalog. Treat its
     // first snapshot as reconciliation so the TUI refreshes any listing that
     // raced with opening the stream.
     let mut known_session_ids = Some(HashSet::new());
-    let mut recovery = RemoteRecovery::new(initial_backoff, max_backoff);
+    let mut recovery = RemoteRecovery::new(backoff);
     loop {
         if events.is_closed() {
             return;

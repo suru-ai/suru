@@ -191,7 +191,7 @@ struct SessionStoreState {
     standings: HashMap<WorkspaceId, crate::protocol::WorkspaceUnavailability>,
     /// Counts each change of what the Workspace listing reads of this
     /// store (see [`SessionStore::registry_moves`]).
-    registry_moves: watch::Sender<u64>,
+    registry_moves: crate::moves::Moves,
     /// Where the store says a Report is waiting for a Session, once
     /// Provider orchestration has asked to hear of it: the Session the Report
     /// is for, whose Agent the orchestrator then delivers it to (see
@@ -435,7 +435,7 @@ impl SessionStore {
             workspaces,
             sightings: Default::default(),
             standings: HashMap::new(),
-            registry_moves: watch::channel(0).0,
+            registry_moves: Default::default(),
             report_notices: None,
         };
         // A history still waiting in storage has nothing a save could be
@@ -897,7 +897,7 @@ impl SessionStoreState {
 
     /// Announces that what the Workspace listing reads of this store moved.
     fn registry_moved(&self) {
-        self.registry_moves.send_modify(|moves| *moves += 1);
+        self.registry_moves.moved();
     }
 
     fn next_timestamp(&mut self) -> SessionTimestamp {

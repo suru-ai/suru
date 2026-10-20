@@ -1254,9 +1254,9 @@ impl SessionOperations {
     /// one and entered its own Workspace in the Registry — the one place a
     /// Clone asks for discovery (ADR 0051) — superseding a scan still running
     /// that read the Root before the clone took its name, and waits for it
-    /// no longer than the bound on waiting for discovery. What the scan finds there
-    /// leaves the Clone's own entry known by its Clone, as an entry already
-    /// made always is.
+    /// no longer than the bound on waiting for discovery. What the scan
+    /// finds there leaves the Clone's own entry known by its Clone, as an
+    /// entry already made always is.
     async fn rediscover_after_clone(&self) {
         let scans = self.root_discovery.rediscover();
         self.root_discovery.settled(scans).await;

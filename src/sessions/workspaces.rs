@@ -152,8 +152,8 @@ impl SessionStore {
     /// entry made, presented anew, or dropped, its Icon or Description
     /// changed, or a Session made or deleted, which moves where its
     /// Workspace stands — so the listing a Server pushes moves with it.
-    pub(crate) fn registry_moves(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.state.lock().unwrap().registry_moves.subscribe()
+    pub(crate) fn registry_moves(&self) -> crate::moves::Moves {
+        self.state.lock().unwrap().registry_moves.clone()
     }
 
     /// Every Workspace this server knows, as its Workspace Registry lists
@@ -258,11 +258,14 @@ impl SessionStore {
         provenance: WorkspaceProvenance,
     ) -> &'state mut StoredWorkspace {
         state.sightings.see(workspace_id);
-        let mut moved = !state.workspaces.contains_key(workspace_id);
+        let mut moved = false;
         let stored = state
             .workspaces
             .entry(workspace_id.clone())
-            .or_insert_with(|| StoredWorkspace::known_by(provenance));
+            .or_insert_with(|| {
+                moved = true;
+                StoredWorkspace::known_by(provenance)
+            });
         if let Some(workspace) = presented {
             let presentation = WorkspacePresentation::of(workspace);
             if stored.path.as_ref() != Some(&workspace.path)
@@ -280,12 +283,9 @@ impl SessionStore {
             }
         }
         if moved {
-            state.registry_moved();
+            state.registry_moves.moved();
         }
-        state
-            .workspaces
-            .get_mut(workspace_id)
-            .expect("the entry was just made where it was not")
+        stored
     }
 
     /// Drops every entry a resolution of `workspace` has superseded: one

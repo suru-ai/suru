@@ -466,8 +466,9 @@ pub trait SourceControl: Send + Sync {
 pub(crate) struct SourceControlService {
     adapter: Arc<dyn SourceControl>,
     repositories: Arc<Mutex<HashMap<RepositoryId, Repository>>>,
-    /// Counts each change of what [`Self::repositories`] answers.
-    repository_moves: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Counts each change of what [`Self::repositories`] answers, while
+    /// `repositories` is held as the change left it.
+    repository_moves: crate::moves::Moves,
     mutations: Arc<Mutex<HashMap<RepositoryId, Arc<tokio::sync::Mutex<()>>>>>,
     incarnations: Arc<Mutex<HashMap<crate::protocol::CheckoutId, u64>>>,
     /// The directory Suru owns outside source control, which is a directory
@@ -489,7 +490,7 @@ impl SourceControlService {
         Self {
             adapter,
             repositories: Default::default(),
-            repository_moves: Arc::new(tokio::sync::watch::channel(0).0),
+            repository_moves: Default::default(),
             mutations: Default::default(),
             incarnations: Default::default(),
             sidekick: None,
@@ -827,9 +828,8 @@ impl SourceControlService {
     pub(crate) fn remember(&self, workspace: &Workspace) {
         if let Some(repository) = workspace.repository.as_deref() {
             let mut moved = false;
-            self.repositories
-                .lock()
-                .unwrap()
+            let mut repositories = self.repositories.lock().unwrap();
+            repositories
                 .entry(repository.id.clone())
                 .and_modify(|known| {
                     if matches!(known.location, RepositoryLocation::UnknownMain)
@@ -844,20 +844,16 @@ impl SourceControlService {
                     repository.clone()
                 });
             if moved {
-                self.repositories_moved();
+                self.repository_moves.moved();
             }
         }
     }
 
-    /// Announces every change of what [`Self::repositories`] answers, which
+    /// Counts every change of what [`Self::repositories`] answers, which
     /// presents each Workspace a listing names, so the listing a Server
     /// pushes moves with it.
-    pub(crate) fn repository_moves(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.repository_moves.subscribe()
-    }
-
-    fn repositories_moved(&self) {
-        self.repository_moves.send_modify(|moves| *moves += 1);
+    pub(crate) fn repository_moves(&self) -> crate::moves::Moves {
+        self.repository_moves.clone()
     }
     /// Every Repository this Server has grouped a Workspace for, however it came
     /// to know it — through a Session at startup, or through a Workspace
@@ -1100,16 +1096,11 @@ impl SourceControlService {
         if matches!(read.location, RepositoryLocation::UnknownMain) {
             return;
         }
-        let learned = if let Some(known) = self.repositories.lock().unwrap().get_mut(&read.id)
+        if let Some(known) = self.repositories.lock().unwrap().get_mut(&read.id)
             && matches!(known.location, RepositoryLocation::UnknownMain)
         {
             known.location = read.location.clone();
-            true
-        } else {
-            false
-        };
-        if learned {
-            self.repositories_moved();
+            self.repository_moves.moved();
         }
     }
     /// Resolve within one discovery batch, so that several directories which
@@ -1225,22 +1216,21 @@ impl SourceControlService {
             }
         }
         if let Some(repository) = resolved.workspace.repository.as_deref_mut() {
-            let moved = {
-                let mut repositories = self.repositories.lock().unwrap();
-                if matches!(repository.location, RepositoryLocation::UnknownMain)
-                    && let Some(previous) = repositories.get(&repository.id)
-                    && !matches!(previous.location, RepositoryLocation::UnknownMain)
-                {
-                    repository.location = previous.location.clone();
-                }
-                repositories
-                    .insert(repository.id.clone(), repository.clone())
-                    .as_ref()
-                    != Some(&*repository)
-            };
-            if moved {
-                self.repositories_moved();
+            let mut repositories = self.repositories.lock().unwrap();
+            if matches!(repository.location, RepositoryLocation::UnknownMain)
+                && let Some(previous) = repositories.get(&repository.id)
+                && !matches!(previous.location, RepositoryLocation::UnknownMain)
+            {
+                repository.location = previous.location.clone();
             }
+            if repositories
+                .insert(repository.id.clone(), repository.clone())
+                .as_ref()
+                != Some(&*repository)
+            {
+                self.repository_moves.moved();
+            }
+            drop(repositories);
             resolved.workspace = repository_workspace(repository);
         }
         resolved

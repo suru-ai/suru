@@ -1052,8 +1052,8 @@ impl SessionOperations {
     /// answers from now on.
     pub(crate) fn workspace_listing_moves(&self) -> WorkspaceListingMoves {
         WorkspaceListingMoves {
-            registry: self.sessions.registry_moves(),
-            repositories: self.source_control.repository_moves(),
+            registry: self.sessions.registry_moves().follow(),
+            repositories: self.source_control.repository_moves().follow(),
         }
     }
 
