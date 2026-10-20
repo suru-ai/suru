@@ -887,16 +887,17 @@ impl SessionStore {
 
 impl SessionStoreState {
     fn publish_catalog_change(&mut self, change: SessionCatalogChange) {
-        // A Workspace's Icon and Description ride the listing. A total or a
-        // Worktree's state moving carries what it moved whole and moves
-        // nothing the listing is ordered by — the work behind a total is
-        // announced on its own as it begins and settles — so the order is
-        // not read again for those, frequent as they are while a Turn
-        // streams. Any other change may come of work that moved a Workspace
+        // A Workspace's Icon and Description ride the listing. A Worktree's
+        // state moving moves nothing the listing is ordered by. A total
+        // moving comes of an Activity that did move its Session's moment, but
+        // the order is not read again for it, frequent as it is while a Turn
+        // streams: a Workspace that streaming work moves ahead is listed so
+        // at the next change that reads the order, as the work begins or
+        // settles. Any other change may come of work that moved a Workspace
         // ahead of another among those the listing stands first — a Session
         // made, deleted, or working anew — so the order is read again, and
-        // counts as a move only where it changed: work in a Workspace
-        // already first moves nothing.
+        // counts as a move only where it changed: work in a Workspace already
+        // first moves nothing.
         let moved = match change {
             SessionCatalogChange::WorkspaceIconChanged { .. }
             | SessionCatalogChange::WorkspaceDescriptionChanged { .. } => true,
