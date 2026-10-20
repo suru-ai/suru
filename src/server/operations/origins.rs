@@ -1053,7 +1053,6 @@ impl SessionOperations {
     pub(crate) fn workspace_listing_moves(&self) -> WorkspaceListingMoves {
         WorkspaceListingMoves {
             registry: self.sessions.registry_moves(),
-            standing: self.registry_standing.moves(),
             repositories: self.source_control.repository_moves(),
         }
     }
@@ -1265,13 +1264,12 @@ impl SessionOperations {
 }
 
 /// Whatever may move the Workspace listing a Server pushes: its Workspace
-/// Registry's entries and the Sessions that order them, what was last found
-/// of each entry's directory, and the Repositories source control has read,
+/// Registry's entries, the Sessions that order them, and what was last found
+/// of each entry's directory; and the Repositories source control has read,
 /// which present them. A move may leave the listing as it was, so whatever
 /// pushes it pushes only what differs from what it pushed last.
 pub(crate) struct WorkspaceListingMoves {
     registry: watch::Receiver<u64>,
-    standing: watch::Receiver<u64>,
     repositories: watch::Receiver<u64>,
 }
 
@@ -1280,7 +1278,6 @@ impl WorkspaceListingMoves {
     pub(crate) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
         tokio::select! {
             changed = self.registry.changed() => changed,
-            changed = self.standing.changed() => changed,
             changed = self.repositories.changed() => changed,
         }
     }

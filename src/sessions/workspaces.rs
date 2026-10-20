@@ -8,7 +8,7 @@ use crate::{
     protocol::{
         Repository, RepositoryId, RepositoryLocation, SessionCatalogChange, SessionChange,
         SessionId, SourceControlAvailability, SourceControlCapabilities, SourceControlCapability,
-        Workspace, WorkspaceId,
+        Workspace, WorkspaceId, WorkspaceUnavailability,
     },
     source_control::SourceControlService,
     storage::{StoredWorkspace, WorkspacePresentation, WorkspaceProvenance},
@@ -106,6 +106,18 @@ impl SessionStoreState {
             self.sidekick_workspace.as_ref(),
             workspace,
         );
+    }
+
+    /// Drops the entry `workspace_id` from the Registry, and with it when it
+    /// was last seen and what was last found of its directory, so an entry
+    /// made there again starts afresh. Answers the entry dropped, where
+    /// there was one.
+    fn drop_entry(&mut self, workspace_id: &WorkspaceId) -> Option<StoredWorkspace> {
+        let dropped = self.workspaces.remove(workspace_id)?;
+        self.sightings.forget(workspace_id);
+        self.standings.remove(workspace_id);
+        self.registry_moved();
+        Some(dropped)
     }
 }
 
@@ -312,11 +324,9 @@ impl SessionStore {
             if state.grouped_besides(&retired_id, moving) {
                 continue;
             }
-            let Some(retired) = state.workspaces.remove(&retired_id) else {
+            let Some(retired) = state.drop_entry(&retired_id) else {
                 continue;
             };
-            state.sightings.forget(&retired_id);
-            state.registry_moved();
             tracing::info!(
                 superseded = %retired_id.0,
                 workspace = %workspace.id.0,
@@ -429,9 +439,7 @@ impl SessionStore {
         if state.grouped_besides(workspace_id, None) {
             return;
         }
-        state.workspaces.remove(workspace_id);
-        state.sightings.forget(workspace_id);
-        state.registry_moved();
+        state.drop_entry(workspace_id);
         tracing::info!(
             workspace = %workspace_id.0,
             root,
@@ -477,9 +485,7 @@ impl SessionStore {
         if state.grouped_besides(workspace_id, None) {
             return true;
         }
-        state.workspaces.remove(workspace_id);
-        state.sightings.forget(workspace_id);
-        state.registry_moved();
+        state.drop_entry(workspace_id);
         tracing::info!(
             workspace = %workspace_id.0,
             path = %path.display(),
@@ -487,6 +493,37 @@ impl SessionStore {
         );
         self.storage.forget_workspace(workspace_id.clone());
         false
+    }
+
+    /// Why each entry cannot be opened, by its identity, as the reading of
+    /// its directory that answered last found it: what a listing says of
+    /// each. An entry not yet read, or last found readable, is not here.
+    pub(crate) fn remembered_standings(&self) -> HashMap<WorkspaceId, WorkspaceUnavailability> {
+        self.state.lock().unwrap().standings.clone()
+    }
+
+    /// Remembers why the entry `workspace_id` cannot be opened, as a
+    /// reading of its directory just found it — or, given `None`, that it
+    /// can be — until a later reading finds otherwise or the entry is
+    /// dropped, which takes what was found of it with it. What a reading
+    /// found of an entry the Registry no longer holds is remembered of
+    /// none.
+    pub(crate) fn remember_standing(
+        &self,
+        workspace_id: &WorkspaceId,
+        why: Option<WorkspaceUnavailability>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        if !state.workspaces.contains_key(workspace_id) {
+            return;
+        }
+        let before = match why {
+            Some(why) => state.standings.insert(workspace_id.clone(), why),
+            None => state.standings.remove(workspace_id),
+        };
+        if before != why {
+            state.registry_moved();
+        }
     }
 
     /// Every entry discovered under a Workspace Root: its identity, that
@@ -539,9 +576,7 @@ impl SessionStore {
                     WorkspaceProvenance::Session
                 }
                 Rerooting::Unrooted => {
-                    state.workspaces.remove(&workspace_id);
-                    state.sightings.forget(&workspace_id);
-                    state.registry_moved();
+                    state.drop_entry(&workspace_id);
                     tracing::info!(
                         workspace = %workspace_id.0,
                         root,

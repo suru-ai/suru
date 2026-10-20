@@ -126,14 +126,6 @@ struct Standing {
     /// How far the check begun last has come, which every listing asking
     /// while it reads joins.
     in_flight: Mutex<Option<watch::Receiver<Progress>>>,
-    /// Why each entry cannot be opened, as the reading of it that answered
-    /// last found — or that it did not answer within the bound — kept from
-    /// one check to the next, so a listing answers from it at once (ADR
-    /// 0052). An entry not yet read, or last found readable, is not here.
-    remembered: Mutex<HashMap<WorkspaceId, WorkspaceUnavailability>>,
-    /// Counts each change of what is remembered, so whatever pushes the
-    /// listing hears of it.
-    moves: watch::Sender<u64>,
     /// What holds the Roots still (see [`RootsHeld`]).
     roots_changing: tokio::sync::Mutex<()>,
 }
@@ -164,8 +156,6 @@ impl RegistryStanding {
             resolutions: ReadsApart::new("suru-workspace-root-resolution", RESOLUTIONS_AT_ONCE),
             wait,
             in_flight: Mutex::new(None),
-            remembered: Mutex::default(),
-            moves: watch::channel(0).0,
             roots_changing: tokio::sync::Mutex::new(()),
         }))
     }
@@ -178,29 +168,19 @@ impl RegistryStanding {
     }
 
     /// Why each entry left that cannot be opened now cannot be, by its
-    /// identity, as the readings that answered last found: what a listing
-    /// says of each, without waiting on a reading. An entry not yet read is
-    /// not here, so it is listed as available.
+    /// identity, as the readings that answered last found, the Registry
+    /// keeping it beside each entry (see
+    /// [`SessionStore::remember_standing`]): what a listing says of each,
+    /// without waiting on a reading. An entry not yet read is not here, so
+    /// it is listed as available.
     pub(crate) fn remembered(&self) -> HashMap<WorkspaceId, WorkspaceUnavailability> {
-        self.0.remembered.lock().unwrap().clone()
-    }
-
-    /// Announces every change of what [`Self::remembered`] answers.
-    pub(crate) fn moves(&self) -> watch::Receiver<u64> {
-        self.0.moves.subscribe()
+        self.0.sessions.remembered_standings()
     }
 
     /// Remembers why the entry `id` cannot be opened — or, given `None`,
-    /// that it can be — announcing the change where it is one.
+    /// that it can be.
     fn remember(&self, id: &WorkspaceId, why: Option<WorkspaceUnavailability>) {
-        let mut remembered = self.0.remembered.lock().unwrap();
-        let before = match why {
-            Some(why) => remembered.insert(id.clone(), why),
-            None => remembered.remove(id),
-        };
-        if before != why {
-            self.0.moves.send_modify(|moves| *moves += 1);
-        }
+        self.0.sessions.remember_standing(id, why);
     }
 
     /// Drops what the disk no longer holds, as the module says, and answers
@@ -231,14 +211,6 @@ impl RegistryStanding {
             return progress.clone();
         }
         let (since, entries) = self.0.sessions.presented_entries();
-        // What is remembered of an entry the Registry no longer holds is
-        // let go, a listing having nothing of it to say.
-        let held = entries.iter().map(|(id, _)| id).collect::<HashSet<_>>();
-        self.0
-            .remembered
-            .lock()
-            .unwrap()
-            .retain(|id, _| held.contains(id));
         let (sender, progress) = watch::channel(Progress {
             unread: entries.iter().map(|(id, _)| id.clone()).collect(),
             ..Progress::default()
@@ -1003,7 +975,7 @@ mod tests {
                 }
             }),
         );
-        let mut moves = standing.moves();
+        let mut moves = registry.sessions.registry_moves();
         let unreadable = [(
             WorkspaceId::directory(&atlas),
             WorkspaceUnavailability::HolderUnreadable,
@@ -1190,6 +1162,50 @@ mod tests {
         )
         .await;
         (registry, atlas)
+    }
+
+    /// What was found of an entry's directory goes with the entry: one
+    /// dropped and entered again is listed as one not yet read, not as its
+    /// last reading found it. Here a Root taken away drops what was found
+    /// unreadable under it, and discovery enters it again.
+    #[tokio::test]
+    async fn what_was_found_of_an_entry_goes_with_it_when_it_is_dropped() {
+        let (registry, atlas) = discovered_under_b().await;
+        let standing = RegistryStanding::with_probe(
+            registry.sessions.clone(),
+            None,
+            None,
+            SURELY,
+            Arc::new(|_: &Path| Reading::Unreadable(WorkspaceUnavailability::HolderUnreadable)),
+        );
+        standing.check().await;
+        assert_eq!(
+            standing.remembered(),
+            [(
+                WorkspaceId::directory(&atlas),
+                WorkspaceUnavailability::HolderUnreadable
+            )]
+            .into_iter()
+            .collect()
+        );
+
+        let held = standing.hold_roots().await;
+        standing
+            .roots_changed(&held, &["~/b".to_owned()], &[])
+            .await;
+        drop(held);
+        assert_eq!(listed(&registry.sessions), Vec::<PathBuf>::new());
+        registry.sessions.enter_discovered(
+            &crate::protocol::Workspace::directory(atlas.clone()),
+            &atlas,
+            "~/b",
+        );
+
+        assert_eq!(
+            standing.remembered(),
+            HashMap::new(),
+            "the entry entered again is not yet read"
+        );
     }
 
     /// Settings put in force while the step at start decides, by whatever

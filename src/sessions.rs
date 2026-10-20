@@ -184,6 +184,11 @@ struct SessionStoreState {
     /// begun before one is never taken over it (see
     /// [`SessionStore::forget_gone`]).
     sightings: workspaces::Sightings,
+    /// Why each entry cannot be opened, as the reading of its directory that
+    /// answered last found it (see [`SessionStore::remember_standing`]),
+    /// kept from one reading to the next and dropped with the entry. An
+    /// entry not yet read, or last found readable, is not here.
+    standings: HashMap<WorkspaceId, crate::protocol::WorkspaceUnavailability>,
     /// Counts each change of what the Workspace listing reads of this
     /// store (see [`SessionStore::registry_moves`]).
     registry_moves: watch::Sender<u64>,
@@ -429,6 +434,7 @@ impl SessionStore {
             posture_generations: HashMap::new(),
             workspaces,
             sightings: Default::default(),
+            standings: HashMap::new(),
             registry_moves: watch::channel(0).0,
             report_notices: None,
         };
