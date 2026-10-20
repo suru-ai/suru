@@ -1761,6 +1761,88 @@ async fn outlook_client_lists_its_remotes_workspace_registry() {
     pair.shutdown().await;
 }
 
+/// A Client keeping Workspace listings hears a Remote's as the Remote
+/// pushes it on the Session catalog stream it follows through the Pairing
+/// (ADR 0052): as that stream connects, and again once a Workspace is made
+/// known there — so a Client's Workspace Picker turned toward a Remote
+/// opens on that Remote's Workspaces before it asks for them.
+#[tokio::test]
+async fn a_remotes_workspace_listing_reaches_a_client_through_the_pairing() {
+    let pair = paired_servers("remote-workspace-listing-pushed").await;
+    let described = async |path: &std::path::Path, description: &str| {
+        let resolved = pair
+            .serving_client
+            .outlook(Outlook::Local)
+            .resolve_workspace(ResolveWorkspaceRequest {
+                checkout_id: None,
+                remembered_execution_directory: None,
+                workspace_id: None,
+                base: None,
+                path: path.to_owned(),
+            })
+            .await
+            .expect("resolve a Workspace on the Serving Server")
+            .workspace;
+        pair.serving_client
+            .set_workspace_description(&resolved.id, Some(&resolved.path), description)
+            .await
+            .expect("describe a Workspace on the Serving Server");
+        resolved.path
+    };
+    let notes = tempfile::tempdir().expect("create a Serving Workspace");
+    let notes = described(notes.path(), "Where the notes are kept.").await;
+    let client = ManagedClient::connect(
+        pair.connecting_client_config
+            .clone()
+            .with_workspace_listings(),
+    )
+    .await
+    .expect("attach a Client keeping Workspace listings");
+    let mut catalog = client
+        .outlook(Outlook::Remote("workstation".to_owned()))
+        .subscribe_catalog();
+    let mut next_heard = async || {
+        timeout(PROGRESS_DEADLINE, async {
+            loop {
+                let event = catalog
+                    .next()
+                    .await
+                    .expect("the Remote's catalog stream stays open");
+                if let ManagedEvent::WorkspaceListing(listing) = event {
+                    let mut paths = listing
+                        .workspaces
+                        .into_iter()
+                        .map(|workspace| workspace.path)
+                        .collect::<Vec<_>>();
+                    paths.sort();
+                    return paths;
+                }
+            }
+        })
+        .await
+        .expect("a Workspace listing of the Remote's is heard")
+    };
+
+    assert_eq!(
+        next_heard().await,
+        std::slice::from_ref(&notes),
+        "the Remote's listing as its catalog stream connects"
+    );
+    let drafts = tempfile::tempdir().expect("create another Serving Workspace");
+    let drafts = described(drafts.path(), "Where drafts wait.").await;
+    let mut both = vec![notes, drafts];
+    both.sort();
+    assert_eq!(
+        next_heard().await,
+        both,
+        "and the listing once another Workspace is made known there"
+    );
+
+    drop(catalog);
+    drop(client);
+    pair.shutdown().await;
+}
+
 #[tokio::test]
 async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
     let (runtime, mut provider) = provider_support::ControlledProvider::with_provider(

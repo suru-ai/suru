@@ -37,6 +37,7 @@ use axum::{
 use eventsource_stream::Eventsource;
 use futures_util::{StreamExt, future::join_all};
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::sync::watch;
 
 use super::SessionOperations;
 use crate::{
@@ -1024,16 +1025,37 @@ impl SessionOperations {
     /// on nothing (ADR 0052): the Workspace Roots are discovered into the
     /// Registry, and every entry's directory read, behind the answer — a
     /// scan still running joined and one only moments old reused — and
-    /// whatever they change is listed after. An entry whose Repository
-    /// source control has read during this run is presented as that
-    /// Repository is, so one whose main checkout is not known is named so;
-    /// one whose directory was last found unreadable, or whose reading went
-    /// unanswered too long, says why it cannot be opened; and one not yet
-    /// read is listed as available.
+    /// whatever they change reaches this Server's Clients on its Session
+    /// catalog stream as it lands. An entry whose Repository source control
+    /// has read during this run is presented as that Repository is, so one
+    /// whose main checkout is not known is named so; one whose directory
+    /// was last found unreadable, or whose reading went unanswered too
+    /// long, says why it cannot be opened; and one not yet read is listed
+    /// as available.
     pub(crate) fn workspace_listing(&self) -> WorkspaceListing {
+        // The answer is taken before anything is read behind it, so all
+        // that reading moves is pushed after it, and newer.
+        let listing = self.workspace_listing_now();
         drop(self.root_discovery.discover());
         self.registry_standing.begin();
+        listing
+    }
+
+    /// Every Workspace this Server knows, as [`Self::workspace_listing`]
+    /// lists them, reading nothing afresh: what is pushed whenever it moves
+    /// (see [`Self::workspace_listing_moves`]).
+    pub(crate) fn workspace_listing_now(&self) -> WorkspaceListing {
         self.listing_of_registry(self.registry_standing.remembered())
+    }
+
+    /// Announces whatever may move what [`Self::workspace_listing_now`]
+    /// answers from now on.
+    pub(crate) fn workspace_listing_moves(&self) -> WorkspaceListingMoves {
+        WorkspaceListingMoves {
+            registry: self.sessions.registry_moves(),
+            standing: self.registry_standing.moves(),
+            repositories: self.source_control.repository_moves(),
+        }
     }
 
     /// Every Workspace this Server's Workspace Registry holds now, as
@@ -1239,6 +1261,28 @@ impl SessionOperations {
             }
         }
         Ok(gathered)
+    }
+}
+
+/// Whatever may move the Workspace listing a Server pushes: its Workspace
+/// Registry's entries and the Sessions that order them, what was last found
+/// of each entry's directory, and the Repositories source control has read,
+/// which present them. A move may leave the listing as it was, so whatever
+/// pushes it pushes only what differs from what it pushed last.
+pub(crate) struct WorkspaceListingMoves {
+    registry: watch::Receiver<u64>,
+    standing: watch::Receiver<u64>,
+    repositories: watch::Receiver<u64>,
+}
+
+impl WorkspaceListingMoves {
+    /// Waits for the next move; an error once nothing is left to move it.
+    pub(crate) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        tokio::select! {
+            changed = self.registry.changed() => changed,
+            changed = self.standing.changed() => changed,
+            changed = self.repositories.changed() => changed,
+        }
     }
 }
 

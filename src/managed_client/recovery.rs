@@ -71,6 +71,7 @@ pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient
     let initial_recovery_backoff = config.initial_recovery_backoff;
     let max_recovery_backoff = config.max_recovery_backoff;
     let attachment_fetch_timeout = config.attachment_fetch_timeout;
+    let workspace_listings = config.workspace_listings;
     let config_dir = config.runtime.config_dir().map(ToOwned::to_owned);
     let task = tokio::spawn(run_managed_client(
         config,
@@ -87,6 +88,7 @@ pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient
         initial_recovery_backoff,
         max_recovery_backoff,
         attachment_fetch_timeout,
+        workspace_listings,
         config_dir,
         task,
     })
@@ -185,7 +187,12 @@ async fn run_managed_client(
             &events,
             &mut known_session_ids,
             catalog_hydrated,
-            false,
+            session_catalog_stream::Heard {
+                // The lifecycle stream already carries the Model Catalog,
+                // after Connected and Settings.
+                models: false,
+                workspaces: config.workspace_listings,
+            },
         );
         tokio::pin!(catalog);
         let mut initial_checkout_states = Vec::new();

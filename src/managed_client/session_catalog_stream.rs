@@ -17,7 +17,7 @@ use crate::protocol::{
     SessionCatalogRevision, SessionCatalogSnapshot, SessionCatalogUpdate, SessionCreated,
     SessionDeleted, SessionId, SessionMonitoringChanged, SessionSettlementChanged,
     SessionStandingInputsChanged, SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged,
-    SkillCatalog, UnreachableReason,
+    SkillCatalog, UnreachableReason, WORKSPACE_LISTING_EVENT, WorkspaceListing,
 };
 
 use super::{
@@ -65,6 +65,7 @@ impl SessionCatalogSubscription {
         outlook: Outlook,
         initial_backoff: Duration,
         max_backoff: Duration,
+        workspace_listings: bool,
     ) -> Self {
         let (events_tx, events_rx) = mpsc::channel(32);
         let task = tokio::spawn(run_attached(
@@ -72,8 +73,11 @@ impl SessionCatalogSubscription {
             descriptor,
             outlook,
             events_tx,
-            initial_backoff,
-            max_backoff,
+            (initial_backoff, max_backoff),
+            Heard {
+                models: true,
+                workspaces: workspace_listings,
+            },
         ));
         Self {
             events: events_rx,
@@ -155,8 +159,8 @@ async fn run_attached(
     mut descriptor: watch::Receiver<RuntimeDescriptor>,
     outlook: Outlook,
     events: mpsc::Sender<ManagedEvent>,
-    initial_backoff: Duration,
-    max_backoff: Duration,
+    (initial_backoff, max_backoff): (Duration, Duration),
+    heard: Heard,
 ) {
     // An attached Outlook has no separately hydrated local catalog. Treat its
     // first snapshot as reconciliation so the TUI refreshes any listing that
@@ -196,7 +200,7 @@ async fn run_attached(
             }
         };
         let (hydrated, hydration) = oneshot::channel();
-        let consumption = consume(response, &events, &mut known_session_ids, hydrated, true);
+        let consumption = consume(response, &events, &mut known_session_ids, hydrated, heard);
         tokio::pin!(consumption);
         tokio::pin!(hydration);
         let outcome = tokio::select! {
@@ -253,12 +257,22 @@ pub(super) enum StreamOutcome {
     ReceiverClosed,
 }
 
+/// What a catalog stream's reader hears of it beside the Session catalog
+/// and its Skill Catalogs.
+#[derive(Clone, Copy)]
+pub(super) struct Heard {
+    /// The Model Catalog the stream pushes.
+    pub(super) models: bool,
+    /// The Workspace listing the stream pushes.
+    pub(super) workspaces: bool,
+}
+
 pub(super) async fn consume(
     response: reqwest::Response,
     events: &mpsc::Sender<ManagedEvent>,
     known_session_ids: &mut Option<HashSet<SessionId>>,
     hydrated: oneshot::Sender<Vec<crate::protocol::CheckoutSummary>>,
-    forward_models: bool,
+    heard: Heard,
 ) -> Result<StreamOutcome> {
     let mut stream = response.bytes_stream().eventsource();
     let mut revision = None;
@@ -305,9 +319,7 @@ pub(super) async fn consume(
                 }
             }
             CatalogEvent::Models(catalog) => {
-                // The managed local connection already receives Models on
-                // its lifecycle stream, after Connected and Settings.
-                if forward_models
+                if heard.models
                     && events
                         .send(ManagedEvent::ModelCatalog(catalog))
                         .await
@@ -321,6 +333,16 @@ pub(super) async fn consume(
                     .send(ManagedEvent::SkillCatalogUpdated(catalog))
                     .await
                     .is_err()
+                {
+                    return Ok(StreamOutcome::ReceiverClosed);
+                }
+            }
+            CatalogEvent::Workspaces(listing) => {
+                if heard.workspaces
+                    && events
+                        .send(ManagedEvent::WorkspaceListing(listing))
+                        .await
+                        .is_err()
                 {
                     return Ok(StreamOutcome::ReceiverClosed);
                 }
@@ -499,6 +521,7 @@ enum CatalogEvent {
     Update(SessionCatalogUpdate),
     Skill(SkillCatalog),
     Models(ModelCatalog),
+    Workspaces(WorkspaceListing),
 }
 
 fn decode_event(event: Event, revision: Option<SessionCatalogRevision>) -> Result<CatalogEvent> {
@@ -530,6 +553,10 @@ fn decode_event(event: Event, revision: Option<SessionCatalogRevision>) -> Resul
             let catalog: SkillCatalog =
                 serde_json::from_str(&event.data).context("decode Skill Catalog update")?;
             Ok(CatalogEvent::Skill(catalog))
+        }
+        WORKSPACE_LISTING_EVENT => {
+            let listing = serde_json::from_str(&event.data).context("decode Workspace listing")?;
+            Ok(CatalogEvent::Workspaces(listing))
         }
         name => bail!("server sent unknown Session catalog event type '{name}'"),
     }

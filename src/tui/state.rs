@@ -2455,6 +2455,7 @@ impl TuiState {
                 self.fatal_error = None;
             }
             ManagedEvent::RemoteRecovered => self.end_recovery(&Outlook::Local),
+            ManagedEvent::WorkspaceListing(_) => {}
             ManagedEvent::Relays(listing) => self.receive_relays(listing),
             ManagedEvent::ServingListener(state) => self.serving_listener = state,
             ManagedEvent::RemoteFailed { message, .. } => self.settle_remote_failure(message),
@@ -2630,6 +2631,7 @@ impl TuiState {
             | ManagedEvent::Relays(_)
             | ManagedEvent::ServingListener(_)
             | ManagedEvent::Onboarded(_)
+            | ManagedEvent::WorkspaceListing(_)
             | ManagedEvent::RemoteRecovered
             | ManagedEvent::RemoteFailed { .. }
             | ManagedEvent::ServerShutdown(_)
@@ -2710,6 +2712,7 @@ impl TuiState {
             | ManagedEvent::Relays(_)
             | ManagedEvent::ServingListener(_)
             | ManagedEvent::Onboarded(_)
+            | ManagedEvent::WorkspaceListing(_)
             | ManagedEvent::RemoteRecovered
             | ManagedEvent::RemoteFailed { .. }
             | ManagedEvent::ServerShutdown(_)

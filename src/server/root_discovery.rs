@@ -54,7 +54,7 @@
 //! are scanned again, so a Root that stalls keeps the others discovering
 //! on their own — and the listing waits on none of them (ADR 0052),
 //! answering from the Registry as it stands: what they find is listed
-//! after.
+//! after, and reaches the Server's Clients as it lands.
 
 use std::{
     collections::HashMap,

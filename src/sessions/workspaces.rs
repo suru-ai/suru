@@ -136,6 +136,14 @@ impl SessionStore {
             .find(|record| &record.summary.session.workspace.id == id)
             .map(|record| record.summary.session.workspace.clone())
     }
+    /// Announces every change of what [`Self::listed_workspaces`] lists: an
+    /// entry made, presented anew, or dropped, its Icon or Description
+    /// changed, or a Session made or deleted, which moves where its
+    /// Workspace stands — so the listing a Server pushes moves with it.
+    pub(crate) fn registry_moves(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.state.lock().unwrap().registry_moves.subscribe()
+    }
+
     /// Every Workspace this server knows, as its Workspace Registry lists
     /// them (ADR 0051): first those the Sessions a listing holds work in —
     /// every top-level Session's that says, readable or not, as
@@ -238,6 +246,7 @@ impl SessionStore {
         provenance: WorkspaceProvenance,
     ) -> &'state mut StoredWorkspace {
         state.sightings.see(workspace_id);
+        let mut moved = !state.workspaces.contains_key(workspace_id);
         let stored = state
             .workspaces
             .entry(workspace_id.clone())
@@ -255,9 +264,16 @@ impl SessionStore {
                     presentation,
                     stored.provenance.clone(),
                 );
+                moved = true;
             }
         }
-        stored
+        if moved {
+            state.registry_moved();
+        }
+        state
+            .workspaces
+            .get_mut(workspace_id)
+            .expect("the entry was just made where it was not")
     }
 
     /// Drops every entry a resolution of `workspace` has superseded: one
@@ -300,6 +316,7 @@ impl SessionStore {
                 continue;
             };
             state.sightings.forget(&retired_id);
+            state.registry_moved();
             tracing::info!(
                 superseded = %retired_id.0,
                 workspace = %workspace.id.0,
@@ -414,6 +431,7 @@ impl SessionStore {
         }
         state.workspaces.remove(workspace_id);
         state.sightings.forget(workspace_id);
+        state.registry_moved();
         tracing::info!(
             workspace = %workspace_id.0,
             root,
@@ -461,6 +479,7 @@ impl SessionStore {
         }
         state.workspaces.remove(workspace_id);
         state.sightings.forget(workspace_id);
+        state.registry_moved();
         tracing::info!(
             workspace = %workspace_id.0,
             path = %path.display(),
@@ -522,6 +541,7 @@ impl SessionStore {
                 Rerooting::Unrooted => {
                     state.workspaces.remove(&workspace_id);
                     state.sightings.forget(&workspace_id);
+                    state.registry_moved();
                     tracing::info!(
                         workspace = %workspace_id.0,
                         root,

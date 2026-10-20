@@ -184,6 +184,9 @@ struct SessionStoreState {
     /// begun before one is never taken over it (see
     /// [`SessionStore::forget_gone`]).
     sightings: workspaces::Sightings,
+    /// Counts each change of what the Workspace listing reads of this
+    /// store (see [`SessionStore::registry_moves`]).
+    registry_moves: watch::Sender<u64>,
     /// Where the store says a Report is waiting for a Session, once
     /// Provider orchestration has asked to hear of it: the Session the Report
     /// is for, whose Agent the orchestrator then delivers it to (see
@@ -426,6 +429,7 @@ impl SessionStore {
             posture_generations: HashMap::new(),
             workspaces,
             sightings: Default::default(),
+            registry_moves: watch::channel(0).0,
             report_notices: None,
         };
         // A history still waiting in storage has nothing a save could be
@@ -870,7 +874,24 @@ impl SessionStore {
 
 impl SessionStoreState {
     fn publish_catalog_change(&mut self, change: SessionCatalogChange) {
+        // A Session made or deleted moves its Workspace among those the
+        // listing stands first, and a Workspace's Icon and Description ride
+        // the listing too.
+        if matches!(
+            change,
+            SessionCatalogChange::Created { .. }
+                | SessionCatalogChange::Deleted { .. }
+                | SessionCatalogChange::WorkspaceIconChanged { .. }
+                | SessionCatalogChange::WorkspaceDescriptionChanged { .. }
+        ) {
+            self.registry_moved();
+        }
         self.catalog.publish(change);
+    }
+
+    /// Announces that what the Workspace listing reads of this store moved.
+    fn registry_moved(&self) {
+        self.registry_moves.send_modify(|moves| *moves += 1);
     }
 
     fn next_timestamp(&mut self) -> SessionTimestamp {

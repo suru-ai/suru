@@ -14,11 +14,12 @@ use std::{
 
 use diesel::{Connection, RunQueryDsl, SqliteConnection, connection::SimpleConnection};
 use suru::{
-    managed_client::{ManagedClient, ManagedClientConfig},
+    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
         CreateSessionRequest, ExecutionDirectory, InitialPrompt, Outlook, PromptId,
-        ResolveWorkspaceRequest, SessionId, SessionListItem, Workspace, WorkspaceDescription,
-        WorkspaceId,
+        ResolveWorkspaceRequest, RuntimeDescriptor, SessionId, SessionListItem,
+        WORKSPACE_LISTING_EVENT, Workspace, WorkspaceDescription, WorkspaceId, WorkspaceListing,
+        WorkspaceUnavailability,
     },
     server::{self, RunningServer, ServerConfig, ServerTimings},
 };
@@ -863,4 +864,218 @@ async fn an_entry_whose_main_checkout_is_unknown_is_named_so_without_its_reposit
         drop(client);
         restarted.shutdown().await.expect("shut down server");
     }
+}
+
+/// The Workspace listings a Server pushes on a Session catalog stream
+/// opened now: the one its connect snapshot carries, then each it pushes
+/// as what it lists moves (ADR 0052).
+async fn pushed_listings(
+    descriptor: &RuntimeDescriptor,
+) -> impl futures_util::Stream<Item = WorkspaceListing> + Unpin + use<> {
+    use eventsource_stream::Eventsource;
+    use futures_util::StreamExt;
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/session-events", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("open the Session catalog stream")
+        .error_for_status()
+        .expect("the catalog stream authenticates");
+    Box::pin(
+        response
+            .bytes_stream()
+            .eventsource()
+            .filter_map(|event| async move {
+                let event = event.expect("the catalog stream stays readable");
+                (event.event == WORKSPACE_LISTING_EVENT).then(|| {
+                    serde_json::from_str::<WorkspaceListing>(&event.data)
+                        .expect("decode a pushed Workspace listing")
+                })
+            }),
+    )
+}
+
+/// The next Workspace listing `pushed` carries.
+async fn next_pushed(
+    pushed: &mut (impl futures_util::Stream<Item = WorkspaceListing> + Unpin),
+) -> WorkspaceListing {
+    use futures_util::StreamExt;
+
+    tokio::time::timeout(crate::server_support::PROGRESS_DEADLINE, pushed.next())
+        .await
+        .expect("a Workspace listing is pushed")
+        .expect("the catalog stream stays open")
+}
+
+/// The Session catalog stream carries the Server's Workspace listing as it
+/// connects, as a request for it answers, and then pushes it again as what
+/// it lists moves: a Workspace a Session made known, and a Description set.
+/// A move that leaves the listing as it was — another Session made in a
+/// Workspace already listed — pushes nothing.
+#[tokio::test]
+async fn the_catalog_stream_carries_the_listing_and_pushes_each_change_of_it_once() {
+    const CHANNEL: &str = "workspace-registry-pushed";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let notes = tempfile::tempdir().expect("create the notes Workspace");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), CHANNEL).expect("configure"),
+    )
+    .await
+    .expect("spawn server");
+    let client = connected_client(state_dir.path(), CHANNEL).await;
+    let mut pushed = pushed_listings(server.descriptor()).await;
+
+    assert_eq!(
+        next_pushed(&mut pushed).await,
+        client.list_workspaces().await.expect("list Workspaces"),
+        "the stream's snapshot carries the listing a request answers"
+    );
+
+    let workspace = client
+        .create_session(quiet_request(notes.path(), "Keep the notes"))
+        .await
+        .expect("create a Session in the notes Workspace")
+        .session
+        .workspace;
+    assert_eq!(
+        next_pushed(&mut pushed).await.workspaces,
+        std::slice::from_ref(&workspace),
+        "the Workspace a Session made known is pushed"
+    );
+
+    client
+        .create_session(quiet_request(notes.path(), "Keep more notes"))
+        .await
+        .expect("create another Session in the notes Workspace");
+    client
+        .set_workspace_description(
+            &workspace.id,
+            Some(&workspace.path),
+            "Where notes are kept.",
+        )
+        .await
+        .expect("describe the notes Workspace");
+    assert_eq!(
+        next_pushed(&mut pushed)
+            .await
+            .workspaces
+            .into_iter()
+            .map(|workspace| workspace.description)
+            .collect::<Vec<_>>(),
+        [set("Where notes are kept.")],
+        "the next push is the Description's, the Session made between them having left the \
+         listing as it was"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A listing answers with what was last found of each entry's directory,
+/// and has it read behind the answer: what the reading finds is pushed once
+/// it lands. Here the directory of a Workspace a Session belongs to is
+/// deleted, and the listing answers it available, not yet read since; the
+/// push says it is gone.
+#[tokio::test]
+async fn what_a_reading_behind_a_listing_finds_is_pushed_once_it_lands() {
+    const CHANNEL: &str = "workspace-registry-reading-pushed";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let notes = tempfile::tempdir().expect("create the notes Workspace");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), CHANNEL).expect("configure"),
+    )
+    .await
+    .expect("spawn server");
+    server.workspace_discovery_settled().await;
+    let client = connected_client(state_dir.path(), CHANNEL).await;
+    client
+        .create_session(quiet_request(notes.path(), "Keep the notes"))
+        .await
+        .expect("create a Session in the notes Workspace");
+    let mut pushed = pushed_listings(server.descriptor()).await;
+    next_pushed(&mut pushed).await;
+
+    notes
+        .close()
+        .expect("delete the notes Workspace's directory");
+    let answered = client.list_workspaces().await.expect("list Workspaces");
+
+    assert_eq!(
+        answered
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.unavailable)
+            .collect::<Vec<_>>(),
+        [None],
+        "the listing answers before the directory is read, as it was last found"
+    );
+    assert_eq!(
+        next_pushed(&mut pushed)
+            .await
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.unavailable)
+            .collect::<Vec<_>>(),
+        [Some(WorkspaceUnavailability::Gone)],
+        "what the reading behind it found is pushed once it lands"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A client keeping Workspace listings hears its Server's listing as the
+/// Server pushes it, and again as it moves; one that does not hears none
+/// of it, as every other test's client shows.
+#[tokio::test]
+async fn a_client_keeping_workspace_listings_hears_each_one_its_server_pushes() {
+    const CHANNEL: &str = "workspace-registry-client-keeps";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let notes = tempfile::tempdir().expect("create the notes Workspace");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), CHANNEL).expect("configure"),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), CHANNEL)
+            .expect("configure client")
+            .with_workspace_listings(),
+    )
+    .await
+    .expect("connect client");
+    let mut next_heard = async || {
+        tokio::time::timeout(crate::server_support::PROGRESS_DEADLINE, async {
+            loop {
+                match client.next().await.expect("the client stays connected") {
+                    ManagedEvent::WorkspaceListing(listing) => return listing.workspaces,
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("a Workspace listing is heard")
+    };
+
+    assert_eq!(next_heard().await, [], "the listing as the client connects");
+    let workspace = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), CHANNEL).expect("configure another client"),
+    )
+    .await
+    .expect("connect another client")
+    .create_session(quiet_request(notes.path(), "Keep the notes"))
+    .await
+    .expect("create a Session in the notes Workspace")
+    .session
+    .workspace;
+    assert_eq!(
+        next_heard().await,
+        [workspace],
+        "and the listing a Session moved"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
 }

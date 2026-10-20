@@ -50,6 +50,7 @@ use crate::protocol::{
     SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
     SkillCatalogRequest, SubagentTreeRevision, SubagentTreeUpdate, TurnId,
     UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
+    WORKSPACE_LISTING_EVENT, WorkspaceListing,
 };
 use crate::provider::{
     ContextBreakdownError, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate,
@@ -2703,6 +2704,7 @@ async fn session_catalog_events(
             .subscribe_catalog(state.workspace_paths.clone()),
         state.skill_catalog.subscribe(),
         state.model_catalog.clone(),
+        state.operations.clone(),
         shutdown,
         state.timings.sse_keepalive_interval,
     );
@@ -2724,12 +2726,30 @@ struct SessionCatalogEventStreamState {
     models: ModelCatalogService,
     model_changes: watch::Receiver<u64>,
     pushed_models: ModelCatalog,
+    workspaces: SessionOperations,
+    workspace_moves: operations::WorkspaceListingMoves,
+    /// The Workspace listing this stream last pushed, so a move that leaves
+    /// it as the client already has it is not pushed again.
+    pushed_workspaces: WorkspaceListing,
 }
 
+fn workspace_listing_event(listing: &WorkspaceListing) -> Event {
+    Event::default()
+        .event(WORKSPACE_LISTING_EVENT)
+        .json_data(listing)
+        .expect("Workspace listings always serialize")
+}
+
+/// The Session catalog as a client follows it: its snapshot, then each
+/// change; the Model Catalog and the Workspace listing as they stand, then
+/// each that moves them (ADR 0052); and each Skill Catalog discovered. A
+/// Peer follows it too, through the Pairing, so all of it reaches a
+/// Remote's Clients alike.
 fn session_catalog_event_stream(
     feed: SessionCatalogFeed,
     skills: broadcast::Receiver<SkillCatalog>,
     models: ModelCatalogService,
+    workspaces: SessionOperations,
     shutdown: watch::Receiver<Option<ServerShutdown>>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
@@ -2745,6 +2765,11 @@ fn session_catalog_event_stream(
     model_changes.mark_unchanged();
     let pushed_models = models.current();
     let model_snapshot = model_catalog_event(&pushed_models);
+    // The Workspace listing follows, its moves heard of from before it is
+    // read, so none landing meanwhile is lost.
+    let workspace_moves = workspaces.workspace_listing_moves();
+    let pushed_workspaces = workspaces.workspace_listing_now();
+    let workspace_snapshot = workspace_listing_event(&pushed_workspaces);
     let state = SessionCatalogEventStreamState {
         keepalive: tokio::time::interval_at(
             Instant::now() + keepalive_interval,
@@ -2757,6 +2782,9 @@ fn session_catalog_event_stream(
         models,
         model_changes,
         pushed_models,
+        workspaces,
+        workspace_moves,
+        pushed_workspaces,
     };
     let updates = stream::unfold(state, |mut state| async move {
         if state.shutdown.borrow().is_some() {
@@ -2809,6 +2837,21 @@ fn session_catalog_event_stream(
                     state.pushed_models = catalog;
                     event
                 }
+                moved = state.workspace_moves.changed() => {
+                    if moved.is_err() {
+                        return None;
+                    }
+                    // A move that leaves the listing as this client already
+                    // has it — a reading finding what the last one did, a
+                    // Description set as it stood — is not worth a push.
+                    let listing = state.workspaces.workspace_listing_now();
+                    if listing == state.pushed_workspaces {
+                        continue;
+                    }
+                    let event = workspace_listing_event(&listing);
+                    state.pushed_workspaces = listing;
+                    event
+                }
                 _ = state.keepalive.tick() => Event::default().comment("keep-alive"),
             };
             return Some((Ok::<_, std::convert::Infallible>(event), state));
@@ -2816,6 +2859,7 @@ fn session_catalog_event_stream(
     });
     stream::once(async move { Ok(snapshot) })
         .chain(stream::once(async move { Ok(model_snapshot) }))
+        .chain(stream::once(async move { Ok(workspace_snapshot) }))
         .chain(updates)
 }
 

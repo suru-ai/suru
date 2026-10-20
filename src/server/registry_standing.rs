@@ -131,6 +131,9 @@ struct Standing {
     /// one check to the next, so a listing answers from it at once (ADR
     /// 0052). An entry not yet read, or last found readable, is not here.
     remembered: Mutex<HashMap<WorkspaceId, WorkspaceUnavailability>>,
+    /// Counts each change of what is remembered, so whatever pushes the
+    /// listing hears of it.
+    moves: watch::Sender<u64>,
     /// What holds the Roots still (see [`RootsHeld`]).
     roots_changing: tokio::sync::Mutex<()>,
 }
@@ -162,6 +165,7 @@ impl RegistryStanding {
             wait,
             in_flight: Mutex::new(None),
             remembered: Mutex::default(),
+            moves: watch::channel(0).0,
             roots_changing: tokio::sync::Mutex::new(()),
         }))
     }
@@ -181,14 +185,22 @@ impl RegistryStanding {
         self.0.remembered.lock().unwrap().clone()
     }
 
+    /// Announces every change of what [`Self::remembered`] answers.
+    pub(crate) fn moves(&self) -> watch::Receiver<u64> {
+        self.0.moves.subscribe()
+    }
+
     /// Remembers why the entry `id` cannot be opened — or, given `None`,
-    /// that it can be.
+    /// that it can be — announcing the change where it is one.
     fn remember(&self, id: &WorkspaceId, why: Option<WorkspaceUnavailability>) {
         let mut remembered = self.0.remembered.lock().unwrap();
-        match why {
+        let before = match why {
             Some(why) => remembered.insert(id.clone(), why),
             None => remembered.remove(id),
         };
+        if before != why {
+            self.0.moves.send_modify(|moves| *moves += 1);
+        }
     }
 
     /// Drops what the disk no longer holds, as the module says, and answers
@@ -963,6 +975,58 @@ mod tests {
             [atlas],
             "and it is never dropped"
         );
+    }
+
+    /// What is remembered announces each change of it, so the listing a
+    /// Server pushes moves with it, and nothing where a reading finds what
+    /// was found before.
+    #[tokio::test]
+    async fn what_is_remembered_announces_each_change_of_it() {
+        let atlas = absolute(&["work", "atlas"]);
+        let registry = Registry::holding(&[&atlas]).await;
+        let readable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readings = Arc::new(AtomicUsize::new(0));
+        let standing = RegistryStanding::with_probe(
+            registry.sessions.clone(),
+            None,
+            None,
+            SURELY,
+            Arc::new({
+                let (readable, readings) = (readable.clone(), readings.clone());
+                move |_: &Path| {
+                    readings.fetch_add(1, Ordering::SeqCst);
+                    if readable.load(Ordering::SeqCst) {
+                        Reading::Readable
+                    } else {
+                        Reading::Unreadable(WorkspaceUnavailability::HolderUnreadable)
+                    }
+                }
+            }),
+        );
+        let mut moves = standing.moves();
+        let unreadable = [(
+            WorkspaceId::directory(&atlas),
+            WorkspaceUnavailability::HolderUnreadable,
+        )]
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        standing.check().await;
+        assert!(moves.has_changed().unwrap(), "finding it unreadable moves");
+        moves.mark_unchanged();
+        assert_eq!(standing.remembered(), unreadable);
+
+        standing.check().await;
+        assert_eq!(readings.load(Ordering::SeqCst), 2);
+        assert!(
+            !moves.has_changed().unwrap(),
+            "finding it as it was found before moves nothing"
+        );
+
+        readable.store(true, Ordering::SeqCst);
+        standing.check().await;
+        assert!(moves.has_changed().unwrap(), "finding it readable moves");
+        assert_eq!(standing.remembered(), HashMap::new());
     }
 
     /// Listings asking while a check reads join it rather than reading

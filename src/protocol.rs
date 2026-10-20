@@ -45,6 +45,11 @@ pub const ONBOARDED_EVENT: &str = "onboarded";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
 pub const SESSION_CATALOG_SNAPSHOT_EVENT: &str = "session_catalog_snapshot";
 pub const SESSION_CATALOG_UPDATED_EVENT: &str = "session_catalog_updated";
+/// The Server's Workspace listing, as its `GET /v1/workspaces` answers it:
+/// pushed on the Session catalog stream after the Model Catalog on every
+/// connect, and again whenever what it lists moves, so a Client holds each
+/// Server's listing before it asks for one (ADR 0052).
+pub const WORKSPACE_LISTING_EVENT: &str = "workspace_listing";
 pub const SESSION_SNAPSHOT_EVENT: &str = "session_snapshot";
 pub const SESSION_UPDATED_EVENT: &str = "session_updated";
 pub const SUBAGENT_TREE_SNAPSHOT_EVENT: &str = "subagent_tree_snapshot";
