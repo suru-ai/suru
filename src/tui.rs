@@ -28,6 +28,7 @@ mod notice;
 mod onboarding;
 mod questionnaire;
 mod relay_overlay;
+mod rename_dialog;
 mod render;
 mod selection;
 mod serve_overlay;

@@ -107,6 +107,22 @@ pub enum SemanticCommandId {
     /// [`Self::SessionIconChoose`] opens it over a Session: inert while
     /// `appearance.showIcons` is off.
     WorkspaceIconChoose,
+    /// Opens the rename dialog over a Session — the one its subject names, or
+    /// the open one where it names none. `/rename <title>` names the Title
+    /// itself, which is set at once where it can stand as written.
+    SessionRename,
+    RenameInsert,
+    RenameDeleteBackward,
+    /// Empties the rename dialog's field.
+    RenameClear,
+    /// Asks the Session's Origin for a Title proposal derived from its
+    /// Prompts so far, which replaces the field's text when it arrives.
+    RenameDerive,
+    /// Renames the Session to what the field holds.
+    RenameSave,
+    /// Stops a proposal still being derived, giving the field its text back,
+    /// or closes the dialog where none is.
+    RenameCancel,
     IconPickerLeft,
     IconPickerRight,
     IconPickerUp,
@@ -624,6 +640,13 @@ impl SemanticCommandId {
             Self::ContextClose => "context.close",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
+            Self::SessionRename => "session.rename",
+            Self::RenameInsert => "rename.insert",
+            Self::RenameDeleteBackward => "rename.delete-backward",
+            Self::RenameClear => "rename.clear",
+            Self::RenameDerive => "rename.derive",
+            Self::RenameSave => "rename.save",
+            Self::RenameCancel => "rename.cancel",
             Self::IconPickerLeft => "icon-picker.left",
             Self::IconPickerRight => "icon-picker.right",
             Self::IconPickerUp => "icon-picker.up",
@@ -1693,6 +1716,68 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         // Workspace Picker row's context menu rather than from a key or a
         // slash that would have no way to say which Workspace it meant.
         description: "Open the Icon Picker over a Workspace, while Icons are shown",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SessionRename,
+        title: "Rename Session",
+        reach: SemanticReach::Origin,
+        // A Sidebar row's context menu and a press on the header's Title name
+        // their Session; the slash names the open one.
+        description: "Rename a Session, by hand or from a derived proposal",
+        slash: Some(SlashCommand {
+            name: "rename",
+            aliases: &[],
+            takes_text: true,
+        }),
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::RenameInsert,
+        title: "Insert Title Text",
+        reach: SemanticReach::Client,
+        description: "Add typed or pasted text to the Title being written",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::RenameDeleteBackward,
+        title: "Delete Title Text",
+        reach: SemanticReach::Client,
+        description: "Take the last character back from the Title being written",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::RenameClear,
+        title: "Clear Title",
+        reach: SemanticReach::Client,
+        description: "Empty the Title being written",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::RenameDerive,
+        title: "Derive Title",
+        reach: SemanticReach::Origin,
+        description: "Propose a Title derived from the Session's Prompts so far",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::RenameSave,
+        title: "Save Title",
+        reach: SemanticReach::Origin,
+        description: "Rename the Session to the Title written",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::RenameCancel,
+        title: "Cancel Rename",
+        reach: SemanticReach::Client,
+        description: "Stop deriving a proposal, or close the rename dialog",
         slash: None,
         keybinding: None,
     },

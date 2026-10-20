@@ -602,6 +602,9 @@ struct TaskChannels {
     thumbnails: UnboundedSender<ApplicationEvent>,
     /// What each Session's Provider said fills its context.
     context_breakdowns: UnboundedSender<ApplicationEvent>,
+    /// What each Origin answered the rename dialog: whether it offers a
+    /// Title proposal, the proposal, and how a rename went.
+    renames: UnboundedSender<ApplicationEvent>,
     /// What the Client's own Server answered about its Relays, and how each
     /// login followed there ended.
     relays: UnboundedSender<ApplicationEvent>,
@@ -647,6 +650,10 @@ struct RunLoop {
     /// Which Client run this is, as it claims Notices of the Server: one for
     /// the whole run, so a claim asked again is known for the same one.
     notice_claimant: uuid::Uuid,
+    /// The Title proposal the rename dialog waits on, by the request it
+    /// answers, so stopping the wait abandons the request — and the Errand
+    /// behind it — rather than letting it run on unheard.
+    title_proposal: Option<(uuid::Uuid, tokio::task::JoinHandle<()>)>,
 }
 
 async fn run_loop(
@@ -669,6 +676,7 @@ async fn run_loop(
     let (attachments, mut attachment_rx) = tokio::sync::mpsc::unbounded_channel();
     let (thumbnails, mut thumbnail_rx) = tokio::sync::mpsc::unbounded_channel();
     let (context_breakdowns, mut context_breakdown_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (renames, mut rename_rx) = tokio::sync::mpsc::unbounded_channel();
     let (relays, mut relay_rx) = tokio::sync::mpsc::unbounded_channel();
     let (directories, mut directory_rx) = tokio::sync::mpsc::unbounded_channel();
     let (providers, mut provider_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -697,6 +705,7 @@ async fn run_loop(
             attachments,
             thumbnails,
             context_breakdowns,
+            renames,
             relays,
             directories,
             providers,
@@ -708,6 +717,7 @@ async fn run_loop(
         needs_redraw: true,
         relay_followers: HashMap::new(),
         notice_claimant: uuid::Uuid::new_v4(),
+        title_proposal: None,
     };
     let mut clipboard = clipboard_thread::ClipboardThread::new(native_clipboard);
     let mut delivery = ClipboardDelivery::default();
@@ -771,6 +781,7 @@ async fn run_loop(
             answer = attachment_rx.recv() => run.receive_attachment_answer(answer)?,
             thumbnail = thumbnail_rx.recv() => run.receive_thumbnail(thumbnail)?,
             breakdown = context_breakdown_rx.recv() => run.receive_context_breakdown(breakdown)?,
+            rename = rename_rx.recv() => run.receive_rename_answer(rename)?,
             relay = relay_rx.recv() => run.receive_relay_answer(relay)?,
             directory = directory_rx.recv() => run.receive_directory_listing(directory)?,
             recheck = provider_rx.recv() => run.receive_providers_recheck(recheck)?,
@@ -1000,6 +1011,24 @@ impl RunLoop {
         answer: Option<ApplicationEvent>,
     ) -> Result<ControlFlow<Exit>> {
         let answer = answer.ok_or_else(|| anyhow!("Context Breakdown task channel stopped"))?;
+        self.needs_redraw = true;
+        let transition = self.application.handle_event(answer)?;
+        Ok(self.dispatch_transition(transition))
+    }
+
+    fn receive_rename_answer(
+        &mut self,
+        answer: Option<ApplicationEvent>,
+    ) -> Result<ControlFlow<Exit>> {
+        let answer = answer.ok_or_else(|| anyhow!("rename task channel stopped"))?;
+        if let ApplicationEvent::TitleProposed { request, .. } = &answer
+            && self
+                .title_proposal
+                .as_ref()
+                .is_some_and(|(pending, _)| pending == request)
+        {
+            self.title_proposal = None;
+        }
         self.needs_redraw = true;
         let transition = self.application.handle_event(answer)?;
         Ok(self.dispatch_transition(transition))
@@ -1340,6 +1369,42 @@ impl RunLoop {
                     session,
                     SessionOperation::SetSessionIcon { session_id, icon },
                 );
+            }
+            ApplicationTransition::SetSessionTitle { session, title } => {
+                spawn_session_title_set(
+                    self.client.session_commands_for(session.origin.clone()),
+                    session,
+                    title,
+                    self.channels.renames.clone(),
+                );
+            }
+            ApplicationTransition::AskTitleProposalOffer { session, opening } => {
+                spawn_title_proposal_offer(
+                    self.client.session_commands_for(session.origin),
+                    session.session_id,
+                    opening,
+                    self.channels.renames.clone(),
+                );
+            }
+            ApplicationTransition::ProposeSessionTitle { session, request } => {
+                if let Some((_, previous)) = self.title_proposal.take() {
+                    previous.abort();
+                }
+                let task = spawn_title_proposal(
+                    self.client.session_commands_for(session.origin),
+                    session.session_id,
+                    request,
+                    self.channels.renames.clone(),
+                );
+                self.title_proposal = Some((request, task));
+            }
+            ApplicationTransition::AbandonTitleProposal { request } => {
+                if let Some((_, task)) = self
+                    .title_proposal
+                    .take_if(|(pending, _)| *pending == request)
+                {
+                    task.abort();
+                }
             }
             ApplicationTransition::SetWorkspaceIcon {
                 origin,
@@ -1816,6 +1881,10 @@ impl RunLoop {
             | ApplicationTransition::DeleteSession(_)
             | ApplicationTransition::SettleSession { .. }
             | ApplicationTransition::SetSessionIcon { .. }
+            | ApplicationTransition::SetSessionTitle { .. }
+            | ApplicationTransition::AskTitleProposalOffer { .. }
+            | ApplicationTransition::ProposeSessionTitle { .. }
+            | ApplicationTransition::AbandonTitleProposal { .. }
             | ApplicationTransition::SetWorkspaceIcon { .. }
             | ApplicationTransition::SetWorkspaceDescription { .. }
             | ApplicationTransition::AdmitPrompt { .. }
@@ -4111,6 +4180,69 @@ fn spawn_workspace_icon_set(
             });
         }
     });
+}
+
+/// Sends a Title the reader wrote to its Session's Origin, and reports how it
+/// went: the Title itself reaches every client through the catalog stream,
+/// while the rename dialog holds the reader's text until it hears whether it
+/// landed.
+fn spawn_session_title_set(
+    commands: SessionCommandClient,
+    session: crate::protocol::SessionReference,
+    title: String,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let answer = match commands.set_session_title(session.session_id, &title).await {
+            Ok(_) => ApplicationEvent::SessionTitleSaved { session },
+            Err(error) => ApplicationEvent::SessionTitleSetFailed {
+                session,
+                error: error.to_string(),
+            },
+        };
+        let _ = answers.send(answer);
+    });
+}
+
+/// Asks a Session's Origin whether it would derive a Title proposal for it.
+/// An Origin that cannot answer offers none: the dialog renames by hand all
+/// the same.
+fn spawn_title_proposal_offer(
+    commands: SessionCommandClient,
+    session_id: crate::protocol::SessionId,
+    opening: uuid::Uuid,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let offered = commands
+            .session_title_proposal_offered(session_id)
+            .await
+            .unwrap_or(false);
+        let _ = answers.send(ApplicationEvent::TitleProposalOffered { opening, offered });
+    });
+}
+
+/// Asks a Session's Origin for a Title proposal, answering with it or with
+/// the Origin's own words for why there is none. Aborting the task abandons
+/// the request.
+fn spawn_title_proposal(
+    commands: SessionCommandClient,
+    session_id: crate::protocol::SessionId,
+    request: uuid::Uuid,
+    answers: UnboundedSender<ApplicationEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = commands
+            .propose_session_title(session_id)
+            .await
+            .map_err(
+                |error| match error.downcast_ref::<crate::protocol::SessionError>() {
+                    Some(refusal) => refusal.message.clone(),
+                    None => format!("{error:#}"),
+                },
+            );
+        let _ = answers.send(ApplicationEvent::TitleProposed { request, result });
+    })
 }
 
 /// Sends a Description the reader saved to its Workspace's own Origin, as
@@ -6777,6 +6909,7 @@ mod ready_event_tests {
                 attachments: sender(),
                 thumbnails: sender(),
                 context_breakdowns: sender(),
+                renames: sender(),
                 relays: sender(),
                 directories: sender(),
                 providers: sender(),
@@ -6788,6 +6921,7 @@ mod ready_event_tests {
             needs_redraw: false,
             relay_followers: std::collections::HashMap::new(),
             notice_claimant: uuid::Uuid::new_v4(),
+            title_proposal: None,
         }
     }
 

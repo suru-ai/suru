@@ -240,7 +240,8 @@ fn pressing_the_header_icon_does_nothing_while_icons_are_hidden() {
         "nothing is drawn for the Icon while Icons are hidden"
     );
     // The press lands where the Title begins — the leading Icon column when
-    // Icons are shown — and reaches nothing: no Icon span was ever recorded.
+    // Icons are shown — and opens no picker: no Icon span was ever recorded,
+    // so it reaches the Title, which renames rather than choosing an Icon.
     let (column, row) = text_position(
         &rendered_application_buffer(&application, WIDE, TALL),
         "Alpha work",
@@ -255,7 +256,13 @@ fn pressing_the_header_icon_does_nothing_while_icons_are_hidden() {
         },
     )
     .expect("press near the Title");
-    assert_eq!(transition, ApplicationTransition::Continue);
+    assert!(
+        matches!(
+            transition,
+            ApplicationTransition::AskTitleProposalOffer { .. }
+        ),
+        "{transition:?}"
+    );
     assert!(!picker_is_drawn(&application));
 }
 

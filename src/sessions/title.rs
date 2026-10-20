@@ -61,6 +61,14 @@
 //! Session's Errand — one working in an existing Worktree, or in none — asks
 //! for no branch at all.
 //!
+//! Renaming a Session is the user's act rather than Suru's: a Title they
+//! write stands as written ([`SessionStore::set_title`]), and one they ask
+//! Suru to propose ([`Derivation::propose`]) is derived anew from the
+//! Session's Prompts so far, asks for the Title alone, and changes nothing
+//! until they keep it. A proposal is governed by the same Setting, and is
+//! never the second attempt the derivation below never makes of its own
+//! accord.
+//!
 //! Everything here is best-effort by construction. Derivation runs in the
 //! background alongside the real first Turn and never blocks or gates it; the
 //! Title is attempted once per Session and never again, so its branch is too;

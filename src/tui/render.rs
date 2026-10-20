@@ -16,9 +16,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     managed_client::SessionProjection,
     protocol::{
-        Author, CostTotal, LandingPage, ListenerState, MAX_WORKSPACE_DESCRIPTION_CHARS,
-        ModelAvailability, RelayState, ServerIdentity, SessionContentWidth, SessionSnapshot,
-        SessionStatus, SessionTimestamp, WatchSummary, Way,
+        Author, CostTotal, LandingPage, ListenerState, MAX_TITLE_CHARS,
+        MAX_WORKSPACE_DESCRIPTION_CHARS, ModelAvailability, RelayState, ServerIdentity,
+        SessionContentWidth, SessionSnapshot, SessionStatus, SessionTimestamp, WatchSummary, Way,
     },
     provider::built_in_providers,
     theme::Theme,
@@ -40,6 +40,7 @@ use super::{
     model_options::ModelOptionChoiceRow,
     onboarding::OwnServer,
     relay_overlay::serve_through_status,
+    rename_dialog::RenameGeometry,
     serve_overlay::{CandidateWay, LISTENER_FAILED, LISTENER_OFF, ServeWays},
     session_picker::SessionPickerRow,
     settings_panel::{
@@ -175,6 +176,10 @@ pub(super) fn render_with_slots(
     // both start over with the frame, so a stale record from a frame that
     // drew neither can never answer a press.
     state.icon_picker.forget_frame();
+    // The rename dialog's derive button is pointable on the same terms, as is
+    // the header Title that opens the dialog.
+    state.rename_dialog.forget_frame();
+    *state.header_title_area.borrow_mut() = None;
     // The Workspace Picker's own rows are pointable on the same terms, so its
     // record of where they were drawn starts over with the frame too.
     state.workspace_picker.forget_frame();
@@ -438,6 +443,11 @@ pub(super) fn render_with_slots(
     if state.icon_picker.is_open() && !state.reconnect_overlay_visible() {
         render_icon_picker(frame, state, main, theme);
     }
+    // The rename dialog stands over even the Icon Picker, as
+    // `top_selection_overlay` and `handle_click` answer for it first.
+    if state.rename_dialog.is_open() && !state.reconnect_overlay_visible() {
+        render_rename_dialog(frame, state, main, theme, truecolor);
+    }
     if state.reconnect_overlay_visible() {
         state.selection_frames.borrow_mut().clear();
         // The modal dims the whole frame, so it covers every strip.
@@ -459,6 +469,7 @@ pub(super) fn render_with_slots(
         && !state.sidebar.menu_is_open()
         && !state.subagent_picker.is_open()
         && !state.icon_picker.is_open()
+        && !state.rename_dialog.is_open()
         && state.composer_focused()
         && matches!(state.command_mode, CommandMode::Composer)
         // The frame may have drawn no composer at all — a Subagent's Session
@@ -2494,6 +2505,121 @@ fn render_workspace_description_editor(
         " Description ",
         theme,
     );
+}
+
+/// The rename dialog: the field, a line saying how it stands, and — where the
+/// Session's Origin offers one — the button asking for a derived proposal,
+/// above the keys.
+fn render_rename_dialog(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    main: Rect,
+    theme: &Theme,
+    truecolor: bool,
+) {
+    let Some(dialog) = state.rename_dialog.view() else {
+        return;
+    };
+    let width = main.width.saturating_sub(4).min(72);
+    let content_width = usize::from(width.saturating_sub(2));
+    let narrow = content_width < usize::from(NARROW_TERMINAL_WIDTH);
+    let prompt = "› ";
+    let text_width = content_width.saturating_sub(prompt.width());
+    let layout = TextLayout::new(dialog.text, u16::try_from(text_width).unwrap_or(u16::MAX));
+    let laid_out = layout.rows().collect::<Vec<_>>();
+    let derive_line = dialog.offered && !dialog.deriving;
+    // The status and the keys below, and the derive button where it stands,
+    // around as many lines as the text takes — or as the view has left,
+    // keeping its end in view.
+    let chrome = if derive_line { 5 } else { 4 };
+    let wanted = u16::try_from(laid_out.len().saturating_add(chrome)).unwrap_or(u16::MAX);
+    let area = centered_rect(main, width, wanted.min(main.height.saturating_sub(2)));
+    let text_rows = usize::from(area.height.saturating_sub(chrome as u16)).max(1);
+    let shown = laid_out.len().saturating_sub(text_rows);
+    let field_style = if dialog.deriving {
+        theme.text.subdued
+    } else {
+        theme.form_field.text
+    };
+    let mut lines = laid_out
+        .iter()
+        .skip(shown)
+        .enumerate()
+        .map(|(index, row)| {
+            let lead = if index == 0 { prompt } else { "  " };
+            Line::styled(format!("{lead}{}", row.text.trim_end()), field_style)
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(Line::styled(prompt, field_style));
+    }
+    // What the line under the field says, most pressing first: why the last
+    // save or proposal did not land, that a proposal or a save is on its way,
+    // or how long the Title is as it will be kept — in the error colour once
+    // that is past the limit.
+    let status = if let Some(error) = dialog.error {
+        Line::styled(
+            truncate_to_width(error, content_width),
+            theme.feedback.error,
+        )
+    } else if dialog.deriving {
+        let label = "Deriving a Title…";
+        state.session_animation_on_screen.set(true);
+        Line::from(shimmered_label_spans(
+            label,
+            state.shimmer_clock.frame(label, state.spinner_frame),
+            theme.text.primary,
+            theme.text.subdued,
+            truecolor,
+        ))
+    } else if dialog.saving {
+        Line::styled("Saving…", theme.text.subdued)
+    } else {
+        let style = if dialog.kept_chars > MAX_TITLE_CHARS {
+            theme.feedback.error
+        } else {
+            theme.text.subdued
+        };
+        Line::styled(format!("{}/{MAX_TITLE_CHARS}", dialog.kept_chars), style)
+    };
+    lines.push(status);
+    const DERIVE_BUTTON: &str = "[ Derive a Title ]";
+    if derive_line {
+        lines.push(Line::styled(DERIVE_BUTTON, theme.accent.primary));
+    }
+    lines.push(Line::styled(
+        if dialog.deriving {
+            "Esc stop deriving"
+        } else if narrow {
+            "Enter save · Esc cancel"
+        } else if dialog.offered {
+            "Enter save · Ctrl+G derive · Ctrl+U clear · Esc cancel"
+        } else {
+            "Enter save · Ctrl+U clear · Esc cancel"
+        },
+        theme.text.subdued,
+    ));
+    let derive_row = area.y + 1 + lines.len() as u16 - 2;
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::RenameDialog,
+        area,
+        lines,
+        " Rename ",
+        theme,
+    );
+    state.rename_dialog.record_geometry(RenameGeometry {
+        dialog: area,
+        derive: derive_line.then(|| {
+            Rect::new(
+                area.x + 1,
+                derive_row,
+                (DERIVE_BUTTON.width() as u16).min(area.width.saturating_sub(2)),
+                1,
+            )
+        }),
+    });
 }
 
 /// One Workspace Picker Workspace row after its `marker`: the name the
@@ -6389,6 +6515,12 @@ fn render_session_header(
             ));
             spans.push(Span::styled(icon_prefix, theme.text.primary));
         }
+        // The Title text is the way into renaming the open Session.
+        let title_x = title_area.x.saturating_add(icon_width as u16);
+        *state.header_title_area.borrow_mut() = Some(PointableSpan::new(
+            title_area.y,
+            title_x..title_x.saturating_add(title.width() as u16),
+        ));
         spans.push(Span::styled(title, theme.text.primary));
         frame.render_widget(Paragraph::new(Line::from(spans)), title_area);
     }

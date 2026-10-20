@@ -651,7 +651,7 @@ pub(super) enum SidebarActivation {
 }
 
 /// The items a Sidebar row's context menu offers. A recovering Remote offers
-/// only a retry; a Session offers its shelf action and deletion; a Workspace
+/// only a retry; a Session offers its shelf action, renaming, and deletion; a Workspace
 /// entry offers nothing but choosing its Icon, and only while there is one to
 /// choose.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -659,6 +659,9 @@ pub(super) enum SidebarMenuItem {
     TryAgain,
     Settle,
     Unsettle,
+    /// Opens the rename dialog over this row's Session. Offered on every
+    /// readable row; one the client could not read has no Title to rename.
+    Rename,
     /// Opens the Icon Picker over this row's Session. Offered only while
     /// `appearance.showIcons` is on and the row is readable — a Session
     /// deletion cannot pick from, and no glyph the Icon Picker offered would
@@ -716,6 +719,7 @@ impl SidebarMenuItem {
             Self::TryAgain => "Try again now",
             Self::Settle => "Settle",
             Self::Unsettle => "Unsettle",
+            Self::Rename => "Rename",
             Self::ChooseIcon | Self::ChooseWorkspaceIcon => "Choose icon",
             Self::Delete if confirming_delete => "Delete — confirm",
             Self::Delete => "Delete",
@@ -729,6 +733,7 @@ impl SidebarMenuItem {
             Self::TryAgain => SemanticCommandId::RemoteRetry,
             Self::Settle => SemanticCommandId::SessionSettle,
             Self::Unsettle => SemanticCommandId::SessionUnsettle,
+            Self::Rename => SemanticCommandId::SessionRename,
             Self::ChooseIcon => SemanticCommandId::SessionIconChoose,
             Self::ChooseWorkspaceIcon => SemanticCommandId::WorkspaceIconChoose,
             Self::Delete => SemanticCommandId::SessionDelete,
@@ -739,7 +744,7 @@ impl SidebarMenuItem {
 impl SidebarMenu {
     /// What the menu offers, top to bottom: what the row's shelf asks for —
     /// except on a row the client could not read, which no shelf operation can
-    /// act on — choosing an Icon while Icons are shown, and Delete, which
+    /// act on — renaming, choosing an Icon while Icons are shown, and Delete, which
     /// every row keeps. A Workspace entry offers only choosing its Icon, and
     /// nothing at all where `show_icons` is off — [`Self::open_menu_at`]
     /// never opens one there in the first place, but a Setting toggled while
@@ -751,11 +756,14 @@ impl SidebarMenu {
                 unreadable: true, ..
             } => vec![SidebarMenuItem::Delete],
             SidebarMenuSubject::Session { settled, .. } => {
-                let mut items = vec![if *settled {
-                    SidebarMenuItem::Unsettle
-                } else {
-                    SidebarMenuItem::Settle
-                }];
+                let mut items = vec![
+                    if *settled {
+                        SidebarMenuItem::Unsettle
+                    } else {
+                        SidebarMenuItem::Settle
+                    },
+                    SidebarMenuItem::Rename,
+                ];
                 if show_icons {
                     items.push(SidebarMenuItem::ChooseIcon);
                 }
@@ -1774,6 +1782,11 @@ impl Sidebar {
 
     pub(super) fn fail_listing(&mut self, request: &SessionListRequest, error: String) {
         self.listing.fail(request, error);
+    }
+
+    /// The Title the Sidebar lists a readable Session by.
+    pub(super) fn title_of(&self, session: &SessionReference) -> Option<&str> {
+        self.listing.title_of(session)
     }
 
     pub(super) fn retitle_origin(

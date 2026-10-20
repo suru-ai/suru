@@ -23,13 +23,13 @@ use crate::{
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AfterWorktreeCreation,
         AgentSelection, AgentSelectionOperationId, ApprovalId, AttachmentId, Author,
-        CreateSessionRequest, EffectiveSettings, InitialPrompt, ListenerState, MessageId,
-        ModelCatalog, Outlook, Prompt, PromptDelivery, PromptId, PromptStatus, PromptWithdrawal,
-        QuestionnaireId, RelayState, ResolveWorkspaceRequest, ServerIdentity, SessionChange,
-        SessionErrorCode, SessionId, SessionListItem, SessionReference, SessionSnapshot,
-        SettingMutation, SettingsSnapshot, ShutdownReason, SkillCatalog, SkillCatalogRequest,
-        TextSelectionCopy, TranscriptSettings, TurnId, TurnStatus, UnreachableReason,
-        UpdateAgentSelectionRequest, Workspace, WorkspaceId,
+        CreateSessionRequest, EffectiveSettings, InitialPrompt, ListenerState, MAX_TITLE_CHARS,
+        MessageId, ModelCatalog, Outlook, Prompt, PromptDelivery, PromptId, PromptStatus,
+        PromptWithdrawal, QuestionnaireId, RelayState, ResolveWorkspaceRequest, ServerIdentity,
+        SessionChange, SessionErrorCode, SessionId, SessionListItem, SessionReference,
+        SessionSnapshot, SettingMutation, SettingsSnapshot, ShutdownReason, SkillCatalog,
+        SkillCatalogRequest, TextSelectionCopy, TranscriptSettings, TurnId, TurnStatus,
+        UnreachableReason, UpdateAgentSelectionRequest, Workspace, WorkspaceId, one_line_title,
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
@@ -64,13 +64,14 @@ use super::{
         command_for_leader_event, command_for_list_editor_event, command_for_model_options_event,
         command_for_model_picker_event, command_for_monitoring_subagent_view_event,
         command_for_numeric_editor_event, command_for_queued_prompt_event,
-        command_for_relay_overlay_event, command_for_serve_overlay_event,
-        command_for_session_picker_event, command_for_settings_panel_event,
-        command_for_sidebar_event, command_for_sidebar_menu_event,
-        command_for_subagent_picker_event, command_for_subagent_view_event,
-        command_for_subagent_view_leader_event, command_for_terminal_event,
-        command_for_theme_picker_event, command_for_workspace_description_editor_event,
-        command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
+        command_for_relay_overlay_event, command_for_rename_dialog_event,
+        command_for_serve_overlay_event, command_for_session_picker_event,
+        command_for_settings_panel_event, command_for_sidebar_event,
+        command_for_sidebar_menu_event, command_for_subagent_picker_event,
+        command_for_subagent_view_event, command_for_subagent_view_leader_event,
+        command_for_terminal_event, command_for_theme_picker_event,
+        command_for_workspace_description_editor_event, command_for_workspace_picker_event,
+        command_for_workspace_picker_menu_event,
     },
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
@@ -80,6 +81,7 @@ use super::{
         ListingLanded, RedemptionLoginLead, RelayLoginAct, RelayLoginFollow, RelayLoginLead,
         RelayOverlay, RelayRequest,
     },
+    rename_dialog::{RenameCancel, RenameDialog, RenamePress},
     render::render_with_slots,
     selection::{
         SelectionCell, SelectionFrame, SelectionGranularity, SelectionSurface, TextSelection,
@@ -758,6 +760,10 @@ pub struct TuiState {
     pub(super) directory_browser: DirectoryBrowser,
     pub(super) subagent_picker: SubagentPicker,
     pub(super) icon_picker: IconPicker,
+    pub(super) rename_dialog: RenameDialog,
+    /// Where the last frame drew the Session header's Title text, so a press
+    /// there opens the rename dialog over the open Session.
+    pub(super) header_title_area: RefCell<Option<PointableSpan>>,
     /// Where the last frame drew the Session header's Icon span, so a press
     /// there can be resolved without the header re-deriving it: `None`
     /// whenever nothing was drawn there, including with Icons turned off, so
@@ -1086,6 +1092,8 @@ impl TuiState {
             directory_browser: DirectoryBrowser::default(),
             subagent_picker: SubagentPicker::default(),
             icon_picker: IconPicker::default(),
+            rename_dialog: RenameDialog::default(),
+            header_title_area: RefCell::new(None),
             header_icon_area: RefCell::new(None),
             unreachable_banner_area: RefCell::new(None),
             relay_notice_area: RefCell::new(None),
@@ -2591,15 +2599,26 @@ impl TuiState {
                 );
             }
             ManagedEvent::SessionDeleted(deleted) => {
+                if self.rename_dialog.session()
+                    == Some(&SessionReference::new(outlook.clone(), deleted.session_id))
+                {
+                    self.rename_dialog.close();
+                }
                 self.sidebar
                     .remove_origin(outlook.clone(), deleted.session_id);
             }
-            ManagedEvent::SessionTitleChanged(retitled) => self.sidebar.retitle_origin(
-                outlook.clone(),
-                retitled.session_id,
-                retitled.title.clone(),
-                retitled.icon.clone(),
-            ),
+            ManagedEvent::SessionTitleChanged(retitled) => {
+                self.rename_dialog.title_changed(
+                    &SessionReference::new(outlook.clone(), retitled.session_id),
+                    &retitled.title,
+                );
+                self.sidebar.retitle_origin(
+                    outlook.clone(),
+                    retitled.session_id,
+                    retitled.title.clone(),
+                    retitled.icon.clone(),
+                );
+            }
             ManagedEvent::SessionSettlementChanged(settled) => {
                 self.sidebar
                     .settle_origin(outlook.clone(), settled.session_id, settled.settled_at)
@@ -3954,9 +3973,22 @@ impl TuiState {
             && !self.directory_browser.opened_from_onboarding()
     }
 
+    /// The Title `session` goes by here: the open Session's own, or the one
+    /// the Sidebar lists it by.
+    pub(super) fn title_of(&self, session: &SessionReference) -> Option<String> {
+        if self.session_reference.as_ref() == Some(session)
+            && let Some(open) = &self.session
+        {
+            return Some(open.snapshot().title.clone());
+        }
+        self.sidebar.title_of(session).map(ToOwned::to_owned)
+    }
+
     /// The top painted overlay owns selection and pointer/key dispatch alike.
     fn top_selection_overlay(&self) -> Option<SelectionSurface> {
-        if self.icon_picker.is_open() {
+        if self.rename_dialog.is_open() {
+            Some(SelectionSurface::RenameDialog)
+        } else if self.icon_picker.is_open() {
             Some(SelectionSurface::Icons)
         } else if self.relay_overlay.is_open() {
             Some(SelectionSurface::Relay)
@@ -4028,7 +4060,8 @@ impl TuiState {
     /// opened over it, and the row it stands on goes on saying which row it
     /// acts upon.
     pub(super) fn overlay_owns_input(&self) -> bool {
-        self.icon_picker.is_open()
+        self.rename_dialog.is_open()
+            || self.icon_picker.is_open()
             || self.theme_picker.is_open()
             || self.model_picker.is_open()
             || self.connect_overlay.is_open()
@@ -5059,6 +5092,28 @@ pub enum ApplicationEvent {
     },
     SessionCreated(SessionSnapshot),
     SessionOperationFailed(String),
+    /// Whether a Session's Origin would derive a Title proposal for the
+    /// rename dialog opening named.
+    TitleProposalOffered {
+        opening: uuid::Uuid,
+        offered: bool,
+    },
+    /// The proposal a rename dialog asked for, or why there is none.
+    TitleProposed {
+        request: uuid::Uuid,
+        result: Result<String, String>,
+    },
+    /// A rename landed on the Session's Origin. The Title itself reaches every
+    /// client through the catalog stream; this says only that the dialog
+    /// waiting on it may close.
+    SessionTitleSaved {
+        session: SessionReference,
+    },
+    /// A rename was refused or could not be sent.
+    SessionTitleSetFailed {
+        session: SessionReference,
+        error: String,
+    },
     /// A Description the reader saved landed on its Workspace's Server. The
     /// Description itself reaches every client through the catalog stream;
     /// this says only that the draft held for it may go.
@@ -5488,6 +5543,28 @@ pub enum ApplicationTransition {
     SetSessionIcon {
         session: SessionReference,
         icon: String,
+    },
+    /// A Title the user wrote for a Session, routed to its Origin like every
+    /// other Session act.
+    SetSessionTitle {
+        session: SessionReference,
+        title: String,
+    },
+    /// Asks a Session's Origin whether it would derive a Title proposal for
+    /// it, on behalf of the rename dialog opening named.
+    AskTitleProposalOffer {
+        session: SessionReference,
+        opening: uuid::Uuid,
+    },
+    /// Asks a Session's Origin for a Title proposal derived from its Prompts
+    /// so far, answered under `request`.
+    ProposeSessionTitle {
+        session: SessionReference,
+        request: uuid::Uuid,
+    },
+    /// Stops waiting for the proposal `request` names, abandoning its Errand.
+    AbandonTitleProposal {
+        request: uuid::Uuid,
     },
     /// A user's own choice of a Workspace's Icon by Icon Catalog name, made
     /// through the Icon Picker. Routed to the Workspace's own Origin like
@@ -6310,6 +6387,30 @@ impl Application {
                 // offered again.
                 self.state.watch_stop = None;
                 self.state.submission_error = Some(error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::TitleProposalOffered { opening, offered } => {
+                self.state.rename_dialog.offer_answered(opening, offered);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::TitleProposed { request, result } => {
+                self.state.rename_dialog.proposal_answered(request, result);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::SessionTitleSaved { session } => {
+                self.state.rename_dialog.saved(&session);
+                Ok(ApplicationTransition::Continue)
+            }
+            // Said beside the text that did not land while the dialog stands
+            // to hold it, and beside the composer otherwise.
+            ApplicationEvent::SessionTitleSetFailed { session, error } => {
+                if !self
+                    .state
+                    .rename_dialog
+                    .save_failed(&session, error.clone())
+                {
+                    self.state.submission_error = Some(error);
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::WorkspaceDescriptionSaved {
@@ -7737,6 +7838,18 @@ impl Application {
     /// order they were drawn: the Sidebar owns the columns it drew, and a
     /// click it does not claim reaches the composer or Transcript beside it.
     fn handle_click(&mut self, position: Position) -> Result<ApplicationTransition> {
+        // The rename dialog stands over everything, the Icon Picker included,
+        // since it is opened over a Session the way the picker is and never
+        // from inside one. A press on its derive affordance asks for a
+        // proposal, the command its key invokes; one elsewhere inside it
+        // moves nothing, and one outside it never reaches here, since
+        // `PointerClick` already turned it into the Escape that closes it.
+        if self.state.rename_dialog.is_open() {
+            return match self.state.rename_dialog.press_at(position) {
+                RenamePress::Derive => self.invoke_semantic(SemanticCommandId::RenameDerive),
+                RenamePress::Inside | RenamePress::Outside => Ok(ApplicationTransition::Continue),
+            };
+        }
         // The Icon Picker stands over everything below while it is up, so it
         // answers first, ahead of even the Subagent Picker: a press on one of
         // its cells chooses the glyph it names — the same command Enter
@@ -7837,6 +7950,14 @@ impl Application {
             && let Some(session) = self.state.session_reference.clone()
         {
             return self.invoke_semantic(SemanticCommandId::SessionIconChoose.on_session(session));
+        }
+        // The Title beside it is the way into renaming the open Session.
+        let header_title = self.state.header_title_area.borrow().clone();
+        if let Some(title) = header_title
+            && title.contains(position)
+            && let Some(session) = self.state.session_reference.clone()
+        {
+            return self.invoke_semantic(SemanticCommandId::SessionRename.on_session(session));
         }
         // A reading beneath the Landing's composer is a way into the surface
         // that changes it, invoked as that surface's own command is.
@@ -8645,6 +8766,76 @@ impl Application {
             SemanticCommandId::WorkspacePickerMenuSelect => self.activate_workspace_picker_menu(),
             _ => Ok(ApplicationTransition::Continue),
         }
+    }
+
+    /// Renames `session`: to `written` at once where it can stand as written,
+    /// and otherwise by opening the dialog over it — holding `written` where
+    /// there is any, so a Title too long to keep is put right there rather
+    /// than lost.
+    fn rename(
+        &mut self,
+        session: SessionReference,
+        written: Option<String>,
+    ) -> ApplicationTransition {
+        let written = written.filter(|text| !one_line_title(text).is_empty());
+        if let Some(text) = &written {
+            let title = one_line_title(text);
+            if title.chars().count() <= MAX_TITLE_CHARS {
+                return ApplicationTransition::SetSessionTitle { session, title };
+            }
+        }
+        let title = self.state.title_of(&session).unwrap_or_default();
+        let opening = self
+            .state
+            .rename_dialog
+            .open(session.clone(), &title, written);
+        ApplicationTransition::AskTitleProposalOffer { session, opening }
+    }
+
+    /// Handles the rename dialog's own commands, routed here only while it
+    /// stands.
+    fn handle_rename_command(
+        &mut self,
+        command: SemanticCommandId,
+        subject: SemanticSubject,
+    ) -> ApplicationTransition {
+        let dialog = &mut self.state.rename_dialog;
+        if !dialog.is_open() {
+            return ApplicationTransition::Continue;
+        }
+        match command {
+            SemanticCommandId::RenameInsert => {
+                if let SemanticSubject::Text(text) = subject {
+                    dialog.insert(&text);
+                }
+            }
+            SemanticCommandId::RenameDeleteBackward => dialog.delete_backward(),
+            SemanticCommandId::RenameClear => dialog.clear(),
+            SemanticCommandId::RenameDerive => {
+                if let Some((session, request)) = dialog.derive() {
+                    return ApplicationTransition::ProposeSessionTitle { session, request };
+                }
+            }
+            SemanticCommandId::RenameSave => {
+                if let Some((session, title)) = dialog.save() {
+                    return ApplicationTransition::SetSessionTitle { session, title };
+                }
+            }
+            SemanticCommandId::RenameCancel => {
+                let abandoned = dialog.derivation();
+                return match dialog.cancel() {
+                    RenameCancel::StoppedDeriving(request) => {
+                        ApplicationTransition::AbandonTitleProposal { request }
+                    }
+                    RenameCancel::Closed => abandoned
+                        .map_or(ApplicationTransition::Continue, |request| {
+                            ApplicationTransition::AbandonTitleProposal { request }
+                        }),
+                };
+            }
+            _ => {}
+        }
+        ApplicationTransition::Continue
     }
 
     /// Handles the Description editor's own commands, routed here only while
@@ -11148,6 +11339,30 @@ impl Application {
                 }
                 Ok(ApplicationTransition::Continue)
             }
+            // The Session it names — a Sidebar row or the header's Title names
+            // one — or the open one, which is what the slash means. Text after
+            // `/rename` is the Title itself: set at once where it can stand as
+            // written, and otherwise opened in the dialog to be put right.
+            SemanticCommandId::SessionRename => {
+                self.state.command_mode = CommandMode::Composer;
+                let (named, written) = match invocation.subject {
+                    SemanticSubject::Session(session) => (Some(session), None),
+                    SemanticSubject::Text(text) => (self.session_reference(), Some(text)),
+                    _ => (self.session_reference(), None),
+                };
+                let Some(session) = named else {
+                    return Ok(ApplicationTransition::Continue);
+                };
+                Ok(self.rename(session, written))
+            }
+            command @ (SemanticCommandId::RenameInsert
+            | SemanticCommandId::RenameDeleteBackward
+            | SemanticCommandId::RenameClear
+            | SemanticCommandId::RenameDerive
+            | SemanticCommandId::RenameSave
+            | SemanticCommandId::RenameCancel) => {
+                Ok(self.handle_rename_command(command, invocation.subject))
+            }
             command @ (SemanticCommandId::IconPickerLeft
             | SemanticCommandId::IconPickerRight
             | SemanticCommandId::IconPickerUp
@@ -12164,6 +12379,7 @@ impl Application {
                 return command_for_approval_posture_picker_event(event);
             }
             Some(SurfaceAboveInterventions::Selection(surface)) => match surface {
+                SelectionSurface::RenameDialog => return command_for_rename_dialog_event(event),
                 SelectionSurface::Icons => return command_for_icon_picker_event(event),
                 SelectionSurface::Connect => {
                     return command_for_connect_overlay_event(
@@ -12426,6 +12642,12 @@ impl Application {
             // top-level Session — whose Marker spins and whose time rises.
             || self.state.aside.shows_live_work()
             || self.state.session_animation_on_screen.get()
+            // And a Title proposal being derived, said in the shimmer.
+            || self
+                .state
+                .rename_dialog
+                .view()
+                .is_some_and(|dialog| dialog.deriving)
             || self.transcript_drag_scroll().is_some()
     }
 

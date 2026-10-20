@@ -5207,7 +5207,7 @@ fn open_menu_on(application: &mut Application, title: &str) -> u16 {
 }
 
 /// The lines the menu's box takes: an item apiece, and its two borders.
-const MENU_LINES: u16 = 4;
+const MENU_LINES: u16 = 5;
 
 /// What the menu anchored at `anchor` says, item by item, read off the frame.
 fn menu_items(application: &Application, anchor: u16) -> Vec<String> {
@@ -5383,7 +5383,10 @@ fn a_right_press_on_an_active_row_offers_settle_and_delete() {
         items[0].contains("Settle") && !items[0].contains("Unsettle"),
         "an active row is offered the shelf: {items:?}"
     );
-    assert!(items[1].contains("Delete"), "and the way off it: {items:?}");
+    assert!(
+        items[1].contains("Rename") && items[2].contains("Delete"),
+        "and the ways to rename it and take it off: {items:?}"
+    );
 }
 
 #[test]
@@ -5410,7 +5413,10 @@ fn a_right_press_on_a_settled_row_offers_unsettle_and_delete() {
         items[0].contains("Unsettle"),
         "a row already on the shelf is offered the way back: {items:?}"
     );
-    assert!(items[1].contains("Delete"), "and the way off it: {items:?}");
+    assert!(
+        items[1].contains("Rename") && items[2].contains("Delete"),
+        "and the ways to rename it and take it off: {items:?}"
+    );
 }
 
 /// A row the client cannot read keeps its way off the list and loses the
@@ -5540,18 +5546,18 @@ fn the_menu_asks_again_before_it_deletes() {
     let anchor = open_menu_on(&mut application, "Wanted work");
 
     assert_eq!(
-        press_menu_item(&mut application, anchor, 1),
+        press_menu_item(&mut application, anchor, 2),
         ApplicationTransition::Continue,
         "the first press takes nothing away"
     );
     let items = menu_items(&application, anchor);
     assert!(
-        items[1].contains("confirm"),
+        items[2].contains("confirm"),
         "it asks the reader to say it again: {items:?}"
     );
 
     assert_eq!(
-        press_menu_item(&mut application, anchor, 1),
+        press_menu_item(&mut application, anchor, 2),
         ApplicationTransition::DeleteSession(suru::protocol::SessionReference::new(
             suru::protocol::Outlook::Local,
             wanted,
@@ -5593,6 +5599,7 @@ fn the_menu_answers_the_arrows_and_backs_out_on_esc() {
 
     let anchor = open_menu_on(&mut application, "Wanted work");
     press_sidebar_key(&mut application, KeyCode::Down);
+    press_sidebar_key(&mut application, KeyCode::Down);
 
     assert_eq!(
         press_sidebar_key(&mut application, KeyCode::Enter),
@@ -5601,7 +5608,7 @@ fn the_menu_answers_the_arrows_and_backs_out_on_esc() {
     );
     let items = menu_items(&application, anchor);
     assert!(
-        items[1].contains("confirm"),
+        items[2].contains("confirm"),
         "which is the item the arrows landed on: {items:?}"
     );
 
@@ -6706,12 +6713,12 @@ fn foreign_row_menu_actions_keep_the_rows_origin_and_delete_still_confirms() {
 
     let active_anchor = open_menu_on(&mut application, "Foreign active");
     assert_eq!(
-        press_menu_item(&mut application, active_anchor, 1),
+        press_menu_item(&mut application, active_anchor, 2),
         ApplicationTransition::Continue,
         "the first delete press only asks for confirmation"
     );
     assert_eq!(
-        press_menu_item(&mut application, active_anchor, 1),
+        press_menu_item(&mut application, active_anchor, 2),
         ApplicationTransition::DeleteSession(SessionReference::new(studio, active))
     );
 }

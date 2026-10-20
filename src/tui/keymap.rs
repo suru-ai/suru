@@ -626,6 +626,46 @@ pub(super) fn command_for_directory_browser_event(event: InputEvent) -> Option<C
     Some(CommandId::InvokeSemantic(semantic))
 }
 
+/// The rename dialog has the keys while it stands: what the reader types or
+/// pastes is the Title, Backspace takes a character back, Ctrl+U empties the
+/// field, Ctrl+G asks for a derived proposal, Enter saves, and Esc stops a
+/// proposal on its way or closes the dialog. A press on its derive button
+/// asks for a proposal; one outside its box is already an Escape by the time
+/// it gets here.
+pub(super) fn command_for_rename_dialog_event(event: InputEvent) -> Option<CommandId> {
+    let key = match event {
+        InputEvent::Key(key) => key,
+        InputEvent::Paste(text) => {
+            return Some(CommandId::InvokeSemanticText(
+                SemanticCommandId::RenameInsert,
+                text,
+            ));
+        }
+        event @ InputEvent::Mouse(_) => return command_for_terminal_event(event),
+        _ => return None,
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let semantic = match (key.code, key.modifiers) {
+        (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::RenameSave,
+        (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::RenameCancel,
+        (KeyCode::Backspace, KeyModifiers::NONE) => SemanticCommandId::RenameDeleteBackward,
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => SemanticCommandId::RenameClear,
+        (KeyCode::Char('g'), KeyModifiers::CONTROL) => SemanticCommandId::RenameDerive,
+        (KeyCode::Char(character), modifiers)
+            if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            return Some(CommandId::InvokeSemanticText(
+                SemanticCommandId::RenameInsert,
+                character.to_string(),
+            ));
+        }
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(semantic))
+}
+
 /// The Description editor has the keys while it stands over the Workspace
 /// Picker: what the reader types or pastes is the Description, Backspace
 /// takes a character back, Ctrl+U empties it, Enter saves it, and Esc closes

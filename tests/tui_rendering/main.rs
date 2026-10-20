@@ -36,6 +36,7 @@ mod reasoning_cycle;
 mod relay_login_needed;
 mod relay_pairing;
 mod relays;
+mod renames;
 mod serving;
 mod session_header;
 mod session_picker;

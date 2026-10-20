@@ -174,6 +174,7 @@ pub(super) enum SelectionSurface {
     Icons,
     WorkspacePickerMenu,
     WorkspaceDescriptionEditor,
+    RenameDialog,
 }
 
 /// A prose surface recorded by the draw, before selection highlighting.
