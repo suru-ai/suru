@@ -37,7 +37,10 @@ impl WorkspaceListings {
     /// Gives the Workspaces `read` lists, read now, as the listing: at the
     /// revision of the one given last where they list the same, and at the
     /// next otherwise. No two are read at once, so one read later is never
-    /// given at an earlier revision.
+    /// given at an earlier revision. `read` runs while this holds its own
+    /// lock, taking the Registry's and source control's in turn, so neither
+    /// of those may ever be held while this one is taken or what it gave
+    /// is borrowed.
     pub(crate) fn give(&self, read: impl FnOnce() -> Vec<Workspace>) -> WorkspaceListing {
         let mut given = None;
         self.0.send_if_modified(|listing| {

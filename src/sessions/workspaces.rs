@@ -108,10 +108,6 @@ impl SessionStoreState {
         );
     }
 
-    /// Drops the entry `workspace_id` from the Registry, and with it when it
-    /// was last seen and what was last found of its directory, so an entry
-    /// made there again starts afresh. Answers the entry dropped, where
-    /// there was one.
     /// The Workspaces the Sessions a listing holds work in — every
     /// top-level Session's that says, readable or not, as
     /// [`SessionStore::list`] lists them — most recently worked in first,
@@ -154,6 +150,10 @@ impl SessionStoreState {
             .collect()
     }
 
+    /// Drops the entry `workspace_id` from the Registry, and with it when it
+    /// was last seen and what was last found of its directory, so an entry
+    /// made there again starts afresh. Answers the entry dropped, where
+    /// there was one.
     fn drop_entry(&mut self, workspace_id: &WorkspaceId) -> Option<StoredWorkspace> {
         let dropped = self.workspaces.remove(workspace_id)?;
         self.sightings.forget(workspace_id);
