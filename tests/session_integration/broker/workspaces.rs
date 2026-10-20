@@ -279,8 +279,8 @@ async fn a_subagent_of_any_agent_brokered_or_native_reads_this_servers_workspace
 
 /// An Agent's `list_workspaces` lists each Repository discovered directly
 /// within a Workspace Root as any other row, before any Session has begun
-/// there — and one cloned by hand into a Root after the Server started at
-/// the very next call, without a restart.
+/// there — and one cloned by hand into a Root after the Server started once
+/// the Roots are discovered behind a call (ADR 0052), without a restart.
 #[tokio::test]
 async fn an_agent_lists_the_repositories_discovered_within_the_workspace_roots() {
     const CHANNEL: &str = "agent-discovered-workspace-listing";
@@ -328,6 +328,7 @@ async fn an_agent_lists_the_repositories_discovered_within_the_workspace_roots()
         })
     };
 
+    hosted.server.workspace_listing_caught_up().await;
     let rows = listed_workspaces(&mut agent).await;
     assert!(
         rows.contains(&discovered(&atlas)),
@@ -344,10 +345,12 @@ async fn an_agent_lists_the_repositories_discovered_within_the_workspace_roots()
             copy.to_str().expect("the fixture's path is UTF-8"),
         ],
     );
+    listed_workspaces(&mut agent).await;
+    hosted.server.workspace_listing_caught_up().await;
     let rows = listed_workspaces(&mut agent).await;
     assert!(
         rows.contains(&discovered(&atlas)) && rows.contains(&discovered(&copy)),
-        "the clone made by hand since is listed at the next call: {rows:?}"
+        "the clone made by hand since is listed once a call has it discovered: {rows:?}"
     );
 
     hosted.server.shutdown().await.expect("shut down server");
@@ -386,6 +389,7 @@ async fn a_row_says_why_its_workspace_cannot_be_opened_for_an_agent_as_for_a_sid
         .close()
         .expect("delete the notes Workspace's directory");
 
+    hosted.server.workspace_listing_caught_up().await;
     let rows = listed_workspaces(&mut agent).await;
     let mut unavailable = row(&notes_workspace, Value::Null, Value::Null);
     unavailable["unavailable"] = json!("its directory is gone");

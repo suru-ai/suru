@@ -43,17 +43,18 @@
 //! quiet holds up neither the others nor the Server. A directory whose read
 //! has not ended is passed over by every later scan until it does, so it
 //! holds one thread however often the Roots change, and a scan passing it
-//! over goes on to finish. Nothing that asks for a scan waits on it for
-//! longer than
-//! [`super::ServerTimings::root_discovery_wait`], answering from the
-//! Registry as it stands, and a slow scan shows in what is listed later.
-//! Every Root is scanned afresh at start and whenever the Roots change,
-//! superseding a scan of it still running, whose findings are then entered
-//! nowhere. Whenever Workspaces are listed, each Root's scan still running
-//! is joined, one that finished no longer ago than
+//! over goes on to finish. Every Root is scanned afresh at start, whenever
+//! the Roots change, and once a Clone has landed, superseding a scan of it
+//! still running, whose findings are then entered nowhere; each of those
+//! waits on its scans no longer than
+//! [`super::ServerTimings::root_discovery_wait`], and a slow scan shows in
+//! what is listed later. Whenever Workspaces are listed, each Root's scan
+//! still running is joined, one that finished no longer ago than
 //! [`super::ServerTimings::root_discovery_memo`] is reused, and the rest
 //! are scanned again, so a Root that stalls keeps the others discovering
-//! on their own.
+//! on their own — and the listing waits on none of them (ADR 0052),
+//! answering from the Registry as it stands: what they find is listed
+//! after.
 
 use std::{
     collections::HashMap,
@@ -279,32 +280,30 @@ impl RootDiscovery {
 
     /// Discovers the Workspaces within the Roots, as a listing does: for
     /// each Root named now, joins its scan still running, reuses one that
-    /// finished within the memo, and otherwise begins one — then waits for
-    /// them, though never past the bound on waiting.
-    pub(crate) async fn discover(&self) {
-        let ticket = {
-            let mut state = self.0.state.lock().unwrap();
-            let roots = self.follow(&mut state);
-            let followed = Arc::<[String]>::from(roots.as_slice());
-            let now = self.0.clock.now();
-            let mut awaited = Vec::new();
-            for root in roots {
-                let scans = state.roots.entry(root.clone()).or_insert_with(Scans::new);
-                if scans.running {
-                    awaited.push(scans.awaited());
-                    continue;
-                }
-                if scans
-                    .finished_at
-                    .is_some_and(|at| now.saturating_sub(at) < self.0.memo)
-                {
-                    continue;
-                }
-                awaited.push(self.begin(&mut state, root, &followed));
+    /// finished within the memo, and otherwise begins one. Answers the scans
+    /// to wait on, which a listing never does (ADR 0052): what they find
+    /// shows in what is listed after.
+    pub(crate) fn discover(&self) -> Ticket {
+        let mut state = self.0.state.lock().unwrap();
+        let roots = self.follow(&mut state);
+        let followed = Arc::<[String]>::from(roots.as_slice());
+        let now = self.0.clock.now();
+        let mut awaited = Vec::new();
+        for root in roots {
+            let scans = state.roots.entry(root.clone()).or_insert_with(Scans::new);
+            if scans.running {
+                awaited.push(scans.awaited());
+                continue;
             }
-            Ticket(awaited)
-        };
-        self.settled(ticket).await;
+            if scans
+                .finished_at
+                .is_some_and(|at| now.saturating_sub(at) < self.0.memo)
+            {
+                continue;
+            }
+            awaited.push(self.begin(&mut state, root, &followed));
+        }
+        Ticket(awaited)
     }
 
     /// Begins discovering every Root afresh, whatever was found before and
@@ -820,11 +819,19 @@ mod tests {
             std::iter::from_fn(|| self.begun.try_recv().ok().map(|(root, _)| root)).collect()
         }
 
-        /// A listing's discovery on a task of its own.
+        /// A listing's discovery on a task of its own, waiting for the
+        /// scans it joined or began.
         fn list(&self) -> tokio::task::JoinHandle<()> {
             let discovery = self.discovery.clone();
-            tokio::spawn(async move { discovery.discover().await })
+            tokio::spawn(async move { discovered(&discovery).await })
         }
+    }
+
+    /// Discovers as a listing does, then waits for the scans it joined or
+    /// began, though never past the bound on waiting.
+    async fn discovered(discovery: &RootDiscovery) {
+        let ticket = discovery.discover();
+        discovery.settled(ticket).await;
     }
 
     fn scripted(roots: &[&str], memo: Duration, wait: Duration) -> Scripted {
@@ -897,7 +904,7 @@ mod tests {
         );
 
         scripted.advance(memo - Duration::from_millis(1));
-        tokio::time::timeout(SURELY, scripted.discovery.discover())
+        tokio::time::timeout(SURELY, discovered(&scripted.discovery))
             .await
             .expect("a listing within the memo answers at once");
         assert_eq!(
@@ -920,7 +927,7 @@ mod tests {
     #[tokio::test]
     async fn a_listing_waits_for_a_scan_no_longer_than_its_bound() {
         let mut scripted = scripted(&["~/projects"], Duration::ZERO, Duration::from_millis(20));
-        tokio::time::timeout(SURELY, scripted.discovery.discover())
+        tokio::time::timeout(SURELY, discovered(&scripted.discovery))
             .await
             .expect("a listing answers once its bound runs out, the scan still running");
         assert_eq!(scripted.next_begun().await, "~/projects");
@@ -1032,7 +1039,7 @@ mod tests {
             memo,
             Duration::from_millis(20),
         );
-        tokio::time::timeout(SURELY, scripted.discovery.discover())
+        tokio::time::timeout(SURELY, discovered(&scripted.discovery))
             .await
             .expect("a listing answers within its bound");
         let mut begun = vec![scripted.next_begun().await, scripted.next_begun().await];
@@ -1047,7 +1054,7 @@ mod tests {
         assert_eq!(entered, ["~/projects"]);
 
         scripted.advance(memo);
-        tokio::time::timeout(SURELY, scripted.discovery.discover())
+        tokio::time::timeout(SURELY, discovered(&scripted.discovery))
             .await
             .expect("a listing answers within its bound");
         assert_eq!(
@@ -1114,7 +1121,7 @@ mod tests {
             .await
             .expect("the listing waits on no Root taken away")
             .expect("the listing runs to its end");
-        tokio::time::timeout(SURELY, scripted.discovery.discover())
+        tokio::time::timeout(SURELY, discovered(&scripted.discovery))
             .await
             .expect("a later listing reuses the scan of the Roots in force");
         assert_eq!(

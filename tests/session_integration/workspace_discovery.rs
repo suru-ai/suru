@@ -5,13 +5,16 @@
 //! that is presented. Plain directories, hidden ones, anything deeper, the
 //! Sidekick Workspace, the Root itself and any Root within it are left
 //! alone, and so is everything within Suru's own data directory named as a
-//! Root. Discovery runs at start, when the Roots change, and whenever
-//! Workspaces are listed, reusing a scan only as old as the Server's memo
-//! allows, which these Servers shorten to nothing or lengthen past any test.
+//! Root. Discovery runs at start, when the Roots change, and behind every
+//! listing of Workspaces (ADR 0052), reusing a scan only as old as the
+//! Server's memo allows, which these Servers shorten to nothing or lengthen
+//! past any test.
 //!
 //! Each test drives the Server as a Client does, with real Git Repositories
 //! in a temporary Root, and asserts on what the Client's Workspace listing
-//! answers, or on what the Registry left on disk.
+//! answers — once the Server has caught up with what it discovers behind a
+//! listing, where that is what is asked — or on what the Registry left on
+//! disk.
 
 use std::{
     path::{Path, PathBuf},
@@ -44,7 +47,7 @@ use crate::{
     support::{hosted_model, hosted_selection},
     workspace_registry::{
         BY_SESSION, canonical, connected_client, entries_on_disk, landing_workspace, listed,
-        quiet_request, repository, set,
+        listed_caught_up, quiet_request, repository, set,
     },
     workspace_standing::delete_once_settled,
 };
@@ -345,9 +348,10 @@ async fn a_root_that_cannot_be_read_is_skipped_and_never_made() {
 }
 
 /// A Repository cloned by hand into a Root while the Server runs is listed
-/// the next time Workspaces are listed, without a restart.
+/// once Workspaces have been listed and the Roots discovered behind that
+/// listing, without a restart.
 #[tokio::test]
-async fn a_repository_cloned_by_hand_after_start_is_listed_at_the_next_listing() {
+async fn a_repository_cloned_by_hand_after_start_is_listed_once_a_listing_discovers_it() {
     const CHANNEL: &str = "workspace-discovery-cloned-by-hand";
     let home = tempfile::tempdir().expect("create a home");
     let home = canonical(home.path());
@@ -373,7 +377,7 @@ async fn a_repository_cloned_by_hand_after_start_is_listed_at_the_next_listing()
     );
 
     assert_eq!(
-        listed(&client)
+        listed_caught_up(&server, &client)
             .await
             .iter()
             .map(located)
@@ -531,7 +535,7 @@ async fn a_root_within_another_root_is_a_root_and_never_a_workspace() {
         server_with_roots(&home, CHANNEL, &[spelled(&projects)], Duration::ZERO).await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
     let located_sorted = async || {
-        let mut located = listed(&client)
+        let mut located = listed_caught_up(&server, &client)
             .await
             .iter()
             .map(located)
@@ -612,7 +616,7 @@ async fn a_root_named_within_a_root_since_respelled_is_never_a_workspace() {
     let client = connected_client(&home.join("state"), CHANNEL).await;
     let atlas_id = repository_id(&atlas.join(".git"));
     assert_eq!(
-        listed(&client)
+        listed_caught_up(&server, &client)
             .await
             .iter()
             .map(located)
@@ -632,7 +636,7 @@ async fn a_root_named_within_a_root_since_respelled_is_never_a_workspace() {
         .await
         .expect("name the Repository within the Root a Root of its own");
     assert_eq!(
-        listed(&client).await,
+        listed_caught_up(&server, &client).await,
         [],
         "a Root within the Root respelled is no Workspace"
     );
@@ -1165,6 +1169,89 @@ async fn a_root_whose_reading_stalls_holds_back_no_change_of_the_roots_and_no_li
     );
 
     drop(stall);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A listing says what the Registry knows now and waits on no discovery
+/// (ADR 0052), however long the Server would wait on one: here discovery at
+/// start stalls on the only Root, and a listing answers at once with the
+/// Workspace a Session made known, joining the scan rather than beginning
+/// another. What the scan finds once it answers is listed after.
+#[tokio::test]
+async fn a_listing_answers_at_once_while_discovery_stalls() {
+    const CHANNEL: &str = "workspace-discovery-no-wait";
+    let home = tempfile::tempdir().expect("create a home");
+    let home = canonical(home.path());
+    let stalled = home.join("stalled");
+    let atlas = stalled.join("atlas");
+    repository(&atlas);
+    let notes = home.join("notes");
+    std::fs::create_dir(&notes).expect("create the notes directory");
+    name_roots(&home.join("config"), &[spelled(&stalled)]);
+    let gate = Arc::new(Gate::default());
+    let stall = OpensOnDrop(gate.clone());
+    let stalled_readings = Arc::new(AtomicUsize::new(0));
+    let server = server::spawn_with_source_control(
+        ServerConfig::new(home.join("state"), CHANNEL)
+            .expect("configure")
+            .with_config_dir(home.join("config")),
+        vec![Arc::new(FailingProviderRuntime)],
+        ServerTimings::default()
+            .with_checkout_observation_interval(Duration::from_secs(60 * 60))
+            .with_root_discovery_memo(Duration::ZERO)
+            .with_root_discovery_wait(AS_LONG_AS_IT_TAKES),
+        Arc::new(StallsWithin {
+            git: GitSourceControl::new("git"),
+            stalled: stalled.clone(),
+            gate,
+            stalled_readings: stalled_readings.clone(),
+        }),
+    )
+    .await
+    .expect("spawn server");
+    let client = connected_client(&home.join("state"), CHANNEL).await;
+    let noted = client
+        .create_session(quiet_request(&notes, "Keep the notes"))
+        .await
+        .expect("begin a Session in the notes directory")
+        .session
+        .workspace;
+    timeout(PROGRESS_DEADLINE, async {
+        while stalled_readings.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("discovery at start reads within the stalled Root");
+
+    let listing = timeout(PROGRESS_DEADLINE, listed(&client))
+        .await
+        .expect("a listing answers while discovery stalls");
+    assert_eq!(
+        listing.iter().map(located).collect::<Vec<_>>(),
+        [located(&noted)],
+        "the listing answers with what the Registry holds now"
+    );
+
+    drop(stall);
+    timeout(PROGRESS_DEADLINE, async {
+        while !listed(&client)
+            .await
+            .iter()
+            .any(|workspace| workspace.path == atlas)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("what the scan finds once it answers is listed after");
+    assert_eq!(
+        stalled_readings.load(Ordering::SeqCst),
+        1,
+        "the listings joined the scan at start rather than reading again"
+    );
+
     drop(client);
     server.shutdown().await.expect("shut down server");
 }

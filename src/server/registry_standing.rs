@@ -1,8 +1,8 @@
 //! Keeping the Workspace Registry in step with the disk and the Workspace
 //! Roots (ADR 0051). An entry stands while its directory can be read or a
-//! Session belongs to it. Whenever Workspaces are listed, and once at start
-//! once the Roots are discovered, the directory every entry is presented at
-//! is read afresh, whatever way the entry came to be known:
+//! Session belongs to it. Behind every listing of Workspaces, and once at
+//! start once the Roots are discovered, the directory every entry is
+//! presented at is read afresh, whatever way the entry came to be known:
 //!
 //! - one that can be read is listed as it is;
 //! - one gone while the directory holding it can be read is dropped, its Icon
@@ -44,13 +44,16 @@
 //! [`super::reads_apart`]), so one on a mount gone quiet holds up neither
 //! the rest nor the Server, and what each reading finds is taken as it
 //! answers. One check reads at a time, on a task of its own, and every
-//! listing asking meanwhile joins it rather than reading again; none waits
-//! on it longer than [`super::ServerTimings::root_discovery_wait`] from
-//! when it asked, and the check itself gives up on its readings once that
-//! long has passed since it began. An entry whose reading has not answered
-//! by then — or whose reading begun earlier is still outstanding — is
-//! listed as unavailable and never dropped; one entered since the check
-//! began is no part of it, and is listed as it is.
+//! listing asking meanwhile joins it rather than reading again. No listing
+//! waits on it (ADR 0052): what each reading found is remembered from one
+//! check to the next, and a listing says of each entry what was found of it
+//! last, so one not yet read is listed as available. The start waits on its
+//! check no longer than [`super::ServerTimings::root_discovery_wait`], and
+//! the check itself gives up on its readings once that long has passed
+//! since it began. An entry whose reading has not answered by then — or
+//! whose reading begun earlier is still outstanding — is remembered as
+//! unavailable and never dropped; one entered since the check began is no
+//! part of it, and is listed as it was last found.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -123,6 +126,11 @@ struct Standing {
     /// How far the check begun last has come, which every listing asking
     /// while it reads joins.
     in_flight: Mutex<Option<watch::Receiver<Progress>>>,
+    /// Why each entry cannot be opened, as the reading of it that answered
+    /// last found — or that it did not answer within the bound — kept from
+    /// one check to the next, so a listing answers from it at once (ADR
+    /// 0052). An entry not yet read, or last found readable, is not here.
+    remembered: Mutex<HashMap<WorkspaceId, WorkspaceUnavailability>>,
     /// What holds the Roots still (see [`RootsHeld`]).
     roots_changing: tokio::sync::Mutex<()>,
 }
@@ -153,15 +161,42 @@ impl RegistryStanding {
             resolutions: ReadsApart::new("suru-workspace-root-resolution", RESOLUTIONS_AT_ONCE),
             wait,
             in_flight: Mutex::new(None),
+            remembered: Mutex::default(),
             roots_changing: tokio::sync::Mutex::new(()),
         }))
+    }
+
+    /// Has every entry's directory read afresh, joining the check still
+    /// reading where one is, and waits on none of it: what each reading
+    /// finds is remembered as it answers (see [`Self::remembered`]).
+    pub(crate) fn begin(&self) {
+        drop(self.join_or_begin());
+    }
+
+    /// Why each entry left that cannot be opened now cannot be, by its
+    /// identity, as the readings that answered last found: what a listing
+    /// says of each, without waiting on a reading. An entry not yet read is
+    /// not here, so it is listed as available.
+    pub(crate) fn remembered(&self) -> HashMap<WorkspaceId, WorkspaceUnavailability> {
+        self.0.remembered.lock().unwrap().clone()
+    }
+
+    /// Remembers why the entry `id` cannot be opened — or, given `None`,
+    /// that it can be.
+    fn remember(&self, id: &WorkspaceId, why: Option<WorkspaceUnavailability>) {
+        let mut remembered = self.0.remembered.lock().unwrap();
+        match why {
+            Some(why) => remembered.insert(id.clone(), why),
+            None => remembered.remove(id),
+        };
     }
 
     /// Drops what the disk no longer holds, as the module says, and answers
     /// why each entry left that cannot be opened now cannot be, by its
     /// identity: as the check still reading finds, or one begun now, once
     /// it has read every entry or the bound on waiting has passed since
-    /// this asked, whichever is sooner.
+    /// this asked, whichever is sooner. Only the start waits so; a listing
+    /// begins a check (see [`Self::begin`]) and says what is remembered.
     pub(crate) async fn check(&self) -> HashMap<WorkspaceId, WorkspaceUnavailability> {
         let deadline = tokio::time::Instant::now() + self.0.wait;
         let mut progress = self.join_or_begin();
@@ -184,6 +219,14 @@ impl RegistryStanding {
             return progress.clone();
         }
         let (since, entries) = self.0.sessions.presented_entries();
+        // What is remembered of an entry the Registry no longer holds is
+        // let go, a listing having nothing of it to say.
+        let held = entries.iter().map(|(id, _)| id).collect::<HashSet<_>>();
+        self.0
+            .remembered
+            .lock()
+            .unwrap()
+            .retain(|id, _| held.contains(id));
         let (sender, progress) = watch::channel(Progress {
             unread: entries.iter().map(|(id, _)| id.clone()).collect(),
             ..Progress::default()
@@ -222,6 +265,7 @@ impl RegistryStanding {
         .for_each(|(directory, read)| {
             for id in &presented[&directory] {
                 let why = self.standing(id, &directory, since, &read);
+                self.remember(id, why);
                 progress.send_modify(|progress| {
                     progress.unread.remove(id);
                     if let Some(why) = why {
@@ -236,6 +280,9 @@ impl RegistryStanding {
         }
         progress.send_modify(|progress| {
             let unread = std::mem::take(&mut progress.unread);
+            for id in &unread {
+                self.remember(id, Some(WorkspaceUnavailability::Unanswered));
+            }
             progress.unavailable.extend(
                 unread
                     .into_iter()
@@ -462,7 +509,7 @@ fn rerooting(
     respelled.or((!may_hold).then_some(Rerooting::Unrooted))
 }
 
-/// How far one check has come, as every listing joining it reads it.
+/// How far one check has come, as whatever waits on it reads it.
 #[derive(Default)]
 struct Progress {
     /// The entries it reads whose reading has not yet been taken.
@@ -759,6 +806,162 @@ mod tests {
             listed(&registry.sessions),
             Vec::<PathBuf>::new(),
             "a reading begun after it was last seen drops it"
+        );
+    }
+
+    /// What `standing` remembers once it remembers `expected`, waited on
+    /// until it does or a test would wait no longer.
+    async fn remembered_as(
+        standing: &RegistryStanding,
+        expected: &HashMap<WorkspaceId, WorkspaceUnavailability>,
+    ) -> HashMap<WorkspaceId, WorkspaceUnavailability> {
+        let _ = tokio::time::timeout(SURELY, async {
+            while standing.remembered() != *expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        standing.remembered()
+    }
+
+    /// An entry not yet read is remembered as nothing, so it is listed as
+    /// available, and so it stays while its first reading is outstanding.
+    #[tokio::test]
+    async fn an_entry_not_yet_read_is_remembered_as_nothing() {
+        let atlas = absolute(&["work", "atlas"]);
+        let registry = Registry::holding(&[&atlas]).await;
+        let gate = Arc::new(Gate::default());
+        let _held = OpensOnDrop(gate.clone());
+        let readings = Arc::new(AtomicUsize::new(0));
+        let standing = RegistryStanding::with_probe(
+            registry.sessions.clone(),
+            None,
+            None,
+            SURELY,
+            Arc::new({
+                let (gate, readings) = (gate.clone(), readings.clone());
+                move |_: &Path| {
+                    readings.fetch_add(1, Ordering::SeqCst);
+                    gate.wait();
+                    Reading::Gone
+                }
+            }),
+        );
+
+        assert_eq!(standing.remembered(), HashMap::new(), "before any reading");
+        standing.begin();
+        tokio::time::timeout(SURELY, async {
+            while readings.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the directory is read");
+        assert_eq!(
+            standing.remembered(),
+            HashMap::new(),
+            "while its first reading is outstanding"
+        );
+    }
+
+    /// Beginning a check waits on none of its readings, and what each
+    /// finds is remembered as it answers, until a later reading answers
+    /// otherwise; a reading begun meanwhile leaves it as it was until then.
+    #[tokio::test]
+    async fn what_a_reading_finds_is_remembered_until_a_later_one_answers() {
+        let atlas = absolute(&["work", "atlas"]);
+        let registry = Registry::holding(&[&atlas]).await;
+        let gate = Arc::new(Gate::default());
+        let held = OpensOnDrop(gate.clone());
+        let readable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readings = Arc::new(AtomicUsize::new(0));
+        let standing = RegistryStanding::with_probe(
+            registry.sessions.clone(),
+            None,
+            None,
+            SURELY,
+            Arc::new({
+                let (gate, readable, readings) = (gate.clone(), readable.clone(), readings.clone());
+                move |_: &Path| {
+                    if readings.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Reading::Unreadable(WorkspaceUnavailability::Unreadable);
+                    }
+                    gate.wait();
+                    if readable.load(Ordering::SeqCst) {
+                        Reading::Readable
+                    } else {
+                        Reading::Unreadable(WorkspaceUnavailability::Unreadable)
+                    }
+                }
+            }),
+        );
+        let atlas_id = WorkspaceId::directory(&atlas);
+        let unreadable = [(atlas_id.clone(), WorkspaceUnavailability::Unreadable)]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+        standing.begin();
+        assert_eq!(remembered_as(&standing, &unreadable).await, unreadable);
+
+        readable.store(true, Ordering::SeqCst);
+        tokio::time::timeout(SURELY, async {
+            loop {
+                standing.begin();
+                if readings.load(Ordering::SeqCst) > 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the directory is read again");
+        assert_eq!(
+            standing.remembered(),
+            unreadable,
+            "a reading begun since leaves what was found as it was until it answers"
+        );
+
+        drop(held);
+        assert_eq!(
+            remembered_as(&standing, &HashMap::new()).await,
+            HashMap::new()
+        );
+    }
+
+    /// A reading that has not answered once the bound on waiting has passed
+    /// is remembered as unanswered, though nothing waited on it.
+    #[tokio::test]
+    async fn a_reading_unanswered_past_the_bound_is_remembered_as_unanswered() {
+        let atlas = absolute(&["mnt", "quiet", "atlas"]);
+        let registry = Registry::holding(&[&atlas]).await;
+        let gate = Arc::new(Gate::default());
+        let _held = OpensOnDrop(gate.clone());
+        let standing = RegistryStanding::with_probe(
+            registry.sessions.clone(),
+            None,
+            None,
+            Duration::from_millis(20),
+            Arc::new({
+                let gate = gate.clone();
+                move |_: &Path| {
+                    gate.wait();
+                    Reading::Readable
+                }
+            }),
+        );
+        let unanswered = [(
+            WorkspaceId::directory(&atlas),
+            WorkspaceUnavailability::Unanswered,
+        )]
+        .into_iter()
+        .collect();
+
+        standing.begin();
+        assert_eq!(remembered_as(&standing, &unanswered).await, unanswered);
+        assert_eq!(
+            listed(&registry.sessions),
+            [atlas],
+            "and it is never dropped"
         );
     }
 

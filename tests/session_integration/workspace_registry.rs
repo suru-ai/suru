@@ -20,7 +20,7 @@ use suru::{
         ResolveWorkspaceRequest, SessionId, SessionListItem, Workspace, WorkspaceDescription,
         WorkspaceId,
     },
-    server::{self, ServerConfig, ServerTimings},
+    server::{self, RunningServer, ServerConfig, ServerTimings},
 };
 
 use crate::{
@@ -82,6 +82,23 @@ pub(super) async fn listed(client: &ManagedClient) -> Vec<Workspace> {
         .await
         .expect("list Workspaces")
         .workspaces
+}
+
+/// The Workspaces the Client's Workspace listing answers once `server` has
+/// caught up with what it reads behind a listing (ADR 0052): with what
+/// changed before this asked, and with the reading the listing itself
+/// began, so nothing that listing began is still reading when the caller
+/// goes on to change the disk or the Roots — where a scan of the Roots, a
+/// change of them superseding it, would leave its reading outstanding, and
+/// the change's own scan pass over what it read.
+pub(super) async fn listed_caught_up(
+    server: &RunningServer,
+    client: &ManagedClient,
+) -> Vec<Workspace> {
+    server.workspace_listing_caught_up().await;
+    let listing = listed(client).await;
+    server.workspace_listing_caught_up().await;
+    listing
 }
 
 /// A directory as the Server reads it, so a path the listing gives compares

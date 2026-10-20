@@ -1,6 +1,7 @@
 //! Keeping the Workspace Registry in step with the disk and the Roots (ADR
 //! 0051): an entry stands while its directory can be read or a Session
-//! belongs to it. Each listing reads where every entry is presented. One
+//! belongs to it. Where every entry is presented is read behind each
+//! listing (ADR 0052), and what the reading finds is listed after it. One
 //! whose directory is gone while the directory holding it can be read is
 //! dropped, its Icon and Description with it — unless a Session belongs to
 //! it, which keeps it listed as unavailable. One whose directory, or the
@@ -12,7 +13,8 @@
 //!
 //! Each test drives the Server as a Client does, with real directories made,
 //! deleted, moved away and sealed, and asserts on what the Client's
-//! Workspace listing answers, or on what the Registry left on disk.
+//! Workspace listing answers once the Server has caught up with what it
+//! reads behind a listing, or on what the Registry left on disk.
 
 use std::{
     path::{Path, PathBuf},
@@ -24,6 +26,7 @@ use suru::{
     protocol::{
         SessionId, SettingMutation, Workspace, WorkspaceDescription, WorkspaceUnavailability,
     },
+    server::RunningServer,
 };
 use tokio::time::timeout;
 
@@ -31,8 +34,8 @@ use crate::{
     server_support::PROGRESS_DEADLINE,
     workspace_discovery::{repository_id, server_beneath, server_with_roots, spelled},
     workspace_registry::{
-        BY_SESSION, canonical, connected_client, entries_on_disk, landing_workspace, listed,
-        quiet_request, repository, set,
+        BY_SESSION, canonical, connected_client, entries_on_disk, landing_workspace,
+        listed_caught_up, quiet_request, repository, set,
     },
 };
 
@@ -42,9 +45,14 @@ fn standing(workspace: &Workspace) -> (PathBuf, Option<WorkspaceUnavailability>)
     (workspace.path.clone(), workspace.unavailable)
 }
 
-/// What a listing says of each Workspace's standing, by path.
-async fn standings(client: &ManagedClient) -> Vec<(PathBuf, Option<WorkspaceUnavailability>)> {
-    let mut standings = listed(client)
+/// What a listing says of each Workspace's standing, by path, once
+/// `server` has caught up with what it reads behind a listing (see
+/// [`listed_caught_up`]).
+async fn standings(
+    server: &RunningServer,
+    client: &ManagedClient,
+) -> Vec<(PathBuf, Option<WorkspaceUnavailability>)> {
+    let mut standings = listed_caught_up(server, client)
         .await
         .iter()
         .map(standing)
@@ -53,9 +61,14 @@ async fn standings(client: &ManagedClient) -> Vec<(PathBuf, Option<WorkspaceUnav
     standings
 }
 
-/// The Description the listing gives the Workspace presented at `path`.
-async fn description_at(client: &ManagedClient, path: &Path) -> Option<WorkspaceDescription> {
-    listed(client)
+/// The Description the listing gives the Workspace presented at `path`,
+/// once `server` has caught up with what it reads behind a listing.
+async fn description_at(
+    server: &RunningServer,
+    client: &ManagedClient,
+    path: &Path,
+) -> Option<WorkspaceDescription> {
+    listed_caught_up(server, client)
         .await
         .into_iter()
         .find(|workspace| workspace.path == path)
@@ -87,7 +100,7 @@ pub(super) async fn delete_once_settled(client: &ManagedClient, session_id: Sess
 }
 
 /// A directory deleted while the directory holding it can still be read
-/// leaves no ghost: the next listing drops its entry, discovered or
+/// leaves no ghost: the next reading drops its entry, discovered or
 /// described, with the Icon and Description it carried, so a Repository
 /// made there again is discovered afresh carrying nothing.
 #[tokio::test]
@@ -118,7 +131,7 @@ async fn a_directory_deleted_drops_its_entry_with_its_icon_and_description() {
         .await
         .expect("describe the drafts directory");
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [(drafts.clone(), None), (atlas.clone(), None)],
         "both are listed, and either can be opened"
     );
@@ -127,13 +140,13 @@ async fn a_directory_deleted_drops_its_entry_with_its_icon_and_description() {
     std::fs::remove_dir_all(&drafts).expect("delete the drafts directory");
 
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [],
-        "a directory deleted from one that can be read is dropped at the next listing"
+        "a directory deleted from one that can be read is dropped once the disk is read"
     );
 
     repository(&atlas);
-    let listing = listed(&client).await;
+    let listing = listed_caught_up(&server, &client).await;
     assert_eq!(
         listing
             .iter()
@@ -160,7 +173,7 @@ async fn a_directory_deleted_drops_its_entry_with_its_icon_and_description() {
 
 /// An entry a Session belongs to stands though its directory is gone,
 /// listed as unavailable and saying why, so the Session keeps its
-/// Workspace; once no Session belongs to it, the next listing drops it.
+/// Workspace; once no Session belongs to it, the next reading drops it.
 #[tokio::test]
 async fn an_entry_a_session_belongs_to_is_kept_unavailable_once_its_directory_is_gone() {
     const CHANNEL: &str = "workspace-standing-session-belongs";
@@ -178,9 +191,12 @@ async fn an_entry_a_session_belongs_to_is_kept_unavailable_once_its_directory_is
 
     std::fs::remove_dir_all(&notes).expect("delete the notes directory");
 
-    for listing in ["the next listing", "every listing after it"] {
+    for listing in [
+        "the listing once the disk is read",
+        "every listing after it",
+    ] {
         assert_eq!(
-            standings(&client).await,
+            standings(&server, &client).await,
             [(notes.clone(), Some(WorkspaceUnavailability::Gone))],
             "{listing} keeps the entry a Session belongs to, unavailable"
         );
@@ -188,7 +204,7 @@ async fn an_entry_a_session_belongs_to_is_kept_unavailable_once_its_directory_is
 
     delete_once_settled(&client, session.id).await;
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [],
         "once no Session belongs to it, the entry follows the disk"
     );
@@ -225,7 +241,7 @@ async fn an_entry_whose_holder_is_moved_away_is_kept_unavailable_across_restarts
         )
         .await
         .expect("describe the discovered Repository");
-    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+    assert_eq!(standings(&server, &client).await, [(atlas.clone(), None)]);
 
     let unplugged = home.join("unplugged");
     std::fs::rename(&drive, &unplugged).expect("take the drive away");
@@ -235,12 +251,12 @@ async fn an_entry_whose_holder_is_moved_away_is_kept_unavailable_across_restarts
         Some(WorkspaceUnavailability::HolderUnreadable),
     )];
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         away,
         "the entry is kept, unavailable, while the directory holding it cannot be read"
     );
     assert_eq!(
-        description_at(&client, &atlas).await,
+        description_at(&server, &client, &atlas).await,
         set("Maps of everything."),
         "with what it carries"
     );
@@ -251,19 +267,19 @@ async fn an_entry_whose_holder_is_moved_away_is_kept_unavailable_across_restarts
         server_with_roots(&home, CHANNEL, &[spelled(&projects)], Duration::ZERO).await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
     assert_eq!(
-        standings(&client).await,
+        standings(&restarted, &client).await,
         away,
         "a restart drops nothing whose holder cannot be read"
     );
 
     std::fs::rename(&unplugged, &drive).expect("bring the drive back");
     assert_eq!(
-        standings(&client).await,
+        standings(&restarted, &client).await,
         [(atlas.clone(), None)],
         "once the drive is back, the Workspace can be opened again"
     );
     assert_eq!(
-        description_at(&client, &atlas).await,
+        description_at(&restarted, &client, &atlas).await,
         set("Maps of everything."),
         "carrying all it did"
     );
@@ -308,7 +324,7 @@ async fn an_entry_sealed_or_whose_holder_is_sealed_is_kept_unavailable() {
         server_with_roots(&home, CHANNEL, &[spelled(&projects)], Duration::ZERO).await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [(atlas.clone(), None), (ledger.clone(), None)]
     );
 
@@ -320,7 +336,7 @@ async fn an_entry_sealed_or_whose_holder_is_sealed_is_kept_unavailable() {
         return;
     }
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [
             (atlas.clone(), None),
             (ledger.clone(), Some(WorkspaceUnavailability::Unreadable))
@@ -330,7 +346,7 @@ async fn an_entry_sealed_or_whose_holder_is_sealed_is_kept_unavailable() {
 
     let sealed_projects = seal(&projects);
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [
             (
                 atlas.clone(),
@@ -347,7 +363,7 @@ async fn an_entry_sealed_or_whose_holder_is_sealed_is_kept_unavailable() {
     drop(sealed_projects);
     drop(sealed_ledger);
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [(atlas.clone(), None), (ledger.clone(), None)],
         "both can be opened again once they can be read"
     );
@@ -418,7 +434,7 @@ async fn removing_a_root_drops_what_was_discovered_under_it_but_what_a_session_b
         (ledger.clone(), None),
         (notes.clone(), None),
     ];
-    assert_eq!(standings(&client).await, every);
+    assert_eq!(standings(&server, &client).await, every);
 
     client
         .mutate_setting(name(&[&archive]))
@@ -426,7 +442,7 @@ async fn removing_a_root_drops_what_was_discovered_under_it_but_what_a_session_b
         .expect("take the projects Root away");
 
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [
             (old.clone(), None),
             (drafts.clone(), None),
@@ -443,7 +459,7 @@ async fn removing_a_root_drops_what_was_discovered_under_it_but_what_a_session_b
         (notes.clone(), None),
     ];
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         kept,
         "an entry kept for its Session stands once no Session belongs to it, its directory \
          readable"
@@ -454,7 +470,7 @@ async fn removing_a_root_drops_what_was_discovered_under_it_but_what_a_session_b
         .await
         .expect("name the projects Root again");
     assert_eq!(
-        description_at(&client, &atlas).await,
+        description_at(&server, &client, &atlas).await,
         None,
         "a Repository discovered again under the Root carries nothing it carried before"
     );
@@ -463,7 +479,7 @@ async fn removing_a_root_drops_what_was_discovered_under_it_but_what_a_session_b
         .await
         .expect("take the projects Root away again");
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         kept,
         "the entry kept for its Session is no longer the Root's to take away"
     );
@@ -553,12 +569,12 @@ async fn a_server_started_on_a_config_document_it_cannot_read_keeps_every_discov
         let (_, server) = server_beneath(&home, CHANNEL, Duration::ZERO).await;
         let client = connected_client(&home.join("state"), CHANNEL).await;
         assert_eq!(
-            standings(&client).await,
+            standings(&server, &client).await,
             [(atlas.clone(), None)],
             "a Config Document with {broken} takes nothing away"
         );
         assert_eq!(
-            description_at(&client, &atlas).await,
+            description_at(&server, &client, &atlas).await,
             set("Maps of everything."),
             "and the entry carries all it did"
         );
@@ -590,7 +606,7 @@ async fn a_root_taken_away_while_the_server_was_stopped_is_taken_away_at_start()
         .expect("begin a Session in a discovered Repository")
         .session;
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [(atlas.clone(), None), (ledger.clone(), None)]
     );
     drop(client);
@@ -599,7 +615,7 @@ async fn a_root_taken_away_while_the_server_was_stopped_is_taken_away_at_start()
     let (_, restarted) = server_with_roots(&home, CHANNEL, &[], Duration::ZERO).await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
     assert_eq!(
-        standings(&client).await,
+        standings(&restarted, &client).await,
         [(ledger.clone(), None)],
         "what was discovered under the Root taken away is dropped, but what a Session belongs to"
     );
@@ -648,7 +664,7 @@ async fn a_root_spelled_another_way_is_the_same_root() {
         .await
         .expect("spell the Root out in full");
     assert_eq!(
-        description_at(&client, &atlas).await,
+        description_at(&server, &client, &atlas).await,
         set("Maps of everything."),
         "spelling the Root out in full takes nothing away"
     );
@@ -658,7 +674,7 @@ async fn a_root_spelled_another_way_is_the_same_root() {
     let (_, restarted) = server_with_roots(&home, CHANNEL, &["~/projects/"], Duration::ZERO).await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
     assert_eq!(
-        description_at(&client, &atlas).await,
+        description_at(&restarted, &client, &atlas).await,
         set("Maps of everything."),
         "nor does spelling it with `~` again by hand while the Server is stopped"
     );
@@ -668,7 +684,7 @@ async fn a_root_spelled_another_way_is_the_same_root() {
         .await
         .expect("take the Root away");
     assert_eq!(
-        standings(&client).await,
+        standings(&restarted, &client).await,
         [],
         "taken away in any spelling, the Root takes what was discovered under it"
     );
@@ -716,12 +732,12 @@ async fn a_change_of_another_setting_takes_nothing_away_for_roots_spoiled_by_han
     );
 
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [(atlas.clone(), None)],
         "and takes away nothing discovered under the Roots it no longer reads"
     );
     assert_eq!(
-        description_at(&client, &atlas).await,
+        description_at(&server, &client, &atlas).await,
         set("Maps of everything."),
         "which carries all it did"
     );
@@ -756,7 +772,7 @@ async fn a_root_respelled_as_where_its_link_led_while_neither_resolves_takes_not
         )
         .await
         .expect("describe the Repository discovered through the link");
-    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+    assert_eq!(standings(&server, &client).await, [(atlas.clone(), None)]);
 
     let unmounted = home.join("unmounted");
     std::fs::rename(&mount, &unmounted).expect("take the mount away, the link left dangling");
@@ -767,7 +783,7 @@ async fn a_root_respelled_as_where_its_link_led_while_neither_resolves_takes_not
         .await
         .expect("spell the Root as where the link led");
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [(
             atlas.clone(),
             Some(WorkspaceUnavailability::HolderUnreadable)
@@ -776,9 +792,9 @@ async fn a_root_respelled_as_where_its_link_led_while_neither_resolves_takes_not
     );
 
     std::fs::rename(&unmounted, &mount).expect("bring the mount back");
-    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+    assert_eq!(standings(&server, &client).await, [(atlas.clone(), None)]);
     assert_eq!(
-        description_at(&client, &atlas).await,
+        description_at(&server, &client, &atlas).await,
         set("Maps of everything."),
         "carrying all it did"
     );
@@ -837,12 +853,12 @@ async fn a_server_started_on_a_config_root_it_cannot_search_keeps_every_discover
     let (_, restarted) = server_beneath(&home, CHANNEL, Duration::ZERO).await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
     assert_eq!(
-        standings(&client).await,
+        standings(&restarted, &client).await,
         [(atlas.clone(), None)],
         "a config root that cannot be searched takes nothing away"
     );
     assert_eq!(
-        description_at(&client, &atlas).await,
+        description_at(&restarted, &client, &atlas).await,
         set("Maps of everything."),
         "and the entry carries all it did"
     );
@@ -881,7 +897,7 @@ async fn a_root_respelled_as_where_its_link_led_while_its_drive_is_gone_takes_no
         )
         .await
         .expect("describe the Repository discovered through the link");
-    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+    assert_eq!(standings(&server, &client).await, [(atlas.clone(), None)]);
     drop(client);
     server.shutdown().await.expect("shut down server");
 
@@ -895,12 +911,12 @@ async fn a_root_respelled_as_where_its_link_led_while_its_drive_is_gone_takes_no
             server_with_roots(&home, CHANNEL, &[spelled(&projects)], Duration::ZERO).await;
         let client = connected_client(&home.join("state"), CHANNEL).await;
         assert_eq!(
-            standings(&client).await,
+            standings(&restarted, &client).await,
             [(atlas.clone(), None)],
             "started with {state}, the Server keeps what was discovered through the link"
         );
         assert_eq!(
-            description_at(&client, &atlas).await,
+            description_at(&restarted, &client, &atlas).await,
             set("Maps of everything."),
             "with what it carries, started with {state}"
         );
@@ -932,7 +948,7 @@ async fn a_root_taken_away_while_its_drive_is_gone_takes_what_was_discovered_und
     )
     .await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
-    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+    assert_eq!(standings(&server, &client).await, [(atlas.clone(), None)]);
 
     let unplugged = home.join("unplugged");
     std::fs::rename(&drive, &unplugged).expect("take the drive away");
@@ -943,14 +959,14 @@ async fn a_root_taken_away_while_its_drive_is_gone_takes_what_was_discovered_und
         .await
         .expect("take the drive's Root away");
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [],
         "what was discovered under it is dropped at once, the drive gone"
     );
 
     std::fs::rename(&unplugged, &drive).expect("bring the drive back");
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [],
         "and the drive coming back brings nothing back"
     );
@@ -1015,7 +1031,7 @@ async fn a_root_taken_away_while_its_drive_is_gone_leaves_what_an_alias_still_na
         .mutate_setting(name(&[spelled(&usb), &alias]))
         .await
         .expect("name an alias of the Root beside it");
-    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+    assert_eq!(standings(&server, &client).await, [(atlas.clone(), None)]);
 
     let unplugged = home.join("unplugged");
     std::fs::rename(&drive, &unplugged).expect("take the drive away");
@@ -1024,7 +1040,7 @@ async fn a_root_taken_away_while_its_drive_is_gone_leaves_what_an_alias_still_na
         .await
         .expect("take the Root away, its alias still named");
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [(
             atlas.clone(),
             Some(WorkspaceUnavailability::HolderUnreadable)
@@ -1033,9 +1049,9 @@ async fn a_root_taken_away_while_its_drive_is_gone_leaves_what_an_alias_still_na
     );
 
     std::fs::rename(&unplugged, &drive).expect("bring the drive back");
-    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+    assert_eq!(standings(&server, &client).await, [(atlas.clone(), None)]);
     assert_eq!(
-        description_at(&client, &atlas).await,
+        description_at(&server, &client, &atlas).await,
         set("Maps of everything."),
         "carrying all it did"
     );
@@ -1045,7 +1061,7 @@ async fn a_root_taken_away_while_its_drive_is_gone_leaves_what_an_alias_still_na
         .await
         .expect("take the alias away");
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [],
         "taken away in every spelling, the Root takes what was discovered under it"
     );
@@ -1082,7 +1098,7 @@ async fn a_root_respelled_as_an_alias_takes_what_it_held_when_the_alias_is_taken
     .await;
     let client = connected_client(&home.join("state"), CHANNEL).await;
     let atlas_id = repository_id(&atlas.join(".git"));
-    assert_eq!(standings(&client).await, [(atlas.clone(), None)]);
+    assert_eq!(standings(&server, &client).await, [(atlas.clone(), None)]);
     let name = |roots: &[&str]| SettingMutation::WorkspaceRoots {
         value: Some(roots.iter().map(|root| (*root).to_owned()).collect()),
     };
@@ -1091,7 +1107,7 @@ async fn a_root_respelled_as_an_alias_takes_what_it_held_when_the_alias_is_taken
         .await
         .expect("respell the Root as its alias");
     assert_eq!(
-        standings(&client).await,
+        standings(&server, &client).await,
         [(atlas.clone(), None)],
         "respelling the Root takes nothing away"
     );
@@ -1113,7 +1129,7 @@ async fn a_root_respelled_as_an_alias_takes_what_it_held_when_the_alias_is_taken
         .await
         .expect("take the alias away");
     assert_eq!(
-        standings(&client).await,
+        standings(&restarted, &client).await,
         [],
         "what was discovered under the Root goes with its alias, the drive gone"
     );

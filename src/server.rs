@@ -168,16 +168,16 @@ pub struct ServerTimings {
     pub checkout_observation_interval: Duration,
     /// How long after a discovery of the Repositories within the Workspace
     /// Roots finished the Workspace listings that follow reuse it before one
-    /// discovers them again, so listing stays cheap while a Repository
-    /// cloned by hand is still listed within moments.
+    /// has them discovered again behind its answer, so listing stays cheap
+    /// while a Repository cloned by hand is still listed within moments.
     pub root_discovery_memo: Duration,
-    /// The longest a Workspace listing, a change of the Roots, or the
-    /// Server's start waits on a discovery of the Workspace Roots before
-    /// going on without it — answering from the Workspace Registry as it
-    /// stands — so a Root on a mount gone quiet holds nothing up; and the
-    /// longest a listing, or the start, then waits on reading where each
-    /// Registry entry is presented, an entry whose reading has not answered
-    /// by then listed as unavailable.
+    /// The longest a change of the Roots, a Clone, or the Server's start
+    /// waits on a discovery of the Workspace Roots before going on without
+    /// it, so a Root on a mount gone quiet holds nothing up; the longest the
+    /// start then waits on reading where each Workspace Registry entry is
+    /// presented; and how long such a reading may go unanswered before its
+    /// entry is listed as unavailable. A Workspace listing waits on neither
+    /// (ADR 0052).
     pub root_discovery_wait: Duration,
     /// Delay after startup Workspace discovery before the first Reclaim pass.
     pub worktree_reclaim_startup_delay: Duration,
@@ -624,9 +624,12 @@ impl ServerTimings {
         self.root_discovery_memo = memo;
         self
     }
-    /// Bounds how long anything waits on a discovery of the Workspace Roots;
-    /// injectable so a test sees what a scan found in the very next answer
-    /// however slowly it runs, or sees a stalled scan waited on only briefly.
+    /// Bounds how long anything waits on a discovery of the Workspace Roots,
+    /// or on reading where each Workspace Registry entry is presented, and
+    /// how long such a reading goes unanswered before its entry is listed as
+    /// unavailable; injectable so a test sees what a scan found once it is
+    /// caught up however slowly it runs, or sees a stalled scan or reading
+    /// waited on only briefly.
     pub fn with_root_discovery_wait(mut self, wait: Duration) -> Self {
         self.root_discovery_wait = wait;
         self
@@ -819,6 +822,12 @@ pub struct RunningServer {
     shutdown: ShutdownController,
     serving: ServingController,
     workspace_discovery: watch::Receiver<bool>,
+    /// What discovers the Workspace Roots into the Workspace Registry, and
+    /// what reads where each entry is presented, behind every listing.
+    workspace_reads: (
+        root_discovery::RootDiscovery,
+        registry_standing::RegistryStanding,
+    ),
     /// How many outlines of its Session trees this Server has served.
     outlines_served: Arc<std::sync::atomic::AtomicU64>,
     task: JoinHandle<Result<()>>,
@@ -861,6 +870,24 @@ impl RunningServer {
     pub async fn workspace_discovery_settled(&self) {
         let mut discovery = self.workspace_discovery.clone();
         let _ = discovery.wait_for(|settled| *settled).await;
+    }
+
+    /// Resolves once the Workspace Roots have been discovered into the
+    /// Workspace Registry and every entry's directory read, as a listing has
+    /// them done behind its answer (ADR 0052), so a listing asked after says
+    /// what they found. A scan or a reading still running is let finish
+    /// first, since it may have read the disk before whatever the caller is
+    /// catching up with changed it; each is then joined or begun as a
+    /// listing would, a scan only moments old reused. Neither is waited on
+    /// past `root_discovery_wait`.
+    pub async fn workspace_listing_caught_up(&self) {
+        let (discovery, standing) = &self.workspace_reads;
+        for _ in 0..2 {
+            discovery.settled(discovery.discover()).await;
+        }
+        for _ in 0..2 {
+            standing.check().await;
+        }
     }
     pub fn descriptor(&self) -> &RuntimeDescriptor {
         &self.descriptor
@@ -1648,7 +1675,7 @@ async fn start(
     // discovered, what was discovered under a Root taken away while the
     // Server was stopped is dropped with it, where the Config Document names
     // the Roots whole; once they are, the Registry is brought in step with
-    // the disk, as every listing brings it.
+    // the disk, as it is behind every listing.
     let (workspace_discovery, workspace_discovery_rx) = watch::channel(false);
     {
         let sessions = sessions.clone();
@@ -1808,8 +1835,8 @@ async fn start(
             runtimes.clone(),
             serving.clone(),
         ),
-        root_discovery,
-        registry_standing,
+        root_discovery.clone(),
+        registry_standing.clone(),
         memories,
         operations::RemoteWatches::new(
             timings.remote_retry_interval,
@@ -2161,6 +2188,7 @@ async fn start(
         shutdown,
         serving,
         workspace_discovery: workspace_discovery_rx,
+        workspace_reads: (root_discovery, registry_standing),
         outlines_served,
         task,
     })
@@ -3887,7 +3915,7 @@ async fn list_workspaces(State(state): State<AppState>, headers: HeaderMap) -> R
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(state.operations.workspace_listing().await).into_response()
+    Json(state.operations.workspace_listing()).into_response()
 }
 
 /// All Session-specific HTTP operations enter through one hydration boundary.

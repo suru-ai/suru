@@ -1485,13 +1485,24 @@ async fn a_clone_still_landing_at_its_bound_is_refused_saying_so_and_lands_and_i
         std::fs::read_to_string(atlas.join("README.md")).expect("the clone landed whole"),
         readme("atlas")
     );
+    // The Log records the Clone once the Roots it had discovered afresh
+    // are, which a listing no longer waits on (ADR 0052).
+    let records_the_clone = |logged: &str| {
+        logged.lines().any(|line| {
+            line.contains(spelled(&atlas_origin))
+                && line.contains(spelled(&atlas))
+                && line.contains("Cloned")
+        })
+    };
+    let _ = timeout(PROGRESS_DEADLINE, async {
+        while !records_the_clone(&log.logged()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
     let logged = log.logged();
     assert!(
-        logged
-            .lines()
-            .any(|line| line.contains(spelled(&atlas_origin))
-                && line.contains(spelled(&atlas))
-                && line.contains("Cloned")),
+        records_the_clone(&logged),
         "the Log records the Clone that landed, with its URL and destination: {logged}"
     );
 

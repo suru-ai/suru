@@ -1014,30 +1014,33 @@ impl SessionOperations {
         &self,
         origins: &Origins,
     ) -> Result<Gathered<WorkspaceListing>, OriginRefusal> {
-        self.gather(origins, self.workspace_listing(), WORKSPACES_PATH)
+        self.gather(origins, async { self.workspace_listing() }, WORKSPACES_PATH)
             .await
     }
 
     /// Every Workspace this Server knows, as its Workspace Registry lists
-    /// them once the Workspace Roots are discovered into it — afresh, or by
-    /// a scan only moments old — and it is brought in step with the disk
-    /// and the Roots, spelled in its own paths: what its `GET
-    /// /v1/workspaces` answers, a Peer included. An entry whose Repository
+    /// them now, spelled in its own paths: what its `GET /v1/workspaces`
+    /// answers, a Peer and the Broker's `list_workspaces` included. It waits
+    /// on nothing (ADR 0052): the Workspace Roots are discovered into the
+    /// Registry, and every entry's directory read, behind the answer — a
+    /// scan still running joined and one only moments old reused — and
+    /// whatever they change is listed after. An entry whose Repository
     /// source control has read during this run is presented as that
-    /// Repository is, so one whose main checkout is not known is named so,
-    /// and one whose directory cannot be read now says why it cannot be
-    /// opened.
-    pub(crate) async fn workspace_listing(&self) -> WorkspaceListing {
-        self.root_discovery.discover().await;
-        let unavailable = self.registry_standing.check().await;
-        self.listing_of_registry(unavailable)
+    /// Repository is, so one whose main checkout is not known is named so;
+    /// one whose directory was last found unreadable, or whose reading went
+    /// unanswered too long, says why it cannot be opened; and one not yet
+    /// read is listed as available.
+    pub(crate) fn workspace_listing(&self) -> WorkspaceListing {
+        drop(self.root_discovery.discover());
+        self.registry_standing.begin();
+        self.listing_of_registry(self.registry_standing.remembered())
     }
 
     /// Every Workspace this Server's Workspace Registry holds now, as
-    /// [`Self::workspace_listing`] lists them, without discovering the
-    /// Workspace Roots first: for what has just had them discovered. It
-    /// reads no entry's directory, so it says of none that it cannot be
-    /// opened.
+    /// [`Self::workspace_listing`] lists them, but saying of none that it
+    /// cannot be opened, nor having anything read afresh: for a Clone just
+    /// entered, whose directory has just been made, whatever was found of
+    /// one there before.
     pub(crate) fn registered_workspace_listing(&self) -> WorkspaceListing {
         self.listing_of_registry(HashMap::new())
     }
