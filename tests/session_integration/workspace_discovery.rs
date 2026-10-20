@@ -1176,8 +1176,9 @@ async fn a_root_whose_reading_stalls_holds_back_no_change_of_the_roots_and_no_li
 /// A listing says what the Registry knows now and waits on no discovery
 /// (ADR 0052), however long the Server would wait on one: here discovery at
 /// start stalls on the only Root, and a listing answers at once with the
-/// Workspace a Session made known, joining the scan rather than beginning
-/// another. What the scan finds once it answers is listed after.
+/// Workspace a Session made known, reading the stalled directory no more
+/// while its read is outstanding. What the scan finds once it answers is
+/// listed after.
 #[tokio::test]
 async fn a_listing_answers_at_once_while_discovery_stalls() {
     const CHANNEL: &str = "workspace-discovery-no-wait";
@@ -1233,6 +1234,11 @@ async fn a_listing_answers_at_once_while_discovery_stalls() {
         [located(&noted)],
         "the listing answers with what the Registry holds now"
     );
+    assert_eq!(
+        stalled_readings.load(Ordering::SeqCst),
+        1,
+        "the directory that does not answer is read once while that read is outstanding"
+    );
 
     drop(stall);
     timeout(PROGRESS_DEADLINE, async {
@@ -1246,11 +1252,6 @@ async fn a_listing_answers_at_once_while_discovery_stalls() {
     })
     .await
     .expect("what the scan finds once it answers is listed after");
-    assert_eq!(
-        stalled_readings.load(Ordering::SeqCst),
-        1,
-        "the listings joined the scan at start rather than reading again"
-    );
 
     drop(client);
     server.shutdown().await.expect("shut down server");
