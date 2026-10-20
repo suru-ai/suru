@@ -13,3 +13,4 @@ Every Workspace listing used to wait up to a second for the Workspace Roots to b
 
 - Availability can lag: a Workspace whose directory has just gone is offered until the reading catches up, and choosing it is refused when its Server resolves it, as any refusal is.
 - A Repository cloned by hand into a Root appears a moment after the picker opens rather than in its first rows, and the same holds for Peers and the Broker's `list_workspaces`, which share the one listing.
+- A change of the Roots made just after a listing supersedes the scan that listing began, which may leave a directory's reading outstanding; the change's own scan passes that directory over, as every scan passes over one whose reading has not ended, so what it would have found there shows only once a listing past the reuse window scans again.
