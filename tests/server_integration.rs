@@ -1796,25 +1796,14 @@ async fn a_remotes_workspace_listing_reaches_a_client_through_the_pairing() {
         .outlook(Outlook::Remote("workstation".to_owned()))
         .subscribe_catalog();
     let mut next_heard = async || {
-        timeout(PROGRESS_DEADLINE, async {
-            loop {
-                let event = catalog
-                    .next()
-                    .await
-                    .expect("the Remote's catalog stream stays open");
-                if let ManagedEvent::WorkspaceListing(listing) = event {
-                    let mut paths = listing
-                        .workspaces
-                        .into_iter()
-                        .map(|workspace| workspace.path)
-                        .collect::<Vec<_>>();
-                    paths.sort();
-                    return paths;
-                }
-            }
-        })
-        .await
-        .expect("a Workspace listing of the Remote's is heard")
+        let mut paths = support::next_workspace_listing(async || catalog.next().await)
+            .await
+            .workspaces
+            .into_iter()
+            .map(|workspace| workspace.path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
     };
 
     assert_eq!(

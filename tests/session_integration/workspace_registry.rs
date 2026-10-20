@@ -872,29 +872,7 @@ async fn an_entry_whose_main_checkout_is_unknown_is_named_so_without_its_reposit
 async fn pushed_listings(
     descriptor: &RuntimeDescriptor,
 ) -> impl futures_util::Stream<Item = WorkspaceListing> + Unpin + use<> {
-    use eventsource_stream::Eventsource;
-    use futures_util::StreamExt;
-
-    let response = reqwest::Client::new()
-        .get(format!("{}/v1/session-events", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("open the Session catalog stream")
-        .error_for_status()
-        .expect("the catalog stream authenticates");
-    Box::pin(
-        response
-            .bytes_stream()
-            .eventsource()
-            .filter_map(|event| async move {
-                let event = event.expect("the catalog stream stays readable");
-                (event.event == WORKSPACE_LISTING_EVENT).then(|| {
-                    serde_json::from_str::<WorkspaceListing>(&event.data)
-                        .expect("decode a pushed Workspace listing")
-                })
-            }),
-    )
+    crate::server_support::open_catalog_events(descriptor, WORKSPACE_LISTING_EVENT).await
 }
 
 /// The next Workspace listing `pushed` carries.
@@ -1090,18 +1068,10 @@ async fn a_client_hears_each_workspace_listing_its_server_pushes() {
         "the client hears it is connected before any Workspace listing"
     );
     let mut next_heard = async || {
-        tokio::time::timeout(crate::server_support::PROGRESS_DEADLINE, async {
-            loop {
-                match client.next().await.expect("the client stays connected") {
-                    ManagedEvent::WorkspaceListing(listing) => return listing.workspaces,
-                    _ => continue,
-                }
-            }
-        })
-        .await
-        .expect("a Workspace listing is heard")
+        crate::server_support::next_workspace_listing(async || client.next().await)
+            .await
+            .workspaces
     };
-
     assert_eq!(next_heard().await, [], "the listing as the client connects");
     let workspace = ManagedClient::connect(
         ManagedClientConfig::new(state_dir.path(), CHANNEL).expect("configure another client"),

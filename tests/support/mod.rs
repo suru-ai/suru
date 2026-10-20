@@ -108,6 +108,25 @@ pub async fn next_event(client: &mut ManagedClient) -> Option<ManagedEvent> {
     }
 }
 
+/// The next Workspace listing heard of what `next` reads — a client's own
+/// events, or a Session catalog subscription's — past whatever else is
+/// heard first.
+pub async fn next_workspace_listing(
+    mut next: impl AsyncFnMut() -> Option<ManagedEvent>,
+) -> suru::protocol::WorkspaceListing {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            if let ManagedEvent::WorkspaceListing(listing) =
+                next().await.expect("what is followed stays open")
+            {
+                return listing;
+            }
+        }
+    })
+    .await
+    .expect("a Workspace listing is heard")
+}
+
 /// Reads what every connect is told, answering the Server's identity, its
 /// Relays, and how its Serving listener stands, which follows them.
 pub async fn receive_connect_state(
@@ -311,11 +330,11 @@ pub async fn request_server_shutdown(
         .expect("request authenticated server shutdown")
 }
 
-/// The raw catalog stream, so a test can count what fired on it rather than only what a client made
-/// of it.
-pub async fn open_catalog_stream(
+/// The raw Session catalog stream, opened now, so a test can read what
+/// fired on it rather than only what a client made of it.
+pub async fn open_raw_catalog_stream(
     descriptor: &RuntimeDescriptor,
-) -> impl futures_util::Stream<Item = SessionCatalogUpdate> + Unpin {
+) -> impl futures_util::Stream<Item = eventsource_stream::Event> + Unpin + use<> {
     let response = reqwest::Client::new()
         .get(format!("{}/v1/session-events", descriptor.base_url))
         .bearer_auth(&descriptor.token)
@@ -328,14 +347,42 @@ pub async fn open_catalog_stream(
         response
             .bytes_stream()
             .eventsource()
-            .filter_map(|event| async move {
-                let event = event.expect("the catalog stream stays open");
-                (event.event == SESSION_CATALOG_UPDATED_EVENT).then(|| {
-                    serde_json::from_str::<SessionCatalogUpdate>(&event.data)
-                        .expect("decode a catalog update")
-                })
-            }),
+            .map(|event| event.expect("the catalog stream stays open")),
     )
+}
+
+/// Of `events`, those named `name`, each decoded as a `T`.
+pub fn named_events<S, T>(
+    events: S,
+    name: &'static str,
+) -> impl futures_util::Stream<Item = T> + Unpin + use<S, T>
+where
+    S: futures_util::Stream<Item = eventsource_stream::Event> + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    Box::pin(events.filter_map(move |event| async move {
+        (event.event == name).then(|| {
+            serde_json::from_str::<T>(&event.data)
+                .unwrap_or_else(|error| panic!("decode a {name} event: {error}"))
+        })
+    }))
+}
+
+/// The events named `name` on the raw Session catalog stream opened now,
+/// each decoded as a `T`.
+pub async fn open_catalog_events<T: serde::de::DeserializeOwned>(
+    descriptor: &RuntimeDescriptor,
+    name: &'static str,
+) -> impl futures_util::Stream<Item = T> + Unpin + use<T> {
+    named_events(open_raw_catalog_stream(descriptor).await, name)
+}
+
+/// The raw catalog stream's updates, so a test can count what fired on it
+/// rather than only what a client made of it.
+pub async fn open_catalog_stream(
+    descriptor: &RuntimeDescriptor,
+) -> impl futures_util::Stream<Item = SessionCatalogUpdate> + Unpin + use<> {
+    open_catalog_events(descriptor, SESSION_CATALOG_UPDATED_EVENT).await
 }
 
 /// The next change the Session catalog stream announces, however long the

@@ -344,37 +344,22 @@ pub async fn open_catalog_stream_with_snapshot(
     Vec<SessionId>,
     impl futures_util::Stream<Item = suru::protocol::SessionCatalogUpdate> + Unpin + use<>,
 ) {
-    use eventsource_stream::Eventsource;
     use futures_util::StreamExt;
 
-    let response = reqwest::Client::new()
-        .get(format!("{}/v1/session-events", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("open the Session catalog stream")
-        .error_for_status()
-        .expect("the catalog stream authenticates");
-    let mut events = Box::pin(response.bytes_stream().eventsource());
+    let mut events = crate::server_support::open_raw_catalog_stream(descriptor).await;
     let snapshot = loop {
         let event = timeout(PROGRESS_DEADLINE, events.next())
             .await
             .expect("the catalog snapshot arrives")
-            .expect("the catalog stream stays open")
-            .expect("the catalog stream stays readable");
+            .expect("the catalog stream stays open");
         if event.event == suru::protocol::SESSION_CATALOG_SNAPSHOT_EVENT {
             break serde_json::from_str::<suru::protocol::SessionCatalogSnapshot>(&event.data)
                 .expect("decode the catalog snapshot");
         }
     };
-    let updates = events.filter_map(|event| async move {
-        let event = event.expect("the catalog stream stays open");
-        (event.event == suru::protocol::SESSION_CATALOG_UPDATED_EVENT).then(|| {
-            serde_json::from_str::<suru::protocol::SessionCatalogUpdate>(&event.data)
-                .expect("decode a catalog update")
-        })
-    });
-    (snapshot.session_ids, Box::pin(updates))
+    let updates =
+        crate::server_support::named_events(events, suru::protocol::SESSION_CATALOG_UPDATED_EVENT);
+    (snapshot.session_ids, updates)
 }
 
 /// Checks whether `haystack` (typically `git worktree list --porcelain`
