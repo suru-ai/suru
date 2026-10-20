@@ -652,7 +652,8 @@ struct RunLoop {
     notice_claimant: uuid::Uuid,
     /// The Title proposal the rename dialog waits on, by the request it
     /// answers, so stopping the wait abandons the request — and the Errand
-    /// behind it — rather than letting it run on unheard.
+    /// behind it — rather than letting it run on unheard (see
+    /// [`Self::sync_title_proposal`]).
     title_proposal: Option<(uuid::Uuid, tokio::task::JoinHandle<()>)>,
 }
 
@@ -723,6 +724,7 @@ async fn run_loop(
     let mut delivery = ClipboardDelivery::default();
     loop {
         run.sync_skill_catalog();
+        run.sync_title_proposal();
         run.sync_subagent_tree();
         run.sync_thumbnail_fetches();
         if run.needs_redraw && run.application.first_frame_ready() {
@@ -1398,14 +1400,6 @@ impl RunLoop {
                 );
                 self.title_proposal = Some((request, task));
             }
-            ApplicationTransition::AbandonTitleProposal { request } => {
-                if let Some((_, task)) = self
-                    .title_proposal
-                    .take_if(|(pending, _)| *pending == request)
-                {
-                    task.abort();
-                }
-            }
             ApplicationTransition::SetWorkspaceIcon {
                 origin,
                 workspace_id,
@@ -1884,7 +1878,6 @@ impl RunLoop {
             | ApplicationTransition::SetSessionTitle { .. }
             | ApplicationTransition::AskTitleProposalOffer { .. }
             | ApplicationTransition::ProposeSessionTitle { .. }
-            | ApplicationTransition::AbandonTitleProposal { .. }
             | ApplicationTransition::SetWorkspaceIcon { .. }
             | ApplicationTransition::SetWorkspaceDescription { .. }
             | ApplicationTransition::AdmitPrompt { .. }
@@ -1996,6 +1989,19 @@ impl RunLoop {
             .expect("the opening loading delay is presentation-only");
         debug_assert_eq!(transition, ApplicationTransition::Continue);
         ControlFlow::Continue(())
+    }
+
+    /// Abandons the Title proposal held for the rename dialog once the dialog
+    /// no longer waits on it — stopped, closed, or its Session gone — so the
+    /// request, and the Errand behind it, never runs on unheard.
+    fn sync_title_proposal(&mut self) {
+        let awaited = self.application.awaited_title_proposal();
+        if let Some((_, task)) = self
+            .title_proposal
+            .take_if(|(request, _)| Some(*request) != awaited)
+        {
+            task.abort();
+        }
     }
 
     /// Arms the presentation tick while anything on screen animates and drops it

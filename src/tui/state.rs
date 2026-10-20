@@ -81,7 +81,7 @@ use super::{
         ListingLanded, RedemptionLoginLead, RelayLoginAct, RelayLoginFollow, RelayLoginLead,
         RelayOverlay, RelayRequest,
     },
-    rename_dialog::{RenameCancel, RenameDialog, RenamePress},
+    rename_dialog::{RenameDialog, RenamePress},
     render::render_with_slots,
     selection::{
         SelectionCell, SelectionFrame, SelectionGranularity, SelectionSurface, TextSelection,
@@ -3973,15 +3973,19 @@ impl TuiState {
             && !self.directory_browser.opened_from_onboarding()
     }
 
-    /// The Title `session` goes by here: the open Session's own, or the one
-    /// the Sidebar lists it by.
-    pub(super) fn title_of(&self, session: &SessionReference) -> Option<String> {
+    /// The Title and Icon `session` goes by here: the open Session's own, or
+    /// the ones the Sidebar lists it by.
+    pub(super) fn titled(&self, session: &SessionReference) -> (String, Option<String>) {
         if self.session_reference.as_ref() == Some(session)
             && let Some(open) = &self.session
         {
-            return Some(open.snapshot().title.clone());
+            let snapshot = open.snapshot();
+            return (snapshot.title.clone(), snapshot.icon.clone());
         }
-        self.sidebar.title_of(session).map(ToOwned::to_owned)
+        self.sidebar
+            .listed(session)
+            .map(|summary| (summary.title.clone(), summary.icon.clone()))
+            .unwrap_or_default()
     }
 
     /// The top painted overlay owns selection and pointer/key dispatch alike.
@@ -5560,10 +5564,6 @@ pub enum ApplicationTransition {
     /// so far, answered under `request`.
     ProposeSessionTitle {
         session: SessionReference,
-        request: uuid::Uuid,
-    },
-    /// Stops waiting for the proposal `request` names, abandoning its Errand.
-    AbandonTitleProposal {
         request: uuid::Uuid,
     },
     /// A user's own choice of a Workspace's Icon by Icon Catalog name, made
@@ -8784,11 +8784,11 @@ impl Application {
                 return ApplicationTransition::SetSessionTitle { session, title };
             }
         }
-        let title = self.state.title_of(&session).unwrap_or_default();
+        let (title, icon) = self.state.titled(&session);
         let opening = self
             .state
             .rename_dialog
-            .open(session.clone(), &title, written);
+            .open(session.clone(), &title, icon, written);
         ApplicationTransition::AskTitleProposalOffer { session, opening }
     }
 
@@ -8821,18 +8821,9 @@ impl Application {
                     return ApplicationTransition::SetSessionTitle { session, title };
                 }
             }
-            SemanticCommandId::RenameCancel => {
-                let abandoned = dialog.derivation();
-                return match dialog.cancel() {
-                    RenameCancel::StoppedDeriving(request) => {
-                        ApplicationTransition::AbandonTitleProposal { request }
-                    }
-                    RenameCancel::Closed => abandoned
-                        .map_or(ApplicationTransition::Continue, |request| {
-                            ApplicationTransition::AbandonTitleProposal { request }
-                        }),
-                };
-            }
+            // The run loop lets go of a proposal the dialog no longer waits
+            // on, so stopping one needs no transition of its own.
+            SemanticCommandId::RenameCancel => dialog.cancel(),
             _ => {}
         }
         ApplicationTransition::Continue
@@ -12562,6 +12553,13 @@ impl Application {
 
     pub(super) fn session_reference(&self) -> Option<SessionReference> {
         self.state.session_reference.clone()
+    }
+
+    /// The Title proposal the rename dialog still waits on, if any. Whatever
+    /// closed the dialog or stopped the wait — Escape, a deleted Session, a
+    /// new opening — the run loop abandons any other it holds.
+    pub fn awaited_title_proposal(&self) -> Option<uuid::Uuid> {
+        self.state.rename_dialog.derivation()
     }
 
     pub(super) fn outlook(&self) -> &Outlook {

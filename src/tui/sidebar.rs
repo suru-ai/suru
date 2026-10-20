@@ -1784,9 +1784,12 @@ impl Sidebar {
         self.listing.fail(request, error);
     }
 
-    /// The Title the Sidebar lists a readable Session by.
-    pub(super) fn title_of(&self, session: &SessionReference) -> Option<&str> {
-        self.listing.title_of(session)
+    /// The summary the Sidebar lists a readable Session by.
+    pub(super) fn listed(
+        &self,
+        session: &SessionReference,
+    ) -> Option<&crate::protocol::SessionSummary> {
+        self.listing.readable(session)
     }
 
     pub(super) fn retitle_origin(

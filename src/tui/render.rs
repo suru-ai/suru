@@ -2564,7 +2564,6 @@ fn render_rename_dialog(
         )
     } else if dialog.deriving {
         let label = "Deriving a Title…";
-        state.session_animation_on_screen.set(true);
         Line::from(shimmered_label_spans(
             label,
             state.shimmer_clock.frame(label, state.spinner_frame),
@@ -2599,19 +2598,30 @@ fn render_rename_dialog(
         },
         theme.text.subdued,
     ));
+    // The button stands second from the bottom of what was written, and is
+    // pointable only where the box had the room to draw it.
     let derive_row = area.y + 1 + lines.len() as u16 - 2;
+    let derive_drawn = derive_line && derive_row < area.bottom().saturating_sub(1);
+    let name = match dialog
+        .icon
+        .filter(|_| state.settings().appearance.show_icons)
+        .and_then(crate::icon_catalog::glyph)
+    {
+        Some(icon) => format!(" {icon} Rename "),
+        None => " Rename ".to_owned(),
+    };
     render_overlay_box(
         frame,
         state,
         SelectionSurface::RenameDialog,
         area,
         lines,
-        " Rename ",
+        &name,
         theme,
     );
     state.rename_dialog.record_geometry(RenameGeometry {
         dialog: area,
-        derive: derive_line.then(|| {
+        derive: derive_drawn.then(|| {
             Rect::new(
                 area.x + 1,
                 derive_row,

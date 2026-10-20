@@ -166,6 +166,11 @@ struct SessionStoreState {
     /// in the public snapshot. Provider actors do not survive restoration, so
     /// restored Sessions begin a fresh local generation sequence.
     posture_generations: HashMap<SessionId, u64>,
+    /// How many times each Session has been renamed since this process began,
+    /// so a derivation answering after a rename stands down even where the
+    /// user wrote the very Title it was derived from. Held in memory alone: a
+    /// derivation never outlives the process that began it.
+    title_renames: HashMap<SessionId, u64>,
     /// The Workspace Registry: an entry for every Workspace this server has
     /// known, seeded from the durable `workspaces` table at startup, made
     /// wherever a Workspace is first seen (see
@@ -437,6 +442,7 @@ impl SessionStore {
             deferred,
             resumable_preparations: resumable_preparations.into_iter().collect(),
             posture_generations: HashMap::new(),
+            title_renames: HashMap::new(),
             workspaces,
             sightings: Default::default(),
             standings: HashMap::new(),

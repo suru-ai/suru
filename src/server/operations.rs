@@ -1217,24 +1217,36 @@ impl SessionOperations {
         self.sessions.set_title(session_id, title)
     }
 
-    /// Whether a Title proposal would be derived for a Session if asked,
-    /// or `None` for a Session this Server cannot read.
-    pub(crate) async fn title_proposal_offered(&self, session_id: SessionId) -> Option<bool> {
-        self.hydrate(session_id).await.ok()?;
-        let session = self.sessions.session(session_id)?;
+    /// Whether a Title proposal would be derived for a Session if asked.
+    pub(crate) async fn title_proposal_offered(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bool, ProposalRefusal> {
+        self.hydrate(session_id)
+            .await
+            .map_err(|_| ProposalRefusal::Storage)?;
+        let session = self
+            .sessions
+            .session(session_id)
+            .ok_or(ProposalRefusal::SessionNotFound)?;
         let provider = session.agent_selection.map(|selection| selection.provider);
-        Some(self.derivation.offers_proposal(session_id, provider))
+        Ok(self.derivation.offers_proposal(session_id, provider))
     }
 
     /// Derives a Title proposal from a Session's Prompts so far, storing
-    /// nothing, or `None` for a Session this Server cannot read.
+    /// nothing.
     pub(crate) async fn propose_title(
         &self,
         session_id: SessionId,
-    ) -> Option<Result<String, ProposalRefusal>> {
-        self.hydrate(session_id).await.ok()?;
-        let snapshot = self.sessions.snapshot(session_id)?;
-        Some(self.derivation.propose(&snapshot).await)
+    ) -> Result<String, ProposalRefusal> {
+        self.hydrate(session_id)
+            .await
+            .map_err(|_| ProposalRefusal::Storage)?;
+        let snapshot = self
+            .sessions
+            .snapshot(session_id)
+            .ok_or(ProposalRefusal::SessionNotFound)?;
+        self.derivation.propose(&snapshot).await
     }
 
     /// Answers a Session's Questionnaire — or declines it — for `author`,

@@ -251,7 +251,7 @@ impl Derivation {
         };
         // The Title as it stands right now is the one this derivation is
         // derived from, and the only one its answer may replace.
-        let Some(derived_from) = self.sessions.title(session_id) else {
+        let Some(derived_from) = self.sessions.title_standing(session_id) else {
             return;
         };
         let asks_branch = created_branch.is_some();
@@ -643,9 +643,22 @@ enum ErrandAt {
     Selection(AgentSelection),
 }
 
+/// A Title as a derivation finds it: what it reads, and how many times the
+/// Session had been renamed. A derivation replaces only the Title standing
+/// as it found it, so a rename in between — even to the same words — stands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TitleStanding {
+    pub(crate) title: String,
+    pub(crate) renames: u64,
+}
+
 /// Why no Title proposal was derived.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProposalRefusal {
+    /// The Session does not exist on this Server.
+    SessionNotFound,
+    /// The Server's own storage could not read the Session; the Log says how.
+    Storage,
     /// The Setting in force derives no Title for this Session: it is off, or
     /// follows a Session with no Provider.
     Withheld,
@@ -666,10 +679,24 @@ impl SessionStore {
             .map(|record| record.summary.title.clone())
     }
 
+    /// The Session's Title as it stands, and how many times it has been
+    /// renamed, or `None` for a Session this server does not hold.
+    pub(crate) fn title_standing(&self, session_id: SessionId) -> Option<TitleStanding> {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        state.sessions.get(&session_id).map(|record| TitleStanding {
+            title: record.summary.title.clone(),
+            renames: state.title_renames.get(&session_id).copied().unwrap_or(0),
+        })
+    }
+
     /// Replaces a Session's Title and Icon with a derived pair, but only
     /// where each of their own guards allows it: the Title only when it
-    /// still reads as the one the derivation was derived from, and the Icon
-    /// only where the Session still carries none.
+    /// still stands as the one the derivation was derived from — reading the
+    /// same, and renamed no time since — and the Icon only where the Session
+    /// still carries none.
     ///
     /// The Title guard is what makes a derivation that is still in flight
     /// safe, and what lets a rename command land later without a schema
@@ -690,7 +717,7 @@ impl SessionStore {
     pub(crate) fn replace_derived_title(
         &self,
         session_id: SessionId,
-        derived_from: &str,
+        derived_from: &TitleStanding,
         derived: DerivedTitle,
     ) -> bool {
         let DerivedTitle { title, icon } = derived;
@@ -698,11 +725,12 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
+        let renames = state.title_renames.get(&session_id).copied().unwrap_or(0);
         let icon = {
             let Some(record) = state.sessions.get_mut(&session_id) else {
                 return false;
             };
-            if record.summary.title != derived_from {
+            if record.summary.title != derived_from.title || renames != derived_from.renames {
                 return false;
             }
             // A derived Icon only ever fills an absence.
@@ -799,6 +827,7 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
+        let state = &mut *state;
         let (icon, summary) = {
             let Some(record) = state.sessions.get_mut(&session_id) else {
                 return Err(SetTitleError::SessionNotFound);
@@ -814,6 +843,7 @@ impl SessionStore {
                     }],
                 )
                 .map_err(|_| SetTitleError::Storage)?;
+            *state.title_renames.entry(session_id).or_default() += 1;
             (icon, record.summary.clone())
         };
         state.publish_catalog_change(SessionCatalogChange::TitleChanged {
@@ -963,8 +993,10 @@ fn proposal_prompt(prompts: &[&Prompt]) -> String {
         }
         let skipped = later.len() - latest.len();
         carried.push(first);
-        if skipped > 0 {
-            carried.push(format!("({skipped} more requests)"));
+        match skipped {
+            0 => {}
+            1 => carried.push("(1 more request)".to_owned()),
+            _ => carried.push(format!("({skipped} more requests)")),
         }
         carried.extend(latest.into_iter().rev());
     }
@@ -1086,6 +1118,14 @@ fn unquoted(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Title as a derivation found it, renamed no time since.
+    fn found(title: &str) -> TitleStanding {
+        TitleStanding {
+            title: title.to_owned(),
+            renames: 0,
+        }
+    }
 
     fn derived_title(answer: &Value) -> Option<DerivedTitle> {
         derived_reply(answer).map(|reply| reply.title)
@@ -1286,7 +1326,7 @@ mod tests {
         assert!(
             !store.replace_derived_title(
                 session_id,
-                "a Title this Session never had",
+                &found("a Title this Session never had"),
                 DerivedTitle {
                     title: "Derived from something else".to_owned(),
                     icon: None,
@@ -1298,12 +1338,34 @@ mod tests {
 
         assert!(store.replace_derived_title(
             session_id,
-            "Explain the seam",
+            &found("Explain the seam"),
             DerivedTitle {
                 title: "Explain the Provider seam".to_owned(),
                 icon: Some("md-bug".to_owned()),
             },
         ));
+        assert_eq!(
+            store.title(session_id).as_deref(),
+            Some("Explain the Provider seam")
+        );
+
+        let before_rename = store
+            .title_standing(session_id)
+            .expect("the created Session is held");
+        store
+            .set_title(session_id, "Explain the Provider seam")
+            .expect("rename to the very words standing");
+        assert!(
+            !store.replace_derived_title(
+                session_id,
+                &before_rename,
+                DerivedTitle {
+                    title: "Derived before the rename".to_owned(),
+                    icon: None,
+                },
+            ),
+            "a rename stands against a derivation even where it wrote the words it found"
+        );
         assert_eq!(
             store.title(session_id).as_deref(),
             Some("Explain the Provider seam")
@@ -1351,7 +1413,7 @@ mod tests {
 
         assert!(store.replace_derived_title(
             session_id,
-            "Explain the seam",
+            &found("Explain the seam"),
             DerivedTitle {
                 title: "Explain the Provider seam".to_owned(),
                 icon: Some("md-bug".to_owned()),
@@ -1374,7 +1436,7 @@ mod tests {
 
         assert!(store.replace_derived_title(
             session_id,
-            "Explain the Provider seam",
+            &found("Explain the Provider seam"),
             DerivedTitle {
                 title: "Explain the Provider seam once more".to_owned(),
                 icon: Some("dev-rust".to_owned()),

@@ -2113,21 +2113,12 @@ impl SessionCommandClient {
     /// so far. Dropping the future abandons the request, and the Errand
     /// behind it with it.
     pub(crate) async fn propose_session_title(&self, session_id: SessionId) -> Result<String> {
-        let descriptor = self.descriptor.borrow().clone();
-        let response = self
-            .http
-            .post(server_url(
-                &descriptor.base_url,
-                &self.outlook,
-                &format!("/v1/sessions/{session_id}/title/proposal"),
-            )?)
-            .bearer_auth(&descriptor.token)
-            .send()
-            .await
-            .context("send Title proposal request")?;
-        decode_api_response::<SessionTitleProposal>(response, "Title proposal")
-            .await
-            .map(|proposal| proposal.title)
+        self.post_session_command_without_body::<SessionTitleProposal>(
+            &format!("/v1/sessions/{session_id}/title/proposal"),
+            "Title proposal",
+        )
+        .await
+        .map(|proposal| proposal.title)
     }
 
     /// Sets a Workspace's Icon to a user's own choice from the Icon Catalog by

@@ -48,6 +48,8 @@ pub(super) enum RenamePress {
 #[derive(Clone, Debug)]
 struct Draft {
     session: SessionReference,
+    /// The Session's Icon, drawn beside the dialog's name.
+    icon: Option<String>,
     /// This opening's identity, named by the Origin's answer to whether it
     /// would derive a proposal, so an answer for an earlier opening moves
     /// nothing.
@@ -81,6 +83,7 @@ struct Derivation {
 /// The dialog as a frame draws it.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RenameDialogView<'a> {
+    pub(super) icon: Option<&'a str>,
     pub(super) text: &'a str,
     /// How long the Title is as it will be kept, which is what the limit is
     /// measured against.
@@ -89,14 +92,6 @@ pub(super) struct RenameDialogView<'a> {
     pub(super) deriving: bool,
     pub(super) saving: bool,
     pub(super) error: Option<&'a str>,
-}
-
-/// What stopping asked for: the derivation it abandoned, or the dialog
-/// closing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RenameCancel {
-    StoppedDeriving(Uuid),
-    Closed,
 }
 
 impl RenameDialog {
@@ -110,6 +105,7 @@ impl RenameDialog {
         &mut self,
         session: SessionReference,
         title: &str,
+        icon: Option<String>,
         written: Option<String>,
     ) -> Uuid {
         let opening = Uuid::new_v4();
@@ -118,6 +114,7 @@ impl RenameDialog {
         let error = touched.then(|| too_long(&text)).flatten();
         self.draft = Some(Draft {
             session,
+            icon,
             opening,
             text,
             touched,
@@ -153,6 +150,7 @@ impl RenameDialog {
 
     pub(super) fn view(&self) -> Option<RenameDialogView<'_>> {
         self.draft.as_ref().map(|draft| RenameDialogView {
+            icon: draft.icon.as_deref(),
             text: &draft.text,
             kept_chars: one_line_title(&draft.text).chars().count(),
             offered: draft.offer == Offer::Offered,
@@ -250,15 +248,14 @@ impl RenameDialog {
 
     /// Stops a proposal still being derived, giving the field back the text
     /// it held, or closes the dialog where none is.
-    pub(super) fn cancel(&mut self) -> RenameCancel {
+    pub(super) fn cancel(&mut self) {
         if let Some(draft) = self.draft.as_mut()
             && let Some(deriving) = draft.deriving.take()
         {
             draft.text = deriving.before;
-            return RenameCancel::StoppedDeriving(deriving.request);
+            return;
         }
         self.draft = None;
-        RenameCancel::Closed
     }
 
     /// Answers the Title to rename the Session to, kept on one line, and holds
@@ -370,7 +367,7 @@ mod tests {
     }
 
     fn offered(dialog: &mut RenameDialog, session: SessionReference) {
-        let opening = dialog.open(session, "Explain the seam", None);
+        let opening = dialog.open(session, "Explain the seam", None, None);
         dialog.offer_answered(opening, true);
     }
 
@@ -382,7 +379,8 @@ mod tests {
         let (_, request) = dialog.derive().expect("a proposal is offered");
         dialog.insert("lost");
         assert_eq!(dialog.view().unwrap().text, "Explain the seam too");
-        assert_eq!(dialog.cancel(), RenameCancel::StoppedDeriving(request));
+        dialog.cancel();
+        assert!(dialog.is_open() && dialog.derivation().is_none());
         assert_eq!(dialog.view().unwrap().text, "Explain the seam too");
         dialog.proposal_answered(request, Ok("Late".to_owned()));
         assert_eq!(
@@ -394,14 +392,14 @@ mod tests {
         let (_, request) = dialog.derive().expect("a proposal is offered again");
         dialog.proposal_answered(request, Ok("Map the Provider seam".to_owned()));
         assert_eq!(dialog.view().unwrap().text, "Map the Provider seam");
-        assert_eq!(dialog.cancel(), RenameCancel::Closed);
+        dialog.cancel();
         assert!(!dialog.is_open());
     }
 
     #[test]
     fn deriving_waits_for_the_origin_to_offer_it() {
         let mut dialog = RenameDialog::default();
-        let opening = dialog.open(session(), "Explain the seam", None);
+        let opening = dialog.open(session(), "Explain the seam", None, None);
         assert!(dialog.derive().is_none(), "nothing is offered yet");
         dialog.offer_answered(Uuid::new_v4(), true);
         assert!(dialog.derive().is_none(), "an answer for another opening");
@@ -413,7 +411,7 @@ mod tests {
     #[test]
     fn a_blank_or_overlong_title_is_not_sent() {
         let mut dialog = RenameDialog::default();
-        dialog.open(session(), "Explain the seam", None);
+        dialog.open(session(), "Explain the seam", None, None);
         dialog.clear();
         dialog.insert("   ");
         assert!(dialog.save().is_none());
@@ -437,7 +435,7 @@ mod tests {
     fn the_field_follows_the_title_until_the_reader_makes_it_their_own() {
         let mut dialog = RenameDialog::default();
         let session = session();
-        dialog.open(session.clone(), "Explain the seam", None);
+        dialog.open(session.clone(), "Explain the seam", None, None);
         dialog.title_changed(&session, "Map the Provider seam");
         assert_eq!(dialog.view().unwrap().text, "Map the Provider seam");
         dialog.insert("!");
@@ -448,7 +446,7 @@ mod tests {
     #[test]
     fn text_written_elsewhere_is_judged_at_once() {
         let mut dialog = RenameDialog::default();
-        dialog.open(session(), "Explain the seam", Some("y".repeat(90)));
+        dialog.open(session(), "Explain the seam", None, Some("y".repeat(90)));
         let view = dialog.view().unwrap();
         assert_eq!(view.text, "y".repeat(90));
         assert!(view.error.is_some());

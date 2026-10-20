@@ -773,23 +773,23 @@ impl SessionListing {
         }
     }
 
-    /// The listed summary a catalog change names, for the changes that revise
-    /// one Session in place. A Session Suru could not read carries no summary
-    /// to revise, so it is passed over rather than reported missing.
-    /// The Title a readable Session is listed by, wherever it is listed.
-    pub(super) fn title_of(&self, session: &SessionReference) -> Option<&str> {
+    /// The summary a readable Session is listed by, wherever it is listed.
+    pub(super) fn readable(&self, session: &SessionReference) -> Option<&SessionSummary> {
         self.origins
             .get(&session.origin)?
             .sessions
             .iter()
             .find_map(|listed| match &listed.item {
                 SessionListItem::Readable(summary) if summary.session.id == session.session_id => {
-                    Some(summary.title.as_str())
+                    Some(summary.as_ref())
                 }
                 _ => None,
             })
     }
 
+    /// The listed summary a catalog change names, for the changes that revise
+    /// one Session in place. A Session Suru could not read carries no summary
+    /// to revise, so it is passed over rather than reported missing.
     fn readable_mut(
         &mut self,
         outlook: &Outlook,

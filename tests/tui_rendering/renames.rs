@@ -312,10 +312,13 @@ fn escape_stops_a_proposal_and_gives_the_field_back_then_closes() {
     else {
         panic!("Ctrl+G asks for a proposal");
     };
+    assert_eq!(application.awaited_title_proposal(), Some(request));
 
+    key(&mut application, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(
-        key(&mut application, KeyCode::Esc, KeyModifiers::NONE),
-        ApplicationTransition::AbandonTitleProposal { request }
+        application.awaited_title_proposal(),
+        None,
+        "the run loop lets go of a proposal no one waits on"
     );
     assert!(
         dialog_is_drawn(&application),
@@ -463,5 +466,53 @@ fn slash_rename_with_an_overlong_title_opens_it_in_the_dialog_to_be_shortened() 
     assert!(
         text.contains("A Title runs to at most 80 characters"),
         "{text}"
+    );
+}
+
+#[test]
+fn deleting_the_session_closes_the_dialog_and_lets_its_proposal_go() {
+    let workspace = workspace_dir();
+    let session_id = SessionId::new();
+    let mut application = sidebar_with_one_session(workspace.path(), session_id, "Wanted work");
+    let (_, opening) = open_from_sidebar(&mut application);
+    offer(&mut application, opening, true);
+    key(&mut application, KeyCode::Char('g'), KeyModifiers::CONTROL);
+    assert!(application.awaited_title_proposal().is_some());
+
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SessionDeleted(
+            suru::protocol::SessionDeleted { session_id },
+        )))
+        .expect("take the deletion");
+    assert!(!dialog_is_drawn(&application));
+    assert_eq!(application.awaited_title_proposal(), None);
+}
+
+#[test]
+fn the_dialog_wears_the_sessions_icon_while_icons_are_shown() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    deliver_settings(
+        &mut application,
+        EffectiveSettings {
+            appearance: suru::protocol::AppearanceSettings {
+                show_icons: true,
+                ..suru::protocol::AppearanceSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+    );
+    let (_, mut snapshot) = enter_session(&mut application, workspace.path());
+    snapshot.title = "Alpha work".into();
+    snapshot.icon = Some("md-bug".to_owned());
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
+        .expect("show the iconed Session");
+    type_terminal_text(&mut application, "/rename");
+    key(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        drawn(&application).contains("\u{f00e4} Rename"),
+        "{}",
+        drawn(&application)
     );
 }

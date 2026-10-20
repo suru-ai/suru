@@ -4308,12 +4308,8 @@ async fn title_proposal_offer(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match state.operations.title_proposal_offered(session_id).await {
-        Some(offered) => Json(SessionTitleProposalOffer { offered }).into_response(),
-        None => session_error_response(
-            StatusCode::NOT_FOUND,
-            SessionErrorCode::SessionNotFound,
-            "Session does not exist on this server instance",
-        ),
+        Ok(offered) => Json(SessionTitleProposalOffer { offered }).into_response(),
+        Err(refusal) => title_proposal_refusal(refusal),
     }
 }
 
@@ -4330,21 +4326,30 @@ async fn propose_session_title(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match state.operations.propose_title(session_id).await {
-        Some(Ok(title)) => Json(SessionTitleProposal { title }).into_response(),
-        Some(Err(ProposalRefusal::Withheld)) => session_error_response(
+        Ok(title) => Json(SessionTitleProposal { title }).into_response(),
+        Err(refusal) => title_proposal_refusal(refusal),
+    }
+}
+
+/// The answer a Title proposal — or the question of whether one is offered —
+/// is refused with.
+fn title_proposal_refusal(refusal: ProposalRefusal) -> Response {
+    match refusal {
+        ProposalRefusal::SessionNotFound => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        ProposalRefusal::Storage => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        ProposalRefusal::Withheld => session_error_response(
             StatusCode::CONFLICT,
             SessionErrorCode::TitleProposalWithheld,
             "Title derivation is turned off for this Session",
         ),
-        Some(Err(ProposalRefusal::Failed(message))) => session_error_response(
+        ProposalRefusal::Failed(message) => session_error_response(
             StatusCode::BAD_GATEWAY,
             SessionErrorCode::TitleProposalFailed,
             message,
-        ),
-        None => session_error_response(
-            StatusCode::NOT_FOUND,
-            SessionErrorCode::SessionNotFound,
-            "Session does not exist on this server instance",
         ),
     }
 }
