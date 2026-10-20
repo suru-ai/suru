@@ -192,6 +192,11 @@ struct SessionStoreState {
     /// Counts each change of what the Workspace listing reads of this
     /// store (see [`SessionStore::registry_moves`]).
     registry_moves: crate::moves::Moves,
+    /// The Workspaces the listing stood first, by which held work most
+    /// recently, as a change of the Session catalog last found them (see
+    /// [`SessionStoreState::worked_order`]), so a change that moves them
+    /// counts as a move of the listing and one that leaves them does not.
+    worked_order: Vec<WorkspaceId>,
     /// Where the store says a Report is waiting for a Session, once
     /// Provider orchestration has asked to hear of it: the Session the Report
     /// is for, whose Agent the orchestrator then delivers it to (see
@@ -436,8 +441,10 @@ impl SessionStore {
             sightings: Default::default(),
             standings: HashMap::new(),
             registry_moves: Default::default(),
+            worked_order: Vec::new(),
             report_notices: None,
         };
+        state.worked_order = state.worked_order();
         // A history still waiting in storage has nothing a save could be
         // encoded from; hydration says what storage holds once it is read.
         if let Some(deferred) = &state.deferred {
@@ -880,16 +887,23 @@ impl SessionStore {
 
 impl SessionStoreState {
     fn publish_catalog_change(&mut self, change: SessionCatalogChange) {
-        // A Session made or deleted moves its Workspace among those the
-        // listing stands first, and a Workspace's Icon and Description ride
-        // the listing too.
-        if matches!(
-            change,
-            SessionCatalogChange::Created { .. }
-                | SessionCatalogChange::Deleted { .. }
-                | SessionCatalogChange::WorkspaceIconChanged { .. }
-                | SessionCatalogChange::WorkspaceDescriptionChanged { .. }
-        ) {
+        // A Workspace's Icon and Description ride the listing. Any other
+        // change may come of work that moved a Workspace ahead of another
+        // among those the listing stands first — a Session made, deleted, or
+        // working anew — so the order is read again, and counts as a move
+        // only where it changed: work streaming in a Workspace already
+        // first moves nothing.
+        let moved = match change {
+            SessionCatalogChange::WorkspaceIconChanged { .. }
+            | SessionCatalogChange::WorkspaceDescriptionChanged { .. } => true,
+            _ => {
+                let order = self.worked_order();
+                let moved = order != self.worked_order;
+                self.worked_order = order;
+                moved
+            }
+        };
+        if moved {
             self.registry_moved();
         }
         self.catalog.publish(change);

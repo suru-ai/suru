@@ -112,6 +112,48 @@ impl SessionStoreState {
     /// was last seen and what was last found of its directory, so an entry
     /// made there again starts afresh. Answers the entry dropped, where
     /// there was one.
+    /// The Workspaces the Sessions a listing holds work in — every
+    /// top-level Session's that says, readable or not, as
+    /// [`SessionStore::list`] lists them — most recently worked in first,
+    /// each once: the order [`SessionStore::listed_workspaces`] stands them
+    /// in ahead of the rest.
+    pub(super) fn worked_order(&self) -> Vec<WorkspaceId> {
+        let mut worked = self
+            .sessions
+            .values()
+            .filter(|record| !record.snapshot.session.is_subagent())
+            .map(|record| {
+                (
+                    record.summary.updated_at,
+                    Some(&record.summary.session.workspace.id),
+                )
+            })
+            .chain(
+                self.unreadable_sessions
+                    .values()
+                    .filter(|unreadable| !self.is_stored_child(unreadable.summary.id))
+                    .map(|unreadable| {
+                        (
+                            unreadable.summary.updated_at,
+                            unreadable
+                                .summary
+                                .workspace
+                                .as_ref()
+                                .map(|workspace| &workspace.id),
+                        )
+                    }),
+            )
+            .collect::<Vec<_>>();
+        worked.sort_by_key(|(updated_at, _)| std::cmp::Reverse(*updated_at));
+        let mut seen = std::collections::HashSet::new();
+        worked
+            .into_iter()
+            .filter_map(|(_, workspace_id)| workspace_id)
+            .filter(|workspace_id| seen.insert(*workspace_id))
+            .cloned()
+            .collect()
+    }
+
     fn drop_entry(&mut self, workspace_id: &WorkspaceId) -> Option<StoredWorkspace> {
         let dropped = self.workspaces.remove(workspace_id)?;
         self.sightings.forget(workspace_id);
@@ -148,10 +190,11 @@ impl SessionStore {
             .find(|record| &record.summary.session.workspace.id == id)
             .map(|record| record.summary.session.workspace.clone())
     }
-    /// Announces every change of what [`Self::listed_workspaces`] lists: an
+    /// Counts every change of what [`Self::listed_workspaces`] lists: an
     /// entry made, presented anew, or dropped, its Icon or Description
-    /// changed, or a Session made or deleted, which moves where its
-    /// Workspace stands — so the listing a Server pushes moves with it.
+    /// changed, what was last found of its directory, or work that moves
+    /// a Workspace ahead of another — so the listing a Server pushes moves
+    /// with it.
     pub(crate) fn registry_moves(&self) -> crate::moves::Moves {
         self.state.lock().unwrap().registry_moves.clone()
     }
@@ -167,19 +210,14 @@ impl SessionStore {
     /// entry that says nowhere, having landed before rows kept a path, cannot
     /// be named and is left out until a Session working there presents it.
     pub(crate) fn listed_workspaces(&self) -> Vec<Workspace> {
-        let worked = self
-            .list(None)
-            .iter()
-            .filter_map(crate::protocol::SessionListItem::workspace)
-            .map(|workspace| workspace.id.clone())
-            .collect::<Vec<_>>();
+        let state = self.state.lock().unwrap();
+        let worked = state.worked_order();
         let recency = |workspace: &Workspace| {
             worked
                 .iter()
                 .position(|id| id == &workspace.id)
                 .unwrap_or(usize::MAX)
         };
-        let state = self.state.lock().unwrap();
         let mut workspaces = state
             .workspaces
             .iter()

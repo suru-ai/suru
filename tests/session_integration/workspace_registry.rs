@@ -1122,3 +1122,117 @@ async fn a_client_hears_each_workspace_listing_its_server_pushes() {
     drop(client);
     server.shutdown().await.expect("shut down server");
 }
+
+/// Waits until the Session `session_id` has stopped working, which a
+/// Session whose Provider fails it does at once.
+async fn settled(client: &ManagedClient, session_id: SessionId) {
+    tokio::time::timeout(crate::server_support::PROGRESS_DEADLINE, async {
+        while client
+            .read_session(session_id)
+            .await
+            .expect("read the Session")
+            .session
+            .working_since
+            .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the Session stops working");
+}
+
+/// Prompts the Session `session_id` again, and waits until it has stopped
+/// working.
+async fn prompt_again(client: &ManagedClient, session_id: SessionId) {
+    client
+        .admit_prompt(
+            session_id,
+            suru::protocol::AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Once more".to_owned(),
+                    skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
+                },
+                delivery: suru::protocol::PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("prompt the Session again");
+    settled(client, session_id).await;
+}
+
+/// The listing stands the Workspaces Sessions work in by which held work
+/// most recently, so work in one that stood behind another moves it ahead,
+/// and the listing is pushed in its new order — while work that leaves the
+/// order as it stood pushes nothing: the next push here is a Description's.
+#[tokio::test]
+async fn work_that_moves_a_workspace_ahead_pushes_the_listing_in_its_new_order() {
+    const CHANNEL: &str = "workspace-registry-reordered";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let notes = tempfile::tempdir().expect("create the notes Workspace");
+    let drafts = tempfile::tempdir().expect("create the drafts Workspace");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), CHANNEL).expect("configure"),
+    )
+    .await
+    .expect("spawn server");
+    let client = connected_client(state_dir.path(), CHANNEL).await;
+    let mut sessions = Vec::new();
+    for directory in [notes.path(), drafts.path()] {
+        let session = client
+            .create_session(quiet_request(directory, "Begin"))
+            .await
+            .expect("create a Session")
+            .session;
+        settled(&client, session.id).await;
+        sessions.push(session);
+    }
+    let mut pushed = pushed_listings(server.descriptor()).await;
+    let order = |listing: &WorkspaceListing| {
+        listing
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>()
+    };
+    let (noted, drafted) = (&sessions[0], &sessions[1]);
+    assert_eq!(
+        order(&next_pushed(&mut pushed).await),
+        [drafted.workspace.id.clone(), noted.workspace.id.clone()],
+        "the Workspace worked in last stands first"
+    );
+
+    prompt_again(&client, noted.id).await;
+    assert_eq!(
+        order(&next_pushed(&mut pushed).await),
+        [noted.workspace.id.clone(), drafted.workspace.id.clone()],
+        "work in the Workspace behind moves it ahead, and is pushed"
+    );
+
+    prompt_again(&client, noted.id).await;
+    client
+        .set_workspace_description(
+            &drafted.workspace.id,
+            Some(&drafted.workspace.path),
+            "Where drafts wait.",
+        )
+        .await
+        .expect("describe the drafts Workspace");
+    let described = next_pushed(&mut pushed).await;
+    assert_eq!(
+        (
+            order(&described),
+            described.workspaces[1].description.clone()
+        ),
+        (
+            vec![noted.workspace.id.clone(), drafted.workspace.id.clone()],
+            set("Where drafts wait.")
+        ),
+        "work leaving the order as it stood pushed nothing before the Description"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
