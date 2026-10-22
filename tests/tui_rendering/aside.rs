@@ -900,6 +900,40 @@ fn the_aside_and_the_sidebar_never_both_hold_the_keys() {
     );
 }
 
+/// A press in the Transcript is the reader turning back to the main view, so
+/// the keys the Aside holds go to the composer, and the Aside stays standing.
+#[test]
+fn pressing_the_transcript_hands_the_asides_keys_to_the_composer() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    deliver_settings(&mut application, EffectiveSettings::default());
+    enter_session(&mut application, workspace.path());
+    let aside_rule = |application: &Application| {
+        rendered_application_buffer(application, WIDTH, HEIGHT)[(WIDTH - ASIDE_WIDTH, 0)].fg
+    };
+    let resting = aside_rule(&application);
+    invoke(&mut application, SemanticCommandId::AsideToggle);
+    assert_ne!(
+        aside_rule(&application),
+        resting,
+        "the Aside takes the keys"
+    );
+
+    click(&mut application, (WIDTH / 3, 2));
+    assert_eq!(
+        aside_rule(&application),
+        resting,
+        "the press takes the keys from the Aside"
+    );
+    type_terminal_text(&mut application, "zq");
+    assert!(
+        rendered_application_rows_at(&application, WIDTH, HEIGHT)
+            .join("\n")
+            .contains("zq"),
+        "and gives them to the composer"
+    );
+}
+
 #[test]
 fn the_aside_is_squeezed_out_before_the_sidebar() {
     let workspace = workspace_dir();

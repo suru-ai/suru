@@ -4365,6 +4365,11 @@ fn sidebar_lines(
         .saturating_sub(u16::try_from(NEW_SESSION.width()).unwrap_or_default());
     let mut rows = vec![
         SidebarSpan {
+            rows: content.y..content.y.saturating_add(1),
+            columns: None,
+            target: SidebarTarget::Search,
+        },
+        SidebarSpan {
             rows: selector_rows.clone(),
             columns: Some(content.x.saturating_sub(1)..split),
             target: SidebarTarget::Selector,

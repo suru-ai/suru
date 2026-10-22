@@ -8020,10 +8020,24 @@ impl Application {
         if let Some(target) = self.transcript_hyperlink(position) {
             return self.invoke_semantic(SemanticCommandId::HyperlinkOpen.on_hyperlink(target));
         }
-        match self.state.toggle_disclosure_at(position) {
-            Some(invocation) => self.invoke_semantic(invocation),
-            None => Ok(ApplicationTransition::Continue),
+        if let Some(invocation) = self.state.toggle_disclosure_at(position) {
+            return self.invoke_semantic(invocation);
         }
+        // Whatever else of the main view was pressed — the Transcript, the
+        // composer's frame, the space between them — is the reader turning
+        // back to it, so the keys go to the composer. A press on either side
+        // column's blank space is that column's, and moves nothing.
+        let in_column = [self.state.sidebar.column(), self.state.aside.column()]
+            .iter()
+            .any(|column| {
+                column
+                    .drawn_area()
+                    .is_some_and(|area| area.contains(position))
+            });
+        if in_column {
+            return Ok(ApplicationTransition::Continue);
+        }
+        self.invoke_semantic(SemanticCommandId::ComposerFocus)
     }
 
     /// Answers what one press of the Sidebar came to. A press mints no
@@ -10494,9 +10508,24 @@ impl Application {
                     && let SemanticSubject::ComposerCursor(target) = invocation.subject
                 {
                     self.state.sidebar.hand_back_keys();
+                    self.state.aside.hand_back_keys();
                     self.state.command_mode = CommandMode::Composer;
                     self.state
                         .navigate_composer(|composers, key| composers.place_cursor(key, target));
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            // Only a side column's claim is given up: a composer that already
+            // has the keys keeps whatever it was in the middle of, an armed
+            // interrupt or a queued Prompt in hand included.
+            SemanticCommandId::ComposerFocus => {
+                if !self.state.overlay_owns_input()
+                    && !self.state.reconnect_overlay_visible()
+                    && !self.state.composer_focused()
+                {
+                    self.state.sidebar.hand_back_keys();
+                    self.state.aside.hand_back_keys();
+                    self.state.command_mode = CommandMode::Composer;
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -11470,6 +11499,18 @@ impl Application {
             SemanticCommandId::SidebarToggle => {
                 let open = self.state.sidebar_highlight();
                 self.state.sidebar.toggle(open.as_ref());
+                if self.state.sidebar.column().claims_keys() {
+                    self.state.aside.hand_back_keys();
+                }
+                self.state.command_mode = CommandMode::Composer;
+                Ok(self.take_session_listing_transition())
+            }
+            SemanticCommandId::SidebarFocus => {
+                if self.state.overlay_owns_input() {
+                    return Ok(ApplicationTransition::Continue);
+                }
+                let open = self.state.sidebar_highlight();
+                self.state.sidebar.focus(open.as_ref());
                 if self.state.sidebar.column().claims_keys() {
                     self.state.aside.hand_back_keys();
                 }

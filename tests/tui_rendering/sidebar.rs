@@ -2936,6 +2936,73 @@ fn esc_hands_the_keys_back_without_hiding_the_sidebar() {
     );
 }
 
+/// Pressing anywhere in the main view is the reader turning back to it, so the
+/// keys go to the composer, as Esc gives them, and the Sidebar stays standing.
+#[test]
+fn pressing_the_main_view_hands_the_keys_back_without_hiding_the_sidebar() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(
+        workspace.path(),
+        vec![listed("Listed work", workspace.path(), 1, now())],
+    );
+
+    rendered_application_rows_at(&application, WIDE, PRESS_HEIGHT);
+    assert_eq!(
+        press_at(&mut application, MouseButton::Left, WIDE - 5, 1),
+        ApplicationTransition::Continue
+    );
+
+    type_terminal_text(&mut application, "hello");
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        rows.iter().any(|row| row.contains("hello")),
+        "the press hands the keys back to the composer: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("Listed work")) && sidebar_is_drawn(&rows),
+        "the Sidebar stays standing, only without the keys: {rows:?}"
+    );
+    assert!(
+        selected_sidebar_text(&application).is_empty(),
+        "nothing in the column claims the keys any more"
+    );
+}
+
+/// The search box is where the reader types to narrow the list, so pressing it
+/// gives a Sidebar standing without the keys the keys — what they type next
+/// searches — and pressing it again while they search moves nothing.
+#[test]
+fn pressing_the_search_box_gives_the_sidebar_the_keys() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_showing(
+        workspace.path(),
+        vec![
+            listed("Listed work", workspace.path(), 1, now()),
+            listed("Other work", workspace.path(), 2, now()),
+        ],
+    );
+
+    press_line(&mut application, MouseButton::Left, "Search:");
+    type_terminal_text(&mut application, "Other");
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        rows.iter().any(|row| row.contains("Search: Other")),
+        "what the reader types goes to the search box: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("Listed work")),
+        "and narrows the list: {rows:?}"
+    );
+
+    press_line(&mut application, MouseButton::Left, "Search:");
+    type_terminal_text(&mut application, " work");
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    assert!(
+        rows.iter().any(|row| row.contains("Search: Other work")) && sidebar_is_drawn(&rows),
+        "a second press neither hides the Sidebar nor gives up the search: {rows:?}"
+    );
+}
+
 #[test]
 fn the_toggle_closes_the_sidebar_from_inside_it() {
     let workspace = workspace_dir();

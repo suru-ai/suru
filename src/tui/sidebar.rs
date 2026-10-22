@@ -550,6 +550,7 @@ pub(super) enum SidebarTarget {
     Selector,
     Scope(SidebarListingScope),
     NewSession,
+    Search,
 }
 
 /// The context menu as one frame drew it: the columns its box holds and where
@@ -945,6 +946,16 @@ impl Sidebar {
         self.window.reveal();
     }
 
+    /// Gives a shown Sidebar the keys, which pressing its search box asks
+    /// for: the reader means to type into it. Unlike [`Self::toggle`] it never
+    /// hides the Sidebar, and one already holding the keys keeps its row
+    /// focus where it is.
+    pub(super) fn focus(&mut self, open: Option<&SessionReference>) {
+        if self.is_revealed() && !self.has_focus() {
+            self.enter(open);
+        }
+    }
+
     /// Backs the reader out of the Sidebar one step at a time, which is what
     /// Esc asks for. The selector's entries are the innermost step, being the
     /// newest thing the reader opened; a query in hand is the next, given up
@@ -1125,6 +1136,11 @@ impl Sidebar {
         // refused, and a refusal must leave the Sidebar exactly as it stood.
         if target == SidebarTarget::NewSession {
             return SidebarPress::NewSession;
+        }
+        // The search box stands for no row: pressing it only gives the
+        // Sidebar the keys, so what the reader types next searches.
+        if target == SidebarTarget::Search {
+            return SidebarPress::Invoke(SemanticCommandId::SidebarFocus.into());
         }
         self.open_entry.press();
         self.focus_on(target);
@@ -1349,6 +1365,9 @@ impl Sidebar {
             SidebarTarget::Selector => SidebarFocus::Selector,
             SidebarTarget::Scope(scope) => SidebarFocus::Scope(scope),
             SidebarTarget::NewSession => SidebarFocus::NewSession,
+            // Never a place for row focus: a press there gives the Sidebar
+            // the keys and leaves row focus to what that seeds.
+            SidebarTarget::Search => return,
         });
     }
 

@@ -47,6 +47,9 @@ pub enum SemanticCommandId {
 
     ApplicationExit,
     ComposerPlaceCursor,
+    /// Gives the composer back the keys a side column holds, which a press
+    /// anywhere in the main view asks for.
+    ComposerFocus,
     /// Pastes what the host clipboard holds into the composer: an image as an
     /// Attachment, text as a bracketed paste of it would, and nothing else.
     ComposerClipboardPaste,
@@ -265,6 +268,9 @@ pub enum SemanticCommandId {
     SidebarNext,
     SidebarAttach,
     SidebarLeave,
+    /// Gives a shown Sidebar the keys without ever hiding it, which a press on
+    /// its search box asks for.
+    SidebarFocus,
     SidebarMenuPrevious,
     SidebarMenuNext,
     SidebarMenuSelect,
@@ -611,6 +617,7 @@ impl SemanticCommandId {
             Self::TextSelectionWord => "text_selection.word",
             Self::TextSelectionLine => "text_selection.line",
             Self::ComposerPlaceCursor => "composer.cursor.place",
+            Self::ComposerFocus => "composer.focus",
             Self::ComposerClipboardPaste => "composer.clipboard.paste",
             Self::ApplicationExit => "application.exit",
             Self::ThemeList => "theme.list",
@@ -730,6 +737,7 @@ impl SemanticCommandId {
             Self::SidebarNext => "sidebar.next",
             Self::SidebarAttach => "sidebar.attach",
             Self::SidebarLeave => "sidebar.leave",
+            Self::SidebarFocus => "sidebar.focus",
             Self::SidebarMenuPrevious => "sidebar.menu.previous",
             Self::SidebarMenuNext => "sidebar.menu.next",
             Self::SidebarMenuSelect => "sidebar.menu.select",
@@ -2563,6 +2571,14 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         keybinding: None,
     },
     SemanticCommandDescriptor {
+        id: SemanticCommandId::ComposerFocus,
+        title: "Focus Composer",
+        reach: SemanticReach::Client,
+        description: "Give the composer the keys the Sidebar or the Aside holds",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
         id: SemanticCommandId::ComposerClipboardPaste,
         title: "Paste from Clipboard",
         // Reading the clipboard is the Client's own; an image's upload that
@@ -2587,6 +2603,14 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         // says it takes one step rather than all of them.
         description: "Back out of the Sidebar a step: close what is open, clear its search, \
                       or hand the keys back to the composer",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SidebarFocus,
+        title: "Focus Sidebar",
+        reach: SemanticReach::Client,
+        description: "Give a shown Sidebar the keys, so what is typed searches it",
         slash: None,
         keybinding: None,
     },
