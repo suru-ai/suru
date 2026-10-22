@@ -4,10 +4,12 @@
 //!
 //! It walks four steps in a fixed order — Providers, Derivation, Workspace
 //! Roots, Icons — under a "Step N of 4" header. Enter confirms the step on
-//! show and moves to the next, finishing the flow on the last; Back returns
-//! to the step before; Esc leaves the whole flow from any step. Leaving counts as taking it as
-//! much as finishing does, so either asks the Server to mark itself
-//! onboarded.
+//! show and moves to the next, finishing the flow on the last; the Providers
+//! and Workspace Roots steps, whose Enter acts on the row under focus, are
+//! confirmed instead from a Confirm row at their foot. Back returns to the
+//! step before; Esc leaves the whole flow from any step. Leaving counts as
+//! taking it as much as finishing does, so either asks the Server to mark
+//! itself onboarded.
 //!
 //! The Client offers the flow while its own Server has not been onboarded,
 //! and withdraws what it offered once the Server has been or the Client
@@ -238,6 +240,26 @@ fn fit_notes<'a>(
     (notes, said)
 }
 
+/// The Confirm row at the foot of a step whose Enter acts on the row under
+/// focus, from which the step is confirmed instead.
+fn confirm_line(focused: bool, width: usize, theme: &Theme) -> Line<'static> {
+    let marker = if focused { "› " } else { "  " };
+    Line::styled(
+        truncate_to_width(&format!("{marker}Confirm"), width),
+        if focused {
+            theme.selection.focused
+        } else {
+            theme.text.primary
+        },
+    )
+}
+
+/// Puts `confirm` at the foot of `room` lines, beneath what `lines` holds.
+fn push_confirm(lines: &mut Vec<Line<'static>>, room: usize, confirm: Line<'static>) {
+    lines.resize(room.saturating_sub(1).max(lines.len()), Line::default());
+    lines.push(confirm);
+}
+
 /// Where the pin a step answered with stands, for the steps that wait on the
 /// Server's word that their pin landed before the flow goes on: the
 /// Derivation and Workspace Roots steps, which move on once it lands, and
@@ -311,11 +333,12 @@ impl Saving {
 }
 
 /// The Providers step: one row for each built-in Provider, in their fixed
-/// order, ticked by its Enablement and beside its Availability. Space writes
-/// the Enablement of the Provider under the cursor at once, and the step
-/// draws only what the Server answers, so a row is never ticked that the
-/// Config Document does not say is. The step is passed only while some
-/// Provider is enabled and not found unavailable.
+/// order, ticked by its Enablement and beside its Availability, and a Confirm
+/// row at the foot. Space or Enter writes the Enablement of the Provider under
+/// the cursor at once, and the step draws only what the Server answers, so a
+/// row is never ticked that the Config Document does not say is. From the
+/// Confirm row they pass the step, which is passed only while some Provider
+/// is enabled and not found unavailable.
 ///
 /// A screen too short for every row with what goes beneath it shows them
 /// through a window that follows the cursor, so the Provider Space would
@@ -339,10 +362,10 @@ struct ProvidersStep {
     /// The row the cursor is on.
     cursor: usize,
     window: ListWindow,
-    /// The Providers whose rows the last frame drew, which are the ones
-    /// Space and Enter may act on; nothing until a frame has been drawn since
-    /// the step opened.
-    drawn: RefCell<Option<Vec<&'static ProviderId>>>,
+    /// The rows the last frame drew, by where they stand among the step's
+    /// rows, which are the ones Space and Enter may act on; nothing until a
+    /// frame has been drawn since the step opened.
+    drawn: RefCell<Option<Vec<usize>>>,
     /// The toggles sent and not yet answered.
     toggles: Vec<Toggle>,
     /// The Provider whose toggle the Server refused newest, and why it never
@@ -393,17 +416,20 @@ impl ProvidersStep {
     /// The keys this step teaches before the ones every step shares, the
     /// most needed first, since a narrow screen gives up the last of them
     /// first.
-    const KEYS: [&'static str; 3] = ["Space Toggle", "r Re-check", "↑↓ Move"];
+    const KEYS: [&'static str; 2] = ["r Re-check", "↑↓ Move"];
 
     fn command_for_key(&self, key: KeyEvent) -> Option<CommandId> {
         let command = match (key.code, key.modifiers) {
+            (KeyCode::Char(' ') | KeyCode::Enter, KeyModifiers::NONE) if self.confirming() => {
+                SemanticCommandId::OnboardingNext
+            }
             (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                 SemanticCommandId::OnboardingProvidersPrevious
             }
             (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                 SemanticCommandId::OnboardingProvidersNext
             }
-            (KeyCode::Char(' '), KeyModifiers::NONE) => {
+            (KeyCode::Char(' ') | KeyCode::Enter, KeyModifiers::NONE) => {
                 SemanticCommandId::OnboardingProvidersToggle
             }
             (KeyCode::Char('r'), KeyModifiers::NONE) => {
@@ -423,25 +449,26 @@ impl ProvidersStep {
             .filter(|provider| provider_enablement(&provider.id).is_some())
     }
 
-    /// Moves the cursor `distance` rows, wrapping past either end.
+    /// Whether the cursor stands on the Confirm row, past every Provider's.
+    fn confirming(&self) -> bool {
+        self.cursor == Self::providers().count()
+    }
+
+    /// Moves the cursor `distance` rows, the Confirm row among them,
+    /// wrapping past either end.
     fn move_cursor(&mut self, distance: isize) {
-        let rows = Self::providers().count();
-        if rows == 0 {
-            return;
-        }
+        let rows = Self::providers().count() + 1;
         self.cursor = (self.cursor as isize + distance).rem_euclid(rows as isize) as usize;
         self.window.reveal();
     }
 
-    /// Whether the Provider under the cursor is one the reader can see: the
-    /// last frame drew its row, or no frame has been drawn yet.
+    /// Whether the row under the cursor is one the reader can see: the last
+    /// frame drew it, or no frame has been drawn yet.
     fn cursor_seen(&self) -> bool {
-        match &*self.drawn.borrow() {
-            None => true,
-            Some(drawn) => Self::providers()
-                .nth(self.cursor)
-                .is_some_and(|provider| drawn.contains(&&provider.id)),
-        }
+        self.drawn
+            .borrow()
+            .as_ref()
+            .is_none_or(|drawn| drawn.contains(&self.cursor))
     }
 
     /// Sends the edit turning the Provider under the cursor off where it is
@@ -628,11 +655,7 @@ impl ProvidersStep {
                     | Standing::Available
                     | Standing::Refreshing => Beneath::Nothing,
                 };
-                ProviderEntry {
-                    provider: &provider.id,
-                    line,
-                    beneath,
-                }
+                ProviderEntry { line, beneath }
             })
             .collect()
     }
@@ -691,18 +714,19 @@ impl ProvidersStep {
             .map(ProviderEntry::rows)
             .sum::<usize>();
         // The gap beneath the header, the introduction and the gap beneath
-        // it, the rows, and the gap above what is said beneath them.
-        3 + rows + usize::from(notes > 0) + notes
+        // it, the rows, the gap above what is said beneath them, and the
+        // Confirm row with the gap above it.
+        3 + rows + usize::from(notes > 0) + notes + 2
     }
 
     /// The step drawn within `width` columns and `room` lines beneath the
-    /// header: the introduction, the Providers' rows through the window, and
-    /// what is said beneath them, which keeps its lines before any row does.
-    /// For the rows to be drawn whole, the gap above what is said beneath
-    /// them gives way first, then the gap beneath the introduction, then the
-    /// gap beneath the header, then the introduction; past that the window
-    /// shows the rows around the cursor. Records whether the row under the
-    /// cursor was drawn.
+    /// header: the introduction, the Providers' rows through the window, what
+    /// is said beneath them, and the Confirm row at the foot, which keeps its
+    /// line before anything else and what is said before any row does. For
+    /// the rows to be drawn whole, the gap above what is said beneath them
+    /// gives way first, then the gap beneath the introduction, then the gap
+    /// beneath the header, then the introduction; past that the window shows
+    /// the rows around the cursor. Records which rows were drawn.
     fn lines<'a>(
         &'a self,
         width: usize,
@@ -711,6 +735,11 @@ impl ProvidersStep {
         server: OwnServer<'a>,
         recheck: &'a Recheck,
     ) -> Drawn<'a> {
+        // A single line is the row under the cursor's, which the Confirm
+        // row is while the cursor is on it.
+        let confirm = room > 1 || (room == 1 && self.confirming());
+        let foot = room;
+        let room = room - usize::from(confirm);
         let entries = self.entries(width, theme, server);
         let (notes, said) = fit_notes(self.notes(width, theme, server, recheck), room);
         let rows = entries.iter().map(ProviderEntry::rows).sum::<usize>();
@@ -740,18 +769,26 @@ impl ProvidersStep {
             .iter()
             .map(|entry| WindowEntry::focusable(entry.rows()))
             .collect::<Vec<_>>();
-        let shown = self.window.settle(&window, capacity, Some(self.cursor));
+        // The Confirm row stands apart beneath the Providers', so while the
+        // cursor is on it the window keeps to the foot of them.
+        let focus = self.cursor.min(entries.len().saturating_sub(1));
+        let shown = self.window.settle(&window, capacity, Some(focus));
         let end = lines.len() + capacity;
         let mut wrapped = Vec::new();
         let mut drawn = Vec::new();
-        for entry in entries.into_iter().skip(shown.start).take(shown.len()) {
+        for (row, entry) in entries
+            .into_iter()
+            .enumerate()
+            .skip(shown.start)
+            .take(shown.len())
+        {
             // Only a row taller than the whole window is cut short, and then
             // from what goes beneath it.
             let room = end.saturating_sub(lines.len());
             if room == 0 {
                 break;
             }
-            drawn.push(entry.provider);
+            drawn.push(row);
             lines.push(entry.line);
             match entry.beneath {
                 Beneath::Fix(fix, style) => {
@@ -765,7 +802,6 @@ impl ProvidersStep {
                 Beneath::Message(_) | Beneath::Nothing => {}
             }
         }
-        self.drawn.replace(Some(drawn));
         if notes_gap {
             lines.push(Line::default());
         }
@@ -775,13 +811,21 @@ impl ProvidersStep {
                 lines.extend(note.lines(style));
             }
         }
+        if confirm {
+            drawn.push(Self::providers().count());
+            push_confirm(
+                &mut lines,
+                foot,
+                confirm_line(self.confirming(), width, theme),
+            );
+        }
+        self.drawn.replace(Some(drawn));
         Drawn { lines, wrapped }
     }
 }
 
 /// One Provider's row as the step lays it out, and what goes beneath it.
 struct ProviderEntry<'a> {
-    provider: &'static ProviderId,
     line: Line<'static>,
     beneath: Beneath<'a>,
 }
@@ -1113,8 +1157,10 @@ fn pinned_selection(selection: AgentSelection) -> SettingMutation {
 /// The Workspace Roots step: which directories the user's work lives in,
 /// edited as the settings panel's list editor edits them — typed, or chosen
 /// in the Directory Browser among the Client's own Server's directories —
-/// and answered as one list when the reader moves on. None is an answer as
-/// good as any, so the step never locks Next.
+/// and answered as one list from the Confirm row at its foot. Enter on a row
+/// of the list, or Space on the row a new Root is added at, opens the
+/// browser for it. None is an answer as good as any, so the step never locks
+/// Next.
 ///
 /// The draft is the step's own until Next pins it whole; Back keeps it as
 /// left without saving it, and leaving the flow drops it. A draft no one has
@@ -1125,6 +1171,8 @@ fn pinned_selection(selection: AgentSelection) -> SettingMutation {
 #[derive(Clone, Debug)]
 struct RootsStep {
     editor: ListEditor,
+    /// Whether focus stands on the Confirm row, beneath the editor's own.
+    confirming: bool,
     /// Whether the draft follows the Roots in force, which it does until the
     /// reader edits it.
     follows: bool,
@@ -1135,6 +1183,7 @@ impl Default for RootsStep {
     fn default() -> Self {
         Self {
             editor: ListEditor::open(WORKSPACE_ROOTS_LIST, &EffectiveSettings::default()),
+            confirming: false,
             follows: true,
             saving: Saving::default(),
         }
@@ -1164,9 +1213,10 @@ impl RootsStep {
                                 under Source Control.";
 
     /// The keys this step teaches before the ones every step shares.
-    const KEYS: [&'static str; 3] = ["Tab Browse", "Ctrl+D Remove", "↑↓ Move"];
+    const KEYS: [&'static str; 2] = ["Ctrl+D Remove", "↑↓ Move"];
 
-    /// The focused row, which the step keeps before anything else it draws.
+    /// The focused row, which the step keeps before anything else it draws
+    /// but the Confirm row.
     const KEPT: usize = 1;
 
     /// Opens the step afresh on the Roots in force, which the draft follows.
@@ -1187,6 +1237,15 @@ impl RootsStep {
 
     fn command_for_key(&self, key: KeyEvent) -> Option<CommandId> {
         let command = match (key.code, key.modifiers) {
+            (KeyCode::Char(' ') | KeyCode::Enter, KeyModifiers::NONE) if self.confirming => {
+                SemanticCommandId::OnboardingNext
+            }
+            // A Space typed into an entry is part of it; on the row a new
+            // Root is added at, nothing is typed yet, so it browses.
+            (KeyCode::Char(' '), KeyModifiers::NONE) if self.editor.focuses_addition() => {
+                SemanticCommandId::OnboardingRootsBrowse
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::OnboardingRootsBrowse,
             (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                 SemanticCommandId::OnboardingRootsPrevious
             }
@@ -1197,7 +1256,6 @@ impl RootsStep {
                 SemanticCommandId::OnboardingRootsDeleteBackward
             }
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => SemanticCommandId::OnboardingRootsRemove,
-            (KeyCode::Tab, KeyModifiers::NONE) => SemanticCommandId::OnboardingRootsBrowse,
             (KeyCode::Char(character), modifiers)
                 if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
             {
@@ -1211,13 +1269,33 @@ impl RootsStep {
         Some(CommandId::InvokeSemantic(command))
     }
 
-    /// Edits the draft, unless a pin of it is awaited. Any edit but a move
+    /// Edits the draft, unless a pin of it is awaited. A move walks the
+    /// editor's rows and the Confirm row beneath them, wrapping past either
+    /// end; from the Confirm row nothing else edits. Any edit but a move
     /// makes the draft the reader's, which follows the Roots in force no
     /// more.
     fn edit(&mut self, edit: RootsEdit) {
         if self.saving.is_pending() {
             return;
         }
+        match edit {
+            RootsEdit::Previous if self.confirming => {
+                self.confirming = false;
+                self.editor.focus_addition();
+            }
+            RootsEdit::Next if self.confirming => {
+                self.confirming = false;
+                self.editor.focus_first();
+            }
+            RootsEdit::Previous if self.editor.focuses_first() => self.confirming = true,
+            RootsEdit::Next if self.editor.focuses_addition() => self.confirming = true,
+            _ if self.confirming => {}
+            edit => self.edit_draft(edit),
+        }
+    }
+
+    /// Edits the draft in the editor, on the row focus stands on there.
+    fn edit_draft(&mut self, edit: RootsEdit) {
         if !matches!(edit, RootsEdit::Previous | RootsEdit::Next) {
             self.follows = false;
         }
@@ -1242,7 +1320,11 @@ impl RootsStep {
         }
         Some(match self.editor.save() {
             Some(pin) => self.saving.send(pin),
-            None => Advance::Held,
+            // The editor's focus has moved to the entry refused.
+            None => {
+                self.confirming = false;
+                Advance::Held
+            }
         })
     }
 
@@ -1279,16 +1361,23 @@ impl RootsStep {
             .map(|(note, _)| note.height())
             .sum::<usize>();
         // The introduction and the gap beneath it, every entry and the row
-        // a new one is added at, and the gap above what is said beneath.
-        Self::introduction(width).height() + 1 + self.editor.view().entries.len() + 1 + 1 + said
+        // a new one is added at, the gap above what is said beneath, and the
+        // Confirm row with the gap above it.
+        Self::introduction(width).height() + 1 + self.editor.view().entries.len() + 1 + 1 + said + 2
     }
 
     /// The step drawn within `width` columns and `room` lines beneath the
-    /// header: the introduction, the rows through their window, and what is
-    /// said beneath them. The focused row is kept above all; what is said
-    /// beneath keeps its lines from its start before the introduction does,
-    /// and the rows scroll within whatever room is left.
+    /// header: the introduction, the rows through their window, what is said
+    /// beneath them, and the Confirm row at the foot. The Confirm row and
+    /// the focused row are kept above all; what is said beneath keeps its
+    /// lines from its start before the introduction does, and the rows
+    /// scroll within whatever room is left.
     fn lines(&self, width: usize, room: usize, theme: &Theme) -> Drawn<'_> {
+        // A single line is the focused row's, which the Confirm row is
+        // while it holds focus.
+        let confirm = room > 1 || (room == 1 && self.confirming);
+        let foot = room;
+        let room = room - usize::from(confirm);
         // What is said beneath leaves room for the focused row and the gap
         // above itself.
         let (notes, said) = fit_notes(
@@ -1308,8 +1397,18 @@ impl RootsStep {
         if given < 1 {
             lines.push(Line::default());
         }
-        let capacity = available.saturating_sub(lines.len()).max(Self::KEPT);
-        lines.extend(self.editor.view().rows(width, capacity, theme));
+        let capacity = if room == 0 {
+            0
+        } else {
+            available.saturating_sub(lines.len()).max(Self::KEPT)
+        };
+        let view = self.editor.view();
+        let view = if self.confirming {
+            view.without_focus()
+        } else {
+            view
+        };
+        lines.extend(view.rows(width, capacity, theme));
         if said > 0 {
             lines.push(Line::default());
         }
@@ -1318,6 +1417,13 @@ impl RootsStep {
                 wrapped.push(note.wrapped(lines.len()));
                 lines.extend(note.lines(style));
             }
+        }
+        if confirm {
+            push_confirm(
+                &mut lines,
+                foot,
+                confirm_line(self.confirming, width, theme),
+            );
         }
         Drawn { lines, wrapped }
     }
@@ -1889,10 +1995,10 @@ impl Onboarding {
     }
 
     /// Whether a Root may be chosen in the Directory Browser for the
-    /// Workspace Roots step: while it is on show and awaits no pin, whose
-    /// draft is held still.
+    /// Workspace Roots step: while it is on show with focus on a row of its
+    /// list, and awaits no pin, whose draft is held still.
     pub(super) fn browses_roots(&self) -> bool {
-        self.shows_roots() && !self.roots.saving.is_pending()
+        self.shows_roots() && !self.roots.confirming && !self.roots.saving.is_pending()
     }
 
     /// Edits the Workspace Roots step's draft, while that step is on show.
@@ -2019,7 +2125,7 @@ impl Onboarding {
             Step::Roots => &RootsStep::KEYS,
             Step::Icons => &IconsStep::KEYS,
         };
-        let footer = footer(step, own_keys, width);
+        let footer = footer(step, self.enter(step), own_keys, width);
         // The keys stay at the foot however much the step draws, and are
         // what gives way last.
         lines.truncate(height.saturating_sub(1));
@@ -2029,6 +2135,17 @@ impl Onboarding {
             theme.text.subdued,
         ));
         Drawn { lines, wrapped }
+    }
+
+    /// What Enter does on `step`, as the keys at its foot name it: on a step
+    /// confirmed from its Confirm row, what it does to the row under focus.
+    fn enter(&self, step: Step) -> &'static str {
+        match step {
+            Step::Providers if !self.providers.confirming() => "Toggle",
+            Step::Roots if !self.roots.confirming => "Browse",
+            _ if step.next().is_none() => "Finish",
+            _ => "Next",
+        }
     }
 
     /// How many rows the flow draws within `width` columns with nothing
@@ -2059,17 +2176,15 @@ pub(super) enum DerivationMove {
 }
 
 /// The keys at the foot of `step` within `width` columns: the step's own
-/// keys first, then Next, or Finish on the last step, Back where there is a
+/// keys first, then what Enter does there, `enter`, Back where there is a
 /// step before, and how to leave. Where they do not all fit, the step's own
 /// give way first, the last of them first, then Back, and then Enter is
 /// named by its glyph, since going on and leaving are what the reader cannot
 /// do without.
-fn footer(step: Step, own_keys: &[&str], width: usize) -> String {
-    let (next, glyph_next) = if step.next().is_some() {
-        ("Enter Next", "↵ Next")
-    } else {
-        ("Enter Finish", "↵ Finish")
-    };
+fn footer(step: Step, enter: &str, own_keys: &[&str], width: usize) -> String {
+    let next = format!("Enter {enter}");
+    let glyph_next = format!("↵ {enter}");
+    let (next, glyph_next) = (next.as_str(), glyph_next.as_str());
     let back = step.previous().map(|_| "← Back");
     let keys = |own: &[&str], next: &str, back: Option<&str>| {
         own.iter()

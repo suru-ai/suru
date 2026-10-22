@@ -55,11 +55,24 @@ pub(super) struct ListEditorView<'a> {
     /// The focused row, where `entries.len()` is the row a new entry is added
     /// at.
     pub(super) focus: usize,
+    /// Whether the focused row is marked so: not while focus stands on a row
+    /// of whatever draws the editor beneath its own.
+    pub(super) marked: bool,
     pub(super) error: Option<&'a str>,
     pub(super) window: &'a ListWindow,
 }
 
 impl ListEditorView<'_> {
+    /// The editor as drawn while focus stands on a row beneath its own: none
+    /// of its rows is marked, and the window keeps to the foot of them.
+    pub(super) fn without_focus(self) -> Self {
+        Self {
+            focus: self.entries.len(),
+            marked: false,
+            ..self
+        }
+    }
+
     /// The rows the window shows within `capacity` lines of `width` columns:
     /// each entry, and the row a new entry is added at, the focused one
     /// marked and cut from its start so the end being typed stays in view.
@@ -69,7 +82,7 @@ impl ListEditorView<'_> {
             .settle_rows(self.entries.len() + 1, capacity, Some(self.focus));
         shown
             .map(|index| {
-                let focused = index == self.focus;
+                let focused = self.marked && index == self.focus;
                 let marker = if focused { "› " } else { "  " };
                 let text_width = width.saturating_sub(marker.width());
                 let (text, style) = match self.entries.get(index) {
@@ -117,6 +130,7 @@ impl ListEditor {
             names_directories: self.names_directories(),
             entries: &self.entries,
             focus: self.focus,
+            marked: true,
             error: self.error.as_deref(),
             window: &self.window,
         }
@@ -139,6 +153,27 @@ impl ListEditor {
             None => self.entries.push(directory),
         }
         self.window.reveal();
+    }
+
+    /// Whether focus stands on the first row.
+    pub(super) fn focuses_first(&self) -> bool {
+        self.focus == 0
+    }
+
+    /// Whether focus stands on the row past the last entry, where a new one
+    /// is added.
+    pub(super) fn focuses_addition(&self) -> bool {
+        self.focus == self.entries.len()
+    }
+
+    /// Moves focus to the first row.
+    pub(super) fn focus_first(&mut self) {
+        self.move_focus(self.rows() - self.focus);
+    }
+
+    /// Moves focus to the row past the last entry, where a new one is added.
+    pub(super) fn focus_addition(&mut self) {
+        self.move_focus(self.entries.len() + self.rows() - self.focus);
     }
 
     pub(super) fn select_previous(&mut self) {
