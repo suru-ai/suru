@@ -372,7 +372,7 @@ fn model_picker_hands_off_to_ordered_options_and_applies_complete_landing_select
     let options = rendered_application_rows(&application);
     assert!(options.join("\n").contains("Model Options"));
     assert!(options.join("\n").contains("Configurable GPT"));
-    assert!(options.join("\n").contains("Provider Codex"));
+    assert!(options.join("\n").contains("Configurable GPT · Codex"));
     assert!(rendered_row(&options, "Reasoning") < rendered_row(&options, "Fast"));
     assert!(options.join("\n").contains("Reasoning · Low"));
     assert!(options.join("\n").contains("Fast · Off"));
@@ -546,7 +546,7 @@ fn landing_model_picker_groups_sorts_focuses_and_searches_models() {
         .expect("load cached Model catalog");
 
     let rows = rendered_application_rows(&application);
-    assert!(rendered_row(&rows, "Provider alpha") < rendered_row(&rows, "Provider zeta"));
+    assert!(heading_row(&rows, "alpha") < heading_row(&rows, "zeta"));
     assert!(rendered_row(&rows, "Alpha Pro") < rendered_row(&rows, "Default"));
     let default = rows
         .iter()
@@ -1513,7 +1513,7 @@ fn model_picker_draws_no_row_at_all_for_a_provider_the_user_turned_off() {
         .expect("merge the re-enabled Provider");
     let rows = rendered_application_rows(&application);
     assert!(
-        rows.join("\n").contains("Provider codex"),
+        has_heading(&rows, "codex"),
         "the Provider returns to the list the moment it is enabled, got {}",
         rows.join("\n")
     );
@@ -1573,7 +1573,7 @@ fn model_picker_keeps_an_unavailable_provider_with_no_models_in_the_list() {
     let rows = rendered_application_rows(&application);
     let screen = rows.join("\n");
     assert!(
-        screen.contains("Provider codex"),
+        has_heading(&rows, "codex"),
         "a Provider with no Models still keeps its place, got {screen}"
     );
     assert!(
@@ -1581,11 +1581,11 @@ fn model_picker_keeps_an_unavailable_provider_with_no_models_in_the_list() {
         "its reason stands in for the Models it has none of, got {screen}"
     );
     assert!(
-        rendered_row(&rows, "Provider codex") < rendered_row(&rows, "Retry codex"),
+        heading_row(&rows, "codex") < rendered_row(&rows, "Retry codex"),
         "the reason sits under its own Provider, got {screen}"
     );
     assert!(
-        rendered_row(&rows, "Retry codex") < rendered_row(&rows, "Provider other"),
+        rendered_row(&rows, "Retry codex") < heading_row(&rows, "other"),
         "the available Provider follows rather than absorbing the reason, got {screen}"
     );
     assert!(
@@ -1828,13 +1828,14 @@ fn model_picker_shows_provider_display_names_from_the_catalog() {
         })
         .expect("load catalog carrying display names");
 
-    let screen = rendered_application_rows(&application).join("\n");
+    let rows = rendered_application_rows(&application);
+    let screen = rows.join("\n");
     assert!(
-        screen.contains("Provider Codex"),
+        has_heading(&rows, "Codex"),
         "the heading reads the display name, got {screen}"
     );
     assert!(
-        !screen.contains("Provider codex"),
+        !screen.contains("codex"),
         "the wire identifier never reaches the screen, got {screen}"
     );
     assert!(
@@ -1845,6 +1846,24 @@ fn model_picker_shows_provider_display_names_from_the_catalog() {
         !screen.contains("Retry copilot"),
         "the retry row never falls back to the wire identifier, got {screen}"
     );
+}
+
+/// Whether a Provider's heading is drawn: a row naming it, with nothing after
+/// but what it says of its catalog.
+fn has_heading(rows: &[String], provider: &str) -> bool {
+    rows.iter().any(|row| is_heading(row, provider))
+}
+
+/// The row a Provider's heading is drawn on.
+fn heading_row(rows: &[String], provider: &str) -> usize {
+    rows.iter()
+        .position(|row| is_heading(row, provider))
+        .unwrap_or_else(|| panic!("rendered frame did not head {provider:?}"))
+}
+
+fn is_heading(row: &str, provider: &str) -> bool {
+    let row = row.trim().trim_matches('│').trim();
+    row == provider || row.starts_with(&format!("{provider} · "))
 }
 
 /// The Models a picker of thirty draws, top to bottom, and which of them row

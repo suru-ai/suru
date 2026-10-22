@@ -2038,8 +2038,8 @@ fn the_derivation_step_offers_the_providers_default_and_off_above_the_models_of_
     };
     assert!(
         position("Provider's default") < position("  Off")
-            && position("  Off") < position("Provider Codex")
-            && position("Provider Codex") < position("GPT-5 Mini"),
+            && position("  Off") < position("Codex")
+            && position("Codex") < position("GPT-5 Mini"),
         "the two named values come first, above the Provider and its Models: {rows:#?}"
     );
     assert!(rows.iter().any(|row| row.contains("GPT-5 ·")), "{rows:#?}");
@@ -2074,7 +2074,7 @@ fn the_derivation_step_follows_enablement_and_availability_as_they_change() {
     deliver_catalog(&mut application, catalog);
     let installed = screen(&application);
     assert!(
-        installed.contains("Provider Claude") && installed.contains("Claude Model"),
+        installed.contains("Claude") && installed.contains("Claude Model"),
         "Claude, installed since, offers its Model: {installed}"
     );
 
@@ -2346,11 +2346,11 @@ fn a_warning_or_refreshing_provider_still_offers_its_models_on_the_derivation_st
 
     let shown = screen(&application);
     assert!(
-        shown.contains("Provider Codex") && shown.contains("GPT-5 Mini"),
+        shown.contains("Codex") && shown.contains("GPT-5 Mini"),
         "a Provider with a warning is usable, so its Models are offered: {shown}"
     );
     assert!(
-        shown.contains("Provider Claude · refreshing") && shown.contains("Claude Model"),
+        shown.contains("Claude · refreshing") && shown.contains("Claude Model"),
         "as are those of one whose catalog is being read again: {shown}"
     );
 }

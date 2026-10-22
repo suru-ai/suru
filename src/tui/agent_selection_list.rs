@@ -430,10 +430,7 @@ impl AgentSelectionList {
                 )),
                 AgentSelectionRow::Provider { name, refreshing } => lines.push(Line::styled(
                     truncate_to_width(
-                        &format!(
-                            "Provider {name}{}",
-                            if refreshing { " · refreshing" } else { "" }
-                        ),
+                        &format!("{name}{}", if refreshing { " · refreshing" } else { "" }),
                         usize::from(width),
                     ),
                     theme.accent.primary.add_modifier(Modifier::BOLD),

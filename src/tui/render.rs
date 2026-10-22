@@ -3294,7 +3294,7 @@ fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
         lines.push(Line::styled(
             truncate_to_width(
                 &format!(
-                    "{} · Provider {}{unavailable}",
+                    "{} · {}{unavailable}",
                     model.display_name,
                     state.model_picker.provider_display_name(&model.provider)
                 ),

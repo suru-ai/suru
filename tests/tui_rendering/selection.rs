@@ -311,7 +311,7 @@ fn model_options_copy_multiple_painted_rows_and_manual_copy_clears_the_highlight
         .unwrap();
     assert_eq!(
         copied,
-        ApplicationTransition::CopyToClipboard("Sample 界🙂 Model · Provider Codex\n› Fast".into())
+        ApplicationTransition::CopyToClipboard("Sample 界🙂 Model · Codex\n› Fast".into())
     );
     assert!(
         !rendered_application_buffer(&application, 100, 32)[first]
