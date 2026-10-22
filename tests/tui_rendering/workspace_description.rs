@@ -20,7 +20,7 @@ use suru::{
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
 
-const WIDE: u16 = 100;
+const WIDE: u16 = 108;
 const TALL: u16 = 30;
 
 /// A Workspace path rooted per platform, so a fixture reads as an absolute

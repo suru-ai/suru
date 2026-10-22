@@ -26,7 +26,7 @@ use suru::{
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 24;
 /// The launch width of the Aside, rule included.
-const ASIDE_WIDTH: u16 = 32;
+const ASIDE_WIDTH: u16 = 40;
 
 /// The tree fixture's Sessions: a top-level Session with two Subagents of its
 /// own, the first of which spawned one more.
@@ -269,7 +269,7 @@ fn entries_run_depth_first_over_two_lines_with_guides_marker_title_name_and_a_fi
             "Subagents 3 (1 active)",
             "Map every seam",
             "├ ✓ Map the provider seams",
-            "│ │ Explore               12s",
+            "│ │ Explore                       12s",
             "│ └ ⠋ Check the mapped seams",
             "│     Review",
             "└ ✓ Weigh the options",
@@ -353,8 +353,8 @@ fn the_title_has_the_first_line_and_the_name_and_time_the_second() {
     assert_eq!(
         rows[2..4],
         [
-            "└ ✓ Chart every Provider sea…",
-            "    Cartographer          12s",
+            "└ ✓ Chart every Provider seam the or…",
+            "    Cartographer                  12s",
         ],
         "the Title has the whole of its line, and the name stands whole beneath it \
          beside the time: {rows:#?}"
@@ -382,7 +382,7 @@ fn a_subagents_confirmed_model_follows_its_name_and_an_unconfirmed_one_is_left_u
         rows[2..8],
         [
             "├ ✓ Map the provider seams",
-            "│ │ Explore · sonnet      12s",
+            "│ │ Explore · sonnet              12s",
             "│ └ ⠋ Check the mapped seams",
             "│     Review",
             "└ × Weigh the options",
@@ -518,7 +518,7 @@ fn a_brokered_subagents_entry_shows_the_model_its_provider_confirmed_and_its_out
         entry_lines(&application, "Scout"),
         [
             "└ × Survey the Claude seam",
-            "    Scout · gpt-5 · Failed 3s"
+            "    Scout · gpt-5 · Failed         3s"
         ],
         "once settled it wears its outcome, named after the Model, and its final time"
     );
@@ -544,13 +544,13 @@ fn at_the_launch_width_the_name_is_left_out_before_the_model_is_cut() {
     };
 
     assert_eq!(
-        detail_line("Cartographer", Some("sonnet")),
-        "    Cartographer · sonnet 12s",
+        detail_line("Cartographer", Some("claude-haiku-4")),
+        "    Cartographer · claude-haiku-4 12s",
         "a name and Model that just fit beside the time are both drawn whole"
     );
     assert_eq!(
-        detail_line("Cartographer", Some("claude-sonnet-4-5")),
-        "    claude-sonnet-4-5     12s",
+        detail_line("Cartographer", Some("claude-sonnet-4-5-20250929")),
+        "    claude-sonnet-4-5-20250929    12s",
         "where both do not fit, the name is left out and the Model stands whole"
     );
     assert_eq!(
@@ -558,12 +558,12 @@ fn at_the_launch_width_the_name_is_left_out_before_the_model_is_cut() {
             "Cartographer",
             Some("claude-sonnet-4-5-with-an-astronomically-long-suffix")
         ),
-        "    claude-sonnet-4-5-wi… 12s",
+        "    claude-sonnet-4-5-with-an-as… 12s",
         "a Model too long for the line alone gives way to the time"
     );
     assert_eq!(
-        detail_line("Cartographer-of-every-seam", None),
-        "    Cartographer-of-ever… 12s",
+        detail_line("Cartographer-of-every-provider-seam", None),
+        "    Cartographer-of-every-provid… 12s",
         "with no Model known, a name too long for the line gives way to the time as ever"
     );
 }
@@ -652,9 +652,9 @@ fn the_last_settle_in_a_branch_moves_it_behind_newer_settled_siblings() {
             "├ ✓ Weigh the options",
             "│   Plan",
             "└ ✓ Map the provider seams",
-            "  │ Explore               12s",
+            "  │ Explore                       12s",
             "  └ × Check the mapped seams",
-            "      Review · Failed      3s",
+            "      Review · Failed              3s",
         ],
         "with nothing in it working, the branch falls in behind its newer settled \
          sibling, and the settled entry wears its outcome — named beside its name, \
@@ -908,8 +908,10 @@ fn pressing_the_transcript_hands_the_asides_keys_to_the_composer() {
     let mut application = connected_application(workspace.path());
     deliver_settings(&mut application, EffectiveSettings::default());
     enter_session(&mut application, workspace.path());
+    // Wide enough for the Sidebar and the Aside both at their launch widths.
+    let width = 140;
     let aside_rule = |application: &Application| {
-        rendered_application_buffer(application, WIDTH, HEIGHT)[(WIDTH - ASIDE_WIDTH, 0)].fg
+        rendered_application_buffer(application, width, HEIGHT)[(width - ASIDE_WIDTH, 0)].fg
     };
     let resting = aside_rule(&application);
     invoke(&mut application, SemanticCommandId::AsideToggle);
@@ -919,7 +921,7 @@ fn pressing_the_transcript_hands_the_asides_keys_to_the_composer() {
         "the Aside takes the keys"
     );
 
-    click(&mut application, (WIDTH / 3, 2));
+    click(&mut application, (width / 2, 2));
     assert_eq!(
         aside_rule(&application),
         resting,
@@ -927,7 +929,7 @@ fn pressing_the_transcript_hands_the_asides_keys_to_the_composer() {
     );
     type_terminal_text(&mut application, "zq");
     assert!(
-        rendered_application_rows_at(&application, WIDTH, HEIGHT)
+        rendered_application_rows_at(&application, width, HEIGHT)
             .join("\n")
             .contains("zq"),
         "and gives them to the composer"
@@ -941,23 +943,23 @@ fn the_aside_is_squeezed_out_before_the_sidebar() {
     deliver_settings(&mut application, EffectiveSettings::default());
     enter_session(&mut application, workspace.path());
 
-    let both = rendered_application_rows_at(&application, 118, HEIGHT);
-    assert_eq!(both[0].chars().nth(118 - 32), Some('│'), "{both:#?}");
+    let both = rendered_application_rows_at(&application, 134, HEIGHT);
+    assert_eq!(both[0].chars().nth(134 - 40), Some('│'), "{both:#?}");
     assert!(both.join("\n").contains("Subagents"));
 
-    let squeezed = rendered_application_rows_at(&application, 109, HEIGHT);
+    let squeezed = rendered_application_rows_at(&application, 117, HEIGHT);
     assert!(
         !squeezed.join("\n").contains("Subagents"),
         "a terminal too narrow for all three drops the Aside first"
     );
     assert_eq!(
-        squeezed[0].chars().nth(31),
+        squeezed[0].chars().nth(39),
         Some('│'),
         "and keeps the Sidebar at its width"
     );
 
     assert!(
-        rendered_application_rows_at(&application, 118, HEIGHT)
+        rendered_application_rows_at(&application, 134, HEIGHT)
             .join("\n")
             .contains("Subagents"),
         "growing the terminal brings the Aside back"
@@ -975,31 +977,34 @@ fn the_edge_drags_and_a_double_click_resets_the_width() {
             .chars()
             .position(|character| character == '│')
     };
-    assert_eq!(rule_column(&application), Some(usize::from(WIDTH - 32)));
+    assert_eq!(
+        rule_column(&application),
+        Some(usize::from(WIDTH - ASIDE_WIDTH))
+    );
     rendered_application_buffer(&application, WIDTH, HEIGHT);
 
     mouse(
         &mut application,
         MouseEventKind::Down(MouseButton::Left),
-        (WIDTH - 32, 10),
+        (WIDTH - ASIDE_WIDTH, 10),
     );
     assert_eq!(
         mouse(
             &mut application,
             MouseEventKind::Drag(MouseButton::Left),
-            (WIDTH - 40, 10),
+            (WIDTH - 48, 10),
         ),
         ApplicationTransition::Continue,
         "a pointer resize is view state"
     );
     let held = rendered_application_buffer(&application, WIDTH, HEIGHT);
-    assert_eq!(held[(WIDTH - 40, 0)].fg, Color::Cyan, "the held edge");
+    assert_eq!(held[(WIDTH - 48, 0)].fg, Color::Cyan, "the held edge");
     mouse(
         &mut application,
         MouseEventKind::Up(MouseButton::Left),
-        (WIDTH - 40, 10),
+        (WIDTH - 48, 10),
     );
-    assert_eq!(rule_column(&application), Some(usize::from(WIDTH - 40)));
+    assert_eq!(rule_column(&application), Some(usize::from(WIDTH - 48)));
 
     for kind in [
         MouseEventKind::Down(MouseButton::Left),
@@ -1007,11 +1012,11 @@ fn the_edge_drags_and_a_double_click_resets_the_width() {
         MouseEventKind::Down(MouseButton::Left),
         MouseEventKind::Up(MouseButton::Left),
     ] {
-        mouse(&mut application, kind, (WIDTH - 40, 10));
+        mouse(&mut application, kind, (WIDTH - 48, 10));
     }
     assert_eq!(
         rule_column(&application),
-        Some(usize::from(WIDTH - 32)),
+        Some(usize::from(WIDTH - ASIDE_WIDTH)),
         "a double-click on the edge returns the Aside to its launch width"
     );
 
@@ -1021,7 +1026,10 @@ fn the_edge_drags_and_a_double_click_resets_the_width() {
     );
     assert_eq!(rule_column(&application), Some(usize::from(WIDTH - 50)));
     invoke(&mut application, SemanticCommandId::AsideWidthReset);
-    assert_eq!(rule_column(&application), Some(usize::from(WIDTH - 32)));
+    assert_eq!(
+        rule_column(&application),
+        Some(usize::from(WIDTH - ASIDE_WIDTH))
+    );
 }
 
 /// A top-level Session whose active Turn spawned one working Subagent.
@@ -1280,9 +1288,9 @@ fn a_tree_that_cannot_be_read_says_so_until_a_session_of_it_is_opened_again() {
     assert_eq!(
         rows[1..4],
         [
-            "Error: Could not load",
-            "Subagents: Session does not",
-            "exist on this server instance",
+            "Error: Could not load Subagents:",
+            "Session does not exist on this server",
+            "instance",
         ],
         "the Section says why it has no tree: {rows:#?}"
     );
@@ -1719,7 +1727,7 @@ fn a_settled_entry_working_again_counts_up_from_its_earlier_turns_and_stands_at_
         entry_lines(&application, "Explore"),
         [
             "└ ✓ Map the provider seams",
-            "  │ Explore               12s"
+            "  │ Explore                       12s"
         ],
         "settled, the older branch stands after its newer sibling"
     );
@@ -1772,7 +1780,7 @@ fn a_settled_entry_working_again_counts_up_from_its_earlier_turns_and_stands_at_
         settled,
         [
             "└ × Map the provider seams",
-            "  │ Explore · Failed   1m 17s"
+            "  │ Explore · Failed           1m 17s"
         ],
         "settled again, it falls back behind its newer sibling and wears the latest \
          Turn's outcome over all its Turns' time"
@@ -1954,6 +1962,7 @@ fn needs_intervention_stands_in_the_warning_colour_on_the_owning_entry_only() {
     snapshot.top_level.working_since = Some(before_start(30_000));
     snapshot.subagents[1].working_since = Some(before_start(5_000));
     snapshot.subagents[1].needs_intervention = true;
+    snapshot.subagents[1].name = "Reviewer of every seam".to_owned();
     deliver_tree(
         &mut application,
         tree.top,
@@ -1962,7 +1971,7 @@ fn needs_intervention_stands_in_the_warning_colour_on_the_owning_entry_only() {
 
     let rows = aside_rows(&application, WIDTH);
     assert!(
-        rows[4].starts_with("│ └ ⠋ ") && rows[5] == "│     Rev… Needs Intervention",
+        rows[4].starts_with("│ └ ⠋ ") && rows[5] == "│     Reviewer of… Needs Intervention",
         "the nested Subagent whose own Session waits says so in its time's place, its \
          name giving way: {rows:#?}"
     );
@@ -2033,10 +2042,15 @@ fn needs_intervention_stands_in_the_warning_colour_on_the_owning_entry_only() {
 /// The Aside rows painted with row focus: the focus block's background at the
 /// Aside's first content column.
 fn focused_aside_rows(application: &Application) -> Vec<String> {
-    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
-    let rows = aside_rows(application, WIDTH);
+    focused_aside_rows_at(application, WIDTH)
+}
+
+/// [`focused_aside_rows`] read off a frame `width` columns wide.
+fn focused_aside_rows_at(application: &Application, width: u16) -> Vec<String> {
+    let buffer = rendered_application_buffer(application, width, HEIGHT);
+    let rows = aside_rows(application, width);
     (0..HEIGHT)
-        .filter(|row| buffer[(WIDTH - ASIDE_WIDTH + 2, *row)].bg == Color::Blue)
+        .filter(|row| buffer[(width - ASIDE_WIDTH + 2, *row)].bg == Color::Blue)
         .map(|row| rows[usize::from(row)].trim_end().to_owned())
         .collect()
 }
@@ -2124,7 +2138,7 @@ fn esc_hands_the_keys_back_and_focus_begins_again_on_the_open_entry() {
         focused_aside_rows(&application),
         [
             "├ ✓ Map the provider seams",
-            "│ │ Explore               12s"
+            "│ │ Explore                       12s"
         ]
     );
 
@@ -2205,7 +2219,10 @@ fn focus_follows_its_entry_through_spawns_settles_and_a_fresh_tree() {
     );
     assert_eq!(
         focused_aside_rows(&application),
-        ["├ × Weigh the options", "│ │ Plan · Failed          1s"],
+        [
+            "├ × Weigh the options",
+            "│ │ Plan · Failed                  1s"
+        ],
         "nor does a spawn below it, which moves its now working branch ahead of the \
          older one, or its own settle, whose spawn now hangs from the rule its second \
          line carries"
@@ -2226,7 +2243,7 @@ fn focus_follows_its_entry_through_spawns_settles_and_a_fresh_tree() {
         focused_aside_rows(&application),
         [
             "└ ✓ Map the provider seams",
-            "  │ Explore               12s"
+            "  │ Explore                       12s"
         ],
         "the entry now standing where Plan stood"
     );
@@ -2244,21 +2261,24 @@ fn focus_is_painted_only_while_the_aside_holds_the_keys() {
     invoke(&mut application, SemanticCommandId::AsideToggle);
     assert_eq!(focused_aside_rows(&application), ["Map every seam"]);
 
+    // Read wide enough for the Sidebar, the main view and the Aside all at
+    // their launch widths, so the Sidebar's arrival squeezes nothing.
+    let all_three = 134;
     invoke(&mut application, SemanticCommandId::SidebarToggle);
     assert!(
-        focused_aside_rows(&application).is_empty(),
+        focused_aside_rows_at(&application, all_three).is_empty(),
         "the Sidebar taking the keys takes them, and the paint, from the Aside"
     );
     invoke(&mut application, SemanticCommandId::AsideToggle);
     assert_eq!(
-        focused_aside_rows(&application),
+        focused_aside_rows_at(&application, all_three),
         ["Map every seam"],
         "and the Aside takes them back"
     );
 
     invoke(&mut application, SemanticCommandId::SettingsOpen);
     assert!(
-        focused_aside_rows(&application).is_empty(),
+        focused_aside_rows_at(&application, all_three).is_empty(),
         "an overlay outranks the Aside, so its focus is not painted beneath it"
     );
 }

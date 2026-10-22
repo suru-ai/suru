@@ -849,7 +849,7 @@ mod aside {
     const WIDTH: u16 = 120;
     const HEIGHT: u16 = 24;
     /// The launch width of the Aside, rule included.
-    const ASIDE_WIDTH: u16 = 32;
+    const ASIDE_WIDTH: u16 = 40;
 
     /// A connected client on the Landing whose Settings show the Aside, with
     /// the Sidebar kept off the frame, and a presentation clock the test

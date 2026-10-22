@@ -219,7 +219,7 @@ async fn describe_setting_says_what_each_kind_of_setting_holds_and_accepts() {
             "{\n",
             "  \"appearance\": { \"mode\": \"dark\" },\n",
             "  \"derivation\": { \"errand\": { \"provider\": \"claude\", \"model\": \"claude-opus-4-5\", \"options\": [] } },\n",
-            "  \"sidebar\": { \"initialWidth\": 40 }\n",
+            "  \"sidebar\": { \"initialWidth\": 48 }\n",
             "}\n",
         ),
     );
@@ -273,8 +273,8 @@ async fn describe_setting_says_what_each_kind_of_setting_holds_and_accepts() {
             &width["accepts"]
         ),
         (
+            &json!(48),
             &json!(40),
-            &json!(32),
             &json!(true),
             &json!("an integer of at least 24")
         ),
@@ -1036,7 +1036,7 @@ async fn set_setting_pins_and_unpins_numbers_text_and_agent_selections() {
     let selection = json!({ "provider": "claude", "model": "claude-opus-4-5", "options": [] });
 
     for (key, value, default) in [
-        ("sidebar.initialWidth", json!(40), json!(32)),
+        ("sidebar.initialWidth", json!(48), json!(40)),
         ("appearance.theme", json!("tokyonight"), json!("system")),
         ("derivation.errand", selection.clone(), json!("session")),
         ("session.contentWidth", json!(120), json!(80)),

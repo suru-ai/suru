@@ -60,14 +60,14 @@ fn the_sidebar_stands_beside_the_landing_and_the_main_view_takes_what_is_left() 
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     assert!(
         sidebar_is_drawn(&rows),
-        "the Sidebar takes its default 32-column left column, divided down the frame: {rows:?}"
+        "the Sidebar takes its default 40-column left column, divided down the frame: {rows:?}"
     );
     let landing = rendered_row(&rows, "Type a prompt");
     assert!(
         rows[landing]
             .find("Type a prompt")
             .expect("the composer is drawn")
-            > 31,
+            > 39,
         "the Landing lays itself out in the columns the Sidebar left: {:?}",
         rows[landing]
     );
@@ -82,7 +82,7 @@ fn the_sidebar_stands_beside_an_open_session_too() {
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     let composer = rendered_row(&rows, "┌");
     assert!(
-        rows[composer].find('┌').expect("the composer is drawn") > 31,
+        rows[composer].find('┌').expect("the composer is drawn") > 39,
         "an open Session lays itself out in the columns the Sidebar left: {:?}",
         rows[composer]
     );
@@ -1446,7 +1446,7 @@ fn the_landing_footer_is_spread_across_the_columns_the_sidebar_left() {
         rows[footer]
             .find("Connected")
             .expect("the connection status is drawn")
-            > 31,
+            > 39,
         "the footer is laid out in the main view, not the whole frame: {:?}",
         rows[footer]
     );
@@ -1530,14 +1530,14 @@ fn every_edge_grab_column_holds_focus_paint_until_release_without_opening_a_row(
     use super::selection::mouse;
 
     let workspace = workspace_dir();
-    for column in 30..=32 {
+    for column in 38..=40 {
         let mut application = sidebar_showing(
             workspace.path(),
             vec![listed("Work behind the grab", workspace.path(), 1, now())],
         );
         let row = drawn_at(&application, "Work behind the grab");
         let before = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
-        assert_eq!(before[(31, row)].fg, Color::DarkGray);
+        assert_eq!(before[(39, row)].fg, Color::DarkGray);
 
         assert_eq!(
             mouse(
@@ -1549,7 +1549,7 @@ fn every_edge_grab_column_holds_focus_paint_until_release_without_opening_a_row(
         );
         let held = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
         assert_eq!(
-            held[(31, row)].fg,
+            held[(39, row)].fg,
             Color::Cyan,
             "grab column {column} paints the edge in the Theme focus color"
         );
@@ -1564,7 +1564,7 @@ fn every_edge_grab_column_holds_focus_paint_until_release_without_opening_a_row(
             "release is neither a row click nor a Selection copy"
         );
         let released = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
-        assert_eq!(released[(31, row)].fg, Color::DarkGray);
+        assert_eq!(released[(39, row)].fg, Color::DarkGray);
         assert!(
             crate::support::buffer_rows(&released)
                 .iter()
@@ -1652,7 +1652,7 @@ fn edge_dragging_stops_at_the_sidebar_and_current_main_view_floors() {
     mouse(
         &mut minimum,
         MouseEventKind::Down(MouseButton::Left),
-        (31, 0),
+        (39, 0),
     );
     assert_eq!(
         mouse(
@@ -1675,7 +1675,7 @@ fn edge_dragging_stops_at_the_sidebar_and_current_main_view_floors() {
     mouse(
         &mut maximum,
         MouseEventKind::Down(MouseButton::Left),
-        (31, 0),
+        (39, 0),
     );
     assert_eq!(
         mouse(
@@ -1759,7 +1759,7 @@ fn transcript_and_composer_drags_that_cross_the_edge_never_resize_it() {
     enter_session(&mut transcript, workspace.path());
     let transcript_buffer = rendered_application_buffer(&transcript, WIDE, PRESS_HEIGHT);
     let prompt = text_position(&transcript_buffer, "Initial Prompt");
-    assert!(prompt.0 > 32, "the Selection begins past the grab zone");
+    assert!(prompt.0 > 40, "the Selection begins past the grab zone");
     mouse(
         &mut transcript,
         MouseEventKind::Down(MouseButton::Left),
@@ -1770,7 +1770,7 @@ fn transcript_and_composer_drags_that_cross_the_edge_never_resize_it() {
         MouseEventKind::Drag(MouseButton::Left),
         (20, prompt.1),
     );
-    assert_eq!(drawn_sidebar_width(&transcript, WIDE), Some(32));
+    assert_eq!(drawn_sidebar_width(&transcript, WIDE), Some(40));
     assert!(matches!(
         mouse(
             &mut transcript,
@@ -1786,7 +1786,7 @@ fn transcript_and_composer_drags_that_cross_the_edge_never_resize_it() {
     let composer_buffer = rendered_application_buffer(&composer, WIDE, PRESS_HEIGHT);
     let draft = text_position(&composer_buffer, "composer drag stays text");
     assert!(
-        draft.0 > 32,
+        draft.0 > 40,
         "the composer gesture begins past the grab zone"
     );
     mouse(
@@ -1799,7 +1799,7 @@ fn transcript_and_composer_drags_that_cross_the_edge_never_resize_it() {
         MouseEventKind::Drag(MouseButton::Left),
         (20, draft.1),
     );
-    assert_eq!(drawn_sidebar_width(&composer, WIDE), Some(32));
+    assert_eq!(drawn_sidebar_width(&composer, WIDE), Some(40));
     mouse(
         &mut composer,
         MouseEventKind::Up(MouseButton::Left),
@@ -1994,25 +1994,25 @@ fn edge_double_click_while_the_sidebar_owns_keys_preserves_row_focus() {
     mouse(
         &mut application,
         MouseEventKind::Down(MouseButton::Left),
-        (32, older_row),
+        (40, older_row),
     );
     mouse(
         &mut application,
         MouseEventKind::Up(MouseButton::Left),
-        (32, older_row),
+        (40, older_row),
     );
     advance_opening_clock(&now, Duration::from_millis(299));
     mouse(
         &mut application,
         MouseEventKind::Down(MouseButton::Left),
-        (32, older_row),
+        (40, older_row),
     );
-    assert_eq!(drawn_sidebar_width(&application, WIDE), Some(32));
+    assert_eq!(drawn_sidebar_width(&application, WIDE), Some(40));
     assert_eq!(selected_sidebar_text(&application), focused_before);
     mouse(
         &mut application,
         MouseEventKind::Up(MouseButton::Left),
-        (32, older_row),
+        (40, older_row),
     );
     assert_eq!(
         selected_sidebar_text(&application),
@@ -2035,7 +2035,7 @@ fn holding_the_edge_moves_neither_composer_key_ownership_nor_sidebar_row_focus()
     mouse(
         &mut composing,
         MouseEventKind::Down(MouseButton::Left),
-        (31, 0),
+        (39, 0),
     );
     type_terminal_text(&mut composing, "composer keeps the keys");
     assert!(
@@ -2046,7 +2046,7 @@ fn holding_the_edge_moves_neither_composer_key_ownership_nor_sidebar_row_focus()
     mouse(
         &mut composing,
         MouseEventKind::Up(MouseButton::Left),
-        (31, 0),
+        (39, 0),
     );
 
     let mut browsing = sidebar_focused(workspace.path(), sessions);
@@ -2056,14 +2056,14 @@ fn holding_the_edge_moves_neither_composer_key_ownership_nor_sidebar_row_focus()
     mouse(
         &mut browsing,
         MouseEventKind::Down(MouseButton::Left),
-        (30, older_row),
+        (38, older_row),
     );
     assert_eq!(selected_sidebar_text(&browsing), focused_before);
     assert_eq!(
         mouse(
             &mut browsing,
             MouseEventKind::Up(MouseButton::Left),
-            (30, older_row),
+            (38, older_row),
         ),
         ApplicationTransition::Continue
     );
@@ -2094,7 +2094,7 @@ fn cells_beyond_the_grab_zone_keep_their_existing_pointer_behavior() {
     mouse(
         &mut application,
         MouseEventKind::Down(MouseButton::Left),
-        (33, prompt.1),
+        (41, prompt.1),
     );
     mouse(
         &mut application,
@@ -2121,7 +2121,7 @@ fn cells_beyond_the_grab_zone_keep_their_existing_pointer_behavior() {
         mouse(
             &mut application,
             MouseEventKind::Down(MouseButton::Left),
-            (29, blank_sidebar_row),
+            (37, blank_sidebar_row),
         ),
         ApplicationTransition::Continue
     );
@@ -2129,7 +2129,7 @@ fn cells_beyond_the_grab_zone_keep_their_existing_pointer_behavior() {
         mouse(
             &mut application,
             MouseEventKind::Up(MouseButton::Left),
-            (29, blank_sidebar_row),
+            (37, blank_sidebar_row),
         ),
         ApplicationTransition::Continue,
         "one column beyond the grab zone inside the Sidebar remains inert"
@@ -2152,17 +2152,17 @@ fn overlays_keep_edge_presses_and_never_show_held_paint() {
     mouse(
         &mut settings,
         MouseEventKind::Down(MouseButton::Left),
-        (31, 0),
+        (39, 0),
     );
     assert_eq!(
-        rendered_application_buffer(&settings, WIDE, PRESS_HEIGHT)[(31, 0)].fg,
+        rendered_application_buffer(&settings, WIDE, PRESS_HEIGHT)[(39, 0)].fg,
         Color::DarkGray,
         "Settings retains pointer ownership"
     );
     mouse(
         &mut settings,
         MouseEventKind::Up(MouseButton::Left),
-        (31, 0),
+        (39, 0),
     );
     assert!(
         !crate::support::buffer_rows(&rendered_application_buffer(&settings, WIDE, PRESS_HEIGHT))
@@ -2177,13 +2177,13 @@ fn overlays_keep_edge_presses_and_never_show_held_paint() {
     );
     open_menu_on(&mut menu, "Menu subject");
     rendered_application_buffer(&menu, WIDE, PRESS_HEIGHT);
-    mouse(&mut menu, MouseEventKind::Down(MouseButton::Left), (31, 0));
+    mouse(&mut menu, MouseEventKind::Down(MouseButton::Left), (39, 0));
     assert_eq!(
-        rendered_application_buffer(&menu, WIDE, PRESS_HEIGHT)[(31, 0)].fg,
+        rendered_application_buffer(&menu, WIDE, PRESS_HEIGHT)[(39, 0)].fg,
         Color::DarkGray,
         "the Sidebar context menu retains pointer ownership"
     );
-    mouse(&mut menu, MouseEventKind::Up(MouseButton::Left), (31, 0));
+    mouse(&mut menu, MouseEventKind::Up(MouseButton::Left), (39, 0));
     assert!(!menu_is_drawn(&menu), "the context menu handles the click");
 
     let mut subagents = sidebar_showing(workspace.path(), Vec::new());
@@ -2226,17 +2226,17 @@ fn overlays_keep_edge_presses_and_never_show_held_paint() {
     mouse(
         &mut subagents,
         MouseEventKind::Down(MouseButton::Left),
-        (31, 0),
+        (39, 0),
     );
     assert_eq!(
-        rendered_application_buffer(&subagents, WIDE, PRESS_HEIGHT)[(31, 0)].fg,
+        rendered_application_buffer(&subagents, WIDE, PRESS_HEIGHT)[(39, 0)].fg,
         Color::DarkGray,
         "the Subagent picker retains pointer ownership"
     );
     mouse(
         &mut subagents,
         MouseEventKind::Up(MouseButton::Left),
-        (31, 0),
+        (39, 0),
     );
     assert!(
         !crate::support::buffer_rows(&rendered_application_buffer(&subagents, WIDE, PRESS_HEIGHT))
@@ -2257,9 +2257,9 @@ fn hidden_and_squeezed_sidebars_leave_no_edge_grab_geometry() {
     mouse(
         &mut hidden,
         MouseEventKind::Down(MouseButton::Left),
-        (31, 0),
+        (39, 0),
     );
-    mouse(&mut hidden, MouseEventKind::Up(MouseButton::Left), (31, 0));
+    mouse(&mut hidden, MouseEventKind::Up(MouseButton::Left), (39, 0));
     let request = expect_sidebar_listing(press_toggle(&mut hidden));
     hidden
         .handle_event(ApplicationEvent::SessionsListed {
@@ -2268,7 +2268,7 @@ fn hidden_and_squeezed_sidebars_leave_no_edge_grab_geometry() {
         })
         .expect("hydrate the shown Sidebar");
     assert_eq!(
-        rendered_application_buffer(&hidden, WIDE, PRESS_HEIGHT)[(31, 0)].fg,
+        rendered_application_buffer(&hidden, WIDE, PRESS_HEIGHT)[(39, 0)].fg,
         Color::Gray,
         "the hidden frame supplied no stale grab zone"
     );
@@ -2278,15 +2278,15 @@ fn hidden_and_squeezed_sidebars_leave_no_edge_grab_geometry() {
     mouse(
         &mut squeezed,
         MouseEventKind::Down(MouseButton::Left),
-        (31, 0),
+        (39, 0),
     );
     mouse(
         &mut squeezed,
         MouseEventKind::Up(MouseButton::Left),
-        (31, 0),
+        (39, 0),
     );
     assert_eq!(
-        rendered_application_buffer(&squeezed, WIDE, PRESS_HEIGHT)[(31, 0)].fg,
+        rendered_application_buffer(&squeezed, WIDE, PRESS_HEIGHT)[(39, 0)].fg,
         Color::DarkGray,
         "squeeze-out clears the previous frame's grab zone"
     );
@@ -2491,7 +2491,7 @@ fn expect_sidebar_listing(transition: ApplicationTransition) -> suru::tui::Sessi
 /// how a Sidebar on screen is told from the composer's own box borders.
 fn sidebar_is_drawn(rows: &[String]) -> bool {
     rows.iter()
-        .all(|row| row.chars().nth(31) == Some('\u{2502}'))
+        .all(|row| row.chars().nth(39) == Some('\u{2502}'))
 }
 
 fn sidebar_divider_column(rows: &[String]) -> Option<usize> {
@@ -3430,7 +3430,7 @@ fn step_onto_the_list(application: &mut Application) {
 /// The Sidebar text this frame draws on `background`, read across the columns
 /// the Sidebar occupies so the main view beside it contributes nothing.
 fn sidebar_text_on(application: &Application, background: Color) -> String {
-    text_on(application, background, (WIDE, 20), 0..31)
+    text_on(application, background, (WIDE, 20), 0..39)
 }
 
 /// The Sidebar row the reader is on while they are driving the Sidebar.
@@ -3443,7 +3443,7 @@ fn open_sidebar_text(application: &Application) -> String {
     let buffer = rendered_application_buffer(application, WIDE, 20);
     (0..20)
         .map(|row| {
-            (0..31)
+            (0..39)
                 .filter_map(|column| buffer.cell((column, row)))
                 .filter(|cell| cell.fg == Color::Cyan)
                 .map(|cell| cell.symbol())
@@ -8445,7 +8445,7 @@ const BEING_READ: &str = "The work being read";
 /// The first column of the main view, past the Sidebar's own columns and the
 /// divider closing them, so a row listed in the column is never mistaken for
 /// one drawn beside it.
-const MAIN_VIEW_COLUMN: usize = 32;
+const MAIN_VIEW_COLUMN: usize = 40;
 
 /// The two rows every optimistic-opening reading works over: the Session the
 /// reader is leaving, and the one above it they open.
@@ -8798,11 +8798,11 @@ fn attach_failure_immediately_keeps_the_target_shell_and_draws_a_transcript_erro
     let rows = main_view_rows(&application);
     let screen = rows.join("\n");
     assert!(
-        screen.contains("Error: Could not load Session: the remote transport refused"),
+        screen.contains("Error: Could not load Session: the remote transport"),
         "the failed shell immediately uses the Transcript error language: {screen}"
     );
     assert!(
-        screen.contains("attach because the Session disappeared"),
+        screen.contains("refused to attach because the Session disappeared"),
         "the attach detail wraps instead of being truncated: {screen}"
     );
     assert_eq!(
@@ -9732,7 +9732,7 @@ fn sidebar_selection_copies_painted_titles_with_ellipsis_and_excludes_rails() {
     let second = text_position(&buffer, "Second title");
     let expected = (first.1.min(second.1)..=first.1.max(second.1))
         .map(|y| {
-            (1..30)
+            (1..38)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
                 .trim_end()
@@ -9745,11 +9745,11 @@ fn sidebar_selection_copies_painted_titles_with_ellipsis_and_excludes_rails() {
         drag(
             &mut application,
             (1, first.1.min(second.1)),
-            (29, first.1.max(second.1))
+            (37, first.1.max(second.1))
         ),
         ApplicationTransition::CopyToClipboard(expected.into())
     );
-    for position in [(0, first.1), (31, first.1), (70, PRESS_HEIGHT - 1)] {
+    for position in [(0, first.1), (39, first.1), (70, PRESS_HEIGHT - 1)] {
         mouse(
             &mut application,
             MouseEventKind::Down(MouseButton::Left),
@@ -10701,7 +10701,7 @@ fn the_landing_after_opening_a_remote_row_names_its_branch() {
     let rows = rendered_application_rows_at(&application, WIDE, 20);
     let landing = rows
         .iter()
-        .map(|row| row.chars().skip(32).collect::<String>())
+        .map(|row| row.chars().skip(40).collect::<String>())
         .find(|row| row.contains("studio · "))
         .expect("the Landing names the Remote it stands on");
     assert!(landing.contains("studio-branch"), "{}", rows.join("\n"));

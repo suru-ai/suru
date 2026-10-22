@@ -357,7 +357,7 @@ fn a_failed_proposal_says_why_and_keeps_the_text() {
     let text = drawn(&application);
     assert!(text.contains("› Wanted work"), "{text}");
     assert!(
-        text.contains("Could not derive a Title: the Provider did not answer in time"),
+        text.contains("Could not derive a Title: the Provider did not answer…"),
         "{text}"
     );
 }

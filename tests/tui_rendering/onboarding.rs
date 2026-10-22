@@ -62,7 +62,7 @@ fn offered_onboarding(workspace: &Path) -> Application {
 }
 
 fn screen(application: &Application) -> String {
-    rendered_application_rows_at(application, 100, 24).join("\n")
+    rendered_application_rows_at(application, 108, 24).join("\n")
 }
 
 fn press(application: &mut Application, code: KeyCode) -> ApplicationTransition {
@@ -736,7 +736,7 @@ fn drag(
 
 /// The line the Providers step draws for `provider`'s row.
 fn provider_row(application: &Application, provider: &str) -> String {
-    let rows = rendered_application_rows_at(application, 100, 24);
+    let rows = rendered_application_rows_at(application, 108, 24);
     rows.iter()
         .find(|row| row.contains(&format!("] {provider}")))
         .unwrap_or_else(|| panic!("no row for {provider}: {}", rows.join("\n")))
@@ -758,7 +758,7 @@ fn provider_row_text(application: &Application, provider: &str) -> String {
 fn the_providers_step_lists_every_built_in_provider_ticked_on_a_fresh_install() {
     let workspace = workspace_dir();
     let application = offered_onboarding(workspace.path());
-    let rows = rendered_application_rows_at(&application, 100, 24);
+    let rows = rendered_application_rows_at(&application, 108, 24);
     let order = ["Codex", "Copilot", "Claude"].map(|provider| {
         rows.iter()
             .position(|row| row.contains(&format!("[x] {provider}")))
@@ -2000,7 +2000,7 @@ fn on_the_derivation_step(workspace: &Path, settings: EffectiveSettings) -> Appl
 
 /// The row of the Derivation step Row Focus stands on.
 fn focused_row(application: &Application) -> String {
-    let rows = rendered_application_rows_at(application, 100, 24);
+    let rows = rendered_application_rows_at(application, 108, 24);
     rows.iter()
         .find(|row| row.contains('›'))
         .unwrap_or_else(|| panic!("the Derivation step focused nothing: {rows:#?}"))
@@ -2030,7 +2030,7 @@ fn the_derivation_step_offers_the_providers_default_and_off_above_the_models_of_
         workspace.path(),
         settings_deriving_with(DerivationErrand::FollowSession),
     );
-    let rows = rendered_application_rows_at(&application, 100, 24);
+    let rows = rendered_application_rows_at(&application, 108, 24);
     let position = |needle: &str| {
         rows.iter()
             .position(|row| row.contains(needle))
@@ -2630,7 +2630,7 @@ fn an_acknowledged_pin_moves_the_mark_of_the_value_in_force() {
     );
 
     press(&mut application, KeyCode::Left);
-    let rows = rendered_application_rows_at(&application, 100, 24);
+    let rows = rendered_application_rows_at(&application, 108, 24);
     let row = |label: &str| {
         rows.iter()
             .find(|row| row.contains(label))
@@ -2663,7 +2663,7 @@ fn codex_listing(before: usize) -> ModelCatalog {
 
 /// The rows the Derivation step draws, from its first to its last.
 fn derivation_rows(application: &Application) -> Vec<String> {
-    let rows = rendered_application_rows_at(application, 100, 24);
+    let rows = rendered_application_rows_at(application, 108, 24);
     let first = rows
         .iter()
         .position(|row| row.contains("Which Agent Selection derives"))
@@ -3162,7 +3162,7 @@ fn the_icons_step_draws_its_sample_glyphs_with_show_icons_off() {
     deliver_settings(&mut application, with_show_icons(false));
     on_the_icons_step(&mut application);
 
-    let rows = rendered_application_rows_at(&application, 100, 24);
+    let rows = rendered_application_rows_at(&application, 108, 24);
     let sample = rows
         .iter()
         .find(|row| row.contains(SAMPLE_GLYPHS[0]))

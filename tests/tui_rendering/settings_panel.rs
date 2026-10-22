@@ -3486,8 +3486,8 @@ fn the_aside_rows_stand_in_general_beside_the_sidebars_and_visibility_cycles() {
 
     focus_setting(&mut application, "aside.initialWidth");
     assert!(
-        row(&application, "Aside width at launch").contains("32 columns [default]"),
-        "and begins 32 columns wide"
+        row(&application, "Aside width at launch").contains("40 columns [default]"),
+        "and begins 40 columns wide"
     );
 }
 

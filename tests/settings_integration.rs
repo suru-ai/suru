@@ -1045,7 +1045,7 @@ async fn sidebar_initial_width_loads_without_a_product_level_maximum_and_resets(
         .mutate_setting(SettingMutation::SidebarInitialWidth { value: None })
         .await
         .expect("reset Sidebar width at launch");
-    assert_eq!(reset.settings.sidebar.initial_width, 32);
+    assert_eq!(reset.settings.sidebar.initial_width, 40);
     assert_eq!(reset.pinned, [] as [String; 0]);
 
     drop(client);
@@ -1073,7 +1073,7 @@ async fn a_sidebar_width_below_the_floor_is_ignored_individually_with_a_diagnost
     .expect("spawn server");
 
     let (_, snapshot) = attach(state_dir.path(), "settings-sidebar-width-invalid").await;
-    assert_eq!(snapshot.settings.sidebar.initial_width, 32);
+    assert_eq!(snapshot.settings.sidebar.initial_width, 40);
     assert_eq!(
         snapshot.settings.transcript.reasoning_visibility,
         ReasoningVisibility::Shown,
@@ -1156,7 +1156,7 @@ async fn aside_initial_width_pins_from_a_document_and_resets_to_its_default() {
     let (client, opening) = attach(state_dir.path(), "settings-aside-width").await;
     assert_eq!(opening.settings.aside.initial_width, 48);
     assert_eq!(
-        opening.settings.sidebar.initial_width, 32,
+        opening.settings.sidebar.initial_width, 40,
         "the Aside's width is its own, not the Sidebar's"
     );
     assert_eq!(opening.pinned, ["aside.initialWidth"]);
@@ -1173,7 +1173,7 @@ async fn aside_initial_width_pins_from_a_document_and_resets_to_its_default() {
         .mutate_setting(SettingMutation::AsideInitialWidth { value: None })
         .await
         .expect("reset Aside width at launch");
-    assert_eq!(reset.settings.aside.initial_width, 32);
+    assert_eq!(reset.settings.aside.initial_width, 40);
     assert_eq!(reset.pinned, [] as [String; 0]);
 
     drop(client);
@@ -1201,7 +1201,7 @@ async fn an_aside_width_below_the_floor_is_ignored_individually_with_a_diagnosti
     .expect("spawn server");
 
     let (_, snapshot) = attach(state_dir.path(), "settings-aside-width-invalid").await;
-    assert_eq!(snapshot.settings.aside.initial_width, 32);
+    assert_eq!(snapshot.settings.aside.initial_width, 40);
     assert_eq!(
         snapshot.settings.transcript.reasoning_visibility,
         ReasoningVisibility::Shown,

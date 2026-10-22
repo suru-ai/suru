@@ -33,7 +33,7 @@ use suru::{
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 30;
 /// The launch width of the Aside, rule included.
-const ASIDE_WIDTH: u16 = 32;
+const ASIDE_WIDTH: u16 = 40;
 /// The glyph a Workspace with no Icon is named beside.
 const FOLDER: char = '\u{ea83}';
 /// The glyph of the Icon Catalog's `md-bug`.
@@ -319,7 +319,7 @@ fn a_sidekicks_tree_is_headed_sessions_and_lists_them_working_first_then_by_its_
             "Sessions 5 (2 active)",
             "Plan the week",
             "├ ✓ Survey the Sessions",
-            "│   Explore               12s",
+            "│   Explore                       12s",
             "├ ⠋ Untangle the build",
             "│ │ build",
             "│ │ gpt-5.5",
@@ -327,10 +327,10 @@ fn a_sidekicks_tree_is_headed_sessions_and_lists_them_working_first_then_by_its_
             "│     Probe",
             "├ ✓ Fix the flaky login test",
             "│   auth",
-            "│   sonnet                45s",
+            "│   sonnet                        45s",
             "└ × Tidy the docs",
             "    docs",
-            "    gpt-5.5 · Stopped      3s",
+            "    gpt-5.5 · Stopped              3s",
             "",
         ],
         "headed Sessions and counted the usual way, the Sidekick's own Subagent \
@@ -443,18 +443,18 @@ fn an_act_moves_its_session_up_and_settled_work_moves_down_but_stays_drawn_as_se
             "Sessions 5",
             "Plan the week",
             "├ ✓ Survey the Sessions",
-            "│   Explore               12s",
+            "│   Explore                       12s",
             "├ × Tidy the docs",
             "│   docs",
-            "│   gpt-5.5 · Stopped      3s",
+            "│   gpt-5.5 · Stopped              3s",
             "├ ✓ Fix the flaky login test",
             "│   auth",
-            "│   sonnet                45s",
+            "│   sonnet                        45s",
             "└ × Untangle the build",
             "  │ build",
-            "  │ gpt-5.5 · Failed    1m 1s",
+            "  │ gpt-5.5 · Failed            1m 1s",
             "  └ ✓ Probe the build",
-            "      Probe                2s",
+            "      Probe                        2s",
             "",
         ],
         "settled, it falls in by its latest act and stays, wearing how it settled: \
@@ -520,32 +520,32 @@ fn where_a_line_runs_short_the_title_and_workspace_are_cut_and_the_model_gives_w
         [
             "└ × Tidy the docs",
             "    docs",
-            "    gpt-5.5 · Stopped      3s"
+            "    gpt-5.5 · Stopped              3s"
         ],
         "everything fits whole"
     );
     assert_eq!(
         entry_lines(
             "Tidy every page of the developer documentation",
-            "documentation-of-every-service",
+            "documentation-of-every-service-we-run",
             Some("gpt-5.5"),
             false,
         ),
         [
-            "└ × Tidy every page of the d…",
-            "    documentation-of-every-s…",
-            "    gpt-5.5 · Stopped      3s",
+            "└ × Tidy every page of the developer…",
+            "    documentation-of-every-service-w…",
+            "    gpt-5.5 · Stopped              3s",
         ],
         "a long Title and Workspace are each cut short with an ellipsis"
     );
     assert_eq!(
         entry_lines(
             "Tidy the docs",
-            "documentation-of-every-service",
+            "documentation-of-every-service-we-run",
             Some("gpt-5.5"),
             true,
         )[1],
-        format!("    {FOLDER} documentation-of-every…"),
+        format!("    {FOLDER} documentation-of-every-service…"),
         "where Icons are drawn the Workspace keeps its Icon and its name gives way"
     );
     assert_eq!(
@@ -555,12 +555,12 @@ fn where_a_line_runs_short_the_title_and_workspace_are_cut_and_the_model_gives_w
             Some("claude-sonnet-4-5-with-a-long-suffix"),
             false,
         )[2],
-        "    claude-sonn… · Stopped 3s",
+        "    claude-sonnet-4-5-w… · Stopped 3s",
         "a Model too long for the line gives way, never the outcome or the time"
     );
     assert_eq!(
         entry_lines("Tidy the docs", "docs", None, false)[2],
-        "    Stopped                3s",
+        "    Stopped                        3s",
         "with no Model, the outcome stands alone beside the time"
     );
 }
@@ -612,7 +612,7 @@ fn row_focus_walks_an_entry_as_one_and_enter_opens_it() {
         [
             "├ ✓ Fix the flaky login test",
             "│   auth",
-            "│   sonnet                45s"
+            "│   sonnet                        45s"
         ],
         "a step walks past a nested Subagent onto the next whole entry"
     );
@@ -1014,28 +1014,28 @@ fn a_session_on_a_remote_names_its_remote_first_which_gives_way_before_its_works
         "beside its own glyph, ahead of the Workspace's Icon"
     );
     assert_eq!(
-        remote_entry_lines("ledger-of-accts", true)[1],
-        format!("    {MONITOR} wo… · {FOLDER} ledger-of-accts"),
+        remote_entry_lines("ledger-of-every-account", true)[1],
+        format!("    {MONITOR} wo… · {FOLDER} ledger-of-every-account"),
         "where the line runs short the Remote's name is cut, its glyph kept"
     );
     assert_eq!(
-        remote_entry_lines("ledger-of-the-account", true)[1],
-        format!("    {FOLDER} ledger-of-the-account"),
+        remote_entry_lines("ledger-of-every-last-account", true)[1],
+        format!("    {FOLDER} ledger-of-every-last-account"),
         "and its glyph is left out with it"
     );
     assert_eq!(
-        remote_entry_lines("ledger-of-account", false)[1],
-        "    work… · ledger-of-account",
+        remote_entry_lines("ledger-of-the-old-account", false)[1],
+        "    work… · ledger-of-the-old-account",
         "where the line runs short the Remote's name is cut first"
     );
     assert_eq!(
-        remote_entry_lines("ledger-of-the-account", false)[1],
-        "    ledger-of-the-account",
+        remote_entry_lines("ledger-of-every-older-account", false)[1],
+        "    ledger-of-every-older-account",
         "then left out, with what parts it from the Workspace"
     );
     assert_eq!(
-        remote_entry_lines("documentation-of-every-service", false)[1],
-        "    documentation-of-every-s…",
+        remote_entry_lines("documentation-of-every-service-we-run", false)[1],
+        "    documentation-of-every-service-w…",
         "and only then is the Workspace's name cut"
     );
 }
@@ -1194,12 +1194,13 @@ fn a_subagent_whose_remote_does_not_answer_is_named_dimmed_with_nothing_of_its_w
 fn a_remote_session_whose_subagents_are_not_all_shown_says_opening_it_shows_them_all() {
     let cut = SubagentTreeSession {
         subagents_unshown: true,
+        model: Some(ModelId::new("sonnet-4-5")),
         ..remote_entry(SessionId::new(), "Bind the ledger", "ledger")
     };
     let (application, _) = sidekick_listing(cut.clone(), false);
     assert_eq!(
         aside_rows(&application)[4],
-        "    sonnet · open for all Su…",
+        "    sonnet-4-5 · open for all Subage…",
         "beside its Model, cut where the line runs short"
     );
     let (application, _) = sidekick_listing(SubagentTreeSession { model: None, ..cut }, false);
@@ -1394,12 +1395,12 @@ fn a_remote_sessions_subagents_stand_beneath_it_alone_and_open_on_its_remote() {
         [
             "├ ✓ Bind the ledger",
             "│ │ workstation · ledger",
-            "│ │ sonnet                 2s",
+            "│ │ sonnet                         2s",
             "│ └ ✓ Read the old entries",
-            "│     Explore              4s",
+            "│     Explore                      4s",
             "└ ✓ Audit the ledger",
             "    audit",
-            "    gpt-5.5                3s",
+            "    gpt-5.5                        3s",
         ],
         "the Remote's Subagent stands beneath its Remote's Session alone, which says its \
          Model and time"
@@ -1515,19 +1516,19 @@ fn selection_lines(catalog: Option<ModelCatalog>, show_icons: bool) -> [String; 
 #[test]
 fn a_sessions_provider_and_model_are_named_as_its_servers_catalog_names_them() {
     assert_eq!(
-        selection_lines(Some(catalog("Sonnet 4.5", "GPT-5.5")), false),
+        selection_lines(Some(catalog("Sonnet 4.5", "GPT-5.5 Preview")), false),
         [
-            "│   Claude · Sonnet 4.5   45s",
-            "    GPT-5.5 · Stopped      3s",
+            "│   Claude · Sonnet 4.5           45s",
+            "    GPT-5.5 Preview · Stopped      3s",
         ],
         "the Provider leads the Model, each by its name, and gives way first where the \
          line runs short"
     );
     assert_eq!(
-        selection_lines(Some(catalog("Sonnet 4.5", "GPT-5.5")), true),
+        selection_lines(Some(catalog("Sonnet 4.5", "GPT-5.5 Preview")), true),
         [
-            format!("│   {CLAUDE} Claude · Sonnet 4.5 45s"),
-            format!("    {CODEX} GPT-5.5 · Stopped    3s"),
+            format!("│   {CLAUDE} Claude · Sonnet 4.5         45s"),
+            format!("    {CODEX} GPT-5.5 Preview · Stopped    3s"),
         ],
         "where Icons are drawn the Provider stands beside its glyph, which it keeps \
          where its name gives way"
@@ -1535,8 +1536,8 @@ fn a_sessions_provider_and_model_are_named_as_its_servers_catalog_names_them() {
     assert_eq!(
         selection_lines(None, false),
         [
-            "│   Claude · sonnet       45s",
-            "    gpt-5.5 · Stopped      3s",
+            "│   Claude · sonnet               45s",
+            "    Codex · gpt-5.5 · Stopped      3s",
         ],
         "with no catalog to name it, a Model goes by what its Agent Selection calls it"
     );
@@ -1568,12 +1569,12 @@ fn a_subagents_model_is_named_as_its_servers_catalog_names_it_where_it_does() {
 
     assert_eq!(
         survey_line(Some(catalog("Sonnet 4.5", "GPT-5.5"))),
-        "│   Explore · Sonnet 4.5  12s",
+        "│   Explore · Sonnet 4.5          12s",
         "the Model the Provider confirmed goes by its catalog name"
     );
     assert_eq!(
         survey_line(None),
-        "│   Explore · sonnet      12s",
+        "│   Explore · sonnet              12s",
         "and by what the Provider called it where no catalog names it"
     );
 }

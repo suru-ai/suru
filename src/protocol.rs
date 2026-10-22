@@ -1480,7 +1480,7 @@ impl Default for SidebarSettings {
     fn default() -> Self {
         Self {
             initial_visibility: SidebarVisibility::default(),
-            initial_width: 32,
+            initial_width: 40,
             initial_scope: SidebarScope::default(),
             auto_settle: AutoSettle::default(),
         }
@@ -1500,7 +1500,7 @@ impl Default for AsideSettings {
     fn default() -> Self {
         Self {
             initial_visibility: AsideVisibility::default(),
-            initial_width: 32,
+            initial_width: 40,
         }
     }
 }

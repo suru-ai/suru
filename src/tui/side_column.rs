@@ -28,7 +28,7 @@ pub(super) const MINIMUM_COLUMN_WIDTH: u16 = 24;
 pub(super) const MINIMUM_MAIN_WIDTH: u16 = 54;
 
 /// The width a side column begins at before any Setting has had its say.
-const DEFAULT_COLUMN_WIDTH: u64 = 32;
+const DEFAULT_COLUMN_WIDTH: u64 = 40;
 
 /// Which side of the main view a column stands on. The side decides where its
 /// rule is drawn, where the grab zone of its edge lies, and which way dragging
