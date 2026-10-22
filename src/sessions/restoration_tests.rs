@@ -992,6 +992,72 @@ async fn a_whole_tree_report_covers_a_native_child_but_never_a_brokered_one() {
 }
 
 #[tokio::test]
+async fn a_sidekicks_tree_cost_carries_its_subsessions_whole_trees() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut sidekick = persisted(workspace.path(), None);
+    // The Sidekick's whole-tree report spans the Subsession's work, yet
+    // covers none of it: the Subsession ran on a Provider actor of its own.
+    sidekick.snapshot.turns = vec![priced_turn(Some(10), 0.10, subtree("sidekick-process"), 40)];
+    let sidekick_id = sidekick.snapshot.session.id;
+    let begun_by = Some(crate::protocol::Author::Sidekick {
+        session_id: sidekick_id,
+        title: "Sidekick".to_owned(),
+    });
+    let subsession_with = |turns| {
+        let mut subsession = persisted(workspace.path(), None);
+        subsession.snapshot.session.begun_by = begun_by.clone();
+        subsession.summary.session.begun_by = begun_by.clone();
+        subsession.snapshot.turns = turns;
+        subsession
+    };
+    let subsession = subsession_with(vec![priced_turn(Some(12), 0.05, CostCoverage::Turn, 15)]);
+    let subsession_id = subsession.snapshot.session.id;
+    let mut subagent = persisted(workspace.path(), Some(subsession_id));
+    subagent.snapshot.turns = vec![priced_turn(Some(20), 0.02, CostCoverage::Turn, 25)];
+    let unpriced = subsession_with(vec![turn(30, Some(35), Some(1))]);
+    let unpriced_id = unpriced.snapshot.session.id;
+    let mut user_begun = persisted(workspace.path(), None);
+    user_begun.snapshot.turns = vec![priced_turn(Some(12), 1.00, CostCoverage::Turn, 15)];
+    let (store, writer) = restore(
+        workspace.path(),
+        vec![sidekick, subsession, subagent, unpriced, user_begun],
+    )
+    .await;
+
+    assert_eq!(
+        costs(&store, sidekick_id),
+        Costs {
+            tree: known(0.17, true),
+            own: known(0.10, false),
+        },
+        "each Subsession's tree Cost adds beneath the Sidekick's, and one \
+         whose work has no Cost leaves the sum partial"
+    );
+    assert_eq!(
+        costs(&store, subsession_id),
+        Costs {
+            tree: known(0.07, false),
+            own: known(0.05, false),
+        },
+        "a Subsession's own tree Cost carries nothing of its Sidekick's"
+    );
+    assert_eq!(costs(&store, unpriced_id).tree, None);
+
+    // A Subsession deleted takes its Cost out of its Sidekick's tree Cost.
+    store.delete(subsession_id).unwrap();
+    store.delete(unpriced_id).unwrap();
+    assert_eq!(
+        costs(&store, sidekick_id),
+        Costs {
+            tree: known(0.10, false),
+            own: known(0.10, false),
+        },
+        "a deleted Subsession's Cost leaves its Sidekick's tree Cost"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_brokered_subagent_covers_its_own_native_descendants_and_counts_its_brokered_ones() {
     let workspace = tempfile::tempdir().unwrap();
     let mut parent = persisted(workspace.path(), None);

@@ -9,7 +9,10 @@ use crate::protocol::{
 
 use super::{
     SessionStoreState,
-    projection::{derived_session_status, interval_contains, work_exceeds_coverage},
+    projection::{
+        add_cost_totals, derived_session_status, interval_contains, with_unpriced_work,
+        work_exceeds_coverage,
+    },
 };
 
 impl SessionStoreState {
@@ -142,6 +145,49 @@ impl SessionStoreState {
                 intervals.insert(id, working);
             }
             cost_states.insert(id, cost_state);
+        }
+
+        // A Subsession heads a tree of its own, so the fold above never
+        // reached its Sidekick's Session; its tree Cost adds there whole,
+        // and its unpriced work leaves the sum partial, as the live
+        // derivation reads them (see `cost_total`).
+        let mut subsession_costs = HashMap::<SessionId, (Vec<CostTotal>, bool)>::new();
+        for (&id, record) in &self.sessions {
+            record_work(1);
+            let Some(sidekick) = record.summary.session.sidekick() else {
+                continue;
+            };
+            if !self
+                .sessions
+                .get(&sidekick)
+                .is_some_and(|sidekick| sidekick.summary.session.sidekick().is_none())
+            {
+                continue;
+            }
+            let (costs, unpriced) = subsession_costs.entry(sidekick).or_default();
+            match record.snapshot.total_cost {
+                Some(cost) => costs.push(cost),
+                None => {
+                    let mut subtree = vec![id];
+                    while let Some(current) = subtree.pop() {
+                        record_work(1);
+                        if !self.sessions[&current].snapshot.turns.is_empty() {
+                            *unpriced = true;
+                            break;
+                        }
+                        subtree.extend(children.get(&current).into_iter().flatten());
+                    }
+                }
+            }
+        }
+        for (sidekick, (costs, unpriced)) in subsession_costs {
+            record_work(costs.len());
+            let record = self.sessions.get_mut(&sidekick).expect("checked above");
+            let total = costs
+                .into_iter()
+                .fold(record.snapshot.total_cost, add_cost_totals);
+            record.snapshot.total_cost = with_unpriced_work(total, unpriced);
+            record.summary.total_usage = record.snapshot.total_usage();
         }
     }
 }

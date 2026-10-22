@@ -445,6 +445,23 @@ impl SessionStoreState {
                 });
             }
         }
+        // A Subsession heads a tree of its own, yet its Sidekick's tree Cost
+        // carries it too, so a move anywhere in it moves the Sidekick's. No
+        // Sidekick's Session is itself a Subsession, so this climbs once.
+        if let Some(sidekick) = ancestry
+            .listed
+            .then(|| ancestry.sessions.last())
+            .flatten()
+            .and_then(|root| self.sessions.get(root))
+            .and_then(|record| record.summary.session.sidekick())
+            .filter(|sidekick| {
+                self.sessions
+                    .get(sidekick)
+                    .is_some_and(|record| record.summary.session.sidekick().is_none())
+            })
+        {
+            self.reconcile_usage(storage, sidekick);
+        }
     }
 
     /// Everything this Session's Subagents have consumed, to any depth, and
@@ -460,9 +477,25 @@ impl SessionStoreState {
     }
 
     /// The tree Cost of this Session: its own and every descendant's, native
-    /// and brokered, to any depth, and nothing above it.
+    /// and brokered, to any depth, and the tree Cost of every Subsession its
+    /// Sidekick began here, and nothing above it. A Subsession is metered by
+    /// a Provider actor of its own, so no report of the Sidekick's covers it
+    /// and its tree Cost adds whole.
     pub(super) fn cost_total(&self, session_id: SessionId) -> Option<CostTotal> {
-        self.cost_of(&self.subtree(session_id))
+        let mut total = self.cost_of(&self.subtree(session_id));
+        let mut unpriced = false;
+        for subsession in self.subsessions_of(session_id) {
+            match self.sessions[&subsession].snapshot.total_cost {
+                Some(cost) => total = add_cost_totals(total, cost),
+                None => {
+                    unpriced |= self
+                        .subtree(subsession)
+                        .iter()
+                        .any(|id| !self.sessions[id].snapshot.turns.is_empty());
+                }
+            }
+        }
+        with_unpriced_work(total, unpriced)
     }
 
     /// The own Cost of this Session: the Provider's account of its own
@@ -886,6 +919,23 @@ pub(super) fn work_exceeds_coverage(
 
 fn add_cost(total: Option<Cost>, cost: Cost) -> Cost {
     total.map_or(cost, |total| total.saturating_add(cost))
+}
+
+/// Two tree Costs stated as one: their sum, partial where either is.
+pub(super) fn add_cost_totals(total: Option<CostTotal>, cost: CostTotal) -> Option<CostTotal> {
+    Some(total.map_or(cost, |total| CostTotal {
+        cost: total.cost.saturating_add(cost.cost),
+        is_partial: total.is_partial || cost.is_partial,
+    }))
+}
+
+/// A known total marked partial where work beside it is unpriced; an unknown
+/// total stays absent rather than becoming a zero nobody measured.
+pub(super) fn with_unpriced_work(total: Option<CostTotal>, unpriced: bool) -> Option<CostTotal> {
+    total.map(|total| CostTotal {
+        is_partial: total.is_partial || unpriced,
+        ..total
+    })
 }
 
 fn stamp_cost_measurements(changes: &mut [SessionChange], updated_at: SessionTimestamp) {

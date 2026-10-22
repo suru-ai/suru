@@ -5,8 +5,10 @@
 //! A Subsession is a top-level Session in every way that matters to its
 //! work, and nothing here makes it otherwise: it is no child of the Sidekick's
 //! Session, so its Turns keep no Sidekick Working, an interrupt or a deletion
-//! of the Sidekick's Session never reaches it, and its Usage and Cost are
-//! rolled up beneath nothing. What the Sidekick's Transcript carries of it is
+//! of the Sidekick's Session never reaches it, and its Usage is rolled up
+//! beneath nothing. Its tree Cost alone is added to the Sidekick's (see
+//! `SessionStoreState::cost_total`), so a Sidekick's Session states what the
+//! work it began has cost. What the Sidekick's Transcript carries of it is
 //! one row, standing where it was begun and leading into it, which names it
 //! by the Title it has.
 //!

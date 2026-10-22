@@ -9,7 +9,8 @@
 //! Sidekick's Transcript gains a row of its own leading into it. Otherwise it
 //! is an ordinary top-level Session: its work keeps no Sidekick Working, an
 //! interrupt or a deletion of the Sidekick's Session leaves it alone, its
-//! Usage and Cost are its own, and the user may prompt it. No Sidekick begins
+//! Usage is its own while its Cost is rolled up into the Sidekick's tree
+//! Cost, and the user may prompt it. No Sidekick begins
 //! a Session in the Sidekick Workspace, and a bare Repository's root takes
 //! one only in a new Worktree.
 //!
@@ -589,15 +590,22 @@ async fn a_subsession_works_apart_from_the_sidekick_that_began_it() {
     };
     assert_eq!(
         (sidekick_snapshot.total_cost, sidekick_snapshot.own_cost),
-        (settled(0.20), settled(0.20)),
-        "nothing the Subsession costs is rolled up beneath the Sidekick"
+        (
+            Some(CostTotal {
+                cost: usd(0.25),
+                is_partial: true,
+            }),
+            settled(0.20)
+        ),
+        "the Subsession's Cost is rolled up beneath the Sidekick's tree Cost, partial while \
+         it works, and never its own Cost"
     );
     assert_eq!(
         sidekick_snapshot
             .total_usage()
             .and_then(|total| total.output_tokens),
         Some(100),
-        "nor anything it consumes"
+        "but nothing else it consumes"
     );
     assert_eq!(
         (

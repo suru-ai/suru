@@ -2973,9 +2973,9 @@ pub struct Session {
     /// names that Peer, heading its own tree since its Sidekick is
     /// elsewhere. Unlike `parent`, it changes nothing about the
     /// Session's work — it is listed, prompted, interrupted and deleted as
-    /// any top-level Session is, and nothing it consumes is rolled up beneath
-    /// whoever began it — so it is what the Session remembers rather than
-    /// where it stands.
+    /// any top-level Session is, and of what it consumes only its tree Cost
+    /// is rolled up beneath the Sidekick's Session that began it — so it is
+    /// what the Session remembers rather than where it stands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub begun_by: Option<Author>,
 }

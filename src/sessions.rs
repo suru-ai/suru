@@ -773,6 +773,11 @@ impl SessionStore {
             .collect();
         // The Sidekicks' trees listing the Session, which it leaves.
         let listing = state.trees_listing(session_id);
+        // The Sidekick whose tree Cost carries this Session as a Subsession.
+        let sidekick = state
+            .sessions
+            .get(&session_id)
+            .and_then(|record| record.summary.session.sidekick());
         // Every Session's joins to its Attachments land first: another
         // Session's, so the deletion keeps an Attachment it has bound but not
         // yet saved, and the doomed Sessions' own, so the deletion reclaims
@@ -838,6 +843,9 @@ impl SessionStore {
         state.forget_sidekicks(&doomed);
         state.publish_catalog_change(SessionCatalogChange::Deleted { session_id });
         state.subagent_trees.invalidate(session_id);
+        if let Some(sidekick) = sidekick.filter(|sidekick| state.sessions.contains_key(sidekick)) {
+            state.reconcile_usage(&self.storage, sidekick);
+        }
         for tree in listing.into_iter().filter(|tree| *tree != session_id) {
             state.announce_tree_headed_by(tree);
         }
