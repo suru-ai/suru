@@ -411,7 +411,7 @@ impl Recheck {
 }
 
 impl ProvidersStep {
-    const INTRODUCTION: &'static str = "Which Providers Suru may use, and whether each works here.";
+    const INTRODUCTION: &'static str = "Which providers should Suru use? Enable at least one.";
 
     /// The keys this step teaches before the ones every step shares, the
     /// most needed first, since a narrow screen gives up the last of them
@@ -957,7 +957,7 @@ impl Default for DerivationStep {
 
 impl DerivationStep {
     const INTRODUCTION: &'static str =
-        "Which Agent Selection derives Titles, Icons, and branch names.";
+        "Which model is used to derive titles, icons, and branch names. Choose something cheap.";
 
     /// The keys this step teaches before the ones every step shares.
     const KEYS: [&'static str; 1] = ["↑↓ Move"];
@@ -1206,8 +1206,8 @@ pub(super) enum RootsEdit {
 
 impl RootsStep {
     const INTRODUCTION: &'static str = "Directories your work lives in. Suru lists each \
-                                        Repository directly inside one as a Workspace, and a \
-                                        Sidekick clones into them.";
+                                        repository directly inside one under /workspace. Sidekicks \
+                                        will clone new repos here.";
 
     const NOTE: &'static str = "None is fine: add Roots whenever you like in /settings, \
                                 under Source Control.";
