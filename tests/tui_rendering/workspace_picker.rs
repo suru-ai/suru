@@ -26,10 +26,10 @@ use suru::{
         EffectiveSettings, ListDirectoryRequest, ModelAvailability, ModelCatalog, ModelId, Outlook,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, RepositoryId, ResolvedWorkspace,
         Session, SessionId, SessionListItem, SessionStatus, SessionSummary, SessionTimestamp,
-        SidebarSettings, SidebarVisibility, SkillCatalog, SkillCatalogCapabilities,
-        SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillPromptDelivery,
-        Workspace, WorkspaceListing, WorkspaceListingRevision, WorkspacePaths,
-        WorkspaceUnavailability,
+        SidebarSettings, SidebarVisibility, SidekickSettings, SkillCatalog,
+        SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor,
+        SkillId, SkillPromptDelivery, Workspace, WorkspaceListing, WorkspaceListingRevision,
+        WorkspacePaths, WorkspaceUnavailability,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, DirectoryListingId,
@@ -3237,6 +3237,9 @@ fn show_sidebar(application: &mut Application, sessions: Vec<SessionListItem>) {
             sidebar: SidebarSettings {
                 initial_visibility: SidebarVisibility::Shown,
                 ..SidebarSettings::default()
+            },
+            sidekick: SidekickSettings {
+                hide_subsessions: false,
             },
             ..EffectiveSettings::default()
         },

@@ -13,6 +13,7 @@ use suru::{
 fn hide_sidebar(application: &mut Application) {
     let mut settings = EffectiveSettings::default();
     settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    settings.sidekick.hide_subsessions = false;
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
             SettingsSnapshot {

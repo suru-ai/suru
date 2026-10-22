@@ -377,8 +377,8 @@ fn subsessions_are_listed_like_any_session_until_the_reader_hides_them() {
     let mut application = sidebar_hiding(root, false, sessions);
 
     assert!(
-        !EffectiveSettings::default().sidekick.hide_subsessions,
-        "Subsessions are listed unless the reader says otherwise"
+        EffectiveSettings::default().sidekick.hide_subsessions,
+        "Subsessions are hidden unless the reader says otherwise"
     );
     assert!(listed_in_sidebar(&application, "Fixing the parser"));
     assert!(

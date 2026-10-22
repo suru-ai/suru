@@ -3492,10 +3492,10 @@ fn the_aside_rows_stand_in_general_beside_the_sidebars_and_visibility_cycles() {
 }
 
 /// Whether Subsessions are listed is the reader's own presentation, so it is a
-/// Client Setting on the General tab beside the Sidebar's: off until they say
-/// otherwise, and Space hides them.
+/// Client Setting on the General tab beside the Sidebar's: on until they say
+/// otherwise, and Space lists them.
 #[test]
-fn the_general_tab_presents_hiding_subsessions_off_by_default_beside_the_sidebars_settings() {
+fn the_general_tab_presents_hiding_subsessions_on_by_default_beside_the_sidebars_settings() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_panel(&mut application);
@@ -3508,14 +3508,14 @@ fn the_general_tab_presents_hiding_subsessions_off_by_default_beside_the_sidebar
         "it follows the Sidebar's own Settings: {rows:?}"
     );
     assert!(
-        row(&application, "Hide Subsessions").contains("false [default]"),
-        "Subsessions are listed unless the reader says otherwise: {:?}",
+        row(&application, "Hide Subsessions").contains("true [default]"),
+        "Subsessions are hidden unless the reader says otherwise: {:?}",
         row(&application, "Hide Subsessions")
     );
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        MutatesSetting(SettingMutation::SidekickHideSubsessions { value: Some(true) }),
-        "Space hides them"
+        MutatesSetting(SettingMutation::SidekickHideSubsessions { value: Some(false) }),
+        "Space lists them"
     );
     let descriptor = suru::settings::SCHEMA
         .iter()
@@ -3528,14 +3528,14 @@ fn the_general_tab_presents_hiding_subsessions_off_by_default_beside_the_sidebar
         &mut application,
         EffectiveSettings {
             sidekick: SidekickSettings {
-                hide_subsessions: true,
+                hide_subsessions: false,
             },
             ..EffectiveSettings::default()
         },
         &["sidekick.hideSubsessions"],
     );
     assert!(
-        row(&application, "Hide Subsessions").contains("true [pinned]"),
+        row(&application, "Hide Subsessions").contains("false [pinned]"),
         "the refreshed snapshot moves the row to the pin: {:?}",
         row(&application, "Hide Subsessions")
     );

@@ -14,7 +14,8 @@ use suru::{
         EffectiveSettings, ModelAvailability, Outlook, PromptId, Remote, RemoteStatus, Session,
         SessionCatalogRevision, SessionCatalogSnapshot, SessionCreated, SessionDeleted, SessionId,
         SessionListItem, SessionStatus, SessionSummary, SessionTimestamp, SessionTitleChanged,
-        SettingsSnapshot, SidebarSettings, SidebarVisibility, UnreadableSessionSummary, Workspace,
+        SettingsSnapshot, SidebarSettings, SidebarVisibility, SidekickSettings,
+        UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SessionListRequest,
@@ -808,6 +809,9 @@ fn choosing_a_foreign_picker_row_turns_and_opens_without_moving_sidebar_scope() 
                     sidebar: SidebarSettings {
                         initial_visibility: SidebarVisibility::Shown,
                         ..SidebarSettings::default()
+                    },
+                    sidekick: SidekickSettings {
+                        hide_subsessions: false,
                     },
                     ..EffectiveSettings::default()
                 },
@@ -1749,6 +1753,9 @@ fn client_showing_icons(workspace: &std::path::Path) -> Application {
                     sidebar: SidebarSettings {
                         initial_visibility: SidebarVisibility::Hidden,
                         ..SidebarSettings::default()
+                    },
+                    sidekick: SidekickSettings {
+                        hide_subsessions: false,
                     },
                     ..EffectiveSettings::default()
                 },

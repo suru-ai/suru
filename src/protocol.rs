@@ -1506,16 +1506,25 @@ impl Default for AsideSettings {
 }
 
 /// How a Client presents the work a Sidekick does on the reader's behalf.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SidekickSettings {
     /// Whether Subsessions are left out wherever Sessions are listed — the
     /// Sidebar, its search, and the Session picker, on every Server listed —
     /// and reached through their Sidekick's Session instead, whose row then
-    /// carries their Standing. Off by default, because a Subsession is as
-    /// much the reader's work as any other until they say otherwise; one
-    /// whose Sidekick's Session is gone is listed either way.
+    /// carries their Standing. On by default, because a Sidekick's
+    /// Subsessions are work it does on the reader's behalf, and listing each
+    /// of them beside the reader's own would bury it; one whose Sidekick's
+    /// Session is gone is listed either way.
     pub hide_subsessions: bool,
+}
+
+impl Default for SidekickSettings {
+    fn default() -> Self {
+        Self {
+            hide_subsessions: true,
+        }
+    }
 }
 
 /// Client presentation selected independently of whichever Server the reader

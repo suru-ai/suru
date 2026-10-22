@@ -796,12 +796,12 @@ async fn image_previews_default_on_pin_off_through_the_config_document_and_reset
     server.shutdown().await.expect("shut down server");
 }
 
-/// Subsessions are listed like any other Session until the user says
-/// otherwise, and hiding them is a pin like any other: it lands in the Config
-/// Document beside what the document already held, reaches every Client, and a
-/// reset lets the built-in default resume.
+/// Subsessions are hidden until the user says otherwise, and listing them is a
+/// pin like any other: it lands in the Config Document beside what the
+/// document already held, reaches every Client, and a reset lets the built-in
+/// default resume.
 #[tokio::test]
-async fn hiding_subsessions_defaults_off_pins_on_through_the_config_document_and_resets() {
+async fn hiding_subsessions_defaults_on_pins_off_through_the_config_document_and_resets() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
     let original = concat!(
@@ -821,16 +821,16 @@ async fn hiding_subsessions_defaults_off_pins_on_through_the_config_document_and
     let (mut editor, opening) = attach(state_dir.path(), "settings-hide-subsessions").await;
     let (mut onlooker, _) = attach(state_dir.path(), "settings-hide-subsessions").await;
     assert!(
-        !opening.settings.sidekick.hide_subsessions,
-        "Subsessions are listed like any other Session unless the user says otherwise"
+        opening.settings.sidekick.hide_subsessions,
+        "Subsessions are hidden unless the user says otherwise"
     );
     assert_eq!(opening.pinned, ["sidebar.autoSettle"]);
 
     let pinned = editor
-        .mutate_setting(SettingMutation::SidekickHideSubsessions { value: Some(true) })
+        .mutate_setting(SettingMutation::SidekickHideSubsessions { value: Some(false) })
         .await
-        .expect("hide Subsessions");
-    assert!(pinned.settings.sidekick.hide_subsessions);
+        .expect("list Subsessions");
+    assert!(!pinned.settings.sidekick.hide_subsessions);
     assert_eq!(
         pinned.settings.sidebar.auto_settle,
         AutoSettle::Off,
@@ -847,7 +847,7 @@ async fn hiding_subsessions_defaults_off_pins_on_through_the_config_document_and
     }
     let document = config_document(config_dir.path());
     assert!(
-        document.contains("\"hideSubsessions\": true"),
+        document.contains("\"hideSubsessions\": false"),
         "the pin lands in the Config Document: {document}"
     );
     assert!(
@@ -861,7 +861,7 @@ async fn hiding_subsessions_defaults_off_pins_on_through_the_config_document_and
         .await
         .expect("reset hiding Subsessions");
     assert!(
-        !reset.settings.sidekick.hide_subsessions,
+        reset.settings.sidekick.hide_subsessions,
         "unpinning it lets the built-in default resume"
     );
     assert_eq!(reset.pinned, ["sidebar.autoSettle"]);

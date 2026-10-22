@@ -4322,7 +4322,11 @@ mod tests {
 
     fn driven() -> (Sidebar, SessionListRequest) {
         let mut sidebar = Sidebar::new(root());
-        sidebar.adopt_settings(&settling_nothing());
+        // Listing Subsessions like any Session, so turning toward a Remote
+        // asks that Remote alone rather than this Server for its Sidekicks too.
+        let mut settings = settling_nothing();
+        settings.sidekick.hide_subsessions = false;
+        sidebar.adopt_settings(&settings);
         // The Setting revealed it without taking the keys, so the reader
         // reaches it themselves.
         sidebar.toggle(None);

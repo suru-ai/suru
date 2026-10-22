@@ -32,9 +32,9 @@ use suru::{
         SessionReference, SessionRevision, SessionSettings, SessionSettlementChanged,
         SessionStandingInputs, SessionStandingInputsChanged, SessionStatus, SessionSummary,
         SessionTimestamp, SessionTitleChanged, SessionUpdate, SessionWorkingChanged,
-        ShutdownReason, SidebarScope, SidebarSettings, SidebarVisibility, SubagentInterventions,
-        SubagentTreeEntry, SubagentTreeRevision, SubagentTreeSnapshot, SubagentTreeTopLevel,
-        TextSelectionCopy, TurnStatus, UnreadableSessionSummary, Workspace,
+        ShutdownReason, SidebarScope, SidebarSettings, SidebarVisibility, SidekickSettings,
+        SubagentInterventions, SubagentTreeEntry, SubagentTreeRevision, SubagentTreeSnapshot,
+        SubagentTreeTopLevel, TextSelectionCopy, TurnStatus, UnreadableSessionSummary, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -2416,6 +2416,9 @@ fn deliver_sidebar_settings(
         application,
         EffectiveSettings {
             sidebar,
+            sidekick: SidekickSettings {
+                hide_subsessions: false,
+            },
             ..EffectiveSettings::default()
         },
     )
