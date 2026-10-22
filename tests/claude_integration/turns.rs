@@ -283,7 +283,7 @@ async fn a_prompt_streams_a_claude_message_into_the_transcript_and_settles_the_t
     };
     uuid::Uuid::parse_str(&flag_value("--session-id"))
         .expect("the provider-session identifier is the UUID Suru minted");
-    assert_eq!(flag_value("--permission-mode"), "default");
+    assert_eq!(flag_value("--permission-mode"), "auto");
     assert_eq!(
         flag_value("--model"),
         "default",

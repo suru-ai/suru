@@ -2476,27 +2476,34 @@ async fn copilot_permissions_default_pins_through_the_config_document_and_resets
     let (client, initial) = attach(state_dir.path(), "settings-copilot-permissions").await;
     assert_eq!(
         initial.settings.provider.copilot.permissions,
-        CopilotPermissions::Ask
+        CopilotPermissions::Auto
     );
-    let pinned = client
-        .mutate_setting(SettingMutation::ProviderCopilotPermissions {
-            value: Some(CopilotPermissions::AllowAll),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        pinned.settings.provider.copilot.permissions,
-        CopilotPermissions::AllowAll
-    );
-    assert_eq!(pinned.pinned, ["provider.copilot.permissions"]);
-    assert!(config_document(config_dir.path()).contains("\"permissions\": \"allowAll\""));
+
+    for (permissions, wire) in [
+        (CopilotPermissions::Ask, "ask"),
+        (CopilotPermissions::Auto, "auto"),
+        (CopilotPermissions::AllowAll, "allowAll"),
+    ] {
+        let pinned = client
+            .mutate_setting(SettingMutation::ProviderCopilotPermissions {
+                value: Some(permissions),
+            })
+            .await
+            .unwrap();
+        assert_eq!(pinned.settings.provider.copilot.permissions, permissions);
+        assert_eq!(pinned.pinned, ["provider.copilot.permissions"]);
+        assert!(
+            config_document(config_dir.path()).contains(&format!("\"permissions\": \"{wire}\""))
+        );
+    }
+
     let reset = client
         .mutate_setting(SettingMutation::ProviderCopilotPermissions { value: None })
         .await
         .unwrap();
     assert_eq!(
         reset.settings.provider.copilot.permissions,
-        CopilotPermissions::Ask
+        CopilotPermissions::Auto
     );
     assert_eq!(reset.pinned, [] as [String; 0]);
     drop(client);
@@ -2517,7 +2524,7 @@ async fn claude_permission_mode_defaults_pins_through_the_config_document_and_re
     let (client, initial) = attach(state_dir.path(), "settings-claude-permission-mode").await;
     assert_eq!(
         initial.settings.provider.claude.permission_mode,
-        ClaudePermissionMode::Default
+        ClaudePermissionMode::Auto
     );
 
     for (mode, wire) in [
@@ -2548,7 +2555,7 @@ async fn claude_permission_mode_defaults_pins_through_the_config_document_and_re
         .unwrap();
     assert_eq!(
         reset.settings.provider.claude.permission_mode,
-        ClaudePermissionMode::Default
+        ClaudePermissionMode::Auto
     );
     assert_eq!(reset.pinned, [] as [String; 0]);
     drop(client);

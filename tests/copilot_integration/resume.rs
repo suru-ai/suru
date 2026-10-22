@@ -225,11 +225,13 @@ async fn a_reopened_session_resumes_its_persisted_copilot_session_after_a_restar
         [
             "connect",
             "session.create",
+            "session.permissions.setMode",
             "session.model.getCurrent",
             "session.send",
             "connect",
             "session.resume",
             "session.skills.reload",
+            "session.permissions.setMode",
             "session.model.getCurrent",
             "session.send",
         ],

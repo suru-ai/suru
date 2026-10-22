@@ -20,13 +20,14 @@ A brokered Subagent on a Provider other than its spawner's takes its Approval Po
 | Codex | never with read-only or workspace-write | 3 |
 | Codex | never with danger-full-access | 4 |
 | Copilot | ask | 1 |
+| Copilot | auto | 2 |
 | Copilot | allowAll | 4 |
 
 | Level | Claude | Codex | Copilot |
 |---|---|---|---|
 | 1 | default | untrusted, workspace-write | ask |
-| 2 | acceptEdits | on-request, workspace-write | ask |
-| 3 | dontAsk | never, workspace-write | ask |
+| 2 | acceptEdits | on-request, workspace-write | auto |
+| 3 | dontAsk | never, workspace-write | auto |
 | 4 | bypassPermissions | never, danger-full-access | allowAll |
 
 ## Considered Options
@@ -36,6 +37,6 @@ A brokered Subagent on a Provider other than its spawner's takes its Approval Po
 
 ## Consequences
 
-- Copilot has no unattended-contained value, so a Copilot child under a dontAsk or never/workspace-write parent raises Interventions rather than running free.
-- Claude's auto sits at level 2 because its classifier still asks; Codex's read-only sandboxes collapse into levels 1 and 3 because neither other Provider can say read-only.
+- Copilot has no unattended-contained value, so a Copilot child under a dontAsk or never/workspace-write parent runs under its safety judge and raises Interventions where the judge does not recommend approving, rather than running free.
+- Claude's auto and Copilot's auto sit at level 2 because their classifier and judge still ask; Codex's read-only sandboxes collapse into levels 1 and 3 because neither other Provider can say read-only.
 - The table is a constant, not a Setting; changing a cell is a code change recorded here.

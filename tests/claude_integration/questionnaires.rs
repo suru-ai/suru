@@ -108,7 +108,7 @@ async fn claude_batches_preserve_metadata_and_deliver_multiple_choices_with_cust
     );
     let launch = fixture.launch_carrying("--session-id");
     assert!(!launch.carries("--dangerously-skip-permissions"));
-    assert_eq!(launch.value("--permission-mode"), "default");
+    assert_eq!(launch.value("--permission-mode"), "auto");
     assert_eq!(
         flag_value(&launch.arguments, "--permission-prompt-tool"),
         "stdio"

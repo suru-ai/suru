@@ -2806,7 +2806,7 @@ fn copilot_permissions_appear_under_the_copilot_provider() {
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
     let permissions = row(&application, "Permissions");
     assert!(
-        permissions.contains("ask") && permissions.contains("[default]"),
+        permissions.contains("auto") && permissions.contains("[default]"),
         "{permissions:?}"
     );
     let rows = rendered_application_rows(&application);
@@ -2827,7 +2827,7 @@ fn claude_permission_mode_appears_under_the_claude_provider() {
 
     let permission = row(&application, "Permission mode");
     assert!(
-        permission.contains("default") && permission.contains("[default]"),
+        permission.contains("auto") && permission.contains("[default]"),
         "{permission:?}"
     );
     let rows = rendered_application_rows(&application);

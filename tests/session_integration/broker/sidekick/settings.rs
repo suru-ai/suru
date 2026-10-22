@@ -326,7 +326,7 @@ async fn describe_setting_says_what_each_kind_of_setting_holds_and_accepts() {
     let posture = describe(&mut sidekick, "provider.claude.permissionMode").await;
     assert_eq!(
         (&posture["value"], &posture["settable"]),
-        (&json!("default"), &json!(false)),
+        (&json!("auto"), &json!(false)),
         "a Setting an Approval Posture is made of is read, and said to be no Sidekick's to \
          change: {posture}"
     );

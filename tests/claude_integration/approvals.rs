@@ -102,7 +102,7 @@ async fn an_existing_session_applies_permission_mode_over_the_native_control_cha
             live.session_id,
             UpdateApprovalPostureRequest {
                 posture: Some(ApprovalPosture::Claude {
-                    permission_mode: ClaudePermissionMode::Auto,
+                    permission_mode: ClaudePermissionMode::AcceptEdits,
                 }),
             },
         )
@@ -137,11 +137,11 @@ async fn an_existing_session_applies_permission_mode_over_the_native_control_cha
         1,
         "changing posture does not restart Claude"
     );
-    assert_eq!(sessions[0].value("--permission-mode"), "default");
+    assert_eq!(sessions[0].value("--permission-mode"), "auto");
     assert!(fixture.requests().iter().any(|request| {
         request["type"] == "control_request"
             && request["request"]["subtype"] == "set_permission_mode"
-            && request["request"]["mode"] == "auto"
+            && request["request"]["mode"] == "acceptEdits"
     }));
     live.shutdown().await;
 }
@@ -175,7 +175,7 @@ async fn a_failed_live_mode_update_is_visible_and_retried_without_restarting_on_
     )
     .await;
     let requested = ApprovalPosture::Claude {
-        permission_mode: ClaudePermissionMode::Auto,
+        permission_mode: ClaudePermissionMode::AcceptEdits,
     };
     let error = live
         .client

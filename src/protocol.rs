@@ -1602,8 +1602,12 @@ impl Default for CopilotSettings {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CopilotPermissions {
-    #[default]
     Ask,
+    /// Copilot's assisted mode: its safety judge reviews each request, and
+    /// Suru approves the ones the judge recommends approving and asks for the
+    /// rest.
+    #[default]
+    Auto,
     AllowAll,
 }
 
@@ -1626,11 +1630,11 @@ impl Default for ClaudeSettings {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ClaudePermissionMode {
-    #[default]
     Default,
     AcceptEdits,
     DontAsk,
     BypassPermissions,
+    #[default]
     Auto,
 }
 
@@ -2069,7 +2073,8 @@ impl ApprovalPosture {
             },
             Self::Copilot { permissions } => Self::Copilot {
                 permissions: match permissions {
-                    CopilotPermissions::Ask => CopilotPermissions::AllowAll,
+                    CopilotPermissions::Ask => CopilotPermissions::Auto,
+                    CopilotPermissions::Auto => CopilotPermissions::AllowAll,
                     CopilotPermissions::AllowAll => CopilotPermissions::Ask,
                 },
             },
@@ -2101,6 +2106,7 @@ impl ApprovalPosture {
                 "Copilot {}",
                 match permissions {
                     CopilotPermissions::Ask => "ask",
+                    CopilotPermissions::Auto => "auto",
                     CopilotPermissions::AllowAll => "allowAll",
                 }
             ),

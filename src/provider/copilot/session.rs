@@ -178,6 +178,7 @@ pub(super) async fn start_copilot_session(
         }
     };
     let native = Arc::new(native);
+    approvals.adopt_posture(&native, permissions).await;
     let current = until_crash(&handle, context, native.rpc().model().get_current()).await?;
     let in_force = agent_selection(current);
     let selection = match &in_force {
@@ -852,7 +853,9 @@ impl ProviderSession for CopilotSession {
                     "Approval Posture belongs to another Provider",
                 ));
             };
-            self.approvals.adopt_posture(permissions);
+            self.approvals
+                .adopt_posture(&self.native, permissions)
+                .await;
             Ok(crate::provider::ProviderPostureApplication::Applied)
         })
     }
@@ -895,7 +898,9 @@ impl ProviderSession for CopilotSession {
             if let Some(crate::protocol::ApprovalPosture::Copilot { permissions }) =
                 input.approval_posture.as_ref()
             {
-                self.approvals.adopt_posture(*permissions);
+                self.approvals
+                    .adopt_posture(&self.native, *permissions)
+                    .await;
             }
             // The interrupt still at work on the Turn before must stop nothing of this one.
             let resolved = self.interrupter.resolved().await;

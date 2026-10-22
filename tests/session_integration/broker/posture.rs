@@ -55,6 +55,14 @@ fn codex_asking() -> ApprovalPosture {
     )
 }
 
+/// Codex's level-2 value: routine work in the workspace runs; going beyond it asks.
+fn codex_routine() -> ApprovalPosture {
+    codex(
+        CodexApprovalPolicy::OnRequest,
+        CodexSandboxMode::WorkspaceWrite,
+    )
+}
+
 /// Codex's level-3 value: nothing asks, and nothing leaves the workspace.
 fn codex_contained() -> ApprovalPosture {
     codex(CodexApprovalPolicy::Never, CodexSandboxMode::WorkspaceWrite)
@@ -293,8 +301,9 @@ async fn a_brokered_subagents_posture_is_refused_as_inherited_when_set_on_the_su
         &mut delegating.hosted.codex,
         "codex-agent",
         codex_selection("high"),
-        codex_asking(),
-        "a Claude Session following its default Setting spawns a Codex Subagent that asks",
+        codex_routine(),
+        "a Claude Session following its default Setting, auto, spawns a Codex Subagent that runs \
+         routine work",
     )
     .await;
 
@@ -317,7 +326,7 @@ async fn a_brokered_subagents_posture_is_refused_as_inherited_when_set_on_the_su
     }
     assert_eq!(
         posture_of(&descriptor, child_id).await,
-        applied(codex_asking(), false),
+        applied(codex_routine(), false),
         "and the Subagent still reads what it derived from its spawner"
     );
 
@@ -348,8 +357,8 @@ async fn a_settings_change_the_spawner_follows_is_derived_again_for_its_brokered
         &mut delegating.hosted.codex,
         "codex-agent",
         codex_selection("high"),
-        codex_asking(),
-        "Claude's default Setting reads as Codex's asking value, not Codex's own default",
+        codex_routine(),
+        "Claude's default Setting, auto, reads as Codex's level-2 value",
     )
     .await;
 

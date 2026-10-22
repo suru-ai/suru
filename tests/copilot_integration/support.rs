@@ -195,7 +195,8 @@ pub fn unknown_method_arm() -> String {
 }
 
 /// A `session.create` arm answering with the identifier Suru generated for the Session, and holding
-/// on to it so the arms that follow can address their events at that Session.
+/// on to it so the arms that follow can address their events at that Session. It brings the
+/// permission-mode arm with it, because every Session Suru opens sets one.
 pub fn create_session_arm() -> String {
     r#"    *'"method":"session.create"'*)
       sid=$(printf '%s' "$body" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
@@ -203,6 +204,7 @@ pub fn create_session_arm() -> String {
       ;;
 "#
     .to_owned()
+        + &permission_mode_arm()
 }
 
 /// A `session.resume` arm answering with the identifier Suru asked to resume, and holding on to it
@@ -212,6 +214,18 @@ pub fn resume_session_arm() -> String {
     r#"    *'"method":"session.resume"'*)
       sid=$(printf '%s' "$body" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
       reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"sessionId":"'"$sid"'"}}'
+      ;;
+"#
+    .to_owned()
+        + &permission_mode_arm()
+}
+
+/// A `session.permissions.setMode` arm applying whichever mode Suru asks for, as a CLI whose
+/// policy permits every mode does.
+pub fn permission_mode_arm() -> String {
+    r#"    *'"method":"session.permissions.setMode"'*)
+      mode=$(printf '%s' "$body" | sed -n 's/.*"mode":"\([^"]*\)".*/\1/p')
+      reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"mode":"'"$mode"'","success":true}}'
       ;;
 "#
     .to_owned()

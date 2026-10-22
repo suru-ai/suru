@@ -93,7 +93,7 @@ async fn hydration_brings_an_unpinned_posture_up_to_the_current_settings() {
 
     store.hydrate(child_id).await.unwrap();
 
-    let expected = claude_posture(ClaudePermissionMode::Default);
+    let expected = claude_posture(ClaudePermissionMode::Auto);
     assert_eq!(
         snapshot(&store, root_id).session.approval_posture,
         Some(expected)
@@ -202,7 +202,7 @@ async fn reconciling_one_session_refreshes_its_tree_and_no_other() {
     );
     assert_eq!(
         snapshot(&store, other_id).session.approval_posture,
-        Some(claude_posture(ClaudePermissionMode::Default)),
+        Some(claude_posture(ClaudePermissionMode::Auto)),
         "an unrelated root is not this reconcile's to refresh"
     );
     writer.shutdown().await.unwrap();
@@ -277,12 +277,12 @@ async fn a_brokered_subagent_read_back_by_the_next_process_keeps_its_own_actor_a
     assert_eq!(store.actor_owner(child_id), Some(child_id), "and after");
     assert_eq!(
         snapshot(&store, root_id).session.approval_posture,
-        Some(claude_posture(ClaudePermissionMode::Default)),
+        Some(claude_posture(ClaudePermissionMode::Auto)),
         "its spawner catches up with the Settings as ever"
     );
     let derived = SessionApprovalPosture {
         value: codex_posture(
-            CodexApprovalPolicy::Untrusted,
+            CodexApprovalPolicy::OnRequest,
             CodexSandboxMode::WorkspaceWrite,
         ),
         pinned: false,
@@ -350,25 +350,25 @@ async fn each_level_of_a_tree_derives_from_the_level_above_it() {
         ),
         "Claude's dontAsk reads as Codex's never within the workspace, the root's pin carried"
     );
-    let asks = ApprovalPosture::Copilot {
-        permissions: crate::protocol::CopilotPermissions::Ask,
+    let judged = ApprovalPosture::Copilot {
+        permissions: crate::protocol::CopilotPermissions::Auto,
     };
     assert_eq!(
         snapshot(&store, copilot_id).session.approval_posture,
-        reading(asks, true),
-        "Copilot has no contained value that runs unasked, so it asks"
+        reading(judged, true),
+        "Copilot has no contained value that runs unasked, so its judge still asks"
     );
-    let default = ApprovalPosture::Claude {
-        permission_mode: ClaudePermissionMode::Default,
+    let routine = ApprovalPosture::Claude {
+        permission_mode: ClaudePermissionMode::AcceptEdits,
     };
     assert_eq!(
         snapshot(&store, claude_id).session.approval_posture,
-        reading(default, true),
-        "and a Claude Subagent beneath it reads what Copilot's ask is, not the root's dontAsk"
+        reading(routine, true),
+        "and a Claude Subagent beneath it reads what Copilot's auto is, not the root's dontAsk"
     );
     assert_eq!(
         snapshot(&store, native_id).session.approval_posture,
-        reading(default, true),
+        reading(routine, true),
         "a native Subagent reads the posture of the brokered one whose actor it rides"
     );
     writer.shutdown().await.unwrap();

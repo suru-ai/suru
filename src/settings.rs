@@ -1865,6 +1865,12 @@ pub const SCHEMA: &[SettingDescriptor] = &[
                 },
             },
             SettingChoice {
+                value: "auto",
+                build_mutation: || SettingMutation::ProviderCopilotPermissions {
+                    value: Some(CopilotPermissions::Auto),
+                },
+            },
+            SettingChoice {
                 value: "allowAll",
                 build_mutation: || SettingMutation::ProviderCopilotPermissions {
                     value: Some(CopilotPermissions::AllowAll),
@@ -3027,7 +3033,7 @@ mod tests {
                 "one of \"untrusted\", \"on-request\", or \"never\"".to_owned(),
                 "one of \"read-only\", \"workspace-write\", or \"danger-full-access\"".to_owned(),
                 "one of true or false".to_owned(),
-                "one of \"ask\" or \"allowAll\"".to_owned(),
+                "one of \"ask\", \"auto\", or \"allowAll\"".to_owned(),
                 "one of true or false".to_owned(),
                 "one of \"default\", \"acceptEdits\", \"dontAsk\", \"bypassPermissions\", or \"auto\"".to_owned(),
                 "one of false or true".to_owned(),

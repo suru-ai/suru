@@ -315,7 +315,12 @@ async fn a_prompt_streams_a_copilot_message_into_the_transcript_and_settles_the_
             .into_iter()
             .filter(|method| method.starts_with("session."))
             .collect::<Vec<_>>(),
-        ["session.create", "session.model.getCurrent", "session.send"],
+        [
+            "session.create",
+            "session.permissions.setMode",
+            "session.model.getCurrent",
+            "session.send"
+        ],
         "a Session already on Copilot's Model needs no Model switch"
     );
 
@@ -374,6 +379,7 @@ async fn a_turn_selected_under_another_model_switches_copilot_onto_it_first() {
             .collect::<Vec<_>>(),
         [
             "session.create",
+            "session.permissions.setMode",
             "session.model.getCurrent",
             "session.model.list",
             "session.model.switchTo",

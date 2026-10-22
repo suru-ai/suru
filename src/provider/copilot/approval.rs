@@ -7,8 +7,9 @@ use std::{
 };
 
 use github_copilot_sdk::{
-    PermissionDecision, PermissionDecisionApproveOnce, PermissionDecisionReject,
-    PermissionRequestData, PermissionRequestKind, RequestId, SessionId,
+    PermissionDecision, PermissionDecisionApproveOnce, PermissionDecisionContext,
+    PermissionDecisionOutcome, PermissionDecisionReject, PermissionDecisionSource,
+    PermissionDecisionSurface, PermissionRequestData, PermissionRequestKind, RequestId, SessionId,
     handler::{PermissionHandler, PermissionResult},
     rpc::{
         PermissionDecisionApproveForSession, PermissionDecisionApproveForSessionApproval,
@@ -17,9 +18,12 @@ use github_copilot_sdk::{
         PermissionDecisionApproveForSessionApprovalMcp,
         PermissionDecisionApproveForSessionApprovalRead,
         PermissionDecisionApproveForSessionApprovalWrite, PermissionDecisionRequest,
+        PermissionsSetModeRequest,
     },
     session::Session as NativeSession,
+    session_events::{AssistedApprovalRecommendation, PermissionAssistedApproval, PermissionMode},
 };
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, mpsc};
 
@@ -44,6 +48,9 @@ struct Shared {
     pending: Mutex<Pending>,
     settlements: Arc<AsyncMutex<()>>,
     permissions: Mutex<CopilotPermissions>,
+    /// The mode Copilot's permission service last reported applying, held across the request
+    /// that changes it so postures adopted in quick succession reach Copilot in order.
+    native_mode: AsyncMutex<Option<PermissionMode>>,
     execution_directory: PathBuf,
 }
 
@@ -76,6 +83,7 @@ impl CopilotApprovals {
                 pending: Mutex::new(Pending::default()),
                 settlements: Arc::new(AsyncMutex::new(())),
                 permissions: Mutex::new(permissions),
+                native_mode: AsyncMutex::new(None),
                 execution_directory,
             }),
         }
@@ -128,12 +136,53 @@ impl CopilotApprovals {
         *pending = Pending::default();
     }
 
-    pub(super) fn adopt_posture(&self, permissions: CopilotPermissions) {
+    /// Answers requests under `permissions` from now on, and asks Copilot for the mode they
+    /// need: Auto needs Copilot's safety judge to review each request, and every other posture
+    /// needs it idle, since Suru decides those requests alone. A refusal is not the posture's
+    /// failure: without the judge's recommendation every request asks, which is where a posture
+    /// Copilot cannot honour should err.
+    pub(super) async fn adopt_posture(
+        &self,
+        native: &NativeSession,
+        permissions: CopilotPermissions,
+    ) {
+        let mut applied = self.shared.native_mode.lock().await;
         *self
             .shared
             .permissions
             .lock()
             .expect("Copilot Approval Posture lock is not poisoned") = permissions;
+        let mode = match permissions {
+            CopilotPermissions::Auto => PermissionMode::Assisted,
+            CopilotPermissions::Ask | CopilotPermissions::AllowAll => PermissionMode::Manual,
+        };
+        if applied.as_ref() == Some(&mode) {
+            return;
+        }
+        match native
+            .rpc()
+            .permissions()
+            .set_mode(PermissionsSetModeRequest {
+                assisted_approval_model: None,
+                mode: mode.clone(),
+                source: None,
+            })
+            .await
+        {
+            Ok(result) => {
+                if result.mode != mode {
+                    tracing::warn!(
+                        "Copilot applied permission mode {:?} where Suru asked for {mode:?}",
+                        result.mode
+                    );
+                }
+                *applied = Some(result.mode);
+            }
+            Err(error) => {
+                tracing::warn!("Copilot refused permission mode {mode:?}: {error}");
+                *applied = None;
+            }
+        }
     }
 
     pub(super) fn settle(&self, attribution: &ProviderEventAttribution) {
@@ -227,6 +276,14 @@ impl PermissionHandler for CopilotApprovals {
         if permissions == CopilotPermissions::AllowAll && !managed_user_decision {
             return PermissionResult::approve_once();
         }
+        if permissions == CopilotPermissions::Auto && judge_approves(&data) {
+            return PermissionResult::approve_once().with_context(PermissionDecisionContext {
+                outcome: PermissionDecisionOutcome::AutoApproved,
+                response_capability: None,
+                source: PermissionDecisionSource::AssistedApproval,
+                surface: PermissionDecisionSurface::Sdk,
+            });
+        }
         let event = {
             let mut pending = self
                 .shared
@@ -294,6 +351,20 @@ fn request(data: &PermissionRequestData) -> &Value {
 fn is_broker_call(data: &PermissionRequestData) -> bool {
     data.kind == Some(PermissionRequestKind::Mcp)
         && request(data)["serverName"] == BROKER_SERVER_NAME
+}
+
+/// Whether Copilot's safety judge reviewed `data` and recommends approving it. Every other
+/// outcome — doubt, exclusion, a judge that failed, or no review at all — leaves it to the user.
+fn judge_approves(data: &PermissionRequestData) -> bool {
+    request(data)
+        .get("assistedApproval")
+        .and_then(|judged| PermissionAssistedApproval::deserialize(judged).ok())
+        .is_some_and(|judged| {
+            matches!(
+                judged.recommendation,
+                AssistedApprovalRecommendation::Approve
+            )
+        })
 }
 
 fn reason(data: &PermissionRequestData) -> Option<String> {

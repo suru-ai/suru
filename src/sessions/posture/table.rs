@@ -61,6 +61,9 @@ impl PostureLevel {
             },
             ApprovalPosture::Copilot { permissions } => match permissions {
                 Copilot::Ask => Self::AsksForConsent,
+                // Copilot's safety judge, like Claude's classifier, still asks
+                // where it does not recommend approving.
+                Copilot::Auto => Self::RunsRoutineWork,
                 Copilot::AllowAll => Self::RunsUnrestricted,
             },
         }
@@ -97,12 +100,11 @@ impl PostureLevel {
                 }
             }
             // Copilot has no value that runs unasked yet stays contained, so
-            // every level short of the last asks.
+            // that level falls back to the judge, which still asks.
             "copilot" => ApprovalPosture::Copilot {
                 permissions: match self {
-                    Self::AsksForConsent | Self::RunsRoutineWork | Self::RunsContained => {
-                        Copilot::Ask
-                    }
+                    Self::AsksForConsent => Copilot::Ask,
+                    Self::RunsRoutineWork | Self::RunsContained => Copilot::Auto,
                     Self::RunsUnrestricted => Copilot::AllowAll,
                 },
             },
@@ -188,9 +190,9 @@ mod tests {
             Sandbox::DangerFullAccess,
         ];
         let _: fn(Copilot) = |permissions| match permissions {
-            Copilot::Ask | Copilot::AllowAll => {}
+            Copilot::Ask | Copilot::Auto | Copilot::AllowAll => {}
         };
-        let permissions = [Copilot::Ask, Copilot::AllowAll];
+        let permissions = [Copilot::Ask, Copilot::Auto, Copilot::AllowAll];
 
         modes
             .into_iter()
@@ -242,6 +244,7 @@ mod tests {
                 RunsUnrestricted,
             ),
             (copilot(Copilot::Ask), AsksForConsent),
+            (copilot(Copilot::Auto), RunsRoutineWork),
             (copilot(Copilot::AllowAll), RunsUnrestricted),
         ]
     }
@@ -262,7 +265,8 @@ mod tests {
             (RunsRoutineWork, "codex") => codex(Policy::OnRequest, Sandbox::WorkspaceWrite),
             (RunsContained, "codex") => codex(Policy::Never, Sandbox::WorkspaceWrite),
             (RunsUnrestricted, "codex") => codex(Policy::Never, Sandbox::DangerFullAccess),
-            (AsksForConsent | RunsRoutineWork | RunsContained, "copilot") => copilot(Copilot::Ask),
+            (AsksForConsent, "copilot") => copilot(Copilot::Ask),
+            (RunsRoutineWork | RunsContained, "copilot") => copilot(Copilot::Auto),
             (RunsUnrestricted, "copilot") => copilot(Copilot::AllowAll),
             _ => unreachable!("ADR 0036 has no column for {provider}"),
         }

@@ -55,12 +55,30 @@ fn approval(
         .unwrap_or_else(|| panic!("pending Approval for {request}"))
 }
 
+/// A fixture whose CLI raises `request` — a `permission.requested` event's data — once Suru asks it
+/// for `mode`: the moment a posture change has reached Copilot, and so the moment Suru has adopted
+/// it.
+fn on_permission_mode(mode: &str, request: &str) -> ScriptedCopilot {
+    let mode_arm = format!(
+        r#"    *'"method":"session.permissions.setMode"'*'"mode":"{mode}"'*)
+      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"mode":"{mode}","success":true}}}}'
+      event live permission.requested '{request}'
+      ;;
+"#
+    );
+    ScriptedCopilot::new(&format!(
+        "{mode_arm}{}{}",
+        conversation_arms(),
+        send_arm("")
+    ))
+}
+
 #[tokio::test]
 async fn an_active_permission_handler_uses_the_changed_posture_on_its_next_request() {
-    let timeline = r#"      wait_for "$COPILOT_FIXTURE_RELEASE"
-      event live permission.requested '{"requestId":"live-update","permissionRequest":{"kind":"read","path":"next.txt","intention":"Use changed posture"}}'
-"#;
-    let copilot = fixture(timeline, "      event idle session.idle '{}'\n");
+    let copilot = on_permission_mode(
+        "manual",
+        r#"{"requestId":"live-update","permissionRequest":{"kind":"read","path":"next.txt","intention":"Use changed posture"}}"#,
+    );
     let live = LiveTurn::start(
         CopilotRuntime::new(copilot.executable()),
         "copilot-live-posture",
@@ -78,7 +96,6 @@ async fn an_active_permission_handler_uses_the_changed_posture_on_its_next_reque
         )
         .await
         .unwrap();
-    copilot.release();
     let response = native_response(&copilot, "live-update").await;
     assert_eq!(response["result"]["kind"], "approve-once");
     live.shutdown().await;
@@ -151,6 +168,87 @@ async fn the_next_turn_adopts_the_sessions_current_permission_posture() {
     let response = native_response(&copilot, "next-turn").await;
     assert_eq!(response["result"]["kind"], "approve-once");
     server.shutdown().await.unwrap();
+}
+
+/// The modes Suru has asked Copilot's permission service for, in the order it asked.
+fn permission_modes(fixture: &ScriptedCopilot) -> Vec<String> {
+    fixture
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "session.permissions.setMode")
+        .map(|request| request["params"]["mode"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn auto_approves_what_copilots_judge_recommends_and_asks_for_the_rest() {
+    let copilot = fixture(
+        r#"      event judged permission.requested '{"requestId":"judged","permissionRequest":{"kind":"read","path":"src/lib.rs","intention":"Read the library","assistedApproval":{"recommendation":"approve","reason":"Reading inside the workspace","model":"gpt-5.5"}}}'
+      event doubted permission.requested '{"requestId":"doubted","permissionRequest":{"kind":"shell","fullCommandText":"rm -rf build","intention":"Clear the build","commands":[{"identifier":"rm","readOnly":false}],"assistedApproval":{"recommendation":"requireApproval","reason":"Deletes files"}}}'
+"#,
+        "",
+    );
+    let mut live = LiveTurn::start(
+        CopilotRuntime::new(copilot.executable()),
+        "copilot-auto-judge",
+        "Tidy up",
+    )
+    .await;
+
+    assert_eq!(permission_modes(&copilot), ["assisted"]);
+    let judged = native_response(&copilot, "judged").await;
+    assert_eq!(judged["result"]["kind"], "approve-once");
+    assert_eq!(judged["decisionContext"]["source"], "assisted_approval");
+    assert_eq!(judged["decisionContext"]["outcome"], "auto_approved");
+    let pending = live
+        .wait_for("the doubted request asks", |snapshot| {
+            snapshot.pending_approvals.len() == 1
+        })
+        .await;
+    approval(&pending, "Clear the build");
+    assert!(
+        pending.activities.iter().all(|activity| !matches!(
+            activity,
+            Activity::Approval { approval, .. }
+                if approval.reason.as_deref() == Some("Read the library")
+        )),
+        "what the judge approved never asks"
+    );
+    live.shutdown().await;
+}
+
+#[tokio::test]
+async fn leaving_auto_returns_copilot_to_manual_and_asks_despite_the_judge() {
+    let copilot = on_permission_mode(
+        "manual",
+        r#"{"requestId":"stale","permissionRequest":{"kind":"read","path":"src/lib.rs","intention":"Read after leaving auto","assistedApproval":{"recommendation":"approve"}}}"#,
+    );
+    let mut live = LiveTurn::start(
+        CopilotRuntime::new(copilot.executable()),
+        "copilot-leave-auto",
+        "Wait",
+    )
+    .await;
+    live.client
+        .update_approval_posture(
+            live.session_id,
+            UpdateApprovalPostureRequest {
+                posture: Some(ApprovalPosture::Copilot {
+                    permissions: CopilotPermissions::Ask,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(permission_modes(&copilot), ["assisted", "manual"]);
+
+    let pending = live
+        .wait_for("the request asks under ask", |snapshot| {
+            snapshot.pending_approvals.len() == 1
+        })
+        .await;
+    approval(&pending, "Read after leaving auto");
+    live.shutdown().await;
 }
 
 async fn native_response(fixture: &ScriptedCopilot, request_id: &str) -> Value {

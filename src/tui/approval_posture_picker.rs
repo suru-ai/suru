@@ -149,6 +149,12 @@ fn rows(current: ApprovalPosture) -> Vec<ApprovalPostureChoice> {
                 },
             ),
             choice(
+                "Permissions: auto",
+                ApprovalPosture::Copilot {
+                    permissions: CopilotPermissions::Auto,
+                },
+            ),
+            choice(
                 "Permissions: allowAll",
                 ApprovalPosture::Copilot {
                     permissions: CopilotPermissions::AllowAll,
