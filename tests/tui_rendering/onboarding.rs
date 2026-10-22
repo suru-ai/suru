@@ -2666,7 +2666,7 @@ fn derivation_rows(application: &Application) -> Vec<String> {
     let rows = rendered_application_rows_at(application, 108, 24);
     let first = rows
         .iter()
-        .position(|row| row.contains("Which Agent Selection derives"))
+        .position(|row| row.contains("Which model is used to derive"))
         .expect("the Derivation step is drawn")
         + 2;
     let foot = rows
