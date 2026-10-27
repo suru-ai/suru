@@ -15,8 +15,8 @@ use ratatui::{
 use crate::tui_rendering::support::{
     MutatesSetting, application_looking_at_studio, connected_application, model_descriptor,
     rendered_application_buffer, rendered_application_rows, rendered_application_rows_at,
-    selected_session_snapshot, studio_stops_answering, text_position, type_terminal_text,
-    workspace_dir,
+    rendered_row, selected_session_snapshot, studio_stops_answering, text_position,
+    type_terminal_text, workspace_dir,
 };
 use suru::{
     managed_client::ManagedEvent,
@@ -1843,9 +1843,9 @@ fn clicking_a_row_selects_it_without_changing_a_value() {
 
 /// Every edit runs through the focused row, so a click on a Provider must not
 /// be one: it may not turn the Provider off, and it may not stand in for the
-/// Enter that reveals what the Provider carries.
+/// Enter that steps in onto what the Provider carries.
 #[test]
-fn clicking_a_provider_row_neither_toggles_it_nor_expands_it() {
+fn clicking_a_provider_row_neither_toggles_it_nor_steps_into_it() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
@@ -1866,12 +1866,10 @@ fn clicking_a_provider_row_neither_toggles_it_nor_expands_it() {
         "and the Provider is left exactly as it was: {copilot:?}"
     );
 
-    // Back onto the Provider that carries further Settings, which is the one a
-    // click could otherwise have opened.
     assert_eq!(
         click_row(&mut application, "Codex"),
         ApplicationTransition::Continue,
-        "clicking an expandable Provider edits nothing either"
+        "clicking another Provider edits nothing either"
     );
     assert_eq!(
         focused_key(&application),
@@ -1879,8 +1877,8 @@ fn clicking_a_provider_row_neither_toggles_it_nor_expands_it() {
         "it takes the focus"
     );
     assert!(
-        !has_row(&application, "Reasoning summary"),
-        "and stays collapsed, because expanding is Enter's and never the pointer's"
+        back_line(&application, "Codex").is_none() && has_row(&application, "Claude"),
+        "and the keys stay on the Providers, because stepping in is Enter's"
     );
 }
 
@@ -2170,11 +2168,11 @@ fn entering_the_providers_tab_reads_availability_every_time() {
     );
 }
 
-/// A Provider Suru cannot use names the condition on its row with what fixes
-/// it beside, and spells both out in full where the reader is looking, because
-/// every way a Provider can be unavailable is something they fix outside Suru.
+/// A Provider Suru cannot use names the condition on its row, and spells it
+/// out in full with what fixes it where the reader is looking, because every
+/// way a Provider can be unavailable is something they fix outside Suru.
 #[test]
-fn an_unavailable_provider_names_its_reason_and_fix_and_the_headline_carries_both() {
+fn an_unavailable_provider_names_its_reason_and_the_headline_carries_it_and_its_fix() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     let request = read_providers_tab(&mut application);
@@ -2192,10 +2190,10 @@ fn an_unavailable_provider_names_its_reason_and_fix_and_the_headline_carries_bot
         )],
     );
 
-    let codex = row(&application, "Codex");
-    assert!(
-        codex.ends_with("Codex · not signed in · run `codex login`"),
-        "the row names the reason and what fixes it, and claims no pin: {codex:?}"
+    let codex = shown(&application, "Codex");
+    assert_eq!(
+        codex, "not signed in",
+        "the row names the reason in its value column, and claims no pin: {codex:?}"
     );
     let rows = rendered_application_rows(&application);
     let panel = rows.join("\n");
@@ -2212,11 +2210,11 @@ fn an_unavailable_provider_names_its_reason_and_fix_and_the_headline_carries_bot
     );
 }
 
-/// A fix too long for the row is cut short there, never at the cost of the
-/// row's reason or value column, and is given whole beneath the headline —
-/// wrapped between words, so an install page's address stays unbroken.
+/// A row has room for a Provider's condition and none for what fixes it, so
+/// the fix is given whole beneath the headline — wrapped between words, so an
+/// install page's address stays unbroken.
 #[test]
-fn a_fix_too_long_for_its_row_is_given_whole_beneath_the_headline() {
+fn a_providers_fix_is_given_whole_beneath_the_headline_rather_than_on_its_row() {
     const INSTALL_PAGE: &str =
         "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli";
     let workspace = workspace_dir();
@@ -2244,8 +2242,8 @@ fn a_fix_too_long_for_its_row_is_given_whole_beneath_the_headline() {
 
     let copilot = row(&application, "Copilot");
     assert!(
-        copilot.contains("Copilot · not installed · install the") && copilot.ends_with('…'),
-        "the row begins the fix and cuts it short before the value column: {copilot:?}"
+        copilot.ends_with("not installed") && !copilot.contains("install the"),
+        "the row names the condition alone: {copilot:?}"
     );
     let rows = rendered_application_rows(&application);
     let panel = rows.join("\n");
@@ -2348,7 +2346,7 @@ fn a_panel_too_small_for_the_whole_fix_keeps_its_end_in_view() {
     let rows = rendered_application_rows_at(&application, 30, 10);
     let screen = rows.join("\n");
     assert!(
-        rows.iter().any(|row| row.contains("› ▸ Copilot")),
+        rows.iter().any(|row| row.contains("› Copilot")),
         "the focused row stays on screen: {screen}"
     );
     let buffer = rendered_application_buffer(&application, 30, 10);
@@ -2443,13 +2441,13 @@ fn a_failed_read_says_error_while_a_serving_catalog_says_nothing() {
         "with the whole message in the headline: {panel}"
     );
     let copilot = row(&application, "Copilot");
-    assert!(
-        copilot.ends_with("▸ Copilot"),
+    assert_eq!(
+        copilot, "  Copilot",
         "a fresh catalog leaves nothing after the Provider's name: {copilot:?}"
     );
     let claude = row(&application, "Claude");
-    assert!(
-        claude.ends_with("▸ Claude"),
+    assert_eq!(
+        claude, "  Claude",
         "and so does a stale one that is still serving what it last read: {claude:?}"
     );
 }
@@ -2676,77 +2674,155 @@ fn turning_a_provider_off_after_a_read_silences_its_row_and_the_headline() {
     );
 }
 
-/// Enter is the Providers tab's one structural key: it reveals the Settings a
-/// Provider carries beyond its Enablement, indented directly beneath it, and
-/// hides them again.
+/// The line a narrow panel heads a Provider's own Settings with, which names
+/// the Provider beside the way back to the Providers.
+fn back_line(application: &Application, provider: &str) -> Option<String> {
+    let rows = rendered_application_rows(application);
+    let left = panel_left(&rows);
+    rows.iter()
+        .map(|row| inside(row, left).trim_end())
+        .find(|row| row.starts_with(&format!("‹ {provider}")))
+        .map(str::to_owned)
+}
+
+/// Enter is the Providers tab's one structural key: it steps the keys from a
+/// Provider's row onto the Settings it carries beyond its Enablement, which a
+/// narrow panel, having no pane to list them in, lists in the Providers'
+/// place beneath a line naming the Provider. Esc steps back out rather than
+/// closing the panel.
 #[test]
-fn enter_reveals_a_providers_further_settings_beneath_it_and_hides_them_again() {
+fn enter_lists_a_providers_own_settings_in_a_narrow_panel_and_esc_steps_back_out() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
     focus_setting(&mut application, "provider.codex.enabled");
     assert!(
         !has_row(&application, "Reasoning summary"),
-        "a Provider's further Settings stay hidden until the reader asks for them"
+        "a Provider's own Settings are no rows of the list of Providers"
     );
     let footer = rendered_application_rows(&application).join("\n");
     assert!(
-        footer.contains("Enter expand"),
-        "the row that expands teaches the key that expands it: {footer}"
+        footer.contains("Space disable · Enter Codex's Settings · Left/Right tabs")
+            && footer.contains("Esc close"),
+        "the Provider's row teaches what its keys do to it: {footer}"
     );
 
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
     let rows = rendered_application_rows(&application);
+    let screen = rows.join("\n");
+    let back = back_line(&application, "Codex")
+        .unwrap_or_else(|| panic!("the Settings are headed by the Provider they are: {screen}"));
+    assert!(
+        back.ends_with(SPINNER),
+        "with the Provider's condition where its row would have said it: {back:?}"
+    );
+    for provider in ["Copilot", "Claude"] {
+        assert!(
+            !has_row(&application, provider),
+            "the Provider's own Settings stand in the Providers' place: {screen}"
+        );
+    }
     assert_eq!(
         row_index(&rows, "Reasoning summary"),
-        row_index(&rows, "Codex") + 1,
-        "the revealed Setting follows the Provider it configures: {rows:?}"
+        rendered_row(&rows, "‹ Codex") + 1,
+        "{screen}"
+    );
+    for (label, value) in [
+        ("Reasoning summary", "auto"),
+        ("Approval policy", "on-request"),
+        ("Sandbox mode", "workspace-write"),
+    ] {
+        assert_eq!(
+            shown(&application, label),
+            value,
+            "each an ordinary Setting row, value and provenance alike: {screen}"
+        );
+    }
+    assert!(
+        row(&application, "Reasoning summary").starts_with("› "),
+        "the keys land on the first of them: {screen}"
+    );
+    assert_eq!(
+        focused_key(&application),
+        "provider.codex.reasoningSummary",
+        "and the headline says what it does"
     );
     assert!(
-        label_column(&application, "Reasoning summary") > label_column(&application, "Codex"),
-        "drawn indented beneath it: {rows:?}"
-    );
-    let summary = shown(&application, "Reasoning summary");
-    assert_eq!(
-        summary, "auto",
-        "and reading as an ordinary Setting row, value and provenance alike: {summary:?}"
-    );
-    let policy = shown(&application, "Approval policy");
-    assert_eq!(
-        policy, "on-request",
-        "Codex's native Approval policy appears under its row: {policy:?}"
-    );
-    let sandbox = shown(&application, "Sandbox mode");
-    assert_eq!(
-        sandbox, "workspace-write",
-        "Codex's native sandbox appears under its row: {sandbox:?}"
-    );
-    assert_eq!(
-        row_index(&rows, "Approval policy"),
-        row_index(&rows, "Reasoning summary") + 1
-    );
-    assert_eq!(
-        row_index(&rows, "Sandbox mode"),
-        row_index(&rows, "Approval policy") + 1
+        screen.contains("Space change · Ctrl+D reset · Esc back") && !screen.contains("Left/Right"),
+        "the footer teaches only what the keys do here: {screen}"
     );
 
-    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
-    assert!(
-        !has_row(&application, "Reasoning summary"),
-        "Enter again collapses the Provider"
+    assert_eq!(
+        press(&mut application, KeyCode::Esc, KeyModifiers::NONE),
+        ApplicationTransition::Continue
     );
     assert!(
-        has_row(&application, "Codex"),
-        "leaving the Provider itself where it was"
+        has_row(&application, "Copilot") && back_line(&application, "Codex").is_none(),
+        "Esc steps back out to the Providers rather than closing the panel"
+    );
+    assert_eq!(focused_key(&application), "provider.codex.enabled");
+
+    press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("Settings ─"),
+        "and Esc on the Providers closes it"
     );
 }
 
-/// A revealed Setting is an ordinary row: the focus walks onto it, Space cycles
-/// its value, Ctrl+D takes its pin out, and its provenance follows the
-/// refreshed snapshot — the guard the flat panel carried before Providers had a
-/// tab of their own.
+/// Left and Tab are the other ways out of a Provider's own Settings, the way
+/// Esc is: from there, neither walks the tab bar.
 #[test]
-fn a_revealed_setting_navigates_cycles_and_resets_like_any_other_row() {
+fn left_and_tab_step_back_out_of_a_providers_settings_instead_of_moving_on() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_providers_tab(&mut application);
+    focus_setting(&mut application, "provider.claude.enabled");
+
+    for code in [KeyCode::Left, KeyCode::Tab] {
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(focused_key(&application), "provider.claude.permissionMode");
+        assert_eq!(
+            press(&mut application, code, KeyModifiers::NONE),
+            ApplicationTransition::Continue,
+            "{code:?} read no Providers, so walked no tab"
+        );
+        assert_eq!(
+            focused_key(&application),
+            "provider.claude.enabled",
+            "{code:?} steps back out onto the Provider"
+        );
+    }
+    assert_eq!(
+        press(&mut application, KeyCode::Right, KeyModifiers::NONE),
+        ApplicationTransition::Continue,
+        "Right on the Providers walks on to the next tab"
+    );
+    assert!(!has_row(&application, "Claude"));
+
+    // The command Esc stands for on the rows still means what it says,
+    // wherever the keys are.
+    click_tab(&mut application, "Providers");
+    focus_setting(&mut application, "provider.claude.enabled");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    invoke(
+        &mut application,
+        CommandId::InvokeSemantic(SemanticCommandId::SettingsClose),
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("Settings ─"),
+        "closing the panel by its command closes it from a Provider's own Settings too"
+    );
+}
+
+/// A Provider's own Setting is edited as any other is: the focus walks onto
+/// it, Space cycles its value, Ctrl+D takes its pin out, and its provenance
+/// follows the refreshed snapshot.
+#[test]
+fn a_providers_own_setting_walks_cycles_and_resets_like_any_other_row() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
@@ -2754,10 +2830,12 @@ fn a_revealed_setting_navigates_cycles_and_resets_like_any_other_row() {
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
 
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
     assert_eq!(
         focused_key(&application),
         "provider.codex.reasoningSummary",
-        "Down walks straight into the expansion, past no second Enablement row"
+        "Down walks the Provider's own Settings, wrapping past the last onto the first"
     );
 
     assert_eq!(
@@ -2765,7 +2843,7 @@ fn a_revealed_setting_navigates_cycles_and_resets_like_any_other_row() {
         MutatesSetting(SettingMutation::ProviderCodexReasoningSummary {
             value: Some(ReasoningSummaryDetail::Concise),
         }),
-        "Space cycles the revealed Setting on from the value in force"
+        "Space cycles the focused Setting on from the value in force"
     );
 
     deliver_snapshot(
@@ -2785,7 +2863,7 @@ fn a_revealed_setting_navigates_cycles_and_resets_like_any_other_row() {
     let summary = shown(&application, "Reasoning summary");
     assert_eq!(
         summary, "concise ●",
-        "the revealed row follows the refreshed snapshot the edit produced: {summary:?}"
+        "the row follows the refreshed snapshot the edit produced: {summary:?}"
     );
 
     assert_eq!(
@@ -2813,107 +2891,69 @@ fn a_revealed_setting_navigates_cycles_and_resets_like_any_other_row() {
         MutatesSetting(SettingMutation::ProviderCodexReasoningSummary {
             value: Some(ReasoningSummaryDetail::Auto),
         }),
-        "a revealed Setting on its last value wraps to the first, like every other"
+        "a Setting on its last value wraps to the first, like every other"
     );
 }
 
-/// The expansion is the Provider's own further Settings and nothing else: its
-/// Enablement is what the Provider row already says, so repeating it inside
-/// would give the reader two rows for one value.
+/// A Provider's own Settings are its further Settings and nothing else: its
+/// Enablement is what the Provider's row already says, so listing it among
+/// them would give the reader two rows for one value.
 #[test]
-fn a_providers_enablement_never_appears_inside_its_own_expansion() {
+fn a_providers_enablement_never_appears_among_its_own_settings() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_providers_tab(&mut application);
+
+    for provider in ["Codex", "Copilot", "Claude"] {
+        let pane = pane(&application);
+        assert!(
+            !pane.iter().any(|row| row.contains("Provider")),
+            "the {provider} pane lists no Enablement among its Settings: {pane:#?}"
+        );
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+        let rows = rendered_application_rows(&application);
+        let left = panel_left(&rows);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| is_row_for(row, left, &format!("{provider} Provider"))),
+            "nor does the {provider} drill-in: {rows:#?}"
+        );
+        press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+        press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    }
+}
+
+/// Where the keys stand is view state the panel forgets: a reader returning to
+/// the panel meets the same short list of Providers every time rather than
+/// whatever they had stepped into.
+#[test]
+fn the_keys_are_back_on_the_providers_each_time_the_panel_opens() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
     focus_setting(&mut application, "provider.codex.enabled");
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(back_line(&application, "Codex").is_some());
 
-    let rows = rendered_application_rows(&application);
-    let left = panel_left(&rows);
-    let codex_rows = rows
-        .iter()
-        .filter(|row| is_row_for(row, left, "Codex Provider"))
-        .count();
-    assert_eq!(
-        codex_rows, 0,
-        "the Enablement's own label surfaces nowhere: {rows:?}"
+    invoke(
+        &mut application,
+        CommandId::InvokeSemantic(SemanticCommandId::SettingsClose),
     );
-    assert_eq!(
-        rows.iter()
-            .filter(|row| is_row_for(row, left, "Codex"))
-            .count(),
-        1,
-        "and Codex holds exactly the one row that stands for it: {rows:?}"
-    );
-}
-
-#[test]
-fn copilot_permissions_appear_under_the_copilot_provider() {
-    let workspace = workspace_dir();
-    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
-    open_providers_tab(&mut application);
-    assert!(row(&application, "Codex").contains('▸'));
-    assert!(row(&application, "Claude").contains('▸'));
-    assert!(row(&application, "Copilot").contains('▸'));
-
-    focus_setting(&mut application, "provider.copilot.enabled");
-    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
-    let permissions = shown(&application, "Permissions");
-    assert_eq!(permissions, "auto");
-    let rows = rendered_application_rows(&application);
-    assert_eq!(
-        row_index(&rows, "Permissions"),
-        row_index(&rows, "Copilot") + 1
-    );
-    assert!(label_column(&application, "Permissions") > label_column(&application, "Copilot"));
-}
-
-#[test]
-fn claude_permission_mode_appears_under_the_claude_provider() {
-    let workspace = workspace_dir();
-    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
-    open_providers_tab(&mut application);
-    focus_setting(&mut application, "provider.claude.enabled");
-    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
-
-    let permission = shown(&application, "Permission mode");
-    assert_eq!(permission, "auto");
-    let rows = rendered_application_rows(&application);
-    assert_eq!(
-        row_index(&rows, "Permission mode"),
-        row_index(&rows, "Claude") + 1
-    );
-    assert!(label_column(&application, "Permission mode") > label_column(&application, "Claude"));
-}
-
-/// Expansion is view state the panel forgets: a reader returning to the panel
-/// meets the same short list of Providers every time rather than whatever they
-/// left open.
-#[test]
-fn every_provider_is_collapsed_each_time_the_panel_opens() {
-    let workspace = workspace_dir();
-    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
-    open_providers_tab(&mut application);
-    focus_setting(&mut application, "provider.codex.enabled");
-    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
-    assert!(
-        has_row(&application, "Reasoning summary"),
-        "the Provider is expanded"
-    );
-
-    press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
     open_providers_tab(&mut application);
     assert!(
-        !has_row(&application, "Reasoning summary"),
-        "the reopened panel collapses every Provider"
+        back_line(&application, "Codex").is_none() && has_row(&application, "Claude"),
+        "the reopened panel lists the Providers"
     );
+    assert_eq!(focused_key(&application), "provider.codex.enabled");
 }
 
 /// Enablement governs what Suru does with a Provider, not whether the reader
-/// may configure it: a Provider turned off expands and its Settings take the
-/// edits that apply when it is turned back on.
+/// may configure it: a Provider turned off says so where it is accounted for,
+/// still lists its Settings, and they take the edits that apply when it is
+/// turned back on.
 #[test]
-fn a_disabled_provider_expands_and_its_settings_stay_editable() {
+fn a_disabled_providers_pane_says_so_and_its_settings_stay_editable() {
     let workspace = workspace_dir();
     let mut application = client_showing(
         workspace.path(),
@@ -2922,24 +2962,285 @@ fn a_disabled_provider_expands_and_its_settings_stay_editable() {
     );
     open_providers_tab(&mut application);
     focus_setting(&mut application, "provider.codex.enabled");
-    assert!(
-        row(&application, "Codex").contains("disabled"),
+    assert_eq!(
+        shown(&application, "Codex"),
+        "disabled ●",
         "the Provider is one the reader turned off"
     );
 
-    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
-    assert!(
-        has_row(&application, "Reasoning summary"),
-        "which expands like any other"
+    let details = pane(&application);
+    assert_eq!(details[0], "Codex disabled", "{details:#?}");
+    pane_row(
+        &details,
+        "Suru leaves Codex entirely alone until you enable it.",
     );
+    pane_row(&details, "Reasoning summary auto");
+    pane_row(&details, "Sandbox mode workspace-write");
+    let footer = rendered_application_rows(&application).join("\n");
+    assert!(
+        footer.contains("Space enable · Enter Codex's Settings"),
+        "Space would turn it back on: {footer}"
+    );
+
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
-        MutatesSetting(SettingMutation::ProviderCodexReasoningSummary {
-            value: Some(ReasoningSummaryDetail::Concise),
+        MutatesSetting(SettingMutation::ProviderCodexApprovalPolicy {
+            value: Some(suru::protocol::CodexApprovalPolicy::Never),
         }),
         "and whose Settings are edited as they would be were it enabled"
     );
+}
+
+/// The Providers tab is one row per Provider, each ending on its condition in
+/// the column a Setting's row ends on its value in, and nothing more: no
+/// Setting of a Provider's own, and no affordance standing for one.
+#[test]
+fn each_provider_row_ends_on_its_condition_in_the_value_column() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        without_codex(),
+        &["provider.codex.enabled"],
+    );
+    let request = read_providers_tab(&mut application);
+    deliver_catalog(
+        &mut application,
+        request,
+        &[
+            (
+                "copilot",
+                ProviderCatalogStatus::Unavailable {
+                    reason: ProviderUnavailability::NotSignedIn,
+                    message: "Copilot holds no credentials".to_owned(),
+                    fix: "run `copilot login`".to_owned(),
+                },
+            ),
+            ("claude", ProviderCatalogStatus::Fresh),
+        ],
+    );
+
+    let rows = rendered_application_rows(&application);
+    let left = panel_left(&rows);
+    let listed = rows
+        .iter()
+        .map(|row| inside(row, left))
+        .filter(|row| row.starts_with("› ") || row.starts_with("  "))
+        .filter(|row| !row.trim().is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed.len(),
+        3,
+        "one row per built-in Provider and nothing else: {rows:#?}"
+    );
+    assert_eq!(shown(&application, "Codex"), "disabled ●");
+    assert_eq!(
+        shown(&application, "Copilot"),
+        "not signed in",
+        "a Provider Suru cannot use names why in the column, its fix left to \
+         where the reader is looking: {rows:#?}"
+    );
+    assert_eq!(
+        row(&application, "Claude"),
+        "  Claude",
+        "an enabled Provider still serving its catalog says nothing more than its name"
+    );
+    let column = |label: &str, value: &str| {
+        let row = &listed[row_index_inside(&listed, label)];
+        row[..row.find(value).expect("the row shows its condition")]
+            .chars()
+            .count()
+    };
+    assert_eq!(
+        column("Codex", "disabled"),
+        column("Copilot", "not signed in"),
+        "the conditions stand in one column: {listed:#?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains('▸') || row.contains('▾')),
+        "{rows:#?}"
+    );
+    let buffer = rendered_application_buffer(&application, 80, 15);
+    assert_ne!(
+        styling(&buffer, "not signed in"),
+        styling(&buffer, "Copilot"),
+        "a condition to fix stands out from the Provider it is about"
+    );
+}
+
+/// A wide panel accounts for the focused Provider in its pane: its name and
+/// whether it is on, then its own Settings listed as the panel lists rows,
+/// then the one among them focus picks out in detail.
+#[test]
+fn a_wide_panel_accounts_for_the_focused_provider_and_its_own_settings() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        EffectiveSettings {
+            provider: ProviderSettings {
+                codex: CodexSettings {
+                    sandbox_mode: suru::protocol::CodexSandboxMode::ReadOnly,
+                    ..CodexSettings::default()
+                },
+                ..ProviderSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &["provider.codex.sandboxMode"],
+    );
+    let request = read_providers_tab(&mut application);
+    deliver_catalog(
+        &mut application,
+        request,
+        &[
+            ("codex", ProviderCatalogStatus::Fresh),
+            ("copilot", ProviderCatalogStatus::Fresh),
+            ("claude", ProviderCatalogStatus::Fresh),
+        ],
+    );
+
+    let details = pane(&application);
+    assert_eq!(details[0], "Codex enabled", "{details:#?}");
+    assert_eq!(details[1], "provider.codex.enabled", "{details:#?}");
+    let summary = pane_row(&details, "Reasoning summary auto");
+    assert_eq!(
+        &details[summary + 1..summary + 3],
+        ["Approval policy on-request", "Sandbox mode read-only ●"],
+        "the Provider's own Settings, each with its value and a pin's mark, and no \
+         condition led with for a Provider with nothing to report: {details:#?}"
+    );
+    assert_eq!(summary, 3, "{details:#?}");
+    pane_row(&details, "provider.codex.reasoningSummary");
+    assert!(
+        pane_text(&application).contains(
+            "provider.codex.reasoningSummary How much Reasoning summary detail each Turn \
+             asks Codex for"
+        ),
+        "then the first of them in detail: {details:#?}"
+    );
+    pane_row(&details, "● auto default");
+    pane_row(&details, "Applies on the Server");
+    pane_row(&details, "Sidekicks read and change");
+
+    let (list, _) = split_panel(&application);
+    assert!(list[0].starts_with("› Codex"), "{list:#?}");
+    assert!(
+        !list.iter().any(|row| row.contains("Reasoning summary")),
+        "the list holds the Providers alone: {list:#?}"
+    );
+    let footer = rendered_application_rows_at(&application, WIDE.0, WIDE.1).join("\n");
+    assert!(
+        footer.contains(
+            "Space disable · Enter Codex's Settings · Left/Right tabs · Ctrl+D reset · Esc close"
+        ),
+        "{footer}"
+    );
+
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    let details = pane(&application);
+    assert_eq!(details[0], "Copilot enabled", "the pane follows focus");
+    pane_row(&details, "Permissions auto");
+    pane_row(&details, "provider.copilot.permissions");
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    let details = pane(&application);
+    assert_eq!(details[0], "Claude enabled");
+    pane_row(&details, "Permission mode auto");
+}
+
+/// Enter moves the keys into the pane, which reads as the side that has them:
+/// its rule and the Provider's name take the accent, its focused row is drawn
+/// as the keys', and the Provider's row in the list dims to the row they come
+/// back to. Up and Down walk the pane, Space and Ctrl+D edit what they stand
+/// on, and Esc, Left and Tab bring the keys back.
+#[test]
+fn enter_moves_the_keys_into_the_pane_where_they_edit_and_esc_brings_them_back() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let request = read_providers_tab(&mut application);
+    deliver_catalog(
+        &mut application,
+        request,
+        &[
+            ("codex", ProviderCatalogStatus::Fresh),
+            ("copilot", ProviderCatalogStatus::Fresh),
+            ("claude", ProviderCatalogStatus::Fresh),
+        ],
+    );
+    let on_list = rendered_application_buffer(&application, WIDE.0, WIDE.1);
+
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    let details = pane(&application);
+    pane_row(&details, "› Reasoning summary auto");
+    let in_pane = rendered_application_buffer(&application, WIDE.0, WIDE.1);
+    assert_eq!(
+        styling(&in_pane, "› Reasoning summary"),
+        styling(&on_list, "› Codex"),
+        "the pane's focused row is drawn as the keys' row"
+    );
+    assert_ne!(
+        styling(&in_pane, "Codex  "),
+        styling(&on_list, "› Codex"),
+        "and the Provider's row no longer is"
+    );
+    // Read beside the Enablement key the heading stands over: the Provider's
+    // name above it, and the pane's rule two columns to its left.
+    let drawn_at = |buffer: &Buffer, across: i32, down: i32| {
+        let (column, row) = text_position(buffer, "provider.codex.enabled");
+        let column = u16::try_from(i32::from(column) + across).expect("inside the buffer");
+        let row = u16::try_from(i32::from(row) + down).expect("inside the buffer");
+        buffer.cell((column, row)).expect("inside the buffer").fg
+    };
+    assert_ne!(
+        drawn_at(&in_pane, 0, -1),
+        drawn_at(&on_list, 0, -1),
+        "the pane's heading reads as focused"
+    );
+    assert_ne!(
+        drawn_at(&in_pane, -2, 0),
+        drawn_at(&on_list, -2, 0),
+        "and so does its rule"
+    );
+    let footer = rendered_application_rows_at(&application, WIDE.0, WIDE.1).join("\n");
+    assert!(
+        footer.contains("Space change · Ctrl+D reset · Esc back") && !footer.contains("Esc close"),
+        "the footer teaches the keys the pane answers to: {footer}"
+    );
+
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    let details = pane(&application);
+    pane_row(&details, "› Approval policy on-request");
+    pane_row(&details, "provider.codex.approvalPolicy");
+    assert!(
+        split_panel(&application).0[0].starts_with("  Codex"),
+        "the keys are off the list"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        MutatesSetting(SettingMutation::ProviderCodexApprovalPolicy {
+            value: Some(suru::protocol::CodexApprovalPolicy::Never),
+        }),
+        "Space edits the Setting the pane has the keys on"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char('d'), KeyModifiers::CONTROL),
+        MutatesSetting(SettingMutation::ProviderCodexApprovalPolicy { value: None })
+    );
+
+    for code in [KeyCode::Esc, KeyCode::Left, KeyCode::Tab] {
+        press(&mut application, code, KeyModifiers::NONE);
+        assert!(
+            split_panel(&application).0[0].starts_with("› Codex"),
+            "{code:?} brings the keys back to the Provider"
+        );
+        let details = pane(&application);
+        pane_row(&details, "Approval policy on-request");
+        press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+        pane_row(&pane(&application), "› Approval policy on-request");
+    }
 }
 
 /// Hopping to the Providers tab to turn something on and back is a round trip
@@ -3604,8 +3905,8 @@ fn the_general_tab_presents_hiding_subsessions_on_by_default_beside_the_sidebars
 }
 
 /// Enter opens a row onto what it stands for and never edits, so on a row
-/// standing for nothing to open — a General Setting cycled through words, or a
-/// Setting revealed inside an expansion — it changes neither the shape of the
+/// standing for nothing to open — a General Setting cycled through words, or
+/// one of a Provider's own Settings — it changes neither the shape of the
 /// panel nor any value.
 #[test]
 fn enter_never_edits_a_value_and_opens_nothing_on_a_row_that_stands_for_nothing() {
@@ -3642,16 +3943,16 @@ fn enter_never_edits_a_value_and_opens_nothing_on_a_row_that_stands_for_nothing(
     focus_setting(&mut application, "provider.codex.enabled");
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
-    let expanded = rendered_application_rows(&application);
+    let stepped_in = rendered_application_rows(&application);
     assert_eq!(
         press(&mut application, KeyCode::Enter, KeyModifiers::NONE),
         ApplicationTransition::Continue,
-        "Enter edited a revealed Setting"
+        "Enter edited one of a Provider's own Settings"
     );
     assert_eq!(
         rendered_application_rows(&application),
-        expanded,
-        "a revealed Setting has nothing of its own to expand"
+        stepped_in,
+        "a Provider's own Setting has nothing further to step into"
     );
 }
 
@@ -3765,26 +4066,29 @@ fn an_edit_command_invoked_while_the_panel_is_closed_touches_no_setting() {
     }
 }
 
-/// A Setting revealed inside an expansion is an ordinary row, so the pointer
-/// reaches it as it reaches any other — and no more than any other: the value
-/// stays where it was until the reader edits it from the keyboard.
+/// A Provider's own Setting listed in the Providers' place is an ordinary row,
+/// so the pointer reaches it as it reaches any other — and no more than any
+/// other: the value stays where it was until the reader edits it from the
+/// keyboard. The line naming the Provider stands for its row among the
+/// Providers, so pointing at it goes back to them.
 #[test]
-fn clicking_a_revealed_setting_focuses_it_like_any_other_row() {
+fn clicking_a_providers_own_setting_in_a_narrow_panel_focuses_it_without_editing() {
     let workspace = workspace_dir();
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_providers_tab(&mut application);
     focus_setting(&mut application, "provider.codex.enabled");
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
 
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
     assert_eq!(
         click_row(&mut application, "Reasoning summary"),
         ApplicationTransition::Continue,
-        "a revealed Setting is selected by a click, not edited by one"
+        "a Provider's own Setting is selected by a click, not edited by one"
     );
     assert_eq!(
         focused_key(&application),
         "provider.codex.reasoningSummary",
-        "the revealed row the reader pointed at is the focused one"
+        "the row the reader pointed at is the focused one"
     );
     assert_eq!(
         shown(&application, "Reasoning summary"),
@@ -3799,6 +4103,18 @@ fn clicking_a_revealed_setting_focuses_it_like_any_other_row() {
         }),
         "Space edits the row the click focused, the edit gate intact"
     );
+
+    let buffer = rendered_application_buffer(&application, 80, 15);
+    let (column, back) = text_position(&buffer, "‹ Codex");
+    assert_eq!(
+        click(&mut application, column + 2, back),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        has_row(&application, "Claude") && back_line(&application, "Codex").is_none(),
+        "pointing at the line naming the Provider goes back to the Providers"
+    );
+    assert_eq!(focused_key(&application), "provider.codex.enabled");
 }
 
 /// A box too short for its tab holds a window onto the rows rather than all of
@@ -4735,13 +5051,15 @@ fn a_wide_panel_leads_its_pane_with_a_providers_condition_and_its_whole_fix() {
         format!("{}{}", details[message + 2], details[message + 3]) == INSTALL_PAGE,
         "whole, its address on rows of its own: {details:#?}"
     );
-    let description = details
-        .iter()
-        .position(|row| row.starts_with("Whether Suru offers Copilot"))
-        .expect("the pane describes the Enablement the row stands for");
+    assert_eq!(
+        &details[..2],
+        ["Copilot enabled", "provider.copilot.enabled"],
+        "beneath the Provider's heading: {details:#?}"
+    );
+    let settings = pane_row(&details, "Permissions auto");
     assert!(
-        message < description,
-        "and both lead the Setting's own account: {details:#?}"
+        message < settings,
+        "and both lead the Provider's own Settings: {details:#?}"
     );
     let (list, _) = split_panel(&application);
     assert!(
@@ -4937,4 +5255,96 @@ fn a_numeric_editor_opens_over_a_wide_panel() {
     );
     press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(pane(&application)[0], "Sidebar width at launch");
+}
+
+/// On the Providers tab the pane holds the one more thing a pointer can focus:
+/// the focused Provider's own Settings, a click on one taking the keys in onto
+/// it as Enter would, never editing it. A click on a Provider's row takes the
+/// keys back to the list, and the rest of the pane focuses nothing.
+#[test]
+fn a_click_on_a_providers_own_setting_in_the_pane_takes_the_keys_onto_it() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_providers_tab(&mut application);
+
+    let buffer = rendered_application_buffer(&application, WIDE.0, WIDE.1);
+    let before = rendered_application_rows_at(&application, WIDE.0, WIDE.1);
+    for needle in ["provider.codex.enabled", "How much Reasoning summary"] {
+        let (column, row) = text_position(&buffer, needle);
+        assert_eq!(
+            click(&mut application, column, row),
+            ApplicationTransition::Continue
+        );
+        assert_eq!(
+            rendered_application_rows_at(&application, WIDE.0, WIDE.1),
+            before,
+            "a click on {needle:?} in the pane focuses nothing"
+        );
+    }
+
+    let (column, row) = text_position(&buffer, "Sandbox mode");
+    assert_eq!(
+        click(&mut application, column, row),
+        ApplicationTransition::Continue,
+        "a click on one of the Provider's own Settings edits nothing"
+    );
+    let details = pane(&application);
+    pane_row(&details, "› Sandbox mode workspace-write");
+    pane_row(&details, "provider.codex.sandboxMode");
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        MutatesSetting(SettingMutation::ProviderCodexSandboxMode {
+            value: Some(suru::protocol::CodexSandboxMode::DangerFullAccess),
+        }),
+        "the keys are on the Setting the reader pointed at"
+    );
+
+    let (column, row) = text_position(&buffer, "Copilot");
+    click(&mut application, column, row);
+    let (list, _) = split_panel(&application);
+    assert!(
+        list[1].starts_with("› Copilot"),
+        "a click on a Provider's row takes the keys back to the list: {list:#?}"
+    );
+    let details = pane(&application);
+    assert_eq!(details[0], "Copilot enabled");
+    pane_row(&details, "Permissions auto");
+}
+
+#[test]
+fn a_diagnostic_naming_one_of_a_providers_own_settings_leads_its_pane() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let file = super::support::named_workspace_path("suru.jsonc");
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
+                settings: EffectiveSettings::default(),
+                pinned: Vec::new(),
+                diagnostics: vec![suru::protocol::SettingsDiagnostic {
+                    severity: suru::protocol::SettingsDiagnosticSeverity::Warning,
+                    file: file.clone(),
+                    key: Some("provider.codex.sandboxMode".to_owned()),
+                    message: "ignored for a test".to_owned(),
+                }],
+            },
+        )))
+        .expect("receive the snapshot and its diagnostics");
+    open_providers_tab(&mut application);
+
+    let text = pane_text(&application);
+    let diagnostic = text
+        .find(&format!("{}: ignored for a test", file.display()))
+        .unwrap_or_else(|| panic!("the Codex pane leads with the ignored pin: {text}"));
+    assert!(
+        text.find("Sandbox mode workspace-write")
+            .is_some_and(|settings| diagnostic < settings),
+        "ahead of the Settings it is about: {text}"
+    );
+
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert!(
+        !pane_text(&application).contains("ignored for a test"),
+        "another Provider's pin is that Provider's business"
+    );
 }

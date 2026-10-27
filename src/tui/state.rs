@@ -10961,6 +10961,7 @@ impl Application {
             | SemanticCommandId::SettingsTabPrevious
             | SemanticCommandId::SettingsTabNext
             | SemanticCommandId::SettingsRowOpen
+            | SemanticCommandId::SettingsProviderLeave
             | SemanticCommandId::SettingsValueCycle
             | SemanticCommandId::SettingsReset
             | SemanticCommandId::SettingsClose
@@ -11695,6 +11696,10 @@ impl Application {
                         }
                     }
                 }
+                None
+            }
+            SemanticCommandId::SettingsProviderLeave => {
+                self.state.settings_panel.leave_provider();
                 None
             }
             SemanticCommandId::SettingsValueCycle => {
@@ -12442,7 +12447,12 @@ impl Application {
                     return command_for_numeric_editor_event(event);
                 }
                 SelectionSurface::ListEditor => return command_for_list_editor_event(event),
-                SelectionSurface::Settings => return command_for_settings_panel_event(event),
+                SelectionSurface::Settings => {
+                    return command_for_settings_panel_event(
+                        event,
+                        self.state.settings_panel.keys(),
+                    );
+                }
                 SelectionSurface::Worktrees => {
                     return super::keymap::command_for_worktree_picker_event(event);
                 }

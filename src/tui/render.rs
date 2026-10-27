@@ -1,6 +1,8 @@
 //! Frame rendering: the landing and Session screens, the pickers and overlays,
 //! and the shared text and layout helpers they draw with.
 
+use std::borrow::Cow;
+
 use super::selection::{SelectionFrame, SelectionSurface, WrappedLine};
 
 use ratatui::{
@@ -37,7 +39,7 @@ use super::{
     directory_browser::{DirectoryBrowserRow, DirectoryBrowserRowKind},
     icon_picker,
     keymap::binding_label,
-    list_window::WindowEntry,
+    list_window::{ListWindow, WindowEntry},
     model_details::{self, DetailsPane},
     model_options::ModelOptionChoiceRow,
     onboarding::OwnServer,
@@ -45,10 +47,10 @@ use super::{
     rename_dialog::RenameGeometry,
     serve_overlay::{CandidateWay, LISTENER_FAILED, LISTENER_OFF, ServeWays},
     session_picker::SessionPickerRow,
-    setting_details,
+    setting_details::{self, SettingValueColumn},
     settings_panel::{
-        PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, SettingRow, TabBar,
-        TabSpan,
+        PanelKeys, PanelLayout, ProviderFocus, RowAvailability, RowOpens, RowValue, RowWindow,
+        SettingRow, TabBar, TabSpan,
     },
     shimmer,
     side_column::{self, SideColumn},
@@ -3058,13 +3060,13 @@ fn render_theme_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
 /// the drawing does.
 const SETTINGS_TAB_GAP: &str = "  ";
 
-/// What stands between an unavailable Provider's condition and its fix on the
-/// Provider's row.
-const SETTINGS_FIX_GAP: &str = " · ";
+/// What a narrow panel heads a Provider's own Settings with, beside the
+/// Provider's name, where they stand in place of the Providers: the way back
+/// to them.
+const SETTINGS_BACK: &str = "‹ ";
 
-/// What a row ends on for a value the reader pinned, where a value riding its
-/// built-in default leaves the column blank.
-const SETTINGS_PINNED: &str = "●";
+/// What stands between two controls the footer teaches.
+const SETTINGS_HINT_GAP: &str = " · ";
 
 /// The room a settings panel needs before it details the focused Setting in a
 /// pane beside its rows rather than a headline above them, and the size it
@@ -3081,39 +3083,47 @@ const SETTINGS_PANEL_SPLIT_HEIGHT: u16 = 24;
 ///
 /// A wide panel splits beneath its tab bar: the rows keep the left, and a pane
 /// on the right details the focused Setting, whatever asks something of the
-/// reader first. A narrow one heads its rows with the focused Setting's
-/// headline instead.
+/// reader first — or, on the Providers tab, the focused Provider and its own
+/// Settings. A narrow one heads its rows with the focused Setting's headline
+/// instead, and having no pane to list a Provider's own Settings in, lists
+/// them in the Providers' place once the reader steps in onto them.
 ///
 /// Drawing is also what tells the panel where it ended up, because the box's
 /// height, the tab labels' columns, and the window of rows that fit are all
 /// decided here. A pointer is resolved against that record, so the reader can
 /// only ever click something this frame actually drew.
 fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
-    let rows = state
-        .settings_panel
-        .rows(state.settings(), state.pinned_settings());
+    let panel = &state.settings_panel;
+    let rows = panel.rows(state.settings(), state.pinned_settings());
+    let provider = panel.provider_focus(state.settings(), state.pinned_settings());
     let split = main.width.saturating_sub(4) >= SETTINGS_PANEL_SPLIT_MIN_WIDTH;
     let width = main.width.saturating_sub(4).min(if split {
         SETTINGS_PANEL_SPLIT_WIDTH
     } else {
         76
     });
+    // A narrow panel with the keys on a Provider's own Settings lists those
+    // in the Providers' place, beneath a line naming the Provider they are.
+    let drilled = provider
+        .as_ref()
+        .filter(|_| !split && panel.keys() == PanelKeys::ProviderSettings);
     // What fixes the focused Provider, whole, on as many lines as it takes
-    // beneath the headline: its row has room for the start of it at most. A
-    // split panel's pane carries it instead.
-    let fix = state
-        .settings_panel
+    // beneath the headline: its row has room for none of it. A split panel's
+    // pane carries it instead, and a panel listing the Provider's own
+    // Settings is about those.
+    let fix = panel
         .selected_fix(state.settings())
-        .filter(|_| !split && state.settings_panel.error().is_none());
+        .filter(|_| !split && drilled.is_none() && panel.error().is_none());
     let fix = fix.map(|fix| WrappedText::new(fix, "", width.saturating_sub(2)));
     let fix_height = fix.as_ref().map_or(0, WrappedText::height);
+    let listed = drilled.map_or(rows.len(), |provider| provider.settings.len() + 1);
     // A tab lists a known number of rows, so a narrow panel is exactly as tall
     // as it needs to be: two borders around the tab bar and the headline,
     // whatever fix goes beneath it, one row per Setting, and the controls.
     let wanted = if split {
         SETTINGS_PANEL_SPLIT_HEIGHT
     } else {
-        u16::try_from(rows.len().saturating_add(5).saturating_add(fix_height)).unwrap_or(u16::MAX)
+        u16::try_from(listed.saturating_add(5).saturating_add(fix_height)).unwrap_or(u16::MAX)
     };
     let area = centered_rect(main, width, main.height.saturating_sub(2).min(wanted));
     let inner = area.inner(ratatui::layout::Margin::new(1, 1));
@@ -3136,25 +3146,8 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     let tabs =
         (content_height >= 4).then(|| settings_tab_bar(state, content_left, content_top, theme));
     let footer_rows = usize::from(content_height >= 3);
-    // Read before the window narrows the rows, and read off the focused row:
-    // Enter acts on that row alone, so that row decides whether the key is
-    // worth teaching and which of the two things it does it would do.
-    let enter_hint = rows.iter().find(|row| row.selected).map_or("", |row| {
-        if row.chooses {
-            "Enter choose · "
-        } else if row.expansion.expands() {
-            "Enter expand · "
-        } else {
-            ""
-        }
-    });
-    // Enter is taught only where it does something, so a reader focused on a
-    // row that opens onto nothing is never offered a dead key.
     let footer = Line::styled(
-        truncate_to_width(
-            &format!("{enter_hint}Left/Right tabs · Space change · Ctrl+D reset · Esc close"),
-            content_width,
-        ),
+        settings_footer(state, &rows, provider.as_ref(), content_width),
         theme.text.subdued,
     );
     if split {
@@ -3188,12 +3181,12 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         // itself, or why the last edit never reached the Config Document — a
         // failed edit is the most urgent of the three, so it takes the line,
         // and a Provider's own condition outranks the description of a Setting
-        // the reader can read off the row anyway.
-        let (headline, style) = match (
-            state.settings_panel.error(),
-            state.settings_panel.selected_message(state.settings()),
-            state.settings_panel.selected_descriptor(),
-        ) {
+        // the reader can read off the row anyway. Among a Provider's own
+        // Settings, the focused one is what the reader is reading about.
+        let message = panel
+            .selected_message(state.settings())
+            .filter(|_| drilled.is_none());
+        let (headline, style) = match (panel.error(), message, panel.selected_descriptor()) {
             (Some(error), _, _) => (error.to_owned(), theme.feedback.error),
             (None, Some(message), _) => (message.to_owned(), theme.text.subdued),
             (None, None, Some(descriptor)) => (
@@ -3223,16 +3216,59 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     // The rows begin under whatever has been drawn above them, and the window
     // decides which of the tab's rows those are — so this frame is the only
     // thing that can say what a pointer over them landed on.
-    let rows_top = content_top.saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
-    let drawn = settings_rows(state, rows, content_width, capacity, theme);
-    let window = drawn.window(rows_top, content_columns.clone());
-    lines.extend(drawn.lines);
+    let top = content_top.saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+    let (window, provider_window) = match drilled {
+        Some(provider) => {
+            let drawn = settings_rows(
+                state,
+                SettingsList {
+                    rows: &provider.settings,
+                    head: Some(&provider.row),
+                    window: panel.provider_window(),
+                    holds_keys: true,
+                },
+                content_width,
+                capacity,
+                theme,
+            );
+            // The line naming the Provider stands for its row among the
+            // Providers, so pointing at it goes back to them.
+            let back = drawn.head_window(
+                top,
+                content_columns.clone(),
+                rows.iter().position(|row| row.selected).unwrap_or(0),
+            );
+            let window = drawn.window(top, content_columns.clone());
+            lines.extend(drawn.lines);
+            (back, window)
+        }
+        None => {
+            let drawn = settings_rows(
+                state,
+                SettingsList {
+                    rows: &rows,
+                    head: None,
+                    window: panel.window(),
+                    holds_keys: true,
+                },
+                content_width,
+                capacity,
+                theme,
+            );
+            let window = drawn.window(top, content_columns.clone());
+            lines.extend(drawn.lines);
+            (window, None)
+        }
+    };
     if footer_rows > 0 && lines.len() < content_height {
         lines.push(footer);
     }
-    state
-        .settings_panel
-        .record_layout(PanelLayout::new(content_columns, tab_bar, window));
+    panel.record_layout(PanelLayout::new(
+        content_columns,
+        tab_bar,
+        window,
+        provider_window,
+    ));
     draw_overlay_box(frame, state, area, lines, " Settings ", theme);
     record_overlay_selection_around(
         frame,
@@ -3242,6 +3278,61 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         true,
         &wrapped,
     );
+}
+
+/// The controls the settings panel teaches at its foot: only the keys that do
+/// something wherever the keys stand, in the order they are given up where
+/// the box is too narrow for all of them — the way out last, and never.
+fn settings_footer(
+    state: &TuiState,
+    rows: &[SettingRow],
+    provider: Option<&ProviderFocus>,
+    width: usize,
+) -> String {
+    // Enter is taught only where it does something, so a reader focused on a
+    // row that opens onto nothing is never offered a dead key.
+    let chooses = |rows: &[SettingRow]| {
+        rows.iter()
+            .find(|row| row.selected)
+            .is_some_and(|row| row.opens == RowOpens::Choice)
+    };
+    let mut hints = Vec::new();
+    let way_out = match (state.settings_panel.keys(), provider) {
+        (PanelKeys::ProviderSettings, Some(provider)) => {
+            if chooses(&provider.settings) {
+                hints.push(Cow::Borrowed("Enter choose"));
+            }
+            hints.extend(["Space change", "Ctrl+D reset"].map(Cow::Borrowed));
+            "Esc back"
+        }
+        (PanelKeys::Rows, Some(provider)) => {
+            hints.push(Cow::Borrowed(if provider.enabled {
+                "Space disable"
+            } else {
+                "Space enable"
+            }));
+            if provider.row.opens == RowOpens::ProviderSettings {
+                hints.push(Cow::Owned(format!(
+                    "Enter {}'s Settings",
+                    provider.row.label
+                )));
+            }
+            hints.extend(["Left/Right tabs", "Ctrl+D reset"].map(Cow::Borrowed));
+            "Esc close"
+        }
+        (_, None) => {
+            if chooses(rows) {
+                hints.push(Cow::Borrowed("Enter choose"));
+            }
+            hints.extend(["Left/Right tabs", "Space change", "Ctrl+D reset"].map(Cow::Borrowed));
+            "Esc close"
+        }
+    };
+    hints.push(Cow::Borrowed(way_out));
+    while hints.len() > 1 && hints.join(SETTINGS_HINT_GAP).width() > width {
+        hints.remove(hints.len() - 2);
+    }
+    truncate_to_width(&hints.join(SETTINGS_HINT_GAP), width)
 }
 
 /// What a wide settings panel lays out beneath and around its split: the box,
@@ -3259,6 +3350,10 @@ struct SplitSettingsPanel {
 /// between them the rows keep the left while the pane beside them details the
 /// focused Setting. The rows begin straight beneath the tab bar, the pane
 /// carrying what a narrow panel's headline and fix would have taken from them.
+/// On the Providers tab the pane lists the focused Provider's own Settings,
+/// and whichever side holds the keys reads as focused: its focused row
+/// brightly, the other side's dimly, and the pane's rule in the accent while
+/// the keys are on it.
 fn render_split_settings_panel(
     frame: &mut Frame<'_>,
     state: &TuiState,
@@ -3272,6 +3367,7 @@ fn render_split_settings_panel(
         rows,
         footer,
     } = panel;
+    let keys = state.settings_panel.keys();
     let inner = area.inner(ratatui::layout::Margin::new(1, 1));
     let (tab_line, tab_bar) = tabs.unzip();
     let tab_rows = u16::from(tab_line.is_some());
@@ -3287,17 +3383,20 @@ fn render_split_settings_panel(
             .areas(body);
     let drawn = settings_rows(
         state,
-        rows,
+        SettingsList {
+            rows: &rows,
+            head: None,
+            window: state.settings_panel.window(),
+            holds_keys: keys == PanelKeys::Rows,
+        },
         usize::from(list_area.width),
         usize::from(list_area.height),
         theme,
     );
-    // A click beside the rows is on the pane, which has nothing to focus, so
-    // the rows answer only for the columns they were drawn across.
+    // A click beside the rows is on the pane, which has nothing to focus but
+    // a Provider's own Settings, so the rows answer only for the columns they
+    // were drawn across.
     let window = drawn.window(list_area.y, list_area.left()..list_area.right());
-    state
-        .settings_panel
-        .record_layout(PanelLayout::new(content_columns, tab_bar, window));
     clear_over(frame, state, area);
     frame.render_widget(
         Block::default()
@@ -3313,7 +3412,11 @@ fn render_split_settings_panel(
     frame.render_widget(Paragraph::new(drawn.lines), list_area);
     let pane = Block::default()
         .borders(Borders::LEFT)
-        .border_style(theme.border.default)
+        .border_style(if keys == PanelKeys::ProviderSettings {
+            theme.accent.primary
+        } else {
+            theme.border.default
+        })
         .padding(Padding::left(1));
     let pane_content = pane.inner(pane_area);
     let details = setting_details::DetailsPane::of(
@@ -3325,8 +3428,34 @@ fn render_split_settings_panel(
     let drawn = details
         .as_ref()
         .map(|details| details.draw(pane_content.width, usize::from(pane_content.height), theme));
-    let (pane_lines, pane_wrapped) =
-        drawn.map_or_else(Default::default, |drawn| (drawn.lines, drawn.wrapped));
+    let (pane_lines, pane_wrapped, provider_settings) = drawn.map_or_else(
+        || (Vec::new(), Vec::new(), None),
+        |drawn| {
+            (
+                drawn.pane.lines,
+                drawn.pane.wrapped,
+                drawn.provider_settings,
+            )
+        },
+    );
+    // The Provider's own Settings are the one thing in the pane a pointer can
+    // focus, on the rows the pane drew them on.
+    let provider_window = provider_settings
+        .filter(|listed| !listed.is_empty())
+        .map(|listed| RowWindow {
+            top: pane_content
+                .y
+                .saturating_add(u16::try_from(listed.start).unwrap_or(u16::MAX)),
+            first: 0,
+            count: u16::try_from(listed.len()).unwrap_or(u16::MAX),
+            columns: pane_content.left()..pane_content.right(),
+        });
+    state.settings_panel.record_layout(PanelLayout::new(
+        content_columns,
+        tab_bar,
+        window,
+        provider_window,
+    ));
     frame.render_widget(Paragraph::new(pane_lines).block(pane), pane_area);
     // The rows and the pane are read apart, so a selection in one never takes
     // in the other's text beside it; the controls beneath both are read whole.
@@ -3380,173 +3509,196 @@ fn settings_tab_bar(
     (Line::from(spans), TabBar { row: top, labels })
 }
 
-/// The rows one frame drew of the tab being shown, and which of the tab's
-/// rows the first of them is.
+/// The rows one frame drew of a list, which of the list's rows the first of
+/// them is, and whether a line heading them was drawn above them.
 struct SettingsRows {
     lines: Vec<Line<'static>>,
     first: usize,
+    head: bool,
 }
 
 impl SettingsRows {
     /// Where these rows stand once drawn from `top` across `columns`, for a
     /// pointer to resolve against, and nothing for a frame that drew none.
     fn window(&self, top: u16, columns: std::ops::Range<u16>) -> Option<RowWindow> {
-        (!self.lines.is_empty()).then(|| RowWindow {
-            top,
+        let head = usize::from(self.head);
+        (self.lines.len() > head).then(|| RowWindow {
+            top: top.saturating_add(u16::from(self.head)),
             first: self.first,
-            count: u16::try_from(self.lines.len()).unwrap_or(u16::MAX),
+            count: u16::try_from(self.lines.len() - head).unwrap_or(u16::MAX),
+            columns,
+        })
+    }
+
+    /// Where the line heading these rows stands once drawn from `top`, as the
+    /// row `stands_for` of whatever list it stands for, and nothing for a
+    /// frame that drew no such line.
+    fn head_window(
+        &self,
+        top: u16,
+        columns: std::ops::Range<u16>,
+        stands_for: usize,
+    ) -> Option<RowWindow> {
+        self.head.then_some(RowWindow {
+            top,
+            first: stands_for,
+            count: 1,
             columns,
         })
     }
 }
 
-/// As many of the tab's rows as `capacity` holds, each `width` columns wide,
-/// from wherever the window settles over them.
+/// A list of settings rows to draw, and what it is drawn as: the rows, the
+/// row a narrow panel heads a Provider's own Settings with, the window the
+/// rows are read through, and whether the list has the keys.
+struct SettingsList<'a> {
+    rows: &'a [SettingRow],
+    /// The Provider whose own Settings `rows` are, named above them with the
+    /// way back to the Providers. It is measured with them, so its condition
+    /// stands in their value column, and is the first thing a box too short
+    /// for it and a Setting gives up.
+    head: Option<&'a SettingRow>,
+    window: &'a ListWindow,
+    /// Whether the keys are on this list, which draws its focused row as
+    /// theirs, and otherwise dimly as the row they come back to.
+    holds_keys: bool,
+}
+
+/// As many of the list's rows as `capacity` holds, each `width` columns wide,
+/// from wherever its window settles over them, beneath the line heading them
+/// where there is room for both.
 fn settings_rows(
     state: &TuiState,
-    rows: Vec<SettingRow>,
+    list: SettingsList<'_>,
     width: usize,
     capacity: usize,
     theme: &Theme,
 ) -> SettingsRows {
+    let SettingsList {
+        rows,
+        head,
+        window,
+        holds_keys,
+    } = list;
     let show_icons = state.settings().appearance.show_icons;
+    let head = head.filter(|_| capacity >= 2);
+    let capacity = capacity.saturating_sub(usize::from(head.is_some()));
     let selected = rows.iter().position(|row| row.selected);
-    let shown = state
-        .settings_panel
-        .window()
-        .settle_rows(rows.len(), capacity, selected);
-    // Every row the tab lists is named and valued before the window narrows
+    let shown = window.settle_rows(rows.len(), capacity, selected);
+    // Every row the list holds is named and valued before the window narrows
     // them, so the value column measures them all and holds still as the
     // window scrolls.
     let named = rows
         .iter()
-        .map(|row| settings_row_name(row, show_icons, state.spinner_frame))
+        .map(|row| {
+            let marker = if row.selected && holds_keys {
+                setting_details::ROW_FOCUS
+            } else {
+                setting_details::ROW_UNFOCUSED
+            };
+            format!("{marker}{}", settings_row_label(row, show_icons))
+        })
         .collect::<Vec<_>>();
+    let values = rows
+        .iter()
+        .map(|row| settings_row_value(row, state.spinner_frame))
+        .collect::<Vec<_>>();
+    let head = head.map(|row| {
+        (
+            row,
+            format!("{SETTINGS_BACK}{}", settings_row_label(row, show_icons)),
+            settings_row_value(row, state.spinner_frame),
+        )
+    });
     let column = SettingValueColumn::of(
-        named.iter().map(|(name, _)| name.width()).max(),
-        rows.iter()
-            .map(|row| settings_row_value(&row.value).width())
+        named
+            .iter()
+            .chain(head.as_ref().map(|(_, name, _)| name))
+            .map(|name| name.width())
+            .max(),
+        values
+            .iter()
+            .chain(head.as_ref().map(|(_, _, value)| value))
+            .map(|value| value.width())
             .max(),
         width,
     );
-    let lines = rows
-        .iter()
-        .zip(&named)
-        .skip(shown.start)
-        .take(shown.len())
-        .map(|(row, (name, fix))| {
-            let cells = column.cells(settings_row_value(&row.value), row.pinned);
-            let text_width = width.saturating_sub(cells.width());
-            // Beside the condition, as much of what fixes it as the row has
-            // room for, cut short before the value rather than taking it: the
-            // whole fix is beneath the headline, or in the pane, once the row
-            // is focused.
-            let fix = fix
-                .map(|fix| {
-                    let room = text_width.saturating_sub(name.width() + SETTINGS_FIX_GAP.width());
-                    truncate_to_width(fix, room)
-                })
-                .filter(|fix| !fix.is_empty() && fix != "…")
-                .map(|fix| format!("{SETTINGS_FIX_GAP}{fix}"))
-                .unwrap_or_default();
-            let text = truncate_to_width(&format!("{name}{fix}"), text_width);
-            let padding = " ".repeat(text_width.saturating_sub(text.width()));
-            Line::styled(
-                truncate_to_width(&format!("{text}{padding}{cells}"), width),
-                match (row.selected, &row.value) {
-                    (true, _) => theme.selection.focused,
-                    (false, RowValue::ProviderDisabled) => theme.text.subdued,
-                    (false, _) => theme.text.primary,
-                },
-            )
-        })
-        .collect();
+    let mut lines = Vec::with_capacity(capacity + 1);
+    if let Some((row, name, value)) = &head {
+        lines.push(column.line(
+            name,
+            (value, settings_row_tone(row, theme)),
+            row.pinned,
+            width,
+            theme.text.primary.add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.extend(
+        rows.iter()
+            .zip(named.iter().zip(&values))
+            .skip(shown.start)
+            .take(shown.len())
+            .map(|(row, (name, value))| {
+                let style = match (row.selected, holds_keys, &row.value) {
+                    (true, true, _) => theme.selection.focused,
+                    (true, false, _) => theme.selection.unfocused,
+                    (false, _, RowValue::ProviderDisabled) => theme.text.subdued,
+                    (false, _, _) => theme.text.primary,
+                };
+                // A condition asking something of the reader takes its own
+                // colour, except on the focused row, which keeps one block.
+                let tone = settings_row_tone(row, theme).filter(|_| !row.selected);
+                column.line(name, (value, tone), row.pinned, width, style)
+            }),
+    );
     SettingsRows {
         lines,
         first: shown.start,
+        head: head.is_some(),
     }
 }
 
-/// Everything a row says before its value: the focus marker, the expansion
-/// affordance, the name, and for a Provider what Suru found out about it,
-/// beside whatever fixes that, which the row fits in as it can.
-fn settings_row_name(
-    row: &SettingRow,
-    show_icons: bool,
-    spinner_frame: usize,
-) -> (String, Option<&str>) {
-    let marker = if row.selected { "› " } else { "  " };
-    // The affordance says what Enter would do to this row and, on a tab of
-    // Providers, holds its column even for the Provider Enter passes over,
-    // so the names line up. A revealed Setting steps in past both.
-    let expansion = match row.expansion {
-        RowExpansion::Absent => "",
-        RowExpansion::Unexpandable => "  ",
-        RowExpansion::Collapsed => "▸ ",
-        RowExpansion::Expanded => "▾ ",
-        RowExpansion::Revealed => "    ",
-    };
-    // What Suru has found out about the Provider, which is a word at most:
-    // a Spinner while the read runs, the condition's name once it lands,
-    // and nothing at all from a Provider still serving its catalog.
-    let (availability, fix) = match &row.availability {
-        RowAvailability::Quiet => (String::new(), None),
-        RowAvailability::Reading => (format!(" · {}", spinner::frame(spinner_frame / 3)), None),
-        RowAvailability::Warning => (" · warning".to_owned(), None),
-        RowAvailability::Unavailable { reason, fix } => {
-            (format!(" · {}", reason.label()), Some(fix.as_str()))
-        }
-        RowAvailability::Failed => (" · error".to_owned(), None),
-    };
-    let label = row.provider.map_or_else(
+/// What a row is called: its Setting's label, or the Provider it stands for,
+/// with that Provider's icon where the reader has icons on.
+fn settings_row_label(row: &SettingRow, show_icons: bool) -> String {
+    row.provider.map_or_else(
         || row.label.to_owned(),
         |provider| provider_label(show_icons, provider, row.label),
-    );
-    (format!("{marker}{expansion}{label}{availability}"), fix)
+    )
 }
 
-/// What a row says its Setting is worth. A Provider Suru has been told to
-/// leave alone is the one row that reads as its own condition rather than as
-/// a value; an enabled Provider claims nothing, because the quiet state is
-/// the good one.
-fn settings_row_value(value: &RowValue) -> &str {
-    match value {
-        RowValue::Choice(value) => value,
-        RowValue::ProviderEnabled => "",
-        RowValue::ProviderDisabled => "disabled",
-    }
-}
-
-/// The column at the end of a settings row saying what its Setting is worth,
-/// and the mark after it for a value the reader pinned. It is as wide as the
-/// widest value the tab lists, so it holds still as the rows scroll, short of
-/// crowding the names: it takes no more than the widest name leaves it, and
-/// never less than a third of the row.
-#[derive(Clone, Copy, Debug)]
-struct SettingValueColumn {
-    width: usize,
-}
-
-impl SettingValueColumn {
-    /// The columns around a value: the gap before it, and the space and the
-    /// pin mark after it.
-    const CHROME: usize = 4;
-
-    fn of(widest_name: Option<usize>, widest_value: Option<usize>, row_width: usize) -> Self {
-        let room = row_width
-            .saturating_sub(widest_name.unwrap_or(0) + Self::CHROME)
-            .max(row_width / 3);
-        Self {
-            width: widest_value.unwrap_or(0).min(room),
+/// What a row says in the column at its end. A Setting's row says what it is
+/// worth; a Provider's says what condition it is in, which is a word at most —
+/// that the reader turned it off, a Spinner while its Availability is read,
+/// what the read found wrong once it lands — and nothing at all from a
+/// Provider still serving its catalog, because the quiet state is the good
+/// one.
+fn settings_row_value(row: &SettingRow, spinner_frame: usize) -> Cow<'_, str> {
+    match (&row.value, &row.availability) {
+        (RowValue::Choice(value), _) => Cow::Borrowed(value),
+        (RowValue::ProviderDisabled, _) => Cow::Borrowed("disabled"),
+        (RowValue::ProviderEnabled, RowAvailability::Quiet) => Cow::Borrowed(""),
+        (RowValue::ProviderEnabled, RowAvailability::Reading) => {
+            Cow::Owned(spinner::frame(spinner_frame / 3).to_string())
         }
+        (RowValue::ProviderEnabled, RowAvailability::Warning) => Cow::Borrowed("warning"),
+        (RowValue::ProviderEnabled, RowAvailability::Unavailable { reason, .. }) => {
+            Cow::Borrowed(reason.label())
+        }
+        (RowValue::ProviderEnabled, RowAvailability::Failed) => Cow::Borrowed("error"),
     }
+}
 
-    /// `value` in the column, and the pin mark where the reader pinned it.
-    fn cells(self, value: &str, pinned: bool) -> String {
-        let value = truncate_to_width(value, self.width);
-        let padding = " ".repeat(self.width.saturating_sub(value.width()));
-        let pin = if pinned { SETTINGS_PINNED } else { " " };
-        format!("  {value}{padding} {pin}")
+/// The colour a Provider's condition takes on its row where it asks something
+/// of the reader: a failed read is Suru's error, and anything they fix
+/// outside Suru is a warning.
+fn settings_row_tone(row: &SettingRow, theme: &Theme) -> Option<Style> {
+    match row.availability {
+        RowAvailability::Warning | RowAvailability::Unavailable { .. } => {
+            Some(theme.feedback.warning)
+        }
+        RowAvailability::Failed => Some(theme.feedback.error),
+        RowAvailability::Quiet | RowAvailability::Reading => None,
     }
 }
 

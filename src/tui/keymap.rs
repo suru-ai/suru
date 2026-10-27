@@ -14,6 +14,7 @@ use super::{
     },
     connect_overlay::ConnectInputMode,
     relay_overlay::RelayInputMode,
+    settings_panel::PanelKeys,
     state::{CommandId, ScrollDirection},
 };
 
@@ -909,16 +910,25 @@ pub(super) fn command_for_model_options_event(event: InputEvent) -> Option<Comma
 /// The settings panel edits one Setting at a time and has no search line, so
 /// its keys are Up and Down between the rows of a tab, Left and Right between
 /// the tabs themselves, the Space that cycles the focused value, the Enter that
-/// opens the focused row onto whatever it stands for — a Provider's further
+/// opens the focused row onto whatever it stands for — a Provider's own
 /// Settings, or the surface a value too rich to cycle is chosen at — and the
 /// reset that takes a pin out. Enter opens and never edits: what it opens onto
 /// is where a value the reader chooses is settled. Nothing else reaches the
 /// composer while the panel is open.
 ///
+/// Stepped in onto a Provider's own Settings, Up and Down walk those, Space,
+/// Enter and the reset act on the one focused among them, and every key that
+/// would take the reader away — Esc, Left, Tab — steps back out to the
+/// Providers instead, so Esc there never closes the panel. Right has nowhere
+/// further in to go and does nothing.
+///
 /// The reader may also point at the panel, which the frame's own geometry
 /// resolves. A click is the whole of it: the pointer asks for a tab or a
 /// row, and no click carries a key's meaning.
-pub(super) fn command_for_settings_panel_event(event: InputEvent) -> Option<CommandId> {
+pub(super) fn command_for_settings_panel_event(
+    event: InputEvent,
+    keys: PanelKeys,
+) -> Option<CommandId> {
     if let InputEvent::Mouse(mouse) = &event {
         return matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)).then_some(
             CommandId::FocusSettingsPanelAt {
@@ -933,6 +943,7 @@ pub(super) fn command_for_settings_panel_event(event: InputEvent) -> Option<Comm
     if key.kind != KeyEventKind::Press {
         return None;
     }
+    let within = keys == PanelKeys::ProviderSettings;
     let semantic = match (key.code, key.modifiers) {
         (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
             SemanticCommandId::SettingsPrevious
@@ -940,6 +951,10 @@ pub(super) fn command_for_settings_panel_event(event: InputEvent) -> Option<Comm
         (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
             SemanticCommandId::SettingsNext
         }
+        (KeyCode::Esc | KeyCode::Left | KeyCode::Tab, KeyModifiers::NONE) if within => {
+            SemanticCommandId::SettingsProviderLeave
+        }
+        (KeyCode::Right, KeyModifiers::NONE) if within => return None,
         (KeyCode::Left, KeyModifiers::NONE) => SemanticCommandId::SettingsTabPrevious,
         (KeyCode::Right, KeyModifiers::NONE) => SemanticCommandId::SettingsTabNext,
         (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::SettingsRowOpen,
@@ -1423,4 +1438,61 @@ pub(super) fn command_for_worktree_picker_event(event: InputEvent) -> Option<Com
         _ => return None,
     };
     Some(CommandId::InvokeSemantic(semantic))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings_command(code: KeyCode, keys: PanelKeys) -> Option<CommandId> {
+        command_for_settings_panel_event(
+            InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+            keys,
+        )
+    }
+
+    /// On a Provider's own Settings, every key that would take the reader away
+    /// steps back out to the Providers instead, so Esc there never closes the
+    /// panel; the keys that walk and edit mean what they mean on any row.
+    #[test]
+    fn the_keys_that_leave_a_providers_settings_step_back_out_rather_than_away() {
+        for code in [KeyCode::Esc, KeyCode::Left, KeyCode::Tab] {
+            assert_eq!(
+                settings_command(code, PanelKeys::ProviderSettings),
+                Some(CommandId::InvokeSemantic(
+                    SemanticCommandId::SettingsProviderLeave
+                )),
+                "{code:?} on a Provider's own Settings"
+            );
+        }
+        assert_eq!(
+            settings_command(KeyCode::Right, PanelKeys::ProviderSettings),
+            None
+        );
+        for (code, command) in [
+            (KeyCode::Up, SemanticCommandId::SettingsPrevious),
+            (KeyCode::Down, SemanticCommandId::SettingsNext),
+            (KeyCode::Enter, SemanticCommandId::SettingsRowOpen),
+            (KeyCode::Char(' '), SemanticCommandId::SettingsValueCycle),
+        ] {
+            assert_eq!(
+                settings_command(code, PanelKeys::ProviderSettings),
+                Some(CommandId::InvokeSemantic(command)),
+                "{code:?} on a Provider's own Settings"
+            );
+        }
+
+        for (code, command) in [
+            (KeyCode::Esc, Some(SemanticCommandId::SettingsClose)),
+            (KeyCode::Left, Some(SemanticCommandId::SettingsTabPrevious)),
+            (KeyCode::Right, Some(SemanticCommandId::SettingsTabNext)),
+            (KeyCode::Tab, None),
+        ] {
+            assert_eq!(
+                settings_command(code, PanelKeys::Rows),
+                command.map(CommandId::InvokeSemantic),
+                "{code:?} on the rows"
+            );
+        }
+    }
 }

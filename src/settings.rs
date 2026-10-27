@@ -2160,8 +2160,8 @@ pub fn provider_enablement(provider: &ProviderId) -> Option<&'static SettingDesc
 }
 
 /// Everything else one Provider is configured by, in schema order: the
-/// Settings a surface presenting the Provider reveals under it, its Enablement
-/// left out because the Provider itself is that Setting's surface. Keyed on the
+/// Settings a surface presenting the Provider lists as the Provider's own, its
+/// Enablement left out because the Provider itself is that Setting's surface. Keyed on the
 /// Provider's own identity like [`provider_enablement`], so a Setting joins the
 /// Provider it names by being written down once.
 pub fn provider_settings(provider: &ProviderId) -> Vec<&'static SettingDescriptor> {

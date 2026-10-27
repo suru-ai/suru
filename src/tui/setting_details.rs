@@ -3,27 +3,42 @@
 //! never reached the Config Document, a Provider's condition and what fixes
 //! it, a pin Suru ignored — then what the Setting does, every value it accepts
 //! with the one in force and the built-in default marked, and where it applies
-//! and what a Sidekick may do with it. A wide panel draws all of it in a pane
-//! beside its rows; a narrow one keeps a headline above them instead.
+//! and what a Sidekick may do with it. A Provider's row stands for more than
+//! its Enablement, so on the Providers tab the pane accounts for the Provider
+//! instead: whether it is on, its own Settings at a glance, and the one among
+//! them focus picks out, in the same detail. A wide panel draws all of it in a
+//! pane beside its rows; a narrow one keeps a headline above them instead.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Range};
 
 use ratatui::{
-    style::Modifier,
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
     protocol::{EffectiveSettings, SettingScope, SettingsDiagnostic},
-    settings::{SettingChoiceSurface, SettingDescriptor, SettingValues, SidekickAccess},
+    settings::{
+        SettingChoiceSurface, SettingDescriptor, SettingValues, SidekickAccess, provider_settings,
+    },
     theme::Theme,
 };
 
 use super::{
     drawn_pane::DrawnPane,
-    settings_panel::{RowAvailability, SettingsPanel},
+    settings_panel::{PanelKeys, RowAvailability, RowValue, SettingRow, SettingsPanel},
+    slots::truncate_to_width,
 };
+
+/// What a settings row ends on for a value the reader pinned, where a value
+/// riding its built-in default leaves the column blank.
+const PINNED: &str = "●";
+
+/// What a row leads with while the keys are on it, and what every other row
+/// stands in by so the names line up.
+pub(super) const ROW_FOCUS: &str = "› ";
+pub(super) const ROW_UNFOCUSED: &str = "  ";
 
 /// The marks a value the Setting accepts leads with: whether it is the one in
 /// force. A list's entries after its first, and what else an Open Setting
@@ -51,11 +66,40 @@ const FACT_INDENT: &str = "           ";
 /// The pane is an account of what the row stands for, headed by its name,
 /// with whatever asks something of the reader standing between that heading
 /// and the rest. The leads are the panel's to say of whichever row focus
-/// stands on; the account is the Setting's, and a Provider's row stands for
-/// its Enablement, so for now it is accounted for as that Setting is.
+/// stands on; the account is the Setting's, or the Provider's where the row
+/// stands for one.
 pub(super) struct DetailsPane<'a> {
     leads: Vec<Lead<'a>>,
-    account: SettingAccount,
+    account: Account,
+}
+
+/// What the pane accounts for beneath its leads.
+enum Account {
+    Setting(SettingAccount),
+    Provider(ProviderAccount),
+}
+
+/// What the pane says of a Provider: its name and whether it is on, its own
+/// Settings listed as the panel lists rows, and the one among them focus
+/// picks out, detailed as any Setting is.
+struct ProviderAccount {
+    name: &'static str,
+    enablement: &'static SettingDescriptor,
+    enabled: bool,
+    /// What a disabled Provider's pane says of it before its Settings.
+    disabled: Option<String>,
+    settings: Vec<SettingRow>,
+    /// Whether the keys have stepped in onto those Settings, which is what
+    /// the pane draws as focus.
+    holds_keys: bool,
+    picked: Option<SettingAccount>,
+}
+
+/// What a pane drew, and where among its rows it listed a Provider's own
+/// Settings, which a pointer resolves against.
+pub(super) struct DrawnDetails<'a> {
+    pub(super) pane: DrawnPane<'a>,
+    pub(super) provider_settings: Option<Range<usize>>,
 }
 
 /// Something the pane leads with because it asks something of the reader
@@ -99,7 +143,8 @@ impl<'a> DetailsPane<'a> {
     /// panel focused on nothing. Leading it is everything the narrow panel's
     /// headline and fix choose between, whole: the last edit's failure, then
     /// the focused Provider's condition and what fixes it, then whatever the
-    /// Config Documents' diagnostics say of the Setting's own pin.
+    /// Config Documents' diagnostics say of the Setting's own pin — or, for a
+    /// Provider, of any pin among the Settings it holds.
     pub(super) fn of(
         panel: &'a SettingsPanel,
         settings: &EffectiveSettings,
@@ -107,6 +152,7 @@ impl<'a> DetailsPane<'a> {
         diagnostics: &'a [SettingsDiagnostic],
     ) -> Option<Self> {
         let descriptor = panel.selected_descriptor()?;
+        let provider = panel.provider_focus(settings, pinned);
         let mut leads = Vec::new();
         if let Some(error) = panel.error() {
             leads.push(Lead {
@@ -129,10 +175,31 @@ impl<'a> DetailsPane<'a> {
                 tone: Tone::Fix,
             });
         }
+        // A Provider's pane accounts for every Setting it holds, so a pin
+        // Suru ignored among any of them is the pane's to lead with.
+        let accounted = match &provider {
+            Some(focus) => {
+                let mut keys = vec![focus.enablement.key];
+                if let Some(provider) = focus.row.provider {
+                    keys.extend(
+                        provider_settings(provider)
+                            .iter()
+                            .map(|descriptor| descriptor.key),
+                    );
+                }
+                keys
+            }
+            None => vec![descriptor.key],
+        };
         leads.extend(
             diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.key.as_deref() == Some(descriptor.key))
+                .filter(|diagnostic| {
+                    diagnostic
+                        .key
+                        .as_deref()
+                        .is_some_and(|key| accounted.contains(&key))
+                })
                 .map(|diagnostic| Lead {
                     text: Cow::Owned(format!(
                         "{}: {}",
@@ -142,21 +209,42 @@ impl<'a> DetailsPane<'a> {
                     tone: Tone::Warning,
                 }),
         );
-        Some(Self {
-            leads,
-            account: SettingAccount::new(
+        let is_pinned =
+            |descriptor: &SettingDescriptor| pinned.iter().any(|key| key == descriptor.key);
+        let account = match provider {
+            Some(focus) => Account::Provider(ProviderAccount {
+                name: focus.row.label,
+                enablement: focus.enablement,
+                enabled: focus.enabled,
+                disabled: (!focus.enabled).then(|| {
+                    format!(
+                        "Suru leaves {} entirely alone until you enable it.",
+                        focus.row.label
+                    )
+                }),
+                settings: focus.settings,
+                holds_keys: panel.keys() == PanelKeys::ProviderSettings,
+                picked: focus.picked.map(|descriptor| {
+                    SettingAccount::new(descriptor, settings, is_pinned(descriptor))
+                }),
+            }),
+            None => Account::Setting(SettingAccount::new(
                 descriptor,
                 settings,
-                pinned.iter().any(|key| key == descriptor.key),
-            ),
-        })
+                is_pinned(descriptor),
+            )),
+        };
+        Some(Self { leads, account })
     }
 
     /// The pane in `height` rows `width` columns wide. A pane with more to
     /// say than it has rows for ends on an ellipsis rather than silently.
-    pub(super) fn draw(&self, width: u16, height: usize, theme: &Theme) -> DrawnPane<'_> {
+    pub(super) fn draw(&self, width: u16, height: usize, theme: &Theme) -> DrawnDetails<'_> {
         let mut drawn = DrawnPane::default();
-        self.account.draw_heading(&mut drawn, width, theme);
+        match &self.account {
+            Account::Setting(account) => account.draw_heading(&mut drawn, width, theme),
+            Account::Provider(account) => account.draw_heading(&mut drawn, width, theme),
+        }
         for (index, lead) in self.leads.iter().enumerate() {
             if index == 0 || lead.tone != Tone::Fix {
                 drawn.lines.push(Line::default());
@@ -168,9 +256,173 @@ impl<'a> DetailsPane<'a> {
             };
             drawn.wrap(&lead.text, "", width, style);
         }
-        self.account.draw(&mut drawn, width, theme);
+        let provider_settings = match &self.account {
+            Account::Setting(account) => {
+                account.draw(&mut drawn, width, theme);
+                None
+            }
+            Account::Provider(account) => Some(account.draw(&mut drawn, width, theme)),
+        };
+        // A row the pane had no room left for is no row a pointer can land
+        // on, and nor is the ellipsis standing in for the rest.
+        let kept = if drawn.lines.len() > height {
+            height.saturating_sub(1)
+        } else {
+            drawn.lines.len()
+        };
         drawn.fit(height, theme);
-        drawn
+        DrawnDetails {
+            pane: drawn,
+            provider_settings: provider_settings
+                .map(|rows| rows.start.min(kept)..rows.end.min(kept)),
+        }
+    }
+}
+
+impl ProviderAccount {
+    /// The Provider's name, with whether it is on standing at the far end of
+    /// its line, and the key a Config Document turns it on or off by. The name
+    /// takes the accent while the keys are on the pane, which is how the pane
+    /// reads as the side that has them.
+    fn draw_heading(&self, drawn: &mut DrawnPane<'_>, width: u16, theme: &Theme) {
+        let state = if self.enabled { "enabled" } else { "disabled" };
+        let name = truncate_to_width(
+            self.name,
+            usize::from(width).saturating_sub(state.width() + 1),
+        );
+        let gap = usize::from(width).saturating_sub(name.width() + state.width());
+        let name_style = if self.holds_keys {
+            theme.accent.primary
+        } else {
+            theme.text.primary
+        };
+        drawn.lines.push(Line::from(vec![
+            Span::styled(name, name_style.add_modifier(Modifier::BOLD)),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(state, theme.text.subdued),
+        ]));
+        drawn.line(self.enablement.key, width, theme.text.subdued);
+    }
+
+    /// What a disabled Provider is left as, then its own Settings, each on a
+    /// row ending on its value and a mark for a pin, then the one focus picks
+    /// out among them in detail. Answers with the rows the Settings took.
+    fn draw<'a>(&'a self, drawn: &mut DrawnPane<'a>, width: u16, theme: &Theme) -> Range<usize> {
+        if let Some(disabled) = &self.disabled {
+            drawn.lines.push(Line::default());
+            drawn.wrap(disabled, "", width, theme.text.subdued);
+        }
+        drawn.lines.push(Line::default());
+        let first = drawn.lines.len();
+        let width = usize::from(width);
+        let column = SettingValueColumn::of(
+            self.settings
+                .iter()
+                .map(|row| ROW_FOCUS.width() + row.label.width())
+                .max(),
+            self.settings
+                .iter()
+                .map(|row| setting_value(row).width())
+                .max(),
+            width,
+        );
+        for row in &self.settings {
+            let focused = row.selected && self.holds_keys;
+            let marker = if focused { ROW_FOCUS } else { ROW_UNFOCUSED };
+            let style = match (row.selected, self.holds_keys) {
+                (true, true) => theme.selection.focused,
+                (true, false) => theme.selection.unfocused,
+                (false, _) => theme.text.primary,
+            };
+            drawn.lines.push(column.line(
+                &format!("{marker}{}", row.label),
+                (setting_value(row), None),
+                row.pinned,
+                width,
+                style,
+            ));
+        }
+        let listed = first..drawn.lines.len();
+        // Whether the picked Setting's value is a pin is already its row's
+        // mark, so its detail goes straight from its values to where it
+        // applies.
+        if let Some(picked) = &self.picked {
+            let width = u16::try_from(width).unwrap_or(u16::MAX);
+            drawn.lines.push(Line::default());
+            drawn.line(picked.descriptor.key, width, theme.text.subdued);
+            drawn.wrap(picked.descriptor.description, "", width, theme.text.primary);
+            drawn.lines.push(Line::default());
+            picked.draw_values(drawn, width, theme);
+            drawn.lines.push(Line::default());
+            picked.draw_reach(drawn, width, theme);
+        }
+        listed
+    }
+}
+
+/// What a Provider's own Setting is worth on its row.
+fn setting_value(row: &SettingRow) -> &str {
+    match &row.value {
+        RowValue::Choice(value) => value,
+        RowValue::ProviderEnabled | RowValue::ProviderDisabled => "",
+    }
+}
+
+/// The column at the end of a settings row saying what its Setting is worth,
+/// and the mark after it for a value the reader pinned. It is as wide as the
+/// widest value its list holds, so it holds still as the rows scroll, short of
+/// crowding the names: it takes no more than the widest name leaves it, and
+/// never less than a third of the row.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SettingValueColumn {
+    width: usize,
+}
+
+impl SettingValueColumn {
+    /// The columns around a value: the gap before it, and the space and the
+    /// pin mark after it.
+    const CHROME: usize = 4;
+
+    pub(super) fn of(
+        widest_name: Option<usize>,
+        widest_value: Option<usize>,
+        row_width: usize,
+    ) -> Self {
+        let room = row_width
+            .saturating_sub(widest_name.unwrap_or(0) + Self::CHROME)
+            .max(row_width / 3);
+        Self {
+            width: widest_value.unwrap_or(0).min(room),
+        }
+    }
+
+    /// `value` in the column, and the pin mark where the reader pinned it.
+    pub(super) fn cells(self, value: &str, pinned: bool) -> String {
+        let value = truncate_to_width(value, self.width);
+        let padding = " ".repeat(self.width.saturating_sub(value.width()));
+        let pin = if pinned { PINNED } else { " " };
+        format!("  {value}{padding} {pin}")
+    }
+
+    /// A whole row `width` columns wide in `style`: `name`, cut short before
+    /// the column rather than into it, then `value` and its pin mark in the
+    /// column, drawn in `value_style` where the value asks to stand out.
+    pub(super) fn line(
+        self,
+        name: &str,
+        (value, value_style): (&str, Option<Style>),
+        pinned: bool,
+        width: usize,
+        style: Style,
+    ) -> Line<'static> {
+        let cells = truncate_to_width(&self.cells(value, pinned), width);
+        let room = width.saturating_sub(cells.width());
+        let name = truncate_to_width(name, room);
+        let padding = " ".repeat(room.saturating_sub(name.width()));
+        Line::from(vec![
+            Span::styled(format!("{name}{padding}"), style),
+            Span::styled(cells, value_style.unwrap_or(style)),
+        ])
     }
 }
 
@@ -260,6 +512,11 @@ impl SettingAccount {
             width,
             theme.text.primary,
         );
+        self.draw_reach(drawn, width, theme);
+    }
+
+    /// Where the Setting applies, and what a Sidekick may do with it.
+    fn draw_reach<'a>(&'a self, drawn: &mut DrawnPane<'a>, width: u16, theme: &Theme) {
         let applies = match self.descriptor.scope {
             SettingScope::Client => "in every TUI",
             SettingScope::Server => "on the Server",

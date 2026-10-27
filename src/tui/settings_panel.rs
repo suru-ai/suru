@@ -14,10 +14,13 @@
 //! on is the Setting's own declaration in the schema, so the panel maps groups
 //! to tabs and invents no grouping of its own.
 //!
-//! Everything else a Provider is configured by is revealed under it, as
-//! ordinary rows the reader expands the Provider to see. The expansion is view
-//! state and nothing more — the panel forgets it on close — so a Provider whose
-//! Settings the reader is not looking at costs the listing one line.
+//! Everything else a Provider is configured by is the Provider's own, so it
+//! never joins the list: the reader steps in from the Provider's row onto its
+//! Settings and back out again, and the list of Providers stays one line
+//! apiece. Where the keys stand is view state and nothing more — the panel
+//! forgets it on close — and it is one state however the panel is drawn: a
+//! wide panel lists the Provider's Settings in the pane beside the Providers,
+//! and a narrow one, with no pane to spare, lists them in the Providers' place.
 //!
 //! The Providers tab is a surface presenting the Providers themselves, so
 //! arriving on it re-reads their Availability through the same Model catalog
@@ -137,10 +140,10 @@ pub(super) struct SettingsPanel {
     /// Ephemeral by design: an opening panel always starts at the first tab's
     /// top row.
     places: [TabPlace; SettingsTab::ALL.len()],
-    /// The Providers whose further Settings are on show. Ephemeral like the
-    /// selection: an opening panel expands nothing, so the reader always meets
-    /// the same short list of Providers.
-    expanded: Vec<&'static ProviderId>,
+    /// Where the reader stands among the focused Provider's own Settings.
+    /// Ephemeral like the tab places: an opening panel has the keys on the
+    /// Providers themselves, so the reader always meets the same short list.
+    provider_place: ProviderPlace,
     /// What the Availability read in force found, one entry per Provider it
     /// asked about — which is every enabled Provider and no other. A Provider
     /// with no entry here is one nothing has been read about, and its row says
@@ -171,6 +174,40 @@ struct TabPlace {
     window: ListWindow,
 }
 
+/// Where the reader stands among the focused Provider's own Settings: the one
+/// the pane picks out and details, the window a narrow panel lists them
+/// through, and whether the keys have stepped in onto them from the
+/// Provider's row. It belongs to the Provider focus stands on, so focus moving
+/// to another Provider starts that Provider's Settings afresh at the first.
+#[derive(Clone, Debug, Default)]
+struct ProviderPlace {
+    entered: bool,
+    focus: usize,
+    window: ListWindow,
+}
+
+impl ProviderPlace {
+    /// A place at the first Setting, the keys still on the Providers, and a
+    /// window that opens at the head of the list.
+    fn fresh() -> Self {
+        let place = Self::default();
+        place.window.open();
+        place
+    }
+}
+
+/// Which keys the panel answers to, which is the one thing the keymap has to
+/// know about it: stepped in onto a Provider's own Settings, the keys that
+/// walk the tabs and close the panel step back out to the Providers instead.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum PanelKeys {
+    /// The rows of the tab being shown.
+    #[default]
+    Rows,
+    /// The focused Provider's own Settings.
+    ProviderSettings,
+}
+
 #[derive(Clone, Debug)]
 struct NumericEditor {
     choice: NumericSettingChoice,
@@ -193,7 +230,7 @@ pub(super) struct SettingsTabLabel {
     pub(super) active: bool,
 }
 
-/// Where a frame drew the panel's two pointable surfaces. Everything here is
+/// Where a frame drew the panel's pointable surfaces. Everything here is
 /// terminal geometry the drawing decided, which is why drawing is what records
 /// it; a panel nothing has drawn yet answers no click, because a layout that
 /// claimed a geometry it had not drawn would move the focus somewhere the
@@ -205,8 +242,11 @@ pub(super) struct PanelLayout {
     columns: Range<u16>,
     /// The tab bar, where the box had the room to draw one.
     tabs: Option<TabBar>,
-    /// The rows, where any were drawn at all.
+    /// The rows of the tab being shown, where any were drawn at all.
     rows: Option<RowWindow>,
+    /// The focused Provider's own Settings, where any were drawn: in the pane
+    /// beside the Providers, or in their place.
+    provider_settings: Option<RowWindow>,
 }
 
 /// The tab bar as one frame drew it: the row it went on, and the columns each
@@ -244,16 +284,23 @@ pub(super) struct RowWindow {
 enum PanelHit {
     Tab(SettingsTab),
     Row(usize),
+    ProviderSetting(usize),
 }
 
 impl PanelLayout {
     /// The geometry one frame drew, out of the parts the drawing decided: what
     /// a valid layout is stays here rather than with whoever assembled it.
-    pub(super) fn new(columns: Range<u16>, tabs: Option<TabBar>, rows: Option<RowWindow>) -> Self {
+    pub(super) fn new(
+        columns: Range<u16>,
+        tabs: Option<TabBar>,
+        rows: Option<RowWindow>,
+        provider_settings: Option<RowWindow>,
+    ) -> Self {
         Self {
             columns,
             tabs,
             rows,
+            provider_settings,
         }
     }
 
@@ -270,14 +317,25 @@ impl PanelLayout {
         {
             return Some(PanelHit::Tab(span.tab));
         }
-        let window = self.rows.as_ref()?;
-        if !window.columns.contains(&column) {
+        if let Some(index) = self.rows.as_ref().and_then(|rows| rows.hit(column, row)) {
+            return Some(PanelHit::Row(index));
+        }
+        self.provider_settings
+            .as_ref()
+            .and_then(|rows| rows.hit(column, row))
+            .map(PanelHit::ProviderSetting)
+    }
+}
+
+impl RowWindow {
+    /// Which of the listed rows a pointer at `column` and `row` is on, and
+    /// none for a pointer beside or past them.
+    fn hit(&self, column: u16, row: u16) -> Option<usize> {
+        if !self.columns.contains(&column) {
             return None;
         }
-        let offset = row.checked_sub(window.top)?;
-        (offset < window.count)
-            .then(|| window.first.saturating_add(usize::from(offset)))
-            .map(PanelHit::Row)
+        let offset = row.checked_sub(self.top)?;
+        (offset < self.count).then(|| self.first.saturating_add(usize::from(offset)))
     }
 }
 
@@ -293,13 +351,23 @@ pub(super) struct SettingRow {
     pub(super) provider: Option<&'static ProviderId>,
     pub(super) value: RowValue,
     pub(super) pinned: bool,
+    /// Whether this is the row focus stands on in its list, which is the one
+    /// the keys act on while that list holds them and the one they come back
+    /// to while it does not.
     pub(super) selected: bool,
-    pub(super) expansion: RowExpansion,
-    /// Whether opening this row leads to a surface where its value is chosen,
-    /// which is the other thing Enter does and so the other thing a footer has
-    /// to teach.
-    pub(super) chooses: bool,
+    /// What opening this row leads to, which is what Enter does on it and so
+    /// what a footer has to teach.
+    pub(super) opens: RowOpens,
     pub(super) availability: RowAvailability,
+}
+
+/// What opening a row leads to: nothing, a surface where its value is chosen,
+/// or the Provider's own Settings it stands at the head of.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RowOpens {
+    Nothing,
+    Choice,
+    ProviderSettings,
 }
 
 /// What one Provider's Availability read has come to, held beside the message
@@ -348,33 +416,6 @@ pub(super) enum RowAvailability {
     Failed,
 }
 
-/// Where a row sits in the one nesting the panel has: a Provider that reveals
-/// further Settings, and the Settings so revealed. A row says which it is
-/// rather than how far to indent it, so the drawing stays the client's.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RowExpansion {
-    /// Neither expandable nor inside an expansion: every General row.
-    Absent,
-    /// A Provider with nothing further to configure. It offers no affordance,
-    /// but stands in the same column as the Providers that do, so a tab of
-    /// Providers reads as one list.
-    Unexpandable,
-    /// A Provider whose further Settings are hidden.
-    Collapsed,
-    /// A Provider whose further Settings follow it.
-    Expanded,
-    /// One of those Settings, drawn under the Provider it configures.
-    Revealed,
-}
-
-impl RowExpansion {
-    /// Whether Enter on this row has anything to do, which is both what the
-    /// key acts on and what decides whether the panel teaches it at all.
-    pub(super) fn expands(self) -> bool {
-        matches!(self, Self::Collapsed | Self::Expanded)
-    }
-}
-
 /// What a row says it is worth, which reads differently for a Setting the
 /// reader cycles through values and for a Provider whose row is its Enablement.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -391,12 +432,17 @@ pub(super) enum RowValue {
     ProviderDisabled,
 }
 
-/// What the focused row stands for, which is what opening it acts on: the
-/// further Settings a Provider holds, or the surface a Setting's value is
-/// chosen at. A row standing for neither yields none of these and is left alone.
-enum RowOpening {
-    Provider(&'static ProviderId),
-    Surface(SettingChoiceSurface),
+/// The Provider focus stands on, as a panel showing the Providers accounts
+/// for it: its own row, the Enablement that row stands for, and its further
+/// Settings valued from the snapshot, the one the pane picks out marked as
+/// selected among them.
+pub(super) struct ProviderFocus {
+    pub(super) row: SettingRow,
+    pub(super) enablement: &'static SettingDescriptor,
+    pub(super) enabled: bool,
+    pub(super) settings: Vec<SettingRow>,
+    /// The Setting among them the pane picks out, which it details.
+    pub(super) picked: Option<&'static SettingDescriptor>,
 }
 
 /// One row of a tab before a snapshot values it: what it is called, the Setting
@@ -406,7 +452,6 @@ struct PanelEntry {
     label: &'static str,
     descriptor: &'static SettingDescriptor,
     provider: Option<&'static ProviderId>,
-    expansion: RowExpansion,
 }
 
 impl PanelEntry {
@@ -419,6 +464,18 @@ impl PanelEntry {
             .is_none()
             .then(|| self.descriptor.chosen_at())?
     }
+
+    /// What opening this row leads to: a Provider's row to the Settings the
+    /// Provider holds beyond its Enablement, where it holds any, and any other
+    /// row to the surface its value is chosen at, where it has one.
+    fn opens(&self) -> RowOpens {
+        match self.provider {
+            Some(provider) if !provider_settings(provider).is_empty() => RowOpens::ProviderSettings,
+            Some(_) => RowOpens::Nothing,
+            None if self.choice_surface().is_some() => RowOpens::Choice,
+            None => RowOpens::Nothing,
+        }
+    }
 }
 
 impl SettingsPanel {
@@ -427,6 +484,7 @@ impl SettingsPanel {
     pub(super) fn open(&mut self) {
         *self = Self {
             open: true,
+            provider_place: ProviderPlace::fresh(),
             ..Self::default()
         };
         for place in &self.places {
@@ -565,6 +623,34 @@ impl SettingsPanel {
         &self.places[self.tab.position()].window
     }
 
+    /// The window a narrow panel lists the focused Provider's own Settings
+    /// through.
+    pub(super) fn provider_window(&self) -> &ListWindow {
+        &self.provider_place.window
+    }
+
+    /// Which keys the panel answers to: its rows, or the focused Provider's
+    /// own Settings once the reader has stepped in onto them.
+    pub(super) fn keys(&self) -> PanelKeys {
+        if self.open && self.tab == SettingsTab::Providers && self.provider_place.entered {
+            PanelKeys::ProviderSettings
+        } else {
+            PanelKeys::Rows
+        }
+    }
+
+    /// Steps the keys back out of the focused Provider's own Settings onto the
+    /// Providers, with focus on the Provider they stepped in from and the pane
+    /// still picking out the Setting they left, so stepping in again lands
+    /// where they were. A move like Up and Down, it takes the standing
+    /// complaint away as they do; keys already on the rows stay there.
+    pub(super) fn leave_provider(&mut self) {
+        if self.keys() == PanelKeys::ProviderSettings {
+            self.error = None;
+            self.provider_place.entered = false;
+        }
+    }
+
     /// Takes the geometry the frame just drew, which is the only account of the
     /// panel a pointer can be resolved against.
     pub(super) fn record_layout(&self, layout: PanelLayout) {
@@ -580,10 +666,11 @@ impl SettingsPanel {
     }
 
     /// Moves the panel to whatever the reader pointed at: a tab label shows
-    /// that tab, a row takes the focus, and a click on anything else — the
-    /// headline, the pane beside the rows, the footer, the border, the screen
-    /// the box is drawn over — changes nothing. A click never edits a Setting and never expands a
-    /// Provider: the focused row is the one surface an edit runs through, so
+    /// that tab, a row takes the focus — one of a Provider's own Settings
+    /// taking the keys along with it — and a click on anything else — the
+    /// headline, the rest of the pane beside the rows, the footer, the border,
+    /// the screen the box is drawn over — changes nothing. A click never edits
+    /// a Setting: the focused row is the one surface an edit runs through, so
     /// pointing at a row asks for the focus and never for the value.
     ///
     /// Like every other way into the panel, this does nothing at all while the
@@ -611,6 +698,10 @@ impl SettingsPanel {
             Some(PanelHit::Tab(tab)) => self.show_tab(tab, settings),
             Some(PanelHit::Row(row)) => {
                 self.focus_row(row);
+                AvailabilityRead::None
+            }
+            Some(PanelHit::ProviderSetting(row)) => {
+                self.focus_provider_setting(row);
                 AvailabilityRead::None
             }
             None => AvailabilityRead::None,
@@ -750,17 +841,24 @@ impl SettingsPanel {
             .collect()
     }
 
-    /// The Setting an edit acts on: the focused row of an open panel, and
+    /// The Setting an edit acts on: the focused row of an open panel, or the
+    /// focused Provider's own Setting the keys have stepped in onto, and
     /// nothing at all while the panel is closed. Every edit runs through here,
     /// so a command invoked from somewhere the panel is not — a plugin, a
     /// click — cannot reach a Setting the reader never focused.
     pub(super) fn selected_descriptor(&self) -> Option<&'static SettingDescriptor> {
-        self.open.then(|| {
-            let entries = self.entries();
-            entries
-                .get(self.selected_row(entries.len()))
-                .map(|entry| entry.descriptor)
-        })?
+        if !self.open {
+            return None;
+        }
+        match self.keys() {
+            PanelKeys::Rows => {
+                let entries = self.entries();
+                entries
+                    .get(self.selected_row(entries.len()))
+                    .map(|entry| entry.descriptor)
+            }
+            PanelKeys::ProviderSettings => self.picked_provider_setting(),
+        }
     }
 
     /// The active tab's rows, valued from the snapshot.
@@ -768,54 +866,98 @@ impl SettingsPanel {
         let entries = self.entries();
         let selected = self.selected_row(entries.len());
         entries
-            .into_iter()
+            .iter()
             .enumerate()
-            .map(|(index, entry)| {
-                let (value, availability) = match entry.provider {
-                    Some(provider) if settings.provider_enabled(provider) => (
-                        RowValue::ProviderEnabled,
-                        self.reading(provider, settings)
-                            .map_or(RowAvailability::Quiet, |reading| {
-                                reading.availability.clone()
-                            }),
-                    ),
-                    // A Provider the reader turned off is one Suru leaves
-                    // entirely alone, so its row reports that choice and never
-                    // a condition nothing looked for.
-                    Some(_) => (RowValue::ProviderDisabled, RowAvailability::Quiet),
-                    // A Setting that can put no words to what it holds is a
-                    // schema that fell behind its own types, not a reason to
-                    // refuse the reader the rest of the panel.
-                    None => (
-                        RowValue::Choice(
-                            entry
-                                .descriptor
-                                .spelling(settings)
-                                .unwrap_or(Cow::Borrowed(UNNAMED_VALUE)),
-                        ),
-                        RowAvailability::Quiet,
-                    ),
-                };
-                SettingRow {
-                    label: entry.label,
-                    provider: entry.provider,
-                    value,
-                    pinned: pinned.iter().any(|key| key == entry.descriptor.key),
-                    selected: index == selected,
-                    expansion: entry.expansion,
-                    chooses: entry.choice_surface().is_some(),
-                    availability,
-                }
-            })
+            .map(|(index, entry)| self.row(entry, index == selected, settings, pinned))
             .collect()
     }
 
-    /// Opens the focused row onto whatever it stands for. That is one meaning
-    /// rather than two: a Provider stands for the further Settings it holds, so
-    /// opening it reveals them and opening it again hides them; a Setting whose
-    /// value is chosen rather than cycled stands for the surface that chooses
-    /// it, so opening the row answers with that surface for the caller to show.
-    /// A row standing for neither is left exactly as it was.
+    /// The Provider focus stands on, for a panel showing the Providers, with
+    /// its own further Settings; none on any other tab.
+    pub(super) fn provider_focus(
+        &self,
+        settings: &EffectiveSettings,
+        pinned: &[String],
+    ) -> Option<ProviderFocus> {
+        if !self.open || self.tab != SettingsTab::Providers {
+            return None;
+        }
+        let entries = self.entries();
+        let entry = entries.get(self.selected_row(entries.len()))?;
+        let provider = entry.provider?;
+        let further = provider_settings(provider);
+        let picked = self.picked_row(further.len());
+        Some(ProviderFocus {
+            row: self.row(entry, true, settings, pinned),
+            enablement: entry.descriptor,
+            enabled: settings.provider_enabled(provider),
+            settings: further
+                .iter()
+                .enumerate()
+                .map(|(index, descriptor)| {
+                    let entry = PanelEntry {
+                        label: descriptor.label,
+                        descriptor,
+                        provider: None,
+                    };
+                    self.row(&entry, index == picked, settings, pinned)
+                })
+                .collect(),
+            picked: further.get(picked).copied(),
+        })
+    }
+
+    /// One row valued from the snapshot.
+    fn row(
+        &self,
+        entry: &PanelEntry,
+        selected: bool,
+        settings: &EffectiveSettings,
+        pinned: &[String],
+    ) -> SettingRow {
+        let (value, availability) = match entry.provider {
+            Some(provider) if settings.provider_enabled(provider) => (
+                RowValue::ProviderEnabled,
+                self.reading(provider, settings)
+                    .map_or(RowAvailability::Quiet, |reading| {
+                        reading.availability.clone()
+                    }),
+            ),
+            // A Provider the reader turned off is one Suru leaves entirely
+            // alone, so its row reports that choice and never a condition
+            // nothing looked for.
+            Some(_) => (RowValue::ProviderDisabled, RowAvailability::Quiet),
+            // A Setting that can put no words to what it holds is a schema
+            // that fell behind its own types, not a reason to refuse the
+            // reader the rest of the panel.
+            None => (
+                RowValue::Choice(
+                    entry
+                        .descriptor
+                        .spelling(settings)
+                        .unwrap_or(Cow::Borrowed(UNNAMED_VALUE)),
+                ),
+                RowAvailability::Quiet,
+            ),
+        };
+        SettingRow {
+            label: entry.label,
+            provider: entry.provider,
+            value,
+            pinned: pinned.iter().any(|key| key == entry.descriptor.key),
+            selected,
+            opens: entry.opens(),
+            availability,
+        }
+    }
+
+    /// Opens what focus stands on. That is one meaning rather than two: a
+    /// Provider stands for the further Settings it holds, so opening it steps
+    /// the keys in onto them; a Setting whose value is chosen rather than
+    /// cycled stands for the surface that chooses it, so opening it answers
+    /// with that surface for the caller to show — the focused row's, or the
+    /// Provider's own Setting the keys have stepped in onto. Anything standing
+    /// for neither is left exactly as it was.
     ///
     /// Like an edit, this reaches a row only through the focus, so a command
     /// arriving while the panel is closed opens nothing.
@@ -823,33 +965,31 @@ impl SettingsPanel {
         if !self.open {
             return None;
         }
-        let entries = self.entries();
-        let entry = entries.get(self.selected_row(entries.len()))?;
-        let opening = match entry.provider {
-            // A Provider stands for the further Settings it holds, and one
-            // holding none stands for nothing to open.
-            Some(provider) => entry
-                .expansion
-                .expands()
-                .then_some(provider)
-                .map(RowOpening::Provider),
-            // A Setting's row stands for the surface its value is chosen at,
-            // where its value is one a reader chooses rather than cycles.
-            None => entry.choice_surface().map(RowOpening::Surface),
-        }?;
-        // Cleared only once the key has something to do, so a row Enter passes
-        // over does not quietly take away the complaint the reader is reading.
-        self.error = None;
-        match opening {
-            RowOpening::Surface(surface) => Some(surface),
-            RowOpening::Provider(provider) => {
-                match self.expanded.iter().position(|open| *open == provider) {
-                    Some(index) => {
-                        self.expanded.remove(index);
+        // The complaint is cleared only once the key has something to do, so
+        // a row Enter passes over does not quietly take away the complaint the
+        // reader is reading.
+        match self.keys() {
+            PanelKeys::Rows => {
+                let entries = self.entries();
+                let entry = entries.get(self.selected_row(entries.len()))?;
+                match entry.opens() {
+                    RowOpens::Nothing => None,
+                    RowOpens::Choice => {
+                        self.error = None;
+                        entry.choice_surface()
                     }
-                    None => self.expanded.push(provider),
+                    RowOpens::ProviderSettings => {
+                        self.error = None;
+                        self.provider_place.entered = true;
+                        self.provider_place.window.reveal();
+                        None
+                    }
                 }
-                None
+            }
+            PanelKeys::ProviderSettings => {
+                let surface = self.picked_provider_setting()?.chosen_at()?;
+                self.error = None;
+                Some(surface)
             }
         }
     }
@@ -895,49 +1035,28 @@ impl SettingsPanel {
                     label: descriptor.label,
                     descriptor,
                     provider: None,
-                    expansion: RowExpansion::Absent,
                 })
                 .collect(),
-            SettingsTab::Providers => {
-                let mut entries = Vec::new();
-                for provider in built_in_providers() {
-                    // A Provider whose Enablement the schema does not define
-                    // has no row to offer, because the row is that Setting's
-                    // surface. The guard beside the Provider list is what keeps
-                    // that from shipping.
-                    let Some(enablement) = provider_enablement(&provider.id) else {
-                        continue;
-                    };
-                    let further = provider_settings(&provider.id);
-                    let expanded = self.expanded.contains(&&provider.id);
-                    entries.push(PanelEntry {
+            // A Provider whose Enablement the schema does not define has no
+            // row to offer, because the row is that Setting's surface. The
+            // guard beside the Provider list is what keeps that from
+            // shipping.
+            SettingsTab::Providers => built_in_providers()
+                .iter()
+                .filter_map(|provider| {
+                    Some(PanelEntry {
                         label: provider.display_name.as_str(),
-                        descriptor: enablement,
+                        descriptor: provider_enablement(&provider.id)?,
                         provider: Some(&provider.id),
-                        expansion: match (further.is_empty(), expanded) {
-                            (true, _) => RowExpansion::Unexpandable,
-                            (false, false) => RowExpansion::Collapsed,
-                            (false, true) => RowExpansion::Expanded,
-                        },
-                    });
-                    if expanded {
-                        entries.extend(further.into_iter().map(|descriptor| PanelEntry {
-                            label: descriptor.label,
-                            descriptor,
-                            provider: None,
-                            expansion: RowExpansion::Revealed,
-                        }));
-                    }
-                }
-                entries
-            }
+                    })
+                })
+                .collect(),
         }
     }
 
     /// Where the focus sits on the tab being shown, held inside a listing of
-    /// `rows`. A tab's length moves under the focus — a Provider collapsing
-    /// takes rows away beneath it — so the focus is clamped where it is read
-    /// rather than only where it is moved, and a shorter listing lands the
+    /// `rows`. The focus is clamped where it is read rather than only where it
+    /// is moved, so a listing that ever grows shorter under it lands the
     /// reader on its last row instead of on nothing at all.
     fn selected_row(&self, rows: usize) -> usize {
         self.places[self.tab.position()]
@@ -945,15 +1064,62 @@ impl SettingsPanel {
             .min(rows.saturating_sub(1))
     }
 
+    /// Which of the focused Provider's `rows` own Settings the pane picks
+    /// out, clamped as [`Self::selected_row`] clamps.
+    fn picked_row(&self, rows: usize) -> usize {
+        self.provider_place.focus.min(rows.saturating_sub(1))
+    }
+
+    /// The focused Provider's own Setting the pane picks out, which is the
+    /// one an edit acts on once the keys have stepped in.
+    fn picked_provider_setting(&self) -> Option<&'static SettingDescriptor> {
+        let further = self.focused_provider_settings();
+        further.get(self.picked_row(further.len())).copied()
+    }
+
+    /// The focused Provider's own further Settings, and none where focus
+    /// stands on no Provider.
+    fn focused_provider_settings(&self) -> Vec<&'static SettingDescriptor> {
+        if self.tab != SettingsTab::Providers {
+            return Vec::new();
+        }
+        let entries = self.entries();
+        entries
+            .get(self.selected_row(entries.len()))
+            .and_then(|entry| entry.provider)
+            .map(provider_settings)
+            .unwrap_or_default()
+    }
+
+    /// Walks focus through whichever list holds the keys, wrapping at either
+    /// end: the tab's rows, or the focused Provider's own Settings, which the
+    /// keys never walk out of — stepping out is a key of its own. Walking off
+    /// one Provider onto another starts the next one's Settings afresh.
     fn move_selection(&mut self, distance: isize) {
         self.error = None;
+        let step = |focus: usize, rows: usize| {
+            (focus as isize + distance).rem_euclid(rows as isize) as usize
+        };
+        if self.keys() == PanelKeys::ProviderSettings {
+            let rows = self.focused_provider_settings().len();
+            if rows > 0 {
+                let place = &mut self.provider_place;
+                place.focus = step(place.focus, rows);
+                place.window.reveal();
+            }
+            return;
+        }
         let rows = self.entries().len();
         if rows == 0 {
             return;
         }
+        let before = self.selected_row(rows);
         let place = &mut self.places[self.tab.position()];
-        place.focus = (place.focus as isize + distance).rem_euclid(rows as isize) as usize;
+        place.focus = step(before, rows);
         place.window.reveal();
+        if self.tab == SettingsTab::Providers && place.focus != before {
+            self.provider_place = ProviderPlace::fresh();
+        }
     }
 
     /// Walks the tab bar, wrapping at either end so neither is a dead end. The
@@ -976,8 +1142,14 @@ impl SettingsPanel {
     /// and that gesture is how a reader who has just signed in outside Suru
     /// watches the row come good. Walking the bar never lands on the tab in
     /// view, so only a pointer can ask this.
+    ///
+    /// The keys come back out of a Provider's own Settings when the reader
+    /// leaves the Providers, so whatever brings them back meets the list.
     fn show_tab(&mut self, tab: SettingsTab, settings: &EffectiveSettings) -> AvailabilityRead {
         self.error = None;
+        if tab != self.tab {
+            self.provider_place.entered = false;
+        }
         self.tab = tab;
         if self.tab != SettingsTab::Providers {
             return AvailabilityRead::None;
@@ -987,10 +1159,26 @@ impl SettingsPanel {
     }
 
     /// Focuses one row of the tab being shown, which is a move like Up and Down
-    /// and takes the standing complaint away as they do.
+    /// and takes the standing complaint away as they do. It is the rows the
+    /// reader pointed at, so the keys go to them, out of any Provider's own
+    /// Settings; and a Provider other than the one focused starts its
+    /// Settings afresh, as walking onto it would.
     fn focus_row(&mut self, row: usize) {
         self.error = None;
+        let before = self.selected_row(self.entries().len());
         self.places[self.tab.position()].focus = row;
+        self.provider_place.entered = false;
+        if self.tab == SettingsTab::Providers && row != before {
+            self.provider_place = ProviderPlace::fresh();
+        }
+    }
+
+    /// Focuses one of the focused Provider's own Settings, stepping the keys
+    /// in onto them as Enter would, with the Setting pointed at picked out.
+    fn focus_provider_setting(&mut self, row: usize) {
+        self.error = None;
+        self.provider_place.entered = true;
+        self.provider_place.focus = row;
     }
 
     /// Puts every Provider that is about to be asked about back to waiting.
@@ -1066,27 +1254,49 @@ mod tests {
         }
     }
 
+    /// A panel open on the Providers tab, focused on its first Provider.
+    fn on_the_providers() -> SettingsPanel {
+        let mut panel = SettingsPanel::default();
+        panel.open();
+        let _ = panel.show_tab(SettingsTab::Providers, &EffectiveSettings::default());
+        panel
+    }
+
+    /// The key of the Setting an edit would act on, which is how these tests
+    /// read where the keys stand.
+    fn editing(panel: &SettingsPanel) -> &'static str {
+        panel
+            .selected_descriptor()
+            .expect("an open panel always has a Setting an edit would act on")
+            .key
+    }
+
     /// A Provider-scoped Setting reaches the reader as the Provider's own row
-    /// or from inside that Provider's expansion, and the two must not overlap:
-    /// one keyed on no built-in Provider would have left the panel silently,
-    /// and an Enablement repeated inside an expansion would give the reader two
-    /// rows for one value.
+    /// or among the Settings stepped into from it, and the two must not
+    /// overlap: one keyed on no built-in Provider would have left the panel
+    /// silently, and an Enablement repeated among the Provider's own Settings
+    /// would give the reader two rows for one value.
     #[test]
-    fn every_provider_setting_has_exactly_one_row_among_the_expanded_providers() {
-        let panel = SettingsPanel {
-            open: true,
-            tab: SettingsTab::Providers,
-            expanded: built_in_providers()
-                .iter()
-                .map(|provider| &provider.id)
-                .collect(),
-            ..SettingsPanel::default()
-        };
-        let keys = panel
-            .entries()
-            .iter()
-            .map(|entry| entry.descriptor.key)
-            .collect::<Vec<_>>();
+    fn every_provider_setting_is_reached_exactly_once_from_the_providers() {
+        let mut panel = on_the_providers();
+        let mut keys = Vec::new();
+        for _ in built_in_providers() {
+            keys.push(editing(&panel));
+            let further = panel
+                .provider_focus(&EffectiveSettings::default(), &[])
+                .expect("every row of the Providers tab is a Provider")
+                .settings
+                .len();
+            let _ = panel.open_row();
+            if panel.keys() == PanelKeys::ProviderSettings {
+                for _ in 0..further {
+                    keys.push(editing(&panel));
+                    panel.select_next();
+                }
+                panel.leave_provider();
+            }
+            panel.select_next();
+        }
         for descriptor in SCHEMA
             .iter()
             .filter(|descriptor| descriptor.group == SettingGroup::Providers)
@@ -1094,10 +1304,205 @@ mod tests {
             assert_eq!(
                 keys.iter().filter(|key| **key == descriptor.key).count(),
                 1,
-                "{} does not have exactly one row on the Providers tab: {keys:?}",
+                "{} is not reached exactly once from the Providers tab: {keys:?}",
                 descriptor.key
             );
         }
+    }
+
+    /// The Providers tab lists one row per built-in Provider and nothing else:
+    /// a Provider's own Settings are stepped into, never listed among them.
+    #[test]
+    fn the_providers_tab_lists_one_row_per_built_in_provider_in_order() {
+        let panel = on_the_providers();
+        let rows = panel.rows(&EffectiveSettings::default(), &[]);
+        assert_eq!(
+            rows.iter().map(|row| row.provider).collect::<Vec<_>>(),
+            built_in_providers()
+                .iter()
+                .map(|provider| Some(&provider.id))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Enter steps the keys from a Provider's row onto its own Settings, where
+    /// they walk and wrap without ever leaving them; stepping out puts them
+    /// back on the Provider, and stepping in again lands where they left.
+    #[test]
+    fn the_keys_step_into_a_providers_settings_walk_them_and_step_back_out() {
+        let mut panel = on_the_providers();
+        assert_eq!(panel.keys(), PanelKeys::Rows);
+        assert_eq!(editing(&panel), "provider.codex.enabled");
+
+        assert!(panel.open_row().is_none(), "stepping in shows no surface");
+        assert_eq!(panel.keys(), PanelKeys::ProviderSettings);
+        assert_eq!(editing(&panel), "provider.codex.reasoningSummary");
+        panel.select_next();
+        assert_eq!(editing(&panel), "provider.codex.approvalPolicy");
+        panel.select_previous();
+        panel.select_previous();
+        assert_eq!(
+            editing(&panel),
+            "provider.codex.sandboxMode",
+            "walking off the first wraps to the last of the Provider's own"
+        );
+        panel.select_next();
+        assert_eq!(
+            editing(&panel),
+            "provider.codex.reasoningSummary",
+            "and off the last back to the first, never onto another Provider"
+        );
+        panel.select_next();
+
+        panel.leave_provider();
+        assert_eq!(panel.keys(), PanelKeys::Rows);
+        assert_eq!(
+            editing(&panel),
+            "provider.codex.enabled",
+            "stepping out lands on the Provider stepped in from"
+        );
+        assert_eq!(
+            panel
+                .provider_focus(&EffectiveSettings::default(), &[])
+                .and_then(|focus| focus.picked)
+                .map(|descriptor| descriptor.key),
+            Some("provider.codex.approvalPolicy"),
+            "with the Setting left still picked out"
+        );
+        let _ = panel.open_row();
+        assert_eq!(
+            editing(&panel),
+            "provider.codex.approvalPolicy",
+            "so stepping in again lands where the reader was"
+        );
+    }
+
+    /// The place among a Provider's Settings belongs to that Provider: moving
+    /// focus to another one starts its Settings at the first.
+    #[test]
+    fn another_provider_starts_its_own_settings_at_the_first() {
+        let mut panel = on_the_providers();
+        let _ = panel.open_row();
+        panel.select_next();
+        panel.leave_provider();
+
+        panel.select_next();
+        assert_eq!(editing(&panel), "provider.copilot.enabled");
+        let _ = panel.open_row();
+        assert_eq!(editing(&panel), "provider.copilot.permissions");
+        panel.leave_provider();
+
+        panel.select_previous();
+        let _ = panel.open_row();
+        assert_eq!(
+            editing(&panel),
+            "provider.codex.reasoningSummary",
+            "and coming back to the first Provider starts it afresh too"
+        );
+    }
+
+    /// Where the keys stand is view state: closing the panel forgets it, and so
+    /// does leaving the Providers for another tab.
+    #[test]
+    fn the_keys_come_back_to_the_providers_on_close_and_on_leaving_the_tab() {
+        let mut panel = on_the_providers();
+        let _ = panel.open_row();
+        let _ = panel.show_tab(SettingsTab::General, &EffectiveSettings::default());
+        assert_eq!(panel.keys(), PanelKeys::Rows);
+        let _ = panel.show_tab(SettingsTab::Providers, &EffectiveSettings::default());
+        assert_eq!(
+            panel.keys(),
+            PanelKeys::Rows,
+            "coming back meets the list of Providers"
+        );
+
+        let _ = panel.open_row();
+        let _ = panel.show_tab(SettingsTab::Providers, &EffectiveSettings::default());
+        assert_eq!(
+            panel.keys(),
+            PanelKeys::ProviderSettings,
+            "asking again for the tab in view re-reads the Providers and keeps the keys"
+        );
+
+        panel.close();
+        panel.open();
+        let _ = panel.show_tab(SettingsTab::Providers, &EffectiveSettings::default());
+        assert_eq!(panel.keys(), PanelKeys::Rows);
+        assert_eq!(editing(&panel), "provider.codex.enabled");
+    }
+
+    /// Stepping in is the Providers' own: a Setting's row on any other tab has
+    /// no Settings of its own to step into, and stepping out of nothing leaves
+    /// the panel as it was.
+    #[test]
+    fn only_a_provider_is_stepped_into() {
+        let mut panel = SettingsPanel::default();
+        panel.open();
+        let before = editing(&panel);
+        panel.leave_provider();
+        assert_eq!(editing(&panel), before);
+        for _ in SCHEMA
+            .iter()
+            .filter(|descriptor| descriptor.group == SettingGroup::General)
+        {
+            let _ = panel.open_row();
+            assert_eq!(panel.keys(), PanelKeys::Rows);
+            panel.select_next();
+        }
+    }
+
+    /// A pointer reaches every list the frame drew and nothing beside it: a
+    /// row of the Providers takes the keys back to them, and one of the
+    /// focused Provider's own Settings takes them in onto it.
+    #[test]
+    fn a_pointer_focuses_a_provider_or_one_of_its_settings_and_never_edits() {
+        let mut panel = on_the_providers();
+        let settings = EffectiveSettings::default();
+        panel.record_layout(PanelLayout::new(
+            0..100,
+            None,
+            Some(RowWindow {
+                top: 2,
+                first: 0,
+                count: 3,
+                columns: 0..50,
+            }),
+            Some(RowWindow {
+                top: 6,
+                first: 0,
+                count: 3,
+                columns: 51..100,
+            }),
+        ));
+
+        assert_eq!(panel.focus_at(60, 7, &settings), AvailabilityRead::None);
+        assert_eq!(panel.keys(), PanelKeys::ProviderSettings);
+        assert_eq!(editing(&panel), "provider.codex.approvalPolicy");
+
+        for (column, row) in [(60, 9), (60, 5), (50, 7), (100, 7)] {
+            let _ = panel.focus_at(column, row, &settings);
+            assert_eq!(
+                editing(&panel),
+                "provider.codex.approvalPolicy",
+                "a pointer at ({column}, {row}) lands on nothing"
+            );
+        }
+
+        let _ = panel.focus_at(10, 3, &settings);
+        assert_eq!(panel.keys(), PanelKeys::Rows);
+        assert_eq!(editing(&panel), "provider.copilot.enabled");
+        let _ = panel.open_row();
+        assert_eq!(
+            editing(&panel),
+            "provider.copilot.permissions",
+            "pointing at another Provider starts its Settings afresh"
+        );
+        let _ = panel.focus_at(10, 3, &settings);
+        assert_eq!(
+            panel.keys(),
+            PanelKeys::Rows,
+            "pointing at the Provider already focused takes the keys back to the list"
+        );
     }
 
     /// The Providers tab is the one tab a Setting's key decides: it is built
