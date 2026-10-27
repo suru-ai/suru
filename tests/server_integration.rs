@@ -4960,6 +4960,18 @@ async fn a_failed_serving_rebind_keeps_the_listener_already_in_service() {
     server.shutdown().await.expect("shut down server");
 }
 
+/// A Server started in-process reads the test binary's marker rather than
+/// hashing the whole of it; see `BUILD_ID` in `tests/support/mod.rs`.
+#[test]
+fn the_test_binary_carries_a_build_marker() {
+    let identity =
+        build_identity::for_current_executable().expect("identify current test executable");
+    assert!(
+        identity.starts_with("suru-build-v1:"),
+        "the linker kept the test binary's marker: {identity}"
+    );
+}
+
 #[test]
 fn build_identity_changes_with_executable_contents() {
     let directory = tempfile::tempdir().expect("create build identity fixture directory");
