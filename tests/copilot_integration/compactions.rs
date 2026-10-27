@@ -28,7 +28,7 @@
 //! decide anything of it. While Copilot still owes reports of a compaction it answered, the next
 //! request is turned away rather than begun.
 
-use crate::support::{
+use crate::copilot_integration::support::{
     Opened, ScriptedCopilot, abort_arm, agent_messages, conversation_arms, conversation_fixture,
     opened_session, opened_session_on, permission_decision_arm, send_arm, session_where,
     settled_session,

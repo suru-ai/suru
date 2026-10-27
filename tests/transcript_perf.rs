@@ -1,6 +1,6 @@
 //! Timing harness for transcript rendering hot paths.
 //!
-//! Run with: cargo test --release --test transcript_perf -- --ignored --nocapture
+//! Run with: cargo test --release --test integration transcript_perf -- --ignored --nocapture
 
 use std::time::Instant;
 

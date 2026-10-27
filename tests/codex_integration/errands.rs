@@ -8,7 +8,7 @@
 //! scripted binary, so this is where it is asserted — alongside the Title that
 //! arrives, or fails to, at the far end.
 
-use crate::{
+use crate::codex_integration::{
     server_support::{
         assert_no_title_reaches, next_derived_title, next_skill_catalog, receive_initial_state,
     },

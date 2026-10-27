@@ -24,8 +24,8 @@ use suru::protocol::{
 use suru::questionnaire::{Question, QuestionChoice};
 
 use super::*;
-use crate::attachments::{next_change, watch_session};
-use crate::broker::sidekick_acts::{
+use crate::session_integration::attachments::{next_change, watch_session};
+use crate::session_integration::broker::sidekick_acts::{
     SIDEKICK_WORKSPACE_REFUSAL, acted, refused, refused_over_http, sidekick_author,
 };
 
@@ -42,7 +42,7 @@ fn offered(id: &str, label: &str) -> QuestionChoice {
 /// A Questionnaire of two Questions: where the tests should run, one of two
 /// machines with a note beside it if wanted, which must be answered; and
 /// anything else to say, in free text, which may be left unanswered.
-pub(in crate::broker) fn where_to_run() -> Questionnaire {
+pub(in crate::session_integration::broker) fn where_to_run() -> Questionnaire {
     Questionnaire {
         id: QuestionnaireId::new(),
         questions: vec![
@@ -77,7 +77,7 @@ pub(in crate::broker) fn where_to_run() -> Questionnaire {
 
 /// Has `provider` ask `questionnaire` in its working Turn, and waits until
 /// `session_id` holds it waiting on an Answer.
-pub(in crate::broker) async fn ask(
+pub(in crate::session_integration::broker) async fn ask(
     descriptor: &RuntimeDescriptor,
     session_id: SessionId,
     provider: &ControlledProviderSession,
@@ -103,7 +103,7 @@ pub(in crate::broker) async fn ask(
 
 /// How the Questionnaire `id` stands in `snapshot`: its outcome, the Answer
 /// recorded for it, and who gave that Answer on the user's behalf.
-pub(in crate::broker) fn stood(
+pub(in crate::session_integration::broker) fn stood(
     snapshot: &SessionSnapshot,
     id: QuestionnaireId,
 ) -> Option<(QuestionnaireOutcome, Option<Answer>, Option<Author>)> {

@@ -40,8 +40,7 @@ use tokio::sync::{Semaphore, oneshot, watch};
 use tokio::time::{Duration, timeout, timeout_at};
 use uuid::Uuid;
 
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
 use support::{
     detached_servers::DetachedServers, mark_onboarded, read_runtime_descriptor,
@@ -1889,12 +1888,14 @@ impl AttachedTui {
         let mut command = portable_pty::CommandBuilder::new(
             std::env::current_exe().expect("locate the running test binary"),
         );
-        command.args([
-            "--exact",
-            "attached_tui_terminal_mode_probe",
-            "--ignored",
-            "--nocapture",
-        ]);
+        // The name the test harness knows the probe by: its path in this
+        // binary, without the crate's name.
+        let module = module_path!();
+        let probe = format!(
+            "{}::attached_tui_terminal_mode_probe",
+            module.split_once("::").map_or(module, |(_, path)| path)
+        );
+        command.args(["--exact", &probe, "--ignored", "--nocapture"]);
         command.env("SURU_STATE_DIR", servers.state_dir());
         command.env("SURU_DATA_DIR", servers.state_dir());
         command.env("SURU_CONFIG_DIR", servers.state_dir());

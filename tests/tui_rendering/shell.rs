@@ -1,6 +1,6 @@
 //! Application shell: connection lifecycle views and responsive layout degradation.
 
-use crate::{
+use crate::tui_rendering::{
     failing_provider_support::spawn_with_failing_provider,
     support::{
         connected_application, connected_application_with_terminal_facts, enter_session,
@@ -96,7 +96,10 @@ fn headless_application_handles_terminal_and_managed_events_through_the_producti
             ..
         }
     ));
-    crate::support::answer_workspace_resolution(&mut application, managed_transition);
+    crate::tui_rendering::support::answer_workspace_resolution(
+        &mut application,
+        managed_transition,
+    );
 
     let screen = rendered_application_rows(&application).join("\n");
     assert!(!screen.contains("▀▀▀▀▀▀▀▀█▀▀▀▀▀"));
@@ -424,7 +427,7 @@ fn landing_centers_the_logo_and_composer_together_as_the_draft_grows() {
         let mut application = connected_application(workspace.path());
         let mut settings = suru::protocol::EffectiveSettings::default();
         settings.appearance.landing_page = suru::protocol::LandingPage::Fancy;
-        crate::support::deliver_settings(&mut application, settings);
+        crate::tui_rendering::support::deliver_settings(&mut application, settings);
         type_terminal_text(&mut application, draft);
         for (width, height) in [(80, 20), (80, 21), (43, 20)] {
             let rows = rendered_application_rows_at(&application, width, height);
@@ -464,7 +467,7 @@ fn landing_centers_the_logo_and_composer_together_as_the_draft_grows() {
 
         // A settings update removes the whole brand area and recenters the
         // existing draft without changing its contents.
-        crate::support::deliver_settings(
+        crate::tui_rendering::support::deliver_settings(
             &mut application,
             suru::protocol::EffectiveSettings::default(),
         );
@@ -488,7 +491,7 @@ fn landing_shell_degrades_by_priority_without_sacrificing_the_composer() {
     let mut application = connected_application(workspace.path());
     let mut settings = suru::protocol::EffectiveSettings::default();
     settings.appearance.landing_page = suru::protocol::LandingPage::Fancy;
-    crate::support::deliver_settings(&mut application, settings);
+    crate::tui_rendering::support::deliver_settings(&mut application, settings);
     application
         .handle_event(ApplicationEvent::Command(CommandId::InsertText(
             "Keep the composer usable".to_owned(),

@@ -1,6 +1,6 @@
 //! Model option resolution and atomic option updates.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     model_descriptor, rendered_application_rows, rendered_application_rows_at,
     selected_session_snapshot, type_terminal_text, workspace_dir,
 };

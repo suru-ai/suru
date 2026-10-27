@@ -1,6 +1,6 @@
 //! Native work resumed by Claude after background commands finish.
 
-use crate::support::{
+use crate::claude_integration::support::{
     CLAUDE_MODELS, ScriptedClaude, agent_messages, conversation_fixture, discovery_arms,
     interrupt_arm, opened_session, session_where, settled_session, user_turn_arm,
 };

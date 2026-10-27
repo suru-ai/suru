@@ -1,11 +1,11 @@
 //! Prompt admission: ordering, idempotent retries, mutation, and rejection.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     failing_provider_support::spawn_with_failing_provider,
     provider_support::ControlledProvider,
     support::{read_session_at_least_revision, receive_managed_client_initial_state},
 };
+use crate::support::PROGRESS_DEADLINE;
 use eventsource_stream::Eventsource;
 use futures_util::{StreamExt, future::join_all};
 use suru::{

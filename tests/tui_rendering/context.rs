@@ -1,6 +1,6 @@
 //! `/context`: what occupies the open Session's context, as its Provider says.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     enter_session, failed_session_snapshot, key, rendered_application_rows,
     rendered_application_rows_at, type_terminal_text, workspace_dir,
 };

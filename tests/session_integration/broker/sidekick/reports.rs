@@ -23,11 +23,11 @@ use suru::provider::Report;
 use suru::questionnaire::{Question, QuestionChoice};
 
 use super::*;
-use crate::broker::{
+use crate::session_integration::broker::{
     reports::held_in,
     sidekick_acts::{acted, refused},
 };
-use crate::server_support::broker::untimed_sidekick_report;
+use crate::support::broker::untimed_sidekick_report;
 
 /// What the Sidekick asks of the Sessions it sets to work.
 const ASKED: &str = "Fix the flaky login test in the auth suite.";

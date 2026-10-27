@@ -2,7 +2,7 @@
 //! one Section today, the Subagents Section — the tree the open Session
 //! belongs to, fed by the per-tree subscription.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     click_mouse, connected_application, deliver_settings, enter_session, failed_session_snapshot,
     invoke, key, rendered_application_buffer, rendered_application_rows_at, type_terminal_text,
     workspace_dir,
@@ -968,7 +968,7 @@ fn the_aside_is_squeezed_out_before_the_sidebar() {
 
 #[test]
 fn the_edge_drags_and_a_double_click_resets_the_width() {
-    use crate::selection::mouse;
+    use crate::tui_rendering::selection::mouse;
 
     let workspace = workspace_dir();
     let (mut application, _) = tree_open_at_top(workspace.path());
@@ -1389,7 +1389,7 @@ fn a_deleted_tree_is_dropped_without_an_error_line() {
 
 #[test]
 fn an_unreachable_remote_leaves_the_last_tree_standing() {
-    let mut application = crate::support::application_looking_at_studio();
+    let mut application = crate::tui_rendering::support::application_looking_at_studio();
     let mut settings = EffectiveSettings::default();
     settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
     deliver_settings(&mut application, settings);
@@ -1413,12 +1413,12 @@ fn an_unreachable_remote_leaves_the_last_tree_standing() {
     let before = aside_rows(&application, WIDTH);
     assert_eq!(before[1], "Map every seam");
 
-    crate::support::studio_stops_answering(
+    crate::tui_rendering::support::studio_stops_answering(
         &mut application,
         1,
         std::time::Duration::from_millis(5),
     );
-    crate::support::grace_elapses(&mut application, studio);
+    crate::tui_rendering::support::grace_elapses(&mut application, studio);
     let rows = aside_rows(&application, WIDTH);
     assert!(
         rows[..5] == before[..5],
@@ -2068,7 +2068,11 @@ fn press(
 /// The fixture tree open at `open`, with the Aside holding the keys.
 fn driving_the_aside(
     open_at: impl FnOnce(&Tree) -> (SessionId, Option<SessionId>),
-) -> (Application, Tree, crate::support::WorkspaceDir) {
+) -> (
+    Application,
+    Tree,
+    crate::tui_rendering::support::WorkspaceDir,
+) {
     let workspace = workspace_dir();
     let (mut application, tree) = tree_open_at_top(workspace.path());
     let (session, parent) = open_at(&tree);

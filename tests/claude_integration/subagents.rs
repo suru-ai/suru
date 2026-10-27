@@ -8,7 +8,7 @@
 //! conversation arrives as those snapshots alone — full messages carrying `parent_tool_use_id`,
 //! never chunks.
 
-use crate::{
+use crate::claude_integration::{
     server_support::PROGRESS_DEADLINE,
     support::{
         CLAUDE_MODELS, ScriptedClaude, after_probe, agent_messages, conversation_fixture,

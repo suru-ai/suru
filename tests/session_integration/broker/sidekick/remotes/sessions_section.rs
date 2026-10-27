@@ -13,9 +13,9 @@ use suru::protocol::{
 };
 
 use super::*;
-use crate::broker::sidekick_acts::acted;
-use crate::subagent_tree::{TreeUpdates, next_change, open_tree};
-use crate::support::open_catalog_stream_with_snapshot;
+use crate::session_integration::broker::sidekick_acts::acted;
+use crate::session_integration::subagent_tree::{TreeUpdates, next_change, open_tree};
+use crate::session_integration::support::open_catalog_stream_with_snapshot;
 
 /// Follows a tree's changes until the entry of `session_id` on the Remote
 /// joins it or moves so that `matches` holds of it, answering that entry.

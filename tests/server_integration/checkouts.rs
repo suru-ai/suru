@@ -353,7 +353,7 @@ async fn remote_checkout_observation_is_owned_and_streamed_by_the_origin() {
         "remote-checkout-observation",
         false,
         Some(std::sync::Arc::new(
-            crate::failing_provider_support::FailingProviderRuntime,
+            crate::support::failing_provider::FailingProviderRuntime,
         )),
     )
     .await;

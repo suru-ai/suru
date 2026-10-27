@@ -9,7 +9,7 @@
 //! gave a Questionnaire is named the same way wherever the Questionnaire
 //! stands, and leads the same way.
 
-use crate::{
+use crate::tui_rendering::{
     connecting::turn_to_studio,
     support::{
         buffer_rows, click_mouse, connected_application, enter_active_session, fixture_instance_id,

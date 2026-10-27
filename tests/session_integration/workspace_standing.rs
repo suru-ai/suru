@@ -30,7 +30,7 @@ use suru::{
 };
 use tokio::time::timeout;
 
-use crate::{
+use crate::session_integration::{
     server_support::PROGRESS_DEADLINE,
     workspace_discovery::{repository_id, server_beneath, server_with_roots, spelled},
     workspace_registry::{

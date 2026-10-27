@@ -1,10 +1,10 @@
 //! Turn execution, transcript projection, and durability across a restart.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::codex_integration::{
     server_support::{detached_servers::DetachedServers, request_server_shutdown},
     support::{ScriptedCodex, receive_initial_state},
 };
+use crate::support::PROGRESS_DEADLINE;
 use serde_json::Value;
 use std::{process::Stdio, sync::Arc};
 use suru::{

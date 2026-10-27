@@ -14,7 +14,7 @@ use suru::{
     server::RunningServer,
 };
 
-use crate::support::{
+use crate::claude_integration::support::{
     CLAUDE_MODELS, ScriptedClaude, discovery_arms, hosting_runtime, settled_session, user_turn_arm,
 };
 

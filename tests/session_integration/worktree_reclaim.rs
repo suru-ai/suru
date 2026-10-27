@@ -1378,7 +1378,7 @@ async fn deleting_the_last_session_starts_reclaim_without_delaying_the_response(
         .await
         .expect("eager Reclaim reaches Git before the scheduled pass");
     assert!(matches!(
-        crate::server_support::next_catalog_change_matching(&mut catalog, |change| {
+        crate::support::next_catalog_change_matching(&mut catalog, |change| {
             matches!(
                 change,
                 SessionCatalogChange::Deleted { session_id }

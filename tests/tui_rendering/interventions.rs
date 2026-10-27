@@ -1,7 +1,7 @@
 //! An Intervention — a pending Approval or Questionnaire — presents its own
 //! panel in the open Session, so the reader never has to know a key to answer.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     add_activity, add_request, approval_activity, connected_application, enter_active_session,
     invoke, key, rendered_application_rows, type_terminal_text, workspace_dir,
 };

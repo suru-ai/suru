@@ -8,7 +8,7 @@
 //! Monitoring cancels its shells through the task roster rather than aborting a loop that is not
 //! running.
 
-use crate::support::{
+use crate::copilot_integration::support::{
     Opened, ScriptedCopilot, agent_messages, conversation_arms, opened_session, opened_session_on,
     send_arm, session_where, settled_session,
 };

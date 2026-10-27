@@ -27,8 +27,7 @@ use suru::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Duration, timeout};
 
-#[allow(dead_code)]
-mod support;
+use crate::support;
 
 // Every way of spawning a Server, each marking it onboarded unless a test of
 // Onboarding asks otherwise; not every one is used.
@@ -52,14 +51,9 @@ mod state_loss;
 #[path = "server_integration/stop_finality.rs"]
 mod stop_finality;
 
-#[path = "support/connect_proxy.rs"]
-mod connect_proxy;
-#[allow(dead_code)]
-#[path = "support/failing_provider.rs"]
-mod failing_provider_support;
-#[allow(dead_code)]
-#[path = "support/provider.rs"]
-mod provider_support;
+use crate::support::connect_proxy;
+use crate::support::failing_provider as failing_provider_support;
+use crate::support::provider as provider_support;
 
 use support::{
     observed_tcp_proxy::ObservedTcpProxy, read_runtime_descriptor, receive_initial_state,
@@ -4961,7 +4955,7 @@ async fn a_failed_serving_rebind_keeps_the_listener_already_in_service() {
 }
 
 /// A Server started in-process reads the test binary's marker rather than
-/// hashing the whole of it; see `BUILD_ID` in `tests/support/mod.rs`.
+/// hashing the whole of it; see `tests/support/build_id.rs`.
 #[test]
 fn the_test_binary_carries_a_build_marker() {
     let identity =

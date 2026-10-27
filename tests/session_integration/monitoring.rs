@@ -5,8 +5,10 @@
 //! so no Session is Monitoring after a restart. Interrupting a Session that is
 //! only Monitoring asks its Provider to stop the Watches, and settles nothing.
 
-use crate::server_support::{PROGRESS_DEADLINE, next_catalog_change_matching};
-use crate::support::{WorkingTurn, open_catalog_stream_with_snapshot, read_session_until};
+use crate::session_integration::support::{
+    WorkingTurn, open_catalog_stream_with_snapshot, read_session_until,
+};
+use crate::support::{PROGRESS_DEADLINE, next_catalog_change_matching};
 use suru::{
     protocol::{
         RuntimeDescriptor, SessionCatalogChange, SessionId, SessionListItem, SessionSnapshot,
@@ -21,7 +23,7 @@ use suru::{
 use tokio::time::timeout;
 
 async fn working_turn(state_dir: &std::path::Path, channel: &str) -> WorkingTurn {
-    crate::support::working_turn(state_dir, channel).await
+    crate::session_integration::support::working_turn(state_dir, channel).await
 }
 
 /// The Session's row in the server's listing.
@@ -256,7 +258,8 @@ async fn working_takes_precedence_over_a_live_watch_across_the_session_tree() {
             _ => None,
         })
         .expect("the Subagent's row names its Session");
-    let child = crate::support::read_session(fixture.server.descriptor(), child).await;
+    let child =
+        crate::session_integration::support::read_session(fixture.server.descriptor(), child).await;
     assert_eq!(
         monitoring.session.monitoring_since,
         Some(settled_at(&child, 0)),
@@ -334,7 +337,7 @@ async fn a_restarted_server_shows_no_session_monitoring() {
     let session_id = fixture.session_id;
     fixture.server.shutdown().await.expect("shut down server");
 
-    let (runtime, _provider) = crate::provider_support::ControlledProvider::new();
+    let (runtime, _provider) = crate::support::provider::ControlledProvider::new();
     let restarted = timeout(
         PROGRESS_DEADLINE,
         server::spawn_with_provider(
@@ -345,7 +348,8 @@ async fn a_restarted_server_shows_no_session_monitoring() {
     .await
     .expect("the server restarts in time")
     .expect("respawn server");
-    let restored = crate::support::read_session(restarted.descriptor(), session_id).await;
+    let restored =
+        crate::session_integration::support::read_session(restarted.descriptor(), session_id).await;
     assert_eq!(
         restored.session.monitoring_since, None,
         "no Watch outlives the Provider process that ran it, so none keeps a Session Monitoring"
@@ -624,7 +628,11 @@ async fn a_watch_stop_the_provider_refuses_leaves_the_session_monitoring() {
         reqwest::StatusCode::BAD_GATEWAY,
         "a stop the Provider refused is reported, not passed off as success"
     );
-    let still = crate::support::read_session(fixture.server.descriptor(), fixture.session_id).await;
+    let still = crate::session_integration::support::read_session(
+        fixture.server.descriptor(),
+        fixture.session_id,
+    )
+    .await;
     assert!(
         still.session.monitoring_since.is_some(),
         "a Watch the Provider would not stop is still live"
@@ -731,7 +739,8 @@ async fn a_grandchilds_watch_makes_each_ancestor_monitoring_unless_a_sibling_kee
     .await;
     let grandchild = child_of(&child_snapshot, "Tail the deploy log");
     let grandchild_snapshot =
-        crate::support::read_session(fixture.server.descriptor(), grandchild).await;
+        crate::session_integration::support::read_session(fixture.server.descriptor(), grandchild)
+            .await;
     assert!(
         grandchild_snapshot.session.monitoring_since.is_some(),
         "the Session whose Agent left the Watch running is Monitoring"
@@ -742,8 +751,11 @@ async fn a_grandchilds_watch_makes_each_ancestor_monitoring_unless_a_sibling_kee
         ["tail -f deploy.log"],
         "its parent waits on the grandchild's Watch too"
     );
-    let top_level =
-        crate::support::read_session(fixture.server.descriptor(), fixture.session_id).await;
+    let top_level = crate::session_integration::support::read_session(
+        fixture.server.descriptor(),
+        fixture.session_id,
+    )
+    .await;
     assert!(
         top_level.session.working_since.is_some(),
         "a Working sibling keeps the top-level Session Working"

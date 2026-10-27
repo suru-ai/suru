@@ -13,11 +13,11 @@
 //! next Turn once the Compaction completes, and withdrawn if it fails or is
 //! interrupted.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{
+use crate::session_integration::support::{
     WorkingTurn, compact, controlled_selection, interrupt, read_session, read_session_until,
     the_subagent_row, working_turn,
 };
+use crate::support::PROGRESS_DEADLINE;
 use axum::http::StatusCode;
 use suru::{
     protocol::{
@@ -802,7 +802,7 @@ async fn a_compaction_still_awaiting_its_after_takes_the_first_reading_after_a_r
 
     // Nothing was read after the Compaction before the stop, so the first
     // reading the next process takes is still the first after it settled.
-    let (runtime, mut provider) = crate::provider_support::ControlledProvider::new();
+    let (runtime, mut provider) = crate::support::provider::ControlledProvider::new();
     let restarted = timeout(
         PROGRESS_DEADLINE,
         server::spawn_with_provider(
@@ -887,7 +887,7 @@ async fn compactions_are_stored_with_the_sessions_history_and_survive_a_restart(
     assert_eq!(before.turns[0].status, TurnStatus::Completed);
     fixture.server.shutdown().await.expect("shut down server");
 
-    let (runtime, _provider) = crate::provider_support::ControlledProvider::new();
+    let (runtime, _provider) = crate::support::provider::ControlledProvider::new();
     let restarted = timeout(
         PROGRESS_DEADLINE,
         server::spawn_with_provider(
@@ -1552,7 +1552,7 @@ async fn a_requested_compactions_turn_is_stored_apart_from_a_continuation_and_su
     .await;
     fixture.server.shutdown().await.expect("shut down server");
 
-    let (runtime, _provider) = crate::provider_support::ControlledProvider::new();
+    let (runtime, _provider) = crate::support::provider::ControlledProvider::new();
     let restarted = timeout(
         PROGRESS_DEADLINE,
         server::spawn_with_provider(
@@ -1672,7 +1672,7 @@ async fn a_compaction_requested_with_instructions_hands_them_its_provider_and_ke
         );
         fixture.server.shutdown().await.expect("shut down server");
 
-        let (runtime, _provider) = crate::provider_support::ControlledProvider::new();
+        let (runtime, _provider) = crate::support::provider::ControlledProvider::new();
         let restarted = timeout(
             PROGRESS_DEADLINE,
             server::spawn_with_provider(
@@ -1796,7 +1796,7 @@ async fn an_interrupted_compaction_keeps_its_instructions_and_nothing_it_never_m
         );
         fixture.server.shutdown().await.expect("shut down server");
 
-        let (runtime, _provider) = crate::provider_support::ControlledProvider::new();
+        let (runtime, _provider) = crate::support::provider::ControlledProvider::new();
         let restarted = timeout(
             PROGRESS_DEADLINE,
             server::spawn_with_provider(
@@ -1826,7 +1826,7 @@ async fn an_interrupted_compaction_keeps_its_instructions_and_nothing_it_never_m
 async fn a_compaction_request_is_refused_while_a_prompt_waits_for_its_turn() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let (runtime, mut provider) = crate::provider_support::ControlledProvider::new();
+    let (runtime, mut provider) = crate::support::provider::ControlledProvider::new();
     let server = server::spawn_with_provider(
         ServerConfig::new(state_dir.path(), "compaction-undelivered-test")
             .expect("configure server"),
@@ -1834,7 +1834,7 @@ async fn a_compaction_request_is_refused_while_a_prompt_waits_for_its_turn() {
     )
     .await
     .expect("spawn server");
-    let created = crate::support::create_session(
+    let created = crate::session_integration::support::create_session(
         server.descriptor(),
         &suru::protocol::CreateSessionRequest {
             preparation_id: None,

@@ -19,7 +19,7 @@ use suru::{
     tui::{Application, ApplicationEvent},
 };
 
-use crate::{
+use crate::tui_rendering::{
     deadlines::PROGRESS_DEADLINE,
     failing_provider_support::spawn_with_failing_provider,
     support::{

@@ -2,6 +2,17 @@
 name = "suru"
 version = "0.3.5"
 edition = "2024"
+# The integration tests are one binary, rather than one per file Cargo would discover; see `tests/integration.rs`.
+autotests = false
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+# Sets the environment and the Log for its whole process, so it holds its one test alone.
+[[test]]
+name = "relay_system"
+path = "tests/relay_system.rs"
 
 [workspace]
 members = ["crates/suru-relay", "crates/suru-relay-protocol"]
@@ -87,7 +98,7 @@ object = { version = "0.37", default-features = false, features = ["read_core", 
 # A real Relay in-process, which the Relay tests drive a Server against.
 suru-relay = { path = "crates/suru-relay" }
 # Marks the test binaries the way `src/main.rs` marks Suru's, so a Server a test starts in-process identifies its
-# executable without hashing the whole of it; see `tests/support/mod.rs`.
+# executable without hashing the whole of it; see `tests/support/build_id.rs`.
 suru-build-id = { path = "crates/suru-build-id" }
 # The Copilot fixtures answer the SDK's own protocol handshake, so they read the version it speaks
 # from the crate rather than pinning a literal that silently rots on an upgrade.

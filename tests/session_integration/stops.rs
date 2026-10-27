@@ -3,14 +3,14 @@
 //! single Subagent stops on its own where the Provider declares the
 //! capability, refusing cleanly where it does not.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     server_support::next_catalog_change_matching,
     support::{
         WorkingTurn, interrupt, open_catalog_stream_with_snapshot, read_session_until,
         the_subagent_row, working_turn,
     },
 };
+use crate::support::PROGRESS_DEADLINE;
 use axum::http::StatusCode;
 use suru::{
     protocol::{

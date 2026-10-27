@@ -1,5 +1,5 @@
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{read_session_until, working_turn};
+use crate::session_integration::support::{read_session_until, working_turn};
+use crate::support::PROGRESS_DEADLINE;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
@@ -769,7 +769,7 @@ async fn nested_subagent_questionnaires_keep_ancestor_attention_and_answer_in_th
     .await
     .unwrap();
     async fn spawn(
-        live: &crate::support::WorkingTurn,
+        live: &crate::session_integration::support::WorkingTurn,
         client: &ManagedClient,
         parent: SessionId,
         attribution: ProviderEventAttribution,
@@ -1188,7 +1188,9 @@ async fn lost_client_acknowledgement_reconciles_acceptance_without_duplicate_del
 #[tokio::test]
 async fn restart_requires_a_genuinely_reissued_live_request_and_does_not_revive_consumed_identity()
 {
-    use crate::{provider_support::ControlledProvider, support::controlled_selection};
+    use crate::session_integration::{
+        provider_support::ControlledProvider, support::controlled_selection,
+    };
     use suru::{
         protocol::{
             AdmitPromptRequest, AgentId, AgentIdentity, CreateSessionRequest, InitialPrompt,

@@ -20,12 +20,12 @@ use suru::protocol::{AgentSelection, CloneWorkspaceRequest, WorkspaceId};
 
 use super::acts::the_peer;
 use super::*;
-use crate::broker::sidekick::cloning::{
+use crate::session_integration::broker::sidekick::cloning::{
     Captured, bare_repository, contents, directory, git_says, readme, repository_id, spelled,
 };
-use crate::broker::sidekick::workspaces::next_workspace_errand;
-use crate::broker::sidekick_acts::{acted, refused, refused_over_http};
-use crate::workspace_registry::entries_on_disk;
+use crate::session_integration::broker::sidekick::workspaces::next_workspace_errand;
+use crate::session_integration::broker::sidekick_acts::{acted, refused, refused_over_http};
+use crate::session_integration::workspace_registry::entries_on_disk;
 
 /// How the Registry spells a Workspace a Sidekick Cloned.
 const BY_CLONE: &str = "\"cloned\"";

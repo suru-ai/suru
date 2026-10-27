@@ -2,13 +2,13 @@
 //! the protocol and reused by every client the same `TitleChanged` change a
 //! derived Icon publishes.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     failing_provider_support::spawn_with_failing_provider,
     provider_support::ControlledProvider,
     server_support::{next_catalog_change_matching, next_derived_title, open_catalog_stream},
     support::{hosted_model, hosted_selection, receive_managed_client_initial_state},
 };
+use crate::support::PROGRESS_DEADLINE;
 use serde_json::json;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
@@ -61,7 +61,7 @@ fn errand_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionReq
 }
 
 fn titling_provider() -> (
-    std::sync::Arc<crate::provider_support::ControlledProviderRuntime>,
+    std::sync::Arc<crate::support::provider::ControlledProviderRuntime>,
     ControlledProvider,
 ) {
     ControlledProvider::with_provider(

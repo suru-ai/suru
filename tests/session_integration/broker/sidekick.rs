@@ -987,8 +987,8 @@ async fn beneath_a_repository_the_sidekick_workspace_keeps_a_directory_workspace
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let channel = "sidekick-in-repository";
-    crate::repositories::git(data_dir.path(), &["init", "-b", "main"]);
-    crate::repositories::git(
+    crate::session_integration::repositories::git(data_dir.path(), &["init", "-b", "main"]);
+    crate::session_integration::repositories::git(
         data_dir.path(),
         &[
             "-c",

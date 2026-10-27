@@ -6,10 +6,10 @@
 //! working child drains into its running turn steers that Turn instead. A child's Tool uses are
 //! Tool Calls in its own Session, never the parent's.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{
+use crate::codex_integration::support::{
     ScriptedCodex, opened_session, receive_initial_state, session_where, settled_session,
 };
+use crate::support::PROGRESS_DEADLINE;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use suru::{

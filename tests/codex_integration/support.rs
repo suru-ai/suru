@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use crate::scripted_binary_support::{captured_methods, captured_requests, write_executable};
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::support::PROGRESS_DEADLINE;
+use crate::support::scripted_binary::{captured_methods, captured_requests, write_executable};
 use serde_json::Value;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},

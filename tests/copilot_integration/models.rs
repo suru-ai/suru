@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::{
+use crate::copilot_integration::{
     provider_support::ControlledProvider,
     support::{
         ScriptedCopilot, connect, connect_arm, connect_arm_with_version, copilot_catalog, hosting,

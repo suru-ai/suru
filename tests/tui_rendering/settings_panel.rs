@@ -12,7 +12,7 @@ use ratatui::{
     style::{Color, Modifier},
 };
 
-use crate::support::{
+use crate::tui_rendering::support::{
     MutatesSetting, application_looking_at_studio, connected_application, model_descriptor,
     rendered_application_buffer, rendered_application_rows, rendered_application_rows_at,
     selected_session_snapshot, studio_stops_answering, text_position, type_terminal_text,

@@ -6,7 +6,7 @@
 //! supplies, matched against the request line, with `$request_id` standing for the envelope's
 //! correlation ID.
 
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::support::PROGRESS_DEADLINE;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
     protocol::{
@@ -18,7 +18,7 @@ use suru::{
 };
 use tokio::time::timeout;
 
-use crate::{
+use crate::claude_integration::{
     scripted_binary_support::{captured_requests, write_executable},
     server_support::receive_initial_state,
 };

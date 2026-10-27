@@ -1,5 +1,5 @@
 //! Real repository preparation shared by native Provider boundary checks.
-use crate::server_support::PROGRESS_DEADLINE;
+use super::PROGRESS_DEADLINE;
 use std::path::Path;
 use suru::{managed_client::ManagedClient, protocol::*};
 

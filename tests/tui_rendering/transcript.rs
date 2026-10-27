@@ -1,7 +1,7 @@
 //! Transcript projection, styling, and scroll navigation.
 
-use crate::deadlines::PROGRESS_DEADLINE;
-use crate::{
+use crate::support::deadlines::PROGRESS_DEADLINE;
+use crate::tui_rendering::{
     failing_provider_support::spawn_with_failing_provider,
     support::{
         buffer_rows, click_mouse, connected_application, connected_application_with_terminal_facts,
@@ -9447,7 +9447,8 @@ fn a_newer_turn_refolds_the_turn_the_reader_expanded_by_hand() {
 fn the_transcript_keeps_a_row_of_air_above_the_composer() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
-    let (session_id, _) = crate::support::enter_session(&mut application, workspace.path());
+    let (session_id, _) =
+        crate::tui_rendering::support::enter_session(&mut application, workspace.path());
     application
         .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
             navigable_session_snapshot(session_id, workspace.path(), 8),
@@ -9472,7 +9473,8 @@ fn the_transcript_keeps_a_row_of_air_above_the_composer() {
 fn the_transcript_keeps_its_margin_when_a_pending_panel_docks_below_it() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
-    let (session_id, _) = crate::support::enter_session(&mut application, workspace.path());
+    let (session_id, _) =
+        crate::tui_rendering::support::enter_session(&mut application, workspace.path());
     let mut snapshot = navigable_session_snapshot(session_id, workspace.path(), 8);
     snapshot.session.status = SessionStatus::Active;
     snapshot.prompts.push(Prompt {

@@ -18,7 +18,7 @@
 //! either CLI not installed or not signed in:
 //!
 //! ```text
-//! SURU_BROKER_SMOKE=1 cargo nextest run --test broker_smoke --run-ignored ignored-only --no-capture
+//! SURU_BROKER_SMOKE=1 cargo nextest run --test integration --run-ignored ignored-only --no-capture broker_smoke::
 //! ```
 //!
 //! `SURU_CLAUDE_PATH` and `SURU_CODEX_PATH` name other binaries, as they do for
@@ -26,9 +26,7 @@
 //! they assert, and the versions they last passed against, are recorded in
 //! `docs/validation/0421-broker-smoke.md`.
 
-#[path = "support/mod.rs"]
-#[allow(dead_code)]
-mod server_support;
+use crate::support as server_support;
 
 use std::{ffi::OsStr, fmt::Display, path::Path, process::Command, sync::Arc};
 

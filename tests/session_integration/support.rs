@@ -1,9 +1,9 @@
 //! Fixtures shared by more than one area of the session protocol tests.
 
-use crate::provider_support::{
+use crate::support::PROGRESS_DEADLINE;
+use crate::support::provider::{
     ControlledProvider, ControlledProviderRuntime, ControlledProviderSession,
 };
-use crate::server_support::PROGRESS_DEADLINE;
 use suru::{
     managed_client::{ManagedClient, SessionEvent},
     protocol::{
@@ -347,7 +347,7 @@ pub async fn open_catalog_stream_with_snapshot(
 ) {
     use futures_util::StreamExt;
 
-    let mut events = crate::server_support::open_raw_catalog_stream(descriptor).await;
+    let mut events = crate::support::open_raw_catalog_stream(descriptor).await;
     let snapshot = loop {
         let event = timeout(PROGRESS_DEADLINE, events.next())
             .await
@@ -359,7 +359,7 @@ pub async fn open_catalog_stream_with_snapshot(
         }
     };
     let updates =
-        crate::server_support::named_events(events, suru::protocol::SESSION_CATALOG_UPDATED_EVENT);
+        crate::support::named_events(events, suru::protocol::SESSION_CATALOG_UPDATED_EVENT);
     (snapshot.session_ids, updates)
 }
 
@@ -378,21 +378,21 @@ pub fn git_output_mentions_path(haystack: &str, path: &std::path::Path) -> bool 
 
 pub async fn receive_managed_client_initial_state(client: &mut ManagedClient) {
     assert!(matches!(
-        crate::server_support::next_event(client).await,
+        crate::support::next_event(client).await,
         Some(suru::managed_client::ManagedEvent::Connecting)
     ));
     assert!(matches!(
-        crate::server_support::next_event(client).await,
+        crate::support::next_event(client).await,
         Some(suru::managed_client::ManagedEvent::Connected(_))
     ));
     assert!(matches!(
-        crate::server_support::next_event(client).await,
+        crate::support::next_event(client).await,
         Some(suru::managed_client::ManagedEvent::SettingsSnapshot(_))
     ));
-    crate::server_support::receive_model_catalog(client).await;
-    crate::server_support::receive_relays(client).await;
-    crate::server_support::receive_serving_listener(client).await;
-    crate::server_support::receive_onboarded(client).await;
+    crate::support::receive_model_catalog(client).await;
+    crate::support::receive_relays(client).await;
+    crate::support::receive_serving_listener(client).await;
+    crate::support::receive_onboarded(client).await;
 }
 
 /// A terminal client reading one Session as a person at it would: a TUI

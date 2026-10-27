@@ -4,7 +4,7 @@
 
 use std::pin::Pin;
 
-use crate::{
+use crate::session_integration::{
     provider_support::{ControlledProvider, ControlledProviderSession},
     server_support::PROGRESS_DEADLINE,
     support::{

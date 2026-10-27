@@ -1,4 +1,4 @@
-use crate::support::{
+use crate::tui_rendering::support::{
     connected_application, rendered_application_rows_at, selected_session_snapshot,
     type_terminal_text, workspace_dir,
 };

@@ -13,7 +13,7 @@
 //! `queued` sends (docs/validation/0397-copilot-subagent-steer.md) and CLI 1.0.88's `idle` one
 //! (docs/validation/0398-copilot-subagent-resume.md).
 
-use crate::{
+use crate::copilot_integration::{
     server_support::PROGRESS_DEADLINE,
     support::{
         conversation_fixture, opened_session, replay_capture, settled_session,

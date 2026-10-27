@@ -5,7 +5,7 @@
 //! is covered in `compactions`. The Broker's calls are covered in `broker`, and a Subagent's Tool
 //! Calls in `subagents`.
 
-use crate::support::{
+use crate::codex_integration::support::{
     OpenedSession, ScriptedCodex, conversation_codex, opened_session, session_where,
     settled_session,
 };

@@ -8,8 +8,8 @@
 //! A Bash call the agent waits on in the foreground is never a Watch, even when it runs long
 //! enough for the CLI to report it as a task.
 
-use crate::continuations::heading_watch_outcome;
-use crate::support::{
+use crate::claude_integration::continuations::heading_watch_outcome;
+use crate::claude_integration::support::{
     CLAUDE_MODELS, ScriptedClaude, after_probe, agent_messages, conversation_fixture,
     discovery_arms, opened_session, session_where, settled_session, stop_task_arm, user_turn_arm,
 };

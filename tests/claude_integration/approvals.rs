@@ -1,6 +1,6 @@
 //! Claude native permission callbacks through the public Session seam.
 
-use crate::{
+use crate::claude_integration::{
     server_support::PROGRESS_DEADLINE,
     support::{
         CLAUDE_MODELS, LiveTurn, ScriptedClaude, discovery_arms, settled_session, user_turn_arm,
@@ -340,7 +340,7 @@ async fn child_approval_is_attributed_to_its_tool_and_survives_the_parent_result
         "{}{}{}",
         discovery_arms(CLAUDE_MODELS),
         user_turn_arm(&timeline),
-        crate::support::stop_task_arm(),
+        crate::claude_integration::support::stop_task_arm(),
     ));
     let mut live = LiveTurn::start(
         ClaudeRuntime::new(fixture.executable()),

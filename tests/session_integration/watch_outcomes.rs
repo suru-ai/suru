@@ -4,10 +4,10 @@
 //! while one that wakes nothing records nothing, and a recorded outcome is
 //! history like any other Activity.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{
+use crate::session_integration::support::{
     WorkingTurn, controlled_selection, read_session, read_session_until, working_turn,
 };
+use crate::support::PROGRESS_DEADLINE;
 use suru::{
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, PromptDelivery, PromptId,
@@ -708,7 +708,7 @@ async fn a_watch_outcome_is_stored_with_the_sessions_history_and_survives_a_rest
     let session_id = fixture.session_id;
     fixture.server.shutdown().await.expect("shut down server");
 
-    let (runtime, _provider) = crate::provider_support::ControlledProvider::new();
+    let (runtime, _provider) = crate::support::provider::ControlledProvider::new();
     let restarted = timeout(
         PROGRESS_DEADLINE,
         server::spawn_with_provider(

@@ -1,6 +1,6 @@
 //! Reconciliation is exercised through API outcomes and real Git resources.
 use super::*;
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::support::PROGRESS_DEADLINE;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -359,7 +359,7 @@ async fn persisted_initial_session_shell_resumes_original_prompt_once_after_rest
     let request = request(&main, "Original draft");
     let prepared = prepare(server.descriptor(), &request).await;
     assert_eq!(prepared.error, None);
-    let original_catalog = crate::provider_support::fixture_skill_catalog(
+    let original_catalog = crate::support::provider::fixture_skill_catalog(
         ProviderId::new("controlled"),
         prepared.preparation.destination.path.clone(),
     );

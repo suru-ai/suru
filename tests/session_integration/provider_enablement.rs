@@ -10,10 +10,10 @@
 //! the `enabled` Settings are a compile-time table keyed by them — a Provider
 //! the schema does not name has no Setting to turn off.
 
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::support::PROGRESS_DEADLINE;
 use std::{path::Path, sync::Arc};
 
-use crate::{
+use crate::session_integration::{
     provider_support::{ControlledProvider, ControlledProviderRuntime},
     support::{
         create_session, hosted_model, hosted_selection, list_catalog, read_session, refresh_catalog,

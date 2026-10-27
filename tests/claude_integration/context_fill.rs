@@ -1,6 +1,6 @@
 //! Native optional snapshots through the runtime, server, persistence and client contract.
 
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::support::PROGRESS_DEADLINE;
 use std::time::Duration;
 
 use suru::{
@@ -14,7 +14,7 @@ use suru::{
     server::RunningServer,
 };
 
-use crate::support::{
+use crate::claude_integration::support::{
     CLAUDE_MODELS, ScriptedClaude, discovery_arms, hosting_runtime, session_where, settled_session,
     user_turn_arm,
 };

@@ -1,6 +1,6 @@
 //! Public Session Approval Posture mutation, runtime delivery, and durability.
 
-use crate::{
+use crate::session_integration::{
     provider_support::ControlledProvider,
     support::{hosted_model, hosted_selection, receive_managed_client_initial_state},
 };
@@ -90,12 +90,15 @@ async fn active_posture_update_reports_next_turn_and_leaves_existing_approval_an
         assert_eq!(update.posture, automatic);
         assert!(update.has_active_work);
         assert_eq!(
-            crate::support::read_session(server.descriptor(), created.session.id)
-                .await
-                .session
-                .approval_posture
-                .unwrap()
-                .application,
+            crate::session_integration::support::read_session(
+                server.descriptor(),
+                created.session.id
+            )
+            .await
+            .session
+            .approval_posture
+            .unwrap()
+            .application,
             ApprovalPostureApplication::Applying,
             "the requested posture is not advertised as applied before native acknowledgement"
         );
@@ -306,13 +309,13 @@ async fn a_late_settings_batch_ack_cannot_restore_a_delay_after_the_next_turn_ap
     });
     let actors = async {
         let first_update = tokio::time::timeout(
-            crate::server_support::PROGRESS_DEADLINE,
+            crate::support::PROGRESS_DEADLINE,
             first_native.next_posture_update(),
         )
         .await
         .expect("first Session receives its Settings posture update");
         let second_update = tokio::time::timeout(
-            crate::server_support::PROGRESS_DEADLINE,
+            crate::support::PROGRESS_DEADLINE,
             second_native.next_posture_update(),
         )
         .await
@@ -337,13 +340,16 @@ async fn a_late_settings_batch_ack_cannot_restore_a_delay_after_the_next_turn_ap
             .await
             .unwrap();
         first_native.next_turn().await.succeed();
-        tokio::time::timeout(crate::server_support::PROGRESS_DEADLINE, async {
+        tokio::time::timeout(crate::support::PROGRESS_DEADLINE, async {
             loop {
-                let posture = crate::support::read_session(server.descriptor(), first.session.id)
-                    .await
-                    .session
-                    .approval_posture
-                    .unwrap();
+                let posture = crate::session_integration::support::read_session(
+                    server.descriptor(),
+                    first.session.id,
+                )
+                .await
+                .session
+                .approval_posture
+                .unwrap();
                 if posture.application == ApprovalPostureApplication::Applied {
                     break;
                 }
@@ -549,7 +555,11 @@ async fn approval_posture_pins_resets_follows_settings_and_reaches_session_and_t
         vec![hosted_model("codex", "gpt-test")],
     );
     let restarted = server::spawn_with_provider(config, runtime).await.unwrap();
-    let restored = crate::support::read_session(restarted.descriptor(), created.session.id).await;
+    let restored = crate::session_integration::support::read_session(
+        restarted.descriptor(),
+        created.session.id,
+    )
+    .await;
     assert_eq!(
         restored.session.approval_posture,
         Some(SessionApprovalPosture {
@@ -680,7 +690,11 @@ async fn a_pinned_approval_posture_survives_server_restart() {
     let (runtime, _provider) =
         ControlledProvider::with_provider(ProviderId::new("codex"), vec![model]);
     let restarted = server::spawn_with_provider(config, runtime).await.unwrap();
-    let restored = crate::support::read_session(restarted.descriptor(), created.session.id).await;
+    let restored = crate::session_integration::support::read_session(
+        restarted.descriptor(),
+        created.session.id,
+    )
+    .await;
     assert_eq!(
         restored.session.approval_posture,
         Some(SessionApprovalPosture {

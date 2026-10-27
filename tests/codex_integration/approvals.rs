@@ -1,6 +1,6 @@
 //! Codex app-server Approval callbacks through the public Session seam.
 
-use crate::{
+use crate::codex_integration::{
     server_support::PROGRESS_DEADLINE,
     support::{ScriptedCodex, receive_initial_state},
 };

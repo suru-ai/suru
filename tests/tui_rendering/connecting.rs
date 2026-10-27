@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::support::{
+use crate::tui_rendering::support::{
     fixture_instance_id, model_descriptor, navigable_session_snapshot, ready_health,
     rendered_application_rows, rendered_application_rows_at, text_on, type_terminal_text,
 };
@@ -530,7 +530,7 @@ fn a_fresh_landing_lets_go_of_a_remote_workspace_still_resolving() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            listing: crate::support::workspace_listing(vec![Workspace::directory(
+            listing: crate::tui_rendering::support::workspace_listing(vec![Workspace::directory(
                 remote_only.clone(),
             )]),
         })
@@ -698,7 +698,7 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            listing: crate::support::workspace_listing(vec![Workspace::directory(
+            listing: crate::tui_rendering::support::workspace_listing(vec![Workspace::directory(
                 remote_only.clone(),
             )]),
         })

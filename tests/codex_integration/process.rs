@@ -1,7 +1,7 @@
 //! The Codex process lifecycle: launching the real binary, loss, and resume.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{ScriptedCodex, receive_initial_state};
+use crate::codex_integration::support::{ScriptedCodex, receive_initial_state};
+use crate::support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
@@ -555,7 +555,7 @@ async fn managed_worktree_native_codex_starts_at_prepared_root() {
         ManagedClient::connect(ManagedClientConfig::new(state.path(), "prepared-codex").unwrap())
             .await
             .unwrap();
-    let prepared = crate::managed_worktree::prepare(&client, source.path(), "codex").await;
+    let prepared = crate::support::managed_worktree::prepare(&client, source.path(), "codex").await;
     assert!(
         !codex
             .requests()
@@ -563,7 +563,7 @@ async fn managed_worktree_native_codex_starts_at_prepared_root() {
             .any(|r| r["method"] == "thread/start")
     );
     let created = client
-        .create_session(crate::managed_worktree::creation(&prepared))
+        .create_session(crate::support::managed_worktree::creation(&prepared))
         .await
         .unwrap();
     codex.wait_for_method_count("turn/start", 1).await;
@@ -576,7 +576,12 @@ async fn managed_worktree_native_codex_starts_at_prepared_root() {
         request["params"]["cwd"].as_str(),
         prepared.destination.path.to_str()
     );
-    crate::managed_worktree::recover(&client, created.session.id, &prepared.destination.path).await;
+    crate::support::managed_worktree::recover(
+        &client,
+        created.session.id,
+        &prepared.destination.path,
+    )
+    .await;
     let resumed = codex
         .requests()
         .into_iter()

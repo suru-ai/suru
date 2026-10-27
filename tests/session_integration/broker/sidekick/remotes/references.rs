@@ -11,7 +11,7 @@
 use diesel::{Connection, QueryableByName, RunQueryDsl, SqliteConnection, sql_types::BigInt};
 
 use super::*;
-use crate::broker::sidekick_acts::refused;
+use crate::session_integration::broker::sidekick_acts::refused;
 
 /// A database holding every Session `config`'s Server stored — once it holds
 /// each of `sessions` — with each Title marked as this copy's.

@@ -6,7 +6,7 @@
 //! stop after the respawn is for the new child's own work alone, whether the interrupt asks for it
 //! or a Subagent's Session does.
 
-use crate::support::{
+use crate::claude_integration::support::{
     CLAUDE_MODELS, ScriptedClaude, agent_messages, discovery_arms, interrupt_arm, opened_session,
     session_where, settled_session, stop_task_arm, user_turn_arm,
 };

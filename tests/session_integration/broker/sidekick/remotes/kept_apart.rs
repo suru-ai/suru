@@ -7,7 +7,7 @@
 //! its own user alone.
 
 use super::*;
-use crate::broker::sidekick_acts::{acted, refused};
+use crate::session_integration::broker::sidekick_acts::{acted, refused};
 
 /// Why every Settings Tool refuses an `origin`.
 const SETTINGS_ALONE: &str =

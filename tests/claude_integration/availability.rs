@@ -3,7 +3,7 @@
 //! its own typed reason with what fixes it beside, each is found by a probe that never starts a
 //! Turn, and each clears on the refresh after the user fixes it outside Suru.
 
-use crate::support::{
+use crate::claude_integration::support::{
     CLAUDE_MODELS, CLAUDE_SUGGESTED_VERSION, SIGNED_IN_ACCOUNT, SIGNED_OUT_ACCOUNT, ScriptedClaude,
     after_probe, claude_catalog, connect, crashing_list_models_arm, hosting, hosting_runtime,
     initialize_arm, list_models_arm, probe_arms, settled_session, signed_out_initialize_arm,

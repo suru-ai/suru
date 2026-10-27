@@ -1,7 +1,7 @@
 //! Steering a Copilot Turn that is already under way: a Prompt delivered into the running Turn
 //! rather than one that begins another.
 
-use crate::support::{
+use crate::copilot_integration::support::{
     LiveTurn, ScriptedCopilot, agent_messages, conversation_arms, conversation_fixture,
     settled_session_on,
 };

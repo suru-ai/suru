@@ -3,7 +3,7 @@
 //! in by hand or filled with a proposal its Origin derives, and saved with
 //! Enter.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     click_mouse, connected_application, deliver_settings, enter_session,
     rendered_application_buffer, rendered_application_rows_at, text_position, type_terminal_text,
     workspace_dir,
@@ -48,7 +48,7 @@ fn sidebar_with_one_session(workspace: &Path, session_id: SessionId, title: &str
     application
         .handle_event(ApplicationEvent::SessionsListed {
             request,
-            sessions: vec![crate::support::listed_session(
+            sessions: vec![crate::tui_rendering::support::listed_session(
                 session_id, title, workspace, 1, 1,
             )],
         })

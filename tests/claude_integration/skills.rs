@@ -1,6 +1,6 @@
 //! Claude-native Skill discovery and slash-command lowering.
 
-use crate::{
+use crate::claude_integration::{
     server_support::{
         attachments::{bound, jpeg, png, uploaded},
         next_skill_catalog,

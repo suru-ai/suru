@@ -2,7 +2,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 
-use crate::support::{
+use crate::tui_rendering::support::{
     deliver_listener, deliver_settings, open_at, rendered_application_rows,
     rendered_application_rows_at, type_terminal_text,
 };

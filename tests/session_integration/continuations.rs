@@ -3,10 +3,10 @@
 //! subtree, and late output owed to those Subagents begins a Continuation
 //! that the next delivered Prompt settles early.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{
+use crate::session_integration::support::{
     open_catalog_stream_with_snapshot, read_session_until, the_subagent_row, working_turn,
 };
+use crate::support::PROGRESS_DEADLINE;
 use suru::{
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, LatestTurnStatus, MessageRole,
@@ -20,7 +20,7 @@ use tokio::time::timeout;
 /// Spawns one Subagent into the fixture's working Turn and returns the child
 /// Session the row names.
 async fn spawn_subagent(
-    fixture: &crate::support::WorkingTurn,
+    fixture: &crate::session_integration::support::WorkingTurn,
     subagent: &ProviderSubagentId,
 ) -> SessionId {
     fixture
@@ -204,7 +204,7 @@ async fn working_reads_from_the_subtree_until_the_last_subagent_settles() {
         "the listing reads Working while the Subagent runs on"
     );
     assert!(matches!(
-        crate::server_support::next_catalog_change(&mut catalog).await,
+        crate::support::next_catalog_change(&mut catalog).await,
         SessionCatalogChange::StandingInputsChanged {
             session_id,
             inputs: SessionStandingInputs {
@@ -232,7 +232,7 @@ async fn working_reads_from_the_subtree_until_the_last_subagent_settles() {
         })
         .await;
     assert_eq!(
-        crate::server_support::next_catalog_change(&mut catalog).await,
+        crate::support::next_catalog_change(&mut catalog).await,
         SessionCatalogChange::WorkingChanged {
             session_id: fixture.session_id,
             working_since: None,

@@ -3,10 +3,7 @@
 //! place, per the user configuration spec: a spawned server driven through the
 //! managed client over the real protocol, against temp config directories only.
 
-#[path = "support/deadlines.rs"]
-mod deadlines;
-
-use crate::deadlines::PROGRESS_DEADLINE;
+use crate::support::deadlines::PROGRESS_DEADLINE;
 use std::{net::IpAddr, path::Path};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},

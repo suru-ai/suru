@@ -7,10 +7,10 @@
 //! these tests hold it to is that nothing of that Session survives — not in Suru's own Session
 //! listing, and not on the CLI as something still open.
 
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 
-use crate::{
+use crate::copilot_integration::{
     server_support::{catalog_changes_through_title, open_catalog_stream},
     support::{
         ScriptedCopilot, connect, connect_arm, connect_in, create_session_arm, current_model_arm,
@@ -400,12 +400,9 @@ async fn an_errand_answered_outside_its_schema_leaves_the_prompt_derived_title_s
         .expect("delete the Session");
     assert!(
         !matches!(
-            timeout(
-                PROGRESS_DEADLINE,
-                crate::server_support::next_event(&mut client)
-            )
-            .await
-            .expect("the deletion reaches the client"),
+            timeout(PROGRESS_DEADLINE, crate::support::next_event(&mut client))
+                .await
+                .expect("the deletion reaches the client"),
             Some(ManagedEvent::SessionTitleChanged(
                 SessionTitleChanged { .. }
             ))

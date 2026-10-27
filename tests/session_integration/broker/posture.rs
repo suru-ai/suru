@@ -22,7 +22,7 @@ use super::{
     DELEGATION, claude_models, codex_selection, delegating, host_providers, mutate_setting,
     next_start, researcher,
 };
-use crate::{
+use crate::session_integration::{
     provider_support::{ControlledProvider, ControlledProviderSession},
     server_support::{PROGRESS_DEADLINE, broker::McpClient},
     support::read_session,

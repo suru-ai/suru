@@ -1,5 +1,5 @@
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{LiveTurn, ScriptedCopilot, conversation_arms, send_arm};
+use crate::copilot_integration::support::{LiveTurn, ScriptedCopilot, conversation_arms, send_arm};
+use crate::support::PROGRESS_DEADLINE;
 use suru::{
     protocol::{Activity, Answer, QuestionAnswer, QuestionnaireOutcome, QuestionnaireSubmission},
     provider::CopilotRuntime,
@@ -125,7 +125,9 @@ async fn interrupting_a_native_questionnaire_stops_work_and_disables_its_answer(
         "{}{}{}",
         conversation_arms(),
         send_arm(ASK),
-        crate::support::abort_arm("      event interrupted session.idle '{\"aborted\":true}'\n")
+        crate::copilot_integration::support::abort_arm(
+            "      event interrupted session.idle '{\"aborted\":true}'\n"
+        )
     ));
     let mut live = LiveTurn::start(
         CopilotRuntime::new(fixture.executable()),

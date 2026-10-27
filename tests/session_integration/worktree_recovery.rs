@@ -1,10 +1,10 @@
 //! Recovery preserves retained conversation and working-copy identities.
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     provider_support::{ControlledProvider, ControlledProviderSession},
     repositories::git,
     support,
 };
+use crate::support::PROGRESS_DEADLINE;
 use std::path::{Path, PathBuf};
 use suru::{
     protocol::*,

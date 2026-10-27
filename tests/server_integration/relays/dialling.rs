@@ -178,7 +178,7 @@ async fn a_remote_is_reached_directly_then_through_the_relay_then_directly_again
     let attachment = api
         .post("/v1/attachments")
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-        .body(crate::padded_png(ATTACHMENT))
+        .body(crate::server_integration::padded_png(ATTACHMENT))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
@@ -212,7 +212,7 @@ async fn a_remote_is_reached_directly_then_through_the_relay_then_directly_again
     let session = api.begin_session(workspace.path()).await;
     let told = timeout(PROGRESS_DEADLINE, async {
         loop {
-            match crate::next_session_catalog_event(&mut catalog).await {
+            match crate::server_integration::next_session_catalog_event(&mut catalog).await {
                 Some(ManagedEvent::SessionCreated(created)) if created.session_id == session => {
                     return;
                 }

@@ -12,7 +12,7 @@
 use std::path::{MAIN_SEPARATOR as SEPARATOR, MAIN_SEPARATOR_STR, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::support::{
+use crate::tui_rendering::support::{
     SIDEBAR_WIDE, application_looking_at_studio, click_mouse, connected_application,
     deliver_settings, drawn_in_sidebar, enter_active_session, fixture_instance_id, invoke, key,
     listed_session, model_descriptor, ready_health, rendered_application_buffer,
@@ -1829,7 +1829,7 @@ fn a_workspace_the_workspace_picker_listed_wears_its_icon_while_the_sidebar_is_h
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            listing: crate::support::workspace_listing(vec![
+            listing: crate::tui_rendering::support::workspace_listing(vec![
                 workspace_with_icon(&here, Some("dev-python")),
                 workspace_with_icon(&here.join("iconed"), Some("dev-rust")),
             ]),
@@ -1862,7 +1862,7 @@ fn a_workspace_the_workspace_picker_listed_wears_its_icon_while_the_sidebar_is_h
         ]
     );
 
-    crate::connecting::turn_to_studio(&mut application);
+    crate::tui_rendering::connecting::turn_to_studio(&mut application);
     let (outlook, listing_id, _) =
         expect_listing(invoke(&mut application, SemanticCommandId::WorkspaceBrowse));
     assert_eq!(outlook, Outlook::Remote("studio".to_owned()));

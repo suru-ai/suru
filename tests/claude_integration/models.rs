@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::{
+use crate::claude_integration::{
     provider_support::ControlledProvider,
     support::{
         CLAUDE_MODELS, ScriptedClaude, after_probe, claude_catalog, drifting_list_models_arm,
@@ -22,7 +22,7 @@ use suru::{
 };
 use tokio::time::Duration;
 
-use crate::server_support::receive_initial_state;
+use crate::support::receive_initial_state;
 
 fn model<'a>(catalog: &'a ProviderModelCatalog, id: &str) -> &'a ModelDescriptor {
     catalog

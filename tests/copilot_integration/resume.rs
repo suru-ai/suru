@@ -4,7 +4,7 @@
 
 use std::{path::Path, sync::Arc};
 
-use crate::support::{
+use crate::copilot_integration::support::{
     ScriptedCopilot, agent_messages, connect_in, conversation_arms, forgotten_session_arm,
     resumable_conversation_fixture, send_arm, settled_session_on,
 };
@@ -327,15 +327,15 @@ async fn resumed_copilot_sessions_register_and_answer_native_questionnaires() {
     use suru::protocol::{Activity, QuestionnaireSubmission};
     let timeline = format!(
         "      if [ \"$attempt\" -eq 1 ]; then\n        event first session.idle '{{}}'\n      else\n{}      fi\n",
-        crate::questionnaires::ASK
+        crate::copilot_integration::questionnaires::ASK
     );
     let fixture = ScriptedCopilot::new(&format!(
         "{}{}{}{}{}",
         conversation_arms(),
-        crate::support::resume_session_arm(),
-        crate::support::skills_reload_arm(),
+        crate::copilot_integration::support::resume_session_arm(),
+        crate::copilot_integration::support::skills_reload_arm(),
         send_arm(&timeline),
-        crate::questionnaires::ANSWERED
+        crate::copilot_integration::questionnaires::ANSWERED
     ));
     let mut live = RestartedSession::establish(&fixture, "copilot-resume-question").await;
     live.client
@@ -353,7 +353,7 @@ async fn resumed_copilot_sessions_register_and_answer_native_questionnaires() {
         )
         .await
         .unwrap();
-    let snapshot = crate::support::session_where(
+    let snapshot = crate::copilot_integration::support::session_where(
         &live.client,
         &mut live.feed,
         live.session_id,

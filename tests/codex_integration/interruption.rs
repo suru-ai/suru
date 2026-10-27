@@ -1,7 +1,7 @@
 //! Interrupting an active turn and settling what it left in flight.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{ScriptedCodex, receive_initial_state};
+use crate::codex_integration::support::{ScriptedCodex, receive_initial_state};
+use crate::support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},

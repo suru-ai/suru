@@ -1,8 +1,7 @@
 //! Renaming a Session: setting its Title to a line the user writes, and asking
 //! Suru to propose one derived anew from the Session's Prompts so far.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     failing_provider_support::spawn_with_failing_provider,
     provider_support::ControlledProvider,
     server_support::{
@@ -11,6 +10,7 @@ use crate::{
     },
     support::{hosted_model, hosted_selection, receive_managed_client_initial_state},
 };
+use crate::support::PROGRESS_DEADLINE;
 use serde_json::json;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
@@ -49,7 +49,7 @@ fn create_request(
 }
 
 fn titling_provider() -> (
-    std::sync::Arc<crate::provider_support::ControlledProviderRuntime>,
+    std::sync::Arc<crate::support::provider::ControlledProviderRuntime>,
     ControlledProvider,
 ) {
     ControlledProvider::with_provider(

@@ -1,6 +1,6 @@
 //! Lazy durable history through the server's public Session boundaries.
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{failing_provider_support::spawn_with_failing_provider, support};
+use crate::session_integration::{failing_provider_support::spawn_with_failing_provider, support};
+use crate::support::PROGRESS_DEADLINE;
 use eventsource_stream::Eventsource;
 use futures_util::{StreamExt, future::join_all};
 use suru::{
@@ -362,7 +362,7 @@ async fn malformed_metadata_is_isolated_at_startup_without_listing_children_as_r
 
 #[tokio::test]
 async fn unreadable_child_hydration_refreshes_root_usage_and_keeps_parent_owned_deletion() {
-    use crate::provider_support::ControlledProvider;
+    use crate::support::provider::ControlledProvider;
     use diesel::{Connection, RunQueryDsl};
     use suru::{
         protocol::Usage,
@@ -444,7 +444,8 @@ async fn unreadable_child_hydration_refreshes_root_usage_and_keeps_parent_owned_
     assert!(matches!(&initial[..], [SessionListItem::Readable(summary)]
         if summary.session.id == before.session.id && summary.total_usage.unwrap().output_tokens == Some(7)));
     let (_, mut events) =
-        crate::support::open_catalog_stream_with_snapshot(server.descriptor()).await;
+        crate::session_integration::support::open_catalog_stream_with_snapshot(server.descriptor())
+            .await;
     let failed = request(
         server.descriptor(),
         reqwest::Method::GET,

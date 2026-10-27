@@ -1,6 +1,6 @@
 //! Composer input: cursor placement, growth, editing bindings, and history.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     WorkspaceDir, buffer_rows, connected_application, enter_active_session, enter_session,
     failed_session_snapshot, rendered_application_buffer, rendered_application_cursor_at,
     rendered_application_rows, rendered_application_rows_at, text_position, type_terminal_text,
@@ -25,7 +25,7 @@ use suru::{
 };
 use uuid::Uuid;
 
-use crate::support::ready_health;
+use crate::tui_rendering::support::ready_health;
 
 #[test]
 fn session_composer_footer_uses_persisted_context_and_cost_across_all_turn_outcomes() {
@@ -2085,7 +2085,7 @@ fn composer_selection_copies_unwrapped_text_on_release_then_replaces_the_draft()
     let mut application = connected_application(workspace.path());
     let mut settings = suru::protocol::EffectiveSettings::default();
     settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
-    crate::support::deliver_settings(&mut application, settings);
+    crate::tui_rendering::support::deliver_settings(&mut application, settings);
     let draft = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima";
     type_terminal_text(&mut application, draft);
     let buffer = rendered_application_buffer(&application, 50, 24);
@@ -2263,7 +2263,7 @@ fn composer_selection_survives_resize_and_copies_the_same_wrapped_text() {
     let mut application = connected_application(workspace.path());
     let mut settings = suru::protocol::EffectiveSettings::default();
     settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
-    crate::support::deliver_settings(&mut application, settings);
+    crate::tui_rendering::support::deliver_settings(&mut application, settings);
     type_terminal_text(
         &mut application,
         "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima",
@@ -2299,7 +2299,7 @@ fn composer_selection_survives_sidebar_and_picker_key_ownership() {
     let mut application = connected_application(workspace.path());
     let mut settings = suru::protocol::EffectiveSettings::default();
     settings.sidebar.initial_visibility = suru::protocol::SidebarVisibility::Hidden;
-    crate::support::deliver_settings(&mut application, settings);
+    crate::tui_rendering::support::deliver_settings(&mut application, settings);
     type_terminal_text(&mut application, "marked draft");
     let buffer = rendered_application_buffer(&application, 140, 32);
     let start = text_position(&buffer, "marked draft");
@@ -2657,7 +2657,7 @@ fn keyboard_selection_bindings_belong_only_to_the_composer() {
     let mut application = connected_application(workspace.path());
     let mut settings = suru::protocol::EffectiveSettings::default();
     settings.sidebar.initial_visibility = suru::protocol::SidebarVisibility::Hidden;
-    crate::support::deliver_settings(&mut application, settings);
+    crate::tui_rendering::support::deliver_settings(&mut application, settings);
     type_terminal_text(&mut application, "draft");
     let bindings = [
         (KeyCode::Left, CommandId::ExtendSelectionLeft),
@@ -3081,7 +3081,7 @@ fn cut_copies_exact_plain_text_in_both_modes_and_without_selection_remains_leade
         let mut application = connected_application(workspace.path());
         let mut settings = suru::protocol::EffectiveSettings::default();
         settings.text_selection.copy = copy;
-        crate::support::deliver_settings(&mut application, settings);
+        crate::tui_rendering::support::deliver_settings(&mut application, settings);
         application
             .handle_terminal_event(InputEvent::Paste("keep 界  \ntail  ".to_owned()))
             .unwrap();
@@ -3164,7 +3164,7 @@ fn select_all_and_cut_bindings_leave_sidebar_and_picker_ownership_alone() {
     let mut application = connected_application(workspace.path());
     let mut settings = suru::protocol::EffectiveSettings::default();
     settings.sidebar.initial_visibility = suru::protocol::SidebarVisibility::Hidden;
-    crate::support::deliver_settings(&mut application, settings);
+    crate::tui_rendering::support::deliver_settings(&mut application, settings);
     type_terminal_text(&mut application, "draft");
     composer_selection_key(&mut application, KeyCode::Home, KeyModifiers::SHIFT);
     for sidebar in [true, false] {

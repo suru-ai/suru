@@ -2,7 +2,7 @@
 //! Subagent row in the spawner's Transcript, attributed content fills the child
 //! and never the parent, and a settle closes the row and the child's Turn.
 
-use crate::{
+use crate::session_integration::{
     provider_support::ControlledProvider,
     server_support::PROGRESS_DEADLINE,
     support::{
@@ -584,12 +584,12 @@ async fn child_sessions_join_no_listing_and_ride_no_catalog_stream() {
         .await;
     fixture.provider_session.emit(ProviderEvent::TurnCompleted);
     assert!(matches!(
-        crate::server_support::next_catalog_change(&mut catalog).await,
+        crate::support::next_catalog_change(&mut catalog).await,
         SessionCatalogChange::StandingInputsChanged { session_id, .. }
             if session_id == fixture.session_id
     ));
     assert_eq!(
-        crate::server_support::next_catalog_change(&mut catalog).await,
+        crate::support::next_catalog_change(&mut catalog).await,
         SessionCatalogChange::WorkingChanged {
             session_id: fixture.session_id,
             working_since: None,
@@ -3391,6 +3391,10 @@ async fn a_resume_state_revised_mid_connection_is_what_the_next_start_resumes_fr
 fn provider_agent() -> suru::protocol::AgentIdentity {
     suru::protocol::AgentIdentity {
         agent: suru::protocol::AgentId::new("controlled-agent"),
-        selection: crate::support::controlled_selection("gpt-subagent", "high", "fast"),
+        selection: crate::session_integration::support::controlled_selection(
+            "gpt-subagent",
+            "high",
+            "fast",
+        ),
     }
 }

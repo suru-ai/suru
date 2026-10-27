@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::support::{
+use crate::tui_rendering::support::{
     SIDEBAR_WIDE, add_activity, add_request, approval_activity, click_mouse, connected_application,
     connected_application_homed, deliver_settings, drawn_in_sidebar, failed_session_snapshot,
     listed_session, named_workspace_path, navigable_session_snapshot, rendered_application_buffer,
@@ -2383,7 +2383,11 @@ fn everywhere_a_subsession_of_an_unreachable_remote_is_not_carried_by_a_row_here
         sidebar_lines(&application)
     );
 
-    crate::support::studio_stops_answering(&mut application, 1, Duration::from_secs(5));
+    crate::tui_rendering::support::studio_stops_answering(
+        &mut application,
+        1,
+        Duration::from_secs(5),
+    );
     assert!(
         listed_in_sidebar(&application, "Begun from here"),
         "it stands as its unreachable Remote's own row: {:?}",
@@ -2511,7 +2515,11 @@ fn a_picker_alone_everywhere_hears_a_remote_stop_answering() {
         "the Sidekick here carries the Subsession it began there: {screen}"
     );
 
-    crate::support::studio_stops_answering(&mut application, 1, Duration::from_secs(5));
+    crate::tui_rendering::support::studio_stops_answering(
+        &mut application,
+        1,
+        Duration::from_secs(5),
+    );
     let screen = picker_screen(&application);
     assert!(
         screen.contains("[studio]")

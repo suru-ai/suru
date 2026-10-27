@@ -1,6 +1,6 @@
 //! Slash command dispatch and composer autocomplete.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     buffer_rows, enter_active_session, enter_session, failed_session_snapshot,
     rendered_application_buffer, rendered_application_cursor_at, rendered_application_rows,
     type_terminal_text, workspace_dir,

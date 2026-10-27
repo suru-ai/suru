@@ -1,6 +1,6 @@
 //! Native app-server question correlation, supported answers, and secret exclusion.
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::ScriptedCodex;
+use crate::codex_integration::support::ScriptedCodex;
+use crate::support::PROGRESS_DEADLINE;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use suru::{

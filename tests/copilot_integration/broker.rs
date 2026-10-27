@@ -16,7 +16,7 @@
 
 use std::{path::Path, sync::Arc};
 
-use crate::{
+use crate::copilot_integration::{
     server_support::{
         PROGRESS_DEADLINE, begin_sidekick,
         broker::{McpClient, untimed_sidekick_report},

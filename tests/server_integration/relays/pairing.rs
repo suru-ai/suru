@@ -179,7 +179,7 @@ pub(super) async fn next_catalog_event(
 ) -> Option<ManagedEvent> {
     timeout(
         PROGRESS_DEADLINE,
-        crate::next_session_catalog_event(catalog),
+        crate::server_integration::next_session_catalog_event(catalog),
     )
     .await
     .expect("the Remote's catalog says something in time")
@@ -1234,7 +1234,7 @@ async fn an_attachment_is_uploaded_and_fetched_through_a_relay_as_directly() {
     let remote_api = format!("{}/v1/remotes/{REMOTE}", descriptor.base_url);
 
     // Far past what one frame a Relay carries holds.
-    let image = crate::padded_png(3 * 1024 * 1024);
+    let image = crate::server_integration::padded_png(3 * 1024 * 1024);
     let uploaded = http
         .post(format!("{remote_api}/v1/attachments"))
         .bearer_auth(&descriptor.token)
@@ -1280,7 +1280,7 @@ async fn an_attachment_whose_reader_pauses_past_the_heartbeat_is_fetched_whole()
     let descriptor = paired.laptop.server.as_ref().unwrap().descriptor().clone();
     let http = reqwest::Client::new();
     let remote_api = format!("{}/v1/remotes/{REMOTE}", descriptor.base_url);
-    let image = crate::padded_png(5 * 1024 * 1024);
+    let image = crate::server_integration::padded_png(5 * 1024 * 1024);
     let attachment = http
         .post(format!("{remote_api}/v1/attachments"))
         .bearer_auth(&descriptor.token)
@@ -1441,7 +1441,7 @@ async fn removing_the_peer_ends_the_pairing_and_closes_what_the_relay_carried() 
     );
     let failure = timeout(PROGRESS_DEADLINE, async {
         loop {
-            match crate::next_session_catalog_event(&mut catalog).await {
+            match crate::server_integration::next_session_catalog_event(&mut catalog).await {
                 Some(ManagedEvent::RemoteFailed { status, .. }) => return status,
                 Some(_) => {}
                 None => panic!("the Remote's catalog ended without saying why"),
@@ -1532,7 +1532,7 @@ async fn a_remote_reached_only_through_a_relay_that_stops_answering_answers_agai
     paired.relay.route.set_online(true).await;
     let recovered = timeout(PROGRESS_DEADLINE, async {
         loop {
-            match crate::next_session_catalog_event(&mut catalog).await {
+            match crate::server_integration::next_session_catalog_event(&mut catalog).await {
                 Some(ManagedEvent::RemoteRecovered) => return,
                 Some(ManagedEvent::RemoteFailed { status, message }) => {
                     panic!("the Remote failed for good: {status:?}: {message}")
@@ -1555,7 +1555,7 @@ async fn a_remote_reached_only_through_a_relay_that_stops_answering_answers_agai
 async fn recovered(catalog: &mut suru::managed_client::SessionCatalogSubscription) {
     let recovering = timeout(PROGRESS_DEADLINE, async {
         loop {
-            match crate::next_session_catalog_event(catalog).await {
+            match crate::server_integration::next_session_catalog_event(catalog).await {
                 Some(ManagedEvent::RemoteRecovered) => return,
                 Some(ManagedEvent::RemoteFailed { status, message }) => {
                     panic!("the Remote failed for good: {status:?}: {message}")
@@ -1944,7 +1944,7 @@ async fn a_stream_through_a_relay_that_falls_silent_ends_and_the_remote_answers_
     paired.relay.route.set_online(true).await;
     let recovered = timeout(PROGRESS_DEADLINE, async {
         loop {
-            match crate::next_session_catalog_event(&mut catalog).await {
+            match crate::server_integration::next_session_catalog_event(&mut catalog).await {
                 Some(ManagedEvent::RemoteRecovered) => return,
                 Some(ManagedEvent::RemoteFailed { status, message }) => {
                     panic!("the Remote failed for good: {status:?}: {message}")
@@ -2759,7 +2759,7 @@ async fn a_joined_connection_that_drops_fails_all_it_carried_and_the_remote_answ
     // What the catalog said of the Session begun comes first.
     let recovering = timeout(PROGRESS_DEADLINE, async {
         loop {
-            match crate::next_session_catalog_event(&mut catalog).await {
+            match crate::server_integration::next_session_catalog_event(&mut catalog).await {
                 Some(ManagedEvent::Recovering(_)) => return,
                 Some(_) => {}
                 None => panic!("the Remote's catalog ended"),
@@ -2770,7 +2770,7 @@ async fn a_joined_connection_that_drops_fails_all_it_carried_and_the_remote_answ
     recovering.expect("the catalog's stream ends with the join that carried it");
     let recovered = timeout(PROGRESS_DEADLINE, async {
         loop {
-            match crate::next_session_catalog_event(&mut catalog).await {
+            match crate::server_integration::next_session_catalog_event(&mut catalog).await {
                 Some(ManagedEvent::RemoteRecovered) => return,
                 Some(ManagedEvent::RemoteFailed { status, message }) => {
                     panic!("the Remote failed for good: {status:?}: {message}")
@@ -2822,7 +2822,7 @@ async fn attachments_left_unread_hold_up_no_session_stream_through_the_relay() {
     let attachment = api
         .post("/v1/attachments")
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-        .body(crate::padded_png(ATTACHMENT))
+        .body(crate::server_integration::padded_png(ATTACHMENT))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
@@ -2953,7 +2953,7 @@ pub(super) async fn until_recovering(
 ) {
     let recovering = timeout(PROGRESS_DEADLINE, async {
         loop {
-            match crate::next_session_catalog_event(catalog).await {
+            match crate::server_integration::next_session_catalog_event(catalog).await {
                 Some(ManagedEvent::Recovering(_)) => return,
                 Some(_) => {}
                 None => panic!("the Remote's catalog ended"),
@@ -2971,7 +2971,7 @@ pub(super) async fn until_recovered(
 ) {
     let recovered = timeout(PROGRESS_DEADLINE, async {
         loop {
-            match crate::next_session_catalog_event(catalog).await {
+            match crate::server_integration::next_session_catalog_event(catalog).await {
                 Some(ManagedEvent::RemoteRecovered) => return,
                 Some(ManagedEvent::RemoteFailed { status, message }) => {
                     panic!("the Remote failed for good: {status:?}: {message}")
@@ -3130,7 +3130,7 @@ async fn an_attachment_its_relay_holds_up_for_a_while_is_fetched_whole() {
     .await;
     let (interception, _intercepting) = intercepted(&paired, false).await;
     let api = RemoteApi::of(&paired.laptop);
-    let image = crate::padded_png(5 * 1024 * 1024);
+    let image = crate::server_integration::padded_png(5 * 1024 * 1024);
     let attachment = api
         .post("/v1/attachments")
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
@@ -3416,7 +3416,7 @@ async fn a_request_whose_body_would_hold_past_what_requests_awaiting_answers_may
 
     let paired = PairedThrough::start("relay-pairing-awaiting-bytes").await;
     let api = RemoteApi::of(&paired.laptop);
-    let image = crate::padded_png(5 * 1024 * 1024);
+    let image = crate::server_integration::padded_png(5 * 1024 * 1024);
 
     let mut bodies = Vec::new();
     let mut answers = futures_util::stream::FuturesUnordered::new();
@@ -3541,7 +3541,7 @@ async fn a_remote_reached_through_a_relay_alone_refuses_its_peers_server_adminis
         Some(ManagedEvent::SessionCatalogReconciled(_))
     ));
 
-    crate::refuses_server_administration_to_peers(
+    crate::server_integration::refuses_server_administration_to_peers(
         &format!("{}/v1/remotes/{REMOTE}", descriptor.base_url),
         &descriptor.token,
         workstation

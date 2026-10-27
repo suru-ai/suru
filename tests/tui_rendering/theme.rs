@@ -17,12 +17,12 @@ use suru::{
     },
 };
 
-use crate::support::{
+use crate::tui_rendering::support::{
     MutatesSetting, connected_application, connected_application_with_terminal_facts,
     deliver_settings, enter_session, rendered_application_buffer, rendered_application_rows,
     rendered_application_rows_at, text_position, type_terminal_text, workspace_dir,
 };
-use crate::transcript::{application_with_ansi_palette_output, assert_ansi_palette};
+use crate::tui_rendering::transcript::{application_with_ansi_palette_output, assert_ansi_palette};
 
 fn themed(name: &str) -> EffectiveSettings {
     themed_in_mode(name, AppearanceMode::System)

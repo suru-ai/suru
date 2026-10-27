@@ -1,11 +1,11 @@
 //! Server-owned Viewed state, exercised through the public session and catalog protocol.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     failing_provider_support::spawn_with_failing_provider,
     server_support::{next_catalog_change, next_catalog_change_matching, open_catalog_stream},
     support::{create_session, receive_managed_client_initial_state},
 };
+use crate::support::PROGRESS_DEADLINE;
 use futures_util::StreamExt;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},

@@ -1,10 +1,10 @@
 //! The managed client: Session attach, reconnection, deletion, and stream recovery.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     failing_provider_support::spawn_with_failing_provider,
     support::{read_session_at_least_revision, receive_managed_client_initial_state},
 };
+use crate::support::PROGRESS_DEADLINE;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -265,7 +265,7 @@ async fn managed_clients_observe_durable_session_deletion() {
     assert_eq!(
         timeout(
             PROGRESS_DEADLINE,
-            crate::server_support::next_event(&mut observing_client),
+            crate::support::next_event(&mut observing_client),
         )
         .await
         .expect("creation reaches connected client"),
@@ -275,7 +275,7 @@ async fn managed_clients_observe_durable_session_deletion() {
     assert!(matches!(
         timeout(
             PROGRESS_DEADLINE,
-            crate::server_support::next_event(&mut observing_client),
+            crate::support::next_event(&mut observing_client),
         )
             .await
             .expect("the failed Turn outcome reaches the connected client"),
@@ -291,7 +291,7 @@ async fn managed_clients_observe_durable_session_deletion() {
     assert_eq!(
         timeout(
             PROGRESS_DEADLINE,
-            crate::server_support::next_event(&mut observing_client),
+            crate::support::next_event(&mut observing_client),
         )
         .await
         .expect("the end of Working reaches the connected client"),
@@ -311,7 +311,7 @@ async fn managed_clients_observe_durable_session_deletion() {
     assert_eq!(
         timeout(
             PROGRESS_DEADLINE,
-            crate::server_support::next_event(&mut observing_client),
+            crate::support::next_event(&mut observing_client),
         )
         .await
         .expect("deletion reaches connected client"),

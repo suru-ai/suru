@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::support::{
+use crate::tui_rendering::support::{
     MutatesSetting, connected_application, deliver_settings, enter_session, fixture_instance_id,
     model_descriptor, ready_health, rendered_application_buffer, rendered_application_rows_at,
     text_position, type_terminal_text, workspace_dir,

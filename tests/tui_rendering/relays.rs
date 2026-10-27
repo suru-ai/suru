@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use crate::support::{
+use crate::tui_rendering::support::{
     application_looking_at_studio, grace_elapses, rendered_application_rows,
     rendered_application_rows_at, studio_stops_answering, type_terminal_text,
 };

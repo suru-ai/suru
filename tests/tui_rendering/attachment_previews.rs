@@ -25,7 +25,7 @@ use suru::{
     },
 };
 
-use crate::support::{
+use crate::tui_rendering::support::{
     buffer_rows, click_mouse, connected_application_with_terminal_facts, deliver_settings,
     enter_session, failed_session_snapshot, invoke, rendered_application_buffer,
     rendered_application_frame, workspace_dir,
@@ -1045,7 +1045,7 @@ fn a_drafts_thumbnails_stand_through_the_session_its_prompt_begins() {
 
     // The Session answering the claim is the same Session: nothing is
     // fetched again, and the strip stands.
-    let mut created = crate::provisional_session::created_session_snapshot(
+    let mut created = crate::tui_rendering::provisional_session::created_session_snapshot(
         SessionId::new(),
         &request.prompt,
         workspace.path(),

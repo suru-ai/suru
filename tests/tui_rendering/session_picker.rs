@@ -1,6 +1,6 @@
 //! The session picker: ordering, search, scope, attach, and deletion.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     connected_application, connected_application_homed, enter_active_session,
     failed_session_snapshot, named_workspace_path, navigable_session_snapshot,
     noncanonical_spelling, rendered_application_buffer, rendered_application_rows,

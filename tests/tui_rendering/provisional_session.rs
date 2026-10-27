@@ -2,7 +2,9 @@
 //! Landing's first Prompt is submitted until the Server answers with the Session
 //! it made, and the refusal it stands through.
 
-use crate::support::{failed_session_snapshot, rendered_application_rows, workspace_dir};
+use crate::tui_rendering::support::{
+    failed_session_snapshot, rendered_application_rows, workspace_dir,
+};
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
     managed_client::SessionEvent,
@@ -833,7 +835,7 @@ fn a_session_carrying_another_prompt_neither_replaces_the_claim_nor_takes_its_in
 
 mod aside {
     use super::{created_session_snapshot, submit_landing_prompt};
-    use crate::support::{
+    use crate::tui_rendering::support::{
         connected_application, deliver_settings, rendered_application_rows_at, workspace_dir,
     };
     use suru::{

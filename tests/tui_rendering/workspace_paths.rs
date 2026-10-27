@@ -1,6 +1,6 @@
 //! Workspace labels use the owning Server's home without changing its paths.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     connected_application, enter_session, fixture_instance_id, ready_health,
     rendered_application_rows_at,
 };
@@ -173,7 +173,7 @@ fn remote_landing_paths_and_session_names_follow_the_remote_path_style() {
                 }),
             )))
             .unwrap();
-        crate::connecting::turn_to_studio(&mut application);
+        crate::tui_rendering::connecting::turn_to_studio(&mut application);
         let session_id = SessionId::new();
         application
             .handle_event(ApplicationEvent::OriginCatalog {
@@ -192,7 +192,11 @@ fn remote_landing_paths_and_session_names_follow_the_remote_path_style() {
             .unwrap();
         application
             .handle_event(ApplicationEvent::SessionAttached(
-                crate::support::navigable_session_snapshot(session_id, Path::new(path), 1),
+                crate::tui_rendering::support::navigable_session_snapshot(
+                    session_id,
+                    Path::new(path),
+                    1,
+                ),
             ))
             .unwrap();
         let rendered = screen(&application);
@@ -225,7 +229,7 @@ fn the_workspace_picker_offers_no_remotes_sidekick_workspace() {
     let other = "/home/Remote/ledger";
     let mut application = Application::default();
     hide_sidebar(&mut application);
-    crate::connecting::turn_to_studio(&mut application);
+    crate::tui_rendering::connecting::turn_to_studio(&mut application);
     let ids = [SessionId::new(), SessionId::new()];
     application
         .handle_event(ApplicationEvent::OriginCatalog {
@@ -251,14 +255,14 @@ fn the_workspace_picker_offers_no_remotes_sidekick_workspace() {
         panic!("opening the Workspace Picker asks the Remote for its Workspaces")
     };
     let listed = |id, path: &str| {
-        crate::support::navigable_session_snapshot(id, std::path::Path::new(path), 1)
+        crate::tui_rendering::support::navigable_session_snapshot(id, std::path::Path::new(path), 1)
             .session
             .workspace
     };
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            listing: crate::support::workspace_listing(vec![
+            listing: crate::tui_rendering::support::workspace_listing(vec![
                 listed(ids[0], sidekick),
                 listed(ids[1], other),
             ]),
@@ -303,7 +307,7 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
         ] {
             let mut application = Application::default();
             hide_sidebar(&mut application);
-            crate::connecting::turn_to_studio(&mut application);
+            crate::tui_rendering::connecting::turn_to_studio(&mut application);
             let id = SessionId::new();
             application
                 .handle_event(ApplicationEvent::OriginCatalog {
@@ -333,13 +337,16 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
                     )))
                     .unwrap();
             }
-            let snapshot =
-                crate::support::navigable_session_snapshot(id, std::path::Path::new(path), 1);
+            let snapshot = crate::tui_rendering::support::navigable_session_snapshot(
+                id,
+                std::path::Path::new(path),
+                1,
+            );
             let listed = match transition {
                 ApplicationTransition::ListWorkspaces(request) => {
                     ApplicationEvent::WorkspacesListed {
                         request,
-                        listing: crate::support::workspace_listing(vec![
+                        listing: crate::tui_rendering::support::workspace_listing(vec![
                             snapshot.session.workspace,
                         ]),
                     }
@@ -367,7 +374,7 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
             assert!(rendered.contains(label), "{command:?}: {rendered}");
             assert!(!rendered.contains(path), "{command:?}: {rendered}");
             if command == SemanticCommandId::WorkspaceList {
-                crate::support::type_terminal_text(&mut application, "Remote");
+                crate::tui_rendering::support::type_terminal_text(&mut application, "Remote");
                 assert!(
                     !screen(&application).contains(label),
                     "Workspace search matches its name, not its home directory"
@@ -425,11 +432,14 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
                         KeyModifiers::NONE,
                     )))
                     .unwrap();
-                let rows =
-                    rendered_application_rows_at(&application, crate::support::SIDEBAR_WIDE, 30);
+                let rows = rendered_application_rows_at(
+                    &application,
+                    crate::tui_rendering::support::SIDEBAR_WIDE,
+                    30,
+                );
                 assert!(
                     rows.iter()
-                        .any(|row| crate::support::sidebar_column(row) == name),
+                        .any(|row| crate::tui_rendering::support::sidebar_column(row) == name),
                     "the selector offers the Workspace as {name}: {rows:?}"
                 );
             }

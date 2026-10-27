@@ -1,4 +1,4 @@
-use crate::support::{
+use crate::tui_rendering::support::{
     add_activity, approval_activity, connected_application, enter_active_session, invoke, key,
     rendered_application_buffer, rendered_application_rows_at, text_position, type_terminal_text,
     workspace_dir,
@@ -628,7 +628,7 @@ fn folded_approval_summary_is_bounded_and_its_fold_affordance_is_not_copied() {
     // Windows defaults to copying manually; this test is about what a release copies.
     let mut settings = suru::protocol::EffectiveSettings::default();
     settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
-    crate::support::deliver_settings(&mut app, settings);
+    crate::tui_rendering::support::deliver_settings(&mut app, settings);
     let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
     let hidden_tail = "HIDDEN-COMMAND-TAIL";
     let command = format!("echo {}{hidden_tail}\nsecond line", "x".repeat(2_000));
@@ -655,7 +655,7 @@ fn folded_approval_summary_is_bounded_and_its_fold_affordance_is_not_copied() {
     let start = text_position(&buffer, "Approval · Command");
     let marker = text_position(&buffer, "+3 lines");
     assert!(
-        !crate::support::buffer_rows(&buffer)
+        !crate::tui_rendering::support::buffer_rows(&buffer)
             .join("\n")
             .contains(hidden_tail),
         "folded summary exposed the long Command tail"

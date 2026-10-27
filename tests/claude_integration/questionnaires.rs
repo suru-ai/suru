@@ -1,8 +1,8 @@
 //! Native stdio AskUserQuestion callbacks remain Questionnaires under Claude's permission mode.
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{
+use crate::claude_integration::support::{
     CLAUDE_MODELS, LiveTurn, ScriptedClaude, discovery_arms, flag_value, user_turn_arm,
 };
+use crate::support::PROGRESS_DEADLINE;
 use serde_json::{Value, json};
 use suru::{
     protocol::{
@@ -268,7 +268,7 @@ async fn interrupting_claude_while_a_questionnaire_is_pending_stops_the_turn_wit
         "{}{}{}",
         discovery_arms(CLAUDE_MODELS),
         user_turn_arm(&ask("interrupt-51")),
-        crate::support::interrupt_arm(interrupted)
+        crate::claude_integration::support::interrupt_arm(interrupted)
     ));
     let mut live = LiveTurn::start(
         ClaudeRuntime::new(fixture.executable()),
@@ -331,7 +331,7 @@ async fn native_child_questionnaire_is_correlated_to_its_tool_call_and_survives_
         "{}{}{}",
         discovery_arms(CLAUDE_MODELS),
         user_turn_arm(&native),
-        crate::support::stop_task_arm()
+        crate::claude_integration::support::stop_task_arm()
     ));
     let mut live = LiveTurn::start(
         ClaudeRuntime::new(fixture.executable()),

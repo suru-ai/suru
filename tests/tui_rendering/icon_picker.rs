@@ -3,7 +3,7 @@
 //! row's context menu, or a press on the open Session's header Icon, narrows
 //! by typing, and chooses from with the arrows and Enter or a pointer press.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     click_mouse, connected_application, deliver_settings, enter_session,
     rendered_application_buffer, rendered_application_rows_at, text_position, workspace_dir,
 };
@@ -38,7 +38,7 @@ fn shown_with_icons(show_icons: bool) -> EffectiveSettings {
 }
 
 fn listed_as(session_id: SessionId, title: &str, workspace: &Path) -> SessionListItem {
-    crate::support::listed_session(session_id, title, workspace, 1, 1)
+    crate::tui_rendering::support::listed_session(session_id, title, workspace, 1, 1)
 }
 
 /// A Sidebar showing one Session, with `show_icons` as given.
@@ -587,7 +587,7 @@ fn workspace_picker_with_two_workspaces(
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            listing: crate::support::workspace_listing(vec![
+            listing: crate::tui_rendering::support::workspace_listing(vec![
                 Workspace::directory(acorn.clone()),
                 Workspace::directory(birch),
             ]),

@@ -26,7 +26,7 @@ use suru::{
 };
 
 use super::*;
-use crate::broker::sidekick_acts::{acted, refused};
+use crate::session_integration::broker::sidekick_acts::{acted, refused};
 
 /// The Tools through which a Sidekick reads and changes Settings.
 const SETTINGS_TOOLS: [&str; 3] = ["list_settings", "describe_setting", "set_setting"];

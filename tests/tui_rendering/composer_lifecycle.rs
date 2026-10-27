@@ -14,7 +14,7 @@ use suru::{
     },
 };
 
-use crate::{
+use crate::tui_rendering::{
     image_paste::{answer_read, bound, descriptor, paste_image, png, read_clipboard, submit},
     support::{
         connected_application, enter_active_session, failed_session_snapshot, invoke, key,
@@ -56,7 +56,7 @@ fn open_through_the_picker(
     application
         .handle_event(ApplicationEvent::SessionsListed {
             request,
-            sessions: vec![crate::support::listed_session(
+            sessions: vec![crate::tui_rendering::support::listed_session(
                 target,
                 "Another Session",
                 workspace,
@@ -194,7 +194,7 @@ fn send_a_prompt_with_an_image(application: &mut Application, workspace: &std::p
     else {
         panic!("the Landing's Prompt begins a Session");
     };
-    let mut created = crate::provisional_session::created_session_snapshot(
+    let mut created = crate::tui_rendering::provisional_session::created_session_snapshot(
         SessionId::new(),
         &request.prompt,
         workspace,
@@ -678,7 +678,7 @@ fn an_upload_landing_once_the_landing_draft_became_a_session_labels_it_or_is_dro
         .expect("answer the upload");
     application
         .handle_event(ApplicationEvent::SessionCreated(
-            crate::provisional_session::created_session_snapshot(
+            crate::tui_rendering::provisional_session::created_session_snapshot(
                 SessionId::new(),
                 &request.prompt,
                 workspace.path(),
@@ -717,7 +717,7 @@ fn an_upload_landing_once_the_landing_draft_became_a_session_labels_it_or_is_dro
         };
         application
             .handle_event(ApplicationEvent::SessionCreated(
-                crate::provisional_session::created_session_snapshot(
+                crate::tui_rendering::provisional_session::created_session_snapshot(
                     SessionId::new(),
                     &request.prompt,
                     workspace.path(),

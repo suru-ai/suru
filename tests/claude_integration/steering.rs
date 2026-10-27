@@ -1,7 +1,7 @@
 //! Steering a Claude Turn that is already under way: a Prompt delivered into the running loop
 //! rather than one that begins another Turn.
 
-use crate::support::{
+use crate::claude_integration::support::{
     CLAUDE_MODELS, LiveTurn, ScriptedClaude, agent_messages, discovery_arms, settled_session,
     user_turn_arm,
 };

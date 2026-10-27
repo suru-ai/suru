@@ -22,7 +22,7 @@ use suru::provider::{ProviderEventAttribution, SubagentReportOutcome};
 use super::reports::{ANSWER, held_in, report_of};
 use super::stops::acknowledge_interrupt;
 use super::*;
-use crate::provider_support::SubagentDelivery;
+use crate::support::provider::SubagentDelivery;
 
 /// The thread the Codex Session's own Agent runs on, which Codex names in
 /// every call's `_meta.sessionId` — its native Subagents' calls included.

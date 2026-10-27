@@ -25,12 +25,11 @@ use tokio::{
     time::timeout,
 };
 
-#[allow(dead_code)]
-mod support;
+#[path = "support/build_id.rs"]
+mod build_id;
 
 #[allow(dead_code)]
-#[path = "support/failing_provider.rs"]
-mod failing_provider_support;
+mod support;
 
 use support::{
     PROGRESS_DEADLINE, observed_tcp_proxy::ObservedTcpProxy, receive_initial_state,
@@ -195,7 +194,7 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
         .expect("initialize the Server's Log, as verbose as it can be asked to be");
     let server = server::spawn_with_provider_and_timings(
         config.clone(),
-        Arc::new(failing_provider_support::FailingProviderRuntime),
+        Arc::new(support::failing_provider::FailingProviderRuntime),
         ServerTimings {
             shutdown_grace: Duration::from_millis(5),
             ..ServerTimings::default()

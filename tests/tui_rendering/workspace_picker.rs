@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::support::{
+use crate::tui_rendering::support::{
     SIDEBAR_WIDE, answer_workspace_resolution, application_looking_at_studio,
     connected_application, deliver_settings, drawn_in_sidebar, enter_active_session,
     fixture_instance_id, model_descriptor, noncanonical_spelling, ready_health,
@@ -924,7 +924,9 @@ fn a_left_press_on_a_row_is_refused_for_an_unreachable_remote_as_enter_is() {
             let mut application = application_looking_at_studio();
             open_picker_with(
                 &mut application,
-                vec![registered(&crate::support::named_workspace_path("atlas"))],
+                vec![registered(
+                    &crate::tui_rendering::support::named_workspace_path("atlas"),
+                )],
             );
             studio_stops_answering(&mut application, 1, Duration::from_secs(5));
             application
@@ -1415,8 +1417,9 @@ fn a_late_refusal_for_a_workspace_let_go_of_moves_nothing() {
     open_picker_with(&mut application, vec![registered(&atlas)]);
     press(&mut application, KeyCode::Down);
     let resolution = choose_unanswered(&mut application);
-    let (outlook, surface, request_id, _) = crate::support::workspace_resolution(&resolution)
-        .expect("choosing a Workspace asks its Server to resolve it");
+    let (outlook, surface, request_id, _) =
+        crate::tui_rendering::support::workspace_resolution(&resolution)
+            .expect("choosing a Workspace asks its Server to resolve it");
     application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
             SemanticCommandId::SessionNew,
@@ -2314,7 +2317,9 @@ fn opening_the_browser_from_the_picker_is_refused_for_an_unreachable_remote() {
         let mut application = application_looking_at_studio();
         open_picker_with(
             &mut application,
-            vec![registered(&crate::support::named_workspace_path("atlas"))],
+            vec![registered(
+                &crate::tui_rendering::support::named_workspace_path("atlas"),
+            )],
         );
         studio_stops_answering(&mut application, 1, Duration::from_secs(5));
         type_terminal_text(&mut application, query);
@@ -2418,7 +2423,7 @@ fn an_answer_replaces_the_rows_in_place_keeping_the_selection_and_the_query() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            listing: crate::support::workspace_listing(vec![
+            listing: crate::tui_rendering::support::workspace_listing(vec![
                 registered(&relay),
                 registered(&atlas),
                 registered(&ledger),
@@ -2627,7 +2632,7 @@ fn an_answer_to_an_opening_moved_past_lands_nowhere_beside_the_pushes() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request: earlier,
-            listing: crate::support::workspace_listing(vec![registered(&maps)]),
+            listing: crate::tui_rendering::support::workspace_listing(vec![registered(&maps)]),
         })
         .expect("answer an opening moved past");
     let rows = picker_rows(&application);
@@ -2647,7 +2652,7 @@ fn an_answer_to_an_opening_moved_past_lands_nowhere_beside_the_pushes() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request: latest,
-            listing: crate::support::workspace_listing(vec![registered(&maps)]),
+            listing: crate::tui_rendering::support::workspace_listing(vec![registered(&maps)]),
         })
         .expect("answer the latest opening");
     assert!(
@@ -2668,17 +2673,19 @@ fn a_remotes_listing_is_kept_for_the_picker_turned_toward_it() {
     application
         .handle_event(ApplicationEvent::OriginCatalog {
             outlook: Outlook::Local,
-            event: ManagedEvent::WorkspaceListing(crate::support::workspace_listing(vec![
-                registered(&workspace(&["local", "notes"])),
-            ])),
+            event: ManagedEvent::WorkspaceListing(
+                crate::tui_rendering::support::workspace_listing(vec![registered(&workspace(&[
+                    "local", "notes",
+                ]))]),
+            ),
         })
         .expect("hear the local Server's listing");
     application
         .handle_event(ApplicationEvent::OriginCatalog {
             outlook: Outlook::Remote("studio".to_owned()),
-            event: ManagedEvent::WorkspaceListing(crate::support::workspace_listing(vec![
-                registered(&studio_work),
-            ])),
+            event: ManagedEvent::WorkspaceListing(
+                crate::tui_rendering::support::workspace_listing(vec![registered(&studio_work)]),
+            ),
         })
         .expect("hear the Remote's listing");
 
@@ -2702,7 +2709,10 @@ fn a_remotes_listing_is_kept_for_the_picker_turned_toward_it() {
 /// Has the client hear its own Server push `workspaces` as its Workspace
 /// listing, at a revision any other the test gives replaces.
 fn hear_listing(application: &mut Application, workspaces: Vec<Workspace>) {
-    hear(application, crate::support::workspace_listing(workspaces));
+    hear(
+        application,
+        crate::tui_rendering::support::workspace_listing(workspaces),
+    );
 }
 
 /// Has the client hear its own Server push `listing`.
@@ -2859,7 +2869,7 @@ fn open_picker_with(application: &mut Application, workspaces: Vec<Workspace>) {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            listing: crate::support::workspace_listing(workspaces),
+            listing: crate::tui_rendering::support::workspace_listing(workspaces),
         })
         .expect("hydrate the Workspace Picker");
 }
@@ -3270,7 +3280,7 @@ fn an_open_sessions_execution_context_is_independent_of_grouping_and_landing() {
     let linked = workspace_in(&grouping, "linked");
     let execution = workspace_in(&linked, "nested");
     let mut application = application_choosing_skills(&landing);
-    let mut snapshot = crate::support::failed_session_snapshot(
+    let mut snapshot = crate::tui_rendering::support::failed_session_snapshot(
         SessionId::new(),
         PromptId::new(),
         "Create a file",

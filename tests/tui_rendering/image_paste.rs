@@ -20,7 +20,7 @@ use suru::{
     },
 };
 
-use crate::support::{
+use crate::tui_rendering::support::{
     add_activity, approval_activity, click_mouse, connected_application, enter_active_session,
     invoke, key, rendered_application_buffer, rendered_application_rows,
     rendered_application_rows_at, text_position, type_terminal_text, workspace_dir,
@@ -209,7 +209,7 @@ fn a_submitted_prompt_lists_its_attachments_before_and_after_its_session_arrives
     );
 
     // The Session arrives describing what it binds, and the row stands.
-    let mut created = crate::provisional_session::created_session_snapshot(
+    let mut created = crate::tui_rendering::provisional_session::created_session_snapshot(
         SessionId::new(),
         &request.prompt,
         workspace.path(),

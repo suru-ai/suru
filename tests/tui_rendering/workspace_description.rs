@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::support::{
+use crate::tui_rendering::support::{
     click_mouse, connected_application, deliver_settings, rendered_application_buffer,
     rendered_application_rows_at, text_position,
 };
@@ -69,7 +69,7 @@ fn picker_over(here: &Path, workspaces: Vec<Workspace>, show_icons: bool) -> App
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            listing: crate::support::workspace_listing(workspaces),
+            listing: crate::tui_rendering::support::workspace_listing(workspaces),
         })
         .expect("hydrate the Workspace Picker");
     application
@@ -620,7 +620,7 @@ fn the_arrows_walk_the_row_menu_and_enter_acts_on_the_item_the_reader_is_on() {
 
 #[test]
 fn a_remote_workspace_s_description_is_saved_to_that_remote() {
-    let mut application = crate::support::application_looking_at_studio();
+    let mut application = crate::tui_rendering::support::application_looking_at_studio();
     let ApplicationTransition::ListWorkspaces(request) = application
         .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
             SemanticCommandId::WorkspaceList,
@@ -633,7 +633,10 @@ fn a_remote_workspace_s_description_is_saved_to_that_remote() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request,
-            listing: crate::support::workspace_listing(vec![registered(&studio_work, None)]),
+            listing: crate::tui_rendering::support::workspace_listing(vec![registered(
+                &studio_work,
+                None,
+            )]),
         })
         .expect("hydrate the Workspace Picker");
     let buffer = rendered_application_buffer(&application, WIDE, TALL);
@@ -665,8 +668,8 @@ fn describing_a_workspace_on_an_unreachable_remote_is_refused_in_view() {
         SemanticCommandId::WorkspaceDescriptionEdit,
         SemanticCommandId::WorkspaceDescriptionSave,
     ] {
-        let mut application = crate::support::application_looking_at_studio();
-        crate::support::studio_stops_answering(
+        let mut application = crate::tui_rendering::support::application_looking_at_studio();
+        crate::tui_rendering::support::studio_stops_answering(
             &mut application,
             1,
             std::time::Duration::from_secs(5),
@@ -680,7 +683,8 @@ fn describing_a_workspace_on_an_unreachable_remote_is_refused_in_view() {
             ApplicationTransition::Continue,
             "{command:?} is applied on the Origin"
         );
-        let screen = crate::support::rendered_application_rows(&application).join("\n");
+        let screen =
+            crate::tui_rendering::support::rendered_application_rows(&application).join("\n");
         assert!(
             screen.contains("studio is unreachable"),
             "{command:?} is refused where the reader can see it: {screen}"
@@ -695,7 +699,7 @@ fn describing_a_workspace_on_an_unreachable_remote_is_refused_in_view() {
 #[test]
 fn a_local_description_never_reaches_a_remote_workspace_of_the_same_identity() {
     let shared = workspace(&["shared", "mural"]);
-    let mut application = crate::support::application_looking_at_studio();
+    let mut application = crate::tui_rendering::support::application_looking_at_studio();
     let open_on_studio = |application: &mut Application| {
         let ApplicationTransition::ListWorkspaces(request) = application
             .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
@@ -709,7 +713,9 @@ fn a_local_description_never_reaches_a_remote_workspace_of_the_same_identity() {
         application
             .handle_event(ApplicationEvent::WorkspacesListed {
                 request,
-                listing: crate::support::workspace_listing(vec![registered(&shared, None)]),
+                listing: crate::tui_rendering::support::workspace_listing(vec![registered(
+                    &shared, None,
+                )]),
             })
             .expect("hydrate the Workspace Picker");
     };

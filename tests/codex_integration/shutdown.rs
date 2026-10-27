@@ -1,10 +1,10 @@
 //! Server shutdown against cooperative, pending, and unresponsive Codex processes.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::codex_integration::{
     server_support::{detached_servers::DetachedServers, request_server_shutdown},
     support::{ScriptedCodex, assert_process_exited, receive_initial_state},
 };
+use crate::support::PROGRESS_DEADLINE;
 use serde_json::Value;
 use std::os::unix::fs::FileTypeExt;
 use std::sync::Arc;

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use crate::support::{
+use crate::tui_rendering::support::{
     application_looking_at_studio, buffer_rows, click_mouse, grace_elapses,
     navigable_session_snapshot, rendered_application_buffer, rendered_application_rows,
     rendered_application_rows_at, studio_stops_answering_because, text_position,

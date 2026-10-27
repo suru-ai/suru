@@ -32,7 +32,7 @@ use super::{
     },
     *,
 };
-use crate::subagent_tree::{TreeUpdates, next_change};
+use crate::session_integration::subagent_tree::{TreeUpdates, next_change};
 
 /// What the Sidekick first asks of a Session it begins.
 const ASKED: &str = "Fix the flaky login test in the auth suite.";
@@ -498,7 +498,7 @@ async fn a_subsessions_tree_is_its_sidekicks_and_a_session_only_acted_on_heads_i
     )
     .await
     .expect("connect managed client");
-    crate::support::receive_managed_client_initial_state(&mut client).await;
+    crate::session_integration::support::receive_managed_client_initial_state(&mut client).await;
     let mut through_sidekick = client
         .outlook(Outlook::Local)
         .subscribe_subagent_tree(sidekick_id);

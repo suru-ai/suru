@@ -9,7 +9,7 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::support::{
+use crate::copilot_integration::support::{
     agent_messages, connect, conversation_fixture, opened_session, opened_session_in,
     session_where, settled_session,
 };

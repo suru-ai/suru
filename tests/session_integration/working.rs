@@ -3,9 +3,9 @@
 //! reached, and stops owing it when that Prompt is delivered, fails, or is
 //! withdrawn (ADR 0024).
 
-use crate::provider_support::ControlledProvider;
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{open_catalog_stream_with_snapshot, read_session_until};
+use crate::session_integration::support::{open_catalog_stream_with_snapshot, read_session_until};
+use crate::support::PROGRESS_DEADLINE;
+use crate::support::provider::ControlledProvider;
 use suru::{
     protocol::{
         CreateSessionRequest, InitialPrompt, InterruptOutcome, PromptId, PromptStatus,
@@ -76,7 +76,7 @@ async fn a_restart_cancels_the_prompt_no_one_is_left_to_deliver() {
         .await
         .expect("spawn server");
     let client = reqwest::Client::new();
-    let created = crate::support::create_session(
+    let created = crate::session_integration::support::create_session(
         server.descriptor(),
         &creation(workspace.path(), PromptId::new(), "Map the provider seams"),
     )
@@ -95,7 +95,11 @@ async fn a_restart_cancels_the_prompt_no_one_is_left_to_deliver() {
     let restarted = server::spawn_with_provider(config.clone(), restarted_runtime)
         .await
         .expect("respawn server");
-    let restored = crate::support::read_session(restarted.descriptor(), created.session.id).await;
+    let restored = crate::session_integration::support::read_session(
+        restarted.descriptor(),
+        created.session.id,
+    )
+    .await;
     assert_eq!(
         restored.prompts[0].status,
         PromptStatus::Cancelled,
@@ -124,7 +128,11 @@ async fn a_restart_cancels_the_prompt_no_one_is_left_to_deliver() {
     let final_server = server::spawn_with_provider(config, final_runtime)
         .await
         .expect("respawn server once more");
-    let again = crate::support::read_session(final_server.descriptor(), created.session.id).await;
+    let again = crate::session_integration::support::read_session(
+        final_server.descriptor(),
+        created.session.id,
+    )
+    .await;
     assert_eq!(again.prompts[0].status, PromptStatus::Cancelled);
     assert_eq!(
         again.revision, restored.revision,
@@ -150,7 +158,7 @@ async fn creation_begins_working_before_the_provider_is_reached() {
     let (listed, mut catalog) = open_catalog_stream_with_snapshot(&descriptor).await;
     assert!(listed.is_empty(), "the catalog opens on an empty listing");
 
-    let created = crate::support::create_session(
+    let created = crate::session_integration::support::create_session(
         &descriptor,
         &creation(workspace.path(), PromptId::new(), "Map the provider seams"),
     )
@@ -171,7 +179,7 @@ async fn creation_begins_working_before_the_provider_is_reached() {
     // The Provider has not been answered, so the listing the catalog's own
     // announcement sends a reader back for already says the Session is
     // Working, with no Turn anywhere to have said it.
-    let announced = crate::server_support::next_catalog_change(&mut catalog).await;
+    let announced = crate::support::next_catalog_change(&mut catalog).await;
     assert!(
         matches!(
             announced,
@@ -215,7 +223,7 @@ async fn interrupting_a_session_owed_a_turn_withdraws_the_prompt() {
     let descriptor = server.descriptor().clone();
     let client = reqwest::Client::new();
     let prompt_id = PromptId::new();
-    let created = crate::support::create_session(
+    let created = crate::session_integration::support::create_session(
         &descriptor,
         &creation(workspace.path(), prompt_id, "Map the provider seams"),
     )
@@ -258,7 +266,7 @@ async fn interrupting_a_session_owed_a_turn_withdraws_the_prompt() {
     assert!(withdrawn.turns.is_empty());
     assert!(withdrawn.messages.is_empty());
     assert_eq!(
-        crate::server_support::next_catalog_change_matching(&mut catalog, |change| matches!(
+        crate::support::next_catalog_change_matching(&mut catalog, |change| matches!(
             change,
             SessionCatalogChange::WorkingChanged { .. }
         ))
@@ -274,7 +282,11 @@ async fn interrupting_a_session_owed_a_turn_withdraws_the_prompt() {
     // answering it now begins no Turn.
     let mut provider_session = start.succeed(suru::protocol::AgentIdentity {
         agent: suru::protocol::AgentId::new("controlled-agent"),
-        selection: crate::support::controlled_selection("gpt-withdrawn", "high", "fast"),
+        selection: crate::session_integration::support::controlled_selection(
+            "gpt-withdrawn",
+            "high",
+            "fast",
+        ),
     });
     let abandoned = read_session_until(
         &client,
@@ -295,7 +307,7 @@ async fn interrupting_a_session_owed_a_turn_withdraws_the_prompt() {
     // already made, Cancelled Prompt and all: the Prompt id is what makes a
     // creation idempotent, and withdrawing its Prompt neither deletes the
     // Session nor frees the id to make another.
-    let retried = crate::support::create_session(
+    let retried = crate::session_integration::support::create_session(
         &descriptor,
         &creation(workspace.path(), prompt_id, "Map the provider seams"),
     )
@@ -326,7 +338,7 @@ async fn a_follow_up_prompt_on_an_idle_session_is_working_and_withdrawable() {
     .expect("spawn server");
     let descriptor = server.descriptor().clone();
     let client = reqwest::Client::new();
-    let created = crate::support::create_session(
+    let created = crate::session_integration::support::create_session(
         &descriptor,
         &creation(workspace.path(), PromptId::new(), "Map the provider seams"),
     )
@@ -412,7 +424,11 @@ async fn a_follow_up_prompt_on_an_idle_session_is_working_and_withdrawable() {
 
     let mut provider_session = start.succeed(suru::protocol::AgentIdentity {
         agent: suru::protocol::AgentId::new("controlled-agent"),
-        selection: crate::support::controlled_selection("gpt-withdrawn", "high", "fast"),
+        selection: crate::session_integration::support::controlled_selection(
+            "gpt-withdrawn",
+            "high",
+            "fast",
+        ),
     });
     let abandoned = read_session_until(
         &client,

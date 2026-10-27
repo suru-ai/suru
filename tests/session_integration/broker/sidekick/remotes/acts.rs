@@ -21,9 +21,11 @@ use suru::{
 };
 
 use super::*;
-use crate::attachments::{next_change, watch_session};
-use crate::broker::sidekick::answering::{ask, stood, where_to_run};
-use crate::broker::sidekick_acts::{SIDEKICK_WORKSPACE_REFUSAL, acted, refused};
+use crate::session_integration::attachments::{next_change, watch_session};
+use crate::session_integration::broker::sidekick::answering::{ask, stood, where_to_run};
+use crate::session_integration::broker::sidekick_acts::{
+    SIDEKICK_WORKSPACE_REFUSAL, acted, refused,
+};
 
 /// The one Peer the Remote `remote` describes is paired with: the
 /// Sidekick's own Server, as the Remote knows it.
@@ -838,7 +840,7 @@ async fn a_session_begun_on_a_remote_is_a_sidekicks_on_this_peer_heading_its_own
         "and says so in the summary every Client of it receives"
     );
 
-    let (tree, _) = crate::subagent_tree::open_tree(&remote, session_id).await;
+    let (tree, _) = crate::session_integration::subagent_tree::open_tree(&remote, session_id).await;
     assert_eq!(
         (tree.top_level.session_id, tree.top_level.sidekick),
         (session_id, false),
@@ -1222,7 +1224,8 @@ async fn an_act_whose_answer_is_lost_once_the_remote_took_it_is_neither_denied_n
     // Kept, not yet confirmed, the act is confirmed by the first read of the
     // Remote that finds the Session — here through the other address, the
     // first being offline still.
-    let (tree, mut updates) = crate::subagent_tree::open_tree(own.descriptor(), sidekick_id).await;
+    let (tree, mut updates) =
+        crate::session_integration::subagent_tree::open_tree(own.descriptor(), sidekick_id).await;
     let mut revision = tree.revision;
     let confirmed = |entry: &suru::protocol::SubagentTreeSession| {
         entry.session_id == target && entry.origin.as_deref() == Some(REMOTE) && !entry.unconfirmed
@@ -1230,7 +1233,8 @@ async fn an_act_whose_answer_is_lost_once_the_remote_took_it_is_neither_denied_n
     if !tree.sessions.iter().any(confirmed) {
         loop {
             if let suru::protocol::SubagentTreeChange::SessionChanged { entry } =
-                crate::subagent_tree::next_change(&mut updates, &mut revision).await
+                crate::session_integration::subagent_tree::next_change(&mut updates, &mut revision)
+                    .await
                 && confirmed(&entry)
             {
                 break;
@@ -1433,7 +1437,7 @@ async fn a_session_begun_on_a_remote_in_a_new_worktree_works_in_one_made_there()
     let main = suru::paths::canonical(temporary.path())
         .expect("read the Remote's home canonically")
         .join("auth");
-    crate::broker::subsessions::committed(&main);
+    crate::session_integration::broker::subsessions::committed(&main);
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
 
     let begun = acted(

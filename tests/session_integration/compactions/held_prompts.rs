@@ -9,10 +9,10 @@ use super::{
     compaction_statuses, completed, failed, idle_session, request_compaction, session_where,
     turn_settled, user_messages,
 };
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{
+use crate::session_integration::support::{
     Reader, WorkingTurn, compact, controlled_selection, interrupt, read_session, working_turn,
 };
+use crate::support::PROGRESS_DEADLINE;
 use axum::http::StatusCode;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
@@ -206,7 +206,7 @@ async fn a_prompt_held_behind_a_requested_compaction_begins_the_next_turn_workin
     )
     .await
     .expect("connect managed client");
-    crate::support::receive_managed_client_initial_state(&mut client).await;
+    crate::session_integration::support::receive_managed_client_initial_state(&mut client).await;
     let mut subscription = client
         .subscribe_session(session_id)
         .await
@@ -236,7 +236,8 @@ async fn a_prompt_held_behind_a_requested_compaction_begins_the_next_turn_workin
 
     let mut working = Vec::new();
     loop {
-        let update = crate::support::next_session_update(&mut subscription).await;
+        let update =
+            crate::session_integration::support::next_session_update(&mut subscription).await;
         working.extend(update.changes.iter().filter_map(|change| match change {
             SessionChange::SessionWorkingChanged { working_since } => Some(*working_since),
             _ => None,
@@ -820,7 +821,7 @@ async fn why_a_held_prompt_was_withdrawn_is_stored_and_survives_a_restart() {
             left_mid_compaction(&config, requested.turns[1].id, prompt.id);
         }
 
-        let (runtime, _provider) = crate::provider_support::ControlledProvider::new();
+        let (runtime, _provider) = crate::support::provider::ControlledProvider::new();
         let restarted = timeout(
             PROGRESS_DEADLINE,
             suru::server::spawn_with_provider(config, runtime),

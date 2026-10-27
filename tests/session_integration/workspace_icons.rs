@@ -1,8 +1,7 @@
 //! Deriving a Workspace's Icon from its presented name and README, through
 //! the second Errand a Session's creation spawns beside its Title Errand.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     provider_support::ControlledProvider,
     repositories::git,
     server_support::{
@@ -11,6 +10,7 @@ use crate::{
     },
     support::{hosted_model, hosted_selection},
 };
+use crate::support::PROGRESS_DEADLINE;
 use serde_json::json;
 use suru::{
     protocol::{
@@ -43,7 +43,7 @@ fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionReq
 }
 
 fn workspace_icon_provider() -> (
-    std::sync::Arc<crate::provider_support::ControlledProviderRuntime>,
+    std::sync::Arc<crate::support::provider::ControlledProviderRuntime>,
     ControlledProvider,
 ) {
     ControlledProvider::with_provider(
@@ -62,7 +62,7 @@ async fn connected_client(
     )
     .await
     .expect("connect client");
-    crate::support::receive_managed_client_initial_state(&mut client).await;
+    crate::session_integration::support::receive_managed_client_initial_state(&mut client).await;
     client
 }
 
@@ -105,7 +105,7 @@ async fn answer_title_errand(provider: &mut ControlledProvider, title: &str) {
 /// for an Icon alone.
 async fn next_workspace_errand(
     provider: &mut ControlledProvider,
-) -> crate::provider_support::ErrandRequest {
+) -> crate::support::provider::ErrandRequest {
     let errand = timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("the Workspace Icon Errand reaches the Provider");

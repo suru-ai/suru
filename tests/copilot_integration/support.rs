@@ -6,7 +6,7 @@
 //! test supplies, matched against the request body, with `$COPILOT_FIXTURE_ID` standing for the
 //! request's JSON-RPC ID and `reply` framing a response body.
 
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::support::PROGRESS_DEADLINE;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionSubscription},
     protocol::{
@@ -19,7 +19,7 @@ use suru::{
 };
 use tokio::time::timeout;
 
-use crate::{
+use crate::copilot_integration::{
     scripted_binary_support::{captured_methods, captured_requests, write_executable},
     server_support::{config_root_pinning, receive_initial_state},
 };

@@ -9,7 +9,7 @@
 //! offers the working ones beside the Sidekick's Subagents, and stops one by
 //! interrupting it.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     click_mouse, connected_application, deliver_settings, failed_session_snapshot, invoke,
     model_descriptor, rendered_application_buffer, rendered_application_rows_at, workspace_dir,
 };
@@ -228,7 +228,13 @@ fn change(application: &mut Application, through: SessionId, change: SubagentTre
 }
 
 /// A client with the Sidekick's Session open and its tree in hand.
-fn sidekick_open(show_icons: bool) -> (Application, Sidekick, crate::support::WorkspaceDir) {
+fn sidekick_open(
+    show_icons: bool,
+) -> (
+    Application,
+    Sidekick,
+    crate::tui_rendering::support::WorkspaceDir,
+) {
     let workspace = workspace_dir();
     let sidekick = Sidekick::new(workspace.path());
     let mut application = client(workspace.path(), show_icons);

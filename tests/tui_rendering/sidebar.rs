@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::support::{
+use crate::tui_rendering::support::{
     NEW_SESSION, SELECTOR_ROW, SIDEBAR_PRESS_HEIGHT as PRESS_HEIGHT, SIDEBAR_WIDE as WIDE,
     answer_workspace_resolution, application_looking_at_studio, connected_application,
     deliver_settings, drawn_in_sidebar, enter_active_session, enter_session,
@@ -352,7 +352,7 @@ fn a_working_active_row_draws_an_info_rail_and_an_idle_row_draws_none() {
     );
 
     let buffer = rendered_application_buffer(&application, WIDE, 20);
-    let rows = crate::support::buffer_rows(&buffer);
+    let rows = crate::tui_rendering::support::buffer_rows(&buffer);
     let working_title = u16::try_from(rendered_row(&rows, "Running a build")).expect("screen row");
     assert_standing_rail(&buffer, working_title, Color::LightBlue, Color::Reset);
     let idle_title = u16::try_from(rendered_row(&rows, "Waiting quietly")).expect("screen row");
@@ -373,7 +373,7 @@ fn the_right_slot_says_monitoring_and_how_long_with_an_info_rail_while_a_watch_i
     );
 
     let buffer = rendered_application_buffer(&application, WIDE, 20);
-    let rows = crate::support::buffer_rows(&buffer);
+    let rows = crate::tui_rendering::support::buffer_rows(&buffer);
     let title = rendered_row(&rows, "Tailing the logs");
     let slot = sidebar_column(&rows[title - 1]);
     assert!(
@@ -409,7 +409,7 @@ fn a_monitoring_rail_holds_steady_while_a_working_rail_shimmers() {
         "a Monitoring duration has to be seen rising, so it arms the tick"
     );
     let before = rendered_application_buffer(&application, WIDE, 20);
-    let rows = crate::support::buffer_rows(&before);
+    let rows = crate::tui_rendering::support::buffer_rows(&before);
     let waiting = u16::try_from(rendered_row(&rows, "Tailing the logs")).expect("screen row");
     let working_row = u16::try_from(rendered_row(&rows, "Running a build")).expect("screen row");
 
@@ -467,7 +467,7 @@ fn failed_stands_ahead_of_monitoring_and_monitoring_ahead_of_done() {
     );
 
     let buffer = rendered_application_buffer(&application, WIDE, 20);
-    let rows = crate::support::buffer_rows(&buffer);
+    let rows = crate::tui_rendering::support::buffer_rows(&buffer);
     let failed = u16::try_from(rendered_row(&rows, "Failed and waiting")).expect("screen row");
     assert_standing_rail(&buffer, failed, Color::Red, Color::Reset);
     assert!(
@@ -516,7 +516,7 @@ fn a_failed_session_still_monitoring_reads_monitoring_once_viewed() {
     open_session(&mut application, workspace.path(), open);
 
     let buffer = rendered_application_buffer(&application, WIDE, 20);
-    let rows = crate::support::buffer_rows(&buffer);
+    let rows = crate::tui_rendering::support::buffer_rows(&buffer);
     for title in ["Viewed elsewhere", "Viewed here"] {
         let row = u16::try_from(rendered_row(&rows, title)).expect("screen row");
         assert_standing_rail(&buffer, row, Color::LightBlue, Color::Reset);
@@ -554,7 +554,7 @@ fn latest_turn_outcomes_draw_failed_and_done_but_leave_interrupted_quiet() {
     );
 
     let buffer = rendered_application_buffer(&application, WIDE, 20);
-    let rows = crate::support::buffer_rows(&buffer);
+    let rows = crate::tui_rendering::support::buffer_rows(&buffer);
     let failed = u16::try_from(rendered_row(&rows, "Failed work")).expect("screen row");
     assert_standing_rail(&buffer, failed, Color::Red, Color::Reset);
     assert!(sidebar_column(&rows[usize::from(failed - 1)]).ends_with("Failed"));
@@ -597,7 +597,7 @@ fn failed_and_done_draw_only_when_the_latest_turn_settled_after_viewed() {
     );
 
     let buffer = rendered_application_buffer(&application, WIDE, 20);
-    let rows = crate::support::buffer_rows(&buffer);
+    let rows = crate::tui_rendering::support::buffer_rows(&buffer);
     let cleared = u16::try_from(rendered_row(&rows, "Already viewed")).expect("screen row");
     for row in cleared - 1..=cleared + 1 {
         assert_ne!(
@@ -1566,7 +1566,7 @@ fn every_edge_grab_column_holds_focus_paint_until_release_without_opening_a_row(
         let released = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
         assert_eq!(released[(39, row)].fg, Color::DarkGray);
         assert!(
-            crate::support::buffer_rows(&released)
+            crate::tui_rendering::support::buffer_rows(&released)
                 .iter()
                 .any(|line| line.contains("Type a prompt")),
             "even the grab over a row leaves the Landing open"
@@ -1604,7 +1604,7 @@ fn dragging_the_held_edge_reflows_the_sidebar_and_main_view_until_release() {
     );
 
     let held = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
-    let held_rows = crate::support::buffer_rows(&held);
+    let held_rows = crate::tui_rendering::support::buffer_rows(&held);
     assert_eq!(sidebar_divider_column(&held_rows), Some(39));
     assert_eq!(
         held[(39, 0)].fg,
@@ -1628,7 +1628,7 @@ fn dragging_the_held_edge_reflows_the_sidebar_and_main_view_until_release() {
     );
     let released = rendered_application_buffer(&application, WIDE, PRESS_HEIGHT);
     assert_eq!(
-        sidebar_divider_column(&crate::support::buffer_rows(&released)),
+        sidebar_divider_column(&crate::tui_rendering::support::buffer_rows(&released)),
         Some(39)
     );
     assert_ne!(released[(39, 0)].fg, Color::Cyan);
@@ -1664,7 +1664,7 @@ fn edge_dragging_stops_at_the_sidebar_and_current_main_view_floors() {
     );
     let at_minimum = rendered_application_buffer(&minimum, WIDE, PRESS_HEIGHT);
     assert_eq!(
-        sidebar_divider_column(&crate::support::buffer_rows(&at_minimum)),
+        sidebar_divider_column(&crate::tui_rendering::support::buffer_rows(&at_minimum)),
         Some(23)
     );
     assert_eq!(at_minimum[(23, 0)].fg, Color::Cyan);
@@ -1687,7 +1687,7 @@ fn edge_dragging_stops_at_the_sidebar_and_current_main_view_floors() {
     );
     let at_maximum = rendered_application_buffer(&maximum, WIDE, PRESS_HEIGHT);
     assert_eq!(
-        sidebar_divider_column(&crate::support::buffer_rows(&at_maximum)),
+        sidebar_divider_column(&crate::tui_rendering::support::buffer_rows(&at_maximum)),
         Some(45),
         "a 46-column Sidebar leaves the current 100-column frame's 54-column main floor"
     );
@@ -2165,9 +2165,13 @@ fn overlays_keep_edge_presses_and_never_show_held_paint() {
         (39, 0),
     );
     assert!(
-        !crate::support::buffer_rows(&rendered_application_buffer(&settings, WIDE, PRESS_HEIGHT))
-            .join("\n")
-            .contains("Settings"),
+        !crate::tui_rendering::support::buffer_rows(&rendered_application_buffer(
+            &settings,
+            WIDE,
+            PRESS_HEIGHT
+        ))
+        .join("\n")
+        .contains("Settings"),
         "the overlay handles the outside click by dismissing itself"
     );
 
@@ -2219,7 +2223,7 @@ fn overlays_keep_edge_presses_and_never_show_held_paint() {
         .expect("open the Subagent picker");
     let picker = rendered_application_buffer(&subagents, WIDE, PRESS_HEIGHT);
     assert!(
-        crate::support::buffer_rows(&picker)
+        crate::tui_rendering::support::buffer_rows(&picker)
             .join("\n")
             .contains("Subagents")
     );
@@ -2239,9 +2243,13 @@ fn overlays_keep_edge_presses_and_never_show_held_paint() {
         (39, 0),
     );
     assert!(
-        !crate::support::buffer_rows(&rendered_application_buffer(&subagents, WIDE, PRESS_HEIGHT))
-            .join("\n")
-            .contains("Subagents"),
+        !crate::tui_rendering::support::buffer_rows(&rendered_application_buffer(
+            &subagents,
+            WIDE,
+            PRESS_HEIGHT
+        ))
+        .join("\n")
+        .contains("Subagents"),
         "the Subagent picker handles the outside click by dismissing itself"
     );
 }
@@ -2566,11 +2574,19 @@ fn listed_with_id_and_updated_at(
     created_at: u64,
     updated_at: u64,
 ) -> SessionListItem {
-    crate::support::listed_session(session_id, title, workspace, created_at, updated_at)
+    crate::tui_rendering::support::listed_session(
+        session_id, title, workspace, created_at, updated_at,
+    )
 }
 
 fn listed(title: &str, workspace: &Path, created_at: u64, updated_at: u64) -> SessionListItem {
-    crate::support::listed_session(SessionId::new(), title, workspace, created_at, updated_at)
+    crate::tui_rendering::support::listed_session(
+        SessionId::new(),
+        title,
+        workspace,
+        created_at,
+        updated_at,
+    )
 }
 
 fn now() -> u64 {
@@ -2855,7 +2871,9 @@ fn moving_workspace_while_a_session_is_opening_reports_the_client_letting_go() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request: listing,
-            listing: crate::support::workspace_listing(vec![Workspace::directory(atlas.clone())]),
+            listing: crate::tui_rendering::support::workspace_listing(vec![Workspace::directory(
+                atlas.clone(),
+            )]),
         })
         .expect("hydrate the Workspace Picker");
     press_sidebar_key(&mut application, KeyCode::Down);
@@ -6032,7 +6050,7 @@ fn everywhere_prefixes_foreign_workspaces_independently_of_title_truncation() {
     }
 
     let buffer = rendered_application_buffer(&application, WIDE, 20);
-    let rows = crate::support::buffer_rows(&buffer);
+    let rows = crate::tui_rendering::support::buffer_rows(&buffer);
     let local = sidebar_column(&rows[rendered_row(&rows, "Local work")]);
     assert_eq!(local, "Local work", "local rows carry no Origin tag");
     let title_row = rendered_row(&rows, "A foreign Title");
@@ -6335,7 +6353,7 @@ fn a_transient_remote_drop_dims_only_its_rows_and_marks_it_unreachable() {
     );
 
     let buffer = rendered_application_buffer(&application, WIDE, 20);
-    let rows = crate::support::buffer_rows(&buffer);
+    let rows = crate::tui_rendering::support::buffer_rows(&buffer);
     let unreachable = rendered_row(&rows, "studio [unreachable]");
     assert!(
         rendered_row(&rows, "Studio work") < unreachable && unreachable < sidebar_divider(&rows),
@@ -6714,7 +6732,7 @@ fn a_fresh_remote_snapshot_clears_its_unreachable_presentation() {
     ));
 
     let buffer = rendered_application_buffer(&application, WIDE, 20);
-    let rows = crate::support::buffer_rows(&buffer);
+    let rows = crate::tui_rendering::support::buffer_rows(&buffer);
     assert!(
         !rows.iter().any(|row| row.contains("[unreachable]")),
         "the fresh snapshot removes the Remote's unreachable row: {rows:?}"
@@ -7130,7 +7148,7 @@ fn a_remote_turn_outcome_lights_that_outlooks_row_in_place() {
     };
     assert_eq!(request.outlook(), &Outlook::Remote("studio".to_owned()));
     let buffer = rendered_application_buffer(&application, WIDE, 20);
-    let rows = crate::support::buffer_rows(&buffer);
+    let rows = crate::tui_rendering::support::buffer_rows(&buffer);
     let remote = u16::try_from(rendered_row(&rows, "Remote work")).expect("screen row");
     assert_standing_rail(&buffer, remote, Color::Red, Color::Reset);
     assert!(sidebar_column(&rows[usize::from(remote - 1)]).ends_with("Failed"));
@@ -7766,7 +7784,7 @@ fn driving_the_sidebar_of_an_unreachable_studio() -> Application {
             )))
             .expect("reveal the Sidebar"),
     );
-    let studio = crate::support::named_workspace_path("studio");
+    let studio = crate::tui_rendering::support::named_workspace_path("studio");
     application
         .handle_event(ApplicationEvent::SessionsListed {
             request,
@@ -7911,7 +7929,9 @@ fn the_workspace_the_reader_moved_to_stands_among_the_selectors_entries() {
     application
         .handle_event(ApplicationEvent::WorkspacesListed {
             request: listing,
-            listing: crate::support::workspace_listing(vec![Workspace::directory(notes.clone())]),
+            listing: crate::tui_rendering::support::workspace_listing(vec![Workspace::directory(
+                notes.clone(),
+            )]),
         })
         .expect("hydrate the Workspace Picker");
     press_sidebar_key(&mut application, KeyCode::Down);
@@ -10147,7 +10167,11 @@ fn eight_listed(workspace: &Path) -> Vec<SessionListItem> {
 fn open_long_session(application: &mut Application, workspace: &Path) {
     application
         .handle_event(ApplicationEvent::SessionAttached(
-            crate::support::navigable_session_snapshot(SessionId::new(), workspace, 8),
+            crate::tui_rendering::support::navigable_session_snapshot(
+                SessionId::new(),
+                workspace,
+                8,
+            ),
         ))
         .expect("open a Session with a long Transcript");
 }

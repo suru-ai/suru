@@ -13,14 +13,14 @@
 //! A Subagent Report reaches a Claude Agent the way a Prompt does: as one stream-json user message
 //! on its process's stdin (ADR 0035).
 
-use crate::server_support::{
-    begin_sidekick,
-    broker::{McpClient, untimed_sidekick_report},
-};
-use crate::support::{
+use crate::claude_integration::support::{
     CLAUDE_MODELS, Launch, LiveTurn, McpConfigFile, ScriptedClaude, conversation_arms,
     conversation_fixture, discovery_arms, errand_preamble, failed_errand_envelope, hosting,
     opened_session, settled_session,
+};
+use crate::support::{
+    begin_sidekick,
+    broker::{McpClient, untimed_sidekick_report},
 };
 use serde_json::{Value, json};
 use suru::{

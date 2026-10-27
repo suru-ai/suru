@@ -1,9 +1,9 @@
 //! Repository grouping through the owning Server's authenticated boundaries.
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     failing_provider_support::{FailingProviderRuntime, spawn_with_failing_provider},
     support,
 };
+use crate::support::PROGRESS_DEADLINE;
 use diesel::{Connection, RunQueryDsl};
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;

@@ -1,5 +1,7 @@
 //! Managed preparation through authenticated owning-Server operations and real Git.
-use crate::{provider_support::ControlledProvider, repositories::git, support};
+use crate::session_integration::{
+    provider_support::ControlledProvider, repositories::git, support,
+};
 use std::path::{Path, PathBuf};
 use suru::{
     protocol::*,
@@ -650,7 +652,7 @@ async fn the_tui_prepares_a_worktree_named_from_its_prompt_and_starts_its_sessio
     };
     // Discovery settles on its own; the event loop would take the fresh
     // catalog from the Server's stream.
-    let catalog = tokio::time::timeout(crate::server_support::PROGRESS_DEADLINE, async {
+    let catalog = tokio::time::timeout(crate::support::PROGRESS_DEADLINE, async {
         loop {
             let catalog: SkillCatalog = answered(post("/v1/skills").json(&skills)).await;
             if matches!(catalog.status, SkillCatalogStatus::Fresh { .. }) {

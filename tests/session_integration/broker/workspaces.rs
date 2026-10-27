@@ -14,7 +14,7 @@
 use suru::protocol::RepositoryId;
 
 use super::*;
-use crate::broker::{
+use crate::session_integration::broker::{
     sidekick::{
         ORDINARY_TOOLS, SIDEKICK_TOOLS, listed_tools, sidekick_directory, start_sidekick,
         unoffered,
@@ -22,7 +22,7 @@ use crate::broker::{
     },
     sidekick_acts::{acted, refused},
 };
-use crate::{repositories::git, workspace_discovery::AS_LONG_AS_IT_TAKES};
+use crate::session_integration::{repositories::git, workspace_discovery::AS_LONG_AS_IT_TAKES};
 
 /// What an Agent other than a Sidekick is told when it asks for any Server's
 /// Workspaces but its own.

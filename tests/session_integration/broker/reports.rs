@@ -57,7 +57,7 @@ async fn row_settles(
 async fn next_turn(
     provider: &mut ControlledProviderSession,
     what: &str,
-) -> crate::provider_support::TurnStart {
+) -> crate::support::provider::TurnStart {
     timeout(PROGRESS_DEADLINE, provider.next_turn())
         .await
         .unwrap_or_else(|_| panic!("{what}"))

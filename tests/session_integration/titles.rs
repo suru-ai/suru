@@ -1,7 +1,6 @@
 //! Deriving a Session's Title from its first Prompt, through an Errand.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     provider_support::ControlledProvider,
     server_support::{
         assert_no_title_reaches, catalog_changes_through_title, config_root_pinning,
@@ -9,6 +8,7 @@ use crate::{
     },
     support::{hosted_model, hosted_selection},
 };
+use crate::support::PROGRESS_DEADLINE;
 use serde_json::json;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
@@ -49,7 +49,7 @@ fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionReq
 }
 
 fn titling_provider() -> (
-    std::sync::Arc<crate::provider_support::ControlledProviderRuntime>,
+    std::sync::Arc<crate::support::provider::ControlledProviderRuntime>,
     ControlledProvider,
 ) {
     ControlledProvider::with_provider(
@@ -64,7 +64,7 @@ fn titling_provider() -> (
 /// least — which is why the runtime declares the whole Selection rather than a
 /// Model identifier.
 fn errand_titling_provider() -> (
-    std::sync::Arc<crate::provider_support::ControlledProviderRuntime>,
+    std::sync::Arc<crate::support::provider::ControlledProviderRuntime>,
     ControlledProvider,
 ) {
     let effort = |id: &str| ModelOptionChoice {
@@ -137,7 +137,7 @@ async fn connected_client(state_dir: &std::path::Path, channel: &str) -> Managed
     )
     .await
     .expect("connect client");
-    crate::support::receive_managed_client_initial_state(&mut client).await;
+    crate::session_integration::support::receive_managed_client_initial_state(&mut client).await;
     client
 }
 

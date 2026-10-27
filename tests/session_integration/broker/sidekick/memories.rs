@@ -22,7 +22,7 @@ use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
 use suru::server::ServerClock;
 
 use super::*;
-use crate::broker::sidekick_acts::{acted, refused};
+use crate::session_integration::broker::sidekick_acts::{acted, refused};
 
 /// The Tools through which a Sidekick keeps Memories.
 const MEMORY_TOOLS: [&str; 5] = [

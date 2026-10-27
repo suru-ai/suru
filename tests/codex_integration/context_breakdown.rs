@@ -1,6 +1,6 @@
 //! Codex reports how full its context is, but not what fills it.
 
-use crate::support::{conversation_codex, opened_session, settled_session};
+use crate::codex_integration::support::{conversation_codex, opened_session, settled_session};
 use suru::protocol::{SessionError, SessionErrorCode};
 
 const COMPLETED: &str = r#"      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'

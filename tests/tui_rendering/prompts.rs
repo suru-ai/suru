@@ -2,7 +2,7 @@
 //! including a Prompt held behind a requested Compaction, which accepts no
 //! steer (ADR 0041).
 
-use crate::support::{
+use crate::tui_rendering::support::{
     FailedTurnFixture, enter_active_session, enter_session, rendered_application_rows,
     type_terminal_text, workspace_dir,
 };
@@ -658,8 +658,9 @@ fn authoritative_delivery_after_an_ambiguous_failure_removes_the_restored_retry(
     assert!(reconciled.contains("Type a prompt"));
     assert!(!reconciled.contains("response connection closed"));
     type_terminal_text(&mut application, "next draft");
-    let buffer = crate::support::rendered_application_buffer(&application, 100, 32);
-    let cursor = crate::support::rendered_application_cursor_at(&application, 100, 32);
+    let buffer = crate::tui_rendering::support::rendered_application_buffer(&application, 100, 32);
+    let cursor =
+        crate::tui_rendering::support::rendered_application_cursor_at(&application, 100, 32);
     for x in cursor.x - 10..cursor.x {
         assert!(
             !buffer[(x, cursor.y)]
@@ -712,8 +713,9 @@ fn failed_admission_drops_the_intervening_drafts_selection_before_restoring_text
             error: "server unavailable".to_owned(),
         })
         .unwrap();
-    let buffer = crate::support::rendered_application_buffer(&application, 100, 32);
-    let cursor = crate::support::rendered_application_cursor_at(&application, 100, 32);
+    let buffer = crate::tui_rendering::support::rendered_application_buffer(&application, 100, 32);
+    let cursor =
+        crate::tui_rendering::support::rendered_application_cursor_at(&application, 100, 32);
     for x in cursor.x - 9..cursor.x {
         assert!(
             !buffer[(x, cursor.y)]
@@ -819,7 +821,7 @@ fn compacting_unseen(application: &mut Application) -> CompactingSession {
 }
 
 struct CompactingSession {
-    _workspace: crate::support::WorkspaceDir,
+    _workspace: crate::tui_rendering::support::WorkspaceDir,
     snapshot: suru::protocol::SessionSnapshot,
     turn_id: TurnId,
     compaction_id: ActivityId,
@@ -1405,7 +1407,7 @@ fn a_prompt_sent_from_an_idle_view_never_overwrites_the_draft_its_writer_left() 
     let elsewhere = workspace_dir();
     writer
         .handle_event(ApplicationEvent::SessionAttached(
-            crate::support::failed_session_snapshot(
+            crate::tui_rendering::support::failed_session_snapshot(
                 SessionId::new(),
                 PromptId::new(),
                 "Another line of work",

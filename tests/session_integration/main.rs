@@ -3,15 +3,9 @@
 //! Each module below covers one area of the protocol; `support` holds the fixtures
 //! shared between them.
 
-#[path = "../support/mod.rs"]
-#[allow(dead_code)]
-mod server_support;
-
-#[path = "../support/failing_provider.rs"]
-mod failing_provider_support;
-
-#[path = "../support/provider.rs"]
-mod provider_support;
+use crate::support as server_support;
+use crate::support::failing_provider as failing_provider_support;
+use crate::support::provider as provider_support;
 
 mod compactions;
 mod context_breakdown;

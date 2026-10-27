@@ -1,7 +1,7 @@
 //! The Working Indicator of a Session that is Monitoring (ADR 0030): what it waits on, for how
 //! long, and the gesture that stops it — stopping its Watches rather than interrupting a Turn.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     connected_application, failed_session_snapshot, rendered_application_buffer,
     rendered_application_rows_at, text_position, workspace_dir,
 };

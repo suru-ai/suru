@@ -30,7 +30,7 @@ use super::{
     workspaces::{connected_client, next_workspace_errand},
     *,
 };
-use crate::{
+use crate::session_integration::{
     broker::sidekick_acts::{acted, refused},
     repositories::git,
     workspace_discovery::AS_LONG_AS_IT_TAKES,

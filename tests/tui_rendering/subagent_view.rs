@@ -4,7 +4,7 @@
 //! delivering a Prompt, and draws each Delegation that opened one of its Turns
 //! apart from a user Message.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     buffer_rows, connected_application, failed_session_snapshot, navigable_session_snapshot,
     rendered_application_buffer, rendered_application_rows_at, text_position, type_terminal_text,
     workspace_dir,

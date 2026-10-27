@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::support::{
+use crate::claude_integration::support::{
     ScriptedClaude, agent_messages, connect, conversation_fixture, probe_arms, settled_session,
     silent_user_turn_arm,
 };
@@ -752,7 +752,7 @@ async fn a_prompt_to_a_session_whose_discovery_fails_settles_its_turn_as_failed(
 async fn managed_worktree_native_claude_starts_at_prepared_root() {
     let claude = ScriptedClaude::new(&format!(
         "{}{}",
-        crate::support::conversation_arms(STREAMED_MESSAGE),
+        crate::claude_integration::support::conversation_arms(STREAMED_MESSAGE),
         r#"
     *'"subtype":"reload_skills"'*) printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{"skills":[]}}}' ;;
 "#
@@ -768,7 +768,8 @@ async fn managed_worktree_native_claude_starts_at_prepared_root() {
     .await
     .unwrap();
     let client = connect(state.path(), "prepared-claude").await;
-    let prepared = crate::managed_worktree::prepare(&client, source.path(), "claude").await;
+    let prepared =
+        crate::support::managed_worktree::prepare(&client, source.path(), "claude").await;
     assert!(
         !claude
             .exact_launches()
@@ -776,7 +777,7 @@ async fn managed_worktree_native_claude_starts_at_prepared_root() {
             .any(|launch| launch.arguments.iter().any(|arg| arg == "--session-id"))
     );
     let created = client
-        .create_session(crate::managed_worktree::creation(&prepared))
+        .create_session(crate::support::managed_worktree::creation(&prepared))
         .await
         .unwrap();
     settled_session(&client, created.session.id, 0).await;
@@ -784,7 +785,12 @@ async fn managed_worktree_native_claude_starts_at_prepared_root() {
         claude.launch_carrying("--session-id").working_directory,
         prepared.destination.path
     );
-    crate::managed_worktree::recover(&client, created.session.id, &prepared.destination.path).await;
+    crate::support::managed_worktree::recover(
+        &client,
+        created.session.id,
+        &prepared.destination.path,
+    )
+    .await;
     assert_eq!(
         claude.launch_carrying("--resume").working_directory,
         prepared.destination.path

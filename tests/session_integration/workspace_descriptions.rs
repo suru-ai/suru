@@ -4,8 +4,7 @@
 //! Errand this extends, and `workspace_icon_choice.rs` the Icon's own choice
 //! this stands beside.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     failing_provider_support::spawn_with_failing_provider,
     provider_support::ControlledProvider,
     server_support::{
@@ -13,6 +12,7 @@ use crate::{
     },
     support::{hosted_model, hosted_selection},
 };
+use crate::support::PROGRESS_DEADLINE;
 use serde_json::json;
 use suru::{
     managed_client::ManagedClient,
@@ -59,7 +59,7 @@ fn quiet_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionRequ
 }
 
 fn controlled_provider() -> (
-    std::sync::Arc<crate::provider_support::ControlledProviderRuntime>,
+    std::sync::Arc<crate::support::provider::ControlledProviderRuntime>,
     ControlledProvider,
 ) {
     ControlledProvider::with_provider(
@@ -75,7 +75,7 @@ async fn connected_client(state_dir: &std::path::Path, channel: &str) -> Managed
     )
     .await
     .expect("connect client");
-    crate::support::receive_managed_client_initial_state(&mut client).await;
+    crate::session_integration::support::receive_managed_client_initial_state(&mut client).await;
     client
 }
 
@@ -97,7 +97,7 @@ async fn answer_title_errand(provider: &mut ControlledProvider, title: &str) {
 /// Errand, identified by its schema, which asks for no Title.
 async fn next_workspace_errand(
     provider: &mut ControlledProvider,
-) -> crate::provider_support::ErrandRequest {
+) -> crate::support::provider::ErrandRequest {
     let errand = timeout(PROGRESS_DEADLINE, provider.next_errand())
         .await
         .expect("the Workspace Errand reaches the Provider");

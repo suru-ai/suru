@@ -1,7 +1,7 @@
 //! Subagent subtree roll-up: a Session's total carries everything its
 //! delegated work consumed, to any depth, while each child keeps its own.
 
-use crate::{
+use crate::session_integration::{
     provider_support::ControlledProvider,
     support::{
         WorkingTurn, open_catalog_stream_with_snapshot, read_session, read_session_until,
@@ -116,7 +116,7 @@ async fn read_session_until_total(
 async fn next_usage_change(
     catalog: &mut (impl futures_util::Stream<Item = SessionCatalogUpdate> + Unpin),
 ) -> (SessionId, Option<UsageTotal>) {
-    let change = crate::server_support::next_catalog_change_matching(catalog, |change| {
+    let change = crate::support::next_catalog_change_matching(catalog, |change| {
         matches!(change, SessionCatalogChange::UsageChanged { .. })
     })
     .await;

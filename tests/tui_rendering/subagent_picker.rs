@@ -5,7 +5,7 @@
 //! readily as the keys, and closing lands back where it opened. With nothing
 //! to browse the key stays inert and composer history keeps its meaning.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     connected_application, enter_session, failed_session_snapshot, rendered_application_buffer,
     rendered_application_rows_at, text_position, type_terminal_text, workspace_dir,
 };

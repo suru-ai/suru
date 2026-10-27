@@ -1,11 +1,11 @@
 //! Session persistence: discovery, restart recovery, and undecodable records.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     failing_provider_support::spawn_with_failing_provider,
     provider_support::ControlledProvider,
     support::{controlled_selection, read_session_at_least_revision, read_session_until},
 };
+use crate::support::PROGRESS_DEADLINE;
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
 use ratatui::{Terminal, backend::TestBackend, style::Color};
@@ -974,8 +974,8 @@ async fn resume_after_summary_mutation(resume_state: Option<serde_json::Value>, 
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let execution_root = if regroup {
         let root = suru::paths::canonical(workspace.path()).unwrap();
-        crate::repositories::git(&root, &["init", "-b", "main"]);
-        crate::repositories::git(
+        crate::session_integration::repositories::git(&root, &["init", "-b", "main"]);
+        crate::session_integration::repositories::git(
             &root,
             &[
                 "-c",
@@ -987,7 +987,7 @@ async fn resume_after_summary_mutation(resume_state: Option<serde_json::Value>, 
             ],
         );
         let linked = root.join("external checkout");
-        crate::repositories::git(
+        crate::session_integration::repositories::git(
             &root,
             &["worktree", "add", "-b", "topic", linked.to_str().unwrap()],
         );
@@ -1268,8 +1268,10 @@ async fn unopened_history_is_not_decoded_or_rewritten_and_failed_hydration_inval
     // A shutdown with no history access must not flush partial writer state
     // over the durable Prompt; its corruption must still be discovered below.
     let replacement = spawn_with_failing_provider(restart_config).await.unwrap();
-    let (_, mut events) =
-        crate::support::open_catalog_stream_with_snapshot(replacement.descriptor()).await;
+    let (_, mut events) = crate::session_integration::support::open_catalog_stream_with_snapshot(
+        replacement.descriptor(),
+    )
+    .await;
     let failed = reqwest::Client::new()
         .get(format!(
             "{}/v1/sessions/{}",
@@ -1740,7 +1742,7 @@ async fn an_update_waiting_on_stalled_storage_does_not_hold_the_stop_past_its_ov
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "stalled-storage-stop-test";
     let config = ServerConfig::new(state_dir.path(), channel).expect("configure server");
-    let fixture = crate::support::working_turn_with_timings(
+    let fixture = crate::session_integration::support::working_turn_with_timings(
         state_dir.path(),
         channel,
         ServerTimings::default().with_shutdown_deadline(SHUTDOWN_DEADLINE, SHUTDOWN_OVERRUN),

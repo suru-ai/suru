@@ -1,6 +1,6 @@
 //! A fresh Managed Worktree's branch renamed to the name its Session's Title
 //! Errand derives, through the owning Server's protocol and real Git.
-use crate::{
+use crate::session_integration::{
     provider_support::{ControlledProvider, ControlledProviderRuntime, ControlledProviderSession},
     repositories::git,
     server_support::{
@@ -514,7 +514,7 @@ async fn spawn(
         ManagedClient::connect(ManagedClientConfig::new(state, channel).expect("configure client"))
             .await
             .expect("connect client");
-    crate::support::receive_managed_client_initial_state(&mut client).await;
+    crate::session_integration::support::receive_managed_client_initial_state(&mut client).await;
     (server, client, provider, witnessed, observations)
 }
 
@@ -524,7 +524,7 @@ struct ErrandReply {
     prompt: String,
     schema: Value,
     selection: AgentSelection,
-    errand: Option<crate::provider_support::ErrandRequest>,
+    errand: Option<crate::support::provider::ErrandRequest>,
 }
 
 impl ErrandReply {
@@ -659,7 +659,7 @@ async fn a_derived_branch_renames_the_fresh_worktree_its_session_was_admitted_fr
     );
     let listed = read_git(&fixture.main, &["worktree", "list", "--porcelain"]).unwrap();
     assert!(
-        crate::support::git_output_mentions_path(&listed, &destination),
+        crate::session_integration::support::git_output_mentions_path(&listed, &destination),
         "{listed}"
     );
     let summary = fixture
@@ -1101,7 +1101,7 @@ fn recovery_branch(snapshot: &SessionSnapshot) -> Option<&str> {
 /// Waits for a Session's recovery facts to name `branch`, which with
 /// observation stood down only the rename's own recording can bring about.
 async fn recovers_on(fixture: &Fixture, session_id: SessionId, branch: &str) -> SessionSnapshot {
-    crate::support::read_session_until(
+    crate::session_integration::support::read_session_until(
         &reqwest::Client::new(),
         fixture.server.descriptor(),
         session_id,

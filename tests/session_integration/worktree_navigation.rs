@@ -1,5 +1,5 @@
 //! Existing checkout selection through the same authenticated Server route used by the TUI.
-use crate::{
+use crate::session_integration::{
     failing_provider_support::spawn_with_failing_provider, provider_support::ControlledProvider,
     repositories::git, support,
 };

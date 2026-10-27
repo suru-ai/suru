@@ -28,13 +28,13 @@
 
 use std::sync::Arc;
 
-use crate::provider_support::{ControlledProvider, ControlledProviderSession};
-use crate::server_support::{
+use crate::codex_integration::support::{
+    ScriptedCodex, conversation_codex, opened_session, receive_initial_state, settled_session,
+};
+use crate::support::provider::{ControlledProvider, ControlledProviderSession};
+use crate::support::{
     PROGRESS_DEADLINE, begin_sidekick,
     broker::{McpClient, untimed_sidekick_report},
-};
-use crate::support::{
-    ScriptedCodex, conversation_codex, opened_session, receive_initial_state, settled_session,
 };
 use serde_json::{Value, json};
 use suru::{

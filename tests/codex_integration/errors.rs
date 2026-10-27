@@ -1,7 +1,7 @@
 //! Protocol violations and launch failures surfaced as error activities.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{ScriptedCodex, receive_initial_state};
+use crate::codex_integration::support::{ScriptedCodex, receive_initial_state};
+use crate::support::PROGRESS_DEADLINE;
 use serde_json::Value;
 use std::sync::Arc;
 use suru::{

@@ -24,7 +24,7 @@ use suru::{
 };
 
 use super::*;
-use crate::{
+use crate::session_integration::{
     broker::{
         sidekick_acts::{acted, refused},
         subsessions::{committed, resolve},
@@ -51,7 +51,11 @@ async fn listed_row(client: &mut McpClient, workspace: &Workspace) -> Value {
 
 /// The row `list_workspaces` gives `workspace` while it carries `description`
 /// and the Icon named `icon`.
-pub(in crate::broker) fn row(workspace: &Workspace, description: Value, icon: Value) -> Value {
+pub(in crate::session_integration::broker) fn row(
+    workspace: &Workspace,
+    description: Value,
+    icon: Value,
+) -> Value {
     json!({
         "workspace_id": workspace.id,
         "name": workspace
@@ -67,7 +71,7 @@ pub(in crate::broker) fn row(workspace: &Workspace, description: Value, icon: Va
 
 /// A Description as a row gives it: its text, and whether it was set rather
 /// than derived.
-pub(in crate::broker) fn description(text: &str, set: bool) -> Value {
+pub(in crate::session_integration::broker) fn description(text: &str, set: bool) -> Value {
     json!({ "text": text, "set": set })
 }
 
@@ -94,7 +98,7 @@ fn described(workspace: &Workspace, description: Value) -> Value {
 /// A Session in `directory` that names no Agent Selection, so it asks for no
 /// Errand and its Workspace carries only what a test gives it; answers with
 /// the Session as the Session API gives it.
-pub(in crate::broker) async fn quiet_session(
+pub(in crate::session_integration::broker) async fn quiet_session(
     descriptor: &RuntimeDescriptor,
     directory: &Path,
     title: &str,
@@ -126,9 +130,9 @@ async fn deriving_session(
 /// The Errand asking `provider` for a Workspace's Icon and Description, told
 /// apart from a Title Errand by its schema; any Title Errand met first is
 /// answered on the way.
-pub(in crate::broker) async fn next_workspace_errand(
+pub(in crate::session_integration::broker) async fn next_workspace_errand(
     provider: &mut ControlledProvider,
-) -> crate::provider_support::ErrandRequest {
+) -> crate::support::provider::ErrandRequest {
     timeout(PROGRESS_DEADLINE, async {
         loop {
             let errand = provider.next_errand().await;
@@ -149,13 +153,16 @@ pub(in crate::broker) async fn next_workspace_errand(
 }
 
 /// A Client of the Server `state_dir` and `channel` name, connected.
-pub(in crate::broker) async fn connected_client(state_dir: &Path, channel: &str) -> ManagedClient {
+pub(in crate::session_integration::broker) async fn connected_client(
+    state_dir: &Path,
+    channel: &str,
+) -> ManagedClient {
     let mut client = ManagedClient::connect(
         ManagedClientConfig::new(state_dir, channel).expect("configure the Client"),
     )
     .await
     .expect("connect the Client");
-    crate::support::receive_managed_client_initial_state(&mut client).await;
+    crate::session_integration::support::receive_managed_client_initial_state(&mut client).await;
     client
 }
 
@@ -198,7 +205,7 @@ async fn relaunched_sidekick(
     descriptor: &RuntimeDescriptor,
     claude: &mut ControlledProvider,
     sidekick_id: SessionId,
-) -> (McpClient, crate::provider_support::StartRequest) {
+) -> (McpClient, crate::support::provider::StartRequest) {
     admit_prompt(descriptor, sidekick_id, "Where were we?").await;
     let relaunch = next_start(claude).await;
     let handoff = relaunch

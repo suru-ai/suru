@@ -17,7 +17,7 @@
 //! completes, and the turn a requested compaction runs as may be announced before the request is
 //! answered or after.
 
-use crate::support::{
+use crate::codex_integration::support::{
     ScriptedCodex, conversation_codex, conversation_codex_with_arms, opened_session,
     opened_session_on, session_where, settled_session,
 };
@@ -676,7 +676,9 @@ fn compaction_turn_started(thread: &str) -> String {
 }
 
 /// Asks for a Compaction of the Session and waits for Codex to start it.
-async fn compaction_requested(opened: &crate::support::OpenedSession) -> SessionSnapshot {
+async fn compaction_requested(
+    opened: &crate::codex_integration::support::OpenedSession,
+) -> SessionSnapshot {
     opened
         .client
         .compact_session(opened.session_id, CompactSessionRequest::default())
@@ -692,7 +694,7 @@ async fn compaction_requested(opened: &crate::support::OpenedSession) -> Session
 }
 
 /// Delivers `text` as the next Prompt to the idle Session.
-async fn prompt(opened: &crate::support::OpenedSession, text: &str) {
+async fn prompt(opened: &crate::codex_integration::support::OpenedSession, text: &str) {
     opened
         .client
         .admit_prompt(

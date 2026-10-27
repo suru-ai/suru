@@ -1,9 +1,16 @@
 pub mod attachments;
 pub mod broker;
-mod deadlines;
+pub mod connect_proxy;
+pub mod deadlines;
 pub mod detached_servers;
+pub mod failing_provider;
+#[cfg(unix)]
+pub mod managed_worktree;
 pub mod observed_tcp_proxy;
+pub mod provider;
 pub mod relay_voice;
+#[cfg(unix)]
+pub mod scripted_binary;
 
 pub use deadlines::PROGRESS_DEADLINE;
 
@@ -19,18 +26,6 @@ use suru::{
     },
 };
 use tokio::time::timeout;
-
-// The marker `src/main.rs` gives Suru's binary, given to every test binary
-// that includes this module. A Server identifies the executable it runs from,
-// and a test binary is a gigabyte of debug information: without a marker, each
-// Server a test starts hashes all of it, which was most of what the suite's
-// integration tests spent. Nothing refers to the static, but `#[used]` keeps it
-// in the binary on every platform; `the_test_binary_carries_a_build_marker`
-// in `tests/server_integration.rs` holds the linker to that.
-#[used]
-#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__suru"))]
-#[cfg_attr(not(target_os = "macos"), unsafe(link_section = ".suru"))]
-static BUILD_ID: [u8; 32] = suru_build_id::generate!();
 
 pub fn write_runtime_descriptor(path: impl AsRef<std::path::Path>, descriptor: &RuntimeDescriptor) {
     let path = path.as_ref();

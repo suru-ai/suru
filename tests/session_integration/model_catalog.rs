@@ -3,10 +3,10 @@
 //! connect, and remembered across restarts so Models are served by name
 //! before any Provider has answered.
 
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 
-use crate::{
+use crate::session_integration::{
     provider_support::{ControlledProvider, ControlledProviderRuntime},
     support::list_catalog,
 };

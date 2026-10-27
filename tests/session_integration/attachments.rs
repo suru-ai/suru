@@ -1,17 +1,17 @@
 //! Attachments: uploading an image's bytes, binding it to a label in a
 //! Prompt, and fetching the bytes back, all over the Server's HTTP API.
 
-use crate::server_support::{
-    PROGRESS_DEADLINE,
-    attachments::{bound, gif, jpeg, png, uploaded, webp},
-};
-use crate::{
+use crate::session_integration::{
     failing_provider_support::{FailingProviderRuntime, spawn_with_failing_provider},
     provider_support::ControlledProvider,
     support::{
         controlled_selection, create_session, read_session_at_least_revision, read_session_until,
         receive_managed_client_initial_state,
     },
+};
+use crate::support::{
+    PROGRESS_DEADLINE,
+    attachments::{bound, gif, jpeg, png, uploaded, webp},
 };
 use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
@@ -908,7 +908,7 @@ async fn prompts_whose_attachment_bindings_cannot_stand_are_refused() {
     assert_eq!(error.code, SessionErrorCode::AttachmentNotFound);
 
     assert_eq!(
-        crate::support::read_session(&descriptor, session_id)
+        crate::session_integration::support::read_session(&descriptor, session_id)
             .await
             .prompts
             .len(),
@@ -1004,7 +1004,11 @@ async fn bindings_and_bytes_survive_a_server_restart() {
     let replacement = spawn_with_failing_provider(config)
         .await
         .expect("spawn replacement server");
-    let restored = crate::support::read_session(replacement.descriptor(), created.session.id).await;
+    let restored = crate::session_integration::support::read_session(
+        replacement.descriptor(),
+        created.session.id,
+    )
+    .await;
     assert_eq!(restored, before_restart);
     assert_eq!(restored.prompts[0].attachments, bindings);
     assert_eq!(
@@ -1147,16 +1151,21 @@ async fn every_client_describes_the_attachments_a_session_binds_even_after_a_res
     let replacement = spawn_with_failing_provider(config)
         .await
         .expect("spawn replacement server");
-    let restored = crate::support::read_session(replacement.descriptor(), session_id).await;
+    let restored =
+        crate::session_integration::support::read_session(replacement.descriptor(), session_id)
+            .await;
     assert_eq!(restored.attachments, all);
     assert_eq!(restored, before_restart);
     let (rewatched, _) = watch_session(replacement.descriptor(), session_id).await;
     assert_eq!(rewatched.attachments, all);
     assert!(
-        crate::support::read_session(replacement.descriptor(), plain.session.id)
-            .await
-            .attachments
-            .is_empty()
+        crate::session_integration::support::read_session(
+            replacement.descriptor(),
+            plain.session.id
+        )
+        .await
+        .attachments
+        .is_empty()
     );
 
     replacement
@@ -1275,7 +1284,7 @@ async fn deleting_a_session_past_the_grace_period_removes_the_attachments_only_i
         StatusCode::OK,
         "an Attachment another Session binds stays"
     );
-    let remaining = crate::support::read_session(&descriptor, kept).await;
+    let remaining = crate::session_integration::support::read_session(&descriptor, kept).await;
     assert_eq!(remaining.prompts[0].attachments[0].attachment_id, shared.id);
 
     server.shutdown().await.expect("shut down server");
@@ -1442,7 +1451,7 @@ async fn admitting_a_prompt_restarts_the_grace_period_of_the_attachments_it_bind
     }
     assert_eq!(
         user_message(
-            &crate::support::read_session(&descriptor, later).await,
+            &crate::session_integration::support::read_session(&descriptor, later).await,
             again_text
         )
         .expect("the admitted Prompt's user Message stands")
@@ -1540,7 +1549,7 @@ async fn a_sweep_never_reclaims_an_attachment_a_stored_prompt_binds_however_old(
         ("image/png".to_owned(), png(10, 10)),
         "an Attachment a stored Prompt binds is never swept"
     );
-    let snapshot = crate::support::read_session(&descriptor, session_id).await;
+    let snapshot = crate::session_integration::support::read_session(&descriptor, session_id).await;
     assert_eq!(snapshot.prompts[0].attachments, bindings);
     assert_eq!(snapshot.attachments, vec![kept]);
 
@@ -1611,7 +1620,7 @@ async fn server_start_sweeps_uploads_no_stored_prompt_binds_once_past_their_grac
         ("image/gif".to_owned(), gif(20, 20)),
         "the sweep at start keeps the Attachment a stored Prompt binds"
     );
-    let restored = crate::support::read_session(&descriptor, session_id).await;
+    let restored = crate::session_integration::support::read_session(&descriptor, session_id).await;
     assert_eq!(restored.prompts[0].attachments, bindings);
 
     replacement

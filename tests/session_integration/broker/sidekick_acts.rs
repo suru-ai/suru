@@ -22,7 +22,7 @@ use super::{
     },
     *,
 };
-use crate::attachments::{next_change, watch_session};
+use crate::session_integration::attachments::{next_change, watch_session};
 
 /// The Tools through which a Sidekick acts on a Session.
 const ACTING_TOOLS: [&str; 4] = [

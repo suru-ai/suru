@@ -1,9 +1,9 @@
 //! Skill Catalog discovery and authoritative Prompt admission.
 
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 
-use crate::{
+use crate::session_integration::{
     provider_support::ControlledProvider,
     server_support::next_skill_catalog,
     support::{hosted_model, hosted_selection, read_session_at_least_revision},
@@ -110,8 +110,9 @@ async fn every_provider_revalidates_queued_skills_before_native_delivery() {
         )
         .await
         .expect("connect second client");
-        crate::support::receive_managed_client_initial_state(&mut first).await;
-        crate::support::receive_managed_client_initial_state(&mut second).await;
+        crate::session_integration::support::receive_managed_client_initial_state(&mut first).await;
+        crate::session_integration::support::receive_managed_client_initial_state(&mut second)
+            .await;
         let catalog_request = SkillCatalogRequest {
             provider: provider_id.clone(),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -218,7 +219,8 @@ async fn every_provider_revalidates_queued_skills_before_native_delivery() {
         )
         .await
         .expect("reconnect client");
-        crate::support::receive_managed_client_initial_state(&mut reconnected).await;
+        crate::session_integration::support::receive_managed_client_initial_state(&mut reconnected)
+            .await;
         assert_eq!(
             reconnected
                 .read_session(created.session.id)
@@ -302,7 +304,8 @@ async fn every_provider_revalidates_initial_skills_after_session_startup() {
         )
         .await
         .expect("connect client");
-        crate::support::receive_managed_client_initial_state(&mut client).await;
+        crate::session_integration::support::receive_managed_client_initial_state(&mut client)
+            .await;
         let loading = client
             .list_skills(SkillCatalogRequest {
                 provider: provider_id.clone(),
@@ -431,7 +434,8 @@ async fn steer_capable_providers_revalidate_skills_before_native_delivery() {
         )
         .await
         .expect("connect client");
-        crate::support::receive_managed_client_initial_state(&mut client).await;
+        crate::session_integration::support::receive_managed_client_initial_state(&mut client)
+            .await;
         let loading = client
             .list_skills(SkillCatalogRequest {
                 provider: provider_id.clone(),
@@ -602,7 +606,7 @@ async fn cancelled_validation_leaves_the_following_prompt_deliverable(replace_sk
     )
     .await
     .expect("connect client");
-    crate::support::receive_managed_client_initial_state(&mut client).await;
+    crate::session_integration::support::receive_managed_client_initial_state(&mut client).await;
     assert!(matches!(
         client
             .list_skills(SkillCatalogRequest {
@@ -782,8 +786,8 @@ async fn cached_catalog_invalidation_is_failure_isolated_and_pushed_to_every_cli
     )
     .await
     .expect("connect second client");
-    crate::support::receive_managed_client_initial_state(&mut first).await;
-    crate::support::receive_managed_client_initial_state(&mut second).await;
+    crate::session_integration::support::receive_managed_client_initial_state(&mut first).await;
+    crate::session_integration::support::receive_managed_client_initial_state(&mut second).await;
     let request = SkillCatalogRequest {
         provider: ProviderId::new("controlled"),
         execution_directory: suru::protocol::ExecutionDirectory {
@@ -975,7 +979,7 @@ async fn force_refresh_during_discovery_discards_the_superseded_result() {
     )
     .await
     .expect("connect client");
-    crate::support::receive_managed_client_initial_state(&mut client).await;
+    crate::session_integration::support::receive_managed_client_initial_state(&mut client).await;
     let request = SkillCatalogRequest {
         provider: ProviderId::new("controlled"),
         execution_directory: suru::protocol::ExecutionDirectory {
@@ -1422,7 +1426,8 @@ async fn steer_skill_prompt_on_idle_session_starts_as_a_queued_delivery() {
         )
         .await
         .expect("connect client");
-        crate::support::receive_managed_client_initial_state(&mut client).await;
+        crate::session_integration::support::receive_managed_client_initial_state(&mut client)
+            .await;
         let loading = client
             .list_skills(SkillCatalogRequest {
                 provider: provider_id.clone(),

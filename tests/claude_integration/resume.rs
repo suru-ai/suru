@@ -7,7 +7,7 @@
 //! the same conversation. A resume the CLI cannot honor fails the Turn rather than quietly opening
 //! an empty conversation under the same identifier.
 
-use crate::support::{
+use crate::claude_integration::support::{
     CLAUDE_MODELS, ScriptedClaude, agent_messages, connect, conversation_arms,
     conversation_fixture, discovery_arms, flag_value, hosting, rejecting_resume_preamble,
     settled_session,

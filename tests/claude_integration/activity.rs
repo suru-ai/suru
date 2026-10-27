@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::support::{
+use crate::claude_integration::support::{
     ScriptedClaude, agent_messages, conversation_arms, conversation_fixture, opened_session,
     opened_session_in, session_where, settled_session,
 };

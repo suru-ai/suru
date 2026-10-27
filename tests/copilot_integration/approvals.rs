@@ -1,6 +1,6 @@
 //! Copilot permission callbacks through the public Session seam.
 
-use crate::{
+use crate::copilot_integration::{
     server_support::PROGRESS_DEADLINE,
     support::{
         LiveTurn, ScriptedCopilot, abort_arm, conversation_arms, hosting, permission_decision_arm,

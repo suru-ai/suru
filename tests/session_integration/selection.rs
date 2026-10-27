@@ -1,10 +1,10 @@
 //! Agent selection: authority, convergence across clients, and turn-boundary capture.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     provider_support::ControlledProvider,
     support::{controlled_selection, next_session_update, receive_managed_client_initial_state},
 };
+use crate::support::PROGRESS_DEADLINE;
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},

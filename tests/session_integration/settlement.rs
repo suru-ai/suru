@@ -1,12 +1,12 @@
 //! A Session's own Settle: the reversible marker that sets it aside as done
 //! for now, mutated over the protocol and cleared by the next Prompt.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     failing_provider_support::spawn_with_failing_provider,
     server_support::{next_catalog_change, next_catalog_change_matching, open_catalog_stream},
     support::{create_session, receive_managed_client_initial_state},
 };
+use crate::support::PROGRESS_DEADLINE;
 use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},

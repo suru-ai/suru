@@ -12,9 +12,9 @@ use suru::protocol::{AgentId, SessionListItem};
 use tokio::sync::oneshot;
 
 use super::*;
-use crate::broker::sidekick::answering::{ask, stood, where_to_run};
-use crate::broker::sidekick_acts::{acted, refused};
-use crate::broker::subsessions::committed;
+use crate::session_integration::broker::sidekick::answering::{ask, stood, where_to_run};
+use crate::session_integration::broker::sidekick_acts::{acted, refused};
+use crate::session_integration::broker::subsessions::committed;
 
 /// Waits until `own` stores its act on the Remote's Session `session_id` as
 /// `confirmed`, or not.
@@ -189,7 +189,8 @@ async fn an_answer_whose_answer_was_lost_is_kept_unconfirmed_until_a_read_finds_
         "the act is kept, not yet confirmed, across a stop"
     );
     remote.route.set_online(true).await;
-    let (_tree, updates) = crate::subagent_tree::open_tree(&own.descriptor(), sidekick_id).await;
+    let (_tree, updates) =
+        crate::session_integration::subagent_tree::open_tree(&own.descriptor(), sidekick_id).await;
     stored_as(&own, asking, true).await;
     assert_eq!(
         stood(

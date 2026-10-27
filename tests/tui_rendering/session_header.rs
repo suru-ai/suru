@@ -1,5 +1,5 @@
 //! The viewed Session's Title stays centered between the header indicators.
-use crate::support::{
+use crate::tui_rendering::support::{
     connected_application, enter_session, navigable_session_snapshot, rendered_application_rows_at,
     workspace_dir,
 };
@@ -218,7 +218,7 @@ fn remote_header_icons_preserve_the_centered_title_and_compact_remote_label() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());
     enable_icons(&mut application);
-    crate::connecting::turn_to_studio(&mut application);
+    crate::tui_rendering::connecting::turn_to_studio(&mut application);
     let mut snapshot =
         navigable_session_snapshot(suru::protocol::SessionId::new(), workspace.path(), 1);
     snapshot.title = "Alpha".into();

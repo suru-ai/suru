@@ -23,7 +23,7 @@ use suru::{
     server::{self, RunningServer, ServerConfig, ServerTimings},
 };
 
-use crate::{
+use crate::session_integration::{
     failing_provider_support::{FailingProviderRuntime, spawn_with_failing_provider},
     repositories::git,
     support,
@@ -871,7 +871,7 @@ async fn next_pushed(
 ) -> WorkspaceListing {
     use futures_util::StreamExt;
 
-    tokio::time::timeout(crate::server_support::PROGRESS_DEADLINE, pushed.next())
+    tokio::time::timeout(crate::support::PROGRESS_DEADLINE, pushed.next())
         .await
         .expect("a Workspace listing is pushed")
         .expect("the catalog stream stays open")
@@ -893,7 +893,7 @@ async fn the_catalog_stream_carries_the_listing_and_pushes_each_change_of_it_onc
     .await
     .expect("spawn server");
     let client = connected_client(state_dir.path(), CHANNEL).await;
-    let mut pushed = crate::server_support::open_catalog_events::<WorkspaceListing>(
+    let mut pushed = crate::support::open_catalog_events::<WorkspaceListing>(
         server.descriptor(),
         WORKSPACE_LISTING_EVENT,
     )
@@ -966,7 +966,7 @@ async fn what_a_reading_behind_a_listing_finds_is_pushed_once_it_lands() {
         .create_session(quiet_request(notes.path(), "Keep the notes"))
         .await
         .expect("create a Session in the notes Workspace");
-    let mut pushed = crate::server_support::open_catalog_events::<WorkspaceListing>(
+    let mut pushed = crate::support::open_catalog_events::<WorkspaceListing>(
         server.descriptor(),
         WORKSPACE_LISTING_EVENT,
     )
@@ -1066,7 +1066,7 @@ async fn a_client_hears_each_workspace_listing_its_server_pushes() {
         "the client hears it is connected before any Workspace listing"
     );
     let mut next_heard = async || {
-        crate::server_support::next_workspace_listing(async || client.next().await)
+        crate::support::next_workspace_listing(async || client.next().await)
             .await
             .workspaces
     };
@@ -1094,7 +1094,7 @@ async fn a_client_hears_each_workspace_listing_its_server_pushes() {
 /// Waits until the Session `session_id` has stopped working, which a
 /// Session whose Provider fails it does at once.
 async fn settled(client: &ManagedClient, session_id: SessionId) {
-    tokio::time::timeout(crate::server_support::PROGRESS_DEADLINE, async {
+    tokio::time::timeout(crate::support::PROGRESS_DEADLINE, async {
         while client
             .read_session(session_id)
             .await
@@ -1157,7 +1157,7 @@ async fn work_that_moves_a_workspace_ahead_pushes_the_listing_in_its_new_order()
         settled(&client, session.id).await;
         sessions.push(session);
     }
-    let mut pushed = crate::server_support::open_catalog_events::<WorkspaceListing>(
+    let mut pushed = crate::support::open_catalog_events::<WorkspaceListing>(
         server.descriptor(),
         WORKSPACE_LISTING_EVENT,
     )

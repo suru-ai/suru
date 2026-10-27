@@ -1,11 +1,11 @@
 //! Interrupting a Copilot Turn: the whole agentic loop stops, and everything it left running
 //! settles with it.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{
+use crate::copilot_integration::support::{
     LiveTurn, ScriptedCopilot, abort_arm, agent_messages, conversation_arms, send_arm,
     silent_abort_arm,
 };
+use crate::support::PROGRESS_DEADLINE;
 use suru::{
     protocol::{
         Activity, ActivityStatus, Cost, CostBasis, MessageStatus, NativeMeter, SessionStatus,

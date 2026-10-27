@@ -1,5 +1,7 @@
 //! A Context Breakdown asked of a Session's Provider through the server, whatever the Provider.
-use crate::support::{WorkingTurn, read_session_until, the_subagent_row, working_turn};
+use crate::session_integration::support::{
+    WorkingTurn, read_session_until, the_subagent_row, working_turn,
+};
 use suru::{
     protocol::{
         Activity, ContextBreakdown, ContextFill, ContextPart, ContextSource, SessionError,

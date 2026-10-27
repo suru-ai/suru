@@ -81,7 +81,7 @@ fn intervention_flags(tree: &SubagentTreeSnapshot) -> Vec<(SessionId, bool)> {
 /// The next change to the tree that flags or clears an entry's
 /// Intervention.
 async fn next_intervention_change(
-    updates: &mut crate::subagent_tree::TreeUpdates,
+    updates: &mut crate::session_integration::subagent_tree::TreeUpdates,
     revision: &mut suru::protocol::SubagentTreeRevision,
 ) -> SubagentTreeChange {
     changes_until(updates, revision, |change| {

@@ -1,5 +1,5 @@
 //! Native ephemeral context snapshots through Server updates and durable Session state.
-use crate::support::{conversation_fixture, hosting, session_where};
+use crate::copilot_integration::support::{conversation_fixture, hosting, session_where};
 use suru::protocol::{
     Activity, ContextFill, CreateSessionRequest, InitialPrompt, PromptId, TurnStatus,
 };
@@ -223,7 +223,7 @@ async fn a_rejected_send_cannot_revive_context_after_switching_models() {
 }
 
 async fn failed_start_keeps_context_invalidated(reject_send: bool) {
-    use crate::support::{
+    use crate::copilot_integration::support::{
         ScriptedCopilot, connect, conversation_arms, send_arm, titling_turned_off,
     };
     use suru::{

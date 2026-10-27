@@ -36,7 +36,7 @@ use suru::{
 };
 use tokio::time::timeout;
 
-use crate::{
+use crate::session_integration::{
     failing_provider_support::FailingProviderRuntime,
     provider_support::ControlledProvider,
     repositories::git,

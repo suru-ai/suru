@@ -220,9 +220,11 @@ async fn pinned_tls<S: AsyncRead + AsyncWrite + Unpin>(
     .with_protocol_versions(versions)
     .unwrap()
     .dangerous()
-    .with_custom_certificate_verifier(std::sync::Arc::new(crate::PinnedTestServerCertificate {
-        expected_public_key: server,
-    }))
+    .with_custom_certificate_verifier(std::sync::Arc::new(
+        crate::server_integration::PinnedTestServerCertificate {
+            expected_public_key: server,
+        },
+    ))
     .with_client_auth_cert(
         vec![certificate.der().clone()],
         rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
@@ -800,7 +802,7 @@ async fn a_carried_connection_that_never_begins_http2_is_let_go_within_the_hands
         .await
         .expect("the pinned TLS is finished, HTTP/2 agreed");
     assert!(
-        crate::ends(&mut silent).await,
+        crate::server_integration::ends(&mut silent).await,
         "a carried connection that never begins HTTP/2 is let go"
     );
 
@@ -845,7 +847,7 @@ async fn removing_a_peer_closes_its_relay_carried_connections_as_it_closes_its_l
     .await
     .unwrap();
     assert_eq!(carried.health().await.unwrap(), StatusCode::OK);
-    let mut direct = crate::open_paired_health_connection(
+    let mut direct = crate::server_integration::open_paired_health_connection(
         serving.workstation.serving_address(),
         &serving.laptop.config.data_dir().join("server-identity.pk8"),
         workstation.subject_public_key_info(),
@@ -1162,7 +1164,7 @@ async fn turning_the_listener_off_and_on_closes_what_was_dialled_and_leaves_what
     // Dialled first, and taken first, so it is handshaking — and saying
     // nothing — by the time the connection dialled after it is answered.
     let mut handshaking = tokio::net::TcpStream::connect(listened).await.unwrap();
-    let mut direct = crate::open_paired_health_connection(
+    let mut direct = crate::server_integration::open_paired_health_connection(
         listened,
         &laptop_key,
         workstation.subject_public_key_info(),
@@ -1252,7 +1254,7 @@ async fn turning_the_listener_off_and_on_closes_what_was_dialled_and_leaves_what
         .await
         .expect("the port free again, the listener opens there");
     assert_eq!(serving.workstation.listening_at(), Some(listened));
-    crate::open_paired_health_connection(
+    crate::server_integration::open_paired_health_connection(
         listened,
         &laptop_key,
         workstation.subject_public_key_info(),

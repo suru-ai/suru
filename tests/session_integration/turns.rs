@@ -1,7 +1,6 @@
 //! Turn execution: provider streaming, steering, interruption, and failure isolation.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::{
+use crate::session_integration::{
     provider_support::ControlledProvider,
     server_support::{next_catalog_change, open_catalog_stream},
     support::{
@@ -9,6 +8,7 @@ use crate::{
         receive_managed_client_initial_state,
     },
 };
+use crate::support::PROGRESS_DEADLINE;
 use axum::http::StatusCode;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},

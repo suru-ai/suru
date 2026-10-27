@@ -6,7 +6,7 @@
 //! Outlook turning toward it. The row is the user's way back to work the
 //! Sidekick began, so a settled Turn's fold never hides it.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     click_mouse, connected_application, navigable_session_snapshot, rendered_application_buffer,
     rendered_application_rows_at, text_position, workspace_dir,
 };

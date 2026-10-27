@@ -24,11 +24,11 @@
 //! The wire shapes mirror the 2.1.283 CLI's own schema for these messages, and what the 2.1.283
 //! CLI was seen to write for `/compact` (docs/validation/0462-claude-manual-compaction.md).
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{
+use crate::claude_integration::support::{
     CLAUDE_MODELS, ScriptedClaude, discovery_arms, interrupt_arm, opened_session, session_where,
     settled_session, user_turn_arm,
 };
+use crate::support::PROGRESS_DEADLINE;
 use suru::protocol::{
     Activity, ActivityStatus, AdmitPromptRequest, CompactSessionRequest, CompactionTrigger,
     ContextFill, Cost, InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionError,
@@ -124,7 +124,7 @@ fn compacting_after_the_turn() -> ScriptedClaude {
 /// Waits for the Compaction Claude began after the first Turn settled to stand Active.
 async fn compacting_in_a_continuation(
     claude: &ScriptedClaude,
-    opened: &crate::support::OpenedSession,
+    opened: &crate::claude_integration::support::OpenedSession,
     feed: &mut suru::managed_client::SessionSubscription,
 ) -> SessionSnapshot {
     settled_session(&opened.client, opened.session_id, 0).await;
@@ -635,7 +635,7 @@ async fn compacted_on_request(
     claude: &ScriptedClaude,
     name: &'static str,
 ) -> (
-    crate::support::OpenedSession,
+    crate::claude_integration::support::OpenedSession,
     SessionSnapshot,
     SessionSnapshot,
 ) {

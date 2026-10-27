@@ -1,11 +1,11 @@
 //! Interrupting a Claude Turn: the background work the agent spawned is stopped first, then the
 //! loop itself, and the Turn Settles as interrupted on the result that follows.
 
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{
+use crate::claude_integration::support::{
     CLAUDE_MODELS, LiveTurn, ScriptedClaude, after_probe, agent_messages, discovery_arms,
     interrupt_arm, silent_interrupt_arm, stop_task_arm, user_turn_arm,
 };
+use crate::support::PROGRESS_DEADLINE;
 use suru::{
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, InitialPrompt, MessageStatus, PromptDelivery,

@@ -7,7 +7,7 @@
 //! own conversation arrives there as full snapshots rather than chunks, as it does from a CLI not
 //! asked for partial messages.
 
-use crate::support::{
+use crate::claude_integration::support::{
     CLAUDE_MODELS, ScriptedClaude, conversation_fixture, discovery_arms, opened_session,
     session_where, settled_session, user_turn_arm,
 };

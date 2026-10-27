@@ -12,7 +12,7 @@
 //! Sessions hold does not.
 
 use super::*;
-use crate::broker::admit_prompt;
+use crate::session_integration::broker::admit_prompt;
 
 /// The most this Server reads of any one answer from its Remote here.
 const BUDGET: usize = 16 * 1024;

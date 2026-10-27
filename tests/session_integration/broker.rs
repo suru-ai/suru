@@ -32,7 +32,7 @@ use suru::{
 };
 use tokio::time::{Duration, timeout};
 
-use crate::{
+use crate::session_integration::{
     provider_support::{
         ControlledProvider, ControlledProviderRuntime, ControlledProviderSession, StartRequest,
         as_subagent,

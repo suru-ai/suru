@@ -4,7 +4,7 @@
 //! does not touch it stays as live as it ever was, and only the local Server's
 //! own loss still stands the whole frame down.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     application_looking_at_studio, grace_elapses, navigable_session_snapshot,
     rendered_application_rows, rendered_application_rows_at, studio_stops_answering,
     studio_stops_answering_because, type_terminal_text,
@@ -409,10 +409,11 @@ fn a_remote_out_of_reach_for_want_of_a_login_says_so_and_its_offer_leads_to_the_
     assert_eq!(address, "https://relay.company.example");
 
     // And by pointer, the same.
-    crate::support::key(&mut application, KeyCode::Esc);
-    let buffer = crate::support::rendered_application_buffer(&application, 100, 15);
-    let (column, row) = crate::support::text_position(&buffer, "Log in to try again");
-    let pressed = crate::support::click_mouse(
+    crate::tui_rendering::support::key(&mut application, KeyCode::Esc);
+    let buffer = crate::tui_rendering::support::rendered_application_buffer(&application, 100, 15);
+    let (column, row) =
+        crate::tui_rendering::support::text_position(&buffer, "Log in to try again");
+    let pressed = crate::tui_rendering::support::click_mouse(
         &mut application,
         crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -428,7 +429,7 @@ fn a_remote_out_of_reach_for_want_of_a_login_says_so_and_its_offer_leads_to_the_
     );
 
     // Anything asked of the Remote meanwhile is refused saying so too.
-    crate::support::key(&mut application, KeyCode::Esc);
+    crate::tui_rendering::support::key(&mut application, KeyCode::Esc);
     type_terminal_text(&mut application, "words worth keeping");
     application
         .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
@@ -632,7 +633,7 @@ fn a_relay_the_server_holds_no_entry_for_is_offered_to_be_added_and_logged_in_at
         screen.contains("Add a Relay") && screen.contains("> https://relay.company.example"),
         "the Relay is ready to be added, its address typed in: {screen}"
     );
-    let added = crate::support::key(&mut application, KeyCode::Enter);
+    let added = crate::tui_rendering::support::key(&mut application, KeyCode::Enter);
     assert!(
         matches!(
             &added,
@@ -795,8 +796,8 @@ fn turning_the_outlook_away_from_an_unreachable_remote_still_works() {
         picker.contains("studio"),
         "the Connect picker is drawn over an Unreachable Remote: {picker}"
     );
-    crate::support::key(&mut application, KeyCode::Up);
-    let transition = crate::support::key(&mut application, KeyCode::Enter);
+    crate::tui_rendering::support::key(&mut application, KeyCode::Up);
+    let transition = crate::tui_rendering::support::key(&mut application, KeyCode::Enter);
     assert!(
         matches!(transition, ApplicationTransition::TurnOutlook { .. }),
         "turning the Outlook back to Local is the reader's own to do: {transition:?}"
@@ -822,18 +823,20 @@ fn the_banners_try_again_invokes_the_command_the_sidebar_row_invokes() {
 
     studio_stops_answering(&mut application, 3, Duration::from_secs(3));
     grace_elapses(&mut application, studio());
-    let buffer = crate::support::rendered_application_buffer(&application, 80, 15);
-    let (column, row) = crate::support::text_position(&buffer, "Try again");
-    let ApplicationTransition::RetryCatalogOrigin(clicked) = crate::support::click_mouse(
-        &mut application,
-        crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column,
-            row,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        },
-    )
-    .expect("retry by pointer") else {
+    let buffer = crate::tui_rendering::support::rendered_application_buffer(&application, 80, 15);
+    let (column, row) = crate::tui_rendering::support::text_position(&buffer, "Try again");
+    let ApplicationTransition::RetryCatalogOrigin(clicked) =
+        crate::tui_rendering::support::click_mouse(
+            &mut application,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        )
+        .expect("retry by pointer")
+    else {
         panic!("a press on the banner's affordance retries the same Remote");
     };
     assert_eq!(clicked.outlook(), &studio());
@@ -863,13 +866,13 @@ fn an_unreachable_remote_is_marked_and_dimmed_outside_everywhere() {
         .expect("hydrate the Sidebar");
 
     studio_stops_answering(&mut application, 1, Duration::from_secs(5));
-    let buffer = crate::support::rendered_application_buffer(&application, 120, 20);
-    let rows = crate::support::buffer_rows(&buffer);
+    let buffer = crate::tui_rendering::support::rendered_application_buffer(&application, 120, 20);
+    let rows = crate::tui_rendering::support::buffer_rows(&buffer);
     assert!(
         rows.iter().any(|row| row.contains("studio [unreachable]")),
         "the unreachable row stands in every scope, not only Everywhere: {rows:?}"
     );
-    let work = crate::support::text_position(&buffer, "Studio work");
+    let work = crate::tui_rendering::support::text_position(&buffer, "Studio work");
     assert_eq!(
         buffer.cell(work).expect("draw the Studio row").fg,
         ratatui::style::Color::DarkGray,
@@ -897,9 +900,9 @@ fn the_sidebar_still_walks_and_reads_while_its_remote_is_unreachable() {
     studio_stops_answering(&mut application, 1, Duration::from_secs(5));
     grace_elapses(&mut application, studio());
 
-    crate::support::key(&mut application, KeyCode::Down);
-    crate::support::key(&mut application, KeyCode::Down);
-    let opened = crate::support::key(&mut application, KeyCode::Enter);
+    crate::tui_rendering::support::key(&mut application, KeyCode::Down);
+    crate::tui_rendering::support::key(&mut application, KeyCode::Down);
+    let opened = crate::tui_rendering::support::key(&mut application, KeyCode::Enter);
     assert!(
         matches!(
             opened,
@@ -932,8 +935,8 @@ fn local_work_is_untouched_while_a_remote_is_unreachable() {
             },
         ]))
         .expect("list the paired Remotes");
-    crate::support::key(&mut application, KeyCode::Up);
-    crate::support::key(&mut application, KeyCode::Enter);
+    crate::tui_rendering::support::key(&mut application, KeyCode::Up);
+    crate::tui_rendering::support::key(&mut application, KeyCode::Enter);
 
     type_terminal_text(&mut application, "local work begins");
     let begun = application
@@ -948,10 +951,10 @@ fn local_work_is_untouched_while_a_remote_is_unreachable() {
 
 #[test]
 fn an_intervention_waits_out_of_sight_until_its_remote_answers() {
-    let workspace = crate::support::workspace_dir();
+    let workspace = crate::tui_rendering::support::workspace_dir();
     let mut application = application_looking_at_studio();
     let (_, mut snapshot, turn_id) =
-        crate::support::enter_active_session(&mut application, workspace.path());
+        crate::tui_rendering::support::enter_active_session(&mut application, workspace.path());
     studio_stops_answering(&mut application, 1, Duration::from_secs(5));
 
     pend_an_approval(&mut snapshot, turn_id);
@@ -994,10 +997,10 @@ fn the_outlook_stays_turned_toward_a_remote_that_merely_stops_answering() {
 }
 
 fn listed(title: &str) -> suru::protocol::SessionListItem {
-    crate::support::listed_session(
+    crate::tui_rendering::support::listed_session(
         SessionId::new(),
         title,
-        &crate::support::named_workspace_path("studio"),
+        &crate::tui_rendering::support::named_workspace_path("studio"),
         1,
         1,
     )
@@ -1011,9 +1014,9 @@ fn what_reaches_into_an_unreachable_sessions_turn_is_refused_too() {
         CommandId::PromoteSelectedPrompt,
         CommandId::CancelSelectedPrompt,
     ] {
-        let workspace = crate::support::workspace_dir();
+        let workspace = crate::tui_rendering::support::workspace_dir();
         let mut application = application_looking_at_studio();
-        crate::support::enter_active_session(&mut application, workspace.path());
+        crate::tui_rendering::support::enter_active_session(&mut application, workspace.path());
         studio_stops_answering(&mut application, 1, Duration::from_secs(5));
 
         assert_eq!(
@@ -1033,10 +1036,10 @@ fn what_reaches_into_an_unreachable_sessions_turn_is_refused_too() {
 
 #[test]
 fn a_held_intervention_does_not_advertise_a_key_that_would_be_refused() {
-    let workspace = crate::support::workspace_dir();
+    let workspace = crate::tui_rendering::support::workspace_dir();
     let mut application = application_looking_at_studio();
     let (_, mut snapshot, turn_id) =
-        crate::support::enter_active_session(&mut application, workspace.path());
+        crate::tui_rendering::support::enter_active_session(&mut application, workspace.path());
     studio_stops_answering(&mut application, 1, Duration::from_secs(5));
     pend_an_approval(&mut snapshot, turn_id);
     application
@@ -1125,7 +1128,7 @@ fn pend_an_approval(
     snapshot: &mut suru::protocol::SessionSnapshot,
     turn_id: suru::protocol::TurnId,
 ) {
-    let activity = crate::support::approval_activity(
+    let activity = crate::tui_rendering::support::approval_activity(
         turn_id,
         suru::protocol::ApprovalSubject::Network {
             host_or_url: "https://api.example.test/v1".to_owned(),
@@ -1139,7 +1142,7 @@ fn pend_an_approval(
     };
     snapshot.pending_approvals.push(approval.id);
     snapshot.pending_approvals_revision = snapshot.revision;
-    crate::support::add_activity(snapshot, activity.clone());
+    crate::tui_rendering::support::add_activity(snapshot, activity.clone());
 }
 
 #[test]
@@ -1220,10 +1223,10 @@ fn a_remote_whose_pairing_ends_stops_being_merely_unreachable() {
 
 #[test]
 fn an_open_panel_leaves_the_frame_when_its_origin_stops_answering() {
-    let workspace = crate::support::workspace_dir();
+    let workspace = crate::tui_rendering::support::workspace_dir();
     let mut application = application_looking_at_studio();
     let (_, mut snapshot, turn_id) =
-        crate::support::enter_active_session(&mut application, workspace.path());
+        crate::tui_rendering::support::enter_active_session(&mut application, workspace.path());
     pend_an_approval(&mut snapshot, turn_id);
     application
         .handle_event(ApplicationEvent::Session(
@@ -1298,8 +1301,8 @@ fn turn_toward_studio(application: &mut Application) {
             }),
         })
         .expect("probe the Remote");
-    crate::support::key(application, KeyCode::Down);
-    let turned = crate::support::key(application, KeyCode::Enter);
+    crate::tui_rendering::support::key(application, KeyCode::Down);
+    let turned = crate::tui_rendering::support::key(application, KeyCode::Enter);
     assert!(
         matches!(
             turned,

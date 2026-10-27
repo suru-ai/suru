@@ -1,10 +1,10 @@
 //! Claude's Errands: a Session started on Claude titled by a print-mode call, at the Model Claude
 //! declares its own Errands run at, carrying no Tools and leaving nothing resumable behind.
 
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 
-use crate::{
+use crate::claude_integration::{
     server_support::{assert_no_title_reaches, next_derived_title},
     support::{
         CLAUDE_MODELS, ScriptedClaude, connect, conversation_arms, crashing_errand_preamble,
@@ -358,7 +358,7 @@ async fn an_errand_falls_back_to_claudes_default_model_once_the_cheap_row_is_wit
 fn conversation_arms_over(models: &str) -> String {
     format!(
         "{}{}",
-        crate::support::discovery_arms(models),
-        crate::support::user_turn_arm(SILENT_TIMELINE)
+        crate::claude_integration::support::discovery_arms(models),
+        crate::claude_integration::support::user_turn_arm(SILENT_TIMELINE)
     )
 }

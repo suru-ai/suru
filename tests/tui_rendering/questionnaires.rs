@@ -1,4 +1,4 @@
-use crate::support::{
+use crate::tui_rendering::support::{
     add_request, connected_application, enter_active_session, invoke, key,
     rendered_application_rows, type_terminal_text, workspace_dir,
 };
@@ -456,7 +456,8 @@ fn batch_navigation_retains_edits_and_reviews_supported_multiple_selections_and_
     )))
     .unwrap();
     invoke(&mut app, SemanticCommandId::QuestionnaireOpen);
-    let first = crate::support::rendered_application_rows_at(&app, 80, 28).join("\n");
+    let first =
+        crate::tui_rendering::support::rendered_application_rows_at(&app, 80, 28).join("\n");
     assert!(
         first.contains("Question 1 of 3")
             && first.contains("[ ] Local (recommended)")
@@ -465,20 +466,20 @@ fn batch_navigation_retains_edits_and_reviews_supported_multiple_selections_and_
     invoke(&mut app, SemanticCommandId::QuestionnaireOmit);
     key(&mut app, KeyCode::Enter);
     assert!(
-        crate::support::rendered_application_rows_at(&app, 80, 28)
+        crate::tui_rendering::support::rendered_application_rows_at(&app, 80, 28)
             .join("\n")
             .contains("Question 1 requires a supported answer")
     );
     key(&mut app, KeyCode::Char(' '));
     key(&mut app, KeyCode::Tab);
     assert!(
-        crate::support::rendered_application_rows_at(&app, 80, 28)
+        crate::tui_rendering::support::rendered_application_rows_at(&app, 80, 28)
             .join("\n")
             .contains("Question 2 of 3")
     );
     key(&mut app, KeyCode::Enter);
     assert!(
-        crate::support::rendered_application_rows_at(&app, 80, 28)
+        crate::tui_rendering::support::rendered_application_rows_at(&app, 80, 28)
             .join("\n")
             .contains("Question 2 requires a supported answer")
     );
@@ -490,7 +491,8 @@ fn batch_navigation_retains_edits_and_reviews_supported_multiple_selections_and_
     key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Char(' '));
     key(&mut app, KeyCode::Tab);
-    let second = crate::support::rendered_application_rows_at(&app, 80, 28).join("\n");
+    let second =
+        crate::tui_rendering::support::rendered_application_rows_at(&app, 80, 28).join("\n");
     assert!(
         second.contains("[x] Unit")
             && second.contains("[x] Integration")
@@ -501,13 +503,14 @@ fn batch_navigation_retains_edits_and_reviews_supported_multiple_selections_and_
     key(&mut app, KeyCode::Char(' ')); // Remove Integration explicitly.
     key(&mut app, KeyCode::Tab);
     assert!(
-        crate::support::rendered_application_rows_at(&app, 80, 28)
+        crate::tui_rendering::support::rendered_application_rows_at(&app, 80, 28)
             .join("\n")
             .contains("Ctrl+O omit")
     );
     invoke(&mut app, SemanticCommandId::QuestionnaireOmit);
     key(&mut app, KeyCode::Enter);
-    let review = crate::support::rendered_application_rows_at(&app, 80, 28).join("\n");
+    let review =
+        crate::tui_rendering::support::rendered_application_rows_at(&app, 80, 28).join("\n");
     assert!(
         review.contains("Review Answer")
             && review.contains("Which environment?")
@@ -550,7 +553,8 @@ fn batch_navigation_retains_edits_and_reviews_supported_multiple_selections_and_
     app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
         .unwrap();
     invoke(&mut app, SemanticCommandId::TranscriptFoldsToggle);
-    let history = crate::support::rendered_application_rows_at(&app, 80, 28).join("\n");
+    let history =
+        crate::tui_rendering::support::rendered_application_rows_at(&app, 80, 28).join("\n");
     assert!(
         history.contains("3 question(s)")
             && history.contains("Which environment?")

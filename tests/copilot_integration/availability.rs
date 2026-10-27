@@ -5,7 +5,7 @@
 //! them, the one way a signed-in CLI must never read as unavailable: credentials it keeps to
 //! itself.
 
-use crate::support::{
+use crate::copilot_integration::support::{
     COPILOT_MODELS, ScriptedCopilot, connect_arm, copilot_catalog, gh_cli_signed_in_arm, hosting,
     models_arm, signed_in_arm, signed_out_arm, unknown_method_arm, upgradable_connect_arm,
 };

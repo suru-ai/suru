@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::support::{
+use crate::copilot_integration::support::{
     COPILOT_MODELS, ScriptedCopilot, agent_messages, cold_switch_refusing_arm, connect,
     connect_arm, conversation_fixture, create_session_arm, modelless_current_model_arm, models_arm,
     permission_decision_arm, resumable_conversation_fixture, send_arm, session_models_arm,
@@ -864,11 +864,11 @@ async fn a_prompt_queued_behind_a_failed_turn_runs_rather_than_settling_on_its_i
 async fn managed_worktree_native_copilot_starts_at_prepared_root() {
     let copilot = ScriptedCopilot::new(&format!(
         "{}{}{}{}{}{}{}",
-        crate::support::conversation_arms(),
-        crate::support::resume_session_arm(),
-        crate::support::skills_reload_arm(),
-        crate::support::detach_session_arm(),
-        crate::support::delete_session_arm(),
+        crate::copilot_integration::support::conversation_arms(),
+        crate::copilot_integration::support::resume_session_arm(),
+        crate::copilot_integration::support::skills_reload_arm(),
+        crate::copilot_integration::support::detach_session_arm(),
+        crate::copilot_integration::support::delete_session_arm(),
         r#"
     *'"method":"session.commands.list"'*) reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"commands":[]}}' ;;
     *'"method":"session.skills.list"'*) reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"skills":[]}}' ;;
@@ -886,7 +886,8 @@ async fn managed_worktree_native_copilot_starts_at_prepared_root() {
     .await
     .unwrap();
     let client = connect(state.path(), "prepared-copilot").await;
-    let prepared = crate::managed_worktree::prepare(&client, source.path(), "copilot").await;
+    let prepared =
+        crate::support::managed_worktree::prepare(&client, source.path(), "copilot").await;
     assert!(
         !copilot
             .requests()
@@ -894,7 +895,7 @@ async fn managed_worktree_native_copilot_starts_at_prepared_root() {
             .any(|r| r["method"] == "session.send")
     );
     let created = client
-        .create_session(crate::managed_worktree::creation(&prepared))
+        .create_session(crate::support::managed_worktree::creation(&prepared))
         .await
         .unwrap();
     settled_session(&client, created.session.id, 0).await;
@@ -907,7 +908,12 @@ async fn managed_worktree_native_copilot_starts_at_prepared_root() {
         request["params"]["workingDirectory"].as_str(),
         prepared.destination.path.to_str()
     );
-    crate::managed_worktree::recover(&client, created.session.id, &prepared.destination.path).await;
+    crate::support::managed_worktree::recover(
+        &client,
+        created.session.id,
+        &prepared.destination.path,
+    )
+    .await;
     let resumed = copilot
         .requests()
         .into_iter()

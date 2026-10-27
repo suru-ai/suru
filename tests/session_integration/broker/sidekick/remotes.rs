@@ -37,7 +37,7 @@ use suru::{
 use tokio::sync::oneshot;
 
 use super::*;
-use crate::server_support::observed_tcp_proxy::ObservedTcpProxy;
+use crate::support::observed_tcp_proxy::ObservedTcpProxy;
 
 mod acts;
 mod clones;
@@ -835,7 +835,7 @@ impl TestRelay {
         let key = std::fs::read(server.config.data_dir().join("server-identity.pk8"))
             .expect("read the Server's identity key");
         let key = rcgen::KeyPair::try_from(key.as_slice()).expect("decode the identity key");
-        let voice = crate::server_support::relay_voice::RelayVoice {
+        let voice = crate::support::relay_voice::RelayVoice {
             at: self.route.address,
             known_as: self.address(),
         };

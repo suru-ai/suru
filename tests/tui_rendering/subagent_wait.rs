@@ -2,7 +2,7 @@
 //! Broker's `wait_subagents` (ADR 0035): its Turn is still open, but the only work in it is the
 //! wait, so the indicator says what the Working is spent on rather than that the Agent works.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     connected_application, failed_session_snapshot, rendered_application_rows_at, workspace_dir,
 };
 use suru::{

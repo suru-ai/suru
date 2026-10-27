@@ -6,7 +6,7 @@ use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use crate::support::{
+use crate::tui_rendering::support::{
     connected_application, rendered_application_rows, rendered_application_rows_at,
     type_terminal_text, workspace_dir,
 };

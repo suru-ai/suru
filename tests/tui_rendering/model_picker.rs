@@ -1,6 +1,6 @@
 //! The model picker: listing, search, focus, and selection.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     deliver_settings, key, model_descriptor, navigable_session_snapshot,
     rendered_application_buffer, rendered_application_rows, rendered_application_rows_at,
     rendered_row, selected_session_snapshot, text_position, type_terminal_text, workspace_dir,
@@ -113,7 +113,7 @@ fn remote_session_names_follow_its_pushed_catalog_without_opening_models() {
 
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
-    crate::connecting::turn_to_studio(&mut application);
+    crate::tui_rendering::connecting::turn_to_studio(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(
             selected_session_snapshot(

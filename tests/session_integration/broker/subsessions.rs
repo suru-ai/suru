@@ -30,7 +30,7 @@ use super::{
     sidekick::{latest_turn_settles, sidekick_directory, start_sidekick, unoffered},
     *,
 };
-use crate::{repositories::git, support::refresh_catalog};
+use crate::session_integration::{repositories::git, support::refresh_catalog};
 
 /// What the Sidekick first asks of the Subsession it begins.
 const ASKED: &str = "Fix the flaky login test in the auth suite.";
@@ -310,7 +310,8 @@ async fn a_sidekick_begins_a_subsession_as_the_landing_would_and_its_transcript_
         start_sidekick(&descriptor, &mut hosted.claude).await;
     let landing = default_selection(&codex_models());
     choose_landing_agent(&descriptor, &landing).await;
-    let (_, mut catalog) = crate::attachments::watch_session(&descriptor, sidekick_id).await;
+    let (_, mut catalog) =
+        crate::session_integration::attachments::watch_session(&descriptor, sidekick_id).await;
 
     let answer = begun(
         &mut sidekick,
@@ -417,14 +418,18 @@ async fn a_sidekick_begins_a_subsession_as_the_landing_would_and_its_transcript_
         )],
         "the Sidekick's working Turn gains a row naming the Subsession and what it was asked"
     );
-    crate::attachments::next_change(&mut catalog, "the Sidekick's row", |change| {
-        matches!(
-            change,
-            SessionChange::ActivityAdded {
-                activity: Activity::Subsession { session_id, .. }
-            } if *session_id == subsession
-        )
-    })
+    crate::session_integration::attachments::next_change(
+        &mut catalog,
+        "the Sidekick's row",
+        |change| {
+            matches!(
+                change,
+                SessionChange::ActivityAdded {
+                    activity: Activity::Subsession { session_id, .. }
+                } if *session_id == subsession
+            )
+        },
+    )
     .await;
 
     // The Title is derived as the Landing's Session's is, on the Subsession's

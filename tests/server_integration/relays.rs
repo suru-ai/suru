@@ -423,7 +423,7 @@ async fn run_server(
 ) -> (server::RunningServer, ManagedClient) {
     let server = server::spawn_with_provider_and_timings(
         config.clone(),
-        Arc::new(crate::failing_provider_support::FailingProviderRuntime),
+        Arc::new(crate::support::failing_provider::FailingProviderRuntime),
         timings.clone(),
     )
     .await
@@ -1269,7 +1269,7 @@ async fn relay_entries_are_kept_owner_only_beside_remotes_and_peers_and_hold_no_
         );
     }
     #[cfg(windows)]
-    crate::assert_windows_current_user_only(&path);
+    crate::server_integration::assert_windows_current_user_only(&path);
 
     server.shutdown().await;
 }

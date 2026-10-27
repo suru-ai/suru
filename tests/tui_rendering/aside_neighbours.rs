@@ -2,7 +2,7 @@
 //! the Intervention panels that outrank it for the keys, and the commands that
 //! move its edge a column at a time.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     add_activity, approval_activity, connected_application, deliver_settings, enter_active_session,
     invoke, key, rendered_application_buffer, rendered_application_rows_at, workspace_dir,
 };

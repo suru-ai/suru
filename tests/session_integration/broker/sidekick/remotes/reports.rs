@@ -24,13 +24,13 @@ use suru::protocol::{
 use suru::provider::{ProviderEventAttribution, ProviderSubagentId, Report};
 
 use super::*;
-use crate::broker::sidekick::answering::where_to_run;
+use crate::session_integration::broker::sidekick::answering::where_to_run;
 
 mod delayed;
 mod unread;
-use crate::broker::sidekick_acts::{acted, refused};
-use crate::server_support::broker::untimed_sidekick_report;
-use crate::subagent_tree::{TreeUpdates, next_change, open_tree};
+use crate::session_integration::broker::sidekick_acts::{acted, refused};
+use crate::session_integration::subagent_tree::{TreeUpdates, next_change, open_tree};
+use crate::support::broker::untimed_sidekick_report;
 
 /// What the Sidekick asks of the Sessions it sets to work on the Remote.
 const ASKED: &str = "Fix the flaky login test in the auth suite.";
@@ -238,7 +238,12 @@ async fn ask(
 ) {
     timeout(
         PROGRESS_DEADLINE,
-        crate::broker::sidekick::answering::ask(remote, session_id, provider, questionnaire),
+        crate::session_integration::broker::sidekick::answering::ask(
+            remote,
+            session_id,
+            provider,
+            questionnaire,
+        ),
     )
     .await
     .expect("the Questionnaire comes to wait on an Answer");

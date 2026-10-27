@@ -1,6 +1,6 @@
 //! The configurable Session Content Column and the surfaces that share it.
 
-use crate::support::{
+use crate::tui_rendering::support::{
     connected_application, enter_session, navigable_session_snapshot, rendered_application_rows_at,
     rendered_row, workspace_dir,
 };

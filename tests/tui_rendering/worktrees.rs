@@ -1,5 +1,5 @@
 //! Landing execution navigation through semantic commands and Server responses.
-use crate::support::{
+use crate::tui_rendering::support::{
     buffer_rows, click_mouse, deliver_settings, fixture_instance_id, ready_health,
     rendered_application_buffer, rendered_application_rows_at, selector_label, type_terminal_text,
     workspace_resolution,
@@ -220,7 +220,7 @@ fn pick_other_workspace(
     };
     app.handle_event(ApplicationEvent::WorkspacesListed {
         request,
-        listing: crate::support::workspace_listing(
+        listing: crate::tui_rendering::support::workspace_listing(
             contexts
                 .iter()
                 .map(|context| context.workspace.clone())
@@ -488,7 +488,7 @@ fn landing_remote_and_path_icons_are_measured_by_existing_truncation() {
     let layout = Layout::new();
     let mut app = layout.app();
     show_icons(&mut app);
-    crate::connecting::turn_to_studio(&mut app);
+    crate::tui_rendering::connecting::turn_to_studio(&mut app);
     app.handle_event(ApplicationEvent::WorkspaceResolved {
         outlook: Outlook::Remote("studio".to_owned()),
         surface: suru::tui::WorkspaceResolutionSurface::Outlook,
@@ -529,7 +529,7 @@ fn turning_to_a_remote_leaves_the_local_checkout_state_behind() {
     answer(&mut app, transition, local);
     key(&mut app, KeyCode::Esc);
     assert!(text(&app).contains("local-only"), "{}", text(&app));
-    crate::connecting::turn_to_studio(&mut app);
+    crate::tui_rendering::connecting::turn_to_studio(&mut app);
     let remote = text(&app);
     assert!(
         !remote.contains("local-only"),
@@ -1046,7 +1046,7 @@ fn on_a_remote_the_workspace_after_the_remotes_name_opens_the_workspace_picker()
     let layout = Layout::new();
     let on_studio = || {
         let mut app = layout.app();
-        crate::connecting::turn_to_studio(&mut app);
+        crate::tui_rendering::connecting::turn_to_studio(&mut app);
         app.handle_event(ApplicationEvent::WorkspaceResolved {
             outlook: Outlook::Remote("studio".to_owned()),
             surface: suru::tui::WorkspaceResolutionSurface::Outlook,
@@ -1222,7 +1222,7 @@ fn at_the_root_of_a_worktree_no_subdirectory_takes_a_press() {
 fn pressing_the_subdirectory_is_refused_while_the_remote_is_unreachable() {
     let layout = Layout::new();
     let mut app = layout.app();
-    crate::connecting::turn_to_studio(&mut app);
+    crate::tui_rendering::connecting::turn_to_studio(&mut app);
     // The Remote spells its paths for the Landing, which is what lets the
     // Landing say where within the Worktree it works.
     app.handle_event(ApplicationEvent::OriginCatalog {
@@ -1244,7 +1244,11 @@ fn pressing_the_subdirectory_is_refused_while_the_remote_is_unreachable() {
     .unwrap();
     let size = (160, 30);
     reading_cell(&app, size, "nested");
-    crate::support::studio_stops_answering(&mut app, 1, std::time::Duration::from_secs(5));
+    crate::tui_rendering::support::studio_stops_answering(
+        &mut app,
+        1,
+        std::time::Duration::from_secs(5),
+    );
 
     assert_eq!(
         press_reading(&mut app, size, "nested"),
@@ -1363,7 +1367,7 @@ fn same_workspace_identity_on_another_origin_has_independent_execution_memory() 
     use suru::tui::WorkspaceResolutionSurface;
     let layout = Layout::new();
     let mut app = layout.app();
-    crate::connecting::turn_to_studio(&mut app);
+    crate::tui_rendering::connecting::turn_to_studio(&mut app);
     app.handle_event(ApplicationEvent::WorkspaceResolved {
         outlook: Outlook::Remote("studio".to_owned()),
         surface: WorkspaceResolutionSurface::Outlook,
@@ -1462,7 +1466,7 @@ fn bare_landing_offers_working_copies_and_choosing_one_makes_next_prompt_executa
 fn choosing_worktree_from_open_session_cannot_relocate_that_session() {
     let layout = Layout::new();
     let mut app = layout.app();
-    let (id, _) = crate::support::enter_session(&mut app, &layout.nested);
+    let (id, _) = crate::tui_rendering::support::enter_session(&mut app, &layout.nested);
     assert_eq!(
         command(&mut app, SemanticCommandId::WorktreeList),
         ApplicationTransition::Continue
@@ -2043,7 +2047,7 @@ fn begin_in_new_worktree(app: &mut Application, layout: &Layout, prompt: &str) -
         panic!("a prepared Worktree continues to creation")
     };
     app.handle_event(ApplicationEvent::SessionCreated(
-        crate::provisional_session::created_session_snapshot(
+        crate::tui_rendering::provisional_session::created_session_snapshot(
             SessionId::new(),
             &create.prompt,
             &destination,
@@ -2143,7 +2147,7 @@ fn leaving_failed_preparation_restores_its_prompt_and_returns_the_landing_with_i
     };
     assert_eq!(create.execution_directory, retained);
     app.handle_event(ApplicationEvent::SessionCreated(
-        crate::provisional_session::created_session_snapshot(
+        crate::tui_rendering::provisional_session::created_session_snapshot(
             SessionId::new(),
             &create.prompt,
             &retained.path,
@@ -2303,7 +2307,7 @@ fn a_worktree_prepared_after_the_reader_left_its_claim_never_moves_their_landing
         panic!("background creation goes on")
     };
     app.handle_event(ApplicationEvent::SessionCreated(
-        crate::provisional_session::created_session_snapshot(
+        crate::tui_rendering::provisional_session::created_session_snapshot(
             SessionId::new(),
             &create.prompt,
             &create.execution_directory.path,

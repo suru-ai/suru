@@ -1,5 +1,5 @@
 //! Client-observable occupancy, ordering, ownership and durable restoration.
-use crate::{
+use crate::session_integration::{
     provider_support::ControlledProvider,
     support::{
         controlled_selection, read_session, read_session_until, the_subagent_row, working_turn,

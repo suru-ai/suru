@@ -1,9 +1,9 @@
 //! Codex-native Skill discovery and structured Prompt lowering.
 
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 
-use crate::{
+use crate::codex_integration::{
     server_support::{
         attachments::{bound, jpeg, png, uploaded},
         next_skill_catalog,
@@ -184,7 +184,7 @@ async fn codex_skill_changes_force_refresh_server_authority() {
     .expect("connect client");
     receive_initial_state(&mut client).await;
     assert!(matches!(
-        crate::server_support::next_event(&mut client).await,
+        crate::support::next_event(&mut client).await,
         Some(ManagedEvent::SettingsSnapshot(_))
     ));
     let request = suru::protocol::SkillCatalogRequest {

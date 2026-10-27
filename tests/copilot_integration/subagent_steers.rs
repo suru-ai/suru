@@ -9,7 +9,7 @@
 //! (`subagent_resumes`). So the steer here is scripted in the shape the SDK's schema documents
 //! for it.
 
-use crate::support::{
+use crate::copilot_integration::support::{
     conversation_fixture, opened_session, settled_session, subagent_children as children,
     transcript_outline as outline,
 };

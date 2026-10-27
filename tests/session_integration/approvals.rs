@@ -1,5 +1,5 @@
-use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{read_session_until, working_turn};
+use crate::session_integration::support::{read_session_until, working_turn};
+use crate::support::PROGRESS_DEADLINE;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
@@ -281,7 +281,7 @@ async fn nested_subagent_approvals_roll_up_with_questions_survive_parent_settlem
     use suru::protocol::{SessionId, TurnStatus};
 
     async fn spawn(
-        live: &crate::support::WorkingTurn,
+        live: &crate::session_integration::support::WorkingTurn,
         client: &ManagedClient,
         parent: SessionId,
         attribution: ProviderEventAttribution,

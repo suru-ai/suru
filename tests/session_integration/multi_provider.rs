@@ -1,10 +1,10 @@
 //! Several Provider runtimes hosted side by side: catalog listing, per-Session
 //! routing, hosted-set selection validation, and the built-in default order.
 
-use crate::server_support::PROGRESS_DEADLINE;
+use crate::support::PROGRESS_DEADLINE;
 use std::sync::Arc;
 
-use crate::{
+use crate::session_integration::{
     failing_provider_support::FailingProviderRuntime,
     provider_support::ControlledProvider,
     support::{
