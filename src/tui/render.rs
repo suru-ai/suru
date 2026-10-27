@@ -2848,21 +2848,6 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
             theme.text.subdued,
         ));
     }
-    if content_height >= 3
-        && let Some(provider) = state.model_picker.list().provider_scope()
-        && lines.len() < usize::from(content_height)
-    {
-        lines.push(Line::styled(
-            truncate_to_width(
-                &format!(
-                    "Session Provider {} · use /new to change Provider",
-                    state.model_picker.provider_display_name(provider)
-                ),
-                usize::from(content_width),
-            ),
-            theme.text.subdued,
-        ));
-    }
     if state.model_picker.is_loading() && lines.len() < usize::from(content_height) {
         lines.push(Line::styled("Loading Models…", theme.text.subdued));
     } else {
@@ -2898,7 +2883,7 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
     if content_height >= 3 && lines.len() < usize::from(content_height) {
         lines.push(Line::styled(
             truncate_to_width(
-                "Type to search · Enter select/retry · Esc close",
+                "Type to search · Enter select · Esc close",
                 usize::from(content_width),
             ),
             theme.text.subdued,

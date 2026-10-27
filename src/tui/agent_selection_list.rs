@@ -250,10 +250,6 @@ impl AgentSelectionList {
         &self.query
     }
 
-    pub(super) fn provider_scope(&self) -> Option<&ProviderId> {
-        self.provider_scope.as_ref()
-    }
-
     /// The Provider as the rows list it, while they do.
     pub(super) fn provider(&self, provider: &ProviderId) -> Option<&ProviderModels> {
         self.providers

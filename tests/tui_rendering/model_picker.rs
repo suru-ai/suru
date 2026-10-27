@@ -891,9 +891,15 @@ fn session_model_selection_is_provider_scoped_optimistic_and_rolls_back_locally(
         })
         .expect("load Session-scoped catalog");
     let picker = rendered_application_rows(&application).join("\n");
-    assert!(picker.contains("Session Provider Codex"));
-    assert!(picker.contains("use /new to change Provider"));
+    assert!(
+        !picker.contains("Session Provider"),
+        "the list scoped to the Session's Provider needs no line saying so"
+    );
     assert!(!picker.contains("Foreign Model"));
+    assert!(
+        picker.contains("Enter select · Esc close"),
+        "the footer names choosing a row once, however the row is chosen"
+    );
     assert!(
         picker
             .lines()
