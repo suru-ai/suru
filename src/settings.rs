@@ -783,6 +783,13 @@ impl SettingDescriptor {
         }
     }
 
+    /// What the built-in default reads as, spelled as [`Self::spelling`] spells
+    /// the value in force: what the Setting holds wherever no Config Document
+    /// pins it.
+    pub fn default_spelling(&self) -> Option<Cow<'static, str>> {
+        self.spelling(&EffectiveSettings::default())
+    }
+
     /// The named choice one step on from the one in force, wrapping past the
     /// last, which is how a reader cycles a Setting through its values. A value
     /// the schema does not name has no neighbours, so the first choice is where

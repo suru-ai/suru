@@ -27,9 +27,10 @@ use crate::{
         MessageId, ModelCatalog, Outlook, Prompt, PromptDelivery, PromptId, PromptStatus,
         PromptWithdrawal, QuestionnaireId, RelayState, ResolveWorkspaceRequest, ServerIdentity,
         SessionChange, SessionErrorCode, SessionId, SessionListItem, SessionReference,
-        SessionSnapshot, SettingMutation, SettingsSnapshot, ShutdownReason, SkillCatalog,
-        SkillCatalogRequest, TextSelectionCopy, TranscriptSettings, TurnId, TurnStatus,
-        UnreachableReason, UpdateAgentSelectionRequest, Workspace, WorkspaceId, one_line_title,
+        SessionSnapshot, SettingMutation, SettingsDiagnostic, SettingsSnapshot, ShutdownReason,
+        SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TranscriptSettings, TurnId,
+        TurnStatus, UnreachableReason, UpdateAgentSelectionRequest, Workspace, WorkspaceId,
+        one_line_title,
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
@@ -2785,6 +2786,10 @@ impl TuiState {
 
     pub(super) fn pinned_settings(&self) -> &[String] {
         &self.pinned_settings
+    }
+
+    pub(super) fn settings_diagnostics(&self) -> &[SettingsDiagnostic] {
+        self.application_notice.settings_diagnostics()
     }
 
     pub(super) fn application_notice(&self) -> Option<&Notice> {

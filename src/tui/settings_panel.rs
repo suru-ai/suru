@@ -225,14 +225,17 @@ pub(super) struct TabSpan {
 }
 
 /// The rows as one frame drew them: where they began, which row of the tab the
-/// first of them was, and how many followed. A tab is longer than the box has
-/// room for, so a pointer means nothing without knowing which of its rows the
-/// window put on screen.
-#[derive(Clone, Copy, Debug)]
+/// first of them was, how many followed, and the columns they were drawn
+/// across. A tab is longer than the box has room for, so a pointer means
+/// nothing without knowing which of its rows the window put on screen; and a
+/// wide panel draws a pane beside them, so a pointer at the same height is not
+/// necessarily on a row.
+#[derive(Clone, Debug)]
 pub(super) struct RowWindow {
     pub(super) top: u16,
     pub(super) first: usize,
     pub(super) count: u16,
+    pub(super) columns: Range<u16>,
 }
 
 /// What the pointer landed on, which is a tab to show or a row to focus and
@@ -267,7 +270,10 @@ impl PanelLayout {
         {
             return Some(PanelHit::Tab(span.tab));
         }
-        let window = self.rows?;
+        let window = self.rows.as_ref()?;
+        if !window.columns.contains(&column) {
+            return None;
+        }
         let offset = row.checked_sub(window.top)?;
         (offset < window.count)
             .then(|| window.first.saturating_add(usize::from(offset)))
@@ -575,8 +581,8 @@ impl SettingsPanel {
 
     /// Moves the panel to whatever the reader pointed at: a tab label shows
     /// that tab, a row takes the focus, and a click on anything else — the
-    /// headline, the footer, the border, the screen the box is drawn over —
-    /// changes nothing. A click never edits a Setting and never expands a
+    /// headline, the pane beside the rows, the footer, the border, the screen
+    /// the box is drawn over — changes nothing. A click never edits a Setting and never expands a
     /// Provider: the focused row is the one surface an edit runs through, so
     /// pointing at a row asks for the focus and never for the value.
     ///
@@ -694,22 +700,33 @@ impl SettingsPanel {
     }
 
     /// What the focused Provider's Availability says in full, which the
-    /// headline carries because a row has room only for the condition's name.
+    /// headline or the pane carries because a row has room only for the
+    /// condition's name.
     pub(super) fn selected_message(&self, settings: &EffectiveSettings) -> Option<&str> {
         self.selected_reading(settings)?.message.as_deref()
     }
 
     /// What fixes the focused Provider's condition, in full, which goes
-    /// beneath the headline because the row it is named on may have room for
-    /// only the start of it.
+    /// beneath the headline, or beneath the condition in the pane, because the
+    /// row it is named on may have room for only the start of it.
     pub(super) fn selected_fix(&self, settings: &EffectiveSettings) -> Option<&str> {
-        match &self.selected_reading(settings)?.availability {
+        match self.selected_availability(settings)? {
             RowAvailability::Unavailable { fix, .. } => Some(fix),
             RowAvailability::Quiet
             | RowAvailability::Reading
             | RowAvailability::Warning
             | RowAvailability::Failed => None,
         }
+    }
+
+    /// What the read in force found about the focused Provider, for focus on
+    /// a Provider anything was read about, which says how urgently the pane
+    /// tells its condition.
+    pub(super) fn selected_availability(
+        &self,
+        settings: &EffectiveSettings,
+    ) -> Option<&RowAvailability> {
+        Some(&self.selected_reading(settings)?.availability)
     }
 
     fn selected_reading(&self, settings: &EffectiveSettings) -> Option<&ProviderReading> {

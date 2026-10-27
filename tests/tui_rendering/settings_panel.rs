@@ -300,33 +300,81 @@ fn focused_key(application: &Application) -> String {
     }
 }
 
-/// The panel row for one Setting or Provider, as the reader sees it. Every row
-/// carries its provenance marker, which is what tells one apart from the
-/// headline naming the same Setting in prose.
+/// The panel row for one Setting or Provider, as the reader sees it inside the
+/// box: from its focus marker to the value column and pin mark it ends on.
 fn row(application: &Application, label: &str) -> String {
     let rows = rendered_application_rows(application);
-    rows[row_index(&rows, label)].trim().to_owned()
+    inside(&rows[row_index(&rows, label)], panel_left(&rows))
+        .trim_end()
+        .to_owned()
+}
+
+/// What a row says its Setting is worth: the value column at its end, then
+/// ` ●` where the row marks that value as the reader's own pin. A value is
+/// spelled with single spaces at most, so it is whatever follows the widest
+/// run of them.
+fn shown(application: &Application, label: &str) -> String {
+    shown_in(&row(application, label))
+}
+
+/// The same, read off a row already in hand.
+fn shown_in(row: &str) -> String {
+    let row = row.trim_end();
+    let (row, pinned) = match row.strip_suffix('●') {
+        Some(rest) => (rest.trim_end(), true),
+        None => (row, false),
+    };
+    let value = row.rsplit("  ").next().unwrap_or_default().trim();
+    if pinned {
+        format!("{value} ●")
+    } else {
+        value.to_owned()
+    }
+}
+
+/// The column the panel's left border stands at in a frame, read off the
+/// corner its title hangs from, so a row is read from inside the box whatever
+/// the screen draws beside it.
+fn panel_left(rows: &[String]) -> usize {
+    rows.iter()
+        .find_map(|row| {
+            row.find("┌ Settings")
+                .map(|byte| row[..byte].chars().count())
+        })
+        .unwrap_or_else(|| panic!("the frame draws no settings panel: {rows:?}"))
+}
+
+/// What one screen row draws inside the panel's left border at `left`, up to
+/// its right border or, on a wide panel, the pane beside its rows.
+fn inside(row: &str, left: usize) -> &str {
+    let start = row
+        .char_indices()
+        .nth(left + 1)
+        .map_or(row.len(), |(byte, _)| byte);
+    row[start..].split('│').next().unwrap_or_default()
 }
 
 /// Where that row sits on screen, so a test can say which row comes first.
 fn row_index(rows: &[String], label: &str) -> usize {
+    let left = panel_left(rows);
     rows.iter()
-        .position(|row| is_row_for(row, label))
+        .position(|row| is_row_for(row, left, label))
         .unwrap_or_else(|| panic!("the settings panel showed no row for {label:?}: {rows:?}"))
 }
 
 /// Whether the panel is showing a row for `label` at all, which is how a test
 /// says a Provider's further Settings are revealed or hidden. Read off the
-/// provenance marker every row carries, so the headline naming the same
+/// focus marker's column every row leads with, so the headline naming the same
 /// Setting in prose is never mistaken for a row of its own.
 fn has_row(application: &Application, label: &str) -> bool {
-    rendered_application_rows(application)
-        .iter()
-        .any(|row| is_row_for(row, label))
+    let rows = rendered_application_rows(application);
+    let left = panel_left(&rows);
+    rows.iter().any(|row| is_row_for(row, left, label))
 }
 
-fn is_row_for(row: &str, label: &str) -> bool {
-    row.contains(label) && (row.contains("[pinned]") || row.contains("[default]"))
+fn is_row_for(row: &str, left: usize, label: &str) -> bool {
+    let inside = inside(row, left);
+    (inside.starts_with("› ") || inside.starts_with("  ")) && inside.contains(label)
 }
 
 /// Which column a row's name starts at, which is what says a revealed Setting
@@ -502,9 +550,9 @@ fn the_transcript_tab_presents_image_previews_on_by_default_beside_the_other_tra
         styling(&transcript, "General"),
         "the Transcript tab is drawn as the active one"
     );
-    let previews = row(&application, "Image previews");
-    assert!(
-        previews.contains("true") && previews.contains("[default]"),
+    let previews = shown(&application, "Image previews");
+    assert_eq!(
+        previews, "true",
         "image previews ride their built-in default: {previews:?}"
     );
     for label in [
@@ -565,9 +613,9 @@ fn the_transcript_tab_presents_tool_call_visibility_shown_by_default_beneath_rea
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_transcript_tab(&mut application);
 
-    let tool_calls = row(&application, "Tool Call visibility");
-    assert!(
-        tool_calls.contains("shown") && tool_calls.contains("[default]"),
+    let tool_calls = shown(&application, "Tool Call visibility");
+    assert_eq!(
+        tool_calls, "shown",
         "Tool Calls ride their shown default: {tool_calls:?}"
     );
     let rows = rendered_application_rows(&application);
@@ -598,9 +646,9 @@ fn the_transcript_tab_presents_tool_call_visibility_shown_by_default_beneath_rea
         &["transcript.toolCallVisibility"],
     );
     open_transcript_tab(&mut application);
-    let tool_calls = row(&application, "Tool Call visibility");
-    assert!(
-        tool_calls.contains("hidden") && tool_calls.contains("[pinned]"),
+    let tool_calls = shown(&application, "Tool Call visibility");
+    assert_eq!(
+        tool_calls, "hidden ●",
         "a Config Document that hides them shows its pinned value: {tool_calls:?}"
     );
     focus_setting(&mut application, "transcript.toolCallVisibility");
@@ -620,9 +668,9 @@ fn source_control_tab_presents_the_server_reclaim_setting_between_providers_and_
     open_panel(&mut application);
     click_tab(&mut application, "Source Control");
 
-    let reclaim_row = row(&application, "Reclaim Managed Worktrees");
-    assert!(
-        reclaim_row.contains("14 days [default]"),
+    let reclaim_row = shown(&application, "Reclaim Managed Worktrees");
+    assert_eq!(
+        reclaim_row, "14 days",
         "default threshold is visible: {reclaim_row}"
     );
     assert_eq!(focused_key(&application), "worktree.autoReclaim");
@@ -644,7 +692,7 @@ fn source_control_tab_presents_the_server_reclaim_setting_between_providers_and_
         },
         &["worktree.autoReclaim"],
     );
-    assert!(row(&application, "Reclaim Managed Worktrees").contains("off [pinned]"));
+    assert_eq!(shown(&application, "Reclaim Managed Worktrees"), "off ●");
 }
 
 #[test]
@@ -662,7 +710,7 @@ fn source_control_tab_offers_whether_the_landing_returns_from_a_worktree_it_crea
         "it keeps the other worktree Setting company: {rows:?}"
     );
     let after = row(&application, "After creating a Worktree");
-    assert!(after.contains("return [default]"), "{after}");
+    assert_eq!(shown_in(&after), "return", "{after}");
     let descriptor = suru::settings::SCHEMA
         .iter()
         .find(|descriptor| descriptor.key == "worktree.afterCreation")
@@ -740,9 +788,9 @@ fn the_source_control_tab_presents_the_workspace_roots_beneath_reclaim_naming_no
         row_index(&rows, "Reclaim Managed Worktrees") < row_index(&rows, "Workspace Roots"),
         "the Roots keep the worktree Settings' company: {rows:?}"
     );
-    let roots = row(&application, "Workspace Roots");
-    assert!(
-        roots.contains("none [default]"),
+    let roots = shown(&application, "Workspace Roots");
+    assert_eq!(
+        roots, "none",
         "no Root is named until the user names one: {roots}"
     );
     let descriptor = suru::settings::SCHEMA
@@ -768,8 +816,9 @@ fn the_source_control_tab_presents_the_workspace_roots_beneath_reclaim_naming_no
         &["workspace.roots"],
     );
     let roots = row(&application, "Workspace Roots");
-    assert!(
-        roots.contains(&format!("~/src, {WORK_ROOT} [pinned]")),
+    assert_eq!(
+        shown_in(&roots),
+        format!("~/src, {WORK_ROOT} ●"),
         "the row names every Root as the user named it: {roots}"
     );
 }
@@ -839,8 +888,9 @@ fn the_workspace_roots_list_editor_adds_edits_and_removes_rows_and_saves_them_as
         !screen(&application).contains(ROOTS_EDITOR),
         "saving closes the editor"
     );
-    assert!(
-        row(&application, "Workspace Roots").contains(&format!("~/src, {WORK_ROOT} [pinned]")),
+    assert_eq!(
+        shown(&application, "Workspace Roots"),
+        format!("~/src, {WORK_ROOT} ●"),
         "and the row waits for the refreshed snapshot"
     );
     deliver_snapshot(
@@ -848,9 +898,7 @@ fn the_workspace_roots_list_editor_adds_edits_and_removes_rows_and_saves_them_as
         with_workspace_roots(&["~/code", ARCHIVE_ROOT]),
         &["workspace.roots"],
     );
-    assert!(
-        row(&application, "Workspace Roots").contains(&format!("~/code, {ARCHIVE_ROOT} [pinned]"))
-    );
+    assert!(shown(&application, "Workspace Roots") == format!("~/code, {ARCHIVE_ROOT} ●"));
 }
 
 /// An entry the Setting refuses keeps the editor open, focused on that entry
@@ -909,7 +957,7 @@ fn a_root_neither_absolute_nor_beginning_with_a_tilde_keeps_the_list_editor_open
         !screen(&application).contains(ROOTS_EDITOR),
         "Esc closes the editor"
     );
-    assert!(row(&application, "Workspace Roots").contains("none [default]"));
+    assert_eq!(shown(&application, "Workspace Roots"), "none");
 }
 
 #[test]
@@ -1311,7 +1359,7 @@ fn appearance_offers_icons_disabled_by_default_and_explains_the_font_requirement
     open_panel(&mut application);
     click_tab(&mut application, "Appearance");
 
-    assert!(row(&application, "Show icons").contains("false [default]"));
+    assert_eq!(shown(&application, "Show icons"), "false");
     focus_setting(&mut application, "appearance.showIcons");
     assert!(
         rendered_application_rows(&application)
@@ -1335,9 +1383,9 @@ fn the_appearance_theme_row_opens_the_picker_and_cancel_returns_to_the_row() {
     press(&mut application, KeyCode::Right, KeyModifiers::NONE);
     press(&mut application, KeyCode::Right, KeyModifiers::NONE);
 
-    let theme = row(&application, "Theme");
-    assert!(
-        theme.contains("catppuccin [pinned]"),
+    let theme = shown(&application, "Theme");
+    assert_eq!(
+        theme, "catppuccin ●",
         "the row shows the effective open Setting value: {theme:?}"
     );
     assert_eq!(focused_key(&application), "appearance.theme");
@@ -1403,7 +1451,7 @@ fn space_cycles_appearance_mode_through_system_dark_and_light_then_wraps() {
         ..EffectiveSettings::default()
     };
     deliver_snapshot(&mut application, dark, &["appearance.mode"]);
-    assert!(row(&application, "Mode").contains("dark [pinned]"));
+    assert_eq!(shown(&application, "Mode"), "dark ●");
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
         MutatesSetting(SettingMutation::AppearanceMode {
@@ -1438,9 +1486,9 @@ fn the_experimental_tab_stands_past_the_providers_and_lists_the_settings_declare
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_experimental_tab(&mut application);
 
-    let serving = row(&application, "Serving");
-    assert!(
-        serving.contains("false [default]"),
+    let serving = shown(&application, "Serving");
+    assert_eq!(
+        serving, "false",
         "Serving is off until the reader turns it on: {serving:?}"
     );
     assert_eq!(
@@ -1463,9 +1511,9 @@ fn the_experimental_tab_stands_past_the_providers_and_lists_the_settings_declare
             "the Experimental tab presents the {label} Server Setting"
         );
     }
-    let listener = row(&application, "Serving listener");
-    assert!(
-        listener.contains("true [default]"),
+    let listener = shown(&application, "Serving listener");
+    assert_eq!(
+        listener, "true",
         "the listener is on until the reader turns it off, so Serving opens it as it always \
          has: {listener:?}"
     );
@@ -1509,9 +1557,9 @@ fn the_broker_setting_stands_under_the_experimental_tab_and_is_on_by_default() {
     let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
     open_experimental_tab(&mut application);
 
-    let broker = row(&application, "Broker");
-    assert!(
-        broker.contains("true [default]"),
+    let broker = shown(&application, "Broker");
+    assert_eq!(
+        broker, "true",
         "the Broker is offered until the reader turns it off: {broker:?}"
     );
     let descriptor = suru::settings::SCHEMA
@@ -1547,16 +1595,16 @@ fn the_broker_limits_stand_under_the_experimental_tab_and_take_a_typed_cap() {
     open_experimental_tab(&mut application);
 
     for (label, key, default) in [
-        ("Broker depth limit", "broker.maxDepth", "3 [default]"),
+        ("Broker depth limit", "broker.maxDepth", "3"),
         (
             "Broker concurrency limit",
             "broker.maxConcurrentSubagents",
-            "6 [default]",
+            "6",
         ),
     ] {
-        let limit = row(&application, label);
+        let limit = shown(&application, label);
         assert!(
-            limit.contains(default),
+            limit == default,
             "{key} holds its built-in cap until the reader pins another: {limit:?}"
         );
         let descriptor = suru::settings::SCHEMA
@@ -1573,8 +1621,9 @@ fn the_broker_limits_stand_under_the_experimental_tab_and_take_a_typed_cap() {
         ApplicationTransition::Continue,
         "a typed cap has no list for Space to step through"
     );
-    assert!(
-        row(&application, "Broker depth limit").contains("3 [default]"),
+    assert_eq!(
+        shown(&application, "Broker depth limit"),
+        "3",
         "so Space leaves the depth limit where it was"
     );
     assert_eq!(
@@ -1623,8 +1672,8 @@ fn the_broker_limits_stand_under_the_experimental_tab_and_take_a_typed_cap() {
         &["broker.maxDepth", "broker.maxConcurrentSubagents"],
     );
     assert!(
-        row(&application, "Broker depth limit").contains("10 [pinned]")
-            && row(&application, "Broker concurrency limit").contains("20 [pinned]"),
+        shown(&application, "Broker depth limit") == "10 ●"
+            && shown(&application, "Broker concurrency limit") == "20 ●",
         "each row reads the count the refreshed snapshot pinned"
     );
 
@@ -1698,8 +1747,9 @@ fn a_broker_limit_outside_its_bound_stays_in_the_editor_and_escape_discards_the_
         !rendered.contains("Subagents at once"),
         "Esc closes the editor: {rendered}"
     );
-    assert!(
-        row(&application, "Broker concurrency limit").contains("6 [default]"),
+    assert_eq!(
+        shown(&application, "Broker concurrency limit"),
+        "6",
         "and leaves the cap where it was"
     );
 }
@@ -1776,8 +1826,9 @@ fn clicking_a_row_selects_it_without_changing_a_value() {
         "transcript.reasoningVisibility",
         "the row the reader pointed at is the one an edit would now act on"
     );
-    assert!(
-        row(&application, "Reasoning visibility").contains("hidden [default]"),
+    assert_eq!(
+        shown(&application, "Reasoning visibility"),
+        "hidden",
         "and it is worth exactly what it was worth before the click"
     );
 
@@ -1893,14 +1944,14 @@ fn the_transcript_tab_marks_each_setting_pinned_or_riding_its_default() {
     );
     open_transcript_tab(&mut application);
 
-    let fold = row(&application, "Default Fold posture");
-    assert!(
-        fold.contains("expanded") && fold.contains("[pinned]"),
+    let fold = shown(&application, "Default Fold posture");
+    assert_eq!(
+        fold, "expanded ●",
         "a Setting a Config Document pins shows its pinned value: {fold:?}"
     );
-    let visibility = row(&application, "Reasoning visibility");
-    assert!(
-        visibility.contains("hidden") && visibility.contains("[default]"),
+    let visibility = shown(&application, "Reasoning visibility");
+    assert_eq!(
+        visibility, "hidden",
         "a Setting nothing pins rides its built-in default: {visibility:?}"
     );
     assert_eq!(
@@ -1936,14 +1987,14 @@ fn the_providers_tab_lists_every_built_in_provider_by_display_name_whatever_its_
         "the Providers keep the built-in order, named as the reader knows them: {rows:?}"
     );
 
-    let copilot = row(&application, "Copilot");
-    assert!(
-        copilot.contains("disabled") && copilot.contains("[pinned]"),
+    let copilot = shown(&application, "Copilot");
+    assert_eq!(
+        copilot, "disabled ●",
         "the Provider the reader turned off says so: {copilot:?}"
     );
     let claude = row(&application, "Claude");
     assert!(
-        !claude.contains("disabled") && claude.contains("[default]"),
+        !claude.contains("disabled") && !claude.ends_with('●'),
         "a Provider nothing pins is on, and an enabled Provider claims nothing further: {claude:?}"
     );
 
@@ -2034,9 +2085,9 @@ fn space_on_a_provider_row_toggles_that_providers_enablement() {
             ),
         )))
         .expect("receive the settings the edit left in force");
-    let codex = row(&application, "Codex");
-    assert!(
-        codex.contains("disabled") && codex.contains("[pinned]"),
+    let codex = shown(&application, "Codex");
+    assert_eq!(
+        codex, "disabled ●",
         "the row follows the refreshed snapshot the edit produced: {codex:?}"
     );
 
@@ -2143,8 +2194,8 @@ fn an_unavailable_provider_names_its_reason_and_fix_and_the_headline_carries_bot
 
     let codex = row(&application, "Codex");
     assert!(
-        codex.contains("not signed in · run `codex login` [default]"),
-        "the row names the reason and what fixes it, and keeps its provenance: {codex:?}"
+        codex.ends_with("Codex · not signed in · run `codex login`"),
+        "the row names the reason and what fixes it, and claims no pin: {codex:?}"
     );
     let rows = rendered_application_rows(&application);
     let panel = rows.join("\n");
@@ -2155,13 +2206,14 @@ fn an_unavailable_provider_names_its_reason_and_fix_and_the_headline_carries_bot
             panic!("the headline carries the whole message while that row is selected: {panel}")
         });
     assert!(
-        rows[message + 1].contains("run `codex login`") && !is_row_for(&rows[message + 1], "Codex"),
+        rows[message + 1].contains("run `codex login`")
+            && !is_row_for(&rows[message + 1], panel_left(&rows), "Codex"),
         "and what fixes it on the line beneath: {panel}"
     );
 }
 
 /// A fix too long for the row is cut short there, never at the cost of the
-/// row's reason or provenance, and is given whole beneath the headline —
+/// row's reason or value column, and is given whole beneath the headline —
 /// wrapped between words, so an install page's address stays unbroken.
 #[test]
 fn a_fix_too_long_for_its_row_is_given_whole_beneath_the_headline() {
@@ -2192,9 +2244,8 @@ fn a_fix_too_long_for_its_row_is_given_whole_beneath_the_headline() {
 
     let copilot = row(&application, "Copilot");
     assert!(
-        copilot.contains("Copilot · not installed · install the")
-            && copilot.contains("… [default]"),
-        "the row begins the fix and cuts it short before its provenance: {copilot:?}"
+        copilot.contains("Copilot · not installed · install the") && copilot.ends_with('…'),
+        "the row begins the fix and cuts it short before the value column: {copilot:?}"
     );
     let rows = rendered_application_rows(&application);
     let panel = rows.join("\n");
@@ -2393,12 +2444,12 @@ fn a_failed_read_says_error_while_a_serving_catalog_says_nothing() {
     );
     let copilot = row(&application, "Copilot");
     assert!(
-        copilot.contains("Copilot [default]"),
-        "a fresh catalog leaves nothing between the Provider and its provenance: {copilot:?}"
+        copilot.ends_with("▸ Copilot"),
+        "a fresh catalog leaves nothing after the Provider's name: {copilot:?}"
     );
     let claude = row(&application, "Claude");
     assert!(
-        claude.contains("Claude [default]"),
+        claude.ends_with("▸ Claude"),
         "and so does a stale one that is still serving what it last read: {claude:?}"
     );
 }
@@ -2655,19 +2706,19 @@ fn enter_reveals_a_providers_further_settings_beneath_it_and_hides_them_again() 
         label_column(&application, "Reasoning summary") > label_column(&application, "Codex"),
         "drawn indented beneath it: {rows:?}"
     );
-    let summary = row(&application, "Reasoning summary");
-    assert!(
-        summary.contains("auto") && summary.contains("[default]"),
+    let summary = shown(&application, "Reasoning summary");
+    assert_eq!(
+        summary, "auto",
         "and reading as an ordinary Setting row, value and provenance alike: {summary:?}"
     );
-    let policy = row(&application, "Approval policy");
-    assert!(
-        policy.contains("on-request") && policy.contains("[default]"),
+    let policy = shown(&application, "Approval policy");
+    assert_eq!(
+        policy, "on-request",
         "Codex's native Approval policy appears under its row: {policy:?}"
     );
-    let sandbox = row(&application, "Sandbox mode");
-    assert!(
-        sandbox.contains("workspace-write") && sandbox.contains("[default]"),
+    let sandbox = shown(&application, "Sandbox mode");
+    assert_eq!(
+        sandbox, "workspace-write",
         "Codex's native sandbox appears under its row: {sandbox:?}"
     );
     assert_eq!(
@@ -2731,9 +2782,9 @@ fn a_revealed_setting_navigates_cycles_and_resets_like_any_other_row() {
         },
         &["provider.codex.reasoningSummary"],
     );
-    let summary = row(&application, "Reasoning summary");
-    assert!(
-        summary.contains("concise") && summary.contains("[pinned]"),
+    let summary = shown(&application, "Reasoning summary");
+    assert_eq!(
+        summary, "concise ●",
         "the revealed row follows the refreshed snapshot the edit produced: {summary:?}"
     );
 
@@ -2778,16 +2829,19 @@ fn a_providers_enablement_never_appears_inside_its_own_expansion() {
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
 
     let rows = rendered_application_rows(&application);
+    let left = panel_left(&rows);
     let codex_rows = rows
         .iter()
-        .filter(|row| is_row_for(row, "Codex Provider"))
+        .filter(|row| is_row_for(row, left, "Codex Provider"))
         .count();
     assert_eq!(
         codex_rows, 0,
         "the Enablement's own label surfaces nowhere: {rows:?}"
     );
     assert_eq!(
-        rows.iter().filter(|row| is_row_for(row, "Codex")).count(),
+        rows.iter()
+            .filter(|row| is_row_for(row, left, "Codex"))
+            .count(),
         1,
         "and Codex holds exactly the one row that stands for it: {rows:?}"
     );
@@ -2804,11 +2858,8 @@ fn copilot_permissions_appear_under_the_copilot_provider() {
 
     focus_setting(&mut application, "provider.copilot.enabled");
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
-    let permissions = row(&application, "Permissions");
-    assert!(
-        permissions.contains("auto") && permissions.contains("[default]"),
-        "{permissions:?}"
-    );
+    let permissions = shown(&application, "Permissions");
+    assert_eq!(permissions, "auto");
     let rows = rendered_application_rows(&application);
     assert_eq!(
         row_index(&rows, "Permissions"),
@@ -2825,11 +2876,8 @@ fn claude_permission_mode_appears_under_the_claude_provider() {
     focus_setting(&mut application, "provider.claude.enabled");
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
 
-    let permission = row(&application, "Permission mode");
-    assert!(
-        permission.contains("auto") && permission.contains("[default]"),
-        "{permission:?}"
-    );
+    let permission = shown(&application, "Permission mode");
+    assert_eq!(permission, "auto");
     let rows = rendered_application_rows(&application);
     assert_eq!(
         row_index(&rows, "Permission mode"),
@@ -2957,8 +3005,9 @@ fn choosing_a_value_pins_it_and_the_row_follows_the_refreshed_snapshot() {
         }),
         "choosing a value emits its set mutation immediately"
     );
-    assert!(
-        row(&application, "Default Fold posture").contains("folded [default]"),
+    assert_eq!(
+        shown(&application, "Default Fold posture"),
+        "folded",
         "the row waits for the server rather than showing an edit the file has not taken"
     );
 
@@ -2970,8 +3019,9 @@ fn choosing_a_value_pins_it_and_the_row_follows_the_refreshed_snapshot() {
             ),
         )))
         .expect("receive the settings the edit left in force");
-    assert!(
-        row(&application, "Default Fold posture").contains("expanded [pinned]"),
+    assert_eq!(
+        shown(&application, "Default Fold posture"),
+        "expanded ●",
         "the row reflects the refreshed snapshot the edit produced"
     );
 }
@@ -2983,8 +3033,9 @@ fn session_content_width_row_spells_maxima_and_space_selects_fill() {
     open_panel(&mut application);
     focus_setting(&mut application, "session.contentWidth");
 
-    assert!(
-        row(&application, "Session content width").contains("max 80 columns [default]"),
+    assert_eq!(
+        shown(&application, "Session content width"),
+        "max 80 columns",
         "the built-in maximum is visible as a default"
     );
     assert_eq!(
@@ -3000,8 +3051,9 @@ fn session_content_width_row_spells_maxima_and_space_selects_fill() {
         with_content_width(SessionContentWidth::Maximum(132)),
         &["session.contentWidth"],
     );
-    assert!(
-        row(&application, "Session content width").contains("max 132 columns [pinned]"),
+    assert_eq!(
+        shown(&application, "Session content width"),
+        "max 132 columns ●",
         "an arbitrary maximum is spelled distinctly from its provenance"
     );
     assert_eq!(
@@ -3045,8 +3097,9 @@ fn sidebar_width_at_launch_uses_the_numeric_editor_and_typed_mutation() {
     open_panel(&mut application);
     focus_setting(&mut application, "sidebar.initialWidth");
 
-    assert!(
-        row(&application, "Sidebar width at launch").contains("48 columns [pinned]"),
+    assert_eq!(
+        shown(&application, "Sidebar width at launch"),
+        "48 columns ●",
         "the active width is shown in General"
     );
     assert_eq!(
@@ -3079,8 +3132,9 @@ fn aside_width_at_launch_uses_the_numeric_editor_and_typed_mutation() {
     open_panel(&mut application);
     focus_setting(&mut application, "aside.initialWidth");
 
-    assert!(
-        row(&application, "Aside width at launch").contains("48 columns [pinned]"),
+    assert_eq!(
+        shown(&application, "Aside width at launch"),
+        "48 columns ●",
         "the active width is shown in General"
     );
     assert_eq!(
@@ -3132,8 +3186,9 @@ fn a_valid_numeric_edit_emits_a_typed_mutation_and_waits_for_the_refreshed_snaps
         }),
         "Enter applies the edited number through the Setting's typed mutation"
     );
-    assert!(
-        row(&application, "Session content width").contains("max 132 columns [pinned]"),
+    assert_eq!(
+        shown(&application, "Session content width"),
+        "max 132 columns ●",
         "the row waits for the refreshed settings snapshot"
     );
 
@@ -3142,8 +3197,9 @@ fn a_valid_numeric_edit_emits_a_typed_mutation_and_waits_for_the_refreshed_snaps
         with_content_width(SessionContentWidth::Maximum(120)),
         &["session.contentWidth"],
     );
-    assert!(
-        row(&application, "Session content width").contains("max 120 columns [pinned]"),
+    assert_eq!(
+        shown(&application, "Session content width"),
+        "max 120 columns ●",
         "the refreshed snapshot moves the row to the accepted maximum"
     );
 }
@@ -3158,8 +3214,9 @@ fn the_auto_settle_row_spells_its_threshold_and_space_turns_settling_off() {
     open_panel(&mut application);
     focus_setting(&mut application, "sidebar.autoSettle");
 
-    assert!(
-        row(&application, "Settle idle Sessions").contains("3 days [default]"),
+    assert_eq!(
+        shown(&application, "Settle idle Sessions"),
+        "3 days",
         "the built-in threshold is visible as a default: {:?}",
         row(&application, "Settle idle Sessions")
     );
@@ -3263,8 +3320,9 @@ fn fill_has_no_hidden_maximum_and_cancel_discards_the_numeric_edit() {
         ApplicationTransition::Continue,
         "cancelling produces no mutation"
     );
-    assert!(
-        row(&application, "Session content width").contains("fill [pinned]"),
+    assert_eq!(
+        shown(&application, "Session content width"),
+        "fill ●",
         "cancelling returns to the unchanged panel"
     );
 
@@ -3473,8 +3531,9 @@ fn the_aside_rows_stand_in_general_beside_the_sidebars_and_visibility_cycles() {
         row_index(&rows, "Settle idle Sessions") < row_index(&rows, "Aside at launch"),
         "the Aside's Settings follow the Sidebar's on the General tab: {rows:?}"
     );
-    assert!(
-        row(&application, "Aside at launch").contains("shown [default]"),
+    assert_eq!(
+        shown(&application, "Aside at launch"),
+        "shown",
         "the Aside begins shown unless a Setting says otherwise"
     );
     assert_eq!(
@@ -3485,8 +3544,9 @@ fn the_aside_rows_stand_in_general_beside_the_sidebars_and_visibility_cycles() {
     );
 
     focus_setting(&mut application, "aside.initialWidth");
-    assert!(
-        row(&application, "Aside width at launch").contains("40 columns [default]"),
+    assert_eq!(
+        shown(&application, "Aside width at launch"),
+        "40 columns",
         "and begins 40 columns wide"
     );
 }
@@ -3507,8 +3567,9 @@ fn the_general_tab_presents_hiding_subsessions_on_by_default_beside_the_sidebars
         row_index(&rows, "Settle idle Sessions") < row_index(&rows, "Hide Subsessions"),
         "it follows the Sidebar's own Settings: {rows:?}"
     );
-    assert!(
-        row(&application, "Hide Subsessions").contains("true [default]"),
+    assert_eq!(
+        shown(&application, "Hide Subsessions"),
+        "true",
         "Subsessions are hidden unless the reader says otherwise: {:?}",
         row(&application, "Hide Subsessions")
     );
@@ -3534,8 +3595,9 @@ fn the_general_tab_presents_hiding_subsessions_on_by_default_beside_the_sidebars
         },
         &["sidekick.hideSubsessions"],
     );
-    assert!(
-        row(&application, "Hide Subsessions").contains("false [pinned]"),
+    assert_eq!(
+        shown(&application, "Hide Subsessions"),
+        "false ●",
         "the refreshed snapshot moves the row to the pin: {:?}",
         row(&application, "Hide Subsessions")
     );
@@ -3556,8 +3618,9 @@ fn enter_never_edits_a_value_and_opens_nothing_on_a_row_that_stands_for_nothing(
         ApplicationTransition::Continue,
         "Enter edited a Transcript Setting"
     );
-    assert!(
-        row(&application, "Default Fold posture").contains("folded [default]"),
+    assert_eq!(
+        shown(&application, "Default Fold posture"),
+        "folded",
         "every Setting stays exactly where it was"
     );
 
@@ -3612,8 +3675,9 @@ fn resetting_a_pinned_setting_unpins_it_and_the_row_returns_to_the_default() {
             snapshot(EffectiveSettings::default(), &[]),
         )))
         .expect("receive the settings the reset left in force");
-    assert!(
-        row(&application, "Default Fold posture").contains("folded [default]"),
+    assert_eq!(
+        shown(&application, "Default Fold posture"),
+        "folded",
         "the row returns to the built-in default, unmarked as pinned"
     );
 }
@@ -3722,8 +3786,9 @@ fn clicking_a_revealed_setting_focuses_it_like_any_other_row() {
         "provider.codex.reasoningSummary",
         "the revealed row the reader pointed at is the focused one"
     );
-    assert!(
-        row(&application, "Reasoning summary").contains("auto [default]"),
+    assert_eq!(
+        shown(&application, "Reasoning summary"),
+        "auto",
         "and it is worth exactly what it was worth before the click"
     );
 
@@ -3749,7 +3814,9 @@ fn a_click_lands_on_the_row_the_window_drew_there() {
     // Short enough that the box has room for the last rows of the tab alone.
     let cramped = rendered_application_rows_at(&application, 80, 9);
     assert!(
-        !cramped.iter().any(|row| is_row_for(row, "Codex")),
+        !cramped
+            .iter()
+            .any(|row| is_row_for(row, panel_left(&cramped), "Codex")),
         "the window has scrolled past the tab's first row: {cramped:?}"
     );
 
@@ -3935,8 +4002,9 @@ fn the_title_derivation_row_cycles_its_named_values_and_spells_a_pinned_selectio
     open_panel(&mut application);
     focus_setting(&mut application, "derivation.errand");
 
-    assert!(
-        row(&application, "Title, Icon, and branch derivation").contains("· session"),
+    assert_eq!(
+        shown(&application, "Title, Icon, and branch derivation"),
+        "session",
         "the built-in default follows the Session's own Provider: {:?}",
         row(&application, "Title, Icon, and branch derivation")
     );
@@ -3960,9 +4028,9 @@ fn the_title_derivation_row_cycles_its_named_values_and_spells_a_pinned_selectio
         deriving_titles_with(DerivationErrand::Pinned(pinned_selection())),
         &["derivation.errand"],
     );
-    let pinned_row = row(&application, "Title, Icon, and branch derivation");
-    assert!(
-        pinned_row.contains("codex · gpt-5-mini") && pinned_row.contains("[pinned]"),
+    let pinned_row = shown(&application, "Title, Icon, and branch derivation");
+    assert_eq!(
+        pinned_row, "codex · gpt-5-mini ●",
         "a value the schema never named is spelled by the Setting itself: {pinned_row:?}"
     );
     assert_eq!(
@@ -4264,7 +4332,10 @@ fn cancelling_title_options_discards_staged_changes_and_preserves_the_setting() 
         ApplicationTransition::Continue
     );
     assert_eq!(focused_key(&application), "derivation.errand");
-    assert!(row(&application, "Title, Icon, and branch derivation").contains("· session"));
+    assert_eq!(
+        shown(&application, "Title, Icon, and branch derivation"),
+        "session"
+    );
 }
 
 #[test]
@@ -4317,10 +4388,11 @@ fn copy_text_selection_cycles_on_the_general_tab() {
         deliver_snapshot(&mut application, settings, &["textSelection.copy"]);
         focus_setting(&mut application, "textSelection.copy");
         assert!(
-            row(&application, "Copy Text Selection").contains(match current {
-                TextSelectionCopy::Release => "release [pinned]",
-                TextSelectionCopy::Manual => "manual [pinned]",
-            })
+            shown(&application, "Copy Text Selection")
+                == match current {
+                    TextSelectionCopy::Release => "release ●",
+                    TextSelectionCopy::Manual => "manual ●",
+                }
         );
         assert_eq!(
             press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
@@ -4368,4 +4440,501 @@ fn numeric_editor_selection_is_modal_over_the_settings_panel() {
     let screen = rendered_application_rows_at(&application, 100, 32).join("\n");
     assert!(!screen.contains("Maximum columns"));
     assert!(screen.contains("Session content width"));
+}
+
+/// A terminal wide enough that the panel splits, its rows on the left and the
+/// focused Setting detailed in a pane beside them.
+const WIDE: (u16, u16) = (140, 30);
+
+/// The wide panel as its two sides, one string per screen row of each: the
+/// rows on the left, and the pane beside them. Rows the split does not reach —
+/// the tab bar, the controls — are neither's.
+fn split_panel(application: &Application) -> (Vec<String>, Vec<String>) {
+    let rows = rendered_application_rows_at(application, WIDE.0, WIDE.1);
+    let left = panel_left(&rows);
+    rows.iter()
+        .filter_map(|row| {
+            let start = row.char_indices().nth(left + 1)?.0;
+            let parts = row[start..].split('│').collect::<Vec<_>>();
+            (parts.len() >= 3).then(|| (parts[0].to_owned(), parts[1].to_owned()))
+        })
+        .unzip()
+}
+
+/// The pane's rows read as text, each with its runs of spaces closed up, so a
+/// test names what a row says rather than how far its columns stand apart.
+fn pane(application: &Application) -> Vec<String> {
+    split_panel(application)
+        .1
+        .iter()
+        .map(|row| row.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+/// The pane's text as one paragraph, wrapped rows rejoined, for a test of a
+/// line the pane wraps.
+fn pane_text(application: &Application) -> String {
+    pane(application)
+        .into_iter()
+        .filter(|row| !row.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The pane row reading `text`, which says where it stands among the rest.
+fn pane_row(pane: &[String], text: &str) -> usize {
+    pane.iter()
+        .position(|row| row == text)
+        .unwrap_or_else(|| panic!("the pane has no row reading {text:?}: {pane:#?}"))
+}
+
+#[test]
+fn a_wide_panel_details_the_focused_setting_in_a_pane_beside_its_rows() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        EffectiveSettings {
+            transcript: TranscriptSettings {
+                groups: suru::protocol::GroupPosture::Expanded,
+                ..TranscriptSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &["transcript.groups"],
+    );
+    open_transcript_tab(&mut application);
+    focus_setting(&mut application, "transcript.groups");
+
+    let details = pane(&application);
+    assert_eq!(details[0], "Groups", "the pane is headed by the Setting");
+    assert_eq!(
+        details[1], "transcript.groups",
+        "then the key it is pinned by"
+    );
+    let text = pane_text(&application);
+    assert!(
+        text.contains(
+            "How a Session view opens its Groups of Commands, Tool Calls, and Reasoning: \
+             collapsed, expanded, or not grouped at all"
+        ),
+        "the description is given whole, however many rows it takes: {details:#?}"
+    );
+    let collapsed = pane_row(&details, "○ collapsed default");
+    assert_eq!(
+        &details[collapsed + 1..collapsed + 3],
+        ["● expanded", "○ off"],
+        "every value it accepts, the one in force marked and the built-in default \
+         tagged: {details:#?}"
+    );
+    let pinned = pane_row(&details, "Pinned");
+    assert_eq!(
+        &details[pinned + 1..pinned + 3],
+        ["Applies in every TUI", "Sidekicks read and change"],
+        "then where it applies and what a Sidekick may do with it: {details:#?}"
+    );
+
+    let (list, _) = split_panel(&application);
+    assert!(
+        list[0].starts_with("  Default Fold posture"),
+        "the rows begin straight beneath the tab bar, the headline gone to the pane: \
+         {list:#?}"
+    );
+    let groups = list
+        .iter()
+        .find(|row| row.contains("Groups"))
+        .expect("the list has a Groups row");
+    assert_eq!(shown_in(groups), "expanded ●", "{groups:?}");
+    assert!(
+        !list.iter().any(|row| row.contains("transcript.groups")),
+        "{list:#?}"
+    );
+
+    press(&mut application, KeyCode::Up, KeyModifiers::NONE);
+    let details = pane(&application);
+    assert_eq!(details[0], "Default Fold posture", "the pane follows focus");
+    pane_row(&details, "Built-in default");
+}
+
+#[test]
+fn the_rows_end_on_a_value_column_that_holds_still_and_marks_a_pin() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        opening_at(FoldPosture::Expanded),
+        &["transcript.defaultFoldPosture"],
+    );
+    open_transcript_tab(&mut application);
+
+    let narrow = rendered_application_rows(&application);
+    let (wide, _) = split_panel(&application);
+    let left = panel_left(&narrow);
+    let narrow = narrow
+        .iter()
+        .map(|row| inside(row, left).to_owned())
+        .collect::<Vec<_>>();
+    for rows in [narrow, wide] {
+        let value_column = |label: &str, value: &str| {
+            let row = &rows[row_index_inside(&rows, label)];
+            row[..row.find(value).expect("the row shows its value")]
+                .chars()
+                .count()
+        };
+        assert_eq!(
+            value_column("Default Fold posture", "expanded"),
+            value_column("Reasoning visibility", "hidden"),
+            "the values stand in one column: {rows:#?}"
+        );
+        assert_eq!(
+            value_column("Default Fold posture", "expanded"),
+            value_column("Command auto-expansion", "false"),
+            "{rows:#?}"
+        );
+        let fold = &rows[row_index_inside(&rows, "Default Fold posture")];
+        let visibility = &rows[row_index_inside(&rows, "Reasoning visibility")];
+        assert!(
+            fold.trim_end().ends_with('●') && !visibility.contains('●'),
+            "a pinned value is marked where the default is not: {rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains('[')),
+            "no row spells its provenance out: {rows:#?}"
+        );
+    }
+}
+
+/// Where the row for `label` stands among rows already read from inside the
+/// box.
+fn row_index_inside(rows: &[String], label: &str) -> usize {
+    rows.iter()
+        .position(|row| (row.starts_with("› ") || row.starts_with("  ")) && row.contains(label))
+        .unwrap_or_else(|| panic!("no row for {label:?}: {rows:#?}"))
+}
+
+#[test]
+fn the_pane_lists_an_open_settings_unnamed_values_beside_what_else_it_accepts() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        with_sidebar_width(48),
+        &["sidebar.initialWidth"],
+    );
+    open_panel(&mut application);
+    focus_setting(&mut application, "sidebar.initialWidth");
+
+    let details = pane(&application);
+    let default = pane_row(
+        &details,
+        &format!(
+            "○ {} columns default",
+            SidebarSettings::default().initial_width
+        ),
+    );
+    assert_eq!(
+        &details[default + 1..default + 3],
+        ["● 48 columns", "or an integer of at least 24"],
+        "the built-in default, the value in force, and what else the Setting takes: \
+         {details:#?}"
+    );
+}
+
+#[test]
+fn the_pane_lists_a_list_settings_entries_one_to_a_row() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        with_workspace_roots(&["~/src", WORK_ROOT]),
+        &["workspace.roots"],
+    );
+    open_panel(&mut application);
+    click_tab(&mut application, "Source Control");
+    focus_setting(&mut application, "workspace.roots");
+
+    let details = pane(&application);
+    let first = pane_row(&details, "○ none default");
+    assert_eq!(
+        &details[first + 1..first + 3],
+        ["● ~/src".to_owned(), WORK_ROOT.to_owned()],
+        "each Root on a row of its own beneath the one mark: {details:#?}"
+    );
+    assert!(
+        pane_text(&application).contains("or a list of absolute paths or paths beginning with ~"),
+        "{details:#?}"
+    );
+}
+
+#[test]
+fn the_pane_says_where_a_setting_applies_and_why_a_sidekick_may_only_read_it() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    click_tab(&mut application, "Source Control");
+    focus_setting(&mut application, "worktree.autoReclaim");
+
+    let text = pane_text(&application);
+    assert!(text.contains("Applies on the Server"), "{text}");
+    assert!(
+        text.contains(
+            "Sidekicks read only, since turning it on lets Suru remove Worktrees, ignored \
+             files and all, which no later change can undo"
+        ),
+        "the reason is given whole, wrapped beneath its label: {text}"
+    );
+    let details = pane(&application);
+    let sidekicks = details
+        .iter()
+        .position(|row| row.starts_with("Sidekicks"))
+        .expect("the pane says what a Sidekick may do");
+    let (_, rows) = split_panel(&application);
+    assert!(
+        rows[sidekicks + 1].starts_with("            "),
+        "a wrapped reason stands in past the labels: {rows:#?}"
+    );
+
+    press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+    open_experimental_tab(&mut application);
+    focus_setting(&mut application, "serving.enabled");
+    let details = pane(&application);
+    pane_row(&details, "Sidekicks hidden from them");
+}
+
+#[test]
+fn a_wide_panel_leads_its_pane_with_a_providers_condition_and_its_whole_fix() {
+    const INSTALL_PAGE: &str =
+        "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli";
+    let workspace = workspace_dir();
+    let mut settings = EffectiveSettings::default();
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    let mut application = client_showing(workspace.path(), settings, &[]);
+    let request = read_providers_tab(&mut application);
+    deliver_catalog(
+        &mut application,
+        request,
+        &[
+            ("codex", ProviderCatalogStatus::Fresh),
+            (
+                "copilot",
+                ProviderCatalogStatus::Unavailable {
+                    reason: ProviderUnavailability::NotInstalled,
+                    message: "could not launch `copilot`".to_owned(),
+                    fix: format!("install the Copilot CLI from {INSTALL_PAGE}"),
+                },
+            ),
+            ("claude", ProviderCatalogStatus::Fresh),
+        ],
+    );
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+
+    let details = pane(&application);
+    let message = pane_row(&details, "could not launch `copilot`");
+    assert_eq!(
+        details[message + 1],
+        "install the Copilot CLI from",
+        "the fix stands beneath the condition: {details:#?}"
+    );
+    assert!(
+        format!("{}{}", details[message + 2], details[message + 3]) == INSTALL_PAGE,
+        "whole, its address on rows of its own: {details:#?}"
+    );
+    let description = details
+        .iter()
+        .position(|row| row.starts_with("Whether Suru offers Copilot"))
+        .expect("the pane describes the Enablement the row stands for");
+    assert!(
+        message < description,
+        "and both lead the Setting's own account: {details:#?}"
+    );
+    let (list, _) = split_panel(&application);
+    assert!(
+        list[0].contains("Codex"),
+        "the rows begin straight beneath the tab bar, the condition gone to the pane: \
+         {list:#?}"
+    );
+
+    let tail = &details[message + 3];
+    let buffer = rendered_application_buffer(&application, WIDE.0, WIDE.1);
+    let start = text_position(&buffer, "install the Copilot CLI from");
+    let tail_start = text_position(&buffer, tail);
+    let end = (tail_start.0 + tail.len() as u16 - 1, tail_start.1);
+    assert_eq!(
+        super::selection::drag(&mut application, start, end),
+        ApplicationTransition::CopyToClipboard(
+            format!("install the Copilot CLI from {INSTALL_PAGE}").into()
+        ),
+        "the pane is read apart from the rows beside it, a wrapped fix as written"
+    );
+}
+
+#[test]
+fn a_refused_edit_leads_the_pane_above_the_providers_own_condition() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let request = read_providers_tab(&mut application);
+    deliver_catalog(
+        &mut application,
+        request,
+        &[(
+            "codex",
+            ProviderCatalogStatus::Unavailable {
+                reason: ProviderUnavailability::NotInstalled,
+                message: "the codex CLI is not on PATH".to_owned(),
+                fix: "fix the CLI".to_owned(),
+            },
+        )],
+    );
+    press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE);
+    application
+        .handle_event(ApplicationEvent::SettingMutationFailed {
+            request: SettingRequest::new(),
+            error: "Config Document \"suru.jsonc\" is not valid JSONC".to_owned(),
+        })
+        .expect("hear that the edit never landed");
+
+    let details = pane(&application);
+    let error = pane_row(
+        &details,
+        "Config Document \"suru.jsonc\" is not valid JSONC",
+    );
+    let message = pane_row(&details, "the codex CLI is not on PATH");
+    assert!(
+        error < message && details[message + 1] == "fix the CLI",
+        "the refusal leads, and the Provider's condition still follows with its fix: \
+         {details:#?}"
+    );
+    let buffer = rendered_application_buffer(&application, WIDE.0, WIDE.1);
+    assert_eq!(
+        styling(&buffer, "is not valid JSONC"),
+        styling(
+            &rendered_application_buffer(&application, 80, 15),
+            "is not valid JSONC"
+        ),
+        "it reads as the same failure the narrow headline reports"
+    );
+}
+
+#[test]
+fn a_diagnostic_naming_the_focused_setting_leads_the_pane_with_its_file() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let file = super::support::named_workspace_path("suru.jsonc");
+    let diagnostic = |key: &str, message: &str| suru::protocol::SettingsDiagnostic {
+        severity: suru::protocol::SettingsDiagnosticSeverity::Warning,
+        file: file.clone(),
+        key: Some(key.to_owned()),
+        message: message.to_owned(),
+    };
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
+                settings: EffectiveSettings::default(),
+                pinned: Vec::new(),
+                diagnostics: vec![
+                    diagnostic(
+                        "transcript.groups",
+                        "ignored because its value is not one of \"collapsed\", \
+                         \"expanded\", or \"off\"",
+                    ),
+                    diagnostic("transcript.reasoningVisibility", "ignored for a test"),
+                ],
+            },
+        )))
+        .expect("receive the snapshot and its diagnostics");
+    open_transcript_tab(&mut application);
+    focus_setting(&mut application, "transcript.groups");
+
+    let text = pane_text(&application);
+    assert!(
+        text.contains(&format!(
+            "{}: ignored because its value is not one of \"collapsed\", \"expanded\", or \"off\"",
+            file.display()
+        )),
+        "the pin Suru ignored is named with the Config Document it was in: {text}"
+    );
+    assert!(
+        !text.contains("ignored for a test"),
+        "another Setting's diagnostic is that Setting's business: {text}"
+    );
+}
+
+#[test]
+fn a_panel_too_narrow_to_split_keeps_its_headline_above_the_rows() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_transcript_tab(&mut application);
+
+    let narrow = rendered_application_rows_at(&application, 103, 20).join("\n");
+    assert!(
+        narrow.contains("transcript.defaultFoldPosture · How a Session view opens"),
+        "a panel short of the room to split heads its rows with the headline: {narrow}"
+    );
+    let wide = rendered_application_rows_at(&application, 104, 30);
+    let left = panel_left(&wide);
+    assert!(
+        wide.iter()
+            .any(|row| inside(row, left).starts_with("  Groups") && row.matches('│').count() >= 3),
+        "with the room, it splits: {wide:#?}"
+    );
+    assert!(
+        !wide.join("\n").contains("transcript.defaultFoldPosture ·"),
+        "and the headline goes to the pane: {wide:#?}"
+    );
+}
+
+#[test]
+fn a_click_on_a_wide_panel_focuses_the_row_it_lands_on_and_never_the_pane() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_transcript_tab(&mut application);
+
+    let buffer = rendered_application_buffer(&application, WIDE.0, WIDE.1);
+    let (_, visibility_row) = text_position(&buffer, "Reasoning visibility");
+    let (pane_column, _) = text_position(&buffer, "transcript.defaultFoldPosture");
+    let before = rendered_application_rows_at(&application, WIDE.0, WIDE.1);
+    for column in [pane_column, pane_column - 2] {
+        assert_eq!(
+            click(&mut application, column, visibility_row),
+            ApplicationTransition::Continue
+        );
+        assert_eq!(
+            rendered_application_rows_at(&application, WIDE.0, WIDE.1),
+            before,
+            "a click on the pane, or its border, beside a row focuses nothing"
+        );
+    }
+
+    let (column, row) = text_position(&buffer, "Reasoning visibility");
+    click(&mut application, column, row);
+    assert_eq!(
+        pane(&application)[0],
+        "Reasoning visibility",
+        "a click on a row focuses it, and the pane follows"
+    );
+
+    let buffer = rendered_application_buffer(&application, WIDE.0, WIDE.1);
+    let (column, row) = text_position(&buffer, "Experimental");
+    click(&mut application, column, row);
+    assert!(
+        pane_text(&application).contains("serving.enabled"),
+        "a tab label beyond the rows' columns still shows its tab"
+    );
+}
+
+#[test]
+fn a_numeric_editor_opens_over_a_wide_panel() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(
+        workspace.path(),
+        with_sidebar_width(48),
+        &["sidebar.initialWidth"],
+    );
+    open_panel(&mut application);
+    focus_setting(&mut application, "sidebar.initialWidth");
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+
+    let screen = rendered_application_rows_at(&application, WIDE.0, WIDE.1).join("\n");
+    assert!(
+        screen.contains("Columns at launch") && screen.contains("48"),
+        "the editor stands over the split panel: {screen}"
+    );
+    press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(pane(&application)[0], "Sidebar width at launch");
 }

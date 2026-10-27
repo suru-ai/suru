@@ -60,6 +60,13 @@ impl ApplicationNotice {
         self.showing.as_ref()
     }
 
+    /// What the latest effective-settings snapshot found wrong with the Config
+    /// Documents, each diagnostic whole, for a surface detailing the Setting
+    /// one of them names.
+    pub(super) fn settings_diagnostics(&self) -> &[SettingsDiagnostic] {
+        &self.settings_diagnostics
+    }
+
     /// Takes what a freshly received effective-settings snapshot found at
     /// startup. The same startup Notice stays dismissed.
     pub(super) fn receive(&mut self, diagnostics: &[SettingsDiagnostic]) {

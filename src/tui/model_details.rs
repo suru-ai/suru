@@ -15,10 +15,7 @@ use crate::{
     theme::Theme,
 };
 
-use super::{
-    selection::WrappedLine, slots::truncate_to_width, usage::compact_count,
-    wrapped_text::WrappedText,
-};
+use super::{drawn_pane::DrawnPane, slots::truncate_to_width, usage::compact_count};
 
 /// How far an advisory's text and a price table stand in beneath their
 /// headings, and an untitled warning's text beside its marker.
@@ -48,12 +45,6 @@ pub(super) struct DetailsPane<'a> {
     advisories: Vec<(&'a ModelAdvisory, String)>,
 }
 
-/// The rows a pane drew, and each line it wrapped over rows of its own.
-pub(super) struct DrawnPane<'a> {
-    pub(super) lines: Vec<Line<'static>>,
-    pub(super) wrapped: Vec<WrappedLine<'a>>,
-}
-
 impl<'a> DetailsPane<'a> {
     pub(super) fn new(model: &'a ModelDescriptor) -> Self {
         Self {
@@ -71,16 +62,12 @@ impl<'a> DetailsPane<'a> {
     /// The pane in `height` rows `width` columns wide. A pane with more to
     /// say than it has rows for ends on an ellipsis rather than silently.
     pub(super) fn draw(&self, width: u16, height: usize, theme: &Theme) -> DrawnPane<'_> {
-        let mut drawn = DrawnPane {
-            lines: Vec::new(),
-            wrapped: Vec::new(),
-        };
-        let line =
-            |text: &str, style| Line::styled(truncate_to_width(text, usize::from(width)), style);
-        drawn.lines.push(line(
+        let mut drawn = DrawnPane::default();
+        drawn.line(
             &self.model.display_name,
+            width,
             theme.text.primary.add_modifier(Modifier::BOLD),
-        ));
+        );
         drawn.wrap(&self.identity, "", width, theme.text.subdued);
         for (advisory, text) in &self.advisories {
             drawn.lines.push(Line::default());
@@ -90,37 +77,32 @@ impl<'a> DetailsPane<'a> {
             };
             match &advisory.title {
                 Some(title) => {
-                    drawn.lines.push(line(
+                    drawn.line(
                         &format!("{marker}{title}"),
+                        width,
                         style.add_modifier(Modifier::BOLD),
-                    ));
+                    );
                     drawn.wrap(text, INDENT, width, theme.text.primary);
                 }
                 // An untitled advisory is its text alone, a warning's marker
                 // standing where its indent would.
                 None if marker.is_empty() => drawn.wrap(text, "", width, style),
-                None => {
-                    let first = drawn.lines.len();
-                    drawn.wrap(text, INDENT, width, style);
-                    if let Some(row) = drawn.lines.get_mut(first) {
-                        let text = row.to_string();
-                        *row = Line::styled(format!("{marker}{}", &text[INDENT.len()..]), style);
-                    }
-                }
+                None => drawn.wrap_led(marker, text, INDENT, width, style),
             }
         }
         if let Some(prices) = &self.model.details.prices {
             drawn.lines.push(Line::default());
-            drawn.lines.push(line(
+            drawn.line(
                 &format!(
                     "{} per {} tokens",
                     prices.unit,
                     compact_count(prices.per_tokens)
                 ),
+                width,
                 theme.text.subdued,
-            ));
+            );
             for row in price_table(&prices.tiers) {
-                drawn.lines.push(line(&row, theme.text.primary));
+                drawn.line(&row, width, theme.text.primary);
             }
         }
         let specifics = limits_and_options(self.model);
@@ -132,50 +114,15 @@ impl<'a> DetailsPane<'a> {
                 .max()
                 .unwrap_or(0);
             for (label, value) in specifics {
-                drawn.lines.push(line(
+                drawn.line(
                     &format!("{label:<label_width$}  {value}"),
+                    width,
                     theme.text.primary,
-                ));
+                );
             }
         }
         drawn.fit(height, theme);
         drawn
-    }
-}
-
-impl<'a> DrawnPane<'a> {
-    /// `text` broken over rows of its own `width` columns wide.
-    fn wrap(
-        &mut self,
-        text: &'a str,
-        indent: &'static str,
-        width: u16,
-        style: ratatui::style::Style,
-    ) {
-        if text.is_empty() {
-            return;
-        }
-        let wrapped = WrappedText::new(text, indent, width);
-        self.wrapped.push(wrapped.wrapped(self.lines.len()));
-        self.lines.extend(wrapped.lines(style));
-    }
-
-    /// The pane cut to `height` rows, its last row an ellipsis where it had
-    /// more, and each wrapped line to the rows still drawn.
-    fn fit(&mut self, height: usize, theme: &Theme) {
-        if self.lines.len() <= height {
-            return;
-        }
-        let kept = height.saturating_sub(1);
-        self.lines.truncate(kept);
-        if height > 0 {
-            self.lines.push(Line::styled("…", theme.text.subdued));
-        }
-        self.wrapped.retain_mut(|line| {
-            let rows = kept.saturating_sub(line.row);
-            line.parts.truncate(rows);
-            !line.parts.is_empty()
-        });
     }
 }
 
