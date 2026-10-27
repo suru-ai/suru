@@ -15,7 +15,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     theme::Theme,
-    tui::{list_window::ListWindow, render::provider_label, slots::truncate_to_width, spinner},
+    tui::{
+        list_window::ListWindow, provider_icons::provider_label, slots::truncate_to_width, spinner,
+    },
 };
 
 use super::{RowAvailability, RowValue, RowWindow, SettingRow};

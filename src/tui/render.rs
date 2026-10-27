@@ -22,7 +22,6 @@ use crate::{
         MAX_WORKSPACE_DESCRIPTION_CHARS, ModelAvailability, RelayState, ServerIdentity,
         SessionContentWidth, SessionSnapshot, SessionStatus, SessionTimestamp, WatchSummary, Way,
     },
-    provider::built_in_providers,
     theme::Theme,
 };
 
@@ -43,6 +42,7 @@ use super::{
     model_details::{self, DetailsPane},
     model_options::ModelOptionChoiceRow,
     onboarding::OwnServer,
+    provider_icons::provider_label,
     relay_overlay::serve_through_status,
     rename_dialog::RenameGeometry,
     serve_overlay::{CandidateWay, LISTENER_FAILED, LISTENER_OFF, ServeWays},
@@ -6952,28 +6952,6 @@ fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String
                 summary
             }
         }
-    }
-}
-
-/// A Provider's Nerd Font glyph where Suru knows one. Unknown Provider IDs
-/// keep their text-only presentation, which lets future Providers participate
-/// in the shared surfaces before choosing an icon of their own.
-pub(super) fn provider_icon(provider: &crate::protocol::ProviderId) -> Option<char> {
-    built_in_providers()
-        .iter()
-        .find(|candidate| &candidate.id == provider)
-        .and_then(|provider| provider.nerd_font_icon)
-}
-
-pub(super) fn provider_label(
-    show_icons: bool,
-    provider: &crate::protocol::ProviderId,
-    label: &str,
-) -> String {
-    if show_icons && let Some(icon) = provider_icon(provider) {
-        format!("{icon} {label}")
-    } else {
-        label.to_owned()
     }
 }
 

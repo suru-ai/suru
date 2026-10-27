@@ -25,7 +25,8 @@ use crate::theme::Theme;
 
 use super::super::{
     commands::{SemanticCommandId, SemanticInvocation},
-    render::{provider_icon, shimmered_label_spans, working_duration},
+    provider_icons::provider_icon,
+    render::{shimmered_label_spans, working_duration},
     sidebar::workspace_name,
     slots::truncate_to_width,
     spinner,

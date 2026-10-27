@@ -28,6 +28,7 @@ mod model_options;
 mod model_picker;
 mod notice;
 mod onboarding;
+mod provider_icons;
 mod questionnaire;
 mod relay_overlay;
 mod rename_dialog;
