@@ -4766,6 +4766,10 @@ const WIDE: (u16, u16) = (140, 30);
 /// rather than twenty.
 const TIGHT: u16 = 24;
 
+/// Shorter still, so the pane has sixteen: too few for Codex's account of
+/// itself however closely it is packed.
+const SHORT: u16 = 22;
+
 /// The wide panel as its two sides, one string per screen row of each: the
 /// rows on the left, and the pane beside them. Rows the split does not reach —
 /// the tab bar, the controls — are neither's.
@@ -5408,15 +5412,16 @@ fn codex_unavailable_in_a_short_terminal() -> (super::support::WorkspaceDir, App
 
 /// A pane with more to say than rows to say it in leads with what asks
 /// something of the reader while the keys are on the Providers. Once they are
-/// on the Provider's own Settings, the pane keeps its heading and scrolls the
-/// rest beneath it, an ellipsis standing for what went by, until the Setting
-/// the keys are on shows with all of its detail.
+/// on the Provider's own Settings, and packing its detail closer still leaves
+/// it too tall, the pane keeps its heading and scrolls the rest beneath it,
+/// an ellipsis standing for what went by, until the Setting the keys are on
+/// shows with all of its detail.
 #[test]
 fn the_pane_scrolls_the_setting_the_keys_are_on_into_view_with_all_its_detail() {
     let (_workspace, mut application) = codex_unavailable_in_a_short_terminal();
 
-    let details = pane_at(&application, TIGHT);
-    assert_eq!(details.len(), 18, "{details:#?}");
+    let details = pane_at(&application, SHORT);
+    assert_eq!(details.len(), 16, "{details:#?}");
     assert_eq!(details[0], "Codex enabled");
     pane_row(&details, "The codex CLI holds no credentials");
     pane_row(&details, "run `codex login`");
@@ -5428,23 +5433,23 @@ fn the_pane_scrolls_the_setting_the_keys_are_on_into_view_with_all_its_detail() 
     );
 
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
-    let details = pane_at(&application, TIGHT);
+    let details = pane_at(&application, SHORT);
     assert_eq!(
         &details[..3],
         ["Codex enabled", "provider.codex.enabled", "…"],
         "the heading holds while the rest scrolls beneath it: {details:#?}"
     );
     pane_row(&details, "› Reasoning summary auto");
-    let text = pane_text_at(&application, TIGHT);
+    let text = pane_text_at(&application, SHORT);
     assert!(
         text.ends_with("Applies on the Server Sidekicks read and change"),
         "the Setting the keys are on shows with all of its detail: {details:#?}"
     );
 
     press(&mut application, KeyCode::Down, KeyModifiers::NONE);
-    let details = pane_at(&application, TIGHT);
+    let details = pane_at(&application, SHORT);
     pane_row(&details, "› Approval policy on-request");
-    let text = pane_text_at(&application, TIGHT);
+    let text = pane_text_at(&application, SHORT);
     assert!(
         text.ends_with(
             "Sidekicks read only, since it is part of an Approval Posture, which bounds \
@@ -5461,7 +5466,7 @@ fn the_pane_scrolls_the_setting_the_keys_are_on_into_view_with_all_its_detail() 
     );
 
     press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
-    let details = pane_at(&application, TIGHT);
+    let details = pane_at(&application, SHORT);
     pane_row(&details, "The codex CLI holds no credentials");
 }
 
@@ -5522,17 +5527,22 @@ fn leads_however_long_never_push_the_setting_the_keys_are_on_out_of_the_pane() {
         })
         .expect("hear that the edit never landed");
 
-    for height in [TIGHT, 22] {
+    for height in [TIGHT, SHORT] {
         let details = pane_at(&application, height);
         pane_row(&details, "› Permissions auto");
         assert!(
-            pane_text_at(&application, height).ends_with(
-                "Sidekicks read only, since it is part of an Approval Posture, which \
-                 bounds what Agents may do without asking the user"
-            ),
-            "at {height} rows: {details:#?}"
+            pane_text_at(&application, height).contains("is not valid JSONC"),
+            "the refusal holds beneath the heading at {height} rows: {details:#?}"
         );
     }
+    assert!(
+        pane_text_at(&application, TIGHT).ends_with(
+            "Sidekicks read only, since it is part of an Approval Posture, which bounds what \
+             Agents may do without asking the user"
+        ),
+        "with the room, all of the Setting's detail too: {:#?}",
+        pane_at(&application, TIGHT)
+    );
     assert_eq!(
         press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
         MutatesSetting(SettingMutation::ProviderCopilotPermissions {
@@ -5548,22 +5558,22 @@ fn a_click_lands_on_the_setting_a_scrolled_pane_drew_there() {
     let (_workspace, mut application) = codex_unavailable_in_a_short_terminal();
     press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
 
-    let buffer = rendered_application_buffer(&application, WIDE.0, TIGHT);
+    let buffer = rendered_application_buffer(&application, WIDE.0, SHORT);
     let (column, row) = text_position(&buffer, "provider.codex.enabled");
-    let before = pane_at(&application, TIGHT);
-    rendered_application_buffer(&application, WIDE.0, TIGHT);
+    let before = pane_at(&application, SHORT);
+    rendered_application_buffer(&application, WIDE.0, SHORT);
     click(&mut application, column, row + 1);
     assert_eq!(
-        pane_at(&application, TIGHT),
+        pane_at(&application, SHORT),
         before,
         "the ellipsis focuses nothing"
     );
 
-    rendered_application_buffer(&application, WIDE.0, TIGHT);
+    rendered_application_buffer(&application, WIDE.0, SHORT);
     let (column, row) = text_position(&buffer, "Sandbox mode");
     click(&mut application, column, row);
     pane_row(
-        &pane_at(&application, TIGHT),
+        &pane_at(&application, SHORT),
         "› Sandbox mode workspace-write",
     );
     assert_eq!(
@@ -5689,5 +5699,82 @@ fn a_diagnostic_names_its_config_document_from_the_readers_home() {
             "~{MAIN_SEPARATOR}.config{MAIN_SEPARATOR}suru{MAIN_SEPARATOR}suru.jsonc: ignored \
              for a test"
         ),
+    );
+}
+
+/// A Setting the keys are on can be scrolled to, but why the reader's last
+/// edit of it never reached the Config Document cannot be scrolled away: the
+/// refusal holds beneath the heading while everything else scrolls, because
+/// a wide panel has no headline to say it in instead.
+#[test]
+fn a_refused_edit_holds_in_view_while_the_pane_scrolls_to_the_setting_refused() {
+    let (_workspace, mut application) = codex_unavailable_in_a_short_terminal();
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        MutatesSetting(SettingMutation::ProviderCodexSandboxMode {
+            value: Some(suru::protocol::CodexSandboxMode::DangerFullAccess),
+        })
+    );
+    application
+        .handle_event(ApplicationEvent::SettingMutationFailed {
+            request: SettingRequest::new(),
+            error: "Config Document \"suru.jsonc\" is not valid JSONC".to_owned(),
+        })
+        .expect("hear that the edit never landed");
+
+    for height in [TIGHT, SHORT] {
+        let details = pane_at(&application, height);
+        assert_eq!(
+            &details[..4],
+            [
+                "Codex enabled",
+                "provider.codex.enabled",
+                "",
+                "Config Document \"suru.jsonc\" is not valid JSONC"
+            ],
+            "the refusal holds beneath the heading at {height} rows: {details:#?}"
+        );
+        assert_eq!(
+            details[4], "…",
+            "with the rest scrolled beneath it: {details:#?}"
+        );
+        pane_row(&details, "› Sandbox mode workspace-write");
+    }
+}
+
+/// A pane too tall for its rows while the keys are on a Provider's own
+/// Settings first gives up the blank rows standing the picked Setting's
+/// detail apart, and scrolls only where that is not enough: packed, Codex's
+/// account of itself fits a full-height pane whole, its condition and all.
+#[test]
+fn the_pane_packs_its_detail_before_it_scrolls_anything_out_of_view() {
+    let (_workspace, mut application) = codex_unavailable_in_a_short_terminal();
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+
+    let details = pane(&application);
+    assert!(
+        !details.iter().any(|row| row == "…"),
+        "nothing is scrolled or cut away: {details:#?}"
+    );
+    let text = pane_text(&application);
+    assert!(
+        text.starts_with(
+            "Codex enabled provider.codex.enabled The codex CLI holds no credentials run \
+             `codex login` › Reasoning summary auto"
+        ),
+        "the condition and its fix stay above the Provider's own Settings: {details:#?}"
+    );
+    assert!(
+        text.ends_with("Applies on the Server Sidekicks read and change"),
+        "and the Setting the keys are on shows to the foot of its detail: {details:#?}"
+    );
+    let key = pane_row(&details, "provider.codex.reasoningSummary");
+    assert_eq!(
+        details[key - 1],
+        "Sandbox mode workspace-write",
+        "its detail packed up against the Settings above it: {details:#?}"
     );
 }

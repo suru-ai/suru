@@ -126,15 +126,15 @@ impl<'a> DrawnPane<'a> {
     }
 
     /// The pane cut to `height` rows as [`Self::fit`] cuts it, save where
-    /// that would cut into `keep`, rows the reader must see: then the rows
-    /// beneath the first `heading` scroll up past an ellipsis standing for
-    /// those they went by, until `keep` shows to its end, or from its start
-    /// where the pane has too few rows for all of it. Answers with which rows
-    /// are still drawn, and where.
+    /// that would cut into `keep`, rows the reader must see: then the first
+    /// `held` rows hold still, and the rows beneath them scroll up past an
+    /// ellipsis standing for those they went by, until `keep` shows to its
+    /// end, or from its start where the pane has too few rows for all of it.
+    /// Answers with which rows are still drawn, and where.
     pub(super) fn fit_showing(
         &mut self,
         height: usize,
-        heading: usize,
+        held: usize,
         keep: Range<usize>,
         theme: &Theme,
     ) -> PaneWindow {
@@ -143,8 +143,8 @@ impl<'a> DrawnPane<'a> {
         if rows <= height {
             return PaneWindow::whole(rows);
         }
-        // The rows beneath the heading and the ellipsis it scrolls past.
-        let room = height.saturating_sub(heading + 1);
+        // The rows beneath those held and the ellipsis the rest scroll past.
+        let room = height.saturating_sub(held + 1);
         let first = if keep.end + 1 < rows {
             // Short of the foot, which an ellipsis then stands for too.
             (keep.end + 1).saturating_sub(room)
@@ -152,7 +152,7 @@ impl<'a> DrawnPane<'a> {
             rows.saturating_sub(room)
         }
         .min(keep.start);
-        if keep.is_empty() || keep.end < height || room < 2 || first <= heading {
+        if keep.is_empty() || keep.end < height || room < 2 || first <= held {
             let kept = height.saturating_sub(1);
             self.lines.truncate(kept);
             if height > 0 {
@@ -163,13 +163,9 @@ impl<'a> DrawnPane<'a> {
         }
         let cut = rows - first > room;
         let end = if cut { first + room - 1 } else { rows };
-        let window = PaneWindow {
-            heading,
-            first,
-            end,
-        };
+        let window = PaneWindow { held, first, end };
         let shown = self.lines.drain(first..end).collect::<Vec<_>>();
-        self.lines.truncate(heading);
+        self.lines.truncate(held);
         self.lines.push(ellipsis());
         self.lines.extend(shown);
         if cut {
@@ -204,11 +200,11 @@ impl<'a> DrawnPane<'a> {
 }
 
 /// Which rows a pane drew are still drawn once it is cut to its height, and
-/// where: the rows of its heading where they were, then — past an ellipsis
+/// where: the rows it held still where they were, then — past an ellipsis
 /// standing for any it scrolled by — the rows from `first` up to `end`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PaneWindow {
-    heading: usize,
+    held: usize,
     first: usize,
     end: usize,
 }
@@ -217,7 +213,7 @@ impl PaneWindow {
     /// The first `end` rows, where they were drawn.
     fn whole(end: usize) -> Self {
         Self {
-            heading: 0,
+            held: 0,
             first: 0,
             end,
         }
@@ -226,12 +222,12 @@ impl PaneWindow {
     /// Where the row drawn at `row` stands now, and none for a row no longer
     /// drawn.
     pub(super) fn row(self, row: usize) -> Option<usize> {
-        if row < self.heading.min(self.end) {
+        if row < self.held.min(self.end) {
             return Some(row);
         }
-        let ellipsis = usize::from(self.first > self.heading);
+        let ellipsis = usize::from(self.first > self.held);
         (self.first..self.end)
             .contains(&row)
-            .then(|| row - self.first + self.heading + ellipsis)
+            .then(|| row - self.first + self.held + ellipsis)
     }
 }

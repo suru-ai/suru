@@ -82,6 +82,10 @@ const fn blanks(width: usize) -> &'static str {
 /// stands on; the account is the Setting's, or the Provider's where the row
 /// stands for one.
 pub(super) struct DetailsPane<'a> {
+    /// Why the reader's last edit never reached the Config Document, which
+    /// leads the pane and holds beneath its heading however far the rest
+    /// scrolls: a wide panel has no headline to say it in instead.
+    refusal: Option<&'a str>,
     leads: Vec<Lead<'a>>,
     account: Account,
 }
@@ -123,9 +127,18 @@ pub(super) struct ShownSettings {
     pub(super) count: usize,
 }
 
-/// The rows every account heads the pane with, which stay put while the rest
-/// scrolls beneath them: a name, and the key it is pinned by.
-const HEADING_ROWS: usize = 2;
+/// Everything a pane has to say at one spacing, however many rows it takes.
+struct LaidOut<'p> {
+    drawn: DrawnPane<'p>,
+    /// The rows that hold still while the rest scrolls beneath them: the
+    /// heading the account drew, and the refusal of the last edit beneath it.
+    held: usize,
+    /// Where it listed a Provider's own Settings.
+    listed: Option<Range<usize>>,
+    /// The rows the reader must see: from the Setting the keys are on to the
+    /// foot, while they are on one, and none otherwise.
+    keep: Range<usize>,
+}
 
 /// Something the pane leads with because it asks something of the reader
 /// before anything about the Setting does.
@@ -136,7 +149,7 @@ struct Lead<'a> {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Tone {
-    /// Something went wrong, the reader's edit or Suru's read of a Provider.
+    /// Something went wrong: Suru's read of a Provider.
     Error,
     /// Something the reader would do well to fix.
     Warning,
@@ -186,12 +199,6 @@ impl<'a> DetailsPane<'a> {
             speaks_for,
         } = focus;
         let mut leads = Vec::new();
-        if let Some(error) = error {
-            leads.push(Lead {
-                text: Cow::Borrowed(error),
-                tone: Tone::Error,
-            });
-        }
         if let Some(condition) = condition {
             leads.push(Lead {
                 text: Cow::Borrowed(condition.message),
@@ -228,7 +235,11 @@ impl<'a> DetailsPane<'a> {
             Some(provider) => Account::Provider(ProviderAccount::new(provider, settings)),
             None => Account::Setting(SettingAccount::new(setting, settings, pinned)),
         };
-        Self { leads, account }
+        Self {
+            refusal: error,
+            leads,
+            account,
+        }
     }
 
     /// The pane in `height` rows `width` columns wide. A pane with more to
@@ -238,15 +249,21 @@ impl<'a> DetailsPane<'a> {
     /// on shows with all of its detail, because that Setting is what an edit
     /// would change.
     pub(super) fn draw(&self, width: u16, height: usize, theme: &Theme) -> DrawnDetails<'_> {
-        // Where even that would cut the Setting short, its detail gives up
-        // the blank rows standing its parts apart before anything it says.
+        // A pane too tall while the keys are on a Provider's own Settings
+        // first gives up the blank rows standing the picked Setting's detail
+        // apart, and scrolls only where that is not enough.
         let spaced = self.lay_out(width, Spacing::Spaced, theme);
-        let (mut drawn, listed, keep) = if spaced.2.len() + HEADING_ROWS + 1 > height {
+        let LaidOut {
+            mut drawn,
+            held,
+            listed,
+            keep,
+        } = if !spaced.keep.is_empty() && spaced.drawn.lines.len() > height {
             self.lay_out(width, Spacing::Packed, theme)
         } else {
             spaced
         };
-        let window = drawn.fit_showing(height, HEADING_ROWS, keep, theme);
+        let window = drawn.fit_showing(height, held, keep, theme);
         // A Setting the pane had no room for, or scrolled past, is no row a
         // pointer can land on, and nor is an ellipsis standing for it.
         let provider_settings = listed.and_then(|listed| {
@@ -267,22 +284,21 @@ impl<'a> DetailsPane<'a> {
     }
 
     /// Everything the pane has to say, `width` columns wide however many rows
-    /// it takes, with where it listed a Provider's own Settings and the rows
-    /// the reader must see: from the Setting the keys are on to the foot,
-    /// while they are on one.
-    fn lay_out(
-        &self,
-        width: u16,
-        spacing: Spacing,
-        theme: &Theme,
-    ) -> (DrawnPane<'_>, Option<Range<usize>>, Range<usize>) {
+    /// it takes.
+    fn lay_out(&self, width: u16, spacing: Spacing, theme: &Theme) -> LaidOut<'_> {
         let mut drawn = DrawnPane::default();
         match &self.account {
             Account::Setting(account) => account.draw_heading(&mut drawn, width, theme),
             Account::Provider(account) => account.draw_heading(&mut drawn, width, theme),
         }
-        for (index, lead) in self.leads.iter().enumerate() {
-            if index == 0 || lead.tone != Tone::Fix {
+        if let Some(refusal) = self.refusal {
+            drawn.blank();
+            drawn.wrap(refusal, "", width, theme.feedback.error);
+        }
+        // Whatever the heading came to, and the refusal beneath it.
+        let held = drawn.lines.len();
+        for lead in &self.leads {
+            if lead.tone != Tone::Fix {
                 drawn.blank();
             }
             let style = match lead.tone {
@@ -292,10 +308,10 @@ impl<'a> DetailsPane<'a> {
             };
             drawn.wrap(&lead.text, "", width, style);
         }
-        match &self.account {
+        let (listed, keep) = match &self.account {
             Account::Setting(account) => {
                 account.draw(&mut drawn, width, theme);
-                (drawn, None, 0..0)
+                (None, 0..0)
             }
             Account::Provider(account) => {
                 let listed = account.draw(&mut drawn, width, spacing, theme);
@@ -309,8 +325,14 @@ impl<'a> DetailsPane<'a> {
                 } else {
                     0..0
                 };
-                (drawn, Some(listed), keep)
+                (Some(listed), keep)
             }
+        };
+        LaidOut {
+            drawn,
+            held,
+            listed,
+            keep,
         }
     }
 }
