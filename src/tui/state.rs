@@ -8975,7 +8975,7 @@ impl Application {
                     return self.apply_chosen_selection(model.default_agent_selection(), purpose);
                 }
                 self.state.model_options.open_for(
-                    model,
+                    *model,
                     current.as_ref(),
                     purpose,
                     ModelOptionsOwner::Standalone,
@@ -11983,7 +11983,7 @@ impl Application {
                 purpose,
             } => {
                 self.state.model_options.open_for(
-                    model,
+                    *model,
                     current.as_ref(),
                     purpose,
                     ModelOptionsOwner::OnboardingDerivation,

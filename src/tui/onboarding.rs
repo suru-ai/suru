@@ -43,7 +43,8 @@ use crate::{
 
 use super::{
     agent_selection_list::{
-        AgentSelectionAction, AgentSelectionList, InForce, ProviderModels, failed_listing,
+        AgentSelectionAction, AgentSelectionList, InForce, ProviderModels, RowLayout,
+        failed_listing,
     },
     commands::SemanticCommandId,
     list_editor::ListEditor,
@@ -138,7 +139,7 @@ pub(super) enum Advance {
     /// first at the Model Options overlay opened over the step for `purpose`,
     /// seeded with `current`; applying them answers the step.
     ChooseOptions {
-        model: ModelDescriptor,
+        model: Box<ModelDescriptor>,
         current: Option<AgentSelection>,
         purpose: ModelPickerPurpose,
     },
@@ -1087,6 +1088,7 @@ impl DerivationStep {
             room,
             u16::try_from(width).unwrap_or(u16::MAX),
             in_force(&self.in_force),
+            RowLayout::default(),
             theme,
         );
         let top = lines.len();

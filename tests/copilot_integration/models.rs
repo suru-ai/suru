@@ -12,9 +12,10 @@ use crate::{
 };
 use suru::{
     protocol::{
-        ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoiceId, ModelOptionId,
-        ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
-        ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
+        ModelAdvisory, ModelAdvisorySeverity, ModelAvailability, ModelDescriptor, ModelDetails,
+        ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionKind, ModelOptionRole,
+        ModelOptionSelection, ModelOptionValue, ModelPrice, ModelPriceCategory, ModelPriceTier,
+        ModelPrices, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
     },
     provider::CopilotRuntime,
     server::{self, ServerConfig},
@@ -181,6 +182,129 @@ async fn copilot_models_reach_the_catalog_with_reasoning_effort_and_context_tier
     copilot.wait_for_exit().await;
 }
 
+/// Models carrying everything Copilot publishes about a Model beyond its options: limits, image
+/// support, relative cost, tiered token prices, and the advisories it asks hosts to surface.
+const DETAILED_COPILOT_MODELS: &str = concat!(
+    r#"[{"id":"auto","name":"Auto","capabilities":{},"billing":{"discountPercent":10}},"#,
+    r#"{"id":"luna-fixture","name":"Luna Fixture","#,
+    r#""capabilities":{"limits":{"max_context_window_tokens":1000000,"max_output_tokens":128000},"#,
+    r#""supports":{"vision":true}},"#,
+    r#""modelPickerCategory":"lightweight","modelPickerPriceCategory":"low","#,
+    r#""billing":{"tokenPrices":{"batchSize":1000000,"inputPrice":10.0,"outputPrice":50.0,"#,
+    r#""cachePrice":1.0,"cacheWritePrice":12.5,"maxPromptTokens":272000,"#,
+    r#""longContext":{"inputPrice":20.0,"outputPrice":75.0,"cacheReadPrice":2.0,"#,
+    r#""cacheWritePrice":25.0,"cacheWrite1hPrice":40.0,"maxPromptTokens":872000}},"#,
+    r#""promo":{"discountPercent":25,"message":"25% off this month","#,
+    r#""endsAt":"2099-11-30T00:00:00Z"}},"#,
+    r#""warningText":{"dataRetention":"Prompts may be retained. [Learn more](https://example.com/r)"},"#,
+    r#""warningMessages":[{"code":"client_version_deprecated","message":"Update your client."}],"#,
+    r#""infoMessages":[{"code":"successor","message":"Try Luna Fixture 2."}]},"#,
+    r#"{"id":"plain-fixture","name":"Plain Fixture","capabilities":{},"#,
+    r#""modelPickerPriceCategory":"very_high","#,
+    r#""billing":{"promo":{"message":"Half off","endsAt":"2020-01-31T00:00:00Z"}}},"#,
+    r#"{"id":"blocked-fixture","name":"Blocked Fixture","capabilities":{},"#,
+    r#""policy":{"state":"disabled","terms":"Enable access to Blocked Fixture."}}]"#,
+);
+
+#[tokio::test]
+async fn copilot_models_carry_their_prices_limits_and_advisories_as_model_details() {
+    let copilot = ScriptedCopilot::with_models(DETAILED_COPILOT_MODELS);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let (server, client) = hosting(&copilot, "copilot-model-details", state_dir.path()).await;
+
+    let catalog = client.list_models().await.expect("discover Copilot Models");
+    let copilot_models = copilot_catalog(&catalog);
+
+    let price = |units: f64| ModelPrice::from_units(units);
+    assert_eq!(
+        model(copilot_models, "luna-fixture").details,
+        ModelDetails {
+            price_category: Some(ModelPriceCategory::Low),
+            context_window_tokens: Some(1_000_000),
+            output_limit_tokens: Some(128_000),
+            accepts_images: Some(true),
+            prices: Some(ModelPrices {
+                unit: "AI Credits".to_owned(),
+                per_tokens: 1_000_000,
+                tiers: vec![
+                    ModelPriceTier {
+                        label: "Default".to_owned(),
+                        max_prompt_tokens: Some(272_000),
+                        input: price(10.0),
+                        output: price(50.0),
+                        cache_read: price(1.0),
+                        cache_write: price(12.5),
+                        cache_write_1h: None,
+                    },
+                    ModelPriceTier {
+                        label: "Long context".to_owned(),
+                        max_prompt_tokens: Some(872_000),
+                        input: price(20.0),
+                        output: price(75.0),
+                        cache_read: price(2.0),
+                        cache_write: price(25.0),
+                        cache_write_1h: price(40.0),
+                    },
+                ],
+            }),
+            advisories: vec![
+                ModelAdvisory {
+                    severity: ModelAdvisorySeverity::Warning,
+                    title: Some("Data retention".to_owned()),
+                    text: "Prompts may be retained. [Learn more](https://example.com/r)".to_owned(),
+                },
+                ModelAdvisory {
+                    severity: ModelAdvisorySeverity::Warning,
+                    title: None,
+                    text: "Update your client.".to_owned(),
+                },
+                ModelAdvisory {
+                    severity: ModelAdvisorySeverity::Info,
+                    title: None,
+                    text: "Try Luna Fixture 2.".to_owned(),
+                },
+                ModelAdvisory {
+                    severity: ModelAdvisorySeverity::Info,
+                    title: Some("Promotion".to_owned()),
+                    text: "25% off this month, until 2099-11-30".to_owned(),
+                },
+            ],
+        },
+        "every part Copilot publishes reaches the catalog, the retention warning first"
+    );
+
+    assert_eq!(
+        model(copilot_models, "auto").details.advisories,
+        [ModelAdvisory {
+            severity: ModelAdvisorySeverity::Info,
+            title: None,
+            text: "Billed 10% below the price of the Model Copilot picks".to_owned(),
+        }],
+        "the routed Model's discount is told, though it has no prices of its own"
+    );
+    assert_eq!(
+        model(copilot_models, "plain-fixture").details,
+        ModelDetails {
+            price_category: Some(ModelPriceCategory::VeryHigh),
+            ..ModelDetails::default()
+        },
+        "a Model that publishes little carries only what it published, and a promotion that has \
+         ended is not told"
+    );
+    assert_eq!(
+        model(copilot_models, "blocked-fixture").details.advisories,
+        [ModelAdvisory {
+            severity: ModelAdvisorySeverity::Warning,
+            title: Some("Disabled by policy".to_owned()),
+            text: "Enable access to Blocked Fixture.".to_owned(),
+        }],
+        "a Model policy disables says why, in the terms the policy gives"
+    );
+
+    server.shutdown().await.expect("shut the server down");
+    copilot.wait_for_exit().await;
+}
+
 /// `models`, a JSON array literal, as CLI 1.0.89 lists a catalog while it holds credentials for
 /// two accounts: the whole catalog once per account, in one flat list that says nothing about
 /// which account an entry came from (docs/validation/copilot-model-list-per-account.md).
@@ -279,6 +403,7 @@ async fn copilot_models_are_listed_beside_another_hosted_provider() {
             is_default: true,
             availability: ModelAvailability::Available,
             options: Vec::new(),
+            details: Default::default(),
         }],
     );
     let state_dir = tempfile::tempdir().expect("create isolated state directory");

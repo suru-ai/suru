@@ -322,6 +322,7 @@ impl From<NativeModel> for ModelDescriptor {
             is_default: model.is_default,
             availability: ModelAvailability::Available,
             options,
+            details: Default::default(),
         }
     }
 }

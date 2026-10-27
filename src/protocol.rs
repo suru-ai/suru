@@ -190,6 +190,120 @@ pub struct ModelDescriptor {
     pub is_default: bool,
     pub availability: ModelAvailability,
     pub options: Vec<ModelOptionDescriptor>,
+    /// What else the Provider publishes about the Model, for a reader choosing
+    /// between Models. Every part is optional: a Provider fills what it knows.
+    pub details: ModelDetails,
+}
+
+/// What a Provider publishes about a Model beyond its name and Model Options:
+/// its prices, how much it holds, and the Model Advisories the Provider asks a
+/// reader be shown.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelDetails {
+    /// Where the Model's price stands relative to the Provider's other Models.
+    pub price_category: Option<ModelPriceCategory>,
+    /// The largest context window the Model offers, in tokens.
+    pub context_window_tokens: Option<u64>,
+    /// The most tokens the Model writes in one response.
+    pub output_limit_tokens: Option<u64>,
+    /// Whether the Model accepts images in a prompt.
+    pub accepts_images: Option<bool>,
+    pub prices: Option<ModelPrices>,
+    /// What the Provider asks be shown beside the Model, warnings first.
+    pub advisories: Vec<ModelAdvisory>,
+}
+
+impl ModelDetails {
+    /// Whether any Model Advisory is one a reader should see before choosing
+    /// the Model.
+    pub fn has_warning(&self) -> bool {
+        self.advisories
+            .iter()
+            .any(|advisory| advisory.severity == ModelAdvisorySeverity::Warning)
+    }
+}
+
+/// A Model's price relative to the Provider's other Models.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPriceCategory {
+    Low,
+    Medium,
+    High,
+    VeryHigh,
+}
+
+/// A Model's token prices in the Provider's own unit, one tier per context
+/// tier the Model offers.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPrices {
+    /// What a price counts, as the Provider names it, e.g. `AI Credits`.
+    pub unit: String,
+    /// How many tokens one price buys.
+    pub per_tokens: u64,
+    pub tiers: Vec<ModelPriceTier>,
+}
+
+/// The prices of one context tier, named as the Model's Context option names
+/// it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPriceTier {
+    pub label: String,
+    /// The most prompt tokens the tier admits.
+    pub max_prompt_tokens: Option<u64>,
+    pub input: Option<ModelPrice>,
+    pub output: Option<ModelPrice>,
+    pub cache_read: Option<ModelPrice>,
+    pub cache_write: Option<ModelPrice>,
+    /// The price of writing a cache that lives an hour rather than the
+    /// Provider's default lifetime.
+    pub cache_write_1h: Option<ModelPrice>,
+}
+
+/// One price in millionths of its unit, so the catalog keeps exact equality
+/// while carrying the fractional prices Providers publish.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ModelPrice(u64);
+
+impl ModelPrice {
+    const MICROS_PER_UNIT: f64 = 1_000_000.0;
+
+    /// Admits a Provider's price, rejecting non-finite, negative, and
+    /// unrepresentable values.
+    pub fn from_units(units: f64) -> Option<Self> {
+        if !units.is_finite() || units < 0.0 || units > u64::MAX as f64 / Self::MICROS_PER_UNIT {
+            return None;
+        }
+        Some(Self((units * Self::MICROS_PER_UNIT).round() as u64))
+    }
+
+    pub fn as_units(self) -> f64 {
+        self.0 as f64 / Self::MICROS_PER_UNIT
+    }
+}
+
+/// Something a Provider asks be shown beside a Model: a data-retention
+/// warning, an advisory of its own, a promotion, or why the Model cannot be
+/// chosen.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAdvisory {
+    pub severity: ModelAdvisorySeverity,
+    pub title: Option<String>,
+    /// The Model Advisory itself, as Markdown.
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAdvisorySeverity {
+    /// Shown before the reader chooses the Model, and marked in the list.
+    Warning,
+    Info,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

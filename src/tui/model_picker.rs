@@ -14,8 +14,8 @@ use crate::{
 use super::{
     ModelListRequest,
     agent_selection_list::{
-        AgentSelectionLines, AgentSelectionList, InForce, ListKeys, ProviderModels, default_model,
-        normalize_catalog,
+        AgentSelectionLines, AgentSelectionList, InForce, ListKeys, ProviderModels, RowLayout,
+        default_model, normalize_catalog,
     },
 };
 
@@ -377,6 +377,7 @@ impl ModelPicker {
         height: usize,
         width: u16,
         current: Option<&AgentSelection>,
+        layout: RowLayout,
         theme: &Theme,
     ) -> AgentSelectionLines<'_> {
         let in_force = self.selection_in_force(current);
@@ -385,6 +386,7 @@ impl ModelPicker {
             height,
             width,
             in_force.as_ref().map(InForce::Model),
+            layout,
             theme,
         )
     }

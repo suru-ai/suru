@@ -504,6 +504,7 @@ fn opaque_cycling_catalog() -> ModelCatalog {
                         kind: ModelOptionKind::Toggle { default: false },
                     },
                 ],
+                details: Default::default(),
             }],
             status: ProviderCatalogStatus::Fresh,
         }],

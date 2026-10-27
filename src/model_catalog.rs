@@ -785,6 +785,7 @@ mod tests {
                         is_default: true,
                         availability: ModelAvailability::Available,
                         options: Vec::new(),
+                        details: Default::default(),
                     }]));
                 }
                 Err(failure)
@@ -825,6 +826,7 @@ mod tests {
                 is_default: true,
                 availability: ModelAvailability::Available,
                 options: Vec::new(),
+                details: Default::default(),
             }],
             warning: None,
             discovered_at: SessionTimestamp(1),
@@ -1209,6 +1211,7 @@ mod tests {
                     "plain",
                 ),
             ],
+            details: Default::default(),
         }
     }
 
@@ -1223,6 +1226,7 @@ mod tests {
             is_default: true,
             availability,
             options: Vec::new(),
+            details: Default::default(),
         }
     }
 

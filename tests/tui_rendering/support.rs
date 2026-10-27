@@ -623,6 +623,7 @@ pub fn model_descriptor(
         is_default,
         availability,
         options: Vec::new(),
+        details: Default::default(),
     }
 }
 

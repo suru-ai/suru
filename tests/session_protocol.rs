@@ -6,18 +6,19 @@ use suru::protocol::{
     AgentSelection, AgentSelectionOperationId, Answer, ApprovalSubject, AttachmentBinding,
     AttachmentDescriptor, AttachmentId, AttachmentKind, Author, CompactSessionRequest,
     CompactionTrigger, Cost, CostBasis, CostTotal, CreateSessionRequest, Delegator, FileChange,
-    InitialPrompt, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
-    ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor,
-    ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
-    PROTOCOL_VERSION, PreparationId, PreparationPrompt, PrepareCheckoutRequest, Prompt,
-    PromptDelivery, PromptId, PromptOrder, PromptStatus, PromptWithdrawal, ProviderId, Question,
-    QuestionAnswer, Questionnaire, QuestionnaireId, QuestionnaireOutcome, Session, SessionChange,
-    SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
-    SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog, SkillCatalogCapabilities,
-    SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillInvocation,
-    SkillPromptDelivery, TextSpan, TranscriptItem, Turn, TurnId, TurnStatus,
-    UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId, ViewSessionRequest,
-    Workspace,
+    InitialPrompt, Message, MessageId, MessageRole, MessageStatus, ModelAdvisory,
+    ModelAdvisorySeverity, ModelAvailability, ModelDescriptor, ModelDetails, ModelId,
+    ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
+    ModelOptionRole, ModelOptionSelection, ModelOptionValue, ModelPrice, ModelPriceCategory,
+    ModelPriceTier, ModelPrices, PROTOCOL_VERSION, PreparationId, PreparationPrompt,
+    PrepareCheckoutRequest, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
+    PromptWithdrawal, ProviderId, Question, QuestionAnswer, Questionnaire, QuestionnaireId,
+    QuestionnaireOutcome, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
+    SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
+    SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus,
+    SkillDescriptor, SkillId, SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn,
+    TurnId, TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId,
+    ViewSessionRequest, Workspace,
 };
 use uuid::Uuid;
 
@@ -3195,6 +3196,30 @@ fn model_descriptors_and_option_values_use_strict_typed_json() {
                 kind: ModelOptionKind::Toggle { default: false },
             },
         ],
+        details: ModelDetails {
+            price_category: Some(ModelPriceCategory::VeryHigh),
+            context_window_tokens: Some(400_000),
+            output_limit_tokens: None,
+            accepts_images: Some(false),
+            prices: Some(ModelPrices {
+                unit: "AI Credits".to_owned(),
+                per_tokens: 1_000_000,
+                tiers: vec![ModelPriceTier {
+                    label: "Default".to_owned(),
+                    max_prompt_tokens: Some(272_000),
+                    input: ModelPrice::from_units(12.5),
+                    output: None,
+                    cache_read: None,
+                    cache_write: None,
+                    cache_write_1h: None,
+                }],
+            }),
+            advisories: vec![ModelAdvisory {
+                severity: ModelAdvisorySeverity::Warning,
+                title: Some("Data retention".to_owned()),
+                text: "Retained [briefly](https://example.com)".to_owned(),
+            }],
+        },
     };
     let encoded = serde_json::to_value(&descriptor).expect("encode Model descriptor");
     assert_eq!(
@@ -3230,7 +3255,31 @@ fn model_descriptors_and_option_values_use_strict_typed_json() {
                     "role": "other",
                     "kind": { "type": "toggle", "default": false }
                 }
-            ]
+            ],
+            "details": {
+                "price_category": "very_high",
+                "context_window_tokens": 400000,
+                "output_limit_tokens": null,
+                "accepts_images": false,
+                "prices": {
+                    "unit": "AI Credits",
+                    "per_tokens": 1000000,
+                    "tiers": [{
+                        "label": "Default",
+                        "max_prompt_tokens": 272000,
+                        "input": 12500000,
+                        "output": null,
+                        "cache_read": null,
+                        "cache_write": null,
+                        "cache_write_1h": null
+                    }]
+                },
+                "advisories": [{
+                    "severity": "warning",
+                    "title": "Data retention",
+                    "text": "Retained [briefly](https://example.com)"
+                }]
+            }
         })
     );
     assert_eq!(
@@ -3299,6 +3348,7 @@ fn model_descriptors_materialize_complete_defaults_and_preserve_valid_same_model
                 kind: ModelOptionKind::Toggle { default: false },
             },
         ],
+        details: Default::default(),
     };
     let defaults = descriptor.default_agent_selection();
     assert_eq!(

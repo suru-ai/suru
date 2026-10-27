@@ -106,6 +106,7 @@ fn model(
         is_default,
         availability: ModelAvailability::Available,
         options,
+        details: Default::default(),
     }
 }
 

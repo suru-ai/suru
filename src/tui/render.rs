@@ -25,6 +25,7 @@ use crate::{
 };
 
 use super::{
+    agent_selection_list::RowLayout,
     approval_posture_picker::ApprovalPostureChoice,
     aside::AsidePresentation,
     attachment_preview::{AttachmentPreviews, AttachmentRows, ReservedStrip},
@@ -37,6 +38,7 @@ use super::{
     icon_picker,
     keymap::binding_label,
     list_window::WindowEntry,
+    model_details::{self, DetailsPane},
     model_options::ModelOptionChoiceRow,
     onboarding::OwnServer,
     relay_overlay::serve_through_status,
@@ -2790,14 +2792,51 @@ fn render_icon_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme
     );
 }
 
+/// The room a Model picker needs before it details the focused Model in a pane
+/// beside its list rather than a strip beneath it, and the size it stands at
+/// once it does.
+const MODEL_PICKER_SPLIT_MIN_WIDTH: u16 = 100;
+const MODEL_PICKER_SPLIT_WIDTH: u16 = 116;
+const MODEL_PICKER_SPLIT_HEIGHT: u16 = 22;
+/// The fewest content rows a narrow picker keeps before it spares any for the
+/// focused Model's strip.
+const MODEL_PICKER_STRIP_MIN_HEIGHT: u16 = 10;
+
 fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
-    let area = centered_rect(
-        main,
-        main.width.saturating_sub(4).min(76),
-        main.height.saturating_sub(2).min(14),
-    );
-    let content_width = area.width.saturating_sub(2);
-    let content_height = area.height.saturating_sub(2);
+    let split = main.width.saturating_sub(4) >= MODEL_PICKER_SPLIT_MIN_WIDTH;
+    let area = if split {
+        centered_rect(
+            main,
+            main.width.saturating_sub(4).min(MODEL_PICKER_SPLIT_WIDTH),
+            main.height.saturating_sub(2).min(MODEL_PICKER_SPLIT_HEIGHT),
+        )
+    } else {
+        centered_rect(
+            main,
+            main.width.saturating_sub(4).min(76),
+            main.height.saturating_sub(2).min(14),
+        )
+    };
+    let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+    let [list_area, pane_area] = if split {
+        let list_width = inner.width * 9 / 20;
+        Layout::horizontal([Constraint::Length(list_width), Constraint::Fill(1)])
+            .spacing(1)
+            .areas(inner)
+    } else {
+        [inner, Rect::default()]
+    };
+    let content_width = list_area.width;
+    let content_height = list_area.height;
+    let focused = state.model_picker.list().focused_model();
+    // A narrow picker spares its strip wherever a listed Model has details to
+    // tell, whichever row focus stands on, so the list holds its height.
+    let strip = (!split
+        && content_height >= MODEL_PICKER_STRIP_MIN_HEIGHT
+        && state.model_picker.list().lists_details())
+    .then(|| model_details::strip_lines(focused, content_width, theme));
+    // The strip stands beneath a rule of its own.
+    let strip_rows = strip.as_ref().map_or(0, |strip| strip.len() + 1);
     let mut lines = Vec::with_capacity(usize::from(content_height));
     let mut wrapped = Vec::new();
     if content_height >= 3 {
@@ -2828,12 +2867,15 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
         lines.push(Line::styled("Loading Models…", theme.text.subdued));
     } else {
         let footer_rows = usize::from(content_height >= 3);
-        let row_capacity = usize::from(content_height).saturating_sub(lines.len() + footer_rows);
+        let room = usize::from(content_height).saturating_sub(lines.len() + strip_rows);
         let drawn = state.model_picker.draw_rows(
-            row_capacity,
-            usize::from(content_height).saturating_sub(lines.len()),
+            room.saturating_sub(footer_rows),
+            room,
             content_width,
             state.agent_selection(),
+            RowLayout {
+                identified_beside: split,
+            },
             theme,
         );
         let above = lines.len();
@@ -2846,6 +2888,13 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
             lines.push(Line::styled("No Models found", theme.text.subdued));
         }
     }
+    if let Some(strip) = strip {
+        lines.push(Line::styled(
+            "─".repeat(usize::from(content_width)),
+            theme.border.default,
+        ));
+        lines.extend(strip);
+    }
     if content_height >= 3 && lines.len() < usize::from(content_height) {
         lines.push(Line::styled(
             truncate_to_width(
@@ -2857,16 +2906,46 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
     }
     clear_over(frame, state, area);
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Models ")
-                .border_style(theme.border.default)
-                .style(theme.surface.overlay),
-        ),
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Models ")
+            .border_style(theme.border.default)
+            .style(theme.surface.overlay),
         area,
     );
-    record_overlay_selection_around(frame, state, area, SelectionSurface::Models, true, &wrapped);
+    frame.render_widget(Paragraph::new(lines), list_area);
+    if !split {
+        record_overlay_selection_around(
+            frame,
+            state,
+            area,
+            SelectionSurface::Models,
+            true,
+            &wrapped,
+        );
+        return;
+    }
+    let pane = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(theme.border.default)
+        .padding(Padding::left(1));
+    let pane_content = pane.inner(pane_area);
+    let details = focused.map(DetailsPane::new);
+    let drawn = details
+        .as_ref()
+        .map(|details| details.draw(pane_content.width, usize::from(pane_content.height), theme));
+    let (pane_lines, pane_wrapped) =
+        drawn.map_or_else(Default::default, |drawn| (drawn.lines, drawn.wrapped));
+    frame.render_widget(Paragraph::new(pane_lines).block(pane), pane_area);
+    // The list and the pane are read apart, so a selection in one never
+    // takes in the other's text beside it.
+    record_overlay_selection_parts(
+        frame,
+        state,
+        area,
+        SelectionSurface::Models,
+        &[(list_area, &wrapped), (pane_content, &pane_wrapped)],
+    );
 }
 
 fn render_approval_posture_picker(
@@ -3523,6 +3602,28 @@ fn record_overlay_selection_around(
         content,
         &wrapped,
     ));
+}
+
+/// [`record_overlay_selection_around`] for a box laid out in parts side by
+/// side, each its own content area with the lines it wrapped, read apart.
+fn record_overlay_selection_parts(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    area: Rect,
+    surface: SelectionSurface,
+    parts: &[(Rect, &[WrappedLine<'_>])],
+) {
+    state.selection_overlay_area.set(Some(area));
+    let mut surfaces = state.selection_frames.borrow_mut();
+    surfaces.clear();
+    for (content, wrapped) in parts {
+        surfaces.push(SelectionFrame::painted_around(
+            surface,
+            frame.buffer_mut(),
+            *content,
+            wrapped,
+        ));
+    }
 }
 
 /// Clears `area` for a picker, dialog, or menu drawn over the frame, and

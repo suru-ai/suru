@@ -29,8 +29,12 @@ The language model selected for an Agent through its Provider. A Subagent's actu
 _Avoid_: Engine
 
 **Model Catalog**:
-The Models each Provider currently offers, together with their names and Model Options, as Suru last learned them from the Provider. Suru remembers the last catalog it learned across restarts so it can present Models by name before asking the Provider again, and asks each Provider anew when a user connects to a server that has not yet asked it since it started. A remembered catalog is the same catalog, not a separate copy, and a Model's name always reflects the latest catalog. Distinct from Provider Availability, which is never remembered: Suru re-reads it rather than replaying a past condition.
+The Models each Provider currently offers, together with their names, Model Options, and whatever else the Provider publishes about each — its relative price, token prices, limits, and the Model Advisories it asks be shown — as Suru last learned them from the Provider. Suru remembers the last catalog it learned across restarts so it can present Models by name before asking the Provider again, and asks each Provider anew when a user connects to a server that has not yet asked it since it started. A remembered catalog is the same catalog, not a separate copy, and a Model's name always reflects the latest catalog. Distinct from Provider Availability, which is never remembered: Suru re-reads it rather than replaying a past condition.
 _Avoid_: Models cache, model list, snapshot
+
+**Model Advisory**:
+Something a Provider asks be shown beside one of its Models in the Model Catalog: a data-retention warning, an advisory of the Provider's own, a promotion, or why a policy keeps the Model from being chosen. A warning is shown before the Model is chosen and marks the Model wherever it is listed for choosing; the rest are told only where the Model is detailed. Distinct from a Notice, which tells of Suru's own behavior rather than a Provider's word about a Model.
+_Avoid_: Model notice, model warning
 
 **Model Option**:
 A Provider-advertised, Model-specific configuration dimension such as reasoning effort or speed. Model Options compose independently within an Agent Selection.

@@ -1917,6 +1917,7 @@ mod tests {
                     default: ModelOptionChoiceId::new("low"),
                 },
             }],
+            details: Default::default(),
         }
     }
 

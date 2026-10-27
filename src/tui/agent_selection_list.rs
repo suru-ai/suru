@@ -13,8 +13,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     protocol::{
-        AgentSelection, ModelAvailability, ModelDescriptor, ModelId, ProviderCatalogStatus,
-        ProviderId, ProviderModelCatalog, ProviderUnavailability,
+        AgentSelection, ModelAvailability, ModelDescriptor, ModelDetails, ModelId,
+        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderUnavailability,
     },
     theme::Theme,
 };
@@ -22,8 +22,10 @@ use crate::{
 use super::{
     fuzzy::fuzzy_matches,
     list_window::{ListWindow, WindowEntry},
+    model_details::price_glyph,
     selection::WrappedLine,
     slots::truncate_to_width,
+    usage::compact_count,
     wrapped_text::{FIX_INDENT, WrappedText},
 };
 
@@ -186,7 +188,7 @@ impl AgentSelectionRow<'_> {
 pub(super) enum AgentSelectionAction {
     /// One of the rows the host named, by its place among them.
     Named(usize),
-    Select(ModelDescriptor),
+    Select(Box<ModelDescriptor>),
     Retry,
 }
 
@@ -351,17 +353,32 @@ impl AgentSelectionList {
         ListKeys(self)
     }
 
+    /// The Model focus stands on, if it stands on one.
+    pub(super) fn focused_model(&self) -> Option<&ModelDescriptor> {
+        let Some(ListSelection::Model(key)) = self.selected.as_ref() else {
+            return None;
+        };
+        self.providers
+            .iter()
+            .flat_map(|provider| &provider.models)
+            .find(|model| ModelKey::from_model(model) == *key)
+    }
+
+    /// Whether any Model the list shows publishes details of its own, for a
+    /// host deciding whether to spare room for them.
+    pub(super) fn lists_details(&self) -> bool {
+        self.listed_models()
+            .any(|model| model.details != ModelDetails::default())
+    }
+
     pub(super) fn choose(&self) -> Option<AgentSelectionAction> {
         match self.selected.as_ref()? {
             ListSelection::Named(index) => Some(AgentSelectionAction::Named(*index)),
-            ListSelection::Model(key) => self
-                .providers
-                .iter()
-                .flat_map(|provider| &provider.models)
-                .find(|model| ModelKey::from_model(model) == *key)
+            ListSelection::Model(_) => self
+                .focused_model()
                 .filter(|model| model.availability == ModelAvailability::Available)
                 .cloned()
-                .map(AgentSelectionAction::Select),
+                .map(|model| AgentSelectionAction::Select(Box::new(model))),
             ListSelection::Retry(_) => Some(AgentSelectionAction::Retry),
         }
     }
@@ -404,10 +421,12 @@ impl AgentSelectionList {
         height: usize,
         width: u16,
         current: Option<InForce<'_>>,
+        layout: RowLayout,
         theme: &Theme,
     ) -> AgentSelectionLines<'_> {
         let mut lines = Vec::new();
         let mut wrapped = Vec::new();
+        let columns = ComparisonColumns::of(self.listed_models());
         for row in self.visible_rows(capacity, width, current) {
             match row {
                 AgentSelectionRow::Named {
@@ -440,7 +459,14 @@ impl AgentSelectionList {
                     selected,
                     current,
                 } => lines.push(Line::styled(
-                    model_row_text(model, selected, current, usize::from(width)),
+                    model_row_text(
+                        model,
+                        selected,
+                        current,
+                        layout,
+                        columns,
+                        usize::from(width),
+                    ),
                     if selected {
                         theme.selection.focused
                     } else if model.availability == ModelAvailability::Unavailable {
@@ -601,6 +627,15 @@ impl AgentSelectionList {
                 .provider_scope
                 .as_ref()
                 .is_none_or(|scope| *scope == provider.provider)
+    }
+
+    /// Every Model the list shows under its query, scrolled into view or not.
+    fn listed_models(&self) -> impl Iterator<Item = &ModelDescriptor> {
+        self.providers
+            .iter()
+            .filter(|provider| self.is_listed(provider))
+            .flat_map(|provider| &provider.models)
+            .filter(|model| model_matches(&self.query, model))
     }
 
     fn rows(&self, current: Option<InForce<'_>>) -> Vec<AgentSelectionRow<'_>> {
@@ -860,8 +895,88 @@ fn retry_row<'a>(text: &str, selected: bool, width: u16, theme: &Theme) -> Line<
     )
 }
 
-fn model_row_text(model: &ModelDescriptor, selected: bool, current: bool, width: usize) -> String {
-    let native = (model.display_name != model.id.as_str()).then_some(model.id.as_str());
+/// How a host lays out the list's Model rows.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct RowLayout {
+    /// Whether the host names the focused Model's identifier beside the list,
+    /// so its row need not.
+    pub(super) identified_beside: bool,
+}
+
+/// The columns at the end of a Model row comparing what the listed Models
+/// publish about themselves: whether a Model Advisory asks to be read before
+/// choosing one, its relative price, and its context window. A column stands
+/// only where a listed Model fills it, so a catalog that publishes none of
+/// them keeps its rows as they were, and is as wide as the widest listed
+/// value, so the columns hold still as the list scrolls.
+#[derive(Clone, Copy, Debug, Default)]
+struct ComparisonColumns {
+    warning: bool,
+    /// How wide the price and context columns are, nothing where no listed
+    /// Model fills them.
+    price: usize,
+    context: usize,
+}
+
+impl ComparisonColumns {
+    fn of<'a>(models: impl Iterator<Item = &'a ModelDescriptor>) -> Self {
+        models.fold(Self::default(), |columns, model| Self {
+            warning: columns.warning || model.details.has_warning(),
+            price: columns.price.max(price_cell(model).width()),
+            context: columns.context.max(context_cell(model).width()),
+        })
+    }
+
+    /// `model`'s cells, each column a space-led field of its column's width.
+    fn cells(self, model: &ModelDescriptor) -> String {
+        let mut cells = String::new();
+        if self.warning {
+            cells.push_str(if model.details.has_warning() {
+                " !"
+            } else {
+                "  "
+            });
+        }
+        if self.price > 0 {
+            cells.push_str(&format!(
+                " {:<width$}",
+                price_cell(model),
+                width = self.price
+            ));
+        }
+        if self.context > 0 {
+            cells.push_str(&format!(
+                " {:>width$}",
+                context_cell(model),
+                width = self.context
+            ));
+        }
+        cells
+    }
+}
+
+fn price_cell(model: &ModelDescriptor) -> &'static str {
+    model.details.price_category.map_or("", price_glyph)
+}
+
+fn context_cell(model: &ModelDescriptor) -> String {
+    model
+        .details
+        .context_window_tokens
+        .map(compact_count)
+        .unwrap_or_default()
+}
+
+fn model_row_text(
+    model: &ModelDescriptor,
+    selected: bool,
+    current: bool,
+    layout: RowLayout,
+    columns: ComparisonColumns,
+    width: usize,
+) -> String {
+    let native = (!layout.identified_beside && model.display_name != model.id.as_str())
+        .then_some(model.id.as_str());
     let mut states = current_state(current);
     if model.is_default {
         states.push(("default", "D"));
@@ -869,7 +984,17 @@ fn model_row_text(model: &ModelDescriptor, selected: bool, current: bool, width:
     if model.availability == ModelAvailability::Unavailable {
         states.push(("unavailable", "U"));
     }
-    choice_row_text(&model.display_name, native, &states, selected, width)
+    let cells = columns.cells(model);
+    // A row too narrow for its name beside the columns drops the columns.
+    let Some(text_width) = width
+        .checked_sub(cells.width())
+        .filter(|room| cells.is_empty() || *room >= 16)
+    else {
+        return choice_row_text(&model.display_name, native, &states, selected, width);
+    };
+    let text = choice_row_text(&model.display_name, native, &states, selected, text_width);
+    let padding = text_width.saturating_sub(text.width());
+    format!("{text}{}{cells}", " ".repeat(padding))
 }
 
 /// The state a row is in for standing for the choice in force, as a row

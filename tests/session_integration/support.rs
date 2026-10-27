@@ -27,6 +27,7 @@ pub fn hosted_model(provider: &str, model: &str) -> ModelDescriptor {
         is_default: true,
         availability: ModelAvailability::Available,
         options: Vec::new(),
+        details: Default::default(),
     }
 }
 

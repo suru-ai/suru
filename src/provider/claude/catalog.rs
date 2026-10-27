@@ -77,6 +77,7 @@ fn model_descriptor(model: NativeModel) -> ModelDescriptor {
         options: reasoning_effort_option(&model.supported_effort_levels)
             .into_iter()
             .collect(),
+        details: Default::default(),
     }
 }
 

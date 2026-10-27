@@ -673,6 +673,7 @@ async fn a_codex_subagent_of_a_claude_session_set_to_bypass_permissions_starts_i
             is_default: true,
             availability: ModelAvailability::Available,
             options: Vec::new(),
+            details: Default::default(),
         }],
     );
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -1305,6 +1306,7 @@ impl NativeCodexChild {
                 is_default: true,
                 availability: ModelAvailability::Available,
                 options: Vec::new(),
+                details: Default::default(),
             }],
         );
         let state_dir = tempfile::tempdir().expect("create isolated state directory");

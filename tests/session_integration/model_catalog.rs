@@ -30,6 +30,7 @@ fn named_model(model: &str, display_name: &str) -> ModelDescriptor {
         is_default: true,
         availability: ModelAvailability::Available,
         options: Vec::new(),
+        details: Default::default(),
     }
 }
 

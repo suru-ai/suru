@@ -8,7 +8,8 @@ use std::{
 
 use github_copilot_sdk::rpc::Model;
 
-use crate::protocol::{Cost, Usage};
+use super::catalog::{token_count, token_prices};
+use crate::protocol::{Cost, ModelPrice, ModelPriceTier, Usage};
 
 /// Copilot documents each AI credit as one cent. Catalog prices are credits
 /// per token batch, so this is the final conversion into the dollar Cost Suru
@@ -22,7 +23,7 @@ pub(super) struct CopilotPricing {
 
 #[derive(Default)]
 struct PriceTable {
-    models: HashMap<String, ModelPrices>,
+    models: HashMap<String, PriceSchedule>,
     loaded: bool,
 }
 
@@ -35,7 +36,7 @@ impl CopilotPricing {
         table.models = models
             .iter()
             .filter_map(|model| {
-                ModelPrices::from_model(model).map(|prices| (model.id.clone(), prices))
+                PriceSchedule::from_model(model).map(|prices| (model.id.clone(), prices))
             })
             .collect();
         table.loaded = true;
@@ -64,7 +65,8 @@ impl CopilotPricing {
     }
 }
 
-struct ModelPrices {
+/// One Model's prices as a Cost is worked out from them.
+struct PriceSchedule {
     batch_size: u64,
     standard: TierPrices,
     long_context: Option<TierPrices>,
@@ -72,40 +74,20 @@ struct ModelPrices {
     long_context_max_prompt_tokens: Option<u64>,
 }
 
-impl ModelPrices {
+impl PriceSchedule {
+    /// The schedule of the prices the catalog lists for `model`: its standard tier first, then
+    /// its long-context tier where it has one.
     fn from_model(model: &Model) -> Option<Self> {
-        let prices = model.billing.as_ref()?.token_prices.as_ref()?;
-        let batch_size = positive_count(prices.batch_size?)?;
-        #[allow(deprecated)]
-        let legacy_cache_read_price = prices.cache_price;
-        let standard = TierPrices {
-            input: valid_price(prices.input_price),
-            output: valid_price(prices.output_price),
-            cache_read: valid_price(prices.cache_read_price.or(legacy_cache_read_price)),
-            cache_write: valid_price(prices.cache_write_price),
-            cache_write_1h: valid_price(prices.cache_write1h_price),
-        };
-        let long_context = prices.long_context.as_ref().map(|long| {
-            #[allow(deprecated)]
-            let legacy_cache_read_price = long.cache_price;
-            TierPrices {
-                input: valid_price(long.input_price),
-                output: valid_price(long.output_price),
-                cache_read: valid_price(long.cache_read_price.or(legacy_cache_read_price)),
-                cache_write: valid_price(long.cache_write_price),
-                cache_write_1h: valid_price(long.cache_write1h_price),
-            }
-        });
+        let prices = token_prices(model.billing.as_ref()?.token_prices.as_ref()?)?;
+        let mut tiers = prices.tiers.iter();
+        let standard = tiers.next()?;
+        let long_context = tiers.next();
         Some(Self {
-            batch_size,
-            standard,
-            long_context,
-            standard_max_prompt_tokens: prices.max_prompt_tokens.and_then(positive_count),
-            long_context_max_prompt_tokens: prices
-                .long_context
-                .as_ref()
-                .and_then(|long| long.max_prompt_tokens)
-                .and_then(positive_count),
+            batch_size: prices.per_tokens,
+            standard: TierPrices::from(standard),
+            long_context: long_context.map(TierPrices::from),
+            standard_max_prompt_tokens: standard.max_prompt_tokens,
+            long_context_max_prompt_tokens: long_context.and_then(|tier| tier.max_prompt_tokens),
         })
     }
 
@@ -128,7 +110,7 @@ impl ModelPrices {
     }
 
     fn tier(&self, max_prompt_tokens: Option<i64>) -> &TierPrices {
-        let reported = max_prompt_tokens.and_then(positive_count);
+        let reported = max_prompt_tokens.and_then(token_count);
         let uses_long_context = reported.is_some_and(|reported| {
             self.long_context_max_prompt_tokens == Some(reported)
                 || self
@@ -151,6 +133,19 @@ struct TierPrices {
     cache_write_1h: Option<f64>,
 }
 
+impl From<&ModelPriceTier> for TierPrices {
+    fn from(tier: &ModelPriceTier) -> Self {
+        let units = |price: Option<ModelPrice>| price.map(ModelPrice::as_units);
+        Self {
+            input: units(tier.input),
+            output: units(tier.output),
+            cache_read: units(tier.cache_read),
+            cache_write: units(tier.cache_write),
+            cache_write_1h: units(tier.cache_write_1h),
+        }
+    }
+}
+
 impl TierPrices {
     fn cache_write_price(&self, cache_ttl_seconds: Option<i64>) -> Option<f64> {
         match cache_ttl_seconds {
@@ -159,14 +154,6 @@ impl TierPrices {
             Some(_) => None,
         }
     }
-}
-
-fn positive_count(count: i64) -> Option<u64> {
-    u64::try_from(count).ok().filter(|count| *count > 0)
-}
-
-fn valid_price(price: Option<f64>) -> Option<f64> {
-    price.filter(|price| price.is_finite() && *price >= 0.0)
 }
 
 fn sum_reported(left: Option<u64>, right: Option<u64>) -> Option<u64> {

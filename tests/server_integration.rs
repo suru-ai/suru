@@ -1837,6 +1837,7 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
             is_default: true,
             availability: ModelAvailability::Available,
             options: Vec::new(),
+            details: Default::default(),
         }],
     );
     let pair = paired_servers_with_runtime("remote-outlook-client", false, Some(runtime)).await;
@@ -2692,6 +2693,7 @@ async fn a_remote_workspace_s_description_is_set_at_its_origin() {
             is_default: true,
             availability: ModelAvailability::Available,
             options: Vec::new(),
+            details: Default::default(),
         }],
     );
     let mut pair =
@@ -6187,6 +6189,7 @@ async fn remote_catalog_delivers_model_names_and_updates_without_listing_models(
             is_default: true,
             availability: ModelAvailability::Available,
             options: Vec::new(),
+            details: Default::default(),
         }],
     );
     let pair =
@@ -6265,6 +6268,7 @@ async fn the_subagent_tree_streams_through_a_remote_outlook() {
             is_default: true,
             availability: ModelAvailability::Available,
             options: Vec::new(),
+            details: Default::default(),
         }],
     );
     let pair = paired_servers_with_runtime("remote-subagent-tree", false, Some(runtime)).await;

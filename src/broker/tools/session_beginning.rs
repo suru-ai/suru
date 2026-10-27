@@ -968,6 +968,7 @@ mod tests {
                 is_default: true,
                 availability: ModelAvailability::Available,
                 options: Vec::new(),
+                details: Default::default(),
             }],
         };
         let catalog = ModelCatalog {

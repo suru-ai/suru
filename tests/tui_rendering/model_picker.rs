@@ -9,11 +9,12 @@ use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
-        AgentSelection, AppearanceSettings, EffectiveSettings, ModelAvailability, ModelCatalog,
-        ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
-        ModelOptionKind, ModelOptionRole, ModelOptionValue, ProviderCatalogStatus, ProviderId,
-        ProviderModelCatalog, ProviderUnavailability, SessionChange, SessionId, SessionRevision,
-        SessionUpdate,
+        AgentSelection, AppearanceSettings, EffectiveSettings, ModelAdvisory,
+        ModelAdvisorySeverity, ModelAvailability, ModelCatalog, ModelDetails, ModelId,
+        ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId,
+        ModelOptionKind, ModelOptionRole, ModelOptionValue, ModelPrice, ModelPriceCategory,
+        ModelPriceTier, ModelPrices, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
+        ProviderUnavailability, SessionChange, SessionId, SessionRevision, SessionUpdate,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId},
 };
@@ -2000,4 +2001,337 @@ fn model_picker_walking_back_up_from_its_foot_leaves_the_list_standing() {
         "and only then moves a Model"
     );
     assert_eq!(focused, drawn[2]);
+}
+
+/// A Copilot-like catalog: a Model publishing prices, limits, and a retention warning, focused by
+/// default; one publishing only its relative cost; and one publishing nothing beyond its options.
+fn detailed_catalog() -> ModelCatalog {
+    let price = ModelPrice::from_units;
+    let mut luna = model_descriptor(
+        "copilot",
+        "luna-fixture",
+        "Luna Fixture",
+        true,
+        ModelAvailability::Available,
+    );
+    luna.description = "Lightweight".to_owned();
+    luna.details = ModelDetails {
+        price_category: Some(ModelPriceCategory::Low),
+        context_window_tokens: Some(1_000_000),
+        output_limit_tokens: Some(128_000),
+        accepts_images: Some(true),
+        prices: Some(ModelPrices {
+            unit: "AI Credits".to_owned(),
+            per_tokens: 1_000_000,
+            tiers: vec![
+                ModelPriceTier {
+                    label: "Default".to_owned(),
+                    max_prompt_tokens: Some(272_000),
+                    input: price(10.0),
+                    output: price(50.0),
+                    cache_read: price(1.0),
+                    cache_write: price(12.5),
+                    cache_write_1h: None,
+                },
+                ModelPriceTier {
+                    label: "Long context".to_owned(),
+                    max_prompt_tokens: Some(872_000),
+                    input: price(20.0),
+                    output: price(75.0),
+                    cache_read: price(2.0),
+                    cache_write: price(25.0),
+                    cache_write_1h: None,
+                },
+            ],
+        }),
+        advisories: vec![ModelAdvisory {
+            severity: ModelAdvisorySeverity::Warning,
+            title: Some("Data retention".to_owned()),
+            text: "Prompts may be retained. [Learn more](https://example.com/r)".to_owned(),
+        }],
+    };
+    let mut terra = model_descriptor(
+        "copilot",
+        "terra-fixture",
+        "Terra Fixture",
+        false,
+        ModelAvailability::Available,
+    );
+    terra.description = "Versatile".to_owned();
+    terra.details.price_category = Some(ModelPriceCategory::VeryHigh);
+    terra.details.advisories.push(ModelAdvisory {
+        severity: ModelAdvisorySeverity::Warning,
+        title: None,
+        text: "Update your client.".to_owned(),
+    });
+    let mut opus = model_descriptor(
+        "claude",
+        "opus-fixture",
+        "Opus Fixture",
+        true,
+        ModelAvailability::Available,
+    );
+    opus.description = "Most capable for complex work".to_owned();
+    opus.options.push(ModelOptionDescriptor {
+        id: ModelOptionId::new("reasoning_effort"),
+        label: "Reasoning effort".to_owned(),
+        description: None,
+        role: ModelOptionRole::ReasoningEffort,
+        kind: ModelOptionKind::Select {
+            choices: ["low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(|choice| ModelOptionChoice {
+                    id: ModelOptionChoiceId::new(choice),
+                    label: choice.to_uppercase(),
+                    description: None,
+                    availability: ModelAvailability::Available,
+                })
+                .collect(),
+            default: ModelOptionChoiceId::new("high"),
+        },
+    });
+    let provider = |id: &str, models| ProviderModelCatalog {
+        provider: ProviderId::new(id),
+        display_name: id.to_owned(),
+        models,
+        status: ProviderCatalogStatus::Fresh,
+    };
+    ModelCatalog {
+        providers: vec![
+            provider("copilot", vec![luna, terra]),
+            provider("claude", vec![opus]),
+        ],
+    }
+}
+
+/// The Landing's Model picker, open on `catalog` with focus on the first Provider's default.
+fn picker_on(catalog: ModelCatalog) -> Application {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed { request, catalog })
+        .expect("list Models");
+    let focus = rendered_application_rows_at(&application, 140, 30)
+        .into_iter()
+        .find(|row| row.contains('›'))
+        .expect("focus stands on a row");
+    if !focus.contains("Luna Fixture") {
+        // Providers list alphabetically, so the Copilot default sits beneath Claude's.
+        key(&mut application, KeyCode::Down);
+    }
+    application
+}
+
+/// A row of a split picker as its two sides: the list, and the details pane right of it.
+fn sides(row: &str) -> (String, String) {
+    let parts = row.split('│').collect::<Vec<_>>();
+    assert!(parts.len() >= 4, "{row:?} is a row of a split picker");
+    (parts[1].to_owned(), parts[2].to_owned())
+}
+
+#[test]
+fn a_wide_model_picker_details_the_focused_model_beside_the_list() {
+    let mut application = picker_on(detailed_catalog());
+    let rows = rendered_application_rows_at(&application, 140, 30);
+    let pane = rows
+        .iter()
+        .filter(|row| row.matches('│').count() >= 3)
+        .map(|row| sides(row).1)
+        .collect::<Vec<_>>();
+    let pane_text = pane.join("\n");
+    assert!(pane_text.contains("Luna Fixture"), "{pane_text}");
+    assert!(
+        pane_text.contains("luna-fixture · Lightweight · Low price"),
+        "{pane_text}"
+    );
+    assert!(
+        pane_text.contains("AI Credits per 1M tokens"),
+        "{pane_text}"
+    );
+    let row = |label: &str| {
+        pane.iter()
+            .find(|row| row.trim_start().starts_with(label))
+            .unwrap_or_else(|| panic!("the pane has a {label} row:\n{pane_text}"))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert_eq!(row("Default"), "Default Long context");
+    assert_eq!(row("Prompt limit"), "Prompt limit 272K 872K");
+    assert_eq!(row("Input"), "Input 10 20");
+    assert_eq!(row("Output"), "Output 50 75");
+    assert_eq!(row("Cache read"), "Cache read 1 2");
+    assert_eq!(row("Cache write"), "Cache write 12.5 25");
+    assert_eq!(row("Context window"), "Context window 1M");
+    assert_eq!(row("Output limit"), "Output limit 128K");
+    assert_eq!(row("Images"), "Images Accepted");
+    assert!(
+        !pane_text.contains("Cache write 1h"),
+        "a price no tier publishes has no row"
+    );
+
+    let (list, _) = sides(&rows[rendered_row(&rows, "› Luna Fixture")]);
+    assert!(
+        list.contains(" $ ") && list.contains("1M"),
+        "the list row compares cost and context at a glance: {list:?}"
+    );
+    assert!(
+        !list.contains("luna-fixture"),
+        "the pane names the Model's identifier, so its row need not: {list:?}"
+    );
+
+    key(&mut application, KeyCode::Down);
+    let pane_text = rendered_application_rows_at(&application, 140, 30)
+        .iter()
+        .filter(|row| row.matches('│').count() >= 3)
+        .map(|row| sides(row).1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        pane_text.contains("terra-fixture · Versatile · Very high price"),
+        "the pane follows focus: {pane_text}"
+    );
+    assert!(!pane_text.contains("AI Credits"), "{pane_text}");
+}
+
+/// The details pane of a split picker, one string per row.
+fn pane(application: &Application) -> Vec<String> {
+    rendered_application_rows_at(application, 140, 30)
+        .iter()
+        .filter(|row| row.matches('│').count() >= 3)
+        .map(|row| sides(row).1)
+        .collect()
+}
+
+#[test]
+fn a_warning_its_provider_asks_be_read_marks_the_model_and_heads_its_details() {
+    let application = picker_on(detailed_catalog());
+    let rows = rendered_application_rows_at(&application, 140, 30);
+    let (luna, _) = sides(&rows[rendered_row(&rows, "› Luna Fixture")]);
+    let (opus, _) = sides(&rows[rendered_row(&rows, "Opus Fixture")]);
+    assert!(luna.contains(" ! "), "{luna:?}");
+    assert!(!opus.contains('!'), "{opus:?}");
+
+    let details = pane(&application);
+    let text = details.join("\n");
+    let warning = details
+        .iter()
+        .position(|row| row.contains("! Data retention"))
+        .unwrap_or_else(|| panic!("the pane heads a retention warning:\n{text}"));
+    let prices = rendered_row(&details, "AI Credits");
+    assert!(
+        warning < prices,
+        "the warning stands before the prices:\n{text}"
+    );
+    assert!(
+        text.contains("Prompts may be retained. Learn more")
+            && text.contains("(https://example.com/r)"),
+        "a link is written out with its address, the picker being no place to click:\n{text}"
+    );
+
+    let mut application = application;
+    key(&mut application, KeyCode::Down);
+    let text = pane(&application).join("\n");
+    assert!(
+        text.contains("! Update your client."),
+        "an untitled warning leads with its marker:\n{text}"
+    );
+}
+
+#[test]
+fn a_narrow_model_picker_summarises_the_focused_model_beneath_the_list() {
+    let mut catalog = detailed_catalog();
+    let mut quiet = catalog.providers[0].models[0].clone();
+    quiet.id = ModelId::new("quiet-fixture");
+    quiet.display_name = "Quiet Fixture".to_owned();
+    quiet.is_default = false;
+    quiet.details.advisories.clear();
+    catalog.providers[0].models.push(quiet);
+    let mut application = picker_on(catalog);
+    let strip = |application: &Application| {
+        let rows = rendered_application_rows_at(application, 80, 20);
+        // The strip's rule runs border to border inside the picker.
+        let rule = rows.iter().position(|row| row.trim().starts_with("│─"));
+        rule.map(|rule| rows[rule + 1..rule + 3].join("\n"))
+    };
+
+    let luna = strip(&application).expect("a Model with details has a strip");
+    assert!(
+        luna.contains("luna-fixture · Lightweight · Low price"),
+        "{luna}"
+    );
+    assert!(
+        luna.contains("! Data retention"),
+        "a warning takes the strip's second line: {luna}"
+    );
+
+    key(&mut application, KeyCode::Down);
+    let quiet = strip(&application).expect("a Model with details has a strip");
+    assert!(
+        quiet.contains("quiet-fixture · Lightweight · Low price"),
+        "{quiet}"
+    );
+    assert!(
+        quiet.contains("In 10 · Out 50 · Cache 1/12.5"),
+        "with no warning, the strip compares prices: {quiet}"
+    );
+
+    key(&mut application, KeyCode::Down);
+    let terra = strip(&application).expect("a Model with details has a strip");
+    assert!(
+        terra.contains("terra-fixture · Versatile · Very high price"),
+        "{terra}"
+    );
+
+    key(&mut application, KeyCode::Down);
+    let opus = strip(&application).expect(
+        "the strip holds its place while a listed Model has details, so the list holds still",
+    );
+    assert!(
+        opus.contains("opus-fixture · Most capable for complex work"),
+        "{opus}"
+    );
+
+    let mut catalog = detailed_catalog();
+    catalog
+        .providers
+        .retain(|provider| provider.provider.as_str() == "claude");
+    let plain = picker_on(catalog);
+    assert_eq!(
+        strip(&plain),
+        None,
+        "a catalog that publishes nothing beyond its rows spares the list its room"
+    );
+}
+
+#[test]
+fn a_model_whose_provider_publishes_no_details_is_described_by_its_options() {
+    let application = picker_on(detailed_catalog());
+    let mut application = application;
+    // Claude lists first, so the Copilot default's row is one below its Model.
+    key(&mut application, KeyCode::Up);
+    let pane = pane(&application);
+    let text = pane.join("\n");
+    assert!(text.contains("Opus Fixture"), "{text}");
+    assert!(
+        text.contains("opus-fixture · Most capable for complex work"),
+        "{text}"
+    );
+    let effort = pane
+        .iter()
+        .find(|row| row.contains("Reasoning effort"))
+        .unwrap_or_else(|| panic!("the pane says what each Option offers:\n{text}"))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(effort, "Reasoning effort LOW … MAX");
+    assert!(!text.contains("AI Credits"), "{text}");
+    assert!(!text.contains("Context window"), "{text}");
 }

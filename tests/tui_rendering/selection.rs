@@ -220,6 +220,65 @@ fn a_wrapped_fix_in_the_model_picker_copies_as_one_unbroken_line() {
 }
 
 #[test]
+fn a_wrapped_advisory_in_the_model_details_pane_copies_as_written_without_the_list() {
+    use suru::protocol::*;
+    const ADVISORY: &str = "Prompts and outputs may be retained by the model provider for up to \
+                            thirty days. Learn more (https://example.com/retention)";
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    release_copy(&mut application);
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::ModelList,
+        )))
+        .unwrap()
+    else {
+        panic!("the picker requests Models")
+    };
+    let mut model = model_descriptor(
+        "copilot",
+        "luna-fixture",
+        "Luna Fixture",
+        true,
+        ModelAvailability::Available,
+    );
+    model.details.advisories.push(ModelAdvisory {
+        severity: ModelAdvisorySeverity::Warning,
+        title: Some("Data retention".to_owned()),
+        text: "Prompts and outputs may be retained by the model provider for up to thirty \
+               days. [Learn more](https://example.com/retention)"
+            .to_owned(),
+    });
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("copilot"),
+                    display_name: "Copilot".to_owned(),
+                    models: vec![model],
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .unwrap();
+
+    let buffer = rendered_application_buffer(&application, 140, 30);
+    let start = text_position(&buffer, "Prompts and outputs");
+    let tail = text_position(&buffer, "retention)");
+    assert!(
+        start.1 < tail.1,
+        "the advisory wraps over rows of the pane, beside the list's own rows"
+    );
+    let end = (tail.0 + "retention)".len() as u16 - 1, tail.1);
+    assert_eq!(
+        drag(&mut application, start, end),
+        ApplicationTransition::CopyToClipboard(ADVISORY.into()),
+        "the advisory copies as one line, with nothing of the list drawn beside it"
+    );
+}
+
+#[test]
 fn composer_and_transcript_drags_stay_on_the_surface_they_started_on() {
     let workspace = workspace_dir();
     let mut application = connected_application(workspace.path());

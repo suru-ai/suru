@@ -92,6 +92,7 @@ fn errand_titling_provider() -> (
                 default: ModelOptionChoiceId::new("thorough"),
             },
         }],
+        details: Default::default(),
     };
     ControlledProvider::with_provider(
         ProviderId::new(PROVIDER),

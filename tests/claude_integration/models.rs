@@ -225,6 +225,7 @@ async fn claude_models_are_listed_beside_another_hosted_provider() {
             is_default: true,
             availability: ModelAvailability::Available,
             options: Vec::new(),
+            details: Default::default(),
         }],
     );
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
