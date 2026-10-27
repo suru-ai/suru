@@ -3510,16 +3510,14 @@ fn render_split_settings_panel(
     );
     // The Provider's own Settings are the one thing in the pane a pointer can
     // focus, on the rows the pane drew them on.
-    let provider_window = provider_settings
-        .filter(|listed| !listed.is_empty())
-        .map(|listed| RowWindow {
-            top: pane_content
-                .y
-                .saturating_add(u16::try_from(listed.start).unwrap_or(u16::MAX)),
-            first: 0,
-            count: u16::try_from(listed.len()).unwrap_or(u16::MAX),
-            columns: pane_content.left()..pane_content.right(),
-        });
+    let provider_window = provider_settings.map(|shown| RowWindow {
+        top: pane_content
+            .y
+            .saturating_add(u16::try_from(shown.row).unwrap_or(u16::MAX)),
+        first: shown.first,
+        count: u16::try_from(shown.count).unwrap_or(u16::MAX),
+        columns: pane_content.left()..pane_content.right(),
+    });
     state.settings_panel.record_layout(
         PanelLayout::new(content_columns, tab_bar)
             .with_rows(window)

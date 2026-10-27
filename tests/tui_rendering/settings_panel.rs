@@ -4762,11 +4762,20 @@ fn numeric_editor_selection_is_modal_over_the_settings_panel() {
 /// focused Setting detailed in a pane beside them.
 const WIDE: (u16, u16) = (140, 30);
 
+/// A terminal as wide, but short enough that the pane has eighteen rows
+/// rather than twenty.
+const TIGHT: u16 = 24;
+
 /// The wide panel as its two sides, one string per screen row of each: the
 /// rows on the left, and the pane beside them. Rows the split does not reach —
 /// the tab bar, the controls — are neither's.
 fn split_panel(application: &Application) -> (Vec<String>, Vec<String>) {
-    let rows = rendered_application_rows_at(application, WIDE.0, WIDE.1);
+    split_panel_at(application, WIDE.1)
+}
+
+/// [`split_panel`] in a terminal `height` rows tall.
+fn split_panel_at(application: &Application, height: u16) -> (Vec<String>, Vec<String>) {
+    let rows = rendered_application_rows_at(application, WIDE.0, height);
     let left = panel_left(&rows);
     rows.iter()
         .filter_map(|row| {
@@ -4780,7 +4789,12 @@ fn split_panel(application: &Application) -> (Vec<String>, Vec<String>) {
 /// The pane's rows read as text, each with its runs of spaces closed up, so a
 /// test names what a row says rather than how far its columns stand apart.
 fn pane(application: &Application) -> Vec<String> {
-    split_panel(application)
+    pane_at(application, WIDE.1)
+}
+
+/// [`pane`] in a terminal `height` rows tall.
+fn pane_at(application: &Application, height: u16) -> Vec<String> {
+    split_panel_at(application, height)
         .1
         .iter()
         .map(|row| row.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -4790,7 +4804,12 @@ fn pane(application: &Application) -> Vec<String> {
 /// The pane's text as one paragraph, wrapped rows rejoined, for a test of a
 /// line the pane wraps.
 fn pane_text(application: &Application) -> String {
-    pane(application)
+    pane_text_at(application, WIDE.1)
+}
+
+/// [`pane_text`] in a terminal `height` rows tall.
+fn pane_text_at(application: &Application, height: u16) -> String {
+    pane_at(application, height)
         .into_iter()
         .filter(|row| !row.is_empty())
         .collect::<Vec<_>>()
@@ -5082,6 +5101,10 @@ fn a_wide_panel_leads_its_pane_with_a_providers_condition_and_its_whole_fix() {
     );
 }
 
+/// A refused edit is the most urgent thing the pane has to say, so it leads
+/// even a pane too short for all it has to say, above the Provider's own
+/// condition and its fix, and it reads as the same failure the narrow
+/// headline reports.
 #[test]
 fn a_refused_edit_leads_the_pane_above_the_providers_own_condition() {
     let workspace = workspace_dir();
@@ -5107,18 +5130,26 @@ fn a_refused_edit_leads_the_pane_above_the_providers_own_condition() {
         })
         .expect("hear that the edit never landed");
 
-    let details = pane(&application);
-    let error = pane_row(
-        &details,
-        "Config Document \"suru.jsonc\" is not valid JSONC",
+    // Short enough that the pane has more to say than rows to say it in.
+    let details = pane_at(&application, TIGHT);
+    assert_eq!(
+        details.last().map(String::as_str),
+        Some("…"),
+        "the pane is cut short: {details:#?}"
     );
-    let message = pane_row(&details, "the codex CLI is not on PATH");
+    let text = pane_text_at(&application, TIGHT);
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("the pane says {needle:?}: {text}"))
+    };
     assert!(
-        error < message && details[message + 1] == "fix the CLI",
-        "the refusal leads, and the Provider's condition still follows with its fix: \
-         {details:#?}"
+        at("Config Document \"suru.jsonc\" is not valid JSONC")
+            < at("the codex CLI is not on PATH fix the CLI")
+            && at("the codex CLI is not on PATH") < at("Reasoning summary auto"),
+        "the refusal leads, and the Provider's condition still follows with its fix, \
+         ahead of the Provider's own Settings: {text}"
     );
-    let buffer = rendered_application_buffer(&application, WIDE.0, WIDE.1);
+    let buffer = rendered_application_buffer(&application, WIDE.0, TIGHT);
     assert_eq!(
         styling(&buffer, "is not valid JSONC"),
         styling(
@@ -5346,5 +5377,199 @@ fn a_diagnostic_naming_one_of_a_providers_own_settings_leads_its_pane() {
     assert!(
         !pane_text(&application).contains("ignored for a test"),
         "another Provider's pin is that Provider's business"
+    );
+}
+
+/// Codex's pane in a terminal too short for all of it: the condition and its
+/// fix lead, and the Provider's own Settings and the one focus picks out in
+/// detail follow.
+fn codex_unavailable_in_a_short_terminal() -> (super::support::WorkspaceDir, Application) {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let request = read_providers_tab(&mut application);
+    deliver_catalog(
+        &mut application,
+        request,
+        &[
+            (
+                "codex",
+                ProviderCatalogStatus::Unavailable {
+                    reason: ProviderUnavailability::NotSignedIn,
+                    message: "The codex CLI holds no credentials".to_owned(),
+                    fix: "run `codex login`".to_owned(),
+                },
+            ),
+            ("copilot", ProviderCatalogStatus::Fresh),
+            ("claude", ProviderCatalogStatus::Fresh),
+        ],
+    );
+    (workspace, application)
+}
+
+/// A pane with more to say than rows to say it in leads with what asks
+/// something of the reader while the keys are on the Providers. Once they are
+/// on the Provider's own Settings, the pane keeps its heading and scrolls the
+/// rest beneath it, an ellipsis standing for what went by, until the Setting
+/// the keys are on shows with all of its detail.
+#[test]
+fn the_pane_scrolls_the_setting_the_keys_are_on_into_view_with_all_its_detail() {
+    let (_workspace, mut application) = codex_unavailable_in_a_short_terminal();
+
+    let details = pane_at(&application, TIGHT);
+    assert_eq!(details.len(), 18, "{details:#?}");
+    assert_eq!(details[0], "Codex enabled");
+    pane_row(&details, "The codex CLI holds no credentials");
+    pane_row(&details, "run `codex login`");
+    assert_eq!(
+        details.last().map(String::as_str),
+        Some("…"),
+        "the keys on the Providers, the pane leads with the condition and is cut \
+         short beneath: {details:#?}"
+    );
+
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    let details = pane_at(&application, TIGHT);
+    assert_eq!(
+        &details[..3],
+        ["Codex enabled", "provider.codex.enabled", "…"],
+        "the heading holds while the rest scrolls beneath it: {details:#?}"
+    );
+    pane_row(&details, "› Reasoning summary auto");
+    let text = pane_text_at(&application, TIGHT);
+    assert!(
+        text.ends_with("Applies on the Server Sidekicks read and change"),
+        "the Setting the keys are on shows with all of its detail: {details:#?}"
+    );
+
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    let details = pane_at(&application, TIGHT);
+    pane_row(&details, "› Approval policy on-request");
+    let text = pane_text_at(&application, TIGHT);
+    assert!(
+        text.ends_with(
+            "Sidekicks read only, since it is part of an Approval Posture, which bounds \
+             what Agents may do without asking the user"
+        ),
+        "{details:#?}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        MutatesSetting(SettingMutation::ProviderCodexApprovalPolicy {
+            value: Some(suru::protocol::CodexApprovalPolicy::Never),
+        }),
+        "and Space edits the Setting on show"
+    );
+
+    press(&mut application, KeyCode::Esc, KeyModifiers::NONE);
+    let details = pane_at(&application, TIGHT);
+    pane_row(&details, "The codex CLI holds no credentials");
+}
+
+/// However much the pane has to lead with — a refused edit, a Provider's
+/// condition and its fix, a pin Suru ignored, each wrapped over rows of its
+/// own — the Setting the keys are on is never pushed out of it.
+#[test]
+fn leads_however_long_never_push_the_setting_the_keys_are_on_out_of_the_pane() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    let file = super::support::named_workspace_path("suru.jsonc");
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
+                settings: EffectiveSettings::default(),
+                pinned: Vec::new(),
+                diagnostics: vec![suru::protocol::SettingsDiagnostic {
+                    severity: suru::protocol::SettingsDiagnosticSeverity::Warning,
+                    file,
+                    key: Some("provider.copilot.permissions".to_owned()),
+                    message: "ignored because its value is not one of \"ask\", \"auto\", or \
+                              \"allowAll\""
+                        .to_owned(),
+                }],
+            },
+        )))
+        .expect("receive the snapshot and its diagnostics");
+    let request = read_providers_tab(&mut application);
+    deliver_catalog(
+        &mut application,
+        request,
+        &[
+            ("codex", ProviderCatalogStatus::Fresh),
+            (
+                "copilot",
+                ProviderCatalogStatus::Unavailable {
+                    reason: ProviderUnavailability::NotInstalled,
+                    message: "could not launch Copilot CLI server `copilot`: No such file or \
+                              directory (os error 2)"
+                        .to_owned(),
+                    fix: "install the Copilot CLI from \
+                          https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli"
+                        .to_owned(),
+                },
+            ),
+            ("claude", ProviderCatalogStatus::Fresh),
+        ],
+    );
+    press(&mut application, KeyCode::Down, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+    press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE);
+    application
+        .handle_event(ApplicationEvent::SettingMutationFailed {
+            request: SettingRequest::new(),
+            error: "Config Document \"suru.jsonc\" is not valid JSONC: expected a value \
+                    at line 3, column 14, so Suru left it exactly as it was"
+                .to_owned(),
+        })
+        .expect("hear that the edit never landed");
+
+    for height in [TIGHT, 22] {
+        let details = pane_at(&application, height);
+        pane_row(&details, "› Permissions auto");
+        assert!(
+            pane_text_at(&application, height).ends_with(
+                "Sidekicks read only, since it is part of an Approval Posture, which \
+                 bounds what Agents may do without asking the user"
+            ),
+            "at {height} rows: {details:#?}"
+        );
+    }
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        MutatesSetting(SettingMutation::ProviderCopilotPermissions {
+            value: Some(suru::protocol::CopilotPermissions::AllowAll),
+        })
+    );
+}
+
+/// A pointer lands on the rows a scrolled pane drew, wherever the scroll put
+/// them, and on nothing where an ellipsis stands for rows it did not.
+#[test]
+fn a_click_lands_on_the_setting_a_scrolled_pane_drew_there() {
+    let (_workspace, mut application) = codex_unavailable_in_a_short_terminal();
+    press(&mut application, KeyCode::Enter, KeyModifiers::NONE);
+
+    let buffer = rendered_application_buffer(&application, WIDE.0, TIGHT);
+    let (column, row) = text_position(&buffer, "provider.codex.enabled");
+    let before = pane_at(&application, TIGHT);
+    rendered_application_buffer(&application, WIDE.0, TIGHT);
+    click(&mut application, column, row + 1);
+    assert_eq!(
+        pane_at(&application, TIGHT),
+        before,
+        "the ellipsis focuses nothing"
+    );
+
+    rendered_application_buffer(&application, WIDE.0, TIGHT);
+    let (column, row) = text_position(&buffer, "Sandbox mode");
+    click(&mut application, column, row);
+    pane_row(
+        &pane_at(&application, TIGHT),
+        "› Sandbox mode workspace-write",
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        MutatesSetting(SettingMutation::ProviderCodexSandboxMode {
+            value: Some(suru::protocol::CodexSandboxMode::DangerFullAccess),
+        })
     );
 }

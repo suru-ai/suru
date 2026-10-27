@@ -88,8 +88,20 @@ struct ProviderAccount {
 /// Settings, which a pointer resolves against.
 pub(super) struct DrawnDetails<'a> {
     pub(super) pane: DrawnPane<'a>,
-    pub(super) provider_settings: Option<Range<usize>>,
+    pub(super) provider_settings: Option<ShownSettings>,
 }
+
+/// Where a pane shows a Provider's own Settings: the row of the pane the first
+/// shown stands on, which of the Settings that is, and how many show.
+pub(super) struct ShownSettings {
+    pub(super) row: usize,
+    pub(super) first: usize,
+    pub(super) count: usize,
+}
+
+/// The rows every account heads the pane with, which stay put while the rest
+/// scrolls beneath them: a name, and the key it is pinned by.
+const HEADING_ROWS: usize = 2;
 
 /// Something the pane leads with because it asks something of the reader
 /// before anything about the Setting does.
@@ -193,8 +205,50 @@ impl<'a> DetailsPane<'a> {
     }
 
     /// The pane in `height` rows `width` columns wide. A pane with more to
-    /// say than it has rows for ends on an ellipsis rather than silently.
+    /// say than it has rows for ends on an ellipsis rather than silently —
+    /// save one whose keys are on a Provider's own Settings, which keeps its
+    /// heading and scrolls the rest beneath it until the Setting the keys are
+    /// on shows with all of its detail, because that Setting is what an edit
+    /// would change.
     pub(super) fn draw(&self, width: u16, height: usize, theme: &Theme) -> DrawnDetails<'_> {
+        // Where even that would cut the Setting short, its detail gives up
+        // the blank rows standing its parts apart before anything it says.
+        let spaced = self.lay_out(width, Spacing::Spaced, theme);
+        let (mut drawn, listed, keep) = if spaced.2.len() + HEADING_ROWS + 1 > height {
+            self.lay_out(width, Spacing::Packed, theme)
+        } else {
+            spaced
+        };
+        let window = drawn.fit_showing(height, HEADING_ROWS, keep, theme);
+        // A Setting the pane had no room for, or scrolled past, is no row a
+        // pointer can land on, and nor is an ellipsis standing for it.
+        let provider_settings = listed.and_then(|listed| {
+            let mut shown = listed
+                .clone()
+                .filter_map(|row| Some((row, window.row(row)?)));
+            let (first, row) = shown.next()?;
+            Some(ShownSettings {
+                row,
+                first: first - listed.start,
+                count: 1 + shown.count(),
+            })
+        });
+        DrawnDetails {
+            pane: drawn,
+            provider_settings,
+        }
+    }
+
+    /// Everything the pane has to say, `width` columns wide however many rows
+    /// it takes, with where it listed a Provider's own Settings and the rows
+    /// the reader must see: from the Setting the keys are on to the foot,
+    /// while they are on one.
+    fn lay_out(
+        &self,
+        width: u16,
+        spacing: Spacing,
+        theme: &Theme,
+    ) -> (DrawnPane<'_>, Option<Range<usize>>, Range<usize>) {
         let mut drawn = DrawnPane::default();
         match &self.account {
             Account::Setting(account) => account.draw_heading(&mut drawn, width, theme),
@@ -211,27 +265,35 @@ impl<'a> DetailsPane<'a> {
             };
             drawn.wrap(&lead.text, "", width, style);
         }
-        let provider_settings = match &self.account {
+        match &self.account {
             Account::Setting(account) => {
                 account.draw(&mut drawn, width, theme);
-                None
+                (drawn, None, 0..0)
             }
-            Account::Provider(account) => Some(account.draw(&mut drawn, width, theme)),
-        };
-        // A row the pane had no room left for is no row a pointer can land
-        // on, and nor is the ellipsis standing in for the rest.
-        let kept = if drawn.lines.len() > height {
-            height.saturating_sub(1)
-        } else {
-            drawn.lines.len()
-        };
-        drawn.fit(height, theme);
-        DrawnDetails {
-            pane: drawn,
-            provider_settings: provider_settings
-                .map(|rows| rows.start.min(kept)..rows.end.min(kept)),
+            Account::Provider(account) => {
+                let listed = account.draw(&mut drawn, width, spacing, theme);
+                let picked = account
+                    .settings
+                    .iter()
+                    .position(|row| row.selected)
+                    .map_or(listed.start, |index| listed.start + index);
+                let keep = if account.holds_keys {
+                    picked..drawn.lines.len()
+                } else {
+                    0..0
+                };
+                (drawn, Some(listed), keep)
+            }
         }
     }
+}
+
+/// Whether the detail of a Provider's picked Setting stands its parts apart
+/// with blank rows, or gives them up for a pane too short for them.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Spacing {
+    Spaced,
+    Packed,
 }
 
 impl ProviderAccount {
@@ -289,7 +351,18 @@ impl ProviderAccount {
     /// What a disabled Provider is left as, then its own Settings, each on a
     /// row ending on its value and a mark for a pin, then the one focus picks
     /// out among them in detail. Answers with the rows the Settings took.
-    fn draw<'a>(&'a self, drawn: &mut DrawnPane<'a>, width: u16, theme: &Theme) -> Range<usize> {
+    fn draw<'a>(
+        &'a self,
+        drawn: &mut DrawnPane<'a>,
+        width: u16,
+        spacing: Spacing,
+        theme: &Theme,
+    ) -> Range<usize> {
+        let space = |drawn: &mut DrawnPane<'a>| {
+            if spacing == Spacing::Spaced {
+                drawn.lines.push(Line::default());
+            }
+        };
         if let Some(disabled) = &self.disabled {
             drawn.lines.push(Line::default());
             drawn.wrap(disabled, "", width, theme.text.subdued);
@@ -306,12 +379,12 @@ impl ProviderAccount {
         // mark, so its detail goes straight from its values to where it
         // applies.
         if let Some(picked) = &self.picked {
-            drawn.lines.push(Line::default());
+            space(drawn);
             drawn.line(picked.descriptor.key, width, theme.text.subdued);
             drawn.wrap(picked.descriptor.description, "", width, theme.text.primary);
-            drawn.lines.push(Line::default());
+            space(drawn);
             picked.draw_values(drawn, width, theme);
-            drawn.lines.push(Line::default());
+            space(drawn);
             picked.draw_reach(drawn, width, theme);
         }
         listed
