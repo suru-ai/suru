@@ -2796,46 +2796,39 @@ fn render_icon_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme
     );
 }
 
-/// The room a Model picker needs before it details the focused Model in a pane
-/// beside its list rather than a strip beneath it, and the size it stands at
-/// once it does.
-const MODEL_PICKER_SPLIT_MIN_WIDTH: u16 = 100;
-const MODEL_PICKER_SPLIT_WIDTH: u16 = 116;
+/// The height a Model picker stands at once it has the room to detail the
+/// focused Model in a pane beside its list rather than a strip beneath it.
 const MODEL_PICKER_SPLIT_HEIGHT: u16 = 22;
+/// The share of a split picker's width its list keeps, in twentieths.
+const MODEL_PICKER_SPLIT_LIST: u16 = 9;
 /// The fewest content rows a narrow picker keeps before it spares any for the
 /// focused Model's strip.
 const MODEL_PICKER_STRIP_MIN_HEIGHT: u16 = 10;
 
 fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
-    let split = main.width.saturating_sub(4) >= MODEL_PICKER_SPLIT_MIN_WIDTH;
-    let area = if split {
-        centered_rect(
-            main,
-            main.width.saturating_sub(4).min(MODEL_PICKER_SPLIT_WIDTH),
-            main.height.saturating_sub(2).min(MODEL_PICKER_SPLIT_HEIGHT),
-        )
-    } else {
-        centered_rect(
-            main,
-            main.width.saturating_sub(4).min(76),
-            main.height.saturating_sub(2).min(14),
-        )
-    };
-    let inner = area.inner(ratatui::layout::Margin::new(1, 1));
-    let [list_area, pane_area] = if split {
-        let list_width = inner.width * 9 / 20;
-        Layout::horizontal([Constraint::Length(list_width), Constraint::Fill(1)])
-            .spacing(1)
-            .areas(inner)
-    } else {
-        [inner, Rect::default()]
-    };
+    let split = SplitBox::fits(main).then(|| {
+        let area = SplitBox::area(main, MODEL_PICKER_SPLIT_HEIGHT);
+        SplitBox::new(area, SplitBox::inner(area), MODEL_PICKER_SPLIT_LIST)
+    });
+    let area = split.as_ref().map_or_else(
+        || {
+            centered_rect(
+                main,
+                main.width.saturating_sub(4).min(76),
+                main.height.saturating_sub(2).min(14),
+            )
+        },
+        |split| split.area,
+    );
+    let list_area = split
+        .as_ref()
+        .map_or_else(|| SplitBox::inner(area), |split| split.list);
     let content_width = list_area.width;
     let content_height = list_area.height;
     let focused = state.model_picker.list().focused_model();
     // A narrow picker spares its strip wherever a listed Model has details to
     // tell, whichever row focus stands on, so the list holds its height.
-    let strip = (!split
+    let strip = (split.is_none()
         && content_height >= MODEL_PICKER_STRIP_MIN_HEIGHT
         && state.model_picker.list().lists_details())
     .then(|| model_details::strip_lines(focused, content_width, theme));
@@ -2863,7 +2856,7 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
             content_width,
             state.agent_selection(),
             RowLayout {
-                identified_beside: split,
+                identified_beside: split.is_some(),
             },
             theme,
         );
@@ -2903,7 +2896,7 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
         area,
     );
     frame.render_widget(Paragraph::new(lines), list_area);
-    if !split {
+    let Some(split) = split else {
         record_overlay_selection_around(
             frame,
             state,
@@ -2913,28 +2906,139 @@ fn render_model_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
             &wrapped,
         );
         return;
-    }
-    let pane = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(theme.border.default)
-        .padding(Padding::left(1));
-    let pane_content = pane.inner(pane_area);
+    };
+    let pane_content = split.pane_content();
     let details = focused.map(DetailsPane::new);
     let drawn = details
         .as_ref()
         .map(|details| details.draw(pane_content.width, usize::from(pane_content.height), theme));
     let (pane_lines, pane_wrapped) =
         drawn.map_or_else(Default::default, |drawn| (drawn.lines, drawn.wrapped));
-    frame.render_widget(Paragraph::new(pane_lines).block(pane), pane_area);
-    // The list and the pane are read apart, so a selection in one never
-    // takes in the other's text beside it.
-    record_overlay_selection_parts(
+    split.draw_pane(frame, pane_lines, false, theme);
+    split.record_selection(
         frame,
         state,
-        area,
         SelectionSurface::Models,
-        &[(list_area, &wrapped), (pane_content, &pane_wrapped)],
+        SplitWrapped {
+            list: &wrapped,
+            pane: &pane_wrapped,
+        },
+        &[],
     );
+}
+
+/// The layout a box takes once it is wide enough to detail what focus stands
+/// on in a pane beside its list, rather than in a headline or a strip with it:
+/// the box itself, its list keeping the left of its body, and the pane on the
+/// right behind a rule of its own. The Model picker and the settings panel
+/// both split this way, so they split at the same width and stand at the same
+/// width once they do.
+struct SplitBox {
+    area: Rect,
+    list: Rect,
+    pane: Rect,
+}
+
+impl SplitBox {
+    /// The room a box needs before it splits, and the width it stands at once
+    /// it does.
+    const MIN_WIDTH: u16 = 100;
+    const WIDTH: u16 = 116;
+
+    /// Whether `main` has the room for a box to split.
+    fn fits(main: Rect) -> bool {
+        main.width.saturating_sub(4) >= Self::MIN_WIDTH
+    }
+
+    /// Where a split box `height` rows tall at most stands, centered in
+    /// `main`.
+    fn area(main: Rect, height: u16) -> Rect {
+        centered_rect(
+            main,
+            main.width.saturating_sub(4).min(Self::WIDTH),
+            main.height.saturating_sub(2).min(height),
+        )
+    }
+
+    /// The rows and columns inside a box's border.
+    fn inner(area: Rect) -> Rect {
+        area.inner(ratatui::layout::Margin::new(1, 1))
+    }
+
+    /// The box at `area`, its `body` — whatever of the inside of its border
+    /// is not spanned by a line of its own — split so the list keeps
+    /// `list_twentieths` of the width and the pane the rest, a column apart.
+    fn new(area: Rect, body: Rect, list_twentieths: u16) -> Self {
+        let [list, pane] = Layout::horizontal([
+            Constraint::Length(body.width * list_twentieths / 20),
+            Constraint::Fill(1),
+        ])
+        .spacing(1)
+        .areas(body);
+        Self { area, list, pane }
+    }
+
+    /// The pane's rule in `rule`, and the column of padding standing its text
+    /// off it.
+    fn pane_block(rule: Style) -> Block<'static> {
+        Block::default()
+            .borders(Borders::LEFT)
+            .border_style(rule)
+            .padding(Padding::left(1))
+    }
+
+    /// Where the pane's text goes, past its rule and padding.
+    fn pane_content(&self) -> Rect {
+        Self::pane_block(Style::default()).inner(self.pane)
+    }
+
+    /// Draws `lines` in the pane behind its rule, which takes the accent while
+    /// the pane `holds_keys`: that is how the pane reads as the side that has
+    /// them.
+    fn draw_pane(
+        &self,
+        frame: &mut Frame<'_>,
+        lines: Vec<Line<'static>>,
+        holds_keys: bool,
+        theme: &Theme,
+    ) {
+        let rule = if holds_keys {
+            theme.accent.primary
+        } else {
+            theme.border.default
+        };
+        frame.render_widget(
+            Paragraph::new(lines).block(Self::pane_block(rule)),
+            self.pane,
+        );
+    }
+
+    /// Records what a selection reads: the list and the pane apart, each with
+    /// the lines it wrapped, so a selection in one never takes in the other's
+    /// text beside it; and each of `spanning`, a row drawn across the whole
+    /// box, whole.
+    fn record_selection(
+        &self,
+        frame: &mut Frame<'_>,
+        state: &TuiState,
+        surface: SelectionSurface,
+        wrapped: SplitWrapped<'_, '_>,
+        spanning: &[Rect],
+    ) {
+        let mut parts = vec![
+            (self.list, wrapped.list),
+            (self.pane_content(), wrapped.pane),
+        ];
+        parts.extend(spanning.iter().map(|area| (*area, &[][..])));
+        record_overlay_selection_parts(frame, state, self.area, surface, &parts);
+    }
+}
+
+/// The lines each side of a split box wrapped, which a selection reads as the
+/// lines they were written as.
+struct SplitWrapped<'s, 'a> {
+    list: &'s [WrappedLine<'a>],
+    pane: &'s [WrappedLine<'a>],
 }
 
 fn render_approval_posture_picker(
@@ -3068,13 +3172,13 @@ const SETTINGS_BACK: &str = "‹ ";
 /// What stands between two controls the footer teaches.
 const SETTINGS_HINT_GAP: &str = " · ";
 
-/// The room a settings panel needs before it details the focused Setting in a
-/// pane beside its rows rather than a headline above them, and the size it
-/// stands at once it does: one size whichever tab it shows, so a reader
-/// walking the tabs never watches the pane move.
-const SETTINGS_PANEL_SPLIT_MIN_WIDTH: u16 = 100;
-const SETTINGS_PANEL_SPLIT_WIDTH: u16 = 116;
+/// The height a settings panel stands at once it has the room to detail the
+/// focused Setting in a pane beside its rows rather than a headline above
+/// them: one size whichever tab it shows, so a reader walking the tabs never
+/// watches the pane move.
 const SETTINGS_PANEL_SPLIT_HEIGHT: u16 = 24;
+/// The share of a split panel's width its rows keep, in twentieths.
+const SETTINGS_PANEL_SPLIT_LIST: u16 = 10;
 
 /// The settings panel: the tab bar, the rows of the tab being shown, what each
 /// is worth right now, and whether that value is the reader's own pin or the
@@ -3096,12 +3200,8 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     let panel = &state.settings_panel;
     let rows = panel.rows(state.settings(), state.pinned_settings());
     let provider = panel.provider_focus(state.settings(), state.pinned_settings());
-    let split = main.width.saturating_sub(4) >= SETTINGS_PANEL_SPLIT_MIN_WIDTH;
-    let width = main.width.saturating_sub(4).min(if split {
-        SETTINGS_PANEL_SPLIT_WIDTH
-    } else {
-        76
-    });
+    let split = SplitBox::fits(main);
+    let width = main.width.saturating_sub(4).min(76);
     // A narrow panel with the keys on a Provider's own Settings lists those
     // in the Providers' place, beneath a line naming the Provider they are.
     let drilled = provider
@@ -3120,13 +3220,14 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     // A tab lists a known number of rows, so a narrow panel is exactly as tall
     // as it needs to be: two borders around the tab bar and the headline,
     // whatever fix goes beneath it, one row per Setting, and the controls.
-    let wanted = if split {
-        SETTINGS_PANEL_SPLIT_HEIGHT
+    let area = if split {
+        SplitBox::area(main, SETTINGS_PANEL_SPLIT_HEIGHT)
     } else {
-        u16::try_from(listed.saturating_add(5).saturating_add(fix_height)).unwrap_or(u16::MAX)
+        let wanted =
+            u16::try_from(listed.saturating_add(5).saturating_add(fix_height)).unwrap_or(u16::MAX);
+        centered_rect(main, width, main.height.saturating_sub(2).min(wanted))
     };
-    let area = centered_rect(main, width, main.height.saturating_sub(2).min(wanted));
-    let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+    let inner = SplitBox::inner(area);
     let content_width = usize::from(inner.width);
     let content_height = usize::from(inner.height);
     let content_left = inner.x;
@@ -3368,7 +3469,7 @@ fn render_split_settings_panel(
         footer,
     } = panel;
     let keys = state.settings_panel.keys();
-    let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+    let inner = SplitBox::inner(area);
     let (tab_line, tab_bar) = tabs.unzip();
     let tab_rows = u16::from(tab_line.is_some());
     let footer_rows = u16::from(footer.is_some());
@@ -3377,10 +3478,8 @@ fn render_split_settings_panel(
         height: inner.height.saturating_sub(tab_rows + footer_rows),
         ..inner
     };
-    let [list_area, pane_area] =
-        Layout::horizontal([Constraint::Length(inner.width / 2), Constraint::Fill(1)])
-            .spacing(1)
-            .areas(body);
+    let split = SplitBox::new(area, body, SETTINGS_PANEL_SPLIT_LIST);
+    let list_area = split.list;
     let drawn = settings_rows(
         state,
         SettingsList {
@@ -3410,15 +3509,7 @@ fn render_split_settings_panel(
         frame.render_widget(Paragraph::new(tab_line), Rect { height: 1, ..inner });
     }
     frame.render_widget(Paragraph::new(drawn.lines), list_area);
-    let pane = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(if keys == PanelKeys::ProviderSettings {
-            theme.accent.primary
-        } else {
-            theme.border.default
-        })
-        .padding(Padding::left(1));
-    let pane_content = pane.inner(pane_area);
+    let pane_content = split.pane_content();
     let details = setting_details::DetailsPane::of(
         &state.settings_panel,
         state.settings(),
@@ -3456,21 +3547,32 @@ fn render_split_settings_panel(
         window,
         provider_window,
     ));
-    frame.render_widget(Paragraph::new(pane_lines).block(pane), pane_area);
-    // The rows and the pane are read apart, so a selection in one never takes
-    // in the other's text beside it; the controls beneath both are read whole.
-    let mut parts: Vec<(Rect, &[WrappedLine<'_>])> =
-        vec![(list_area, &[]), (pane_content, &pane_wrapped)];
-    if let Some(footer) = footer {
+    split.draw_pane(
+        frame,
+        pane_lines,
+        keys == PanelKeys::ProviderSettings,
+        theme,
+    );
+    // The controls beneath both sides are read whole.
+    let footer_area = footer.map(|footer| {
         let footer_area = Rect {
             y: inner.bottom().saturating_sub(1),
             height: 1,
             ..inner
         };
         frame.render_widget(Paragraph::new(footer), footer_area);
-        parts.push((footer_area, &[]));
-    }
-    record_overlay_selection_parts(frame, state, area, SelectionSurface::Settings, &parts);
+        footer_area
+    });
+    split.record_selection(
+        frame,
+        state,
+        SelectionSurface::Settings,
+        SplitWrapped {
+            list: &[],
+            pane: &pane_wrapped,
+        },
+        footer_area.as_slice(),
+    );
 }
 
 /// The tab bar heading the panel at `top`, its labels from `left`, and where
