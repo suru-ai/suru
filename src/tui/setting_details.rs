@@ -18,7 +18,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    protocol::{EffectiveSettings, SettingScope, SettingsDiagnostic},
+    protocol::{EffectiveSettings, SettingScope, SettingsDiagnostic, WorkspacePaths},
     settings::{SettingChoiceSurface, SettingDescriptor, SettingValues, SidekickAccess},
     theme::Theme,
 };
@@ -168,11 +168,14 @@ impl<'a> DetailsPane<'a> {
     /// panel's headline and fix choose between, whole: the last edit's
     /// failure, then the focused Provider's condition and what fixes it, then
     /// whatever the Config Documents' diagnostics say of a pin among the
-    /// Settings focus speaks for.
+    /// Settings focus speaks for, each naming its Config Document as `paths`
+    /// — the reader's own Server's — spell it: from the reader's home, so a
+    /// path says where without a run of rows to say it in.
     pub(super) fn of(
         focus: PanelFocus<'a>,
         settings: &EffectiveSettings,
         diagnostics: &'a [SettingsDiagnostic],
+        paths: &WorkspacePaths,
     ) -> Self {
         let PanelFocus {
             error,
@@ -215,7 +218,7 @@ impl<'a> DetailsPane<'a> {
                 .map(|diagnostic| Lead {
                     text: Cow::Owned(format!(
                         "{}: {}",
-                        diagnostic.file.display(),
+                        paths.label(&diagnostic.file),
                         diagnostic.message
                     )),
                     tone: Tone::Warning,
@@ -508,7 +511,7 @@ impl SettingAccount {
     /// Where the Setting applies, and what a Sidekick may do with it.
     fn draw_reach<'a>(&'a self, drawn: &mut DrawnPane<'a>, width: u16, theme: &Theme) {
         let applies = match self.descriptor.scope {
-            SettingScope::Client => "in every TUI",
+            SettingScope::Client => "in every Client",
             SettingScope::Server => "on the Server",
         };
         draw_fact(drawn, APPLIES, applies, width, theme);

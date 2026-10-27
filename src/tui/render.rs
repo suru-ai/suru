@@ -3492,8 +3492,18 @@ fn render_split_settings_panel(
     }
     frame.render_widget(Paragraph::new(drawn.lines), list_area);
     let pane_content = split.pane_content();
+    // Settings are the reader's own Server's, so its Config Documents are
+    // named as that Server spells its paths, however the Outlook is turned.
+    let paths = state
+        .paths_for(&crate::protocol::Outlook::Local)
+        .unwrap_or_default();
     let details = focus.map(|focus| {
-        setting_details::DetailsPane::of(focus, state.settings(), state.settings_diagnostics())
+        setting_details::DetailsPane::of(
+            focus,
+            state.settings(),
+            state.settings_diagnostics(),
+            &paths,
+        )
     });
     let drawn = details
         .as_ref()

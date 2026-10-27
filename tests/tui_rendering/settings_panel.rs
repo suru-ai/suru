@@ -4864,7 +4864,7 @@ fn a_wide_panel_details_the_focused_setting_in_a_pane_beside_its_rows() {
     let pinned = pane_row(&details, "Pinned");
     assert_eq!(
         &details[pinned + 1..pinned + 3],
-        ["Applies in every TUI", "Sidekicks read and change"],
+        ["Applies in every Client", "Sidekicks read and change"],
         "then where it applies and what a Sidekick may do with it: {details:#?}"
     );
 
@@ -5630,5 +5630,64 @@ fn a_fact_or_a_value_copies_with_its_label_whether_or_not_it_wraps() {
     assert!(
         single.text.starts_with("○ none") && single.text.ends_with("default"),
         "as a value on a row of its own does, with its mark and its tag: {single:?}"
+    );
+}
+
+/// The home of the reader's own Server, rooted for the platform the test runs
+/// on.
+#[cfg(windows)]
+const READER_HOME: &str = r"C:\Users\reader";
+#[cfg(not(windows))]
+const READER_HOME: &str = "/home/reader";
+
+/// A pin Suru ignored is named by the Config Document it is in, spelled from
+/// the reader's home as every other path of their own Server is, so the pane
+/// says where without a run of rows to say it in.
+#[test]
+fn a_diagnostic_names_its_config_document_from_the_readers_home() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Local,
+            event: ManagedEvent::SessionCatalogReconciled(suru::protocol::SessionCatalogSnapshot {
+                workspace_paths: suru::protocol::WorkspacePaths {
+                    home: Some(READER_HOME.to_owned()),
+                    ..suru::protocol::WorkspacePaths::default()
+                },
+                revision: suru::protocol::SessionCatalogRevision::INITIAL,
+                session_ids: Vec::new(),
+                checkout_states: Vec::new(),
+            }),
+        })
+        .expect("hear how the reader's own Server spells its paths");
+    let file = Path::new(READER_HOME)
+        .join(".config")
+        .join("suru")
+        .join("suru.jsonc");
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
+                settings: EffectiveSettings::default(),
+                pinned: Vec::new(),
+                diagnostics: vec![suru::protocol::SettingsDiagnostic {
+                    severity: suru::protocol::SettingsDiagnosticSeverity::Warning,
+                    file,
+                    key: Some("transcript.groups".to_owned()),
+                    message: "ignored for a test".to_owned(),
+                }],
+            },
+        )))
+        .expect("receive the snapshot and its diagnostic");
+    open_transcript_tab(&mut application);
+    focus_setting(&mut application, "transcript.groups");
+
+    let details = pane(&application);
+    pane_row(
+        &details,
+        &format!(
+            "~{MAIN_SEPARATOR}.config{MAIN_SEPARATOR}suru{MAIN_SEPARATOR}suru.jsonc: ignored \
+             for a test"
+        ),
     );
 }
