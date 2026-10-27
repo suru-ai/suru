@@ -249,16 +249,16 @@ impl<'a> DetailsPane<'a> {
     /// on shows with all of its detail, because that Setting is what an edit
     /// would change.
     pub(super) fn draw(&self, width: u16, height: usize, theme: &Theme) -> DrawnDetails<'_> {
-        // A pane too tall while the keys are on a Provider's own Settings
-        // first gives up the blank rows standing the picked Setting's detail
-        // apart, and scrolls only where that is not enough.
+        // A Provider's pane too tall for its rows first gives up the blank
+        // rows standing the picked Setting's detail apart, and scrolls or cuts
+        // only where that is not enough.
         let spaced = self.lay_out(width, Spacing::Spaced, theme);
         let LaidOut {
             mut drawn,
             held,
             listed,
             keep,
-        } = if !spaced.keep.is_empty() && spaced.drawn.lines.len() > height {
+        } = if spaced.drawn.lines.len() > height {
             self.lay_out(width, Spacing::Packed, theme)
         } else {
             spaced

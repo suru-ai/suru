@@ -5745,8 +5745,7 @@ fn a_refused_edit_holds_in_view_while_the_pane_scrolls_to_the_setting_refused() 
     }
 }
 
-/// A pane too tall for its rows while the keys are on a Provider's own
-/// Settings first gives up the blank rows standing the picked Setting's
+/// A Provider's pane too tall for its rows first gives up the blank rows standing the picked Setting's
 /// detail apart, and scrolls only where that is not enough: packed, Codex's
 /// account of itself fits a full-height pane whole, its condition and all.
 #[test]
@@ -5776,5 +5775,22 @@ fn the_pane_packs_its_detail_before_it_scrolls_anything_out_of_view() {
         details[key - 1],
         "Sandbox mode workspace-write",
         "its detail packed up against the Settings above it: {details:#?}"
+    );
+}
+
+/// A Provider's pane packs just the same while the keys are on the Providers,
+/// so a pane packing would fit whole is never cut short of its last fact.
+#[test]
+fn the_pane_packs_its_detail_while_the_keys_are_on_the_providers() {
+    let (_workspace, application) = codex_unavailable_in_a_short_terminal();
+
+    let details = pane(&application);
+    assert!(
+        !details.iter().any(|row| row == "…"),
+        "nothing is cut away: {details:#?}"
+    );
+    assert!(
+        pane_text(&application).ends_with("Applies on the Server Sidekicks read and change"),
+        "the picked Setting shows to the foot of its detail: {details:#?}"
     );
 }
