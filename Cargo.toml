@@ -133,6 +133,12 @@ strip = true
 lto = "fat"
 codegen-units = 1
 
+# Every test binary links the whole of Suru, and with full debug information each came to about a gigabyte, so a build
+# spent much of its time writing them out. Line tables keep a panic's file and line; for a debugger's view of
+# variables, build with `CARGO_PROFILE_DEV_DEBUG=full`.
+[profile.dev]
+debug = "line-tables-only"
+
 # An executable without an embedded build identity is identified by hashing all of it, as a test binary that does not
 # embed one and the build identity tests' fixtures are. Unoptimized, that costs seconds per Server start wherever
 # BLAKE3 has no assembly to fall back on (aarch64).

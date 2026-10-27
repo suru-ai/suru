@@ -57,8 +57,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Panics keep their file and line, but the test build's debug info no longer fills the runner's disk.
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   RELEASE_TAG: ${{ inputs.tag }}
   # The dist profile's fat LTO is for the binaries that ship. Every other run only leaves a binary to try, so it
   # builds the release profile rather than spend LTO's extra minutes on each runner.
