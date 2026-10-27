@@ -39,7 +39,7 @@ use super::{
     directory_browser::{DirectoryBrowserRow, DirectoryBrowserRowKind},
     icon_picker,
     keymap::binding_label,
-    list_window::{ListWindow, WindowEntry},
+    list_window::WindowEntry,
     model_details::{self, DetailsPane},
     model_options::ModelOptionChoiceRow,
     onboarding::OwnServer,
@@ -47,10 +47,10 @@ use super::{
     rename_dialog::RenameGeometry,
     serve_overlay::{CandidateWay, LISTENER_FAILED, LISTENER_OFF, ServeWays},
     session_picker::SessionPickerRow,
-    setting_details::{self, SettingValueColumn},
+    setting_details,
     settings_panel::{
-        PanelKeys, PanelLayout, ProviderFocus, RowAvailability, RowOpens, RowValue, RowWindow,
-        SettingRow, TabBar, TabSpan,
+        PanelFocus, PanelLayout, ProviderFocus, RowList, RowOpens, RowWindow, SettingRow, TabBar,
+        TabSpan,
     },
     shimmer,
     side_column::{self, SideColumn},
@@ -3164,11 +3164,6 @@ fn render_theme_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, them
 /// the drawing does.
 const SETTINGS_TAB_GAP: &str = "  ";
 
-/// What a narrow panel heads a Provider's own Settings with, beside the
-/// Provider's name, where they stand in place of the Providers: the way back
-/// to them.
-const SETTINGS_BACK: &str = "‹ ";
-
 /// What stands between two controls the footer teaches.
 const SETTINGS_HINT_GAP: &str = " · ";
 
@@ -3199,21 +3194,21 @@ const SETTINGS_PANEL_SPLIT_LIST: u16 = 10;
 fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
     let panel = &state.settings_panel;
     let rows = panel.rows(state.settings(), state.pinned_settings());
-    let provider = panel.provider_focus(state.settings(), state.pinned_settings());
+    let focus = panel.focus(state.settings(), state.pinned_settings());
     let split = SplitBox::fits(main);
     let width = main.width.saturating_sub(4).min(76);
+    let provider = focus.as_ref().and_then(|focus| focus.provider.as_ref());
     // A narrow panel with the keys on a Provider's own Settings lists those
     // in the Providers' place, beneath a line naming the Provider they are.
-    let drilled = provider
-        .as_ref()
-        .filter(|_| !split && panel.keys() == PanelKeys::ProviderSettings);
+    let drilled = provider.filter(|provider| !split && provider.holds_keys);
     // What fixes the focused Provider, whole, on as many lines as it takes
     // beneath the headline: its row has room for none of it. A split panel's
     // pane carries it instead, and a panel listing the Provider's own
     // Settings is about those.
-    let fix = panel
-        .selected_fix(state.settings())
-        .filter(|_| !split && drilled.is_none() && panel.error().is_none());
+    let fix = focus
+        .as_ref()
+        .filter(|focus| !split && drilled.is_none() && focus.error.is_none())
+        .and_then(|focus| focus.condition.as_ref()?.fix);
     let fix = fix.map(|fix| WrappedText::new(fix, "", width.saturating_sub(2)));
     let fix_height = fix.as_ref().map_or(0, WrappedText::height);
     let listed = drilled.map_or(rows.len(), |provider| provider.settings.len() + 1);
@@ -3248,7 +3243,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         (content_height >= 4).then(|| settings_tab_bar(state, content_left, content_top, theme));
     let footer_rows = usize::from(content_height >= 3);
     let footer = Line::styled(
-        settings_footer(state, &rows, provider.as_ref(), content_width),
+        settings_footer(&rows, provider, content_width),
         theme.text.subdued,
     );
     if split {
@@ -3260,6 +3255,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
                 content_columns,
                 tabs,
                 rows,
+                focus,
                 footer: (footer_rows > 0).then_some(footer),
             },
             theme,
@@ -3284,17 +3280,19 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
         // and a Provider's own condition outranks the description of a Setting
         // the reader can read off the row anyway. Among a Provider's own
         // Settings, the focused one is what the reader is reading about.
-        let message = panel
-            .selected_message(state.settings())
-            .filter(|_| drilled.is_none());
-        let (headline, style) = match (panel.error(), message, panel.selected_descriptor()) {
-            (Some(error), _, _) => (error.to_owned(), theme.feedback.error),
-            (None, Some(message), _) => (message.to_owned(), theme.text.subdued),
-            (None, None, Some(descriptor)) => (
-                format!("{} · {}", descriptor.key, descriptor.description),
+        let (headline, style) = match &focus {
+            Some(PanelFocus {
+                error: Some(error), ..
+            }) => ((*error).to_owned(), theme.feedback.error),
+            Some(PanelFocus {
+                condition: Some(condition),
+                ..
+            }) if drilled.is_none() => (condition.message.to_owned(), theme.text.subdued),
+            Some(focus) => (
+                format!("{} · {}", focus.setting.key, focus.setting.description),
                 theme.text.subdued,
             ),
-            (None, None, None) => (String::new(), theme.text.subdued),
+            None => (String::new(), theme.text.subdued),
         };
         lines.push(Line::styled(
             truncate_to_width(&headline, content_width),
@@ -3318,20 +3316,18 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     // decides which of the tab's rows those are — so this frame is the only
     // thing that can say what a pointer over them landed on.
     let top = content_top.saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
+    let show_icons = state.settings().appearance.show_icons;
     let (window, provider_window) = match drilled {
         Some(provider) => {
-            let drawn = settings_rows(
-                state,
-                SettingsList {
-                    rows: &provider.settings,
-                    head: Some(&provider.row),
-                    window: panel.provider_window(),
-                    holds_keys: true,
-                },
-                content_width,
-                capacity,
-                theme,
-            );
+            let drawn = RowList::new(&provider.settings, true)
+                .headed_by(&provider.row)
+                .presented(show_icons, state.spinner_frame)
+                .draw(
+                    Some(panel.provider_window()),
+                    content_width,
+                    capacity,
+                    theme,
+                );
             // The line naming the Provider stands for its row among the
             // Providers, so pointing at it goes back to them.
             let back = drawn.head_window(
@@ -3344,18 +3340,9 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
             (back, window)
         }
         None => {
-            let drawn = settings_rows(
-                state,
-                SettingsList {
-                    rows: &rows,
-                    head: None,
-                    window: panel.window(),
-                    holds_keys: true,
-                },
-                content_width,
-                capacity,
-                theme,
-            );
+            let drawn = RowList::new(&rows, true)
+                .presented(show_icons, state.spinner_frame)
+                .draw(Some(panel.window()), content_width, capacity, theme);
             let window = drawn.window(top, content_columns.clone());
             lines.extend(drawn.lines);
             (window, None)
@@ -3364,12 +3351,11 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     if footer_rows > 0 && lines.len() < content_height {
         lines.push(footer);
     }
-    panel.record_layout(PanelLayout::new(
-        content_columns,
-        tab_bar,
-        window,
-        provider_window,
-    ));
+    panel.record_layout(
+        PanelLayout::new(content_columns, tab_bar)
+            .with_rows(window)
+            .with_provider_settings(provider_window),
+    );
     draw_overlay_box(frame, state, area, lines, " Settings ", theme);
     record_overlay_selection_around(
         frame,
@@ -3384,12 +3370,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
 /// The controls the settings panel teaches at its foot: only the keys that do
 /// something wherever the keys stand, in the order they are given up where
 /// the box is too narrow for all of them — the way out last, and never.
-fn settings_footer(
-    state: &TuiState,
-    rows: &[SettingRow],
-    provider: Option<&ProviderFocus>,
-    width: usize,
-) -> String {
+fn settings_footer(rows: &[SettingRow], provider: Option<&ProviderFocus>, width: usize) -> String {
     // Enter is taught only where it does something, so a reader focused on a
     // row that opens onto nothing is never offered a dead key.
     let chooses = |rows: &[SettingRow]| {
@@ -3398,15 +3379,15 @@ fn settings_footer(
             .is_some_and(|row| row.opens == RowOpens::Choice)
     };
     let mut hints = Vec::new();
-    let way_out = match (state.settings_panel.keys(), provider) {
-        (PanelKeys::ProviderSettings, Some(provider)) => {
+    let way_out = match provider {
+        Some(provider) if provider.holds_keys => {
             if chooses(&provider.settings) {
                 hints.push(Cow::Borrowed("Enter choose"));
             }
             hints.extend(["Space change", "Ctrl+D reset"].map(Cow::Borrowed));
             "Esc back"
         }
-        (PanelKeys::Rows, Some(provider)) => {
+        Some(provider) => {
             hints.push(Cow::Borrowed(if provider.enabled {
                 "Space disable"
             } else {
@@ -3421,7 +3402,7 @@ fn settings_footer(
             hints.extend(["Left/Right tabs", "Ctrl+D reset"].map(Cow::Borrowed));
             "Esc close"
         }
-        (_, None) => {
+        None => {
             if chooses(rows) {
                 hints.push(Cow::Borrowed("Enter choose"));
             }
@@ -3439,11 +3420,12 @@ fn settings_footer(
 /// What a wide settings panel lays out beneath and around its split: the box,
 /// the columns inside its border, the tab bar heading it, its rows, and the
 /// controls at its foot.
-struct SplitSettingsPanel {
+struct SplitSettingsPanel<'a> {
     area: Rect,
     content_columns: std::ops::Range<u16>,
     tabs: Option<(Line<'static>, TabBar)>,
     rows: Vec<SettingRow>,
+    focus: Option<PanelFocus<'a>>,
     footer: Option<Line<'static>>,
 }
 
@@ -3458,7 +3440,7 @@ struct SplitSettingsPanel {
 fn render_split_settings_panel(
     frame: &mut Frame<'_>,
     state: &TuiState,
-    panel: SplitSettingsPanel,
+    panel: SplitSettingsPanel<'_>,
     theme: &Theme,
 ) {
     let SplitSettingsPanel {
@@ -3466,9 +3448,13 @@ fn render_split_settings_panel(
         content_columns,
         tabs,
         rows,
+        focus,
         footer,
     } = panel;
-    let keys = state.settings_panel.keys();
+    let pane_holds_keys = focus
+        .as_ref()
+        .and_then(|focus| focus.provider.as_ref())
+        .is_some_and(|provider| provider.holds_keys);
     let inner = SplitBox::inner(area);
     let (tab_line, tab_bar) = tabs.unzip();
     let tab_rows = u16::from(tab_line.is_some());
@@ -3480,18 +3466,14 @@ fn render_split_settings_panel(
     };
     let split = SplitBox::new(area, body, SETTINGS_PANEL_SPLIT_LIST);
     let list_area = split.list;
-    let drawn = settings_rows(
-        state,
-        SettingsList {
-            rows: &rows,
-            head: None,
-            window: state.settings_panel.window(),
-            holds_keys: keys == PanelKeys::Rows,
-        },
-        usize::from(list_area.width),
-        usize::from(list_area.height),
-        theme,
-    );
+    let drawn = RowList::new(&rows, !pane_holds_keys)
+        .presented(state.settings().appearance.show_icons, state.spinner_frame)
+        .draw(
+            Some(state.settings_panel.window()),
+            usize::from(list_area.width),
+            usize::from(list_area.height),
+            theme,
+        );
     // A click beside the rows is on the pane, which has nothing to focus but
     // a Provider's own Settings, so the rows answer only for the columns they
     // were drawn across.
@@ -3510,12 +3492,9 @@ fn render_split_settings_panel(
     }
     frame.render_widget(Paragraph::new(drawn.lines), list_area);
     let pane_content = split.pane_content();
-    let details = setting_details::DetailsPane::of(
-        &state.settings_panel,
-        state.settings(),
-        state.pinned_settings(),
-        state.settings_diagnostics(),
-    );
+    let details = focus.map(|focus| {
+        setting_details::DetailsPane::of(focus, state.settings(), state.settings_diagnostics())
+    });
     let drawn = details
         .as_ref()
         .map(|details| details.draw(pane_content.width, usize::from(pane_content.height), theme));
@@ -3541,18 +3520,12 @@ fn render_split_settings_panel(
             count: u16::try_from(listed.len()).unwrap_or(u16::MAX),
             columns: pane_content.left()..pane_content.right(),
         });
-    state.settings_panel.record_layout(PanelLayout::new(
-        content_columns,
-        tab_bar,
-        window,
-        provider_window,
-    ));
-    split.draw_pane(
-        frame,
-        pane_lines,
-        keys == PanelKeys::ProviderSettings,
-        theme,
+    state.settings_panel.record_layout(
+        PanelLayout::new(content_columns, tab_bar)
+            .with_rows(window)
+            .with_provider_settings(provider_window),
     );
+    split.draw_pane(frame, pane_lines, pane_holds_keys, theme);
     // The controls beneath both sides are read whole.
     let footer_area = footer.map(|footer| {
         let footer_area = Rect {
@@ -3609,199 +3582,6 @@ fn settings_tab_bar(
         ));
     }
     (Line::from(spans), TabBar { row: top, labels })
-}
-
-/// The rows one frame drew of a list, which of the list's rows the first of
-/// them is, and whether a line heading them was drawn above them.
-struct SettingsRows {
-    lines: Vec<Line<'static>>,
-    first: usize,
-    head: bool,
-}
-
-impl SettingsRows {
-    /// Where these rows stand once drawn from `top` across `columns`, for a
-    /// pointer to resolve against, and nothing for a frame that drew none.
-    fn window(&self, top: u16, columns: std::ops::Range<u16>) -> Option<RowWindow> {
-        let head = usize::from(self.head);
-        (self.lines.len() > head).then(|| RowWindow {
-            top: top.saturating_add(u16::from(self.head)),
-            first: self.first,
-            count: u16::try_from(self.lines.len() - head).unwrap_or(u16::MAX),
-            columns,
-        })
-    }
-
-    /// Where the line heading these rows stands once drawn from `top`, as the
-    /// row `stands_for` of whatever list it stands for, and nothing for a
-    /// frame that drew no such line.
-    fn head_window(
-        &self,
-        top: u16,
-        columns: std::ops::Range<u16>,
-        stands_for: usize,
-    ) -> Option<RowWindow> {
-        self.head.then_some(RowWindow {
-            top,
-            first: stands_for,
-            count: 1,
-            columns,
-        })
-    }
-}
-
-/// A list of settings rows to draw, and what it is drawn as: the rows, the
-/// row a narrow panel heads a Provider's own Settings with, the window the
-/// rows are read through, and whether the list has the keys.
-struct SettingsList<'a> {
-    rows: &'a [SettingRow],
-    /// The Provider whose own Settings `rows` are, named above them with the
-    /// way back to the Providers. It is measured with them, so its condition
-    /// stands in their value column, and is the first thing a box too short
-    /// for it and a Setting gives up.
-    head: Option<&'a SettingRow>,
-    window: &'a ListWindow,
-    /// Whether the keys are on this list, which draws its focused row as
-    /// theirs, and otherwise dimly as the row they come back to.
-    holds_keys: bool,
-}
-
-/// As many of the list's rows as `capacity` holds, each `width` columns wide,
-/// from wherever its window settles over them, beneath the line heading them
-/// where there is room for both.
-fn settings_rows(
-    state: &TuiState,
-    list: SettingsList<'_>,
-    width: usize,
-    capacity: usize,
-    theme: &Theme,
-) -> SettingsRows {
-    let SettingsList {
-        rows,
-        head,
-        window,
-        holds_keys,
-    } = list;
-    let show_icons = state.settings().appearance.show_icons;
-    let head = head.filter(|_| capacity >= 2);
-    let capacity = capacity.saturating_sub(usize::from(head.is_some()));
-    let selected = rows.iter().position(|row| row.selected);
-    let shown = window.settle_rows(rows.len(), capacity, selected);
-    // Every row the list holds is named and valued before the window narrows
-    // them, so the value column measures them all and holds still as the
-    // window scrolls.
-    let named = rows
-        .iter()
-        .map(|row| {
-            let marker = if row.selected && holds_keys {
-                setting_details::ROW_FOCUS
-            } else {
-                setting_details::ROW_UNFOCUSED
-            };
-            format!("{marker}{}", settings_row_label(row, show_icons))
-        })
-        .collect::<Vec<_>>();
-    let values = rows
-        .iter()
-        .map(|row| settings_row_value(row, state.spinner_frame))
-        .collect::<Vec<_>>();
-    let head = head.map(|row| {
-        (
-            row,
-            format!("{SETTINGS_BACK}{}", settings_row_label(row, show_icons)),
-            settings_row_value(row, state.spinner_frame),
-        )
-    });
-    let column = SettingValueColumn::of(
-        named
-            .iter()
-            .chain(head.as_ref().map(|(_, name, _)| name))
-            .map(|name| name.width())
-            .max(),
-        values
-            .iter()
-            .chain(head.as_ref().map(|(_, _, value)| value))
-            .map(|value| value.width())
-            .max(),
-        width,
-    );
-    let mut lines = Vec::with_capacity(capacity + 1);
-    if let Some((row, name, value)) = &head {
-        lines.push(column.line(
-            name,
-            (value, settings_row_tone(row, theme)),
-            row.pinned,
-            width,
-            theme.text.primary.add_modifier(Modifier::BOLD),
-        ));
-    }
-    lines.extend(
-        rows.iter()
-            .zip(named.iter().zip(&values))
-            .skip(shown.start)
-            .take(shown.len())
-            .map(|(row, (name, value))| {
-                let style = match (row.selected, holds_keys, &row.value) {
-                    (true, true, _) => theme.selection.focused,
-                    (true, false, _) => theme.selection.unfocused,
-                    (false, _, RowValue::ProviderDisabled) => theme.text.subdued,
-                    (false, _, _) => theme.text.primary,
-                };
-                // A condition asking something of the reader takes its own
-                // colour, except on the focused row, which keeps one block.
-                let tone = settings_row_tone(row, theme).filter(|_| !row.selected);
-                column.line(name, (value, tone), row.pinned, width, style)
-            }),
-    );
-    SettingsRows {
-        lines,
-        first: shown.start,
-        head: head.is_some(),
-    }
-}
-
-/// What a row is called: its Setting's label, or the Provider it stands for,
-/// with that Provider's icon where the reader has icons on.
-fn settings_row_label(row: &SettingRow, show_icons: bool) -> String {
-    row.provider.map_or_else(
-        || row.label.to_owned(),
-        |provider| provider_label(show_icons, provider, row.label),
-    )
-}
-
-/// What a row says in the column at its end. A Setting's row says what it is
-/// worth; a Provider's says what condition it is in, which is a word at most —
-/// that the reader turned it off, a Spinner while its Availability is read,
-/// what the read found wrong once it lands — and nothing at all from a
-/// Provider still serving its catalog, because the quiet state is the good
-/// one.
-fn settings_row_value(row: &SettingRow, spinner_frame: usize) -> Cow<'_, str> {
-    match (&row.value, &row.availability) {
-        (RowValue::Choice(value), _) => Cow::Borrowed(value),
-        (RowValue::ProviderDisabled, _) => Cow::Borrowed("disabled"),
-        (RowValue::ProviderEnabled, RowAvailability::Quiet) => Cow::Borrowed(""),
-        (RowValue::ProviderEnabled, RowAvailability::Reading) => {
-            Cow::Owned(spinner::frame(spinner_frame / 3).to_string())
-        }
-        (RowValue::ProviderEnabled, RowAvailability::Warning) => Cow::Borrowed("warning"),
-        (RowValue::ProviderEnabled, RowAvailability::Unavailable { reason, .. }) => {
-            Cow::Borrowed(reason.label())
-        }
-        (RowValue::ProviderEnabled, RowAvailability::Failed) => Cow::Borrowed("error"),
-    }
-}
-
-/// The colour a Provider's condition takes on its row where it asks something
-/// of the reader: a failed read is Suru's error, and anything they fix
-/// outside Suru is a warning.
-fn settings_row_tone(row: &SettingRow, theme: &Theme) -> Option<Style> {
-    match row.availability {
-        RowAvailability::Warning | RowAvailability::Unavailable { .. } => {
-            Some(theme.feedback.warning)
-        }
-        RowAvailability::Failed => Some(theme.feedback.error),
-        RowAvailability::Quiet | RowAvailability::Reading => None,
-    }
 }
 
 fn render_onboarding(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
@@ -7177,7 +6957,11 @@ pub(super) fn provider_icon(provider: &crate::protocol::ProviderId) -> Option<ch
         .and_then(|provider| provider.nerd_font_icon)
 }
 
-fn provider_label(show_icons: bool, provider: &crate::protocol::ProviderId, label: &str) -> String {
+pub(super) fn provider_label(
+    show_icons: bool,
+    provider: &crate::protocol::ProviderId,
+    label: &str,
+) -> String {
     if show_icons && let Some(icon) = provider_icon(provider) {
         format!("{icon} {label}")
     } else {

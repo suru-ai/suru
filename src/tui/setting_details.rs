@@ -12,33 +12,22 @@
 use std::{borrow::Cow, ops::Range};
 
 use ratatui::{
-    style::{Modifier, Style},
+    style::Modifier,
     text::{Line, Span},
 };
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
     protocol::{EffectiveSettings, SettingScope, SettingsDiagnostic},
-    settings::{
-        SettingChoiceSurface, SettingDescriptor, SettingValues, SidekickAccess, provider_settings,
-    },
+    settings::{SettingChoiceSurface, SettingDescriptor, SettingValues, SidekickAccess},
     theme::Theme,
 };
 
 use super::{
     drawn_pane::DrawnPane,
-    settings_panel::{PanelKeys, RowAvailability, RowValue, SettingRow, SettingsPanel},
+    settings_panel::{PanelFocus, ProviderFocus, RowList, SettingRow},
     slots::truncate_to_width,
 };
-
-/// What a settings row ends on for a value the reader pinned, where a value
-/// riding its built-in default leaves the column blank.
-const PINNED: &str = "●";
-
-/// What a row leads with while the keys are on it, and what every other row
-/// stands in by so the names line up.
-pub(super) const ROW_FOCUS: &str = "› ";
-pub(super) const ROW_UNFOCUSED: &str = "  ";
 
 /// The marks a value the Setting accepts leads with: whether it is the one in
 /// force. A list's entries after its first, and what else an Open Setting
@@ -139,58 +128,45 @@ struct AcceptedValue {
 }
 
 impl<'a> DetailsPane<'a> {
-    /// The pane for the row focus stands on in an open `panel`, and none for a
-    /// panel focused on nothing. Leading it is everything the narrow panel's
-    /// headline and fix choose between, whole: the last edit's failure, then
-    /// the focused Provider's condition and what fixes it, then whatever the
-    /// Config Documents' diagnostics say of the Setting's own pin — or, for a
-    /// Provider, of any pin among the Settings it holds.
+    /// The pane for where `focus` stands. Leading it is everything the narrow
+    /// panel's headline and fix choose between, whole: the last edit's
+    /// failure, then the focused Provider's condition and what fixes it, then
+    /// whatever the Config Documents' diagnostics say of a pin among the
+    /// Settings focus speaks for.
     pub(super) fn of(
-        panel: &'a SettingsPanel,
+        focus: PanelFocus<'a>,
         settings: &EffectiveSettings,
-        pinned: &[String],
         diagnostics: &'a [SettingsDiagnostic],
-    ) -> Option<Self> {
-        let descriptor = panel.selected_descriptor()?;
-        let provider = panel.provider_focus(settings, pinned);
+    ) -> Self {
+        let PanelFocus {
+            error,
+            condition,
+            setting,
+            pinned,
+            provider,
+            speaks_for,
+        } = focus;
         let mut leads = Vec::new();
-        if let Some(error) = panel.error() {
+        if let Some(error) = error {
             leads.push(Lead {
                 text: Cow::Borrowed(error),
                 tone: Tone::Error,
             });
         }
-        if let Some(message) = panel.selected_message(settings) {
+        if let Some(condition) = condition {
             leads.push(Lead {
-                text: Cow::Borrowed(message),
-                tone: match panel.selected_availability(settings) {
-                    Some(RowAvailability::Failed) => Tone::Error,
-                    _ => Tone::Warning,
+                text: Cow::Borrowed(condition.message),
+                tone: if condition.failed {
+                    Tone::Error
+                } else {
+                    Tone::Warning
                 },
             });
-        }
-        if let Some(fix) = panel.selected_fix(settings) {
-            leads.push(Lead {
+            leads.extend(condition.fix.map(|fix| Lead {
                 text: Cow::Borrowed(fix),
                 tone: Tone::Fix,
-            });
+            }));
         }
-        // A Provider's pane accounts for every Setting it holds, so a pin
-        // Suru ignored among any of them is the pane's to lead with.
-        let accounted = match &provider {
-            Some(focus) => {
-                let mut keys = vec![focus.enablement.key];
-                if let Some(provider) = focus.row.provider {
-                    keys.extend(
-                        provider_settings(provider)
-                            .iter()
-                            .map(|descriptor| descriptor.key),
-                    );
-                }
-                keys
-            }
-            None => vec![descriptor.key],
-        };
         leads.extend(
             diagnostics
                 .iter()
@@ -198,7 +174,7 @@ impl<'a> DetailsPane<'a> {
                     diagnostic
                         .key
                         .as_deref()
-                        .is_some_and(|key| accounted.contains(&key))
+                        .is_some_and(|key| speaks_for.contains(&key))
                 })
                 .map(|diagnostic| Lead {
                     text: Cow::Owned(format!(
@@ -209,32 +185,11 @@ impl<'a> DetailsPane<'a> {
                     tone: Tone::Warning,
                 }),
         );
-        let is_pinned =
-            |descriptor: &SettingDescriptor| pinned.iter().any(|key| key == descriptor.key);
         let account = match provider {
-            Some(focus) => Account::Provider(ProviderAccount {
-                name: focus.row.label,
-                enablement: focus.enablement,
-                enabled: focus.enabled,
-                disabled: (!focus.enabled).then(|| {
-                    format!(
-                        "Suru leaves {} entirely alone until you enable it.",
-                        focus.row.label
-                    )
-                }),
-                settings: focus.settings,
-                holds_keys: panel.keys() == PanelKeys::ProviderSettings,
-                picked: focus.picked.map(|descriptor| {
-                    SettingAccount::new(descriptor, settings, is_pinned(descriptor))
-                }),
-            }),
-            None => Account::Setting(SettingAccount::new(
-                descriptor,
-                settings,
-                is_pinned(descriptor),
-            )),
+            Some(provider) => Account::Provider(ProviderAccount::new(provider, settings)),
+            None => Account::Setting(SettingAccount::new(setting, settings, pinned)),
         };
-        Some(Self { leads, account })
+        Self { leads, account }
     }
 
     /// The pane in `height` rows `width` columns wide. A pane with more to
@@ -280,6 +235,33 @@ impl<'a> DetailsPane<'a> {
 }
 
 impl ProviderAccount {
+    fn new(provider: ProviderFocus, settings: &EffectiveSettings) -> Self {
+        let ProviderFocus {
+            row,
+            enablement,
+            enabled,
+            settings: rows,
+            picked,
+            holds_keys,
+        } = provider;
+        let picked_pinned = rows.iter().any(|row| row.selected && row.pinned);
+        Self {
+            name: row.label,
+            enablement,
+            enabled,
+            disabled: (!enabled).then(|| {
+                format!(
+                    "Suru leaves {} entirely alone until you enable it.",
+                    row.label
+                )
+            }),
+            settings: rows,
+            holds_keys,
+            picked: picked
+                .map(|descriptor| SettingAccount::new(descriptor, settings, picked_pinned)),
+        }
+    }
+
     /// The Provider's name, with whether it is on standing at the far end of
     /// its line, and the key a Config Document turns it on or off by. The name
     /// takes the accent while the keys are on the pane, which is how the pane
@@ -314,40 +296,16 @@ impl ProviderAccount {
         }
         drawn.lines.push(Line::default());
         let first = drawn.lines.len();
-        let width = usize::from(width);
-        let column = SettingValueColumn::of(
-            self.settings
-                .iter()
-                .map(|row| ROW_FOCUS.width() + row.label.width())
-                .max(),
-            self.settings
-                .iter()
-                .map(|row| setting_value(row).width())
-                .max(),
-            width,
+        drawn.lines.extend(
+            RowList::new(&self.settings, self.holds_keys)
+                .draw(None, usize::from(width), self.settings.len(), theme)
+                .lines,
         );
-        for row in &self.settings {
-            let focused = row.selected && self.holds_keys;
-            let marker = if focused { ROW_FOCUS } else { ROW_UNFOCUSED };
-            let style = match (row.selected, self.holds_keys) {
-                (true, true) => theme.selection.focused,
-                (true, false) => theme.selection.unfocused,
-                (false, _) => theme.text.primary,
-            };
-            drawn.lines.push(column.line(
-                &format!("{marker}{}", row.label),
-                (setting_value(row), None),
-                row.pinned,
-                width,
-                style,
-            ));
-        }
         let listed = first..drawn.lines.len();
         // Whether the picked Setting's value is a pin is already its row's
         // mark, so its detail goes straight from its values to where it
         // applies.
         if let Some(picked) = &self.picked {
-            let width = u16::try_from(width).unwrap_or(u16::MAX);
             drawn.lines.push(Line::default());
             drawn.line(picked.descriptor.key, width, theme.text.subdued);
             drawn.wrap(picked.descriptor.description, "", width, theme.text.primary);
@@ -357,72 +315,6 @@ impl ProviderAccount {
             picked.draw_reach(drawn, width, theme);
         }
         listed
-    }
-}
-
-/// What a Provider's own Setting is worth on its row.
-fn setting_value(row: &SettingRow) -> &str {
-    match &row.value {
-        RowValue::Choice(value) => value,
-        RowValue::ProviderEnabled | RowValue::ProviderDisabled => "",
-    }
-}
-
-/// The column at the end of a settings row saying what its Setting is worth,
-/// and the mark after it for a value the reader pinned. It is as wide as the
-/// widest value its list holds, so it holds still as the rows scroll, short of
-/// crowding the names: it takes no more than the widest name leaves it, and
-/// never less than a third of the row.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct SettingValueColumn {
-    width: usize,
-}
-
-impl SettingValueColumn {
-    /// The columns around a value: the gap before it, and the space and the
-    /// pin mark after it.
-    const CHROME: usize = 4;
-
-    pub(super) fn of(
-        widest_name: Option<usize>,
-        widest_value: Option<usize>,
-        row_width: usize,
-    ) -> Self {
-        let room = row_width
-            .saturating_sub(widest_name.unwrap_or(0) + Self::CHROME)
-            .max(row_width / 3);
-        Self {
-            width: widest_value.unwrap_or(0).min(room),
-        }
-    }
-
-    /// `value` in the column, and the pin mark where the reader pinned it.
-    pub(super) fn cells(self, value: &str, pinned: bool) -> String {
-        let value = truncate_to_width(value, self.width);
-        let padding = " ".repeat(self.width.saturating_sub(value.width()));
-        let pin = if pinned { PINNED } else { " " };
-        format!("  {value}{padding} {pin}")
-    }
-
-    /// A whole row `width` columns wide in `style`: `name`, cut short before
-    /// the column rather than into it, then `value` and its pin mark in the
-    /// column, drawn in `value_style` where the value asks to stand out.
-    pub(super) fn line(
-        self,
-        name: &str,
-        (value, value_style): (&str, Option<Style>),
-        pinned: bool,
-        width: usize,
-        style: Style,
-    ) -> Line<'static> {
-        let cells = truncate_to_width(&self.cells(value, pinned), width);
-        let room = width.saturating_sub(cells.width());
-        let name = truncate_to_width(name, room);
-        let padding = " ".repeat(room.saturating_sub(name.width()));
-        Line::from(vec![
-            Span::styled(format!("{name}{padding}"), style),
-            Span::styled(cells, value_style.unwrap_or(style)),
-        ])
     }
 }
 

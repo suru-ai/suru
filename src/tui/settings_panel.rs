@@ -52,6 +52,10 @@ use crate::{
     },
 };
 
+mod rows;
+
+pub(super) use rows::RowList;
+
 use super::{
     ModelListRequest,
     commands::NumericDigit,
@@ -289,18 +293,28 @@ enum PanelHit {
 
 impl PanelLayout {
     /// The geometry one frame drew, out of the parts the drawing decided: what
-    /// a valid layout is stays here rather than with whoever assembled it.
-    pub(super) fn new(
-        columns: Range<u16>,
-        tabs: Option<TabBar>,
-        rows: Option<RowWindow>,
-        provider_settings: Option<RowWindow>,
-    ) -> Self {
+    /// a valid layout is stays here rather than with whoever assembled it. A
+    /// layout begins as the box and its tab bar, and takes each list a pointer
+    /// can land on by name.
+    pub(super) fn new(columns: Range<u16>, tabs: Option<TabBar>) -> Self {
         Self {
             columns,
             tabs,
-            rows,
-            provider_settings,
+            rows: None,
+            provider_settings: None,
+        }
+    }
+
+    /// The layout with the rows of the tab being shown where `rows` says.
+    pub(super) fn with_rows(self, rows: Option<RowWindow>) -> Self {
+        Self { rows, ..self }
+    }
+
+    /// The layout with the focused Provider's own Settings where `rows` says.
+    pub(super) fn with_provider_settings(self, rows: Option<RowWindow>) -> Self {
+        Self {
+            provider_settings: rows,
+            ..self
         }
     }
 
@@ -432,6 +446,36 @@ pub(super) enum RowValue {
     ProviderDisabled,
 }
 
+/// What the panel says about where focus stands beyond the rows listing it:
+/// everything the pane beside a wide panel presents, and what a narrow
+/// panel's headline and the fix beneath it choose between.
+pub(super) struct PanelFocus<'a> {
+    /// Why the last edit never reached the Config Document.
+    pub(super) error: Option<&'a str>,
+    /// What the focused Provider's Availability read found, where it found
+    /// anything to say.
+    pub(super) condition: Option<Condition<'a>>,
+    /// The Setting an edit acts on, and whether the reader pinned it.
+    pub(super) setting: &'static SettingDescriptor,
+    pub(super) pinned: bool,
+    /// The Provider focus stands on, on the tab presenting the Providers.
+    pub(super) provider: Option<ProviderFocus>,
+    /// The keys of every Setting focus speaks for: the focused Setting, or a
+    /// Provider's Enablement and every Setting the Provider holds. A Config
+    /// Document's diagnostic naming any of them is focus's to report.
+    pub(super) speaks_for: Vec<&'static str>,
+}
+
+/// A Provider's condition as the read in force found it, whole.
+pub(super) struct Condition<'a> {
+    pub(super) message: &'a str,
+    /// Whether the read itself failed, which is Suru's problem to report
+    /// rather than a condition the reader fixes.
+    pub(super) failed: bool,
+    /// What fixes the condition, where the Provider named a fix.
+    pub(super) fix: Option<&'a str>,
+}
+
 /// The Provider focus stands on, as a panel showing the Providers accounts
 /// for it: its own row, the Enablement that row stands for, and its further
 /// Settings valued from the snapshot, the one the pane picks out marked as
@@ -443,6 +487,8 @@ pub(super) struct ProviderFocus {
     pub(super) settings: Vec<SettingRow>,
     /// The Setting among them the pane picks out, which it details.
     pub(super) picked: Option<&'static SettingDescriptor>,
+    /// Whether the keys have stepped in onto the Provider's own Settings.
+    pub(super) holds_keys: bool,
 }
 
 /// One row of a tab before a snapshot values it: what it is called, the Setting
@@ -498,10 +544,6 @@ impl SettingsPanel {
 
     pub(super) fn is_open(&self) -> bool {
         self.open
-    }
-
-    pub(super) fn error(&self) -> Option<&str> {
-        self.error.as_deref()
     }
 
     pub(super) fn open_numeric_editor(
@@ -790,36 +832,51 @@ impl SettingsPanel {
             })
     }
 
-    /// What the focused Provider's Availability says in full, which the
-    /// headline or the pane carries because a row has room only for the
-    /// condition's name.
-    pub(super) fn selected_message(&self, settings: &EffectiveSettings) -> Option<&str> {
-        self.selected_reading(settings)?.message.as_deref()
-    }
-
-    /// What fixes the focused Provider's condition, in full, which goes
-    /// beneath the headline, or beneath the condition in the pane, because the
-    /// row it is named on may have room for only the start of it.
-    pub(super) fn selected_fix(&self, settings: &EffectiveSettings) -> Option<&str> {
-        match self.selected_availability(settings)? {
-            RowAvailability::Unavailable { fix, .. } => Some(fix),
-            RowAvailability::Quiet
-            | RowAvailability::Reading
-            | RowAvailability::Warning
-            | RowAvailability::Failed => None,
-        }
-    }
-
-    /// What the read in force found about the focused Provider, for focus on
-    /// a Provider anything was read about, which says how urgently the pane
-    /// tells its condition.
-    pub(super) fn selected_availability(
+    /// Everything the panel says about where focus stands beyond the rows, and
+    /// nothing at all while it is closed. The Provider's condition is said
+    /// whole here because a row has room only for its name.
+    pub(super) fn focus(
         &self,
         settings: &EffectiveSettings,
-    ) -> Option<&RowAvailability> {
-        Some(&self.selected_reading(settings)?.availability)
+        pinned: &[String],
+    ) -> Option<PanelFocus<'_>> {
+        let setting = self.selected_descriptor()?;
+        let provider = self.provider_focus(settings, pinned);
+        let speaks_for = match &provider {
+            Some(focus) => {
+                let mut keys = vec![focus.enablement.key];
+                keys.extend(
+                    self.focused_provider_settings()
+                        .iter()
+                        .map(|setting| setting.key),
+                );
+                keys
+            }
+            None => vec![setting.key],
+        };
+        Some(PanelFocus {
+            error: self.error.as_deref(),
+            condition: self.selected_reading(settings).and_then(|reading| {
+                Some(Condition {
+                    message: reading.message.as_deref()?,
+                    failed: reading.availability == RowAvailability::Failed,
+                    fix: match &reading.availability {
+                        RowAvailability::Unavailable { fix, .. } => Some(fix.as_str()),
+                        RowAvailability::Quiet
+                        | RowAvailability::Reading
+                        | RowAvailability::Warning
+                        | RowAvailability::Failed => None,
+                    },
+                })
+            }),
+            setting,
+            pinned: pinned.iter().any(|key| key == setting.key),
+            provider,
+            speaks_for,
+        })
     }
 
+    /// What the read in force found about the Provider focus stands on.
     fn selected_reading(&self, settings: &EffectiveSettings) -> Option<&ProviderReading> {
         if !self.open {
             return None;
@@ -846,7 +903,7 @@ impl SettingsPanel {
     /// nothing at all while the panel is closed. Every edit runs through here,
     /// so a command invoked from somewhere the panel is not — a plugin, a
     /// click — cannot reach a Setting the reader never focused.
-    pub(super) fn selected_descriptor(&self) -> Option<&'static SettingDescriptor> {
+    fn selected_descriptor(&self) -> Option<&'static SettingDescriptor> {
         if !self.open {
             return None;
         }
@@ -874,7 +931,7 @@ impl SettingsPanel {
 
     /// The Provider focus stands on, for a panel showing the Providers, with
     /// its own further Settings; none on any other tab.
-    pub(super) fn provider_focus(
+    fn provider_focus(
         &self,
         settings: &EffectiveSettings,
         pinned: &[String],
@@ -904,6 +961,7 @@ impl SettingsPanel {
                 })
                 .collect(),
             picked: further.get(picked).copied(),
+            holds_keys: self.keys() == PanelKeys::ProviderSettings,
         })
     }
 
@@ -1458,22 +1516,21 @@ mod tests {
     fn a_pointer_focuses_a_provider_or_one_of_its_settings_and_never_edits() {
         let mut panel = on_the_providers();
         let settings = EffectiveSettings::default();
-        panel.record_layout(PanelLayout::new(
-            0..100,
-            None,
-            Some(RowWindow {
-                top: 2,
-                first: 0,
-                count: 3,
-                columns: 0..50,
-            }),
-            Some(RowWindow {
-                top: 6,
-                first: 0,
-                count: 3,
-                columns: 51..100,
-            }),
-        ));
+        panel.record_layout(
+            PanelLayout::new(0..100, None)
+                .with_rows(Some(RowWindow {
+                    top: 2,
+                    first: 0,
+                    count: 3,
+                    columns: 0..50,
+                }))
+                .with_provider_settings(Some(RowWindow {
+                    top: 6,
+                    first: 0,
+                    count: 3,
+                    columns: 51..100,
+                })),
+        );
 
         assert_eq!(panel.focus_at(60, 7, &settings), AvailabilityRead::None);
         assert_eq!(panel.keys(), PanelKeys::ProviderSettings);
