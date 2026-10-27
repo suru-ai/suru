@@ -3,9 +3,10 @@
 //! written as (ADR-0020). The Model picker and the settings panel each detail
 //! what focus stands on in a pane beside their list, and both lay it out here.
 
-use std::ops::Range;
+use std::{borrow::Cow, ops::Range};
 
 use ratatui::{style::Style, text::Line};
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
 
@@ -19,6 +20,11 @@ pub(super) struct DrawnPane<'a> {
 }
 
 impl<'a> DrawnPane<'a> {
+    /// A blank row, which stands one part of the pane off the next.
+    pub(super) fn blank(&mut self) {
+        self.lines.push(Line::default());
+    }
+
     /// `text` on one row `width` columns wide, cut short where it is wider.
     pub(super) fn line(&mut self, text: &str, width: u16, style: Style) {
         self.lines.push(Line::styled(
@@ -38,8 +44,14 @@ impl<'a> DrawnPane<'a> {
     }
 
     /// [`Self::wrap`], with `lead` standing in its first row's indent: a
-    /// marker or a label the text reads on from, which a selection leaves out
-    /// as it does the indent.
+    /// marker the text reads on from, which a selection leaves out as it does
+    /// the indent.
+    ///
+    /// The lead must be exactly as wide as `indent`. The text is broken to the
+    /// columns the indent leaves every row, and a selection reads every row's
+    /// text as beginning past the indent, so a narrower lead would leave a
+    /// gap a selection reads as text and a wider one would push the first
+    /// row's text off its end.
     pub(super) fn wrap_led(
         &mut self,
         lead: &str,
@@ -48,12 +60,63 @@ impl<'a> DrawnPane<'a> {
         width: u16,
         style: Style,
     ) {
+        debug_assert_eq!(lead.width(), indent.width(), "a lead stands in the indent");
         let first = self.lines.len();
         self.wrap(text, indent, width, style);
         if let Some(row) = self.lines.get_mut(first) {
             let text = row.to_string();
             *row = Line::styled(format!("{lead}{}", &text[indent.len()..]), style);
         }
+    }
+
+    /// `text` broken over rows of its own as [`Self::wrap`] breaks it, with
+    /// `label` standing in its first row's indent — and read by a selection as
+    /// the start of the line, so the line copies label and all, as a label
+    /// and its text on one row would.
+    ///
+    /// The label must be exactly as wide as `indent`, for the reason
+    /// [`Self::wrap_led`]'s lead must be.
+    pub(super) fn wrap_labelled(
+        &mut self,
+        label: &str,
+        text: &str,
+        indent: &'static str,
+        width: u16,
+        style: Style,
+    ) {
+        debug_assert_eq!(
+            label.width(),
+            indent.width(),
+            "a label stands in the indent"
+        );
+        if text.is_empty() {
+            return;
+        }
+        let wrapped = WrappedText::new(text, indent, width);
+        let first = self.lines.len();
+        let drawn = wrapped.wrapped(first);
+        self.lines.extend(wrapped.lines(style));
+        if let Some(row) = self.lines.get_mut(first) {
+            let drawn = row.to_string();
+            *row = Line::styled(format!("{label}{}", &drawn[indent.len()..]), style);
+        }
+        // The line as written begins with its label, so every part stands
+        // that much further into it, the first reaching back to take it in.
+        let mut parts = drawn
+            .parts
+            .iter()
+            .map(|part| part.start + label.len()..part.end + label.len())
+            .collect::<Vec<_>>();
+        if let Some(part) = parts.first_mut() {
+            part.start = 0;
+        }
+        self.wrapped.push(WrappedLine {
+            row: first,
+            column: drawn.column,
+            first_column: 0,
+            text: Cow::Owned(format!("{label}{text}")),
+            parts,
+        });
     }
 
     /// The pane cut to `height` rows, its last row an ellipsis where it had
@@ -131,6 +194,10 @@ impl<'a> DrawnPane<'a> {
                 .count();
             line.row = row;
             line.parts = line.parts[start..start + count].to_vec();
+            // A line shown from past its first row shows no label.
+            if start > 0 {
+                line.first_column = line.column;
+            }
             true
         });
     }

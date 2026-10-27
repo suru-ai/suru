@@ -5573,3 +5573,62 @@ fn a_click_lands_on_the_setting_a_scrolled_pane_drew_there() {
         })
     );
 }
+
+/// Drags from the start of `first` to the end of `last` in the wide panel,
+/// both as the pane draws them, answering with what the selection copied.
+fn copy_across(application: &mut Application, first: &str, last: &str) -> ApplicationTransition {
+    let buffer = rendered_application_buffer(application, WIDE.0, WIDE.1);
+    let start = text_position(&buffer, first);
+    let tail = text_position(&buffer, last);
+    let end = (tail.0 + last.chars().count() as u16 - 1, tail.1);
+    super::selection::drag(application, start, end)
+}
+
+/// What a selection copies of the pane's facts and values is what the pane
+/// says of them, label and mark and all, whether the line fits on its row or
+/// wraps over several (ADR-0020).
+#[test]
+fn a_fact_or_a_value_copies_with_its_label_whether_or_not_it_wraps() {
+    let workspace = workspace_dir();
+    let mut settings = with_workspace_roots(&["~/src", WORK_ROOT]);
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    let mut application = client_showing(workspace.path(), settings, &["workspace.roots"]);
+    open_panel(&mut application);
+    click_tab(&mut application, "Source Control");
+    focus_setting(&mut application, "worktree.autoReclaim");
+
+    assert_eq!(
+        copy_across(&mut application, "Applies", "on the Server"),
+        ApplicationTransition::CopyToClipboard("Applies    on the Server".into()),
+        "a fact on one row copies with its label"
+    );
+    assert_eq!(
+        copy_across(
+            &mut application,
+            "Sidekicks  read only",
+            "no later change can undo"
+        ),
+        ApplicationTransition::CopyToClipboard(
+            "Sidekicks  read only, since turning it on lets Suru remove Worktrees, ignored \
+             files and all, which no later change can undo"
+                .into()
+        ),
+        "and so does one wrapped over several, as written"
+    );
+
+    focus_setting(&mut application, "workspace.roots");
+    assert_eq!(
+        copy_across(&mut application, "● ~/src", "● ~/src"),
+        ApplicationTransition::CopyToClipboard("● ~/src".into()),
+        "an entry of a list copies with its mark"
+    );
+    let ApplicationTransition::CopyToClipboard(single) =
+        copy_across(&mut application, "○ none", "default")
+    else {
+        panic!("a value on a row of its own copies");
+    };
+    assert!(
+        single.text.starts_with("○ none") && single.text.ends_with("default"),
+        "as a value on a row of its own does, with its mark and its tag: {single:?}"
+    );
+}

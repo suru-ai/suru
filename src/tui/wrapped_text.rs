@@ -9,7 +9,7 @@
 //! cannot yet be passed the same way, so a line's rows and the parts of it
 //! they draw come from here together and cannot disagree.
 
-use std::ops::Range;
+use std::{borrow::Cow, ops::Range};
 
 use ratatui::{style::Style, text::Line};
 use unicode_width::UnicodeWidthStr;
@@ -81,7 +81,8 @@ impl<'a> WrappedText<'a> {
         WrappedLine {
             row,
             column: self.indent.width(),
-            text: self.text,
+            first_column: self.indent.width(),
+            text: Cow::Borrowed(self.text),
             parts: self.parts.clone(),
         }
     }

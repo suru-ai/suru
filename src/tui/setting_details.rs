@@ -41,12 +41,36 @@ const VALUE_INDENT: &str = "  ";
 const DEFAULT_TAG: &str = "default";
 const DEFAULT_TAG_GAP: usize = 3;
 
-/// The labels of the facts the pane ends on, and how far each fact's value
-/// stands in past them, wrapped rows and all: the widest label, and two
-/// columns more.
+/// The labels of the facts the pane ends on. Each is ASCII, so it takes as
+/// many columns as it has bytes.
 const APPLIES: &str = "Applies";
 const SIDEKICKS: &str = "Sidekicks";
-const FACT_INDENT: &str = "           ";
+
+/// The columns standing a fact's value off the widest label.
+const FACT_GAP: usize = 2;
+
+/// How far each fact's value stands in past the labels, wrapped rows and all:
+/// the widest label, and the gap after it.
+const FACT_INDENT: &str = blanks(widest(&[APPLIES, SIDEKICKS]) + FACT_GAP);
+
+/// The widest of `labels`, each of them ASCII.
+const fn widest(labels: &[&str]) -> usize {
+    let mut widest = 0;
+    let mut index = 0;
+    while index < labels.len() {
+        if labels[index].len() > widest {
+            widest = labels[index].len();
+        }
+        index += 1;
+    }
+    widest
+}
+
+/// `width` blank columns.
+const fn blanks(width: usize) -> &'static str {
+    const BLANKS: &str = "                                ";
+    BLANKS.split_at(width).0
+}
 
 /// The pane a wide panel details its focused row in. It holds each line it
 /// wraps as the pane writes it, so a selection across a wrapped description or
@@ -256,7 +280,7 @@ impl<'a> DetailsPane<'a> {
         }
         for (index, lead) in self.leads.iter().enumerate() {
             if index == 0 || lead.tone != Tone::Fix {
-                drawn.lines.push(Line::default());
+                drawn.blank();
             }
             let style = match lead.tone {
                 Tone::Error => theme.feedback.error,
@@ -360,14 +384,14 @@ impl ProviderAccount {
     ) -> Range<usize> {
         let space = |drawn: &mut DrawnPane<'a>| {
             if spacing == Spacing::Spaced {
-                drawn.lines.push(Line::default());
+                drawn.blank();
             }
         };
         if let Some(disabled) = &self.disabled {
-            drawn.lines.push(Line::default());
+            drawn.blank();
             drawn.wrap(disabled, "", width, theme.text.subdued);
         }
-        drawn.lines.push(Line::default());
+        drawn.blank();
         let first = drawn.lines.len();
         drawn.lines.extend(
             RowList::new(&self.settings, self.holds_keys)
@@ -397,8 +421,9 @@ impl SettingAccount {
         settings: &EffectiveSettings,
         pinned: bool,
     ) -> Self {
+        let defaults = EffectiveSettings::default();
         let in_force = descriptor.spelling(settings);
-        let default = descriptor.default_spelling();
+        let default = descriptor.spelling(&defaults);
         let named = descriptor.values.named();
         let mut values = named
             .iter()
@@ -417,7 +442,7 @@ impl SettingAccount {
         };
         if let Some(spelling) = unnamed(&default) {
             values.push(AcceptedValue {
-                rows: rows_of(descriptor, &EffectiveSettings::default(), spelling.as_ref()),
+                rows: rows_of(descriptor, &defaults, spelling.as_ref()),
                 in_force: in_force.as_ref() == Some(&spelling),
                 default: true,
             });
@@ -463,11 +488,11 @@ impl SettingAccount {
     /// value in force is the reader's pin, where it applies, and what a
     /// Sidekick may do with it.
     fn draw<'a>(&'a self, drawn: &mut DrawnPane<'a>, width: u16, theme: &Theme) {
-        drawn.lines.push(Line::default());
+        drawn.blank();
         drawn.wrap(self.descriptor.description, "", width, theme.text.primary);
-        drawn.lines.push(Line::default());
+        drawn.blank();
         self.draw_values(drawn, width, theme);
-        drawn.lines.push(Line::default());
+        drawn.blank();
         drawn.line(
             if self.pinned {
                 "Pinned"
@@ -511,11 +536,13 @@ impl SettingAccount {
             } else {
                 (NOT_IN_FORCE, theme.text.subdued)
             };
+            // A value, or each of a list's entries, copies with the mark it
+            // leads with, whether it fits its row or wraps over several.
             let [row] = value.rows.as_slice() else {
                 // A list's entries, one to a row beneath the one mark.
                 for (index, entry) in value.rows.iter().enumerate() {
                     let lead = if index == 0 { mark } else { VALUE_INDENT };
-                    drawn.wrap_led(lead, entry, VALUE_INDENT, width, style);
+                    drawn.wrap_labelled(lead, entry, VALUE_INDENT, width, style);
                 }
                 continue;
             };
@@ -529,7 +556,7 @@ impl SettingAccount {
                     ),
                 ]));
             } else {
-                drawn.line(&format!("{mark}{row}"), width, style);
+                drawn.wrap_labelled(mark, row, VALUE_INDENT, width, style);
             }
         }
         if let Some(accepts) = &self.accepts {
@@ -559,23 +586,10 @@ fn rows_of(
 }
 
 /// A labelled fact, its value standing in past the label on every row it
-/// takes.
-fn draw_fact<'a>(
-    drawn: &mut DrawnPane<'a>,
-    label: &str,
-    value: &'a str,
-    width: u16,
-    theme: &Theme,
-) {
-    let lead = format!(
-        "{label:<label_width$}  ",
-        label_width = FACT_INDENT.len() - 2
-    );
-    if lead.width() + value.width() <= usize::from(width) {
-        drawn.line(&format!("{lead}{value}"), width, theme.text.primary);
-    } else {
-        drawn.wrap_led(&lead, value, FACT_INDENT, width, theme.text.primary);
-    }
+/// takes, and copying with its label however many that is.
+fn draw_fact(drawn: &mut DrawnPane<'_>, label: &str, value: &str, width: u16, theme: &Theme) {
+    let label = format!("{label:<0$}", FACT_INDENT.len());
+    drawn.wrap_labelled(&label, value, FACT_INDENT, width, theme.text.primary);
 }
 
 #[cfg(test)]

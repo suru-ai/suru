@@ -70,7 +70,7 @@ impl<'a> DetailsPane<'a> {
         );
         drawn.wrap(&self.identity, "", width, theme.text.subdued);
         for (advisory, text) in &self.advisories {
-            drawn.lines.push(Line::default());
+            drawn.blank();
             let (marker, style) = match advisory.severity {
                 ModelAdvisorySeverity::Warning => ("! ", theme.feedback.warning),
                 ModelAdvisorySeverity::Info => ("", theme.text.subdued),
@@ -91,7 +91,7 @@ impl<'a> DetailsPane<'a> {
             }
         }
         if let Some(prices) = &self.model.details.prices {
-            drawn.lines.push(Line::default());
+            drawn.blank();
             drawn.line(
                 &format!(
                     "{} per {} tokens",
@@ -107,7 +107,7 @@ impl<'a> DetailsPane<'a> {
         }
         let specifics = limits_and_options(self.model);
         if !specifics.is_empty() {
-            drawn.lines.push(Line::default());
+            drawn.blank();
             let label_width = specifics
                 .iter()
                 .map(|(label, _)| label.width())

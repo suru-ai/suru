@@ -1,4 +1,6 @@
 //! Selection coordinates belong to the surface that painted the text.
+use std::borrow::Cow;
+
 use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
 use unicode_width::UnicodeWidthStr;
 
@@ -210,10 +212,15 @@ impl SelectionRow {
 pub(super) struct WrappedLine<'a> {
     /// The Row of the frame's area the first drawn part of the line is on.
     pub(super) row: usize,
-    /// The column of the area every drawn part of the line begins at.
+    /// The column of the area every drawn part of the line begins at, save
+    /// the first.
     pub(super) column: usize,
+    /// The column of the area the first drawn part begins at: `column`, save
+    /// for a line whose label stands in its first row's indent and is read as
+    /// part of the line.
+    pub(super) first_column: usize,
     /// The line as written.
-    pub(super) text: &'a str,
+    pub(super) text: Cow<'a, str>,
     /// The part of `text` each Row draws, top to bottom. A line drawn only in
     /// part leaves out the parts it did not draw.
     pub(super) parts: Vec<std::ops::Range<usize>>,
@@ -393,11 +400,17 @@ impl SelectionFrame {
                 .find(|line| line.row == row && !line.parts.is_empty())
             {
                 let start = text.len();
-                text.push_str(line.text);
+                text.push_str(&line.text);
                 let drawn = line.parts.len().min(usize::from(area.bottom() - y));
-                rows.extend(line.parts[..drawn].iter().map(|part| SelectionRow {
-                    text: start + part.start..start + part.end,
-                    column: line.column,
+                rows.extend(line.parts[..drawn].iter().enumerate().map(|(index, part)| {
+                    SelectionRow {
+                        text: start + part.start..start + part.end,
+                        column: if index == 0 {
+                            line.first_column
+                        } else {
+                            line.column
+                        },
+                    }
                 }));
                 y = y.saturating_add(u16::try_from(drawn).unwrap_or(u16::MAX));
                 continue;
