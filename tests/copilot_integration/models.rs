@@ -446,6 +446,49 @@ const AWKWARD_MODELS: &str = concat!(
 );
 
 #[tokio::test]
+async fn a_reasoning_effort_copilot_names_no_default_for_defaults_to_medium_or_else_the_middle() {
+    let copilot = ScriptedCopilot::with_models(concat!(
+        r#"[{"id":"luna-fixture","name":"Luna Fixture","capabilities":{},"#,
+        r#""supportedReasoningEfforts":["none","low","medium","high","xhigh","max"]},"#,
+        r#"{"id":"kimi-fixture","name":"Kimi Fixture","capabilities":{},"#,
+        r#""supportedReasoningEfforts":["low","high","max"]},"#,
+        r#"{"id":"grok-fixture","name":"Grok Fixture","capabilities":{},"#,
+        r#""supportedReasoningEfforts":["low","high","xhigh","max"]},"#,
+        r#"{"id":"named-fixture","name":"Named Fixture","capabilities":{},"#,
+        r#""supportedReasoningEfforts":["low","medium","high"],"defaultReasoningEffort":"high"}]"#,
+    ));
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let (server, client) = hosting(&copilot, "copilot-effort-default", state_dir.path()).await;
+
+    let catalog = client.list_models().await.expect("discover Copilot Models");
+    let copilot_models = copilot_catalog(&catalog);
+    let default = |id: &str| choices(model(copilot_models, id), "reasoning_effort").1;
+    assert_eq!(
+        default("luna-fixture"),
+        "medium",
+        "medium is the default where Copilot names none, not the first effort listed"
+    );
+    assert_eq!(
+        default("kimi-fixture"),
+        "high",
+        "without medium, the effort in the middle"
+    );
+    assert_eq!(
+        default("grok-fixture"),
+        "high",
+        "an even count has no one middle, so the lower, cheaper, of the two"
+    );
+    assert_eq!(
+        default("named-fixture"),
+        "high",
+        "an effort Copilot names is the default"
+    );
+
+    server.shutdown().await.expect("shut the server down");
+    copilot.wait_for_exit().await;
+}
+
+#[tokio::test]
 async fn a_catalog_without_the_routed_model_defaults_to_the_first_usable_one() {
     let copilot = ScriptedCopilot::with_models(AWKWARD_MODELS);
     let state_dir = tempfile::tempdir().expect("create isolated state directory");

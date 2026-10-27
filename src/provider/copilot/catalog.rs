@@ -33,6 +33,9 @@ use crate::{
 /// when it offers this one Suru defaults to it rather than guessing between concrete Models.
 const AUTO_MODEL_ID: &str = "auto";
 
+/// The reasoning effort a Model defaults to where Copilot names none and the Model offers it.
+const MEDIUM_EFFORT: &str = "medium";
+
 /// The wire name Copilot knows `tier` by, read out of the SDK's own serialization rather than
 /// written here: a Session lowers these same IDs back over the wire, so a tier Copilot renames must
 /// arrive renamed rather than quietly going stale.
@@ -278,7 +281,7 @@ fn promotion(promo: &ModelBillingPromo) -> Option<String> {
 
 fn reasoning_effort_option(model: &Model) -> Option<ModelOptionDescriptor> {
     let efforts = model.supported_reasoning_efforts.as_ref()?;
-    let default = preferred_default(efforts, model.default_reasoning_effort.as_deref())?;
+    let default = default_effort(efforts, model.default_reasoning_effort.as_deref())?;
     Some(ModelOptionDescriptor {
         id: ModelOptionId::new(REASONING_EFFORT_OPTION_ID),
         label: "Reasoning effort".to_owned(),
@@ -286,6 +289,22 @@ fn reasoning_effort_option(model: &Model) -> Option<ModelOptionDescriptor> {
         role: ModelOptionRole::ReasoningEffort,
         kind: select_of(efforts, default),
     })
+}
+
+/// The effort a Model defaults to: the one Copilot names where it is on offer, which it rarely
+/// does; otherwise `medium` where that is on offer, rather than the first effort listed, which on
+/// some Models is `none` and turns reasoning off; otherwise the middle of the efforts listed, the
+/// lower, cheaper, of the two where their count is even, since Copilot lists them weakest first.
+fn default_effort<'a>(efforts: &'a [String], named: Option<&'a str>) -> Option<&'a str> {
+    let offered = |effort: &str| efforts.iter().any(|offered| offered == effort);
+    named
+        .filter(|named| offered(named))
+        .or_else(|| offered(MEDIUM_EFFORT).then_some(MEDIUM_EFFORT))
+        .or_else(|| {
+            efforts
+                .get(efforts.len().saturating_sub(1) / 2)
+                .map(String::as_str)
+        })
 }
 
 /// The context tiers a Model offers, however Copilot publishes them.

@@ -59,9 +59,11 @@ The parent Agent, meanwhile, had read `status: failed` with no message, because 
 error row is not a Message: `read_subagent` and the Subagent Report now carry what a failed
 stretch failed with.
 
-## Left open
+## Since
 
-Copilot names no default effort for any Model, so Suru's default is the first choice the CLI
-lists, which is `none` — reasoning off — on the GPT 5.4, 5.6 and 6 families. That is a valid
-choice now, but it is Suru's guess, not Copilot's: the CLI itself sends no effort when none is
-chosen and lets the service decide.
+Copilot still names no default effort for any Model (CLI 1.0.91, 2026-10-27), and taking the first
+choice the CLI lists made `none` — reasoning off — the default on the GPT 5.4, 5.6 and 6 families.
+Where Copilot names no default, Suru now defaults to `medium` where a Model offers it, and
+otherwise to the middle effort it lists, the lower of two (`default_effort` in
+`src/provider/copilot/catalog.rs`). It remains Suru's choice, not Copilot's: the CLI itself sends
+no effort when none is chosen and lets the service decide.
