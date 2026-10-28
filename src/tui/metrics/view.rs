@@ -11,14 +11,14 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    protocol::{UsageMetricsAggregate, UsageMetricsBreakdown},
+    protocol::{UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsReport},
     theme::Theme,
 };
 
 use super::{
     super::slots::truncate_to_width,
     BREAKDOWNS, MetricsContent, MetricsView, OfferedBreakdown, UsageMetricsReadRefusal,
-    calendar::{BucketUnit, CalendarBucket, MetricsRange},
+    calendar::{MetricsRange, RangeBuckets},
     chart::{self, MetricsMeasure, Series},
 };
 
@@ -139,19 +139,10 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 return;
             }
             let series = chart::series(report, measure, theme);
-            let across = range_legend(&series, measure, view, &report.across_buckets.total);
-            let selected = view.selected_bucket().and_then(|index| {
-                let bucket = buckets.buckets.get(index)?;
-                let figures = &report.buckets.get(index)?.total;
-                Some(bucket_legend(
-                    &series,
-                    measure,
-                    index,
-                    buckets.unit,
-                    bucket,
-                    figures,
-                ))
-            });
+            let across = Legend::of_range(&series, measure, range, &report.across_buckets.total);
+            let selected = view
+                .selected_bucket()
+                .and_then(|index| Legend::of_bucket(&series, measure, buckets, report, index));
             // Room is kept for a note either legend needs, so selecting a
             // bar never moves the chart.
             let noted = across.noted || selected.as_ref().is_some_and(|legend| legend.noted);
@@ -231,66 +222,71 @@ struct Legend {
     noted: bool,
 }
 
-/// The legend of the range taken together, headed by its name and whole.
-fn range_legend(
-    series: &[Series],
-    measure: MetricsMeasure,
-    view: &MetricsView,
-    whole: &UsageMetricsAggregate,
-) -> Legend {
-    let total = measure.value(whole);
-    let figures: Vec<(u64, bool)> = series
-        .iter()
-        .map(|series| (series.total, series.is_partial))
-        .collect();
-    Legend {
-        heading: format!(
-            "{} · {}",
-            view.range().title(),
+impl Legend {
+    /// A legend of `figures` over `whole`, headed by `name` and that whole,
+    /// then, where `sessions`, the distinct Sessions that worked in it —
+    /// never the series' Sessions added, which count a Session once under
+    /// each key — unless the measure's whole already counts them.
+    fn new(
+        name: String,
+        figures: Vec<(u64, bool)>,
+        measure: MetricsMeasure,
+        whole: &UsageMetricsAggregate,
+        sessions: bool,
+    ) -> Self {
+        let total = measure.value(whole);
+        let mut heading = format!(
+            "{name} · {}",
             measure.total(total, measure.is_partial(whole))
-        ),
-        noted: overcounts(&figures, measure, total),
-        figures,
-        whole: total,
+        );
+        if sessions && measure != MetricsMeasure::Sessions {
+            heading.push_str(" · ");
+            heading.push_str(&MetricsMeasure::Sessions.total(whole.sessions, false));
+        }
+        Self {
+            heading,
+            noted: overcounts(&figures, measure, total),
+            figures,
+            whole: total,
+        }
     }
-}
 
-/// The legend of the `index`-th bucket alone, headed by its local date or
-/// hour, its whole, and the distinct Sessions that worked in it — never the
-/// series' Sessions added, which count a Session once under each key.
-fn bucket_legend(
-    series: &[Series],
-    measure: MetricsMeasure,
-    index: usize,
-    unit: BucketUnit,
-    bucket: &CalendarBucket,
-    whole: &UsageMetricsAggregate,
-) -> Legend {
-    let total = measure.value(whole);
-    let figures: Vec<(u64, bool)> = series
-        .iter()
-        .map(|series| {
-            (
-                series.values.get(index).copied().unwrap_or(0),
-                series.partials.get(index).copied().unwrap_or(false),
-            )
-        })
-        .collect();
-    let mut heading = format!(
-        "{} · {}",
-        chart::bucket_heading(bucket, unit),
-        measure.total(total, measure.is_partial(whole))
-    );
-    // The Sessions measure's whole already counts them.
-    if measure != MetricsMeasure::Sessions {
-        heading.push_str(" · ");
-        heading.push_str(&MetricsMeasure::Sessions.total(whole.sessions, false));
+    /// The legend of the range taken together, headed by its name.
+    fn of_range(
+        series: &[Series],
+        measure: MetricsMeasure,
+        range: MetricsRange,
+        whole: &UsageMetricsAggregate,
+    ) -> Self {
+        let figures = series
+            .iter()
+            .map(|series| (series.total, series.is_partial))
+            .collect();
+        Self::new(range.title().to_owned(), figures, measure, whole, false)
     }
-    Legend {
-        heading,
-        noted: overcounts(&figures, measure, total),
-        figures,
-        whole: total,
+
+    /// The legend of the `index`-th of `buckets` alone, headed by its local
+    /// date or hour and its Sessions, where the report holds that bucket.
+    fn of_bucket(
+        series: &[Series],
+        measure: MetricsMeasure,
+        buckets: &RangeBuckets,
+        report: &UsageMetricsReport,
+        index: usize,
+    ) -> Option<Self> {
+        let bucket = buckets.buckets.get(index)?;
+        let whole = &report.buckets.get(index)?.total;
+        let figures = series
+            .iter()
+            .map(|series| {
+                (
+                    series.values.get(index).copied().unwrap_or(0),
+                    series.partials.get(index).copied().unwrap_or(false),
+                )
+            })
+            .collect();
+        let name = chart::bucket_heading(bucket, buckets.unit);
+        Some(Self::new(name, figures, measure, whole, true))
     }
 }
 

@@ -4995,6 +4995,15 @@ struct LeftPress {
     composer_anchor: Option<std::ops::Range<usize>>,
 }
 
+impl LeftPress {
+    /// Follows the held pointer to `position`, marking the press dragged
+    /// once it has left where it was pressed, so letting go is no click.
+    fn move_to(&mut self, position: Position) {
+        self.pointer = position;
+        self.dragged |= position != self.position;
+    }
+}
+
 pub struct Application {
     pub(super) state: TuiState,
     pub(super) slots: RenderSlots,
@@ -10284,12 +10293,30 @@ impl Application {
         }
     }
 
+    /// Resolves a pointer gesture at `position` through the same mode table
+    /// as other input, so the surface that owns the pointer acts on it.
+    fn resolve_pointer(
+        &mut self,
+        kind: MouseEventKind,
+        position: Position,
+    ) -> Result<ApplicationTransition> {
+        let event = InputEvent::Mouse(MouseEvent {
+            kind,
+            column: position.x,
+            row: position.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        self.command_for_input_mode(event)
+            .map_or(Ok(ApplicationTransition::Continue), |command| {
+                self.handle_command(command)
+            })
+    }
+
     fn update_text_selection_drag(&mut self, position: Position, scroll_rows: usize) {
         let Some(press) = &mut self.state.left_press else {
             return;
         };
-        press.pointer = position;
-        press.dragged |= position != press.position;
+        press.move_to(position);
         if let Some(anchor) = press.composer_anchor.clone() {
             if press.dragged
                 && let Some(frame) = self.state.composers.selection_frame()
@@ -10548,16 +10575,7 @@ impl Application {
                 }
                 // Resolve a recognized click through the same mode table as other
                 // input, so overlays retain their ownership of pointer actions.
-                let event = InputEvent::Mouse(MouseEvent {
-                    kind: MouseEventKind::Up(MouseButton::Left),
-                    column: position.x,
-                    row: position.y,
-                    modifiers: KeyModifiers::NONE,
-                });
-                self.command_for_input_mode(event)
-                    .map_or(Ok(ApplicationTransition::Continue), |command| {
-                        self.handle_command(command)
-                    })
+                self.resolve_pointer(MouseEventKind::Up(MouseButton::Left), position)
             }
             SemanticCommandId::PointerDrag => {
                 // The Usage Metrics view covers the whole frame and holds no
@@ -10569,20 +10587,9 @@ impl Application {
                         return Ok(ApplicationTransition::Continue);
                     };
                     if let Some(press) = &mut self.state.left_press {
-                        press.pointer = position;
-                        press.dragged |= position != press.position;
+                        press.move_to(position);
                     }
-                    let event = InputEvent::Mouse(MouseEvent {
-                        kind: MouseEventKind::Drag(MouseButton::Left),
-                        column: position.x,
-                        row: position.y,
-                        modifiers: KeyModifiers::NONE,
-                    });
-                    return self
-                        .command_for_input_mode(event)
-                        .map_or(Ok(ApplicationTransition::Continue), |command| {
-                            self.handle_command(command)
-                        });
+                    return self.resolve_pointer(MouseEventKind::Drag(MouseButton::Left), position);
                 }
                 if self.state.sidebar.column().edge_is_held() {
                     let SemanticSubject::ScreenPosition(position) = &invocation.subject else {
