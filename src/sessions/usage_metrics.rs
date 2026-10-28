@@ -179,6 +179,8 @@ struct CopiedSession {
     is_brokered_subagent: bool,
     /// The Sidekick's Session that began it, where one did.
     sidekick: Option<SessionId>,
+    /// Whether a Sidekick began it, this Server's or a Peer's: a Subsession.
+    is_subsession: bool,
     turns: Vec<Turn>,
 }
 
@@ -196,6 +198,7 @@ impl SessionStoreState {
                     workspace: record.snapshot.session.workspace.id.clone(),
                     is_brokered_subagent: record.is_brokered_subagent(),
                     sidekick: record.summary.session.sidekick(),
+                    is_subsession: record.summary.session.begun_by.is_some(),
                     turns: record.snapshot.turns.clone(),
                 };
                 (*session_id, copied)

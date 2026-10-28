@@ -6,10 +6,11 @@ use crate::session_integration::support::{read_session_until, working_turn};
 use std::time::Duration;
 use suru::{
     protocol::{
-        Cost, InsightsQuery, InsightsReport, InsightsTool, QUARTER_HOUR_MS, RuntimeDescriptor,
-        SessionError, SessionErrorCode, SessionTimestamp, TURN_DURATION_BINS, ToolTally,
-        TurnDurations, TurnInsights, Usage, UsageMetricsAggregate, UsageMetricsBreakdown,
-        UsageMetricsInterval, UsageMetricsKey, UsageMetricsQuery, UsageMetricsReport,
+        Cost, DelegationInsights, InsightsQuery, InsightsReport, InsightsTool, QUARTER_HOUR_MS,
+        RoleCost, RuntimeDescriptor, SessionError, SessionErrorCode, SessionTimestamp,
+        TURN_DURATION_BINS, ToolTally, TurnDurations, TurnInsights, Usage, UsageMetricsAggregate,
+        UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsKey, UsageMetricsQuery,
+        UsageMetricsReport,
     },
     provider::{MeteredCost, ProviderActivityId, ProviderEvent, ProviderToolCallStatus},
 };
@@ -293,6 +294,17 @@ async fn insights_are_read_over_the_api_and_a_backwards_interval_is_refused() {
             1
         )],
         "the Turn's UTC quarter-hour"
+    );
+    assert_eq!(
+        report.delegation,
+        DelegationInsights {
+            own_sessions: RoleCost {
+                cost: None,
+                is_cost_partial: true,
+            },
+            ..DelegationInsights::default()
+        },
+        "the user's own Session did the work, which nobody priced"
     );
 
     let refused = ask(UsageMetricsInterval {

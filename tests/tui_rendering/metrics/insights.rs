@@ -92,6 +92,7 @@ fn worked() -> InsightsReport {
         tools: worked_tools(),
         compactions: worked_compactions(),
         approvals: worked_approvals(),
+        delegation: Default::default(),
     }
 }
 

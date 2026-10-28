@@ -5,17 +5,18 @@ use super::{
     InsightsRefusal, Pairing, RemoteAct, SessionStore,
     restoration_tests::persisted,
     usage_metrics_tests::{
-        CODEX, FABLE, OPUS, PAIRING, STUDIO, by_model, metered, read as read_metrics, restore,
-        restore_deferred, running_total, turn_scoped, usd,
+        CODEX, FABLE, OPUS, PAIRING, SONNET, STUDIO, by_model, metered, read as read_metrics,
+        restore, restore_deferred, running_total, turn_scoped, usd,
     },
 };
 use crate::{
     protocol::{
         Activity, ActivityId, ActivityStatus, Approval, ApprovalId, ApprovalInsights,
         ApprovalOutcome, ApprovalSubject, Author, CompactionCounts, CompactionTrigger, Cost,
-        Decision, FreedShare, InsightsQuery, InsightsReport, InsightsTool, QUARTER_HOUR_MS,
-        QuarterHourTurns, SessionListItem, SessionTimestamp, ToolTally, TranscriptItem, Turn,
-        TurnDurations, TurnId, TurnInsights, TurnStatus, UsageMetricsInterval, UsageTotal,
+        Decision, DelegationInsights, FreedShare, InsightsQuery, InsightsReport, InsightsTool,
+        QUARTER_HOUR_MS, QuarterHourTurns, RoleCost, SessionId, SessionListItem, SessionTimestamp,
+        ToolTally, TranscriptItem, Turn, TurnDurations, TurnId, TurnInsights, TurnStatus,
+        UsageMetricsInterval, UsageTotal,
     },
     sidekick::SidekickWorkspace,
     storage::PersistedSession,
@@ -377,6 +378,149 @@ async fn quarter_hour_costs_add_up_to_the_range_s_cost() {
         ),
         (range.cost, range.is_cost_partial),
         "the quarter-hours add up to the Cost the metrics read gives the range"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+/// What the Sessions of one role cost.
+fn role(cost: Option<Cost>, partial: bool) -> RoleCost {
+    RoleCost {
+        cost,
+        is_cost_partial: partial,
+    }
+}
+
+/// `session`, begun by the Sidekick's Session `sidekick`: a Subsession.
+fn begun_by(session: &mut PersistedSession, sidekick: SessionId) {
+    let author = Some(Author::Sidekick {
+        session_id: sidekick,
+        title: "Sidekick".to_owned(),
+    });
+    session.snapshot.session.begun_by = author.clone();
+    session.summary.session.begun_by = author;
+}
+
+#[tokio::test]
+async fn delegation_divides_the_range_s_cost_by_the_role_of_the_session_carrying_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let at = |offset: u64| START + offset * 1_000;
+    // A Session of the user's own, whose Cost is its Turns' own.
+    let mut own = persisted(directory.path(), None);
+    own.snapshot.turns = vec![
+        turn_scoped(CODEX, at(0), 0.50),
+        // Before the range: its Cost is no part of the range's.
+        turn_scoped(CODEX, START - 10, 9.00),
+    ];
+    let own_id = own.snapshot.session.id;
+    // A native Subagent whose Cost no report above it covers is its own.
+    let mut native = persisted(directory.path(), Some(own_id));
+    native.snapshot.turns = vec![turn_scoped(CODEX, at(1), 0.05)];
+    // A brokered Subagent's Cost is its own, apart from its parent's, and
+    // work of it nobody priced leaves its role's Cost partial.
+    let mut brokered = persisted(directory.path(), Some(own_id));
+    brokered.brokered = true;
+    brokered.snapshot.turns = vec![
+        turn_scoped(CODEX, at(2), 0.08),
+        metered(CODEX, Some(at(3)), None, 1),
+    ];
+    // A Sidekick, the Subagent it delegated to, and the Subsession it
+    // began, whose own native Subagent is a Subagent like any other.
+    let sidekick_workspace = SidekickWorkspace::beside(data.path()).unwrap();
+    let mut sidekick = persisted(&sidekick_workspace.ensure().unwrap(), None);
+    sidekick.snapshot.turns = vec![turn_scoped(CODEX, at(4), 0.02)];
+    let sidekick_id = sidekick.snapshot.session.id;
+    let mut sidekicks_subagent = persisted(directory.path(), Some(sidekick_id));
+    sidekicks_subagent.snapshot.turns = vec![turn_scoped(CODEX, at(5), 0.03)];
+    let mut subsession = persisted(directory.path(), None);
+    begun_by(&mut subsession, sidekick_id);
+    subsession.snapshot.turns = vec![turn_scoped(CODEX, at(6), 0.01)];
+    let subsession_id = subsession.snapshot.session.id;
+    let mut subsessions_subagent = persisted(directory.path(), Some(subsession_id));
+    subsessions_subagent.snapshot.turns = vec![turn_scoped(CODEX, at(7), 0.04)];
+    let (store, writer) = restore(
+        directory.path(),
+        vec![
+            own,
+            native,
+            brokered,
+            sidekick,
+            sidekicks_subagent,
+            subsession,
+            subsessions_subagent,
+        ],
+    )
+    .await;
+    let store = store.with_sidekicks(sidekick_workspace, Vec::new());
+
+    let delegation = read(&store, &over(START, END)).await.delegation;
+
+    assert_eq!(
+        delegation,
+        DelegationInsights {
+            own_sessions: role(usd(0.50), false),
+            native_subagents: role(usd(0.12), false),
+            brokered_subagents: role(usd(0.08), true),
+            sidekicks: role(usd(0.02), false),
+            subsessions: role(usd(0.01), false),
+        }
+    );
+    let range = read_metrics(&store, &by_model(&[(START, END)]))
+        .across_buckets
+        .total;
+    assert_eq!(
+        delegation.total(),
+        role(range.cost, range.is_cost_partial),
+        "the roles add up to the Cost the metrics read gives the range"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_claude_native_subagent_s_cost_is_inside_its_parent_s_own_sessions_share() {
+    let directory = tempfile::tempdir().unwrap();
+    // Claude's whole-tree report covers the native Subagent it ran.
+    let mut parent = persisted(directory.path(), None);
+    parent.snapshot.turns = vec![running_total(OPUS, START, 0.30, "parent-process")];
+    parent.snapshot.turns[0]
+        .cost_details
+        .as_mut()
+        .unwrap()
+        .recorded_at = SessionTimestamp(START + 30);
+    let parent_id = parent.snapshot.session.id;
+    let mut native = persisted(directory.path(), Some(parent_id));
+    native.snapshot.turns = vec![turn_scoped(SONNET, START + 12, 0.05)];
+    let (store, writer) = restore(directory.path(), vec![parent, native]).await;
+
+    let delegation = read(&store, &over(START, END)).await.delegation;
+
+    assert_eq!(
+        delegation,
+        DelegationInsights {
+            own_sessions: role(usd(0.30), false),
+            ..DelegationInsights::default()
+        },
+        "the native Subagent's own Cost is inside its parent's report"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_range_whose_turns_carry_no_cost_divides_none() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![metered(FABLE, Some(START), None, 1)];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+
+    let delegation = read(&store, &over(START, END)).await.delegation;
+
+    assert_eq!(
+        delegation,
+        DelegationInsights {
+            own_sessions: role(None, true),
+            ..DelegationInsights::default()
+        },
+        "work nobody priced is partial, with no amount anyone measured"
     );
     writer.shutdown().await.unwrap();
 }

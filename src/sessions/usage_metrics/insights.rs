@@ -16,14 +16,16 @@
 //! The quarter-hours carry Cost as the metrics read's buckets do: every
 //! Cost Coverage contribution of the counted trees lands where the Turn
 //! carrying it does, so the quarter-hours of a span add up to the Cost the
-//! metrics read gives it.
+//! metrics read gives it. Delegation divides those same contributions by
+//! the role of the Session whose Turn carries each, so its roles add up to
+//! that Cost too.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::protocol::{
-    InsightsQuery, InsightsReport, QUARTER_HOUR_MS, QuarterHourTurns, SessionId,
-    TURN_DURATION_BIN_ENDS_MS, TURN_DURATION_BINS, ToolTally, Turn, TurnDurations, TurnId,
-    TurnInsights, TurnStatus, Usage,
+    DelegationInsights, InsightsQuery, InsightsReport, QUARTER_HOUR_MS, QuarterHourTurns, RoleCost,
+    SessionId, TURN_DURATION_BIN_ENDS_MS, TURN_DURATION_BINS, ToolTally, Turn, TurnDurations,
+    TurnId, TurnInsights, TurnStatus, Usage, WorkspaceId,
 };
 
 use crate::storage::ActivityTallies;
@@ -33,7 +35,8 @@ use super::{
         SessionStore,
         cost_coverage::{CostContribution, tree_contributions},
     },
-    CountedSession, MeteredForest, SessionTimestamp, TurnPlaces, add_counted, placed_at,
+    CopiedSession, CountedSession, MeteredForest, SessionTimestamp, TurnPlaces, add_counted,
+    placed_at,
 };
 
 /// Why an Insights query is refused.
@@ -61,7 +64,7 @@ impl SessionStore {
         if interval.end < interval.start {
             return Err(InsightsRefusal::Backwards);
         }
-        let (copied, repository) = {
+        let (copied, repository, sidekick_workspace) = {
             let state = self
                 .state
                 .lock()
@@ -70,15 +73,26 @@ impl SessionStore {
                 .deferred
                 .as_ref()
                 .map(|deferred| deferred.repository.clone());
-            (state.copied_sessions(), repository)
+            (
+                state.copied_sessions(),
+                repository,
+                state.sidekick_workspace.clone(),
+            )
         };
+        // Read once the lock is let go, since naming the Sidekick
+        // Workspace reads the filesystem.
+        let sidekick_workspace = sidekick_workspace
+            .as_ref()
+            .map(|workspace| WorkspaceId::directory(&workspace.directory()));
         let forest = MeteredForest::index(copied);
         let roots = forest.cost_tree_heads();
         let mut fold = InsightsFold::default();
         for CountedSession { session_id, .. } in forest.counted_sessions(&roots) {
-            for turn in &forest.sessions[&session_id].turns {
+            let session = &forest.sessions[&session_id];
+            let role = SessionRole::of(session, sidekick_workspace.as_ref());
+            for turn in &session.turns {
                 if let Some(at) = placed_at(turn).filter(|at| interval.contains(*at)) {
-                    fold.add_turn(session_id, turn, at);
+                    fold.add_turn(session_id, role, turn, at);
                 }
             }
         }
@@ -108,6 +122,7 @@ impl SessionStore {
 struct InsightsFold {
     turns: TurnTally,
     quarter_hours: QuarterHourTally,
+    delegation: DelegationTally,
     /// The Turns the interval holds of each Session, whose Activities it
     /// counts.
     held_turns: HashMap<SessionId, HashSet<TurnId>>,
@@ -116,10 +131,18 @@ struct InsightsFold {
 }
 
 impl InsightsFold {
-    /// Adds a Turn of `session_id` the interval holds, placed `at`.
-    fn add_turn(&mut self, session_id: SessionId, turn: &Turn, at: SessionTimestamp) {
+    /// Adds a Turn of `session_id`, a Session playing `role`, the interval
+    /// holds, placed `at`.
+    fn add_turn(
+        &mut self,
+        session_id: SessionId,
+        role: SessionRole,
+        turn: &Turn,
+        at: SessionTimestamp,
+    ) {
         self.turns.add(turn);
         self.quarter_hours.add_turn(session_id, turn, at);
+        self.delegation.roles.place(session_id, turn.id, role);
         self.held_turns
             .entry(session_id)
             .or_default()
@@ -130,6 +153,7 @@ impl InsightsFold {
     /// holds the Turn carrying it.
     fn add_cost(&mut self, contribution: &CostContribution) {
         self.quarter_hours.add_cost(contribution);
+        self.delegation.add_cost(contribution);
     }
 
     fn into_report(self) -> InsightsReport {
@@ -139,6 +163,7 @@ impl InsightsFold {
             tools: most_used_first(self.activities.tools),
             compactions: self.activities.compactions,
             approvals: self.activities.approvals,
+            delegation: self.delegation.insights,
         }
     }
 }
@@ -199,6 +224,68 @@ impl QuarterHourTally {
 
     fn into_quarter_hours(self) -> Vec<QuarterHourTurns> {
         self.quarters.into_values().collect()
+    }
+}
+
+/// The role a Session plays in its forest, by which Delegation divides the
+/// Cost its Turns carry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionRole {
+    Own,
+    NativeSubagent,
+    BrokeredSubagent,
+    Sidekick,
+    Subsession,
+}
+
+impl SessionRole {
+    /// The role `session` plays, where `sidekick_workspace` names the
+    /// Sidekick Workspace, if the store knows it yet. A Subagent is one
+    /// whoever spawned it, a Sidekick's or a Subsession's included; a
+    /// Sidekick is a top-level Session of the Sidekick Workspace, and a
+    /// Subsession one a Sidekick began, never in that Workspace.
+    fn of(session: &CopiedSession, sidekick_workspace: Option<&WorkspaceId>) -> Self {
+        if session.parent.is_some() {
+            if session.is_brokered_subagent {
+                Self::BrokeredSubagent
+            } else {
+                Self::NativeSubagent
+            }
+        } else if session.is_subsession {
+            Self::Subsession
+        } else if sidekick_workspace == Some(&session.workspace) {
+            Self::Sidekick
+        } else {
+            Self::Own
+        }
+    }
+}
+
+/// The interval's Cost by the role of the Session whose Turn carries each
+/// contribution, and which role each Turn the interval holds is of.
+#[derive(Default)]
+struct DelegationTally {
+    roles: TurnPlaces<SessionRole>,
+    insights: DelegationInsights,
+}
+
+impl DelegationTally {
+    fn add_cost(&mut self, contribution: &CostContribution) {
+        let Some(role) = self.roles.of(contribution) else {
+            return;
+        };
+        let insights = &mut self.insights;
+        let RoleCost {
+            cost,
+            is_cost_partial,
+        } = match role {
+            SessionRole::Own => &mut insights.own_sessions,
+            SessionRole::NativeSubagent => &mut insights.native_subagents,
+            SessionRole::BrokeredSubagent => &mut insights.brokered_subagents,
+            SessionRole::Sidekick => &mut insights.sidekicks,
+            SessionRole::Subsession => &mut insights.subsessions,
+        };
+        add_counted(cost, is_cost_partial, contribution);
     }
 }
 

@@ -279,6 +279,72 @@ pub struct InsightsReport {
     /// The Approvals the interval's Turns asked, read from storage as the
     /// Tools are.
     pub approvals: ApprovalInsights,
+    /// The interval's Cost, divided by the role of the Session doing the
+    /// work.
+    pub delegation: DelegationInsights,
+}
+
+/// The interval's Cost divided by the role of the Session whose Turn carries
+/// each Cost Coverage contribution, overlaps removed as a
+/// [`UsageMetricsAggregate`]'s are, so the roles add up to the interval's
+/// Cost, partial where it is. A Provider that reports a whole tree's Cost
+/// on its own Turns — Claude's, for the native Subagents it runs — leaves
+/// those Subagents' work inside the Session that reported it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationInsights {
+    /// Top-level Sessions that are neither a Sidekick's nor Subsessions.
+    pub own_sessions: RoleCost,
+    /// Subagents a Provider spawned of its own accord.
+    pub native_subagents: RoleCost,
+    /// Subagents spawned through the Broker, metered apart from the
+    /// Session that spawned them.
+    pub brokered_subagents: RoleCost,
+    /// The top-level Sessions of the Sidekick Workspace.
+    pub sidekicks: RoleCost,
+    /// Sessions a Sidekick began.
+    pub subsessions: RoleCost,
+}
+
+impl DelegationInsights {
+    /// The Cost every role adds up to: the interval's.
+    pub fn total(&self) -> RoleCost {
+        [
+            self.own_sessions,
+            self.native_subagents,
+            self.brokered_subagents,
+            self.sidekicks,
+            self.subsessions,
+        ]
+        .into_iter()
+        .fold(RoleCost::default(), RoleCost::with)
+    }
+}
+
+/// The Cost of the work Sessions of one role did.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleCost {
+    /// Absent where none of their work contributes a known amount.
+    pub cost: Option<Cost>,
+    /// Whether some of their work has a Cost no counted amount accounts
+    /// for.
+    pub is_cost_partial: bool,
+}
+
+impl RoleCost {
+    /// This Cost and `other` stated as one: their sum, partial where either
+    /// is.
+    pub fn with(self, other: Self) -> Self {
+        let cost = match (self.cost, other.cost) {
+            (Some(cost), Some(other)) => Some(cost.saturating_add(other)),
+            (cost, other) => cost.or(other),
+        };
+        Self {
+            cost,
+            is_cost_partial: self.is_cost_partial || other.is_cost_partial,
+        }
+    }
 }
 
 /// How many Compactions the interval's Turns held, of each trigger and
