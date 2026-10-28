@@ -165,6 +165,25 @@ async fn restore_with_registry(
     (store, writer)
 }
 
+/// A store restored from `records` as storage holds them, each history
+/// deferred, so a Turn a stopped process left working still reads as Active,
+/// as one working now does (ADR 0029).
+pub(super) async fn restore_deferred(
+    directory: &std::path::Path,
+    records: Vec<crate::storage::PersistedSession>,
+) -> (SessionStore, StorageWriter) {
+    let repository = StorageRepository::open(directory).await.unwrap();
+    let (writer, sink) = StorageWriter::spawn(repository.clone());
+    for record in records {
+        sink.created(record, Vec::new());
+    }
+    writer.shutdown().await.unwrap();
+    let restored = repository.load_sessions().await.unwrap();
+    let (writer, sink) = StorageWriter::spawn(repository);
+    let store = SessionStore::new(restored, sink, Vec::new(), Default::default());
+    (store, writer)
+}
+
 fn read(store: &SessionStore, query: &UsageMetricsQuery) -> UsageMetricsReport {
     store
         .usage_metrics(
@@ -951,14 +970,7 @@ async fn reading_never_hydrates_a_deferred_session_and_moves_no_revision() {
     let mut subagent = persisted(directory.path(), Some(root_id));
     subagent.snapshot.turns = vec![metered(FABLE, Some(13), Some(14), 10)];
     let subagent_id = subagent.snapshot.session.id;
-    let repository = StorageRepository::open(directory.path()).await.unwrap();
-    let (writer, sink) = StorageWriter::spawn(repository.clone());
-    sink.created(root, Vec::new());
-    sink.created(subagent, Vec::new());
-    writer.shutdown().await.unwrap();
-    let restored = repository.load_sessions().await.unwrap();
-    let (writer, sink) = StorageWriter::spawn(repository.clone());
-    let store = SessionStore::new(restored, sink, Vec::new(), Default::default());
+    let (store, writer) = restore_deferred(directory.path(), vec![root, subagent]).await;
     let deferred = |store: &SessionStore| {
         let state = store.state.lock().unwrap();
         [root_id, subagent_id].map(|id| state.is_deferred(id))

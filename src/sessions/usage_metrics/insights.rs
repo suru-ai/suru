@@ -33,11 +33,11 @@ impl SessionStore {
         if interval.end < interval.start {
             return Err(InsightsRefusal::Backwards);
         }
-        let (copied, _) = self
+        let copied = self
             .state
             .lock()
             .expect("Session store lock is not poisoned")
-            .copied_forest();
+            .copied_sessions();
         let forest = MeteredForest::index(copied);
         let mut fold = InsightsFold::default();
         for CountedSession { session_id, .. } in forest.counted_sessions(&forest.cost_tree_heads())

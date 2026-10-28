@@ -152,11 +152,13 @@ impl SessionStore {
         if let Some(refusal) = UsageMetricsRefusal::of(query) {
             return Err(refusal);
         }
-        let (copied, workspaces) = self
-            .state
-            .lock()
-            .expect("Session store lock is not poisoned")
-            .copied_forest();
+        let (copied, workspaces) = {
+            let state = self
+                .state
+                .lock()
+                .expect("Session store lock is not poisoned");
+            (state.copied_sessions(), state.presented_workspaces())
+        };
         let forest = MeteredForest::index(copied);
         let metered = forest.metered(query.breakdown);
         let names = KeyNames {
@@ -181,40 +183,38 @@ struct CopiedSession {
 }
 
 impl SessionStoreState {
-    /// Every Session living here, copied as the read needs it and nothing
-    /// more worked out while the lock is held, and each of their Workspaces
-    /// — which a breakdown by Workspace and the top Sessions name — as the
-    /// Workspace Registry presents it, which is how every listing of
-    /// Workspaces names them, or as one of its Sessions does where its entry
-    /// says nowhere.
-    fn copied_forest(
-        &self,
-    ) -> (
-        HashMap<SessionId, CopiedSession>,
-        HashMap<WorkspaceId, Workspace>,
-    ) {
-        let mut sessions_copy = HashMap::<&WorkspaceId, &Workspace>::new();
-        let sessions = self
-            .sessions
+    /// Every Session living here, copied as a read needs it and nothing more
+    /// worked out while the lock is held.
+    fn copied_sessions(&self) -> HashMap<SessionId, CopiedSession> {
+        self.sessions
             .iter()
             .map(|(session_id, record)| {
                 record_work(1 + record.snapshot.turns.len());
-                let workspace = &record.snapshot.session.workspace;
-                sessions_copy.entry(&workspace.id).or_insert(workspace);
                 let copied = CopiedSession {
                     title: record.summary.title.clone(),
                     parent: record.snapshot.session.parent,
-                    workspace: workspace.id.clone(),
+                    workspace: record.snapshot.session.workspace.id.clone(),
                     is_brokered_subagent: record.is_brokered_subagent(),
                     sidekick: record.summary.session.sidekick(),
                     turns: record.snapshot.turns.clone(),
                 };
                 (*session_id, copied)
             })
-            .collect();
-        // One for each Workspace a Session here works in, however many
-        // Workspaces the Registry holds.
-        let workspaces = sessions_copy
+            .collect()
+    }
+
+    /// Each Workspace a Session living here works in — which a breakdown by
+    /// Workspace and the top Sessions name — as the Workspace Registry
+    /// presents it, which is how every listing of Workspaces names them, or
+    /// as one of its Sessions does where its entry says nowhere: one for
+    /// each, however many Workspaces the Registry holds.
+    fn presented_workspaces(&self) -> HashMap<WorkspaceId, Workspace> {
+        let mut sessions_copy = HashMap::<&WorkspaceId, &Workspace>::new();
+        for record in self.sessions.values() {
+            let workspace = &record.snapshot.session.workspace;
+            sessions_copy.entry(&workspace.id).or_insert(workspace);
+        }
+        sessions_copy
             .into_iter()
             .map(|(id, copy)| {
                 let presented = self
@@ -222,8 +222,7 @@ impl SessionStoreState {
                     .unwrap_or_else(|| copy.clone());
                 (id.clone(), presented)
             })
-            .collect();
-        (sessions, workspaces)
+            .collect()
     }
 }
 

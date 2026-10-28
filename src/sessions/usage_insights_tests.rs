@@ -4,7 +4,7 @@
 use super::{
     InsightsRefusal, Pairing, RemoteAct, SessionStore,
     restoration_tests::persisted,
-    usage_metrics_tests::{FABLE, PAIRING, STUDIO, metered, restore},
+    usage_metrics_tests::{FABLE, PAIRING, STUDIO, metered, restore, restore_deferred},
 };
 use crate::{
     protocol::{
@@ -12,7 +12,6 @@ use crate::{
         TurnDurations, TurnInsights, TurnStatus, UsageMetricsInterval, UsageTotal,
     },
     sidekick::SidekickWorkspace,
-    storage::{StorageRepository, StorageWriter},
 };
 
 /// Insights over the half-open span from `start` up to `end`.
@@ -47,25 +46,6 @@ fn took(start: u64, seconds: u64) -> Turn {
         Some(start),
         Some(start + seconds * 1_000),
     )
-}
-
-/// A store restored from `records` as storage holds them, each history
-/// deferred, so a Turn a stopped process left working still reads as Active,
-/// as one working now does (ADR 0029).
-async fn restore_deferred(
-    directory: &std::path::Path,
-    records: Vec<crate::storage::PersistedSession>,
-) -> (SessionStore, StorageWriter) {
-    let repository = StorageRepository::open(directory).await.unwrap();
-    let (writer, sink) = StorageWriter::spawn(repository.clone());
-    for record in records {
-        sink.created(record, Vec::new());
-    }
-    writer.shutdown().await.unwrap();
-    let restored = repository.load_sessions().await.unwrap();
-    let (writer, sink) = StorageWriter::spawn(repository);
-    let store = SessionStore::new(restored, sink, Vec::new(), Default::default());
-    (store, writer)
 }
 
 const START: u64 = 1_000_000;
@@ -178,9 +158,13 @@ async fn an_interval_that_runs_backwards_is_refused_and_an_empty_one_is_not() {
 }
 
 /// The Sessions the metrics read counts and no others: a Sidekick, its
-/// Subagents native and brokered, and its Subsession, and not the Session
-/// it began on a Remote, which that Remote counts; nor a Subagent whose
-/// parent is gone, which is in no tree Cost.
+/// Subagents native and brokered, and its Subsession; not a Subagent whose
+/// parent is gone, which is in no tree Cost; and not the Session the
+/// Sidekick began on a Remote, which that Remote counts. The store holds
+/// such a Session only as its listing, apart from the Sessions living here
+/// (ADR 0049) and with no Turns to count, so leaving it out is structural:
+/// the test pins that its listing reaches the Sidekick's tree and still
+/// adds nothing.
 #[tokio::test]
 async fn the_sessions_the_metrics_read_counts_are_read_and_a_remotes_are_not() {
     let directory = tempfile::tempdir().unwrap();
@@ -210,8 +194,7 @@ async fn the_sessions_the_metrics_read_counts_are_read_and_a_remotes_are_not() {
     )
     .await;
     let store = store.with_sidekicks(sidekick_workspace, Vec::new());
-    let mut remote_session = persisted(directory.path(), None);
-    remote_session.snapshot.turns = vec![took(START, 1)];
+    let remote_session = persisted(directory.path(), None);
     let remote_id = remote_session.summary.session.id;
     store.record_remote_sidekick_act(
         sidekick_id,
