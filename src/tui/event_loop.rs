@@ -3457,16 +3457,13 @@ fn spawn_usage_metrics_read(
     answers: UnboundedSender<ApplicationEvent>,
 ) {
     tokio::spawn(async move {
-        let result =
-            commands
-                .usage_metrics(&query)
-                .await
-                .map_err(
-                    |error| match error.downcast_ref::<crate::protocol::SessionError>() {
-                        Some(refusal) => refusal.message.clone(),
-                        None => format!("{error:#}"),
-                    },
-                );
+        let result = commands.usage_metrics(&query).await.map_err(|error| {
+            use crate::tui::UsageMetricsReadRefusal;
+            match error.downcast_ref::<crate::protocol::SessionError>() {
+                Some(refusal) => UsageMetricsReadRefusal::Refused(refusal.message.clone()),
+                None => UsageMetricsReadRefusal::Failed(format!("{error:#}")),
+            }
+        });
         let _ = answers.send(ApplicationEvent::UsageMetricsRead { request_id, result });
     });
 }

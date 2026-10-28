@@ -275,9 +275,11 @@ pub(super) fn command_for_context_overlay_event(event: InputEvent) -> Option<Com
     Some(CommandId::InvokeSemantic(command))
 }
 
-/// The Usage Metrics view owns every key and press while it is open, since
-/// it covers the whole frame: Esc or a press on its ✕ closes it, and `r`
-/// reads it again.
+/// The Usage Metrics view owns every key and click while it is open, since
+/// it covers the whole frame: Esc or a click on its ✕ closes it, `r` reads it
+/// again, and Ctrl+C leaves Suru, as it does from a composer with nothing in
+/// it — the view holds nothing a press could clear, and a draft it covers is
+/// the reader's to come back to.
 pub(super) fn command_for_metrics_view_event(
     event: InputEvent,
     close_target: impl Fn(Position) -> bool,
@@ -287,11 +289,13 @@ pub(super) fn command_for_metrics_view_event(
             match (key.code, key.modifiers) {
                 (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::MetricsClose,
                 (KeyCode::Char('r'), KeyModifiers::NONE) => SemanticCommandId::MetricsRefresh,
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => SemanticCommandId::ApplicationExit,
                 _ => return None,
             }
         }
+        // A click arrives as the release that completes it.
         InputEvent::Mouse(mouse)
-            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            if mouse.kind == MouseEventKind::Up(MouseButton::Left)
                 && close_target(Position::new(mouse.column, mouse.row)) =>
         {
             SemanticCommandId::MetricsClose

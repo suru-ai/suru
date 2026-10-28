@@ -7,17 +7,23 @@ use crate::tui_rendering::support::{
     rendered_application_rows_at, studio_stops_answering, text_position, type_terminal_text,
     workspace_dir,
 };
-use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use jiff::{ToSpan, civil::date, tz::TimeZone};
 use ratatui::style::Color;
 use suru::{
+    managed_client::{ManagedEvent, RecoveryStatus},
     protocol::{
         EffectiveSettings, KeyedUsageMetrics, ModelId, Outlook, ProviderId, SessionTimestamp,
         SidebarVisibility, UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsBucket,
         UsageMetricsInterval, UsageMetricsKey, UsageMetricsKeyLabel, UsageMetricsQuery,
         UsageMetricsReport,
     },
-    tui::{Application, ApplicationEvent, ApplicationTransition, SemanticCommandId},
+    tui::{
+        Application, ApplicationEvent, ApplicationTransition, SemanticCommandId,
+        UsageMetricsReadRefusal,
+    },
 };
 use uuid::Uuid;
 
@@ -69,7 +75,7 @@ fn expect_read(transition: ApplicationTransition) -> (Outlook, Uuid, UsageMetric
 fn answer(
     application: &mut Application,
     request_id: Uuid,
-    result: Result<UsageMetricsReport, String>,
+    result: Result<UsageMetricsReport, UsageMetricsReadRefusal>,
 ) {
     application
         .handle_event(ApplicationEvent::UsageMetricsRead { request_id, result })
@@ -406,12 +412,138 @@ fn a_refused_read_shows_its_reason() {
     answer(
         &mut application,
         request_id,
-        Err("A Usage Metrics query's buckets overlap".to_owned()),
+        Err(UsageMetricsReadRefusal::Refused(
+            "A Usage Metrics query's buckets overlap".to_owned(),
+        )),
+    );
+
+    let rows = screen(&application);
+    row(&rows, "The Server refused the Usage Metrics read");
+    row(&rows, "A Usage Metrics query's buckets overlap");
+}
+
+#[test]
+fn a_read_that_never_reached_a_server_says_so() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, _) = ask(&mut application);
+    answer(
+        &mut application,
+        request_id,
+        Err(UsageMetricsReadRefusal::Failed(
+            "send Usage Metrics read command: connection refused".to_owned(),
+        )),
     );
 
     let rows = screen(&application);
     row(&rows, "Usage Metrics could not be read");
-    row(&rows, "A Usage Metrics query's buckets overlap");
+    row(&rows, "connection refused");
+}
+
+#[test]
+fn a_refused_refresh_keeps_the_figures_and_says_why_beside_them() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, first, query) = ask(&mut application);
+    answer(&mut application, first, Ok(report(&query)));
+
+    let (_, second, _) = expect_read(key(&mut application, KeyCode::Char('r')));
+    answer(
+        &mut application,
+        second,
+        Err(UsageMetricsReadRefusal::Failed(
+            "connection refused".to_owned(),
+        )),
+    );
+
+    let rows = screen(&application);
+    row(&rows, "Claude Opus 5.5");
+    let subtitle = row(&rows, "Tokens by Model · Last 30 days");
+    assert!(
+        subtitle.contains("could not refresh: connection refused"),
+        "{subtitle}"
+    );
+    assert!(!subtitle.contains("Refreshing…"), "{subtitle}");
+
+    // A refresh that lands clears the note.
+    let (_, third, _) = expect_read(key(&mut application, KeyCode::Char('r')));
+    answer(&mut application, third, Ok(report(&query)));
+    assert!(!row(&screen(&application), "Tokens by Model").contains("could not refresh"));
+}
+
+#[test]
+fn a_wide_label_leaves_the_legend_s_figures_aligned() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    let mut report = report(&query);
+    report.keys[1].label = "模型 Codex".to_owned();
+    answer(&mut application, request_id, Ok(report));
+
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let column = |figure: &str| {
+        let (_, y) = text_position(&buffer, figure);
+        // Read as cells, so a wide glyph counts for the two it covers.
+        (0..WIDTH)
+            .find(|x| {
+                (0..figure.chars().count() as u16)
+                    .map(|offset| buffer[(x + offset, y)].symbol())
+                    .collect::<String>()
+                    == figure
+            })
+            .unwrap()
+    };
+    let shares = ["83%", "14%", "3%"].map(|share| column(share) + share.len() as u16);
+    assert!(
+        shares.iter().all(|end| *end == shares[0]),
+        "every share ends in one column: {shares:?}"
+    );
+}
+
+#[test]
+fn ctrl_c_leaves_suru_from_the_view_without_touching_the_draft_it_covers() {
+    let (mut application, _workspace) = beside_a_session();
+    type_terminal_text(&mut application, "half a thought");
+    invoke(&mut application, SemanticCommandId::MetricsShow);
+
+    let quit = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("press Ctrl+C");
+
+    assert_eq!(quit, ApplicationTransition::Exit);
+}
+
+#[test]
+fn the_reader_can_leave_while_the_reconnect_modal_stands_over_the_view() {
+    let (mut application, _workspace) = beside_a_session();
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(report(&query)));
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Recovering(
+            RecoveryStatus {
+                attempt: 1,
+                retry_in: std::time::Duration::from_millis(50),
+                unreachable: None,
+            },
+        )))
+        .expect("begin recovery");
+    grace_elapses(&mut application, Outlook::Local);
+    let rows = screen(&application).join("\n");
+    assert!(rows.contains("Reconnecting to Suru"), "{rows}");
+
+    assert_eq!(
+        key(&mut application, KeyCode::Esc),
+        ApplicationTransition::Continue,
+        "only leaving is answered under the modal"
+    );
+    assert!(screen(&application).join("\n").contains("Metrics"));
+    let quit = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("press Ctrl+C");
+    assert_eq!(quit, ApplicationTransition::Exit);
 }
 
 /// An Application with a Session open, so the Sidebar and the Aside both
@@ -510,7 +642,11 @@ fn r_reads_again_and_only_the_newest_answer_lands() {
     row(&rows, "Claude Opus 5.5");
 
     // A straggler from the first read moves nothing.
-    answer(&mut application, first, Err("too late".to_owned()));
+    answer(
+        &mut application,
+        first,
+        Err(UsageMetricsReadRefusal::Failed("too late".to_owned())),
+    );
     assert!(!screen(&application).join("\n").contains("too late"));
 
     let mut quieter = report(&query);

@@ -74,7 +74,7 @@ use super::{
         command_for_theme_picker_event, command_for_workspace_description_editor_event,
         command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
     },
-    metrics::MetricsView,
+    metrics::{MetricsView, UsageMetricsReadRefusal},
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
@@ -4024,7 +4024,11 @@ impl TuiState {
 
     /// The top painted overlay owns selection and pointer/key dispatch alike.
     fn top_selection_overlay(&self) -> Option<SelectionSurface> {
-        if self.rename_dialog.is_open() {
+        // The Usage Metrics view covers the whole frame, whatever it was
+        // opened over, so it stands above every other surface.
+        if self.metrics_view.is_open() {
+            Some(SelectionSurface::Metrics)
+        } else if self.rename_dialog.is_open() {
             Some(SelectionSurface::RenameDialog)
         } else if self.icon_picker.is_open() {
             Some(SelectionSurface::Icons)
@@ -5391,7 +5395,7 @@ pub enum ApplicationEvent {
     /// answer to [`ApplicationTransition::ReadUsageMetrics`].
     UsageMetricsRead {
         request_id: uuid::Uuid,
-        result: std::result::Result<crate::protocol::UsageMetricsReport, String>,
+        result: std::result::Result<crate::protocol::UsageMetricsReport, UsageMetricsReadRefusal>,
     },
     /// The Client's own Server's answer to Onboarding's re-check `recheck`:
     /// the Model Catalog as every Provider was read anew, or why it was not.
@@ -7718,7 +7722,9 @@ impl Application {
         // The Usage Metrics view covers the whole frame, so it says so itself,
         // and leaves nothing behind for the screen it returns to.
         if self.state.metrics_view.is_open() {
-            self.state.metrics_view.refuse(refusal);
+            self.state
+                .metrics_view
+                .refuse(UsageMetricsReadRefusal::Failed(refusal));
             return true;
         }
         self.state.submission_error = Some(refusal);
@@ -12447,13 +12453,6 @@ impl Application {
     /// Translates a terminal event through the active input mode. `None` means
     /// the event changes nothing, so callers can skip redrawing.
     pub fn command_for_terminal_input(&self, event: InputEvent) -> Option<CommandId> {
-        // The Usage Metrics view covers the whole frame, so nothing it covers
-        // answers anything while it is open.
-        if self.state.metrics_view.is_open() {
-            return command_for_metrics_view_event(event, |position| {
-                self.state.metrics_view.close_target_contains(position)
-            });
-        }
         self.refresh_text_selection();
         if self.state.has_text_selection() {
             match &event {
@@ -12535,6 +12534,11 @@ impl Application {
                     );
                 }
                 SelectionSurface::Context => return command_for_context_overlay_event(event),
+                SelectionSurface::Metrics => {
+                    return command_for_metrics_view_event(event, |position| {
+                        self.state.metrics_view.close_target_contains(position)
+                    });
+                }
                 SelectionSurface::Themes => return command_for_theme_picker_event(event),
                 SelectionSurface::Models => return command_for_model_picker_event(event),
                 SelectionSurface::ModelOptions => return command_for_model_options_event(event),
@@ -12929,6 +12933,12 @@ impl TuiState {
     /// opened over them, the `/relay` list a login-needed offer opens say,
     /// still owns its keys.
     fn surface_above_interventions(&self) -> Option<SurfaceAboveInterventions> {
+        // The Usage Metrics view covers even the Approval Posture picker.
+        if self.metrics_view.is_open() {
+            return Some(SurfaceAboveInterventions::Selection(
+                SelectionSurface::Metrics,
+            ));
+        }
         if self.approval_posture_picker.is_open() {
             return Some(SurfaceAboveInterventions::ApprovalPosture);
         }

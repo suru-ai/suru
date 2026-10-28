@@ -10,7 +10,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    protocol::{UsageMetricsAggregate, UsageMetricsKey, UsageMetricsReport},
+    protocol::{UsageMetricsAggregate, UsageMetricsReport},
     theme::Theme,
 };
 
@@ -59,7 +59,6 @@ impl MetricsMeasure {
 /// One key's part of every bucket, in the measure the chart plots.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Series {
-    pub(crate) key: UsageMetricsKey,
     pub(crate) label: String,
     pub(crate) color: Color,
     /// The series' figure in each bucket, in the order of the buckets.
@@ -92,7 +91,6 @@ pub(crate) fn series(
                 })
                 .collect();
             Series {
-                key: label.key.clone(),
                 label: label.label.clone(),
                 color: Color::Reset,
                 total: values.iter().sum(),
@@ -199,25 +197,31 @@ pub(crate) fn thinned_labels(
     width: u16,
 ) -> Vec<(usize, u16)> {
     let widest = labels.iter().map(|label| label.width()).max().unwrap_or(0);
-    let needed = u16::try_from(widest + 1).unwrap_or(u16::MAX);
-    let slot = slot.max(1);
+    // Counted in `usize`, so no range's stride or width can overflow.
+    let needed = widest + 1;
+    let slot = usize::from(slot.max(1));
     let stride = strides
         .iter()
-        .copied()
-        .find(|stride| stride * slot >= needed)
-        .unwrap_or_else(|| needed.div_ceil(slot));
+        .map(|stride| usize::from(*stride))
+        .find(|stride| stride.saturating_mul(slot) >= needed)
+        .unwrap_or_else(|| needed.div_ceil(slot))
+        .max(1);
     let mut placed: Vec<(usize, u16)> = Vec::new();
-    for index in (0..labels.len()).rev().step_by(usize::from(stride)) {
-        let label_width = u16::try_from(labels[index].width()).unwrap_or(u16::MAX);
-        let under_bar = u16::try_from(index)
-            .unwrap_or(u16::MAX)
-            .saturating_mul(slot);
+    let width = usize::from(width);
+    for index in (0..labels.len()).rev().step_by(stride) {
+        let label_width = labels[index].width();
+        let under_bar = index.saturating_mul(slot);
         let at = match placed.last() {
             None if label_width <= width => under_bar.min(width - label_width),
-            Some(&(_, neighbour)) if under_bar + label_width < neighbour => under_bar,
+            Some(&(_, neighbour))
+                if under_bar.saturating_add(label_width) < usize::from(neighbour) =>
+            {
+                under_bar
+            }
             _ => continue,
         };
-        placed.push((index, at));
+        // Within `width`, so it fits the column type it is drawn at.
+        placed.push((index, u16::try_from(at).unwrap_or(u16::MAX)));
     }
     placed.reverse();
     placed
@@ -410,6 +414,15 @@ mod tests {
         }
         let (last, at) = *placed.last().unwrap();
         assert!(at + labels[last].width() as u16 <= 90);
+    }
+
+    #[test]
+    fn no_slot_or_stride_is_too_wide_to_count() {
+        let labels: Vec<String> = (0..600).map(|day| format!("{day} Oct")).collect();
+
+        let placed = thinned_labels(&labels, &[u16::MAX], u16::MAX, u16::MAX);
+
+        assert_eq!(placed.first(), Some(&(599, u16::MAX - 7)));
     }
 
     #[test]

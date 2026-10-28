@@ -14,7 +14,7 @@ use crate::theme::Theme;
 
 use super::{
     super::slots::truncate_to_width,
-    MetricsContent, MetricsView,
+    MetricsContent, MetricsView, UsageMetricsReadRefusal,
     chart::{self, Series},
 };
 
@@ -56,7 +56,15 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
     if view.is_reading() && matches!(view.content(), MetricsContent::Report { .. }) {
         subtitle.push_str(" · Refreshing…");
     }
-    buffer.set_string(area.x + INSET, area.y + 3, subtitle, subdued);
+    let subtitle_width = u16::try_from(subtitle.width()).unwrap_or(u16::MAX);
+    buffer.set_string(area.x + INSET, area.y + 3, &subtitle, subdued);
+    // Figures that could not be read again stay, saying why beside them.
+    if let Some(refusal) = view.stale_because() {
+        let x = area.x + INSET + subtitle_width;
+        let room = usize::from(area.right().saturating_sub(x + INSET));
+        let note = truncate_to_width(&format!(" · {}", stale_note(refusal)), room);
+        buffer.set_string(x, area.y + 3, note, theme.feedback.error);
+    }
 
     let body = Rect::new(
         area.x + INSET,
@@ -71,14 +79,18 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
         MetricsContent::Reading => {
             buffer.set_string(body.x, body.y, "Reading Usage Metrics…", subdued);
         }
-        MetricsContent::Refused(reason) => {
+        MetricsContent::Refused(refusal) => {
+            let heading = match refusal {
+                UsageMetricsReadRefusal::Refused(_) => "The Server refused the Usage Metrics read",
+                UsageMetricsReadRefusal::Failed(_) => "Usage Metrics could not be read",
+            };
             buffer.set_string(
                 body.x,
                 body.y,
-                "Usage Metrics could not be read",
+                heading,
                 theme.feedback.error.add_modifier(Modifier::BOLD),
             );
-            let reason = truncate_to_width(reason, usize::from(body.width));
+            let reason = truncate_to_width(refusal.reason(), usize::from(body.width));
             buffer.set_string(body.x, body.y + 1, reason, theme.feedback.error);
         }
         MetricsContent::Report { buckets, report } => {
@@ -163,9 +175,12 @@ fn render_legend(
         };
         let swatch = Style::default().fg(series.color);
         buffer.set_string(area.x, y, "█", swatch);
+        // Padded by the columns it is drawn in, not its characters, so a
+        // wide glyph in one label leaves the figures beside every row aligned.
         let label = truncate_to_width(&series.label, label_width);
+        let padding = " ".repeat(label_width.saturating_sub(label.width()));
         let text = format!(
-            "{label:<label_width$}  {value:>value_width$}  {share:>4}",
+            "{label}{padding}  {value:>value_width$}  {share:>4}",
             share = share(series.total, total),
         );
         buffer.set_string(area.x + 2, y, &text, theme.text.primary);
@@ -177,6 +192,14 @@ fn render_legend(
         if bar > 0 && bar_x < area.right() {
             buffer.set_string(bar_x, y, "█".repeat(bar), swatch);
         }
+    }
+}
+
+/// What the subtitle says of figures a refresh could not replace.
+fn stale_note(refusal: &UsageMetricsReadRefusal) -> String {
+    match refusal {
+        UsageMetricsReadRefusal::Refused(reason) => format!("not refreshed: {reason}"),
+        UsageMetricsReadRefusal::Failed(reason) => format!("could not refresh: {reason}"),
     }
 }
 

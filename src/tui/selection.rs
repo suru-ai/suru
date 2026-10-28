@@ -177,6 +177,8 @@ pub(super) enum SelectionSurface {
     WorkspacePickerMenu,
     WorkspaceDescriptionEditor,
     RenameDialog,
+    /// The Usage Metrics view, which covers the whole frame.
+    Metrics,
 }
 
 /// A prose surface recorded by the draw, before selection highlighting.

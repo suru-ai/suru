@@ -71,6 +71,7 @@ pub use context_overlay::ContextBreakdownRefusal;
 pub use directory_browser::DirectoryListingId;
 pub use event_loop::run;
 pub use keymap::command_for_terminal_event;
+pub use metrics::UsageMetricsReadRefusal;
 pub use relay_overlay::{RelayLoginFollow, RelayRequest};
 pub use serve_overlay::ServeRequest;
 pub use state::{

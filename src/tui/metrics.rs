@@ -22,6 +22,24 @@ use chart::MetricsMeasure;
 
 pub(super) use view::render;
 
+/// Why the view has no fresh figures to show.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UsageMetricsReadRefusal {
+    /// The Server answered, and refused the read, in its own words.
+    Refused(String),
+    /// The read never reached a Server that could answer it, for the reason
+    /// given: an Origin that stopped answering, or a request that failed.
+    Failed(String),
+}
+
+impl UsageMetricsReadRefusal {
+    pub(super) fn reason(&self) -> &str {
+        match self {
+            Self::Refused(reason) | Self::Failed(reason) => reason,
+        }
+    }
+}
+
 /// The view's state. Its choices outlive its closing, for the rest of the
 /// TUI process; what it read does not, since the next opening reads again.
 #[derive(Clone, Debug, Default)]
@@ -34,7 +52,7 @@ pub(super) struct MetricsView {
     /// The last report read, with the buckets it answers.
     shown: Option<(Vec<CalendarBucket>, UsageMetricsReport)>,
     /// Why the last read gave no report.
-    refusal: Option<String>,
+    refusal: Option<UsageMetricsReadRefusal>,
     /// Where the last frame drew the close control.
     close_target: Cell<Option<Rect>>,
 }
@@ -42,7 +60,7 @@ pub(super) struct MetricsView {
 /// What the view shows beneath its title bar.
 pub(super) enum MetricsContent<'a> {
     Reading,
-    Refused(&'a str),
+    Refused(&'a UsageMetricsReadRefusal),
     Report {
         buckets: &'a [CalendarBucket],
         report: &'a UsageMetricsReport,
@@ -78,7 +96,9 @@ impl MetricsView {
         zone: &TimeZone,
     ) -> Option<(Uuid, UsageMetricsQuery)> {
         let Some(buckets) = calendar::resolve(self.range, now, zone) else {
-            self.refuse("The clock reads a moment the calendar cannot place".to_owned());
+            self.refuse(UsageMetricsReadRefusal::Failed(
+                "The clock reads a moment the calendar cannot place".to_owned(),
+            ));
             return None;
         };
         let request_id = Uuid::new_v4();
@@ -93,7 +113,11 @@ impl MetricsView {
 
     /// Takes the Server's answer, unless the view has since closed or asked
     /// again.
-    pub(super) fn receive(&mut self, request_id: Uuid, result: Result<UsageMetricsReport, String>) {
+    pub(super) fn receive(
+        &mut self,
+        request_id: Uuid,
+        result: Result<UsageMetricsReport, UsageMetricsReadRefusal>,
+    ) {
         if !self
             .asked
             .as_ref()
@@ -103,16 +127,24 @@ impl MetricsView {
         }
         let (_, buckets) = self.asked.take().expect("the awaited read");
         match result {
-            Ok(report) => self.shown = Some((buckets, report)),
-            Err(reason) => self.refuse(reason),
+            Ok(report) => {
+                self.shown = Some((buckets, report));
+                self.refusal = None;
+            }
+            Err(refusal) => self.refuse(refusal),
         }
     }
 
-    /// Says why the view has no report to show, giving up any it awaits.
-    pub(super) fn refuse(&mut self, reason: String) {
+    /// Says why the view has no fresh figures, giving up any read it
+    /// awaits. A report already shown stays, with the refusal beside it.
+    pub(super) fn refuse(&mut self, refusal: UsageMetricsReadRefusal) {
         self.asked = None;
-        self.shown = None;
-        self.refusal = Some(reason);
+        self.refusal = Some(refusal);
+    }
+
+    /// Why the figures shown could not be read again, where they could not.
+    pub(super) fn stale_because(&self) -> Option<&UsageMetricsReadRefusal> {
+        self.shown.as_ref().and(self.refusal.as_ref())
     }
 
     pub(super) fn range(&self) -> MetricsRange {
@@ -129,12 +161,10 @@ impl MetricsView {
     }
 
     pub(super) fn content(&self) -> MetricsContent<'_> {
-        if let Some(reason) = &self.refusal {
-            return MetricsContent::Refused(reason);
-        }
-        match &self.shown {
-            Some((buckets, report)) => MetricsContent::Report { buckets, report },
-            None => MetricsContent::Reading,
+        match (&self.shown, &self.refusal) {
+            (Some((buckets, report)), _) => MetricsContent::Report { buckets, report },
+            (None, Some(refusal)) => MetricsContent::Refused(refusal),
+            (None, None) => MetricsContent::Reading,
         }
     }
 
