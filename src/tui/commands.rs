@@ -9,7 +9,8 @@ use super::{
 };
 
 use crate::protocol::{
-    ApprovalId, AttachmentId, Outlook, QuestionnaireId, SessionReference, TurnId, WorkspaceId,
+    ApprovalId, AttachmentId, Outlook, QuestionnaireId, SessionReference, TurnId,
+    UsageMetricsBreakdown, WorkspaceId,
 };
 
 pub(super) const AUTOCOMPLETE_LIMIT: usize = 10;
@@ -124,6 +125,12 @@ pub enum SemanticCommandId {
     /// Plots the measure after the Usage Metrics view's, the last turning
     /// back to the first.
     MetricsMeasureNext,
+    /// Splits the Usage Metrics view's bars by one breakdown, reading them
+    /// anew.
+    MetricsBreakdownSelect(UsageMetricsBreakdown),
+    /// Splits the Usage Metrics view's bars by the breakdown after its own,
+    /// the last turning back to the first.
+    MetricsBreakdownNext,
     /// Opens the Icon Picker over a Session, which the picker only does while
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
     /// menu item stays quiet rather than opening a picker no glyph could draw.
@@ -688,6 +695,12 @@ impl SemanticCommandId {
                 MetricsMeasure::Sessions => "metrics.measure.sessions",
             },
             Self::MetricsMeasureNext => "metrics.measure.next",
+            Self::MetricsBreakdownSelect(breakdown) => match breakdown {
+                UsageMetricsBreakdown::Model => "metrics.breakdown.model",
+                UsageMetricsBreakdown::Provider => "metrics.breakdown.provider",
+                UsageMetricsBreakdown::Workspace => "metrics.breakdown.workspace",
+            },
+            Self::MetricsBreakdownNext => "metrics.breakdown.next",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::SessionRename => "session.rename",
@@ -958,6 +971,23 @@ const fn metrics_measure_descriptor(
         title,
         reach: SemanticReach::Client,
         description: "Plot one measure in the Usage Metrics view",
+        slash: None,
+        keybinding: None,
+    }
+}
+
+/// Choosing a breakdown changes only what the view shows, so it reaches the
+/// Client, as choosing a range does; the read it brings is refused in the
+/// view where the Origin has stopped answering.
+const fn metrics_breakdown_descriptor(
+    breakdown: UsageMetricsBreakdown,
+    title: &'static str,
+) -> SemanticCommandDescriptor {
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsBreakdownSelect(breakdown),
+        title,
+        reach: SemanticReach::Client,
+        description: "Split the Usage Metrics view's bars by one breakdown",
         slash: None,
         keybinding: None,
     }
@@ -1839,6 +1869,20 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Next Metrics Measure",
         reach: SemanticReach::Client,
         description: "Plot the next measure in the Usage Metrics view",
+        slash: None,
+        keybinding: None,
+    },
+    metrics_breakdown_descriptor(UsageMetricsBreakdown::Model, "Show Metrics by Model"),
+    metrics_breakdown_descriptor(UsageMetricsBreakdown::Provider, "Show Metrics by Provider"),
+    metrics_breakdown_descriptor(
+        UsageMetricsBreakdown::Workspace,
+        "Show Metrics by Workspace",
+    ),
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsBreakdownNext,
+        title: "Next Metrics Breakdown",
+        reach: SemanticReach::Client,
+        description: "Split the Usage Metrics view's bars by the next breakdown",
         slash: None,
         keybinding: None,
     },

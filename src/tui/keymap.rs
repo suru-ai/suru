@@ -280,7 +280,8 @@ pub(super) fn command_for_context_overlay_event(event: InputEvent) -> Option<Com
 /// it covers the whole frame: Esc or a click on its ✕ closes it, `r` reads it
 /// again, `1`–`5` or a click in the range bar choose a range, `[`/`]` or the
 /// wheel over the chart step to the range before or after, `c`/`t`/`s` or a
-/// click on a measure choose what the chart plots and Tab the next, and Ctrl+C leaves
+/// click on a measure choose what the chart plots and Tab the next, `b` splits
+/// the bars by the next breakdown and a click on one by that, and Ctrl+C leaves
 /// Suru, as it does from a composer with nothing in it — the view holds
 /// nothing a press could clear, and a draft it covers is the reader's to come
 /// back to.
@@ -309,6 +310,7 @@ pub(super) fn command_for_metrics_view_event(
                     SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Sessions)
                 }
                 (KeyCode::Tab, KeyModifiers::NONE) => SemanticCommandId::MetricsMeasureNext,
+                (KeyCode::Char('b'), KeyModifiers::NONE) => SemanticCommandId::MetricsBreakdownNext,
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => SemanticCommandId::ApplicationExit,
                 _ => return None,
             }
@@ -325,6 +327,9 @@ pub(super) fn command_for_metrics_view_event(
                 }
                 (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Measure(measure)) => {
                     SemanticCommandId::MetricsMeasureSelect(measure)
+                }
+                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Breakdown(breakdown)) => {
+                    SemanticCommandId::MetricsBreakdownSelect(breakdown)
                 }
                 // Down the wheel to the longer ranges, as a map zooms out.
                 (MouseEventKind::ScrollDown, MetricsTarget::Chart) => {

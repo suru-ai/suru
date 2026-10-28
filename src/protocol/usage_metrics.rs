@@ -57,6 +57,37 @@ pub enum UsageMetricsBreakdown {
 impl UsageMetricsBreakdown {
     /// Every breakdown, in the order a reader is offered them.
     pub const ALL: [Self; 3] = [Self::Model, Self::Provider, Self::Workspace];
+
+    /// The breakdown after this one, the last turning back to the first.
+    pub fn next(self) -> Self {
+        Self::ALL[(self.place() + 1) % Self::ALL.len()]
+    }
+
+    /// Where the breakdown stands in [`Self::ALL`].
+    pub fn place(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|breakdown| *breakdown == self)
+            .expect("every breakdown is listed")
+    }
+
+    /// What one of its keys is called, as a reader is offered it.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Model => "Model",
+            Self::Provider => "Provider",
+            Self::Workspace => "Workspace",
+        }
+    }
+
+    /// What several of its keys are called.
+    pub const fn plural(self) -> &'static str {
+        match self {
+            Self::Model => "Models",
+            Self::Provider => "Providers",
+            Self::Workspace => "Workspaces",
+        }
+    }
 }
 
 /// One part of a breakdown.

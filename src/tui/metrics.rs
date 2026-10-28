@@ -48,6 +48,7 @@ pub(super) struct MetricsView {
     open: bool,
     range: MetricsRange,
     measure: MetricsMeasure,
+    breakdown: UsageMetricsBreakdown,
     /// The read the view awaits, and what it asked for.
     asked: Option<(Uuid, Asked)>,
     /// The last report read, with the buckets it answers.
@@ -105,6 +106,9 @@ struct Targets {
     ranges: [Option<Rect>; MetricsRange::ALL.len()],
     /// Each measure's place beside it, in [`MetricsMeasure::ALL`] order.
     measures: [Option<Rect>; MetricsMeasure::ALL.len()],
+    /// Each breakdown's place after them, in [`UsageMetricsBreakdown::ALL`]
+    /// order.
+    breakdowns: [Option<Rect>; UsageMetricsBreakdown::ALL.len()],
     /// The chart, or where it stands while there is none to draw.
     chart: Option<Rect>,
 }
@@ -115,6 +119,7 @@ pub(super) enum MetricsTarget {
     Close,
     Range(MetricsRange),
     Measure(MetricsMeasure),
+    Breakdown(UsageMetricsBreakdown),
     Chart,
 }
 
@@ -161,6 +166,24 @@ impl MetricsView {
         true
     }
 
+    /// Chooses how the view splits its bars, answering whether that changed
+    /// it, so that it must be read anew: a report holds the keys of the
+    /// breakdown it was asked for alone, and is not shown under another's
+    /// name while the new one is read.
+    pub(super) fn choose_breakdown(&mut self, breakdown: UsageMetricsBreakdown) -> bool {
+        if self.breakdown == breakdown {
+            return false;
+        }
+        self.breakdown = breakdown;
+        self.shown = None;
+        self.refusal = None;
+        true
+    }
+
+    pub(super) fn breakdown(&self) -> UsageMetricsBreakdown {
+        self.breakdown
+    }
+
     /// The query for the view's range at `now` in `zone`, which the view now
     /// awaits the answer to under the request it answers with. A report
     /// already shown stays until the answer replaces it. A moment the
@@ -204,7 +227,7 @@ impl MetricsView {
         let request_id = Uuid::new_v4();
         let query = UsageMetricsQuery {
             buckets,
-            breakdown: UsageMetricsBreakdown::Model,
+            breakdown: self.breakdown,
         };
         self.asked = Some((request_id, asked));
         self.refusal = None;
@@ -314,6 +337,10 @@ impl MetricsView {
         self.update_targets(|targets| targets.measures[measure.place()] = Some(area));
     }
 
+    pub(super) fn record_breakdown_target(&self, breakdown: UsageMetricsBreakdown, area: Rect) {
+        self.update_targets(|targets| targets.breakdowns[breakdown.place()] = Some(area));
+    }
+
     pub(super) fn record_chart_target(&self, area: Rect) {
         self.update_targets(|targets| targets.chart = Some(area));
     }
@@ -342,6 +369,12 @@ impl MetricsView {
             .find(|measure| on(targets.measures[measure.place()]))
         {
             return Some(MetricsTarget::Measure(measure));
+        }
+        if let Some(breakdown) = UsageMetricsBreakdown::ALL
+            .into_iter()
+            .find(|breakdown| on(targets.breakdowns[breakdown.place()]))
+        {
+            return Some(MetricsTarget::Breakdown(breakdown));
         }
         on(targets.chart).then_some(MetricsTarget::Chart)
     }

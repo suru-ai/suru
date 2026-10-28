@@ -10,7 +10,10 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    protocol::{Cost, UsageMetricsAggregate, UsageMetricsBucket, UsageMetricsReport},
+    protocol::{
+        Cost, UsageMetricsAggregate, UsageMetricsBucket, UsageMetricsKey, UsageMetricsKeyLabel,
+        UsageMetricsReport,
+    },
     theme::Theme,
 };
 
@@ -133,47 +136,101 @@ pub(crate) struct Series {
     pub(crate) is_partial: bool,
 }
 
-/// The series a report stacks, bottom first: the largest range total at the
-/// bottom and the rest above it in falling order, ties settled by label so
-/// the order never shifts between reads of the same figures. Each takes the
-/// colour of its place from the Theme's series palette, and its total from
-/// the report's figures across its buckets, where a Session counts once
-/// however many buckets it worked in.
+/// The most keys a chart stacks as series of their own; the rest fold into
+/// one, so the chart and its legend stay readable however many Models or
+/// Workspaces the range holds.
+pub(crate) const KEYED_SERIES: usize = 6;
+
+/// What the series holding every key past the largest few is called.
+pub(crate) const OTHER: &str = "Other";
+
+/// The series a report stacks, bottom first: the largest key over the range
+/// at the bottom and the rest above it in falling order, then, where there
+/// are more than [`KEYED_SERIES`] keys, every one past them folded into a
+/// single [`OTHER`] series at the top, its figures theirs added together.
+///
+/// Keys are ranked the same way whatever the measure — by Cost over the
+/// range, then by tokens, then by Sessions, ties settled by label — so for
+/// a breakdown and range each key keeps its place, its colour, and whether
+/// it is folded as the measure changes, and the order never shifts between
+/// reads of the same figures. Each takes the colour of its place from the
+/// Theme's series palette, and Other the Theme's subdued colour, which no
+/// key takes. Each total comes from the report's figures across its
+/// buckets, where a Session counts once however many buckets it worked in.
+///
+/// Other's Sessions are its keys' counts added: a Session that worked under
+/// two of them counts once for each, as it does under the keys shown, and
+/// the note that says so covers it.
 pub(crate) fn series(
     report: &UsageMetricsReport,
     measure: MetricsMeasure,
     theme: &Theme,
 ) -> Vec<Series> {
-    let mut series: Vec<Series> = report
+    let part = |bucket: &UsageMetricsBucket, key: &UsageMetricsKey| {
+        bucket
+            .by_key
+            .iter()
+            .find(|keyed| keyed.key == *key)
+            .map(|keyed| keyed.aggregate)
+            .unwrap_or_default()
+    };
+    let mut ranked: Vec<(&UsageMetricsKeyLabel, UsageMetricsAggregate)> = report
         .keys
         .iter()
-        .map(|label| {
-            let part = |bucket: &UsageMetricsBucket| {
-                bucket
-                    .by_key
-                    .iter()
-                    .find(|keyed| keyed.key == label.key)
-                    .map(|keyed| keyed.aggregate)
-                    .unwrap_or_default()
-            };
-            let whole = part(&report.across_buckets);
-            Series {
-                label: label.label.clone(),
-                color: Color::Reset,
-                values: report
-                    .buckets
-                    .iter()
-                    .map(|bucket| measure.value(&part(bucket)))
-                    .collect(),
-                total: measure.value(&whole),
-                is_partial: measure.is_partial(&whole),
-            }
+        .map(|label| (label, part(&report.across_buckets, &label.key)))
+        .collect();
+    let rank = |whole: &UsageMetricsAggregate| {
+        [
+            MetricsMeasure::Cost,
+            MetricsMeasure::Tokens,
+            MetricsMeasure::Sessions,
+        ]
+        .map(|measure| measure.value(whole))
+    };
+    ranked.sort_by(|(left, left_whole), (right, right_whole)| {
+        rank(right_whole)
+            .cmp(&rank(left_whole))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    let folded = if ranked.len() > KEYED_SERIES {
+        ranked.split_off(KEYED_SERIES)
+    } else {
+        Vec::new()
+    };
+    let values = |keys: &[(&UsageMetricsKeyLabel, UsageMetricsAggregate)]| {
+        report
+            .buckets
+            .iter()
+            .map(|bucket| {
+                keys.iter()
+                    .map(|(label, _)| measure.value(&part(bucket, &label.key)))
+                    .fold(0, u64::saturating_add)
+            })
+            .collect()
+    };
+    let palette = palette(theme);
+    let mut series: Vec<Series> = ranked
+        .iter()
+        .enumerate()
+        .map(|(place, keyed)| Series {
+            label: keyed.0.label.clone(),
+            color: palette[place % palette.len()],
+            values: values(std::slice::from_ref(keyed)),
+            total: measure.value(&keyed.1),
+            is_partial: measure.is_partial(&keyed.1),
         })
         .collect();
-    series.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.label.cmp(&b.label)));
-    let palette = palette(theme);
-    for (place, series) in series.iter_mut().enumerate() {
-        series.color = palette[place % palette.len()];
+    if !folded.is_empty() {
+        series.push(Series {
+            label: OTHER.to_owned(),
+            color: other_color(theme),
+            values: values(&folded),
+            total: folded
+                .iter()
+                .map(|(_, whole)| measure.value(whole))
+                .fold(0, u64::saturating_add),
+            is_partial: folded.iter().any(|(_, whole)| measure.is_partial(whole)),
+        });
     }
     series
 }
@@ -189,7 +246,9 @@ pub(crate) fn holds_nothing(report: &UsageMetricsReport) -> bool {
 }
 
 /// The colours series take in turn: the Theme's accent, then the bright
-/// ANSI hues it names, each once and none the canvas is painted with.
+/// ANSI hues it names, each once and none the canvas is painted with — as
+/// many as [`KEYED_SERIES`] where the Theme's hues are all distinct. A Theme
+/// naming fewer distinct hues has them taken in turn again.
 fn palette(theme: &Theme) -> Vec<Color> {
     let bright = theme.ansi.bright;
     let canvas = theme.surface.base.bg;
@@ -214,6 +273,19 @@ fn palette(theme: &Theme) -> Vec<Color> {
         palette.push(Color::Reset);
     }
     palette
+}
+
+/// The colour of the [`OTHER`] series: the Theme's subdued text, a neutral
+/// no key's colour is drawn from, so the folded keys never read as one of
+/// those shown.
+fn other_color(theme: &Theme) -> Color {
+    theme
+        .text
+        .subdued
+        .fg
+        .or(theme.border.subdued.fg)
+        .filter(|color| *color != Color::Reset)
+        .unwrap_or(Color::Gray)
 }
 
 /// A y-axis: its top, and the step between its ticks.

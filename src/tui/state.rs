@@ -9575,6 +9575,20 @@ impl Application {
         }
     }
 
+    /// Splits the open Usage Metrics view's bars by `breakdown`, reading
+    /// them where that changed what the view shows, as a range is chosen.
+    fn choose_metrics_breakdown(
+        &mut self,
+        breakdown: crate::protocol::UsageMetricsBreakdown,
+    ) -> ApplicationTransition {
+        let view = &mut self.state.metrics_view;
+        if view.is_open() && view.choose_breakdown(breakdown) {
+            self.read_usage_metrics()
+        } else {
+            ApplicationTransition::Continue
+        }
+    }
+
     /// Plots `measure` in the open Usage Metrics view, as a range is chosen
     /// only there.
     fn choose_metrics_measure(&mut self, measure: MetricsMeasure) {
@@ -11450,6 +11464,13 @@ impl Application {
             SemanticCommandId::MetricsMeasureNext => {
                 self.choose_metrics_measure(self.state.metrics_view.measure().next());
                 Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::MetricsBreakdownSelect(breakdown) => {
+                Ok(self.choose_metrics_breakdown(breakdown))
+            }
+            SemanticCommandId::MetricsBreakdownNext => {
+                let breakdown = self.state.metrics_view.breakdown().next();
+                Ok(self.choose_metrics_breakdown(breakdown))
             }
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,

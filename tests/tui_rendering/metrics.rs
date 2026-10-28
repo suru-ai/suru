@@ -339,7 +339,7 @@ fn a_report_draws_stacked_bars_over_a_nice_axis_with_a_legend() {
     let shown = rows.join("\n");
     eprintln!("{shown}");
     assert!(rows[0].trim_end().ends_with("esc ✕"), "{shown}");
-    let controls = row(&rows, "by Model");
+    let controls = row(&rows, "by ▐Model▌");
     assert!(
         controls.starts_with("  Today   7 days  ▐30 days▌  Year   All time"),
         "the range bar, thirty days chosen: {controls:?}"
@@ -556,7 +556,7 @@ fn a_refused_refresh_keeps_the_figures_and_says_why_above_them() {
 
     let rows = screen(&application);
     row(&rows, "Claude Opus 5.5");
-    let controls = rendered_row(&rows, "by Model");
+    let controls = rendered_row(&rows, "by ▐Model▌");
     let note = rendered_row(&rows, "Could not refresh: connection refused");
     assert_eq!(note, controls + 1, "beneath the controls");
     assert!(!rows.join("\n").contains("Refreshing…"));
@@ -1189,7 +1189,7 @@ fn brackets_clicks_and_the_wheel_choose_ranges_as_the_keys_do() {
         rendered_application_buffer(&application, WIDTH, HEIGHT);
         let (_, _, query) = expect_read(act(&mut application));
         let rows = screen(&application);
-        (query.buckets, row(&rows, "by Model").to_owned())
+        (query.buckets, row(&rows, "by ▐Model▌").to_owned())
     };
     let semantic = |command| move |application: &mut Application| invoke(application, command);
     let chart = |application: &Application| {
@@ -1410,7 +1410,7 @@ fn cost_is_shown_first_in_dollars_with_a_plus_after_every_partial_figure() {
     let rows = screen(&application);
     let shown = rows.join("\n");
     eprintln!("{shown}");
-    let controls = row(&rows, "by Model");
+    let controls = row(&rows, "by ▐Model▌");
     assert!(
         controls.contains("▐Cost▌  Tokens"),
         "Cost chosen beside the range bar: {controls:?}"
@@ -1490,7 +1490,7 @@ fn measure_keys_tab_and_clicks_choose_a_measure_without_reading_again() {
     answer(&mut application, request_id, Ok(priced_report(&query)));
     let shows = |application: &Application, chosen: &str, total: &str| {
         let rows = screen(application);
-        let controls = row(&rows, "by Model");
+        let controls = row(&rows, "by ▐Model▌");
         assert!(controls.contains(chosen), "{chosen} in {controls:?}");
         row(&rows, total);
     };
@@ -1500,7 +1500,7 @@ fn measure_keys_tab_and_clicks_choose_a_measure_without_reading_again() {
     shows(&application, cost.0, cost.1);
     let label_at = |application: &Application, label: &str| {
         let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
-        let (_, controls_y) = text_position(&buffer, "by Model");
+        let (_, controls_y) = text_position(&buffer, "by ▐Model▌");
         let rows = screen(application);
         let x = rows[usize::from(controls_y)].find(label).unwrap();
         // The row holds wide glyphs before the label: count its columns.
@@ -1732,4 +1732,346 @@ fn the_measure_outlives_the_view_and_is_chosen_while_a_read_is_on_its_way() {
     let (_, request_id, query) = ask(&mut application);
     answer(&mut application, request_id, Ok(priced_report(&query)));
     row(&screen(&application), "Last 30 days · 109M tokens");
+}
+
+fn provider(provider: &str) -> UsageMetricsKey {
+    UsageMetricsKey::Provider {
+        provider: ProviderId::new(provider),
+    }
+}
+
+/// [`report`]'s figures under the Providers its Models are reached through,
+/// each Provider having the one Model, as the Server would break them down.
+fn by_provider(query: &UsageMetricsQuery) -> UsageMetricsReport {
+    let mut report = report(query);
+    let renamed = |key: &mut UsageMetricsKey| {
+        if let UsageMetricsKey::Model { provider: id, .. } = key {
+            *key = provider(id.as_str());
+        }
+    };
+    for label in &mut report.keys {
+        renamed(&mut label.key);
+        label.label = match label.label.as_str() {
+            "Claude Opus 5.5" => "Claude",
+            "GPT-5.5 Codex" => "Codex",
+            _ => "Copilot",
+        }
+        .to_owned();
+    }
+    for bucket in report
+        .buckets
+        .iter_mut()
+        .chain([&mut report.across_buckets])
+    {
+        bucket
+            .by_key
+            .iter_mut()
+            .for_each(|keyed| renamed(&mut keyed.key));
+    }
+    report
+}
+
+#[test]
+fn b_and_clicks_choose_a_breakdown_and_read_it_anew() {
+    assert_eq!(
+        [
+            SemanticCommandId::MetricsBreakdownSelect(UsageMetricsBreakdown::Model),
+            SemanticCommandId::MetricsBreakdownSelect(UsageMetricsBreakdown::Provider),
+            SemanticCommandId::MetricsBreakdownSelect(UsageMetricsBreakdown::Workspace),
+            SemanticCommandId::MetricsBreakdownNext,
+        ]
+        .map(SemanticCommandId::as_str),
+        [
+            "metrics.breakdown.model",
+            "metrics.breakdown.provider",
+            "metrics.breakdown.workspace",
+            "metrics.breakdown.next",
+        ]
+    );
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, opened) = ask(&mut application);
+    assert_eq!(opened.breakdown, UsageMetricsBreakdown::Model);
+    answer(&mut application, request_id, Ok(report(&opened)));
+    let controls = |application: &Application| row(&screen(application), "Sessions").to_owned();
+    assert!(
+        controls(&application).contains("by ▐Model▌  Provider   Workspace"),
+        "{}",
+        controls(&application)
+    );
+    let click = |application: &mut Application, label: &str| {
+        let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+        let (_, controls_y) = text_position(&buffer, "▐Cost▌");
+        let rows = screen(application);
+        let x = rows[usize::from(controls_y)].find(label).unwrap();
+        let x = unicode_width::UnicodeWidthStr::width(&rows[usize::from(controls_y)][..x]);
+        press_at(application, (u16::try_from(x).unwrap(), controls_y))
+    };
+
+    // `b` steps through every breakdown and back, each step a read of the
+    // same buckets split anew; a click or an invocation chooses one.
+    for (act, expected) in [
+        (
+            Box::new(|application: &mut Application| press(application, 'b'))
+                as Box<dyn Fn(&mut Application) -> ApplicationTransition>,
+            UsageMetricsBreakdown::Provider,
+        ),
+        (
+            Box::new(|application: &mut Application| press(application, 'b')),
+            UsageMetricsBreakdown::Workspace,
+        ),
+        (
+            Box::new(|application: &mut Application| press(application, 'b')),
+            UsageMetricsBreakdown::Model,
+        ),
+        (
+            Box::new(|application: &mut Application| click(application, "Workspace")),
+            UsageMetricsBreakdown::Workspace,
+        ),
+        (
+            Box::new(|application: &mut Application| click(application, "Provider")),
+            UsageMetricsBreakdown::Provider,
+        ),
+        (
+            Box::new(|application: &mut Application| {
+                invoke(
+                    application,
+                    SemanticCommandId::MetricsBreakdownSelect(UsageMetricsBreakdown::Model),
+                )
+            }),
+            UsageMetricsBreakdown::Model,
+        ),
+        (
+            Box::new(|application: &mut Application| {
+                invoke(application, SemanticCommandId::MetricsBreakdownNext)
+            }),
+            UsageMetricsBreakdown::Provider,
+        ),
+    ] {
+        let (_, request_id, query) = expect_read(act(&mut application));
+        assert_eq!(query.breakdown, expected);
+        assert_eq!(query.buckets, opened.buckets);
+        // Figures split another way are not shown under the new name.
+        assert!(
+            screen(&application)
+                .iter()
+                .any(|row| row.contains("Reading Usage Metrics")),
+            "{expected:?}"
+        );
+        let chosen = format!("▐{}▌", expected.label());
+        assert!(controls(&application).contains(&chosen), "{chosen}");
+        answer(&mut application, request_id, Ok(empty_report(&query, None)));
+    }
+
+    // Choosing the breakdown already shown reads nothing.
+    assert_eq!(
+        click(&mut application, "Provider"),
+        ApplicationTransition::Continue
+    );
+
+    // The key names the very command the invocation does.
+    assert_eq!(
+        application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE
+        ))),
+        Some(CommandId::InvokeSemantic(
+            SemanticCommandId::MetricsBreakdownNext
+        ))
+    );
+}
+
+#[test]
+fn the_breakdown_outlives_the_view() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    ask(&mut application);
+    expect_read(press(&mut application, 'b'));
+    key(&mut application, KeyCode::Esc);
+
+    let (_, _, query) = ask(&mut application);
+
+    assert_eq!(query.breakdown, UsageMetricsBreakdown::Provider);
+}
+
+#[test]
+fn a_provider_breakdown_names_each_provider_and_notes_sessions_counted_under_several() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    ask(&mut application);
+    let (_, request_id, query) = expect_read(press(&mut application, 'b'));
+    answer(&mut application, request_id, Ok(by_provider(&query)));
+    press(&mut application, 's');
+
+    let rows = screen(&application);
+    for (label, figure) in [("Claude", " 12 "), ("Codex", " 4 "), ("Copilot", " 3 ")] {
+        let line = row(&rows, &format!("█ {label}"));
+        assert!(line.contains(figure), "{figure} in {line:?}");
+    }
+    row(
+        &rows,
+        "A Session that used several Providers counts once for each",
+    );
+    assert!(!rows.join("\n").contains("several Models"));
+}
+
+/// Thirty days of `keys` Workspaces, the first using a million tokens a day
+/// and each after it a hundred thousand fewer, every one of them the work of
+/// one Session alone.
+fn many_workspaces(query: &UsageMetricsQuery, keys: u64) -> UsageMetricsReport {
+    let workspace = |index: u64| UsageMetricsKey::Workspace {
+        workspace: suru::protocol::WorkspaceId(format!("directory:{index}")),
+    };
+    let daily = |index: u64| 1_000_000 - index * 100_000;
+    let keyed = |index: u64| KeyedUsageMetrics {
+        key: workspace(index),
+        aggregate: UsageMetricsAggregate {
+            sessions: 1,
+            ..tokens(daily(index))
+        },
+    };
+    let mut report = UsageMetricsReport {
+        buckets: query
+            .buckets
+            .iter()
+            .map(|_| UsageMetricsBucket {
+                total: UsageMetricsAggregate {
+                    sessions: keys,
+                    ..tokens((0..keys).map(daily).sum())
+                },
+                by_key: (0..keys).map(keyed).collect(),
+            })
+            .collect(),
+        untimed: UsageMetricsBucket::default(),
+        earliest_turn_at: query.buckets.first().map(|bucket| bucket.start),
+        // By identity, which says nothing of their size.
+        keys: (0..keys)
+            .rev()
+            .map(|index| UsageMetricsKeyLabel {
+                key: workspace(index),
+                label: format!("workspace-{index}"),
+            })
+            .collect(),
+        across_buckets: UsageMetricsBucket {
+            total: UsageMetricsAggregate {
+                sessions: keys,
+                ..UsageMetricsAggregate::default()
+            },
+            by_key: (0..keys).map(keyed).collect(),
+        },
+    };
+    for keyed in &mut report.across_buckets.by_key {
+        keyed.aggregate = UsageMetricsAggregate {
+            sessions: 1,
+            ..UsageMetricsAggregate::default()
+        };
+    }
+    take_together(&mut report);
+    report
+}
+
+#[test]
+fn keys_beyond_the_six_largest_fold_into_other_with_their_figures_added() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    ask(&mut application);
+    expect_read(press(&mut application, 'b'));
+    let (_, request_id, query) = expect_read(press(&mut application, 'b'));
+    answer(&mut application, request_id, Ok(many_workspaces(&query, 9)));
+    show_tokens(&mut application);
+
+    let rows = screen(&application);
+    let shown = rows.join("\n");
+    eprintln!("{shown}");
+    for index in 0..6 {
+        row(&rows, &format!("workspace-{index}"));
+    }
+    for index in 6..9 {
+        assert!(!shown.contains(&format!("workspace-{index}")), "{shown}");
+    }
+    // The seventh to ninth use 400K, 300K and 200K a day: 27M over thirty.
+    let other = row(&rows, "█ Other");
+    assert!(other.contains("27M"), "{other:?}");
+    assert!(other.contains("17%"), "27M of 162M: {other:?}");
+    assert_eq!(
+        rendered_row(&rows, "█ Other"),
+        rendered_row(&rows, "workspace-5") + 1,
+        "Other stands after the six it is smaller than"
+    );
+    row(&rows, "Last 30 days · 162M tokens");
+
+    // Each of the six its own colour, and Other one of its own beside them.
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let swatch = |label: &str| {
+        let (x, y) = text_position(&buffer, label);
+        buffer[(x - 2, y)].fg
+    };
+    let mut colours = (0..6)
+        .map(|index| swatch(&format!("workspace-{index}")))
+        .chain([swatch("Other")])
+        .collect::<Vec<_>>();
+    colours.sort_by_key(|colour| format!("{colour:?}"));
+    colours.dedup();
+    assert_eq!(colours.len(), 7, "{colours:?}");
+}
+
+#[test]
+fn six_keys_fold_nothing() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(many_workspaces(&query, 6)));
+
+    let shown = screen(&application).join("\n");
+    assert!(shown.contains("workspace-5"), "{shown}");
+    assert!(!shown.contains("Other"), "{shown}");
+}
+
+#[test]
+fn other_counts_the_sessions_of_the_keys_it_holds_once_for_each() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    let mut report = many_workspaces(&query, 8);
+    // One Session worked under every key, so the keys count eight Sessions
+    // of the one.
+    report.across_buckets.total.sessions = 1;
+    answer(&mut application, request_id, Ok(report));
+    press(&mut application, 's');
+
+    let rows = screen(&application);
+    row(&rows, "Last 30 days · 1 Session");
+    let other = row(&rows, "█ Other");
+    assert!(other.contains(" 2 "), "{other:?}");
+    row(
+        &rows,
+        "A Session that used several Models counts once for each",
+    );
+}
+
+#[test]
+fn each_series_keeps_its_colour_whatever_the_measure() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    let mut report = priced_report(&query);
+    // Copilot's few tokens cost the most, so Cost and Tokens rank the
+    // Models differently.
+    for bucket in &mut report.buckets {
+        for keyed in &mut bucket.by_key {
+            if keyed.key == copilot() {
+                keyed.aggregate.cost = Some(Cost::from_nano_usd(100_000_000_000));
+            }
+        }
+    }
+    take_together(&mut report);
+    answer(&mut application, request_id, Ok(report));
+    let colours = |application: &Application| {
+        let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+        ["Claude Opus 5.5", "GPT-5.5 Codex", "copilot · GPT-5.5"].map(|label| {
+            let (x, y) = text_position(&buffer, label);
+            buffer[(x - 2, y)].fg
+        })
+    };
+
+    let by_cost = colours(&application);
+    show_tokens(&mut application);
+    let by_tokens = colours(&application);
+    press(&mut application, 's');
+
+    assert_eq!(by_cost, by_tokens);
+    assert_eq!(by_cost, colours(&application));
 }

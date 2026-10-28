@@ -10,7 +10,10 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::{protocol::UsageMetricsAggregate, theme::Theme};
+use crate::{
+    protocol::{UsageMetricsAggregate, UsageMetricsBreakdown},
+    theme::Theme,
+};
 
 use super::{
     super::slots::truncate_to_width,
@@ -32,8 +35,8 @@ const LEGEND_LABEL: usize = 32;
 const CONTROL_GAP: u16 = 4;
 /// Columns between one tab's place in a row of them and the next's.
 const TAB_GAP: u16 = 1;
-/// Why the legend's series can count more Sessions than its heading does.
-const OVERLAP_NOTE: &str = "A Session that used several Models counts once for each";
+/// What stands before the breakdowns on the controls row.
+const BREAKDOWN_LEAD: &str = "by ";
 
 pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &Theme) {
     let area = frame.area();
@@ -77,7 +80,17 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
         |place, at| view.record_measure_target(MetricsMeasure::ALL[place], at),
         theme,
     );
-    buffer.set_string(measures_end + CONTROL_GAP, controls_y, "by Model", subdued);
+    let breakdown = view.breakdown();
+    let lead_x = measures_end + CONTROL_GAP;
+    buffer.set_string(lead_x, controls_y, BREAKDOWN_LEAD, subdued);
+    render_tabs(
+        buffer,
+        lead_x + u16::try_from(BREAKDOWN_LEAD.width()).unwrap_or(0),
+        controls_y,
+        UsageMetricsBreakdown::ALL.map(|chosen| (chosen.label(), chosen == breakdown)),
+        |place, at| view.record_breakdown_target(UsageMetricsBreakdown::ALL[place], at),
+        theme,
+    );
     // What is happening to the figures shown takes the row under the
     // controls, where it has the whole width to say it in.
     let status_y = controls_y + 1;
@@ -180,8 +193,8 @@ fn render_tabs<const N: usize>(
 }
 
 /// A heading naming the range's whole, then one row per series from the
-/// largest: its colour, label, figure, share, and a bar proportional to the
-/// largest series. Where the series count more than the whole, `noted`, a
+/// largest, Other last: its colour, label, figure, share, and a bar
+/// proportional to the largest series. Where the series count more than the whole, `noted`, a
 /// note under them says why.
 fn render_legend(
     frame: &mut Frame<'_>,
@@ -219,7 +232,14 @@ fn render_legend(
         .map(|series| measure.figure(series.total, series.is_partial))
         .collect();
     let value_width = values.iter().map(|value| value.width()).max().unwrap_or(0);
-    let largest = series.first().map_or(0, |series| series.total).max(1);
+    // Series stand in the same order whatever the measure, so the largest
+    // in this one need not be the first.
+    let largest = series
+        .iter()
+        .map(|series| series.total)
+        .max()
+        .unwrap_or(0)
+        .max(1);
     let fixed = 2 + label_width + 2 + value_width + 2 + 4 + 2;
     let bar_room = usize::from(area.width)
         .saturating_sub(fixed)
@@ -257,9 +277,19 @@ fn render_legend(
         .map(|row| area.y.saturating_add(row))
         .filter(|y| *y < area.bottom());
     if noted && let Some(y) = note_y {
-        let note = truncate_to_width(OVERLAP_NOTE, usize::from(area.width));
+        let note = overlap_note(view.breakdown());
+        let note = truncate_to_width(&note, usize::from(area.width));
         buffer.set_string(area.x, y, note, theme.text.subdued);
     }
+}
+
+/// Why the legend's series can count more Sessions than its heading does,
+/// in the words of the breakdown that splits them.
+fn overlap_note(breakdown: UsageMetricsBreakdown) -> String {
+    format!(
+        "A Session that used several {} counts once for each",
+        breakdown.plural()
+    )
 }
 
 /// Whether `series` count more than `whole` does, as a measure that does not
