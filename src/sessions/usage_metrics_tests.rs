@@ -11,7 +11,7 @@ use crate::{
         ModelDescriptor, ModelId, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
         SessionListItem, SessionTimestamp, Turn, TurnId, TurnStatus, Usage, UsageMetricsAggregate,
         UsageMetricsBreakdown, UsageMetricsBucket, UsageMetricsInterval, UsageMetricsKey,
-        UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport, UsageTotal,
+        UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport, UsageTotal, WorkspacePaths,
     },
     sidekick::SidekickWorkspace,
     storage::{PersistedSession, RestoredSessions, StorageRepository, StorageWriter},
@@ -145,6 +145,7 @@ fn read(store: &SessionStore, query: &UsageMetricsQuery) -> UsageMetricsReport {
             &ModelCatalog {
                 providers: Vec::new(),
             },
+            &WorkspacePaths::default(),
         )
         .expect("a well-formed query is answered")
 }
@@ -182,7 +183,7 @@ async fn a_query_with_too_many_buckets_or_buckets_out_of_order_or_overlapping_is
     };
     let refusal = |buckets: Vec<(u64, u64)>| {
         store
-            .usage_metrics(&by_model(&buckets), &catalog)
+            .usage_metrics(&by_model(&buckets), &catalog, &WorkspacePaths::default())
             .expect_err("the query is refused")
     };
 
@@ -313,7 +314,7 @@ async fn a_model_under_two_providers_is_two_keys_and_a_turn_of_no_known_agent_is
     };
 
     let report = store
-        .usage_metrics(&by_model(&[(10, 20)]), &catalog)
+        .usage_metrics(&by_model(&[(10, 20)]), &catalog, &WorkspacePaths::default())
         .unwrap();
 
     let model = |provider: &str| UsageMetricsKey::Model {
@@ -356,6 +357,163 @@ async fn a_model_under_two_providers_is_two_keys_and_a_turn_of_no_known_agent_is
         ]
     );
     assert_eq!(report.buckets[0].total, output(1111));
+    writer.shutdown().await.unwrap();
+}
+
+fn by(breakdown: UsageMetricsBreakdown, buckets: &[(u64, u64)]) -> UsageMetricsQuery {
+    UsageMetricsQuery {
+        breakdown,
+        ..by_model(buckets)
+    }
+}
+
+fn labels(report: &UsageMetricsReport) -> Vec<(UsageMetricsKey, &str)> {
+    report
+        .keys
+        .iter()
+        .map(|label| (label.key.clone(), label.label.as_str()))
+        .collect()
+}
+
+/// Each key's part of `bucket`, in the order the report lists them.
+fn parts(bucket: &UsageMetricsBucket) -> Vec<(UsageMetricsKey, UsageMetricsAggregate)> {
+    bucket
+        .by_key
+        .iter()
+        .map(|keyed| (keyed.key.clone(), keyed.aggregate))
+        .collect()
+}
+
+fn provider(provider: &str) -> UsageMetricsKey {
+    UsageMetricsKey::Provider {
+        provider: ProviderId::new(provider),
+    }
+}
+
+#[tokio::test]
+async fn the_provider_breakdown_groups_every_model_under_its_provider_by_its_display_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![
+        metered(Some(("codex", "gpt-5.5")), Some(11), None, 1),
+        metered(Some(("copilot", "gpt-5.5")), Some(12), None, 10),
+        metered(Some(("copilot", "claude-sonnet-5-5")), Some(13), None, 100),
+        metered(FABLE, Some(14), None, 1000),
+        metered(None, Some(15), None, 10_000),
+    ];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+    let catalog = |provider: &str, display_name: &str| ProviderModelCatalog {
+        provider: ProviderId::new(provider),
+        display_name: display_name.to_owned(),
+        models: Vec::new(),
+        status: ProviderCatalogStatus::Fresh,
+    };
+    let catalog = ModelCatalog {
+        providers: vec![catalog("codex", "Codex"), catalog("copilot", "Copilot")],
+    };
+
+    let report = store
+        .usage_metrics(
+            &by(UsageMetricsBreakdown::Provider, &[(10, 20)]),
+            &catalog,
+            &WorkspacePaths::default(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        labels(&report),
+        vec![
+            // The catalog names no such Provider: its id stands.
+            (provider("claude"), "claude"),
+            (provider("codex"), "Codex"),
+            (provider("copilot"), "Copilot"),
+            (UsageMetricsKey::Unknown, "Unknown"),
+        ]
+    );
+    assert_eq!(
+        parts(&report.buckets[0]),
+        vec![
+            (provider("claude"), output(1000)),
+            (provider("codex"), output(1)),
+            (provider("copilot"), output(110)),
+            (UsageMetricsKey::Unknown, output(10_000)),
+        ]
+    );
+    assert_eq!(report.buckets[0].total, output(11_111));
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_workspace_breakdown_counts_each_turn_under_its_own_session_s_workspace() {
+    let directory = tempfile::tempdir().unwrap();
+    let atlas = directory.path().join("atlas");
+    let borealis = directory.path().join("borealis");
+    let mut root = persisted(&atlas, None);
+    root.snapshot.turns = vec![
+        turn_scoped(OPUS, 11, 0.10),
+        metered(CODEX, Some(12), None, 2),
+    ];
+    let root_id = root.snapshot.session.id;
+    // A Subagent working in another Workspace counts there, by its own
+    // Session, not its parent's.
+    let mut subagent = persisted(&borealis, Some(root_id));
+    subagent.brokered = true;
+    subagent.snapshot.turns = vec![turn_scoped(SONNET, 13, 0.20)];
+    let mut other = persisted(&borealis, None);
+    other.snapshot.turns = vec![metered(None, Some(14), None, 100)];
+    let workspace = |session: &PersistedSession| UsageMetricsKey::Workspace {
+        workspace: session.snapshot.session.workspace.id.clone(),
+    };
+    let (atlas_key, borealis_key) = (workspace(&root), workspace(&other));
+    let (store, writer) = restore(directory.path(), vec![root, subagent, other]).await;
+
+    let report = read(&store, &by(UsageMetricsBreakdown::Workspace, &[(10, 20)]));
+
+    let mut named = labels(&report);
+    named.sort_by(|left, right| left.1.cmp(right.1));
+    assert_eq!(
+        named,
+        vec![
+            (atlas_key.clone(), "atlas"),
+            (borealis_key.clone(), "borealis")
+        ],
+        "each Workspace by its name, and no Unknown: every Session has one"
+    );
+    let bucket = &report.buckets[0];
+    let atlas = keyed(bucket, &atlas_key);
+    assert_eq!(atlas.output_tokens, Some(3));
+    assert_eq!(cost(&atlas), (usd(0.10), true, None));
+    assert_eq!(sessions(&atlas), (1, 0));
+    let borealis = keyed(bucket, &borealis_key);
+    assert_eq!(borealis.output_tokens, Some(101));
+    assert_eq!(cost(&borealis), (usd(0.20), true, None));
+    assert_eq!(sessions(&borealis), (1, 1));
+    assert_eq!(sessions(&bucket.total), (2, 1));
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn workspaces_of_one_name_are_told_apart_by_where_they_are() {
+    let directory = tempfile::tempdir().unwrap();
+    let mine = directory.path().join("mine").join("suru");
+    let theirs = directory.path().join("theirs").join("suru");
+    let mut records = Vec::new();
+    for path in [&mine, &theirs] {
+        let mut session = persisted(path, None);
+        session.snapshot.turns = vec![metered(FABLE, Some(11), None, 1)];
+        records.push(session);
+    }
+    let (store, writer) = restore(directory.path(), records).await;
+
+    let report = read(&store, &by(UsageMetricsBreakdown::Workspace, &[(10, 20)]));
+
+    let paths = WorkspacePaths::default();
+    let mut named = labels(&report)
+        .into_iter()
+        .map(|(_, label)| label.to_owned())
+        .collect::<Vec<_>>();
+    named.sort();
+    assert_eq!(named, vec![paths.label(&mine), paths.label(&theirs)]);
     writer.shutdown().await.unwrap();
 }
 

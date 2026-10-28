@@ -3732,10 +3732,11 @@ async fn read_usage_metrics(State(state): State<AppState>, request: Request) -> 
             Ok(query) => query,
             Err(response) => return response,
         };
-    match state
-        .sessions
-        .usage_metrics(&query, &state.model_catalog.current())
-    {
+    match state.sessions.usage_metrics(
+        &query,
+        &state.model_catalog.current(),
+        &state.workspace_paths,
+    ) {
         Ok(report) => Json(report).into_response(),
         Err(refusal) => session_error_response(
             StatusCode::BAD_REQUEST,

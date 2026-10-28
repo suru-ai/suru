@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{Cost, ModelId, ProviderId, SessionTimestamp};
+use super::{Cost, ModelId, ProviderId, SessionTimestamp, WorkspaceId};
 
 /// The most buckets one query may ask for: enough for every hour of a day,
 /// every day of a year, or every month of decades, and few enough that a
@@ -41,11 +41,22 @@ impl UsageMetricsInterval {
 }
 
 /// How each bucket's figures are split.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageMetricsBreakdown {
     /// By the Provider and Model of the Agent that ran each Turn.
+    #[default]
     Model,
+    /// By the Provider of the Agent that ran each Turn.
+    Provider,
+    /// By the Workspace of the Session that owns each Turn: a Subagent's
+    /// Turns count under its own Session's Workspace, not its parent's.
+    Workspace,
+}
+
+impl UsageMetricsBreakdown {
+    /// Every breakdown, in the order a reader is offered them.
+    pub const ALL: [Self; 3] = [Self::Model, Self::Provider, Self::Workspace];
 }
 
 /// One part of a breakdown.
@@ -58,11 +69,18 @@ pub enum UsageMetricsKey {
         provider: ProviderId,
         model: ModelId,
     },
-    /// Turns whose Agent is not known, which no other key can hold.
+    /// A Provider, every Model reached through it together.
+    Provider { provider: ProviderId },
+    /// A Workspace, by its identity: what the Sessions grouped there ran.
+    Workspace { workspace: WorkspaceId },
+    /// Turns whose Agent is not known, which no Model or Provider key can
+    /// hold. Every Session has a Workspace, so that breakdown has none.
     Unknown,
 }
 
-/// A breakdown key and the name a reader is shown for it.
+/// A breakdown key and the name a reader is shown for it: a Model's name, a
+/// Provider's display name, or a Workspace's name — told apart by where it
+/// is where another Workspace goes by the same name.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageMetricsKeyLabel {

@@ -828,7 +828,7 @@ async fn malformed_relationships_do_not_promote_children_into_listed_roots() {
     store.reconcile_approval_postures(&crate::protocol::EffectiveSettings::default());
     assert_eq!(store.list(None).len(), 1);
     assert!(store.subscribe(root_id).is_some());
-    let all_time = all_time_metrics(&store).buckets[0].total;
+    let all_time = all_time_metrics(&store, UsageMetricsBreakdown::Model).buckets[0].total;
     assert_eq!(
         (all_time.cost, all_time.output_tokens),
         (Cost::from_usd(0.01), Some(1)),
@@ -1280,8 +1280,12 @@ fn assert_same_contributions(
     assert!(actual.is_empty(), "{case}: unexpected {actual:?}");
 }
 
-/// Usage Metrics over one bucket holding all of time.
-fn all_time_metrics(store: &SessionStore) -> crate::protocol::UsageMetricsReport {
+/// Usage Metrics over one bucket holding all of time, broken down by
+/// `breakdown`.
+fn all_time_metrics(
+    store: &SessionStore,
+    breakdown: UsageMetricsBreakdown,
+) -> crate::protocol::UsageMetricsReport {
     store
         .usage_metrics(
             &UsageMetricsQuery {
@@ -1289,11 +1293,12 @@ fn all_time_metrics(store: &SessionStore) -> crate::protocol::UsageMetricsReport
                     start: SessionTimestamp(0),
                     end: SessionTimestamp(u64::MAX),
                 }],
-                breakdown: UsageMetricsBreakdown::Model,
+                breakdown,
             },
             &ModelCatalog {
                 providers: Vec::new(),
             },
+            &crate::protocol::WorkspacePaths::default(),
         )
         .expect("an all-time query is answered")
 }
@@ -1338,14 +1343,16 @@ async fn reading_usage_metrics_over_a_wide_forest_walks_each_tree_once() {
     let sessions = records.len();
     let (store, writer) = restore(workspace.path(), records).await;
 
-    WORK.set(0);
-    let report = all_time_metrics(&store);
-    let work = WORK.get();
-
-    assert!(
-        work <= sessions * 8,
-        "{sessions} Sessions required {work} operations to read"
-    );
+    for breakdown in UsageMetricsBreakdown::ALL {
+        WORK.set(0);
+        all_time_metrics(&store, breakdown);
+        let work = WORK.get();
+        assert!(
+            work <= sessions * 8,
+            "{sessions} Sessions required {work} operations to read by {breakdown:?}"
+        );
+    }
+    let report = all_time_metrics(&store, UsageMetricsBreakdown::Model);
     assert_eq!(
         report.buckets[0].total.cost,
         Cost::from_usd(128.0 * 0.12 + 0.65),
@@ -1368,10 +1375,19 @@ async fn reading_usage_metrics_over_a_wide_forest_walks_each_tree_once() {
 /// Sessions' tree Costs added, each Session counted once — a Sidekick's
 /// Subsessions beneath it, not again as roots of their own — and partial
 /// exactly where one of those trees holds work no counted amount accounts
-/// for, a tree whose Cost is wholly unknown included. The keys divide that
-/// Cost without adding to it.
+/// for, a tree whose Cost is wholly unknown included. The keys of every
+/// breakdown divide that Cost without adding to it.
 fn assert_all_time_metrics_add_up_to_root_tree_costs(store: &SessionStore) {
-    let report = all_time_metrics(store);
+    for breakdown in UsageMetricsBreakdown::ALL {
+        assert_all_time_metrics_by_add_up_to_root_tree_costs(store, breakdown);
+    }
+}
+
+fn assert_all_time_metrics_by_add_up_to_root_tree_costs(
+    store: &SessionStore,
+    breakdown: UsageMetricsBreakdown,
+) {
+    let report = all_time_metrics(store, breakdown);
     let added = |aggregates: &[UsageMetricsAggregate]| {
         (
             aggregates
@@ -1422,7 +1438,10 @@ fn assert_all_time_metrics_add_up_to_root_tree_costs(store: &SessionStore) {
         all_time, tree_costs,
         "all of time costs what the root Sessions' trees do"
     );
-    assert_eq!(by_key, all_time, "the keys divide the Cost exactly");
+    assert_eq!(
+        by_key, all_time,
+        "the keys by {breakdown:?} divide the Cost exactly"
+    );
 }
 
 /// Restoration states, for every root it folded, the tree Cost the

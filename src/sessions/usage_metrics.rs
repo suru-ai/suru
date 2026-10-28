@@ -14,6 +14,12 @@
 //! the Sessions living here (ADR 0049), so it is never counted: its own
 //! Server counts it.
 //!
+//! A Turn is broken down by the Model or Provider of the Agent that ran it,
+//! or by the Workspace of the Session that owns it — a Subagent's by its
+//! own Session's, not its parent's. A Cost lands under the key of the Turn
+//! carrying it, so a running total over a whole tree counts under the
+//! Workspace of the Session that reported it.
+//!
 //! A bucket counts each Session whose Turns it holds once — a top-level
 //! Session apart from a Subagent — in its whole and once in each key it
 //! worked under, so its keys can count more Sessions than it does. Distinct
@@ -26,7 +32,7 @@ use crate::protocol::{
     Cost, CostBasis, KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS, ModelCatalog, SessionId,
     SessionTimestamp, Turn, TurnId, Usage, UsageMetricsAggregate, UsageMetricsBreakdown,
     UsageMetricsBucket, UsageMetricsKey, UsageMetricsKeyLabel, UsageMetricsQuery,
-    UsageMetricsReport,
+    UsageMetricsReport, Workspace, WorkspaceId, WorkspacePaths,
 };
 
 use super::{
@@ -80,32 +86,47 @@ struct MeteredTurn {
     usage: Option<Usage>,
 }
 
-/// What the read takes of the store: every Turn it counts, and what each
-/// adds to the Server's Cost.
+/// What the read takes of the store: every Turn it counts, what each adds
+/// to the Server's Cost, and how each Workspace a Turn may be counted under
+/// is presented.
 struct Metered {
     turns: Vec<MeteredTurn>,
     costs: Vec<CostContribution>,
+    workspaces: HashMap<WorkspaceId, Workspace>,
+}
+
+/// What names a report's keys: the Model Catalog, naming each Model and
+/// Provider, and the Server's paths, naming each Workspace.
+struct KeyNames<'a> {
+    catalog: &'a ModelCatalog,
+    workspace_paths: &'a WorkspacePaths,
 }
 
 impl SessionStore {
     /// What the Sessions living here consumed in each of `query`'s buckets,
-    /// labelling each Model as `catalog` names it. A pure read: it moves no
-    /// Session's revision, writes nothing, and reads no history in.
+    /// labelling each Model and Provider as `catalog` names it and each
+    /// Workspace as `workspace_paths` do. A pure read: it moves no Session's
+    /// revision, writes nothing, and reads no history in.
     pub(crate) fn usage_metrics(
         &self,
         query: &UsageMetricsQuery,
         catalog: &ModelCatalog,
+        workspace_paths: &WorkspacePaths,
     ) -> Result<UsageMetricsReport, UsageMetricsRefusal> {
         if let Some(refusal) = UsageMetricsRefusal::of(query) {
             return Err(refusal);
         }
-        let copied = self
+        let (copied, workspaces) = self
             .state
             .lock()
             .expect("Session store lock is not poisoned")
-            .copied_forest();
-        let metered = MeteredForest::index(copied).metered(query.breakdown);
-        Ok(fold(query, metered, catalog))
+            .copied_forest(query.breakdown);
+        let metered = MeteredForest::index(copied).metered(query.breakdown, workspaces);
+        let names = KeyNames {
+            catalog,
+            workspace_paths,
+        };
+        Ok(fold(query, metered, &names))
     }
 }
 
@@ -113,6 +134,7 @@ impl SessionStore {
 /// and where it stands in its forest.
 struct CopiedSession {
     parent: Option<SessionId>,
+    workspace: WorkspaceId,
     is_brokered_subagent: bool,
     /// The Sidekick's Session that began it, where one did.
     sidekick: Option<SessionId>,
@@ -121,21 +143,51 @@ struct CopiedSession {
 
 impl SessionStoreState {
     /// Every Session living here, copied as the read needs it and nothing
-    /// more worked out while the lock is held.
-    fn copied_forest(&self) -> HashMap<SessionId, CopiedSession> {
-        self.sessions
+    /// more worked out while the lock is held, and — for a breakdown by
+    /// Workspace — each of their Workspaces as the Session last updated
+    /// there presents it, since every Session's copy is regrouped as its
+    /// Workspace is presented anew.
+    fn copied_forest(
+        &self,
+        breakdown: UsageMetricsBreakdown,
+    ) -> (
+        HashMap<SessionId, CopiedSession>,
+        HashMap<WorkspaceId, Workspace>,
+    ) {
+        let mut presented =
+            HashMap::<&WorkspaceId, (SessionTimestamp, uuid::Uuid, &Workspace)>::new();
+        let sessions = self
+            .sessions
             .iter()
             .map(|(session_id, record)| {
                 record_work(1 + record.snapshot.turns.len());
+                let workspace = &record.snapshot.session.workspace;
+                if breakdown == UsageMetricsBreakdown::Workspace {
+                    let seen = (record.summary.updated_at, session_id.as_uuid(), workspace);
+                    presented
+                        .entry(&workspace.id)
+                        .and_modify(|held| {
+                            if (seen.0, seen.1) > (held.0, held.1) {
+                                *held = seen;
+                            }
+                        })
+                        .or_insert(seen);
+                }
                 let copied = CopiedSession {
                     parent: record.snapshot.session.parent,
+                    workspace: workspace.id.clone(),
                     is_brokered_subagent: record.is_brokered_subagent(),
                     sidekick: record.summary.session.sidekick(),
                     turns: record.snapshot.turns.clone(),
                 };
                 (*session_id, copied)
             })
-            .collect()
+            .collect();
+        let workspaces = presented
+            .into_iter()
+            .map(|(id, (_, _, workspace))| (id.clone(), workspace.clone()))
+            .collect();
+        (sessions, workspaces)
     }
 }
 
@@ -184,7 +236,11 @@ impl MeteredForest {
     /// whose parent is gone, or one of a cycle — is in no tree Cost a
     /// listing shows, so neither its Usage nor its Cost is counted, and the
     /// two measures cover the same Sessions.
-    fn metered(&self, breakdown: UsageMetricsBreakdown) -> Metered {
+    fn metered(
+        &self,
+        breakdown: UsageMetricsBreakdown,
+        workspaces: HashMap<WorkspaceId, Workspace>,
+    ) -> Metered {
         let roots: Vec<SessionId> = self
             .sessions
             .iter()
@@ -209,12 +265,16 @@ impl MeteredForest {
                     turn_id: turn.id,
                     is_subagent: session.parent.is_some(),
                     placed_at: turn.started_at.or(turn.settled_at),
-                    key: key_of(breakdown, turn),
+                    key: key_of(breakdown, session, turn),
                     usage: turn.usage.clone(),
                 }));
             }
         }
-        Metered { turns, costs }
+        Metered {
+            turns,
+            costs,
+            workspaces,
+        }
     }
 }
 
@@ -265,15 +325,26 @@ fn record_work(_count: usize) {
     super::restoration_tests::record_work(_count);
 }
 
-fn key_of(breakdown: UsageMetricsBreakdown, turn: &Turn) -> UsageMetricsKey {
-    match breakdown {
-        UsageMetricsBreakdown::Model => {
-            turn.agent
-                .as_ref()
-                .map_or(UsageMetricsKey::Unknown, |agent| UsageMetricsKey::Model {
-                    provider: agent.selection.provider.clone(),
-                    model: agent.selection.model.clone(),
-                })
+/// The key `turn`, one of `session`'s, is broken down under.
+fn key_of(
+    breakdown: UsageMetricsBreakdown,
+    session: &CopiedSession,
+    turn: &Turn,
+) -> UsageMetricsKey {
+    let selection = turn.agent.as_ref().map(|agent| &agent.selection);
+    match (breakdown, selection) {
+        (UsageMetricsBreakdown::Model, Some(selection)) => UsageMetricsKey::Model {
+            provider: selection.provider.clone(),
+            model: selection.model.clone(),
+        },
+        (UsageMetricsBreakdown::Provider, Some(selection)) => UsageMetricsKey::Provider {
+            provider: selection.provider.clone(),
+        },
+        (UsageMetricsBreakdown::Workspace, _) => UsageMetricsKey::Workspace {
+            workspace: session.workspace.clone(),
+        },
+        (UsageMetricsBreakdown::Model | UsageMetricsBreakdown::Provider, None) => {
+            UsageMetricsKey::Unknown
         }
     }
 }
@@ -353,7 +424,7 @@ fn add_contribution(aggregate: &mut UsageMetricsAggregate, contribution: &CostCo
     aggregate.is_cost_partial |= contribution.is_partial;
 }
 
-fn fold(query: &UsageMetricsQuery, metered: Metered, catalog: &ModelCatalog) -> UsageMetricsReport {
+fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageMetricsReport {
     let mut buckets = query
         .buckets
         .iter()
@@ -415,6 +486,7 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, catalog: &ModelCatalog) -> 
         .collect::<Vec<_>>();
     keys.sort_by(|left, right| key_order(left).cmp(&key_order(right)));
     keys.dedup();
+    let labels = labels(&keys, names, &metered.workspaces);
     UsageMetricsReport {
         buckets: buckets
             .into_iter()
@@ -425,31 +497,71 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, catalog: &ModelCatalog) -> 
         earliest_turn_at,
         keys: keys
             .into_iter()
-            .map(|key| UsageMetricsKeyLabel {
-                label: label(&key, catalog),
-                key,
-            })
+            .zip(labels)
+            .map(|(key, label)| UsageMetricsKeyLabel { key, label })
             .collect(),
     }
 }
 
 /// The order keys stand in a report: every Model by Provider and then by
-/// id, and Unknown after them all.
+/// id, every Provider by id, every Workspace by identity, and Unknown after
+/// them all. One report holds keys of one breakdown alone.
 fn key_order(key: &UsageMetricsKey) -> (bool, &str, &str) {
     match key {
         UsageMetricsKey::Model { provider, model } => (false, provider.as_str(), model.as_str()),
+        UsageMetricsKey::Provider { provider } => (false, provider.as_str(), ""),
+        UsageMetricsKey::Workspace { workspace } => (false, &workspace.0, ""),
         UsageMetricsKey::Unknown => (true, "", ""),
     }
 }
 
-/// The name a reader is shown for `key`: a Model's name in the Model
-/// Catalog where it carries one, otherwise its id.
-fn label(key: &UsageMetricsKey, catalog: &ModelCatalog) -> String {
-    match key {
-        UsageMetricsKey::Model { provider, model } => catalog.model(provider, model).map_or_else(
-            || model.as_str().to_owned(),
-            |descriptor| descriptor.display_name.clone(),
-        ),
-        UsageMetricsKey::Unknown => "Unknown".to_owned(),
+/// The name a reader is shown for each of `keys`, in their order: a Model's
+/// name in the Model Catalog where it carries one, a Provider's display
+/// name there, each otherwise by its id; and a Workspace's name, as
+/// wherever Workspaces are listed — or, where two Workspaces go by one
+/// name, where each is, so no two series read alike.
+fn labels(
+    keys: &[UsageMetricsKey],
+    names: &KeyNames,
+    workspaces: &HashMap<WorkspaceId, Workspace>,
+) -> Vec<String> {
+    let catalog = names.catalog;
+    let paths = names.workspace_paths;
+    let workspace_name = |id: &WorkspaceId| {
+        workspaces
+            .get(id)
+            .map_or_else(|| id.0.clone(), |workspace| paths.workspace_name(workspace))
+    };
+    let mut named = HashMap::<String, usize>::new();
+    for key in keys {
+        if let UsageMetricsKey::Workspace { workspace } = key {
+            *named.entry(workspace_name(workspace)).or_default() += 1;
+        }
     }
+    keys.iter()
+        .map(|key| match key {
+            UsageMetricsKey::Model { provider, model } => {
+                catalog.model(provider, model).map_or_else(
+                    || model.as_str().to_owned(),
+                    |descriptor| descriptor.display_name.clone(),
+                )
+            }
+            UsageMetricsKey::Provider { provider } => catalog
+                .providers
+                .iter()
+                .find(|listed| listed.provider == *provider)
+                .map_or_else(
+                    || provider.as_str().to_owned(),
+                    |listed| listed.display_name.clone(),
+                ),
+            UsageMetricsKey::Workspace { workspace } => {
+                let name = workspace_name(workspace);
+                match workspaces.get(workspace) {
+                    Some(presented) if named[&name] > 1 => paths.label(&presented.path),
+                    _ => name,
+                }
+            }
+            UsageMetricsKey::Unknown => "Unknown".to_owned(),
+        })
+        .collect()
 }

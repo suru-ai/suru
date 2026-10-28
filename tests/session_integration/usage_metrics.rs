@@ -6,8 +6,8 @@ use crate::session_integration::support::{read_session_until, working_turn};
 use suru::{
     protocol::{
         Cost, RuntimeDescriptor, SessionError, SessionErrorCode, SessionTimestamp, Usage,
-        UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsQuery,
-        UsageMetricsReport,
+        UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsKey,
+        UsageMetricsQuery, UsageMetricsReport,
     },
     provider::{MeteredCost, ProviderEvent},
 };
@@ -111,6 +111,36 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
         report.across_buckets.total, measured,
         "the buckets taken together hold the one Session's Turn"
     );
+
+    // By Workspace, the Turn counts under its Session's, named as a
+    // listing names it.
+    let by_workspace = ask(
+        &fixture.client,
+        &descriptor,
+        &UsageMetricsQuery {
+            breakdown: UsageMetricsBreakdown::Workspace,
+            ..by_model(vec![UsageMetricsInterval {
+                start: started_at,
+                end: SessionTimestamp(started_at.0 + 1),
+            }])
+        },
+    )
+    .await;
+    assert!(by_workspace.status().is_success());
+    let report = by_workspace.json::<UsageMetricsReport>().await.unwrap();
+    let workspace = &snapshot.session.workspace;
+    assert_eq!(report.keys.len(), 1);
+    assert_eq!(
+        report.keys[0].key,
+        UsageMetricsKey::Workspace {
+            workspace: workspace.id.clone()
+        }
+    );
+    assert_eq!(
+        Some(report.keys[0].label.as_str()),
+        workspace.path.file_name().and_then(|name| name.to_str())
+    );
+    assert_eq!(report.buckets[0].by_key[0].aggregate, measured);
 
     let overlapping = UsageMetricsInterval {
         start: SessionTimestamp(0),
