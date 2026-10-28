@@ -1,8 +1,9 @@
 //! The Usage Metrics calendar: where a range's buckets begin and end, cut at
-//! the reader's own local boundaries. The Server knows nothing of calendars
-//! or time zones, so the reader resolves them here, a pure function of the
-//! range, the moment now, the zone, and — for All time — the earliest timed
-//! Turn, and asks for the intervals.
+//! the reader's own local boundaries, and the interval each is compared
+//! with. The Server knows nothing of calendars or time zones, so the reader
+//! resolves them here, a pure function of the range, the moment now, the
+//! zone, and — for All time — the earliest timed Turn, and asks for the
+//! intervals.
 
 use jiff::{
     Span, Timestamp, ToSpan, Zoned,
@@ -65,6 +66,18 @@ impl MetricsRange {
             Self::ThirtyDays => "Last 30 days",
             Self::Year => "Last 12 months",
             Self::AllTime => "All time",
+        }
+    }
+
+    /// How a comparison names the period the range is compared with, where
+    /// it is compared with any.
+    pub(crate) fn compared_with(self) -> Option<&'static str> {
+        match self {
+            Self::Today => Some("vs yesterday"),
+            Self::SevenDays => Some("vs prev 7d"),
+            Self::ThirtyDays => Some("vs prev 30d"),
+            Self::Year => Some("vs prev 12mo"),
+            Self::AllTime => None,
         }
     }
 

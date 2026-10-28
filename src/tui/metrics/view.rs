@@ -1,7 +1,8 @@
 //! Draws the Usage Metrics view over the whole frame: a title bar with its
-//! close control, the range bar and the measures beside it, then the chart
-//! and its legend, or what stands in for them while a read is on its way,
-//! when it was refused, or when the range holds no Usage.
+//! close control, the range bar and the measures beside it, then the range's
+//! headline figures, the chart, and its legend — with the Usage mix strip
+//! under it for Tokens — or what stands in for them while a read is on its
+//! way, when it was refused, or when the range holds no Usage.
 
 use ratatui::{
     Frame,
@@ -20,6 +21,7 @@ use super::{
     BREAKDOWNS, FocusedRow, MetricsContent, MetricsView, OfferedBreakdown, UsageMetricsReadRefusal,
     calendar::{MetricsRange, RangeBuckets},
     chart::{self, MetricsMeasure, Series},
+    headline::{self, HEADLINE_ROWS, MIX_ROWS},
 };
 
 /// The close control, pointable as a whole.
@@ -37,6 +39,9 @@ const CONTROL_GAP: u16 = 4;
 const TAB_GAP: u16 = 1;
 /// What stands before the breakdowns on the controls row.
 const BREAKDOWN_LEAD: &str = "by ";
+/// What stands in for the chart where All time's every Turn is untimed.
+const UNCHARTED: &str =
+    "This Usage was recorded before Suru timed Turns, so none of it can be charted.";
 
 pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &Theme) {
     let area = frame.area();
@@ -103,12 +108,37 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
         buffer.set_string(area.x + INSET, status_y, "Refreshing…", subdued);
     }
 
-    let body = Rect::new(
+    let mut body = Rect::new(
         area.x + INSET,
         area.y + 5,
         area.width.saturating_sub(INSET * 2),
         area.height.saturating_sub(6),
     );
+    // The headline states the range's figures above everything the report
+    // draws, the hidden series among them: All time's count every Turn,
+    // untimed ones too, where the chart can place only the timed.
+    let mut headed = false;
+    if let MetricsContent::Report { report, .. } = view.content() {
+        let whole = if range == MetricsRange::AllTime {
+            &report.across_buckets_and_untimed
+        } else {
+            &report.across_buckets.total
+        };
+        if headline::holds_anything(whole) && body.height > 0 {
+            let rows = HEADLINE_ROWS.min(body.height);
+            headline::render_headline(
+                buffer,
+                Rect::new(body.x, body.y, body.width, rows),
+                whole,
+                report.comparison.as_ref(),
+                range,
+                theme,
+            );
+            let taken = (HEADLINE_ROWS + 1).min(body.height);
+            body = Rect::new(body.x, body.y + taken, body.width, body.height - taken);
+            headed = true;
+        }
+    }
     if matches!(view.content(), MetricsContent::Report { .. }) {
         // No legend rows drawn until the legend says otherwise, so a frame
         // with no room for any leaves none to focus.
@@ -140,7 +170,15 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
         }
         MetricsContent::Report { buckets, report } => {
             if chart::holds_nothing(report) {
-                buffer.set_string(body.x, body.y, range.no_usage(), subdued);
+                // Only All time's headline holds what its chart cannot: Turns
+                // stored before Suru recorded when they ran.
+                let note = if headed && range == MetricsRange::AllTime {
+                    UNCHARTED
+                } else {
+                    range.no_usage()
+                };
+                let note = truncate_to_width(note, usize::from(body.width));
+                buffer.set_string(body.x, body.y, note, subdued);
                 return;
             }
             let series = chart::series(report, measure, theme);
@@ -154,8 +192,10 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
             // Room is kept for a note either legend needs, so selecting a
             // bar never moves the chart.
             let noted = across.noted || selected.as_ref().is_some_and(|legend| legend.noted);
-            let legend_rows =
-                u16::try_from(series.len() + 1 + usize::from(noted)).unwrap_or(u16::MAX);
+            let mixed = measure == MetricsMeasure::Tokens;
+            let legend_rows = u16::try_from(series.len() + 1 + usize::from(noted))
+                .unwrap_or(u16::MAX)
+                .saturating_add(if mixed { MIX_ROWS + 1 } else { 0 });
             let chart_rows = body.height.saturating_sub(legend_rows + 1).min(24);
             let chart_area = Rect::new(body.x, body.y, body.width, chart_rows);
             view.record_chart_target(chart_area);
@@ -185,6 +225,19 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
             );
             let shown = selected.unwrap_or(across);
             render_legend(frame, legend, &series, &shown, view, theme);
+            if mixed {
+                // Under the legend, a blank row apart, reading what it reads.
+                let after = u16::try_from(series.len() + 2 + usize::from(noted))
+                    .unwrap_or(u16::MAX)
+                    .min(legend.height);
+                let mix = Rect::new(
+                    legend.x,
+                    legend.y + after,
+                    legend.width,
+                    (legend.height - after).min(MIX_ROWS),
+                );
+                headline::render_mix(frame.buffer_mut(), mix, &shown.aggregate, theme);
+            }
         }
     }
 }
@@ -235,34 +288,46 @@ struct Legend {
     /// Whether the figures count more than the whole, as Sessions under
     /// several keys do, so a note must say why.
     noted: bool,
+    /// The figures of the whole in every measure, which the Usage mix strip
+    /// reads.
+    aggregate: UsageMetricsAggregate,
 }
 
 impl Legend {
     /// A legend of `figures` over `whole`, headed by `name` and that whole,
-    /// then, where `sessions`, the distinct Sessions that worked in it —
+    /// then, where `counts`, the distinct Sessions that worked in it —
     /// never the series' Sessions added, which count a Session once under
-    /// each key — unless the measure's whole already counts them.
+    /// each key — unless the measure's whole already counts them, and its
+    /// Turns.
     fn new(
         name: String,
         figures: Vec<(u64, bool)>,
         measure: MetricsMeasure,
         whole: &UsageMetricsAggregate,
-        sessions: bool,
+        counts: bool,
     ) -> Self {
         let total = measure.value(whole);
         let mut heading = format!(
             "{name} · {}",
             measure.total(total, measure.is_partial(whole))
         );
-        if sessions && measure != MetricsMeasure::Sessions {
+        if counts {
+            if measure != MetricsMeasure::Sessions {
+                heading.push_str(" · ");
+                heading.push_str(&MetricsMeasure::Sessions.total(whole.sessions, false));
+            }
             heading.push_str(" · ");
-            heading.push_str(&MetricsMeasure::Sessions.total(whole.sessions, false));
+            heading.push_str(&match whole.turns {
+                1 => "1 Turn".to_owned(),
+                turns => format!("{} Turns", MetricsMeasure::Sessions.format(turns)),
+            });
         }
         Self {
             heading,
             noted: overcounts(&figures, measure, total),
             figures,
             whole: total,
+            aggregate: *whole,
         }
     }
 
@@ -281,7 +346,8 @@ impl Legend {
     }
 
     /// The legend of the `index`-th of `buckets` alone, headed by its local
-    /// date or hour and its Sessions, where the report holds that bucket.
+    /// date or hour, its Sessions, and its Turns, where the report holds
+    /// that bucket.
     fn of_bucket(
         series: &[Series],
         measure: MetricsMeasure,

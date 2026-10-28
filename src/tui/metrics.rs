@@ -5,6 +5,7 @@
 
 pub(crate) mod calendar;
 pub(crate) mod chart;
+mod headline;
 mod view;
 
 use std::{cell::Cell, collections::HashSet};

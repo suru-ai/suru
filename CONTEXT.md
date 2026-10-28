@@ -176,7 +176,7 @@ Where a Cost came from: **Reported** when the Provider itself stated the figure,
 _Avoid_: Cost source, cost type
 
 **Usage Metrics**:
-What the Sessions living on one Server consumed over a span of time, divided into time buckets and broken down by Model, Provider, or Workspace. It is read on request and never stored. The reader cuts the buckets at its own local boundaries and asks for them as spans of time, so the Server keeps no calendar, and a remote Server's Usage Metrics are read in the reader's days. Only the Sessions that live on that Server count, so one it merely reads from another Server is never counted twice.
+What the Sessions living on one Server consumed over a span of time, divided into time buckets and broken down by Model, Provider, or Workspace. It is read on request and never stored. The reader cuts the buckets at its own local boundaries and asks for them as spans of time, so the Server keeps no calendar, and a remote Server's Usage Metrics are read in the reader's days. Only the Sessions that live on that Server count, so one it merely reads from another Server is never counted twice. A span's figures are compared with the period of its own length before it, cut in the reader's calendar as far as the span has run, and all of time with nothing.
 _Avoid_: Usage stats, analytics, spend, token count
 
 **Prompt**:

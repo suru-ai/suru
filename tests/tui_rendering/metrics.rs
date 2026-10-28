@@ -28,7 +28,7 @@ use suru::{
 use uuid::Uuid;
 
 const WIDTH: u16 = 120;
-const HEIGHT: u16 = 40;
+const HEIGHT: u16 = 48;
 const NEW_YORK: &str = "America/New_York";
 
 fn zone(name: &str) -> TimeZone {
@@ -114,7 +114,7 @@ fn tokens(tokens: u64) -> UsageMetricsAggregate {
 ///
 /// Two Sessions work on Opus every day, one of them on Codex too on the
 /// days Codex works, and a third on Copilot on its days, so the busiest day
-/// stacks four Sessions over three. Over the range twelve Sessions worked
+/// stacks four Sessions over three, each Session's ten Turns that day. Over the range twelve Sessions worked
 /// on Opus, four of them on Codex too, and three more on Copilot: the
 /// Models count nineteen Sessions, which are fifteen.
 fn report(query: &UsageMetricsQuery) -> UsageMetricsReport {
@@ -132,6 +132,7 @@ fn report(query: &UsageMetricsQuery) -> UsageMetricsReport {
             UsageMetricsBucket {
                 total: UsageMetricsAggregate {
                     sessions: 2 + u64::from(day % 2 == 0),
+                    turns: 10 * (2 + u64::from(day % 2 == 0)),
                     ..tokens(parts.iter().map(|(_, tokens, _)| tokens).sum())
                 },
                 by_key: parts
@@ -771,6 +772,8 @@ fn r_reads_again_and_only_the_newest_answer_lands() {
 
     let mut quieter = report(&query);
     quieter.buckets = vec![UsageMetricsBucket::default(); query.buckets.len()];
+    quieter.across_buckets = UsageMetricsBucket::default();
+    quieter.across_buckets_and_untimed = UsageMetricsAggregate::default();
     answer(&mut application, second, Ok(quieter));
     let rows = screen(&application);
     row(&rows, "No Usage in the last 30 days.");
@@ -2286,7 +2289,7 @@ fn a_selected_bar_reads_its_own_figures_in_the_legend() {
     eprintln!("{shown}");
     assert_eq!(
         legend_heading(&application),
-        "Tue 13 Oct · 6.25M tokens · 3 Sessions"
+        "Tue 13 Oct · 6.25M tokens · 3 Sessions · 30 Turns"
     );
     assert!(!shown.contains("Last 30 days"), "{shown}");
     for (label, figures) in [
@@ -2304,13 +2307,16 @@ fn a_selected_bar_reads_its_own_figures_in_the_legend() {
     press(&mut application, 'c');
     assert_eq!(
         legend_heading(&application),
-        "Tue 13 Oct · $0.00 · 3 Sessions"
+        "Tue 13 Oct · $0.00 · 3 Sessions · 30 Turns"
     );
 
     // Sessions count the bucket's distinct total, which the Models overcount.
     press(&mut application, 's');
     let rows = screen(&application);
-    assert_eq!(legend_heading(&application), "Tue 13 Oct · 3 Sessions");
+    assert_eq!(
+        legend_heading(&application),
+        "Tue 13 Oct · 3 Sessions · 30 Turns"
+    );
     for (label, sessions) in [
         ("Claude Opus 5.5", "2 "),
         ("GPT-5.5 Codex", "1 "),
@@ -2344,7 +2350,7 @@ fn a_selected_bar_s_cost_is_partial_where_its_own_work_is() {
     let rows = screen(&application);
     assert_eq!(
         legend_heading(&application),
-        "Tue 13 Oct · $7.00+ · 3 Sessions"
+        "Tue 13 Oct · $7.00+ · 3 Sessions · 30 Turns"
     );
     for (label, figures) in [
         ("Claude Opus 5.5", ["$5.00 ", "71%"]),
@@ -2364,7 +2370,7 @@ fn a_selected_bar_s_cost_is_partial_where_its_own_work_is() {
     );
     assert_eq!(
         legend_heading(&application),
-        "Wed 30 Sep · $3.00 · 2 Sessions"
+        "Wed 30 Sep · $3.00 · 2 Sessions · 20 Turns"
     );
 }
 
@@ -3132,7 +3138,9 @@ fn other_is_a_series_to_hide_or_show_alone() {
 
 #[test]
 fn where_too_short_to_list_every_series_the_focus_stops_at_the_last_drawn() {
-    const SHORT: u16 = 9;
+    // The headline's three rows and the one after them, then the legend's
+    // heading and its first row.
+    const SHORT: u16 = 13;
     let mut application = thirty_days_of_tokens();
     let rows = rendered_application_rows_at(&application, WIDTH, SHORT);
     assert!(
@@ -3156,8 +3164,9 @@ fn where_too_short_to_list_every_series_the_focus_stops_at_the_last_drawn() {
 
 #[test]
 fn where_too_short_to_list_any_series_nothing_can_be_focused() {
-    // Eight rows leave the legend its heading alone; six leave it nothing.
-    for short in [8, 6] {
+    // Under the headline, twelve rows leave the legend its heading alone;
+    // ten leave it nothing.
+    for short in [12, 10] {
         let mut application = thirty_days_of_tokens();
         let rows = rendered_application_rows_at(&application, WIDTH, short);
         assert!(
@@ -3176,4 +3185,433 @@ fn where_too_short_to_list_any_series_nothing_can_be_focused() {
             "{short} rows"
         );
     }
+}
+
+fn usd(usd: f64) -> Option<Cost> {
+    Some(Cost::from_usd(usd).expect("a dollar figure"))
+}
+
+/// [`report`] of `query`, its range taken together as thirty days of a
+/// busy Server might be, and the period before it as `comparison` says.
+fn headlined(
+    query: &UsageMetricsQuery,
+    comparison: Option<UsageMetricsAggregate>,
+) -> UsageMetricsReport {
+    let mut report = report(query);
+    let whole = UsageMetricsAggregate {
+        fresh_input_tokens: Some(20_000_000),
+        cache_read_tokens: Some(71_000_000),
+        cache_write_tokens: Some(9_000_000),
+        output_tokens: Some(5_000_000),
+        reasoning_tokens: Some(2_000_000),
+        cost: usd(412.86),
+        is_cost_partial: true,
+        estimated_cost: usd(37.10),
+        sessions: 96,
+        subagent_sessions: 12,
+        turns: 1_284,
+        failed_turns: 40,
+        interrupted_turns: 31,
+    };
+    report.across_buckets.total = whole;
+    report.across_buckets_and_untimed = whole;
+    report.comparison = comparison;
+    report
+}
+
+/// What the thirty days before [`headlined`]'s held: less Cost, more
+/// tokens, fewer Sessions and Turns, and less input from cache.
+fn the_month_before() -> UsageMetricsAggregate {
+    UsageMetricsAggregate {
+        fresh_input_tokens: Some(25_000_000),
+        cache_read_tokens: Some(60_000_000),
+        cache_write_tokens: Some(15_000_000),
+        output_tokens: Some(5_000_000),
+        cost: usd(349.88),
+        sessions: 92,
+        turns: 1_070,
+        ..UsageMetricsAggregate::default()
+    }
+}
+
+/// The three rows of the headline, the one beneath the status row and the
+/// two after it.
+fn headline(rows: &[String]) -> [String; 3] {
+    let at = rendered_row(rows, "esc ✕") + 5;
+    [0, 1, 2].map(|row| rows[at + row].clone())
+}
+
+/// Whether `words` stand in `line` in their order.
+fn in_order(line: &str, words: &[&str]) -> bool {
+    let mut from = 0;
+    words.iter().all(|word| match line[from..].find(word) {
+        Some(at) => {
+            from += at + word.len();
+            true
+        }
+        None => false,
+    })
+}
+
+#[test]
+fn the_headline_states_the_range_s_figures_against_the_period_before() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(
+        &mut application,
+        request_id,
+        Ok(headlined(&query, Some(the_month_before()))),
+    );
+
+    let rows = screen(&application);
+    let shown = rows.join("\n");
+    eprintln!("{shown}");
+    let [figures, compared, details] = headline(&rows);
+    // Tokens blend fresh input, output and the reasoning within it, 27M;
+    // cache reads are 71M of the 100M input.
+    assert!(
+        in_order(
+            &figures,
+            &[
+                "$412.86+",
+                "27M tokens",
+                "96 Sessions",
+                "1.28K Turns",
+                "71% from cache"
+            ]
+        ),
+        "{figures:?}"
+    );
+    // $412.86 is 18% over $349.88, 27M 10% under 30M, 96 Sessions 4% over
+    // 92, 1,284 Turns 20% over 1,070, and 71% from cache 11 points over 60%.
+    assert!(
+        in_order(
+            &compared,
+            &["▲ 18% vs prev 30d", "▼ 10%", "▲ 4%", "▲ 20%", "▲ 11 pts"]
+        ),
+        "{compared:?}"
+    );
+    assert!(
+        in_order(
+            &details,
+            &[
+                "$37.10 estimated",
+                "12 Subagents",
+                "40 failed · 31 interrupted"
+            ]
+        ),
+        "{details:?}"
+    );
+    // Each column's lines begin where its figure does.
+    let column = |line: &str, word: &str| line.find(word).unwrap();
+    assert_eq!(column(&figures, "$412"), column(&compared, "▲ 18%"));
+    assert_eq!(column(&figures, "96 Sessions"), column(&details, "12 Sub"));
+    assert_eq!(column(&figures, "1.28K"), column(&details, "40 failed"));
+}
+
+#[test]
+fn the_comparison_is_left_out_where_the_period_before_had_no_usage() {
+    for (case, comparison) in [
+        ("no comparison answered", None),
+        (
+            "a period of Turns that recorded nothing",
+            Some(UsageMetricsAggregate {
+                sessions: 3,
+                turns: 4,
+                is_cost_partial: true,
+                ..UsageMetricsAggregate::default()
+            }),
+        ),
+    ] {
+        let mut application = reader_in(NEW_YORK, afternoon());
+        let (_, request_id, query) = ask(&mut application);
+        answer(
+            &mut application,
+            request_id,
+            Ok(headlined(&query, comparison)),
+        );
+
+        let rows = screen(&application);
+        let [figures, compared, details] = headline(&rows);
+        assert!(figures.contains("$412.86+"), "{case}: {figures:?}");
+        let shown = rows.join("\n");
+        assert!(
+            !shown.contains('▲') && !shown.contains('▼') && !shown.contains("vs prev"),
+            "{case}: {shown}"
+        );
+        assert!(
+            in_order(&compared, &["$37.10 estimated", "12 Subagents"]),
+            "{case}: the details close up under their figures: {compared:?}"
+        );
+        assert!(
+            details.trim().is_empty() || !details.contains('$'),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn a_figure_the_period_before_held_none_of_has_no_comparison() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    // Usage, but no Cost and no Turn that Suru counted.
+    let before = UsageMetricsAggregate {
+        fresh_input_tokens: Some(54_000_000),
+        ..UsageMetricsAggregate::default()
+    };
+    answer(
+        &mut application,
+        request_id,
+        Ok(headlined(&query, Some(before))),
+    );
+
+    let [_, compared, _] = headline(&screen(&application));
+    // Only Tokens can be compared: half the 54M, and every input from cache
+    // where none of the 54M was.
+    assert!(in_order(&compared, &["▼ 50%", "▲ 71 pts"]), "{compared:?}");
+    assert_eq!(compared.matches(['▲', '▼']).count(), 2, "{compared:?}");
+}
+
+#[test]
+fn all_time_headline_figures_count_untimed_turns_and_no_other_range_s_do() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    let with_untimed = |query: &UsageMetricsQuery| {
+        // Compared as the Server does, only where the query asks.
+        let mut report = headlined(query, query.comparison.map(|_| the_month_before()));
+        // A Session with timed and untimed work counts once in the whole,
+        // which adding the two cannot say.
+        report.untimed.total = UsageMetricsAggregate {
+            cost: usd(10.0),
+            sessions: 3,
+            turns: 16,
+            ..UsageMetricsAggregate::default()
+        };
+        report.across_buckets_and_untimed = UsageMetricsAggregate {
+            cost: usd(422.86),
+            sessions: 98,
+            turns: 1_300,
+            ..report.across_buckets.total
+        };
+        report
+    };
+    answer(&mut application, request_id, Ok(with_untimed(&query)));
+    let [figures, _, _] = headline(&screen(&application));
+    assert!(
+        in_order(&figures, &["$412.86+", "96 Sessions", "1.28K Turns"]),
+        "{figures:?}"
+    );
+
+    let (_, request_id, all_time) = expect_read(press(&mut application, '5'));
+    answer(&mut application, request_id, Ok(with_untimed(&all_time)));
+
+    let rows = screen(&application);
+    let [figures, compared, _] = headline(&rows);
+    assert!(
+        in_order(&figures, &["$422.86+", "98 Sessions", "1.3K Turns"]),
+        "{figures:?}"
+    );
+    assert!(
+        !compared.contains('▲') && !compared.contains('▼'),
+        "nothing comes before all of time: {compared:?}"
+    );
+}
+
+#[test]
+fn all_time_with_no_timed_turn_still_heads_the_view_with_its_untimed_figures() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    ask(&mut application);
+    let (_, probe, first) = expect_read(press(&mut application, '5'));
+    let untimed = UsageMetricsAggregate {
+        output_tokens: Some(4_000),
+        cost: usd(5.0),
+        sessions: 2,
+        turns: 7,
+        failed_turns: 1,
+        ..UsageMetricsAggregate::default()
+    };
+    let only_untimed = |query: &UsageMetricsQuery| UsageMetricsReport {
+        untimed: UsageMetricsBucket {
+            total: untimed,
+            by_key: Vec::new(),
+        },
+        across_buckets_and_untimed: untimed,
+        ..empty_report(query, None)
+    };
+    let (_, request_id, this_month) = expect_read(
+        application
+            .handle_event(ApplicationEvent::UsageMetricsRead {
+                request_id: probe,
+                result: Ok(only_untimed(&first)),
+            })
+            .expect("deliver the earliest Turn"),
+    );
+    answer(&mut application, request_id, Ok(only_untimed(&this_month)));
+
+    let rows = screen(&application);
+    let shown = rows.join("\n");
+    eprintln!("{shown}");
+    let [figures, compared, _] = headline(&rows);
+    assert!(
+        in_order(&figures, &["$5.00", "4K tokens", "2 Sessions", "7 Turns"]),
+        "{figures:?}"
+    );
+    assert!(compared.contains("1 failed"), "{compared:?}");
+    assert!(!shown.contains("No Usage yet."), "{shown}");
+    row(&rows, "none of it can be charted");
+    assert!(!shown.contains('└'), "no empty chart is drawn");
+}
+
+#[test]
+fn hiding_or_showing_one_series_alone_leaves_the_headline_whole() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(
+        &mut application,
+        request_id,
+        Ok(headlined(&query, Some(the_month_before()))),
+    );
+    let whole = headline(&screen(&application));
+
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsSeriesToggle { series: 0 },
+    );
+    assert_eq!(headline(&screen(&application)), whole);
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsSeriesSolo { series: 2 },
+    );
+    assert_eq!(headline(&screen(&application)), whole);
+}
+
+#[test]
+fn a_selected_bar_s_legend_is_headed_by_its_sessions_and_turns() {
+    let mut application = thirty_days_of_tokens();
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsBucketSelect { bucket: 13 },
+    );
+
+    assert_eq!(
+        legend_heading(&application),
+        "Mon 12 Oct · 4.5M tokens · 2 Sessions · 20 Turns"
+    );
+    invoke(&mut application, SemanticCommandId::MetricsBucketClear);
+    assert_eq!(legend_heading(&application), "Last 30 days · 109M tokens");
+}
+
+/// [`headlined`] with cache writes never reported.
+fn without_cache_writes(query: &UsageMetricsQuery) -> UsageMetricsReport {
+    let mut report = headlined(query, None);
+    report.across_buckets.total.cache_write_tokens = None;
+    report
+}
+
+#[test]
+fn the_usage_mix_strip_shows_under_tokens_alone_and_keeps_absent_parts_absent() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(
+        &mut application,
+        request_id,
+        Ok(without_cache_writes(&query)),
+    );
+    let shown = screen(&application).join("\n");
+    assert!(!shown.contains("Usage mix"), "not under Cost: {shown}");
+
+    show_tokens(&mut application);
+
+    let rows = screen(&application);
+    let shown = rows.join("\n");
+    eprintln!("{shown}");
+    let strip_at = rendered_row(&rows, "Usage mix");
+    assert!(
+        strip_at > rendered_row(&rows, "copilot · GPT-5.5"),
+        "under the legend: {shown}"
+    );
+    // 20M fresh input, 71M cache reads and 5M output are 96M, the bar's
+    // whole; 2M of the output is reasoning.
+    let key = &rows[strip_at + 1];
+    assert!(
+        in_order(
+            key,
+            &[
+                "fresh input 21%",
+                "cache reads 74%",
+                "output 5%",
+                "40% of it reasoning"
+            ]
+        ),
+        "{key:?}"
+    );
+    assert!(!shown.contains("cache writes"), "never reported: {shown}");
+
+    press(&mut application, 's');
+    assert!(!screen(&application).join("\n").contains("Usage mix"));
+}
+
+#[test]
+fn the_usage_mix_strip_divides_one_bar_among_the_parts_reported() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(
+        &mut application,
+        request_id,
+        Ok(without_cache_writes(&query)),
+    );
+    show_tokens(&mut application);
+
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let (x, y) = text_position(&buffer, "Usage mix");
+    let row: String = (x..WIDTH)
+        .map(|column| buffer[(column, y)].symbol().to_owned())
+        .collect();
+    let bar = row["Usage mix".len()..].trim();
+    let cells = |glyph: char| bar.chars().filter(|cell| *cell == glyph).count();
+    let whole = bar.chars().count();
+    assert!(whole >= 40, "{bar:?}");
+    // Three parts, each its own shade, in the order of the key.
+    assert_eq!(cells('█') + cells('▓') + cells('░'), whole, "{bar:?}");
+    assert_eq!(cells('▒'), 0, "no cache writes: {bar:?}");
+    assert!(bar.starts_with('█') && bar.ends_with('░'), "{bar:?}");
+    let share = |glyph| cells(glyph) as f64 / whole as f64;
+    assert!((share('▓') - 0.74).abs() < 0.03, "{bar:?}");
+}
+
+#[test]
+fn the_headline_fits_eighty_columns() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(
+        &mut application,
+        request_id,
+        Ok(headlined(&query, Some(the_month_before()))),
+    );
+
+    let rows = rendered_application_rows_at(&application, 80, HEIGHT);
+    let shown = rows.join("\n");
+    eprintln!("{shown}");
+    let [figures, compared, details] = headline(&rows);
+    assert!(
+        in_order(
+            &figures,
+            &[
+                "$412.86+",
+                "27M tokens",
+                "96 Sessions",
+                "1.28K Turns",
+                "71%"
+            ]
+        ),
+        "{figures:?}"
+    );
+    assert!(
+        in_order(&compared, &["▲ 18%", "▼ 10%", "▲ 4%", "▲ 20%", "▲ 11 pts"]),
+        "{compared:?}"
+    );
+    assert!(
+        in_order(&details, &["$37.10", "12 Subagents", "40 failed", "31"]),
+        "{details:?}"
+    );
 }
