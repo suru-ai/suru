@@ -1,7 +1,7 @@
 //! Usage Metrics read from a restored Session forest, as the next process
 //! finds it: every Session's Turns in memory, and nothing yet read since.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use super::{Pairing, RemoteAct, SessionStore, UsageMetricsRefusal, restoration_tests::persisted};
 use crate::{
@@ -11,10 +11,14 @@ use crate::{
         ModelDescriptor, ModelId, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
         SessionListItem, SessionTimestamp, Turn, TurnId, TurnStatus, Usage, UsageMetricsAggregate,
         UsageMetricsBreakdown, UsageMetricsBucket, UsageMetricsInterval, UsageMetricsKey,
-        UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport, UsageTotal, WorkspacePaths,
+        UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport, UsageTotal, WorkspaceId,
+        WorkspacePaths,
     },
     sidekick::SidekickWorkspace,
-    storage::{PersistedSession, RestoredSessions, StorageRepository, StorageWriter},
+    storage::{
+        PersistedSession, RestoredSessions, StorageRepository, StorageWriter, StoredWorkspace,
+        WorkspacePresentation, WorkspaceProvenance,
+    },
 };
 
 /// A Turn of `model` under `provider`, Settled as Completed, that began at
@@ -124,6 +128,15 @@ async fn restore(
     directory: &Path,
     records: Vec<PersistedSession>,
 ) -> (SessionStore, StorageWriter) {
+    restore_with_registry(directory, records, HashMap::new()).await
+}
+
+/// [`restore`], the Workspace Registry holding `registry`.
+async fn restore_with_registry(
+    directory: &Path,
+    records: Vec<PersistedSession>,
+    registry: HashMap<WorkspaceId, StoredWorkspace>,
+) -> (SessionStore, StorageWriter) {
     let repository = StorageRepository::open(directory).await.unwrap();
     let (writer, sink) = StorageWriter::spawn(repository);
     let store = SessionStore::new(
@@ -133,7 +146,7 @@ async fn restore(
         },
         sink,
         Vec::new(),
-        Default::default(),
+        registry,
     );
     (store, writer)
 }
@@ -514,6 +527,81 @@ async fn workspaces_of_one_name_are_told_apart_by_where_they_are() {
         .collect::<Vec<_>>();
     named.sort();
     assert_eq!(named, vec![paths.label(&mine), paths.label(&theirs)]);
+    writer.shutdown().await.unwrap();
+}
+
+/// A Registry entry presenting its Workspace at `path`, or nowhere.
+fn entry(path: Option<&Path>) -> StoredWorkspace {
+    StoredWorkspace {
+        path: path.map(Path::to_owned),
+        presentation: Some(WorkspacePresentation::Directory),
+        ..StoredWorkspace::known_by(WorkspaceProvenance::Session)
+    }
+}
+
+#[tokio::test]
+async fn a_workspace_is_named_as_its_registry_entry_presents_it_or_else_as_its_sessions_do() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut presented = persisted(&directory.path().join("atlas"), None);
+    presented.snapshot.turns = vec![metered(FABLE, Some(11), None, 1)];
+    let mut pathless = persisted(&directory.path().join("borealis"), None);
+    pathless.snapshot.turns = vec![metered(FABLE, Some(12), None, 1)];
+    let id = |session: &PersistedSession| session.snapshot.session.workspace.id.clone();
+    let (atlas, borealis) = (id(&presented), id(&pathless));
+    // The Registry presents Atlas where it stands now, and Borealis
+    // nowhere, as an entry from before rows kept a path does.
+    let registry = HashMap::from([
+        (
+            atlas.clone(),
+            entry(Some(&directory.path().join("atlas-moved"))),
+        ),
+        (borealis.clone(), entry(None)),
+    ]);
+    let (store, writer) =
+        restore_with_registry(directory.path(), vec![presented, pathless], registry).await;
+
+    let report = read(&store, &by(UsageMetricsBreakdown::Workspace, &[(10, 20)]));
+
+    let mut named = labels(&report);
+    named.sort_by(|left, right| left.1.cmp(right.1));
+    let workspace = |workspace: WorkspaceId| UsageMetricsKey::Workspace { workspace };
+    assert_eq!(
+        named,
+        vec![
+            (workspace(atlas), "atlas-moved"),
+            (workspace(borealis), "borealis"),
+        ]
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn two_workspaces_presented_at_one_path_are_still_told_apart() {
+    let directory = tempfile::tempdir().unwrap();
+    let shared = directory.path().join("suru");
+    let mut records = Vec::new();
+    let mut registry = HashMap::new();
+    for (index, turn_at) in [11, 12].into_iter().enumerate() {
+        let mut session = persisted(&directory.path().join(format!("{index}")), None);
+        session.snapshot.turns = vec![metered(FABLE, Some(turn_at), None, 1)];
+        registry.insert(
+            session.snapshot.session.workspace.id.clone(),
+            entry(Some(&shared)),
+        );
+        records.push(session);
+    }
+    let (store, writer) = restore_with_registry(directory.path(), records, registry).await;
+
+    let report = read(&store, &by(UsageMetricsBreakdown::Workspace, &[(10, 20)]));
+
+    let label = |index: usize| report.keys[index].label.as_str();
+    assert_ne!(label(0), label(1));
+    let place = WorkspacePaths::default().label(&shared);
+    assert!(
+        label(0).starts_with(&place) && label(1).starts_with(&place),
+        "{:?}",
+        report.keys
+    );
     writer.shutdown().await.unwrap();
 }
 

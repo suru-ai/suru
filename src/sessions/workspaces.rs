@@ -108,6 +108,32 @@ impl SessionStoreState {
         );
     }
 
+    /// The Workspace `id` as its Registry entry presents it — its identity,
+    /// the path it was last presented by, and as much of its Repository as
+    /// how that path presents it says (see [`presented_repository`]) — not
+    /// yet dressed in what the entry carries. `None` where there is no such
+    /// entry, or it says nowhere, having landed before rows kept a path.
+    pub(super) fn registry_presentation(&self, id: &WorkspaceId) -> Option<Workspace> {
+        let stored = self.workspaces.get(id)?;
+        let path = stored.path.clone()?;
+        let repository = stored
+            .presentation
+            .and_then(|presentation| presented_repository(id, &path, presentation));
+        Some(Workspace {
+            id: id.clone(),
+            path,
+            source_control: repository
+                .as_ref()
+                .map_or(SourceControlAvailability::NotDetected, |repository| {
+                    repository.availability.clone()
+                }),
+            repository: repository.map(Box::new),
+            icon: None,
+            description: None,
+            unavailable: None,
+        })
+    }
+
     /// The Workspaces the Sessions a listing holds work in — every
     /// top-level Session's that says, readable or not, as
     /// [`SessionStore::list`] lists them — most recently worked in first,
@@ -203,10 +229,9 @@ impl SessionStore {
     /// them (ADR 0051): first those the Sessions a listing holds work in —
     /// every top-level Session's that says, readable or not, as
     /// [`Self::list`] lists them — most recently worked in first; then the
-    /// rest, by path. Each is given as its entry presents it — its identity,
-    /// the path it was last presented by, and as much of its Repository as
-    /// how that path presents it says (see [`presented_repository`]) — and
-    /// dressed in what the entry carries; the Sessions only order them. An
+    /// rest, by path. Each is given as its entry presents it (see
+    /// [`SessionStoreState::registry_presentation`]) and dressed in what the
+    /// entry carries; the Sessions only order them. An
     /// entry that says nowhere, having landed before rows kept a path, cannot
     /// be named and is left out until a Session working there presents it.
     pub(crate) fn listed_workspaces(&self) -> Vec<Workspace> {
@@ -220,25 +245,9 @@ impl SessionStore {
         };
         let mut workspaces = state
             .workspaces
-            .iter()
-            .filter_map(|(id, stored)| {
-                let path = stored.path.clone()?;
-                let repository = stored
-                    .presentation
-                    .and_then(|presentation| presented_repository(id, &path, presentation));
-                let mut workspace = Workspace {
-                    id: id.clone(),
-                    path,
-                    source_control: repository
-                        .as_ref()
-                        .map_or(SourceControlAvailability::NotDetected, |repository| {
-                            repository.availability.clone()
-                        }),
-                    repository: repository.map(Box::new),
-                    icon: None,
-                    description: None,
-                    unavailable: None,
-                };
+            .keys()
+            .filter_map(|id| {
+                let mut workspace = state.registry_presentation(id)?;
                 state.dress_workspace(&mut workspace);
                 Some(workspace)
             })

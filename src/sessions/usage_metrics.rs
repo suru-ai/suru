@@ -145,9 +145,9 @@ struct CopiedSession {
 impl SessionStoreState {
     /// Every Session living here, copied as the read needs it and nothing
     /// more worked out while the lock is held, and — for a breakdown by
-    /// Workspace — each of their Workspaces as the Session last updated
-    /// there presents it, since every Session's copy is regrouped as its
-    /// Workspace is presented anew.
+    /// Workspace — each of their Workspaces as the Workspace Registry
+    /// presents it, which is how every listing of Workspaces names them, or
+    /// as one of its Sessions does where its entry says nowhere.
     fn copied_forest(
         &self,
         breakdown: UsageMetricsBreakdown,
@@ -155,8 +155,7 @@ impl SessionStoreState {
         HashMap<SessionId, CopiedSession>,
         HashMap<WorkspaceId, Workspace>,
     ) {
-        let mut presented =
-            HashMap::<&WorkspaceId, (SessionTimestamp, uuid::Uuid, &Workspace)>::new();
+        let mut sessions_copy = HashMap::<&WorkspaceId, &Workspace>::new();
         let sessions = self
             .sessions
             .iter()
@@ -164,15 +163,7 @@ impl SessionStoreState {
                 record_work(1 + record.snapshot.turns.len());
                 let workspace = &record.snapshot.session.workspace;
                 if breakdown == UsageMetricsBreakdown::Workspace {
-                    let seen = (record.summary.updated_at, session_id.as_uuid(), workspace);
-                    presented
-                        .entry(&workspace.id)
-                        .and_modify(|held| {
-                            if (seen.0, seen.1) > (held.0, held.1) {
-                                *held = seen;
-                            }
-                        })
-                        .or_insert(seen);
+                    sessions_copy.entry(&workspace.id).or_insert(workspace);
                 }
                 let copied = CopiedSession {
                     parent: record.snapshot.session.parent,
@@ -184,9 +175,16 @@ impl SessionStoreState {
                 (*session_id, copied)
             })
             .collect();
-        let workspaces = presented
+        // One for each Workspace a Session here works in, however many
+        // Workspaces the Registry holds.
+        let workspaces = sessions_copy
             .into_iter()
-            .map(|(id, (_, _, workspace))| (id.clone(), workspace.clone()))
+            .map(|(id, copy)| {
+                let presented = self
+                    .registry_presentation(id)
+                    .unwrap_or_else(|| copy.clone());
+                (id.clone(), presented)
+            })
             .collect();
         (sessions, workspaces)
     }
@@ -510,24 +508,11 @@ fn key_order(key: &UsageMetricsKey) -> (bool, &str, &str) {
 
 /// The name a reader is shown for each of `keys`, in their order: a Model's
 /// name in the Model Catalog where it carries one, a Provider's display
-/// name there, each otherwise by its id; and a Workspace's name, as
-/// wherever Workspaces are listed — or, where two Workspaces go by one
-/// name, where each is, so no two series read alike.
+/// name there, each otherwise by its id; and a Workspace's as
+/// [`workspace_labels`] tells them apart.
 fn labels(keys: &[UsageMetricsKey], names: &KeyNames) -> Vec<String> {
     let catalog = names.catalog;
-    let paths = names.workspace_paths;
-    let workspaces = &names.workspaces;
-    let workspace_name = |id: &WorkspaceId| {
-        workspaces
-            .get(id)
-            .map_or_else(|| id.0.clone(), |workspace| paths.workspace_name(workspace))
-    };
-    let mut named = HashMap::<String, usize>::new();
-    for key in keys {
-        if let UsageMetricsKey::Workspace { workspace } = key {
-            *named.entry(workspace_name(workspace)).or_default() += 1;
-        }
-    }
+    let mut workspaces = workspace_labels(keys, names);
     keys.iter()
         .map(|key| match key {
             UsageMetricsKey::Model { provider, model } => {
@@ -545,13 +530,61 @@ fn labels(keys: &[UsageMetricsKey], names: &KeyNames) -> Vec<String> {
                     |listed| listed.display_name.clone(),
                 ),
             UsageMetricsKey::Workspace { workspace } => {
-                let name = workspace_name(workspace);
-                match workspaces.get(workspace) {
-                    Some(presented) if named[&name] > 1 => paths.label(&presented.path),
-                    _ => name,
-                }
+                workspaces.remove(workspace).unwrap_or_default()
             }
             UsageMetricsKey::Unknown => "Unknown".to_owned(),
         })
         .collect()
+}
+
+/// Relabels, by `refine`, every Workspace in `labels` whose label another
+/// shares.
+fn tell_apart(
+    labels: &mut HashMap<WorkspaceId, String>,
+    refine: impl Fn(&WorkspaceId, &str) -> String,
+) {
+    let mut counts = HashMap::<String, usize>::new();
+    for label in labels.values() {
+        *counts.entry(label.clone()).or_default() += 1;
+    }
+    for (id, label) in labels.iter_mut() {
+        if counts[label.as_str()] > 1 {
+            *label = refine(id, label);
+        }
+    }
+}
+
+/// The label of each Workspace among `keys`, no two alike: its name, as
+/// wherever Workspaces are listed; where two go by one name, where each is
+/// presented; and where two are presented at one place — a directory that
+/// became a Repository's while Sessions belonged to each, say — that and
+/// the start of its identity besides.
+fn workspace_labels(keys: &[UsageMetricsKey], names: &KeyNames) -> HashMap<WorkspaceId, String> {
+    let paths = names.workspace_paths;
+    let mut labels: HashMap<WorkspaceId, String> = keys
+        .iter()
+        .filter_map(|key| match key {
+            UsageMetricsKey::Workspace { workspace } => Some(workspace),
+            _ => None,
+        })
+        .map(|id| {
+            let name = names
+                .workspaces
+                .get(id)
+                .map_or_else(|| id.0.clone(), |workspace| paths.workspace_name(workspace));
+            (id.clone(), name)
+        })
+        .collect();
+    tell_apart(&mut labels, |id, label| {
+        names.workspaces.get(id).map_or_else(
+            || label.to_owned(),
+            |workspace| paths.label(&workspace.path),
+        )
+    });
+    tell_apart(&mut labels, |id, label| {
+        // The identity's kind and the first eight of its hash.
+        let shown = id.0.find(':').map_or(8, |colon| colon + 9);
+        format!("{label} ({})", id.0.get(..shown).unwrap_or(&id.0))
+    });
+    labels
 }
