@@ -305,7 +305,6 @@ pub(super) fn command_for_metrics_view_event(
                 (KeyCode::Char('t'), KeyModifiers::NONE) => {
                     SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Tokens)
                 }
-                // `s` is kept for the Sessions measure.
                 (KeyCode::Tab, KeyModifiers::NONE) => SemanticCommandId::MetricsMeasureNext,
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => SemanticCommandId::ApplicationExit,
                 _ => return None,
