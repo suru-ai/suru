@@ -1352,6 +1352,13 @@ async fn reading_usage_metrics_over_a_wide_forest_walks_each_tree_once() {
         "every tree once: each root's report and its brokered Subagent, and \
          the Sidekick with its Subsessions"
     );
+    let total = &report.buckets[0].total;
+    assert_eq!(
+        (total.sessions, total.subagent_sessions),
+        (128 + 1 + 64, 128 * 2),
+        "the roots, the Sidekick and its Subsessions top-level, and the \
+         Subagents apart, each once"
+    );
     assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
 }

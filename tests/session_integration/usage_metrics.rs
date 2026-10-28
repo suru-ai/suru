@@ -90,6 +90,7 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
         cost: Cost::from_usd(0.25),
         // The Turn is working still, past what its Cost says.
         is_cost_partial: true,
+        sessions: 1,
         ..UsageMetricsAggregate::default()
     };
     assert_eq!(report.buckets.len(), 2);
@@ -106,6 +107,10 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
         vec![&report.buckets[1].by_key[0].key]
     );
     assert_eq!(report.earliest_turn_at, Some(started_at));
+    assert_eq!(
+        report.range.total, measured,
+        "the buckets taken together hold the one Session's Turn"
+    );
 
     let overlapping = UsageMetricsInterval {
         start: SessionTimestamp(0),

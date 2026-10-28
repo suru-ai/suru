@@ -83,14 +83,30 @@ fn by_model(buckets: &[(u64, u64)]) -> UsageMetricsQuery {
     }
 }
 
-/// `tokens` of output from Turns that recorded no Cost, so their Cost is
-/// unknown.
+/// `tokens` of output from Turns of one top-level Session that recorded no
+/// Cost, so their Cost is unknown.
 fn output(tokens: u64) -> UsageMetricsAggregate {
     UsageMetricsAggregate {
         output_tokens: Some(tokens),
         is_cost_partial: true,
+        sessions: 1,
         ..Default::default()
     }
+}
+
+/// `bucket`, its whole and every key's part the work of `sessions` top-level
+/// Sessions and `subagents` Subagent Sessions.
+fn worked_by(mut bucket: UsageMetricsBucket, sessions: u64, subagents: u64) -> UsageMetricsBucket {
+    let counted = |aggregate: &mut UsageMetricsAggregate| {
+        aggregate.sessions = sessions;
+        aggregate.subagent_sessions = subagents;
+    };
+    counted(&mut bucket.total);
+    bucket
+        .by_key
+        .iter_mut()
+        .for_each(|keyed| counted(&mut keyed.aggregate));
+    bucket
 }
 
 /// A bucket holding `tokens` of output, every one of them under `key`.
@@ -246,6 +262,8 @@ async fn a_part_no_turn_reported_stays_absent_and_failed_interrupted_and_active_
         cost: None,
         is_cost_partial: true,
         estimated_cost: None,
+        sessions: 1,
+        subagent_sessions: 0,
     };
     assert_eq!(
         report.buckets,
@@ -407,7 +425,11 @@ async fn subagent_and_subsession_turns_count_and_a_remotes_sessions_do_not() {
 
     let report = read(&store, &by_model(&[(10, 20)]));
 
-    assert_eq!(report.buckets, vec![only(fable(), 1111)]);
+    assert_eq!(
+        report.buckets,
+        vec![worked_by(only(fable(), 1111), 2, 2)],
+        "the Sidekick and its Subsession, and the two Subagents"
+    );
     writer.shutdown().await.unwrap();
 }
 
@@ -470,7 +492,7 @@ async fn reading_never_hydrates_a_deferred_session_and_moves_no_revision() {
 
     let report = read(&store, &by_model(&[(10, 20)]));
 
-    assert_eq!(report.buckets, vec![only(fable(), 11)]);
+    assert_eq!(report.buckets, vec![worked_by(only(fable(), 11), 1, 1)]);
     assert_eq!(deferred(&store), [true, true], "no history was read in");
     assert_eq!(revisions(&store), before);
     writer.shutdown().await.unwrap();
@@ -740,5 +762,153 @@ async fn an_unpriced_turn_marks_its_bucket_its_key_and_the_untimed_figures_parti
         (None, true, None)
     );
     assert_eq!(cost(&report.untimed.total), (None, true, None));
+    writer.shutdown().await.unwrap();
+}
+
+/// The Sessions a bucket or a key's part of it is the work of: top-level
+/// Sessions, then Subagent Sessions.
+fn sessions(aggregate: &UsageMetricsAggregate) -> (u64, u64) {
+    (aggregate.sessions, aggregate.subagent_sessions)
+}
+
+#[tokio::test]
+async fn a_session_that_worked_under_two_models_counts_once_under_each_and_once_in_the_total() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut both = persisted(directory.path(), None);
+    both.snapshot.turns = vec![
+        metered(OPUS, Some(11), None, 1),
+        metered(OPUS, Some(12), None, 1),
+        metered(CODEX, Some(13), None, 1),
+    ];
+    let mut opus_only = persisted(directory.path(), None);
+    // A Turn that reported no Usage is work all the same.
+    opus_only.snapshot.turns = vec![Turn {
+        usage: None,
+        ..metered(OPUS, Some(14), None, 0)
+    }];
+    let (store, writer) = restore(directory.path(), vec![both, opus_only]).await;
+
+    let report = read(&store, &by_model(&[(10, 20)]));
+
+    let bucket = &report.buckets[0];
+    assert_eq!(sessions(&keyed(bucket, &key(OPUS))), (2, 0));
+    assert_eq!(sessions(&keyed(bucket, &key(CODEX))), (1, 0));
+    assert_eq!(
+        sessions(&bucket.total),
+        (2, 0),
+        "the keys add up to three, the Sessions are two"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn subagent_sessions_are_counted_apart_from_top_level_sessions() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut root = persisted(directory.path(), None);
+    root.snapshot.turns = vec![metered(OPUS, Some(11), None, 1)];
+    let root_id = root.snapshot.session.id;
+    let mut native = persisted(directory.path(), Some(root_id));
+    native.snapshot.turns = vec![metered(SONNET, Some(12), None, 1)];
+    let native_id = native.snapshot.session.id;
+    // A Subagent's own Subagent is a Subagent too, however deep.
+    let mut nested = persisted(directory.path(), Some(native_id));
+    nested.snapshot.turns = vec![metered(SONNET, Some(13), None, 1)];
+    let mut brokered = persisted(directory.path(), Some(root_id));
+    brokered.brokered = true;
+    brokered.snapshot.turns = vec![metered(CODEX, Some(14), None, 1)];
+    // A Subagent with no work in the bucket is not counted in it.
+    let mut idle = persisted(directory.path(), Some(root_id));
+    idle.snapshot.turns = vec![metered(SONNET, Some(25), None, 1)];
+    let (store, writer) =
+        restore(directory.path(), vec![root, native, nested, brokered, idle]).await;
+
+    let report = read(&store, &by_model(&[(10, 20), (20, 30)]));
+
+    let bucket = &report.buckets[0];
+    assert_eq!(sessions(&bucket.total), (1, 3));
+    assert_eq!(sessions(&keyed(bucket, &key(OPUS))), (1, 0));
+    assert_eq!(sessions(&keyed(bucket, &key(SONNET))), (0, 2));
+    assert_eq!(sessions(&keyed(bucket, &key(CODEX))), (0, 1));
+    assert_eq!(
+        sessions(&report.buckets[1].total),
+        (0, 1),
+        "a Subagent's work counts it without its parent's"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_session_counts_in_every_bucket_it_worked_in_and_once_across_them_all() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut daily = persisted(directory.path(), None);
+    daily.snapshot.turns = vec![
+        metered(OPUS, Some(11), None, 1),
+        metered(OPUS, Some(21), None, 1),
+        metered(CODEX, Some(22), None, 1),
+        // Begun before the first bucket, placed in none of them.
+        metered(OPUS, Some(5), None, 1),
+        metered(OPUS, None, None, 1),
+    ];
+    let daily_id = daily.snapshot.session.id;
+    let mut subagent = persisted(directory.path(), Some(daily_id));
+    subagent.snapshot.turns = vec![
+        metered(CODEX, Some(12), None, 1),
+        metered(CODEX, Some(31), None, 1),
+    ];
+    let mut once = persisted(directory.path(), None);
+    once.snapshot.turns = vec![metered(OPUS, Some(32), None, 1)];
+    let mut before = persisted(directory.path(), None);
+    before.snapshot.turns = vec![metered(OPUS, Some(1), None, 1)];
+    let (store, writer) = restore(directory.path(), vec![daily, subagent, once, before]).await;
+
+    let report = read(&store, &by_model(&[(10, 20), (20, 30), (30, 40)]));
+
+    assert_eq!(
+        report
+            .buckets
+            .iter()
+            .map(|bucket| sessions(&bucket.total))
+            .collect::<Vec<_>>(),
+        vec![(1, 1), (1, 0), (1, 1)]
+    );
+    assert_eq!(
+        sessions(&report.range.total),
+        (2, 1),
+        "across the buckets each Session counts once, though the buckets add to five"
+    );
+    assert_eq!(sessions(&keyed(&report.range, &key(OPUS))), (2, 0));
+    assert_eq!(sessions(&keyed(&report.range, &key(CODEX))), (1, 1));
+    assert_eq!(
+        report.range.total.output_tokens,
+        Some(6),
+        "the range holds what its buckets do, and no more"
+    );
+    assert_eq!(
+        sessions(&report.untimed.total),
+        (1, 0),
+        "a Session with untimed work counts in the untimed figures"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_range_holds_the_cost_its_buckets_add_up_to() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![
+        turn_scoped(OPUS, 11, 0.10),
+        turn_scoped(OPUS, 21, 0.15),
+        metered(CODEX, Some(22), Some(23), 1),
+    ];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+
+    let report = read(&store, &by_model(&[(10, 20), (20, 30)]));
+
+    assert_eq!(cost(&report.range.total), (usd(0.25), true, None));
+    assert_eq!(
+        cost(&keyed(&report.range, &key(OPUS))),
+        (usd(0.25), false, None)
+    );
+    assert_eq!(cost(&keyed(&report.range, &key(CODEX))), (None, true, None));
     writer.shutdown().await.unwrap();
 }

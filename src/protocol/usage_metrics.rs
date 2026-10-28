@@ -85,6 +85,11 @@ pub struct UsageMetricsReport {
     pub earliest_turn_at: Option<SessionTimestamp>,
     /// Every key a bucket breaks its figures down by, each with its label.
     pub keys: Vec<UsageMetricsKeyLabel>,
+    /// The buckets taken together, as though they were one: what a reader
+    /// shows for the whole span it asked about. Its Session counts count a
+    /// Session once however many buckets it has work in, which adding up
+    /// the buckets' counts cannot.
+    pub range: UsageMetricsBucket,
 }
 
 /// The figures of one bucket: its whole, and its part under each key a Turn
@@ -106,7 +111,8 @@ pub struct KeyedUsageMetrics {
 
 /// What a set of Turns consumed together: the five parts of their Usage,
 /// each absent where no Turn among them reported it, as a Session's total
-/// keeps it, and what their Cost Coverage contributions add up to.
+/// keeps it, what their Cost Coverage contributions add up to, and how many
+/// Sessions they are the work of.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageMetricsAggregate {
@@ -127,6 +133,16 @@ pub struct UsageMetricsAggregate {
     /// The part of `cost` Suru estimated rather than the Provider reported;
     /// absent where no contribution was Estimated.
     pub estimated_cost: Option<Cost>,
+    /// How many distinct top-level Sessions — those without a parent, a
+    /// Sidekick's Subsessions among them — ran at least one of the Turns.
+    /// Distinct within the aggregate alone: a key's count and the bucket's
+    /// total each count a Session once, so a Session that worked under two
+    /// keys counts in both and once in the total.
+    pub sessions: u64,
+    /// How many distinct Subagent Sessions ran at least one of the Turns,
+    /// counted apart from `sessions` so a delegating conversation is still
+    /// one Session.
+    pub subagent_sessions: u64,
 }
 
 impl UsageMetricsAggregate {

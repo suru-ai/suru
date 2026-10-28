@@ -150,6 +150,7 @@ fn report(query: &UsageMetricsQuery) -> UsageMetricsReport {
                 label: "Claude Opus 5.5".to_owned(),
             },
         ],
+        range: UsageMetricsBucket::default(),
     }
 }
 
@@ -409,6 +410,7 @@ fn a_range_without_usage_says_so() {
             untimed: UsageMetricsBucket::default(),
             earliest_turn_at: None,
             keys: Vec::new(),
+            range: UsageMetricsBucket::default(),
         }),
     );
 
@@ -802,6 +804,7 @@ fn empty_report(
         untimed: UsageMetricsBucket::default(),
         earliest_turn_at: earliest,
         keys: Vec::new(),
+        range: UsageMetricsBucket::default(),
     }
 }
 

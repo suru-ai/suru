@@ -13,6 +13,12 @@
 //! Costs. A Remote's Session that a Sidekick here acted on is held apart from
 //! the Sessions living here (ADR 0049), so it is never counted: its own
 //! Server counts it.
+//!
+//! A bucket counts each Session whose Turns it holds once — a top-level
+//! Session apart from a Subagent — in its whole and once in each key it
+//! worked under, so its keys can count more Sessions than it does. Distinct
+//! counts do not add across buckets, so the report counts the buckets
+//! taken together on their own.
 
 use std::collections::{HashMap, HashSet};
 
@@ -62,11 +68,13 @@ impl UsageMetricsRefusal {
     }
 }
 
-/// What the read takes of one Turn: which it is, where it is placed in
-/// time, the key it is broken down under, and its Usage.
+/// What the read takes of one Turn: which it is, whether a Subagent ran it,
+/// where it is placed in time, the key it is broken down under, and its
+/// Usage.
 struct MeteredTurn {
     session_id: SessionId,
     turn_id: TurnId,
+    is_subagent: bool,
     placed_at: Option<SessionTimestamp>,
     key: UsageMetricsKey,
     usage: Option<Usage>,
@@ -195,18 +203,15 @@ impl MeteredForest {
                 if !counted.insert(session_id) {
                     continue;
                 }
-                turns.extend(
-                    self.sessions[&session_id]
-                        .turns
-                        .iter()
-                        .map(|turn| MeteredTurn {
-                            session_id,
-                            turn_id: turn.id,
-                            placed_at: turn.started_at.or(turn.settled_at),
-                            key: key_of(breakdown, turn),
-                            usage: turn.usage.clone(),
-                        }),
-                );
+                let session = &self.sessions[&session_id];
+                turns.extend(session.turns.iter().map(|turn| MeteredTurn {
+                    session_id,
+                    turn_id: turn.id,
+                    is_subagent: session.parent.is_some(),
+                    placed_at: turn.started_at.or(turn.settled_at),
+                    key: key_of(breakdown, turn),
+                    usage: turn.usage.clone(),
+                }));
             }
         }
         Metered { turns, costs }
@@ -276,32 +281,60 @@ fn key_of(breakdown: UsageMetricsBreakdown, turn: &Turn) -> UsageMetricsKey {
 /// One bucket's figures as they are added up.
 #[derive(Default)]
 struct Tally {
-    total: UsageMetricsAggregate,
-    by_key: HashMap<UsageMetricsKey, UsageMetricsAggregate>,
+    total: Part,
+    by_key: HashMap<UsageMetricsKey, Part>,
+}
+
+/// A bucket's whole, or one key's part of it, as it is added up: its
+/// aggregate, and the Sessions already counted in it, so each counts once.
+#[derive(Default)]
+struct Part {
+    aggregate: UsageMetricsAggregate,
+    sessions: HashSet<SessionId>,
+}
+
+impl Part {
+    fn add(&mut self, turn: &MeteredTurn) {
+        if let Some(usage) = &turn.usage {
+            self.aggregate.add_usage(usage);
+        }
+        if self.sessions.insert(turn.session_id) {
+            let count = if turn.is_subagent {
+                &mut self.aggregate.subagent_sessions
+            } else {
+                &mut self.aggregate.sessions
+            };
+            *count += 1;
+        }
+    }
 }
 
 impl Tally {
-    fn add(&mut self, turn: MeteredTurn) {
-        let keyed = self.by_key.entry(turn.key).or_default();
-        if let Some(usage) = &turn.usage {
-            self.total.add_usage(usage);
-            keyed.add_usage(usage);
+    fn add(&mut self, turn: &MeteredTurn) {
+        self.total.add(turn);
+        match self.by_key.get_mut(&turn.key) {
+            Some(keyed) => keyed.add(turn),
+            None => self.by_key.entry(turn.key.clone()).or_default().add(turn),
         }
     }
 
-    fn add_cost(&mut self, key: UsageMetricsKey, contribution: &CostContribution) {
-        add_contribution(&mut self.total, contribution);
-        add_contribution(self.by_key.entry(key).or_default(), contribution);
+    fn add_cost(&mut self, key: &UsageMetricsKey, contribution: &CostContribution) {
+        add_contribution(&mut self.total.aggregate, contribution);
+        let keyed = match self.by_key.get_mut(key) {
+            Some(keyed) => keyed,
+            None => self.by_key.entry(key.clone()).or_default(),
+        };
+        add_contribution(&mut keyed.aggregate, contribution);
     }
 
     fn into_bucket(mut self, keys: &[UsageMetricsKey]) -> UsageMetricsBucket {
         UsageMetricsBucket {
-            total: self.total,
+            total: self.total.aggregate,
             by_key: keys
                 .iter()
                 .filter_map(|key| {
                     Some(KeyedUsageMetrics {
-                        aggregate: self.by_key.remove(key)?,
+                        aggregate: self.by_key.remove(key)?.aggregate,
                         key: key.clone(),
                     })
                 })
@@ -330,6 +363,8 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, catalog: &ModelCatalog) -> 
         .map(|_| Tally::default())
         .collect::<Vec<_>>();
     let mut untimed = Tally::default();
+    // Every bucket at once, where a Session working in several counts once.
+    let mut range = Tally::default();
     // The bucket a moment falls in, if any: the buckets run in order without
     // overlapping, so the one that can hold it is the first not over before it.
     let bucket_of = |placed_at: SessionTimestamp| {
@@ -349,12 +384,13 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, catalog: &ModelCatalog) -> 
         let place = turn.placed_at.map(bucket_of);
         placed.insert((turn.session_id, turn.turn_id), (place, turn.key.clone()));
         let Some(placed_at) = turn.placed_at else {
-            untimed.add(turn);
+            untimed.add(&turn);
             continue;
         };
         earliest_turn_at = Some(earliest_turn_at.map_or(placed_at, |held| held.min(placed_at)));
         if let Some(Some(index)) = place {
-            buckets[index].add(turn);
+            buckets[index].add(&turn);
+            range.add(&turn);
         }
     }
     for contribution in &metered.costs {
@@ -365,8 +401,11 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, catalog: &ModelCatalog) -> 
             .cloned()
             .unwrap_or((None, UsageMetricsKey::Unknown));
         match place {
-            None => untimed.add_cost(key, contribution),
-            Some(Some(index)) => buckets[index].add_cost(key, contribution),
+            None => untimed.add_cost(&key, contribution),
+            Some(Some(index)) => {
+                buckets[index].add_cost(&key, contribution);
+                range.add_cost(&key, contribution);
+            }
             Some(None) => {}
         }
     }
@@ -385,6 +424,7 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, catalog: &ModelCatalog) -> 
             .map(|tally| tally.into_bucket(&keys))
             .collect(),
         untimed: untimed.into_bucket(&keys),
+        range: range.into_bucket(&keys),
         earliest_turn_at,
         keys: keys
             .into_iter()
