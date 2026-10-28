@@ -685,6 +685,7 @@ impl SemanticCommandId {
             Self::MetricsMeasureSelect(measure) => match measure {
                 MetricsMeasure::Cost => "metrics.measure.cost",
                 MetricsMeasure::Tokens => "metrics.measure.tokens",
+                MetricsMeasure::Sessions => "metrics.measure.sessions",
             },
             Self::MetricsMeasureNext => "metrics.measure.next",
             Self::SessionIconChoose => "session.icon.choose",
@@ -1832,6 +1833,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     },
     metrics_measure_descriptor(MetricsMeasure::Cost, "Show Cost Metrics"),
     metrics_measure_descriptor(MetricsMeasure::Tokens, "Show Token Metrics"),
+    metrics_measure_descriptor(MetricsMeasure::Sessions, "Show Session Metrics"),
     SemanticCommandDescriptor {
         id: SemanticCommandId::MetricsMeasureNext,
         title: "Next Metrics Measure",

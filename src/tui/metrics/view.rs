@@ -10,7 +10,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::theme::Theme;
+use crate::{protocol::UsageMetricsAggregate, theme::Theme};
 
 use super::{
     super::slots::truncate_to_width,
@@ -32,6 +32,8 @@ const LEGEND_LABEL: usize = 32;
 const CONTROL_GAP: u16 = 4;
 /// Columns between one tab's place in a row of them and the next's.
 const TAB_GAP: u16 = 1;
+/// Why the legend's series can count more Sessions than its heading does.
+const OVERLAP_NOTE: &str = "A Session that used several Models counts once for each";
 
 pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &Theme) {
     let area = frame.area();
@@ -124,11 +126,10 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 return;
             }
             let series = chart::series(report, measure, theme);
-            let total = series
-                .iter()
-                .map(|series| series.total)
-                .fold(0, u64::saturating_add);
-            let legend_rows = u16::try_from(series.len() + 1).unwrap_or(u16::MAX);
+            let whole = &report.range.total;
+            let noted = overcounts(&series, measure, whole);
+            let legend_rows =
+                u16::try_from(series.len() + 1 + usize::from(noted)).unwrap_or(u16::MAX);
             let chart_rows = body.height.saturating_sub(legend_rows + 1).min(24);
             let chart_area = Rect::new(body.x, body.y, body.width, chart_rows);
             view.record_chart_target(chart_area);
@@ -139,7 +140,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 body.width,
                 body.height.saturating_sub(chart_rows + 1),
             );
-            render_legend(frame, legend, &series, total, view, theme);
+            render_legend(frame, legend, &series, whole, noted, view, theme);
         }
     }
 }
@@ -180,12 +181,14 @@ fn render_tabs<const N: usize>(
 
 /// A heading naming the range's whole, then one row per series from the
 /// largest: its colour, label, figure, share, and a bar proportional to the
-/// largest series.
+/// largest series. Where the series count more than the whole, `noted`, a
+/// note under them says why.
 fn render_legend(
     frame: &mut Frame<'_>,
     area: Rect,
     series: &[Series],
-    total: u64,
+    whole: &UsageMetricsAggregate,
+    noted: bool,
     view: &MetricsView,
     theme: &Theme,
 ) {
@@ -194,13 +197,14 @@ fn render_legend(
     if area.height == 0 {
         return;
     }
+    let total = measure.value(whole);
     buffer.set_string(
         area.x,
         area.y,
         format!(
             "{} · {}",
             view.range().title(),
-            measure.total(total, series.iter().any(|series| series.is_partial))
+            measure.total(total, measure.is_partial(whole))
         ),
         theme.text.primary.add_modifier(Modifier::BOLD),
     );
@@ -248,6 +252,25 @@ fn render_legend(
             buffer.set_string(bar_x, y, "█".repeat(bar), swatch);
         }
     }
+    let note_y = u16::try_from(series.len() + 1)
+        .ok()
+        .map(|row| area.y.saturating_add(row))
+        .filter(|y| *y < area.bottom());
+    if noted && let Some(y) = note_y {
+        let note = truncate_to_width(OVERLAP_NOTE, usize::from(area.width));
+        buffer.set_string(area.x, y, note, theme.text.subdued);
+    }
+}
+
+/// Whether `series` count more than `whole` does, as a measure that does not
+/// add up can: a Session that worked under several keys counts once under
+/// each and once in the whole.
+fn overcounts(series: &[Series], measure: MetricsMeasure, whole: &UsageMetricsAggregate) -> bool {
+    let counted = series
+        .iter()
+        .map(|series| series.total)
+        .fold(0, u64::saturating_add);
+    !measure.adds_up() && counted > measure.value(whole)
 }
 
 /// What the view says of figures a refresh could not replace.

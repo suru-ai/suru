@@ -10,7 +10,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    protocol::{Cost, UsageMetricsAggregate, UsageMetricsReport},
+    protocol::{Cost, UsageMetricsAggregate, UsageMetricsBucket, UsageMetricsReport},
     theme::Theme,
 };
 
@@ -28,16 +28,20 @@ pub enum MetricsMeasure {
     Cost,
     /// The blended token figure every other surface shows.
     Tokens,
+    /// The top-level Sessions that did any work, each counted once, its
+    /// Subagents not among them.
+    Sessions,
 }
 
 impl MetricsMeasure {
     /// Every measure, in the order the view offers them.
-    pub const ALL: [Self; 2] = [Self::Cost, Self::Tokens];
+    pub const ALL: [Self; 3] = [Self::Cost, Self::Tokens, Self::Sessions];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Cost => "Cost",
             Self::Tokens => "Tokens",
+            Self::Sessions => "Sessions",
         }
     }
 
@@ -53,27 +57,38 @@ impl MetricsMeasure {
             .expect("every measure is listed")
     }
 
-    fn value(self, aggregate: &UsageMetricsAggregate) -> u64 {
+    pub(crate) fn value(self, aggregate: &UsageMetricsAggregate) -> u64 {
         match self {
             Self::Cost => aggregate.cost.map_or(0, Cost::nano_usd),
             Self::Tokens => aggregate.blended_tokens().unwrap_or(0),
+            Self::Sessions => aggregate.sessions,
         }
     }
 
     /// Whether `aggregate`'s figure says less than its Turns consumed.
-    fn is_partial(self, aggregate: &UsageMetricsAggregate) -> bool {
+    pub(crate) fn is_partial(self, aggregate: &UsageMetricsAggregate) -> bool {
         match self {
             Self::Cost => aggregate.is_cost_partial,
-            Self::Tokens => false,
+            Self::Tokens | Self::Sessions => false,
+        }
+    }
+
+    /// Whether the series' figures add up to their whole. Sessions do not:
+    /// a Session that worked under several keys counts once under each and
+    /// once in the whole.
+    pub(crate) fn adds_up(self) -> bool {
+        match self {
+            Self::Cost | Self::Tokens => true,
+            Self::Sessions => false,
         }
     }
 
     /// The smallest step the y-axis climbs by: a cent, the least a Cost is
-    /// written to, and a single token.
+    /// written to, and a single token or Session.
     fn resolution(self) -> u64 {
         match self {
             Self::Cost => 10_000_000,
-            Self::Tokens => 1,
+            Self::Tokens | Self::Sessions => 1,
         }
     }
 
@@ -82,7 +97,7 @@ impl MetricsMeasure {
     pub(crate) fn format(self, value: u64) -> String {
         match self {
             Self::Cost => compact_cost(Cost::from_nano_usd(value)),
-            Self::Tokens => compact_count(value),
+            Self::Tokens | Self::Sessions => compact_count(value),
         }
     }
 
@@ -97,6 +112,8 @@ impl MetricsMeasure {
         match self {
             Self::Cost => self.figure(value, is_partial),
             Self::Tokens => format!("{} tokens", self.figure(value, is_partial)),
+            Self::Sessions if value == 1 => "1 Session".to_owned(),
+            Self::Sessions => format!("{} Sessions", self.figure(value, is_partial)),
         }
     }
 }
@@ -108,6 +125,8 @@ pub(crate) struct Series {
     pub(crate) color: Color,
     /// The series' figure in each bucket, in the order of the buckets.
     pub(crate) values: Vec<u64>,
+    /// The series' figure over the buckets taken together, which for a
+    /// measure that does not add up is not its values added.
     pub(crate) total: u64,
     /// Whether the total says less than the key's Turns consumed, as a
     /// partial Cost does.
@@ -117,7 +136,9 @@ pub(crate) struct Series {
 /// The series a report stacks, bottom first: the largest range total at the
 /// bottom and the rest above it in falling order, ties settled by label so
 /// the order never shifts between reads of the same figures. Each takes the
-/// colour of its place from the Theme's series palette.
+/// colour of its place from the Theme's series palette, and its total from
+/// the report's range, where a Session counts once however many buckets it
+/// worked in.
 pub(crate) fn series(
     report: &UsageMetricsReport,
     measure: MetricsMeasure,
@@ -127,30 +148,25 @@ pub(crate) fn series(
         .keys
         .iter()
         .map(|label| {
-            let parts: Vec<Option<&UsageMetricsAggregate>> = report
-                .buckets
-                .iter()
-                .map(|bucket| {
-                    bucket
-                        .by_key
-                        .iter()
-                        .find(|keyed| keyed.key == label.key)
-                        .map(|keyed| &keyed.aggregate)
-                })
-                .collect();
-            let values: Vec<u64> = parts
-                .iter()
-                .map(|part| part.map_or(0, |aggregate| measure.value(aggregate)))
-                .collect();
+            let part = |bucket: &UsageMetricsBucket| {
+                bucket
+                    .by_key
+                    .iter()
+                    .find(|keyed| keyed.key == label.key)
+                    .map(|keyed| keyed.aggregate)
+                    .unwrap_or_default()
+            };
+            let whole = part(&report.range);
             Series {
                 label: label.label.clone(),
                 color: Color::Reset,
-                total: values.iter().copied().fold(0, u64::saturating_add),
-                is_partial: parts
+                values: report
+                    .buckets
                     .iter()
-                    .flatten()
-                    .any(|aggregate| measure.is_partial(aggregate)),
-                values,
+                    .map(|bucket| measure.value(&part(bucket)))
+                    .collect(),
+                total: measure.value(&whole),
+                is_partial: measure.is_partial(&whole),
             }
         })
         .collect();

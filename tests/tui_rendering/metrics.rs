@@ -111,27 +111,43 @@ fn tokens(tokens: u64) -> UsageMetricsAggregate {
 /// Thirty days of three Models: Opus takes 1M to 5M a day in turn, Codex 0
 /// to 1M, and Copilot 250K every other day. Over the range that is 90M,
 /// 15M, and 3.75M, and the busiest day, the fifteenth, holds 6.25M.
+///
+/// Two Sessions work on Opus every day, one of them on Codex too on the
+/// days Codex works, and a third on Copilot on its days, so the busiest day
+/// stacks four Sessions over three. Over the range twelve Sessions worked
+/// on Opus, four of them on Codex too, and three more on Copilot: the
+/// Models count nineteen Sessions, which are fifteen.
 fn report(query: &UsageMetricsQuery) -> UsageMetricsReport {
     let buckets = (0..query.buckets.len() as u64)
         .map(|day| {
             let parts = [
-                (opus(), (day % 5 + 1) * 1_000_000),
-                (codex(), (day % 3) * 500_000),
-                (copilot(), if day % 2 == 0 { 250_000 } else { 0 }),
+                (opus(), (day % 5 + 1) * 1_000_000, 2),
+                (codex(), (day % 3) * 500_000, u64::from(day % 3 != 0)),
+                (
+                    copilot(),
+                    if day % 2 == 0 { 250_000 } else { 0 },
+                    u64::from(day % 2 == 0),
+                ),
             ];
             UsageMetricsBucket {
-                total: tokens(parts.iter().map(|(_, tokens)| tokens).sum()),
+                total: UsageMetricsAggregate {
+                    sessions: 2 + u64::from(day % 2 == 0),
+                    ..tokens(parts.iter().map(|(_, tokens, _)| tokens).sum())
+                },
                 by_key: parts
                     .into_iter()
-                    .map(|(key, tokens_)| KeyedUsageMetrics {
+                    .map(|(key, tokens_, sessions)| KeyedUsageMetrics {
                         key,
-                        aggregate: tokens(tokens_),
+                        aggregate: UsageMetricsAggregate {
+                            sessions,
+                            ..tokens(tokens_)
+                        },
                     })
                     .collect(),
             }
         })
         .collect();
-    UsageMetricsReport {
+    let mut report = UsageMetricsReport {
         buckets,
         untimed: UsageMetricsBucket::default(),
         earliest_turn_at: query.buckets.first().map(|bucket| bucket.start),
@@ -150,8 +166,78 @@ fn report(query: &UsageMetricsQuery) -> UsageMetricsReport {
                 label: "Claude Opus 5.5".to_owned(),
             },
         ],
-        range: UsageMetricsBucket::default(),
+        range: UsageMetricsBucket {
+            total: UsageMetricsAggregate {
+                sessions: 15,
+                ..UsageMetricsAggregate::default()
+            },
+            by_key: [(opus(), 12), (codex(), 4), (copilot(), 3)]
+                .into_iter()
+                .map(|(key, sessions)| KeyedUsageMetrics {
+                    key,
+                    aggregate: UsageMetricsAggregate {
+                        sessions,
+                        ..UsageMetricsAggregate::default()
+                    },
+                })
+                .collect(),
+        },
+    };
+    take_together(&mut report);
+    report
+}
+
+/// Sets `report`'s range to its buckets taken together, as the Server does,
+/// in the figures that add up across buckets: Usage and Cost. Session counts
+/// do not, so the range keeps those it was given.
+fn take_together(report: &mut UsageMetricsReport) {
+    fn add(into: &mut UsageMetricsAggregate, part: &UsageMetricsAggregate) {
+        let count = |held: Option<u64>, more: Option<u64>| match (held, more) {
+            (Some(held), Some(more)) => Some(held + more),
+            (held, more) => held.or(more),
+        };
+        let cost = |held: Option<Cost>, more: Option<Cost>| match (held, more) {
+            (Some(held), Some(more)) => Some(held.saturating_add(more)),
+            (held, more) => held.or(more),
+        };
+        into.fresh_input_tokens = count(into.fresh_input_tokens, part.fresh_input_tokens);
+        into.cache_read_tokens = count(into.cache_read_tokens, part.cache_read_tokens);
+        into.cache_write_tokens = count(into.cache_write_tokens, part.cache_write_tokens);
+        into.output_tokens = count(into.output_tokens, part.output_tokens);
+        into.reasoning_tokens = count(into.reasoning_tokens, part.reasoning_tokens);
+        into.cost = cost(into.cost, part.cost);
+        into.estimated_cost = cost(into.estimated_cost, part.estimated_cost);
+        into.is_cost_partial |= part.is_cost_partial;
     }
+    let counted = |aggregate: &UsageMetricsAggregate| UsageMetricsAggregate {
+        sessions: aggregate.sessions,
+        subagent_sessions: aggregate.subagent_sessions,
+        ..UsageMetricsAggregate::default()
+    };
+    let mut total = counted(&report.range.total);
+    let mut by_key: Vec<KeyedUsageMetrics> = report
+        .keys
+        .iter()
+        .map(|label| KeyedUsageMetrics {
+            key: label.key.clone(),
+            aggregate: report
+                .range
+                .by_key
+                .iter()
+                .find(|keyed| keyed.key == label.key)
+                .map(|keyed| counted(&keyed.aggregate))
+                .unwrap_or_default(),
+        })
+        .collect();
+    for bucket in &report.buckets {
+        add(&mut total, &bucket.total);
+        for part in &bucket.by_key {
+            if let Some(keyed) = by_key.iter_mut().find(|keyed| keyed.key == part.key) {
+                add(&mut keyed.aggregate, &part.aggregate);
+            }
+        }
+    }
+    report.range = UsageMetricsBucket { total, by_key };
 }
 
 /// Shows the Tokens measure, which reads nothing again.
@@ -1311,6 +1397,7 @@ fn priced_report(query: &UsageMetricsQuery) -> UsageMetricsReport {
         }
         bucket.total = total;
     }
+    take_together(&mut report);
     report
 }
 
@@ -1373,6 +1460,7 @@ fn work_with_no_known_cost_is_not_shown_as_no_usage() {
             aggregate: unpriced,
         }],
     };
+    take_together(&mut report);
     answer(&mut application, request_id, Ok(report));
 
     let rows = screen(&application);
@@ -1386,12 +1474,14 @@ fn measure_keys_tab_and_clicks_choose_a_measure_without_reading_again() {
         [
             SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Cost),
             SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Tokens),
+            SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Sessions),
             SemanticCommandId::MetricsMeasureNext,
         ]
         .map(SemanticCommandId::as_str),
         [
             "metrics.measure.cost",
             "metrics.measure.tokens",
+            "metrics.measure.sessions",
             "metrics.measure.next",
         ]
     );
@@ -1406,6 +1496,7 @@ fn measure_keys_tab_and_clicks_choose_a_measure_without_reading_again() {
     };
     let tokens = ("▐Tokens▌", "Last 30 days · 109M tokens");
     let cost = ("▐Cost▌", "Last 30 days · $120.00+");
+    let sessions = ("▐Sessions▌", "Last 30 days · 15 Sessions");
     shows(&application, cost.0, cost.1);
     let label_at = |application: &Application, label: &str| {
         let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
@@ -1429,12 +1520,31 @@ fn measure_keys_tab_and_clicks_choose_a_measure_without_reading_again() {
             cost,
         ),
         (
+            Box::new(|application: &mut Application| press(application, 's')),
+            sessions,
+        ),
+        (
+            Box::new(|application: &mut Application| press(application, 'c')),
+            cost,
+        ),
+        (
             Box::new(|application: &mut Application| key(application, KeyCode::Tab)),
             tokens,
         ),
         (
             Box::new(|application: &mut Application| key(application, KeyCode::Tab)),
+            sessions,
+        ),
+        (
+            Box::new(|application: &mut Application| key(application, KeyCode::Tab)),
             cost,
+        ),
+        (
+            Box::new(|application: &mut Application| {
+                let at = label_at(application, "Sessions");
+                press_at(application, at)
+            }),
+            sessions,
         ),
         (
             Box::new(|application: &mut Application| {
@@ -1463,6 +1573,15 @@ fn measure_keys_tab_and_clicks_choose_a_measure_without_reading_again() {
             Box::new(|application: &mut Application| {
                 invoke(application, SemanticCommandId::MetricsMeasureNext)
             }),
+            sessions,
+        ),
+        (
+            Box::new(|application: &mut Application| {
+                invoke(
+                    application,
+                    SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Cost),
+                )
+            }),
             cost,
         ),
     ] {
@@ -1488,8 +1607,114 @@ fn measure_keys_tab_and_clicks_choose_a_measure_without_reading_again() {
         ))
     );
     assert_eq!(
+        command_for(key_event(KeyCode::Char('s'))),
+        semantic_command(SemanticCommandId::MetricsMeasureSelect(
+            MetricsMeasure::Sessions
+        ))
+    );
+    assert_eq!(
         command_for(key_event(KeyCode::Tab)),
         semantic_command(SemanticCommandId::MetricsMeasureNext)
+    );
+}
+
+/// The note the legend carries where its series count more Sessions than
+/// worked in all.
+const OVERLAP_NOTE: &str = "A Session that used several Models counts once for each";
+
+#[test]
+fn sessions_plot_each_model_s_sessions_over_the_distinct_total_with_a_note() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(report(&query)));
+    assert_eq!(
+        press(&mut application, 's'),
+        ApplicationTransition::Continue
+    );
+
+    let rows = screen(&application);
+    let shown = rows.join("\n");
+    eprintln!("{shown}");
+    // The busiest days stack four Sessions: a tick for each.
+    for tick in ["1", "4"] {
+        assert!(
+            rows.iter()
+                .any(|row| row.trim_start().starts_with(&format!("{tick} ┤"))),
+            "a tick at {tick}: {shown}"
+        );
+    }
+    assert!(!shown.contains("5 ┤"), "{shown}");
+    // The heading counts each Session once; each Model counts those that
+    // used it, their share of all the Sessions that worked.
+    row(&rows, "Last 30 days · 15 Sessions");
+    for (label, figures) in [
+        ("Claude Opus 5.5", [" 12 ", "80%"]),
+        ("GPT-5.5 Codex", [" 4 ", "27%"]),
+        ("copilot · GPT-5.5", [" 3 ", "20%"]),
+    ] {
+        let line = row(&rows, label);
+        for figure in figures {
+            assert!(line.contains(figure), "{figure} in {line:?}");
+        }
+    }
+    let legend_at = |label: &str| rendered_row(&rows, label);
+    assert_eq!(
+        legend_at(OVERLAP_NOTE),
+        legend_at("copilot · GPT-5.5") + 1,
+        "the note stands under the legend: {shown}"
+    );
+
+    // Cost and Tokens add up across Models, so they carry no such note.
+    show_tokens(&mut application);
+    assert!(!screen(&application).join("\n").contains(OVERLAP_NOTE));
+}
+
+#[test]
+fn sessions_that_each_used_one_model_carry_no_note() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    let mut report = report(&query);
+    // Every Session used one Model alone: the Models add up to the total.
+    report.range.total.sessions = 19;
+    answer(&mut application, request_id, Ok(report));
+    press(&mut application, 's');
+
+    let rows = screen(&application);
+    row(&rows, "Last 30 days · 19 Sessions");
+    assert!(!rows.join("\n").contains(OVERLAP_NOTE), "{rows:#?}");
+}
+
+#[test]
+fn one_session_is_named_in_the_singular() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    let mut report = empty_report(&query, None);
+    report.keys = vec![UsageMetricsKeyLabel {
+        key: opus(),
+        label: "Claude Opus 5.5".to_owned(),
+    }];
+    let one = UsageMetricsAggregate {
+        sessions: 1,
+        subagent_sessions: 3,
+        ..tokens(1_000)
+    };
+    let worked = UsageMetricsBucket {
+        total: one,
+        by_key: vec![KeyedUsageMetrics {
+            key: opus(),
+            aggregate: one,
+        }],
+    };
+    report.buckets[29] = worked.clone();
+    report.range = worked;
+    answer(&mut application, request_id, Ok(report));
+    press(&mut application, 's');
+
+    let rows = screen(&application);
+    row(&rows, "Last 30 days · 1 Session");
+    assert!(
+        !rows.join("\n").contains("1 Sessions"),
+        "Subagents are not counted among the Sessions: {rows:#?}"
     );
 }
 
