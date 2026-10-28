@@ -19,6 +19,7 @@ mod reading;
 mod relay;
 mod source_control;
 mod standing;
+mod usage_metrics;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
@@ -29,6 +30,7 @@ pub use reading::*;
 pub use relay::*;
 pub use source_control::*;
 pub use standing::{SessionStanding, StandingReading};
+pub use usage_metrics::*;
 /// The response header naming a [`SessionError`]'s code beside its body, so
 /// an answer that carries no body, such as one to a `HEAD`, still says why it
 /// was refused.
