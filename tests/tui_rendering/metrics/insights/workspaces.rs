@@ -315,3 +315,26 @@ fn opening_a_workspace_while_overview_shows_workspaces_already_reads_nothing() {
         [Some(true), Some(true), Some(false)]
     );
 }
+
+#[test]
+fn a_workspace_opened_into_a_report_without_it_is_not_shown_alone_by_a_later_one() {
+    let mut application = on_workspaces(|query| Ok(spent(query, &MOCKUP)));
+    let opened = invoke(
+        &mut application,
+        SemanticCommandId::MetricsPanelItemOpen {
+            panel: InsightsPanel::Workspaces,
+            item: 1,
+        },
+    );
+    let (_, request_id, query) = expect_read(opened);
+    answer(&mut application, request_id, Ok(spent(&query, &[])));
+
+    let (_, request_id, query) = expect_read(key(&mut application, KeyCode::Char('r')));
+    answer(&mut application, request_id, Ok(spent(&query, &MOCKUP)));
+
+    assert_eq!(
+        dimmed(&application, ["suru", "relay-infra", "dotfiles"]),
+        [Some(false); 3],
+        "the report the Workspace was opened into had none of it to show alone"
+    );
+}

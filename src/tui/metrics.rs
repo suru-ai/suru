@@ -653,24 +653,24 @@ impl MetricsView {
     /// legend, by which key rather than where its row stands. The key is
     /// kept apart from Other, as a series of its own in place of the
     /// smallest key kept, so that a key that would fold away is shown alone
-    /// rather than among the keys folded with it. Before a report holding
-    /// series has landed, the key is shown alone once one does; a report
-    /// without the key shows every series.
+    /// rather than among the keys folded with it. Before a report has landed
+    /// for the breakdown, the key is shown alone once one does; a report
+    /// without the key shows every series, and no later one hides any.
     pub(super) fn show_alone(&mut self, key: UsageMetricsKey) {
         self.kept_apart = Some(key.clone());
         self.alone = Some(SeriesId::Key(key));
-        self.show_awaited_alone();
+        if self.shown.is_some() {
+            self.show_awaited_alone();
+        }
     }
 
-    /// Shows the series awaiting it alone, once the report shown has series.
+    /// Shows the series awaiting it alone, where the report shown has it,
+    /// and stops awaiting it either way.
     fn show_awaited_alone(&mut self) {
-        let ids = self.series_ids();
-        if ids.is_empty() {
-            return;
-        }
         let Some(id) = self.alone.take() else {
             return;
         };
+        let ids = self.series_ids();
         if ids.contains(&id) {
             self.hidden = ids.into_iter().filter(|other| *other != id).collect();
             self.focused = Some(ListRow::Series(id));
