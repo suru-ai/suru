@@ -14,22 +14,27 @@ use crate::theme::Theme;
 
 use super::{
     super::{UsageMetricsReadRefusal, calendar::MetricsRange},
-    InsightsContent, InsightsPanel, InsightsView, PanelSelection, turns,
+    InsightsContent, InsightsPanel, InsightsView, turns,
 };
-use crate::{protocol::InsightsReport, tui::slots::truncate_to_width};
+use crate::{
+    protocol::{InsightsReport, Outlook},
+    tui::slots::truncate_to_width,
+};
 
 /// Columns between the grid's two columns.
 const COLUMN_GAP: u16 = 2;
 
+/// Draws the tab's report for `range` from `origin` in `body`.
 pub(in crate::tui) fn render(
     buffer: &mut Buffer,
     body: Rect,
     view: &InsightsView,
+    origin: &Outlook,
     range: MetricsRange,
     theme: &Theme,
 ) {
     view.forget_targets();
-    match view.content(range) {
+    match view.content(origin, range) {
         InsightsContent::Reading => {
             buffer.set_string(body.x, body.y, "Reading Insights…", theme.text.subdued);
         }
@@ -124,10 +129,7 @@ fn render_panel(
     );
     match panel {
         InsightsPanel::Turns => {
-            let selected = view
-                .selection()
-                .filter(|_| focused)
-                .and_then(PanelSelection::turns_bin);
+            let selected = view.selected_item().filter(|_| focused);
             turns::render(buffer, inner, &report.turns, range, selected, view, theme);
         }
     }

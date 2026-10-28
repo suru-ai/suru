@@ -259,6 +259,14 @@ fn tab_or_a_click_focuses_a_panel_and_highlights_its_border() {
         SemanticCommandId::MetricsPanelFocus(InsightsPanel::Turns).as_str(),
         "metrics.panel.turns"
     );
+    assert_eq!(
+        SemanticCommandId::MetricsPanelItemSelect {
+            panel: InsightsPanel::Turns,
+            item: 0,
+        }
+        .as_str(),
+        "metrics.panel.item.select"
+    );
     let mut application = on_insights(Ok(worked()));
     let unfocused = turns_border(&application);
 
@@ -354,7 +362,7 @@ fn the_turns_panel_states_durations_their_spread_and_how_turns_ended() {
     row(&rows, "Turns");
     row(&rows, "median 48s · p90 6m 12s · longest 41m 5s");
     row(&rows, "▁▃▇█▆▃▂▁  <10s … 30m+");
-    row(&rows, "✓ 1.21K completed  ✗ 40 failed  ⏹ 31 interrupted");
+    row(&rows, "✓ 1,213 completed  ✗ 40 failed  ⏹ 31 interrupted");
 }
 
 #[test]
@@ -419,4 +427,92 @@ fn insights_asked_of_a_remote_that_stopped_answering_are_refused_in_the_tab() {
     let rows = screen(&application);
     row(&rows, "studio is unreachable");
     assert!(row(&rows, "7 days").contains("▐7 days▌"), "{rows:#?}");
+}
+
+#[test]
+fn g_and_i_switch_tabs_where_the_system_takes_ctrl_arrows() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(report(&query)));
+
+    let (_, request_id, by_letter) = expect_insights_read(press(&mut application, 'i'));
+    answer_insights(&mut application, request_id, Ok(worked()));
+    row(&screen(&application), "median 48s");
+    assert_eq!(
+        press(&mut application, 'g'),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        screen(&application)
+            .iter()
+            .any(|row| row.contains("▐Overview▌"))
+    );
+
+    let mut keyed = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut keyed);
+    answer(&mut keyed, request_id, Ok(report(&query)));
+    let (_, _, by_ctrl) = expect_insights_read(ctrl(&mut keyed, KeyCode::Right));
+    assert_eq!(by_letter, by_ctrl);
+}
+
+#[test]
+fn a_new_range_lets_go_of_the_selection_its_figures_were_made_for() {
+    let mut application = on_insights(Ok(worked()));
+    press_tab(&mut application);
+    key(&mut application, KeyCode::Right);
+    let focused = turns_border(&application);
+
+    let (_, request_id, _) = expect_insights_read(press(&mut application, '2'));
+    answer_insights(&mut application, request_id, Ok(worked()));
+
+    assert!(
+        !screen(&application)
+            .iter()
+            .any(|row| row.contains("<10s · 10 Turns")),
+        "no bin is selected"
+    );
+    assert_eq!(turns_border(&application), focused, "the panel keeps focus");
+    key(&mut application, KeyCode::Esc);
+    assert_ne!(
+        turns_border(&application),
+        focused,
+        "Esc leaves the panel, with no selection left to clear"
+    );
+}
+
+#[test]
+fn a_refresh_lets_go_of_every_other_range_s_insights() {
+    let mut application = on_insights(Ok(worked()));
+    let (_, request_id, _) = expect_insights_read(press(&mut application, '2'));
+    answer_insights(&mut application, request_id, Ok(worked()));
+
+    let (_, request_id, _) = expect_insights_read(press(&mut application, 'r'));
+    answer_insights(&mut application, request_id, Ok(worked()));
+
+    let (_, _, thirty_days) = expect_insights_read(press(&mut application, '3'));
+    assert!(thirty_days.interval.contains(afternoon()));
+}
+
+#[test]
+fn a_tab_whose_read_was_refused_reads_again_when_shown_again() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, _) = ask(&mut application);
+    answer(
+        &mut application,
+        request_id,
+        Err(UsageMetricsReadRefusal::Failed(
+            "the line dropped".to_owned(),
+        )),
+    );
+    let (_, request_id, _) = expect_insights_read(ctrl(&mut application, KeyCode::Right));
+    answer_insights(
+        &mut application,
+        request_id,
+        Err(UsageMetricsReadRefusal::Failed(
+            "the line dropped".to_owned(),
+        )),
+    );
+
+    expect_metrics_read(ctrl(&mut application, KeyCode::Left));
+    expect_insights_read(ctrl(&mut application, KeyCode::Right));
 }

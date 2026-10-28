@@ -212,19 +212,6 @@ pub(crate) struct CalendarBucket {
     pub(crate) begins: DateTime,
 }
 
-/// The buckets `range` divides into at `now` in `zone`. All time begins
-/// with the month of `earliest`, the earliest timed Turn, and is this month
-/// alone where no Turn is timed; no other range consults it. `None` where
-/// `now` lies beyond what the calendar can place.
-///
-/// Every range but All time, before which nothing comes, is compared with
-/// the period of the same length before it, in the reader's calendar: as
-/// many local days or calendar months back from its first, up to the same
-/// reading of the clock as many days or months before now. So the range so
-/// far is compared with as much of the period before: Today with yesterday
-/// up to this time of day, 30 days with the 30 local days before as far
-/// into the last of them, and Year with the 12 months before as far into
-/// the twelfth, a day past the end of a shorter month taken as its last.
 /// The one interval `range` spans at `now` in `zone`, from its first
 /// bucket's start to its last's end, as the Insights tab reads it: All time
 /// from the first moment a Turn can be placed at, so it needs no earliest
@@ -246,6 +233,19 @@ pub(crate) fn span(
     })
 }
 
+/// The buckets `range` divides into at `now` in `zone`. All time begins
+/// with the month of `earliest`, the earliest timed Turn, and is this month
+/// alone where no Turn is timed; no other range consults it. `None` where
+/// `now` lies beyond what the calendar can place.
+///
+/// Every range but All time, before which nothing comes, is compared with
+/// the period of the same length before it, in the reader's calendar: as
+/// many local days or calendar months back from its first, up to the same
+/// reading of the clock as many days or months before now. So the range so
+/// far is compared with as much of the period before: Today with yesterday
+/// up to this time of day, 30 days with the 30 local days before as far
+/// into the last of them, and Year with the 12 months before as far into
+/// the twelfth, a day past the end of a shorter month taken as its last.
 pub(crate) fn resolve(
     range: MetricsRange,
     now: SessionTimestamp,

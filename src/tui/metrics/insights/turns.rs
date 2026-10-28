@@ -13,11 +13,11 @@ use crate::{
 
 use super::{
     super::{
-        super::{slots::truncate_to_width, transcript::humanized_duration, usage::compact_count},
+        super::{slots::truncate_to_width, transcript::humanized_duration, usage::grouped_count},
         calendar::MetricsRange,
         view::share,
     },
-    InsightsView, ItemMove,
+    InsightsPanel, InsightsView, ItemRun,
 };
 
 /// The rows the panel draws inside its border.
@@ -31,15 +31,13 @@ const BIN_LABELS: [&str; TURN_DURATION_BINS] = [
 /// The eighth-block glyphs a bin's height is drawn in, the lowest first.
 const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
-/// The bin a selection at `selected` moves to, staying within them.
-pub(super) fn moved_bin(selected: Option<usize>, to: ItemMove) -> usize {
-    let last = TURN_DURATION_BINS - 1;
-    match (to, selected) {
-        (ItemMove::Previous, Some(bin)) => bin.saturating_sub(1),
-        (ItemMove::Next, Some(bin)) => (bin + 1).min(last),
-        (ItemMove::Previous, None) => last,
-        (ItemMove::Next, None) => 0,
-        (ItemMove::To(bin), _) => bin.min(last),
+/// How many items the panel offers for selection: a bin apiece where the
+/// Turns recorded durations, and none where they did not.
+pub(super) fn items(turns: &TurnInsights) -> usize {
+    if turns.durations.is_some() {
+        TURN_DURATION_BINS
+    } else {
+        0
     }
 }
 
@@ -93,13 +91,21 @@ pub(super) fn render(
     for (place, (glyph, count, name, style)) in ended.into_iter().enumerate() {
         let gap = if place == 0 { "" } else { "  " };
         let figure = format!("{gap}{glyph} ");
-        let words = format!("{} {name}", compact_count(count));
+        let words = format!("{} {name}", grouped_count(count));
         for (text, style) in [(figure, style), (words, primary)] {
             let left = usize::from(area.right().saturating_sub(x));
             let text = truncate_to_width(&text, left);
             buffer.set_string(x, y, &text, style);
             x += u16::try_from(text.width()).unwrap_or(u16::MAX);
         }
+    }
+}
+
+/// `count` Turns, written whole.
+fn counted(count: u64) -> String {
+    match count {
+        1 => "1 Turn".to_owned(),
+        count => format!("{} Turns", grouped_count(count)),
     }
 }
 
@@ -133,13 +139,17 @@ fn render_bins(
         let x = area.x + u16::try_from(bin).unwrap_or(0);
         buffer.set_string(x, y, glyph, style);
     }
-    view.record_turns_bins_target(Rect::new(area.x, y, bins, 1));
+    view.record_item_targets(
+        InsightsPanel::Turns,
+        Rect::new(area.x, y, bins, 1),
+        ItemRun::Across,
+    );
     let timed: u64 = durations.bins.iter().sum();
     let caption = match selected {
         Some(bin) => format!(
             "{} · {} · {}",
             BIN_LABELS[bin],
-            super::super::chart::counted(durations.bins[bin], "Turn", "Turns"),
+            counted(durations.bins[bin]),
             share(durations.bins[bin], timed),
         ),
         None => format!("{} … {}", BIN_LABELS[0], BIN_LABELS[TURN_DURATION_BINS - 1]),

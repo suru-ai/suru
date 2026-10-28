@@ -296,8 +296,10 @@ pub(super) struct MetricsKeys {
 }
 
 /// The Usage Metrics view owns every key and click while it is open, since
-/// it covers the whole frame. On either tab, Ctrl+←/→ or a click in the tab
-/// bar switch tab, `r` reads the tab showing again, `1`–`5` or a click in
+/// it covers the whole frame. On either tab, Ctrl+←/→, `g` for Overview and
+/// `i` for Insights — which work where the system takes Ctrl+←/→, as macOS
+/// does for Spaces — or a click in the tab bar switch tab, `r` reads the tab
+/// showing again, `1`–`5` or a click in
 /// the range bar choose the range both tabs share, `[`/`]` step to the
 /// range before or after, a click on its ✕ closes it, and Ctrl+C leaves
 /// Suru, as it does from a composer with nothing in it — the view holds
@@ -315,6 +317,12 @@ pub(super) fn command_for_metrics_view_event(
             match (key.code, key.modifiers) {
                 (KeyCode::Left, KeyModifiers::CONTROL) => SemanticCommandId::MetricsTabPrevious,
                 (KeyCode::Right, KeyModifiers::CONTROL) => SemanticCommandId::MetricsTabNext,
+                (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                    SemanticCommandId::MetricsTabSelect(MetricsTab::Overview)
+                }
+                (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                    SemanticCommandId::MetricsTabSelect(MetricsTab::Insights)
+                }
                 (KeyCode::Char('r'), KeyModifiers::NONE) => SemanticCommandId::MetricsRefresh,
                 (KeyCode::Char('['), KeyModifiers::NONE) => SemanticCommandId::MetricsRangePrevious,
                 (KeyCode::Char(']'), KeyModifiers::NONE) => SemanticCommandId::MetricsRangeNext,
@@ -484,18 +492,18 @@ fn command_for_insights_key(key: KeyEvent, keys: MetricsKeys) -> Option<Semantic
     })
 }
 
-/// A key the focused Insights panel acts on: on Turns, ←/→ move the bin
-/// selection along its sparkline.
+/// A key the focused Insights panel acts on: the keys that move along its
+/// items the way they stand — on Turns, ←/→ along its sparkline's bins.
 fn command_for_insights_panel_key(
     panel: InsightsPanel,
     key: KeyEvent,
 ) -> Option<SemanticCommandId> {
     match (panel, key.code, key.modifiers) {
         (InsightsPanel::Turns, KeyCode::Left, KeyModifiers::NONE) => {
-            Some(SemanticCommandId::MetricsTurnsBinPrevious)
+            Some(SemanticCommandId::MetricsPanelItemPrevious)
         }
         (InsightsPanel::Turns, KeyCode::Right, KeyModifiers::NONE) => {
-            Some(SemanticCommandId::MetricsTurnsBinNext)
+            Some(SemanticCommandId::MetricsPanelItemNext)
         }
         _ => None,
     }
@@ -510,8 +518,8 @@ fn command_for_insights_pointer(
     target: InsightsTarget,
 ) -> Option<SemanticCommandId> {
     match (mouse.kind, target) {
-        (MouseEventKind::Up(MouseButton::Left), InsightsTarget::TurnsBin(bin)) => {
-            Some(SemanticCommandId::MetricsTurnsBinSelect { bin })
+        (MouseEventKind::Up(MouseButton::Left), InsightsTarget::Item { panel, item }) => {
+            Some(SemanticCommandId::MetricsPanelItemSelect { panel, item })
         }
         (MouseEventKind::Up(MouseButton::Left), InsightsTarget::Panel(panel)) => {
             Some(SemanticCommandId::MetricsPanelFocus(panel))
@@ -523,9 +531,11 @@ fn command_for_insights_pointer(
     }
 }
 
-/// What the wheel does over an Insights panel: nothing over Turns, whose
-/// figures all stand in view, and never a step of the range, which the
-/// wheel over Overview's chart takes.
+/// What the wheel does over an Insights panel, whether up or down by
+/// `_kind`: the seam a panel whose rows run past its border scrolls them
+/// through, as the Tools panel will. Over Turns, whose figures all stand in
+/// view, nothing; and never a step of the range, which the wheel over
+/// Overview's chart takes.
 fn command_for_insights_panel_wheel(
     panel: InsightsPanel,
     _kind: MouseEventKind,

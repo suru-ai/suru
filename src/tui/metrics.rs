@@ -381,10 +381,11 @@ impl MetricsView {
         changed
     }
 
-    /// Whether the Overview has no report to show, nor one on its way, nor
-    /// a refusal to show in its place, so showing it must read.
+    /// Whether the Overview has no report to show nor one on its way, so
+    /// showing it must read: a read that was refused is read again, as
+    /// Insights reads a refused range again.
     pub(super) fn overview_lacks_report(&self) -> bool {
-        self.shown.is_none() && self.asked.is_none() && self.refusal.is_none()
+        self.shown.is_none() && self.asked.is_none()
     }
 
     pub(super) fn insights(&self) -> &InsightsView {
@@ -395,11 +396,11 @@ impl MetricsView {
         &mut self.insights
     }
 
-    /// Says why the tab showing has no fresh figures.
-    pub(super) fn refuse_showing(&mut self, refusal: UsageMetricsReadRefusal) {
+    /// Says why the tab showing has no fresh figures from `origin`.
+    pub(super) fn refuse_showing(&mut self, origin: Outlook, refusal: UsageMetricsReadRefusal) {
         match self.tab {
             MetricsTab::Overview => self.refuse(refusal),
-            MetricsTab::Insights => self.insights.refuse(self.range, refusal),
+            MetricsTab::Insights => self.insights.refuse(origin, self.range, refusal),
         }
     }
 
@@ -412,6 +413,9 @@ impl MetricsView {
         }
         self.range = range;
         self.forget_figures();
+        // An item a panel selected stands for figures of the range before,
+        // and must not outlast them unseen for Esc to clear.
+        self.insights.clear_selection();
         true
     }
 

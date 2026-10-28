@@ -79,7 +79,7 @@ use super::{
         Receipt as MetricsReceipt, UsageMetricsReadRefusal,
         calendar::MetricsRange,
         chart::MetricsMeasure,
-        insights::{ItemMove, PanelMove},
+        insights::{InsightsView, ItemMove, PanelMove},
     },
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
@@ -7772,7 +7772,7 @@ impl Application {
         if self.state.metrics_view.is_open() {
             self.state
                 .metrics_view
-                .refuse_showing(UsageMetricsReadRefusal::Failed(refusal));
+                .refuse_showing(origin.clone(), UsageMetricsReadRefusal::Failed(refusal));
             return true;
         }
         self.state.submission_error = Some(refusal);
@@ -9642,7 +9642,19 @@ impl Application {
         }
     }
 
-    /// Reads the tab of the open Usage Metrics view showing again.
+    /// Reads the tab of the open Usage Metrics view showing again, as `r`
+    /// does. Insights lets go of every other range's report first, which
+    /// would otherwise show older figures beside nothing saying so.
+    fn refresh_metrics_tab(&mut self) -> ApplicationTransition {
+        let view = &mut self.state.metrics_view;
+        if view.tab() == MetricsTab::Insights {
+            let range = view.range();
+            view.insights_mut().forget_all_but(range);
+        }
+        self.read_metrics_tab()
+    }
+
+    /// Reads the tab of the open Usage Metrics view showing.
     fn read_metrics_tab(&mut self) -> ApplicationTransition {
         match self.state.metrics_view.tab() {
             MetricsTab::Overview => self.read_usage_metrics(),
@@ -9675,12 +9687,12 @@ impl Application {
     /// the report shown holds every panel's figures.
     fn act_on_metrics_insights(
         &mut self,
-        act: impl FnOnce(&mut super::metrics::insights::InsightsView, MetricsRange),
+        act: impl FnOnce(&mut InsightsView, &Outlook, MetricsRange),
     ) -> ApplicationTransition {
         let view = &mut self.state.metrics_view;
         if view.is_open() {
             let range = view.range();
-            act(view.insights_mut(), range);
+            act(view.insights_mut(), &self.state.outlook, range);
         }
         ApplicationTransition::Continue
     }
@@ -11637,7 +11649,7 @@ impl Application {
                 Ok(self.read_usage_metrics())
             }
             SemanticCommandId::MetricsRefresh => Ok(if self.state.metrics_view.is_open() {
-                self.read_metrics_tab()
+                self.refresh_metrics_tab()
             } else {
                 ApplicationTransition::Continue
             }),
@@ -11726,34 +11738,37 @@ impl Application {
                 Ok(self.choose_metrics_tab(tab))
             }
             SemanticCommandId::MetricsPanelFocus(panel) => {
-                Ok(self.act_on_metrics_insights(|insights, _| insights.focus(panel)))
+                Ok(self.act_on_metrics_insights(|insights, _, _| insights.focus(panel)))
             }
-            SemanticCommandId::MetricsPanelFocusNext => Ok(
-                self.act_on_metrics_insights(|insights, _| insights.move_focus(PanelMove::Next))
-            ),
-            SemanticCommandId::MetricsPanelFocusPrevious => Ok(self
-                .act_on_metrics_insights(|insights, _| insights.move_focus(PanelMove::Previous))),
+            SemanticCommandId::MetricsPanelFocusNext => {
+                Ok(self
+                    .act_on_metrics_insights(|insights, _, _| insights.move_focus(PanelMove::Next)))
+            }
+            SemanticCommandId::MetricsPanelFocusPrevious => {
+                Ok(self.act_on_metrics_insights(|insights, _, _| {
+                    insights.move_focus(PanelMove::Previous)
+                }))
+            }
             SemanticCommandId::MetricsPanelFocusClear => {
-                Ok(self.act_on_metrics_insights(|insights, _| insights.clear_focus()))
+                Ok(self.act_on_metrics_insights(|insights, _, _| insights.clear_focus()))
             }
             SemanticCommandId::MetricsPanelSelectionClear => {
-                Ok(self.act_on_metrics_insights(|insights, _| insights.clear_selection()))
+                Ok(self.act_on_metrics_insights(|insights, _, _| insights.clear_selection()))
             }
-            SemanticCommandId::MetricsTurnsBinPrevious => {
-                Ok(self.act_on_metrics_insights(|insights, range| {
-                    insights.move_turns_bin(range, ItemMove::Previous)
+            SemanticCommandId::MetricsPanelItemPrevious => {
+                Ok(self.act_on_metrics_insights(|insights, origin, range| {
+                    insights.move_item(origin, range, ItemMove::Previous)
                 }))
             }
-            SemanticCommandId::MetricsTurnsBinNext => {
-                Ok(self.act_on_metrics_insights(|insights, range| {
-                    insights.move_turns_bin(range, ItemMove::Next)
+            SemanticCommandId::MetricsPanelItemNext => {
+                Ok(self.act_on_metrics_insights(|insights, origin, range| {
+                    insights.move_item(origin, range, ItemMove::Next)
                 }))
             }
-            SemanticCommandId::MetricsTurnsBinSelect { bin } => {
-                Ok(self.act_on_metrics_insights(|insights, range| {
-                    insights.move_turns_bin(range, ItemMove::To(bin))
-                }))
-            }
+            SemanticCommandId::MetricsPanelItemSelect { panel, item } => Ok(self
+                .act_on_metrics_insights(|insights, origin, range| {
+                    insights.select_item(origin, range, panel, item)
+                })),
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,
             // so on the Landing there is nothing to set aside and the view
@@ -12899,7 +12914,7 @@ impl Application {
                         bucket_selected: view.selected_bucket().is_some(),
                         focused_row: view.focused_row(),
                         panel: view.insights().focused(),
-                        panel_selected: view.insights().selection().is_some(),
+                        panel_selected: view.insights().selected_item().is_some(),
                     };
                     return command_for_metrics_view_event(event, keys, |position| {
                         view.target_at(position)

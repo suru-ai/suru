@@ -218,7 +218,7 @@ pub(super) fn render_with_slots(
     // Aside included, so nothing it covers is drawn at all. Only the modal
     // for this machine's own Server going away stands over it.
     if state.metrics_view.is_open() {
-        super::metrics::render(frame, &state.metrics_view, theme);
+        super::metrics::render(frame, &state.metrics_view, &state.outlook, theme);
         if state.reconnect_overlay_visible() {
             render_reconnect_overlay(frame, theme);
         }

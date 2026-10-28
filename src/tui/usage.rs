@@ -29,6 +29,21 @@ pub(super) fn compact_count(value: u64) -> String {
     )
 }
 
+/// `value` written whole, its thousands grouped by commas: `1,213`. Where
+/// [`compact_count`] rounds a figure to fit beside others, this states a
+/// count a reader may want exactly.
+pub(super) fn grouped_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (place, digit) in digits.chars().enumerate() {
+        if place > 0 && (digits.len() - place).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
 pub(super) fn compact_cost(cost: Cost) -> String {
     format!("${:.2}", cost.as_usd())
 }
@@ -47,13 +62,27 @@ fn trim_fractional_zeros(mut value: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::compact_cost;
+    use super::{compact_cost, grouped_count};
     use crate::protocol::Cost;
 
     #[test]
     fn cost_always_has_two_decimal_places() {
         for (usd, expected) in [(0.001, "$0.00"), (1.2, "$1.20"), (10.0, "$10.00")] {
             assert_eq!(compact_cost(Cost::from_usd(usd).unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn a_grouped_count_puts_a_comma_between_each_three_digits() {
+        for (value, expected) in [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1,000"),
+            (1_213, "1,213"),
+            (12_345_678, "12,345,678"),
+            (u64::MAX, "18,446,744,073,709,551,615"),
+        ] {
+            assert_eq!(grouped_count(value), expected);
         }
     }
 }

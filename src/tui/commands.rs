@@ -199,16 +199,18 @@ pub enum SemanticCommandId {
     /// Clears what the focused Insights panel has selected, keeping its
     /// focus.
     MetricsPanelSelectionClear,
-    /// Selects the Turns panel's duration bin before its selected one, or
-    /// the last where none is, focusing the panel.
-    MetricsTurnsBinPrevious,
-    /// Selects the Turns panel's duration bin after its selected one, or the
-    /// first where none is, focusing the panel.
-    MetricsTurnsBinNext,
-    /// Selects one of the Turns panel's duration bins by its place among
-    /// them, counted from the shortest, focusing the panel.
-    MetricsTurnsBinSelect {
-        bin: usize,
+    /// Selects the item before the one the focused Insights panel has
+    /// selected — a Turns panel's duration bin, say — or its last where none
+    /// is.
+    MetricsPanelItemPrevious,
+    /// Selects the item after the one the focused Insights panel has
+    /// selected, or its first where none is.
+    MetricsPanelItemNext,
+    /// Selects one of an Insights panel's items by its place among them,
+    /// counted from the first, focusing the panel.
+    MetricsPanelItemSelect {
+        panel: InsightsPanel,
+        item: usize,
     },
     /// Opens the Icon Picker over a Session, which the picker only does while
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
@@ -805,9 +807,9 @@ impl SemanticCommandId {
             Self::MetricsPanelFocusPrevious => "metrics.panel.previous",
             Self::MetricsPanelFocusClear => "metrics.panel.clear",
             Self::MetricsPanelSelectionClear => "metrics.panel.selection.clear",
-            Self::MetricsTurnsBinPrevious => "metrics.turns.bin.previous",
-            Self::MetricsTurnsBinNext => "metrics.turns.bin.next",
-            Self::MetricsTurnsBinSelect { .. } => "metrics.turns.bin.select",
+            Self::MetricsPanelItemPrevious => "metrics.panel.item.previous",
+            Self::MetricsPanelItemNext => "metrics.panel.item.next",
+            Self::MetricsPanelItemSelect { .. } => "metrics.panel.item.select",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::SessionRename => "session.rename",
@@ -2178,29 +2180,34 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: None,
         keybinding: None,
     },
-    // Selecting a bin reads nothing: the report holds every bin's count.
+    // Selecting an item reads nothing: the report holds every panel's
+    // figures.
     SemanticCommandDescriptor {
-        id: SemanticCommandId::MetricsTurnsBinPrevious,
-        title: "Previous Turn Duration Bin",
+        id: SemanticCommandId::MetricsPanelItemPrevious,
+        title: "Previous Insights Item",
         reach: SemanticReach::Client,
-        description: "Select the Turns panel's duration bin before its selected one",
+        description: "Select the item before the focused Insights panel's selected one",
         slash: None,
         keybinding: None,
     },
     SemanticCommandDescriptor {
-        id: SemanticCommandId::MetricsTurnsBinNext,
-        title: "Next Turn Duration Bin",
+        id: SemanticCommandId::MetricsPanelItemNext,
+        title: "Next Insights Item",
         reach: SemanticReach::Client,
-        description: "Select the Turns panel's duration bin after its selected one",
+        description: "Select the item after the focused Insights panel's selected one",
         slash: None,
         keybinding: None,
     },
     SemanticCommandDescriptor {
-        // The bin's place is invocation data, as a bucket's is.
-        id: SemanticCommandId::MetricsTurnsBinSelect { bin: 0 },
-        title: "Select Turn Duration Bin",
+        // The panel and the item's place are invocation data, as a bucket's
+        // place is.
+        id: SemanticCommandId::MetricsPanelItemSelect {
+            panel: InsightsPanel::Turns,
+            item: 0,
+        },
+        title: "Select Insights Item",
         reach: SemanticReach::Client,
-        description: "Select one of the Turns panel's duration bins by its place",
+        description: "Select one of an Insights panel's items by its place",
         slash: None,
         keybinding: None,
     },
@@ -3506,8 +3513,8 @@ pub(super) fn descriptor(id: SemanticCommandId) -> &'static SemanticCommandDescr
                         SemanticCommandId::MetricsSessionOpen { .. },
                         SemanticCommandId::MetricsSessionOpen { .. }
                     ) | (
-                        SemanticCommandId::MetricsTurnsBinSelect { .. },
-                        SemanticCommandId::MetricsTurnsBinSelect { .. }
+                        SemanticCommandId::MetricsPanelItemSelect { .. },
+                        SemanticCommandId::MetricsPanelItemSelect { .. }
                     )
                 )
         })

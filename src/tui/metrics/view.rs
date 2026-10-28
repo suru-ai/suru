@@ -1,12 +1,13 @@
 //! Draws the Usage Metrics view over the whole frame: a title bar with its
-//! close control, the tab bar, then on Overview the range bar and the
-//! measures beside it, then the range's
+//! close control and the tab bar under it, then the tab showing. Overview
+//! draws the range bar and the measures beside it, then the range's
 //! headline figures, the chart, and its legend — with the Usage mix strip
 //! under it for Tokens — and the Sessions that cost the most beneath them,
 //! or what stands in for them while a read is on its way, when it was
-//! refused, or when the range holds no Usage. Where the frame is narrow the
-//! controls shorten and the legend's series flow along a line; where it is
-//! smaller than the view can be drawn in, it asks for a larger terminal.
+//! refused, or when the range holds no Usage; Insights draws the range bar
+//! alone and its panels. Where the frame is narrow the controls shorten and
+//! the legend's series flow along a line; where it is smaller than the view
+//! can be drawn in, it asks for a larger terminal.
 
 use ratatui::{
     Frame,
@@ -18,7 +19,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     protocol::{
-        UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsReport, UsageMetricsSession,
+        Outlook, UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsReport,
+        UsageMetricsSession,
     },
     theme::Theme,
 };
@@ -91,7 +93,14 @@ const TOO_SMALL: &str = "Make the terminal larger to see Usage Metrics";
 const UNCHARTED: &str =
     "This Usage was recorded before Suru timed Turns, so none of it can be charted.";
 
-pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &Theme) {
+/// Draws `view` over the whole frame, the Outlook turned toward `outlook`,
+/// whose figures alone it shows.
+pub(in crate::tui) fn render(
+    frame: &mut Frame<'_>,
+    view: &MetricsView,
+    outlook: &Outlook,
+    theme: &Theme,
+) {
     let area = frame.area();
     let buffer = frame.buffer_mut();
     view.forget_targets();
@@ -127,7 +136,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
         theme,
     );
     if view.tab() == MetricsTab::Insights {
-        render_insights(buffer, area, view, theme);
+        render_insights(buffer, area, view, outlook, theme);
         return;
     }
     let range = view.range();
@@ -393,12 +402,15 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
     }
 }
 
-/// What the view draws in a frame smaller than it can be drawn in: a request
-/// for a larger terminal, centred, saying how large and how to leave, and
-/// nothing a pointer or a key could act on.
 /// The Insights tab beneath the tab bar: the range bar alone, the row under
 /// it saying what became of a read, and the panels.
-fn render_insights(buffer: &mut Buffer, area: Rect, view: &MetricsView, theme: &Theme) {
+fn render_insights(
+    buffer: &mut Buffer,
+    area: Rect,
+    view: &MetricsView,
+    outlook: &Outlook,
+    theme: &Theme,
+) {
     let range = view.range();
     let controls_y = area.y + 3;
     render_tabs(
@@ -411,12 +423,12 @@ fn render_insights(buffer: &mut Buffer, area: Rect, view: &MetricsView, theme: &
     );
     let insights = view.insights();
     let room = usize::from(area.width.saturating_sub(INSET * 2));
-    if let Some(refusal) = insights.stale_because(range) {
+    if let Some(refusal) = insights.stale_because(outlook, range) {
         let note = truncate_to_width(&stale_note(refusal), room);
         buffer.set_string(area.x + INSET, controls_y + 1, note, theme.feedback.error);
-    } else if insights.is_reading(range)
+    } else if insights.is_reading(outlook, range)
         && matches!(
-            insights.content(range),
+            insights.content(outlook, range),
             super::insights::InsightsContent::Report(_)
         )
     {
@@ -433,9 +445,12 @@ fn render_insights(buffer: &mut Buffer, area: Rect, view: &MetricsView, theme: &
         area.width.saturating_sub(INSET * 2),
         area.height.saturating_sub(HEAD_ROWS + 1),
     );
-    super::insights::render(buffer, body, insights, range, theme);
+    super::insights::render(buffer, body, insights, outlook, range, theme);
 }
 
+/// What the view draws in a frame smaller than it can be drawn in: a request
+/// for a larger terminal, centred, saying how large and how to leave, and
+/// nothing a pointer or a key could act on.
 fn render_too_small(buffer: &mut Buffer, area: Rect, view: &MetricsView, theme: &Theme) {
     view.record_bar_targets(no_bars(area));
     view.record_legend_targets([None; LEGEND_SERIES]);
