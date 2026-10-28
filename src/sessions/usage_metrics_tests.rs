@@ -78,7 +78,7 @@ fn interval(start: u64, end: u64) -> UsageMetricsInterval {
     }
 }
 
-fn by_model(buckets: &[(u64, u64)]) -> UsageMetricsQuery {
+pub(super) fn by_model(buckets: &[(u64, u64)]) -> UsageMetricsQuery {
     UsageMetricsQuery {
         buckets: buckets
             .iter()
@@ -184,7 +184,7 @@ pub(super) async fn restore_deferred(
     (store, writer)
 }
 
-fn read(store: &SessionStore, query: &UsageMetricsQuery) -> UsageMetricsReport {
+pub(super) fn read(store: &SessionStore, query: &UsageMetricsQuery) -> UsageMetricsReport {
     store
         .usage_metrics(
             query,
@@ -994,9 +994,9 @@ async fn reading_never_hydrates_a_deferred_session_and_moves_no_revision() {
     writer.shutdown().await.unwrap();
 }
 
-const OPUS: Option<(&str, &str)> = Some(("claude", "claude-opus-5-5"));
-const SONNET: Option<(&str, &str)> = Some(("claude", "claude-sonnet-5-5"));
-const CODEX: Option<(&str, &str)> = Some(("codex", "gpt-5.5-codex"));
+pub(super) const OPUS: Option<(&str, &str)> = Some(("claude", "claude-opus-5-5"));
+pub(super) const SONNET: Option<(&str, &str)> = Some(("claude", "claude-sonnet-5-5"));
+pub(super) const CODEX: Option<(&str, &str)> = Some(("codex", "gpt-5.5-codex"));
 
 fn key(agent: Option<(&str, &str)>) -> UsageMetricsKey {
     let (provider, model) = agent.expect("a known Agent");
@@ -1006,7 +1006,7 @@ fn key(agent: Option<(&str, &str)>) -> UsageMetricsKey {
     }
 }
 
-fn usd(usd: f64) -> Option<Cost> {
+pub(super) fn usd(usd: f64) -> Option<Cost> {
     Some(Cost::from_usd(usd).unwrap())
 }
 
@@ -1034,7 +1034,7 @@ fn priced(
 
 /// A Turn of `agent` begun at `started_at` whose own Cost is `usd`, recorded
 /// as it Settled one moment later.
-fn turn_scoped(agent: Option<(&str, &str)>, started_at: u64, usd: f64) -> Turn {
+pub(super) fn turn_scoped(agent: Option<(&str, &str)>, started_at: u64, usd: f64) -> Turn {
     priced(
         metered(agent, Some(started_at), Some(started_at + 1), 1),
         usd,
@@ -1046,7 +1046,12 @@ fn turn_scoped(agent: Option<(&str, &str)>, started_at: u64, usd: f64) -> Turn {
 
 /// A Turn of `agent` begun at `started_at` carrying `usd`, the running total
 /// of its Session's tree in `lifetime`, recorded as it Settled.
-fn running_total(agent: Option<(&str, &str)>, started_at: u64, usd: f64, lifetime: &str) -> Turn {
+pub(super) fn running_total(
+    agent: Option<(&str, &str)>,
+    started_at: u64,
+    usd: f64,
+    lifetime: &str,
+) -> Turn {
     priced(
         metered(agent, Some(started_at), Some(started_at + 1), 1),
         usd,

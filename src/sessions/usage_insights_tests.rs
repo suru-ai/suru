@@ -4,12 +4,16 @@
 use super::{
     InsightsRefusal, Pairing, RemoteAct, SessionStore,
     restoration_tests::persisted,
-    usage_metrics_tests::{FABLE, PAIRING, STUDIO, metered, restore, restore_deferred},
+    usage_metrics_tests::{
+        CODEX, FABLE, OPUS, PAIRING, STUDIO, by_model, metered, read as read_metrics, restore,
+        restore_deferred, running_total, turn_scoped, usd,
+    },
 };
 use crate::{
     protocol::{
-        Author, InsightsQuery, InsightsReport, SessionListItem, SessionTimestamp, Turn,
-        TurnDurations, TurnInsights, TurnStatus, UsageMetricsInterval, UsageTotal,
+        Author, Cost, InsightsQuery, InsightsReport, QUARTER_HOUR_MS, QuarterHourTurns,
+        SessionListItem, SessionTimestamp, Turn, TurnDurations, TurnInsights, TurnStatus,
+        UsageMetricsInterval, UsageTotal,
     },
     sidekick::SidekickWorkspace,
 };
@@ -137,7 +141,10 @@ async fn an_interval_with_no_timed_settled_turn_has_no_durations() {
     ];
     let (store, writer) = restore_deferred(directory.path(), vec![session]).await;
 
-    assert_eq!(read(&store, &over(START, END)), InsightsReport::default());
+    assert_eq!(
+        read(&store, &over(START, END)).turns,
+        TurnInsights::default()
+    );
     writer.shutdown().await.unwrap();
 }
 
@@ -260,5 +267,112 @@ async fn reading_insights_never_hydrates_a_deferred_session_and_moves_no_revisio
 
     assert_eq!(turns.completed, 1);
     assert_eq!(read_state(&store), before, "no history was read in");
+    writer.shutdown().await.unwrap();
+}
+
+/// A quarter-hour beginning on a whole quarter-hour since the epoch, from
+/// which the quarter-hour tests count.
+const QUARTER: u64 = 1_800_000_000_000;
+
+/// The quarter-hour `place` quarter-hours after [`QUARTER`] holding `turns`
+/// Turns of `tokens` tokens, costing `cost`.
+fn quarter(
+    place: u64,
+    turns: u64,
+    tokens: u64,
+    cost: Option<Cost>,
+    partial: bool,
+) -> QuarterHourTurns {
+    QuarterHourTurns {
+        start: SessionTimestamp(QUARTER + place * QUARTER_HOUR_MS),
+        turns,
+        tokens: Some(tokens),
+        cost,
+        is_cost_partial: partial,
+    }
+}
+
+#[tokio::test]
+async fn turns_land_in_the_utc_quarter_hour_they_are_placed_in_earliest_first() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![
+        // The last moment of the third quarter-hour, listed first.
+        metered(FABLE, Some(QUARTER + 3 * QUARTER_HOUR_MS - 1), None, 100),
+        // The first moment of the first, and the last of it.
+        metered(FABLE, Some(QUARTER), Some(QUARTER + 5 * QUARTER_HOUR_MS), 1),
+        metered(FABLE, Some(QUARTER + QUARTER_HOUR_MS - 1), None, 2),
+        // Never said when it began: its Settle places it, as it places it in
+        // the range.
+        metered(FABLE, None, Some(QUARTER + 2 * QUARTER_HOUR_MS), 10),
+        // Untimed, and begun before the interval: in no quarter-hour.
+        metered(FABLE, None, None, 1_000),
+        metered(FABLE, Some(QUARTER - 1), None, 1_000),
+    ];
+    let (store, writer) = restore_deferred(directory.path(), vec![session]).await;
+
+    let report = read(&store, &over(QUARTER, QUARTER + 4 * QUARTER_HOUR_MS));
+
+    assert_eq!(
+        report.quarter_hours,
+        vec![quarter(0, 2, 3, None, true), quarter(2, 2, 110, None, true),],
+        "only quarter-hours a Turn is placed in, each Turn's Cost unknown"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn quarter_hour_costs_add_up_to_the_range_s_cost() {
+    let directory = tempfile::tempdir().unwrap();
+    let at = |place: u64| QUARTER + place * QUARTER_HOUR_MS + 1;
+    let mut parent = persisted(directory.path(), None);
+    // A running total's increments land on the Turns carrying them.
+    parent.snapshot.turns = vec![
+        running_total(OPUS, at(0), 0.10, "first-process"),
+        running_total(OPUS, at(1), 0.25, "first-process"),
+        running_total(OPUS, at(1) + 5, 0.40, "first-process"),
+    ];
+    let parent_id = parent.snapshot.session.id;
+    // A brokered Subagent's own Cost is its own, apart from its parent's.
+    let mut brokered = persisted(directory.path(), Some(parent_id));
+    brokered.brokered = true;
+    brokered.snapshot.turns = vec![
+        turn_scoped(CODEX, at(3), 0.08),
+        // Unpriced: its quarter-hour's Cost is partial.
+        metered(CODEX, Some(at(3) + 7), None, 1),
+    ];
+    let (store, writer) = restore(directory.path(), vec![parent, brokered]).await;
+    let (start, end) = (QUARTER, QUARTER + 4 * QUARTER_HOUR_MS);
+
+    let report = read(&store, &over(start, end));
+
+    assert_eq!(
+        report.quarter_hours,
+        vec![
+            quarter(0, 1, 1, usd(0.10), false),
+            quarter(1, 2, 2, usd(0.30), false),
+            quarter(3, 2, 2, usd(0.08), true),
+        ]
+    );
+    let range = read_metrics(&store, &by_model(&[(start, end)]))
+        .across_buckets
+        .total;
+    let added = report
+        .quarter_hours
+        .iter()
+        .filter_map(|quarter| quarter.cost)
+        .fold(None, |total: Option<Cost>, cost| {
+            Some(Cost::from_nano_usd(
+                total.map_or(0, Cost::nano_usd) + cost.nano_usd(),
+            ))
+        });
+    assert_eq!(
+        (
+            added,
+            report.quarter_hours.iter().any(|q| q.is_cost_partial)
+        ),
+        (range.cost, range.is_cost_partial),
+        "the quarter-hours add up to the Cost the metrics read gives the range"
+    );
     writer.shutdown().await.unwrap();
 }

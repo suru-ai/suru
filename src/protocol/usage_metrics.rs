@@ -256,6 +256,37 @@ pub struct InsightsQuery {
 #[serde(deny_unknown_fields)]
 pub struct InsightsReport {
     pub turns: TurnInsights,
+    /// The Turns placed in each UTC quarter-hour, earliest first: only those
+    /// quarter-hours a Turn is placed in, so a long span stays small. Every
+    /// UTC offset in use is a whole number of quarter-hours, so a reader
+    /// folds these into its own calendar's hours exactly, daylight saving
+    /// included, while the Server knows nothing of calendars.
+    pub quarter_hours: Vec<QuarterHourTurns>,
+}
+
+/// How long a quarter-hour of [`InsightsReport::quarter_hours`] lasts, in
+/// milliseconds.
+pub const QUARTER_HOUR_MS: u64 = 15 * 60 * 1_000;
+
+/// The Turns placed in one UTC quarter-hour — by when each began, otherwise
+/// when it Settled, as the interval places them — and what they consumed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarterHourTurns {
+    /// When the quarter-hour begins: a whole number of [`QUARTER_HOUR_MS`]
+    /// since the epoch.
+    pub start: SessionTimestamp,
+    pub turns: u64,
+    /// Their blended tokens, on the same terms as every other surface's;
+    /// absent where none of them reported any.
+    pub tokens: Option<u64>,
+    /// The Cost their Cost Coverage contributions add up to, overlaps
+    /// removed as a [`UsageMetricsAggregate`]'s are, so the quarter-hours of
+    /// an interval add up to its Cost; absent where none contributes a
+    /// known amount.
+    pub cost: Option<Cost>,
+    /// Whether work among them has a Cost no counted amount accounts for.
+    pub is_cost_partial: bool,
 }
 
 /// How long the interval's Turns took to Settle, and how they ended.

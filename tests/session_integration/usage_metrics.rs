@@ -5,8 +5,8 @@
 use crate::session_integration::support::{read_session_until, working_turn};
 use suru::{
     protocol::{
-        Cost, InsightsQuery, InsightsReport, RuntimeDescriptor, SessionError, SessionErrorCode,
-        SessionTimestamp, TURN_DURATION_BINS, TurnDurations, TurnInsights, Usage,
+        Cost, InsightsQuery, InsightsReport, QUARTER_HOUR_MS, RuntimeDescriptor, SessionError,
+        SessionErrorCode, SessionTimestamp, TURN_DURATION_BINS, TurnDurations, TurnInsights, Usage,
         UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsKey,
         UsageMetricsQuery, UsageMetricsReport,
     },
@@ -240,6 +240,18 @@ async fn insights_are_read_over_the_api_and_a_backwards_interval_is_refused() {
             failed: 0,
             interrupted: 0,
         }
+    );
+    assert_eq!(
+        report
+            .quarter_hours
+            .iter()
+            .map(|quarter| (quarter.start, quarter.turns))
+            .collect::<Vec<_>>(),
+        vec![(
+            SessionTimestamp(started_at.0 - started_at.0 % QUARTER_HOUR_MS),
+            1
+        )],
+        "the Turn's UTC quarter-hour"
     );
 
     let refused = ask(UsageMetricsInterval {

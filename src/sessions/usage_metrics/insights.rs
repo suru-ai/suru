@@ -6,13 +6,27 @@
 //!
 //! Each panel of the Insights tab reads one part of the report, which a
 //! [`InsightsFold`] adds up a part apiece from the Turns the span holds.
+//!
+//! The quarter-hours carry Cost as the metrics read's buckets do: every
+//! Cost Coverage contribution of the counted trees lands where the Turn
+//! carrying it does, so the quarter-hours of a span add up to the Cost the
+//! metrics read gives it.
+
+use std::collections::{BTreeMap, HashMap};
 
 use crate::protocol::{
-    InsightsQuery, InsightsReport, TURN_DURATION_BIN_ENDS_MS, TURN_DURATION_BINS, Turn,
-    TurnDurations, TurnInsights, TurnStatus,
+    InsightsQuery, InsightsReport, QUARTER_HOUR_MS, QuarterHourTurns, SessionId,
+    TURN_DURATION_BIN_ENDS_MS, TURN_DURATION_BINS, Turn, TurnDurations, TurnId, TurnInsights,
+    TurnStatus, Usage,
 };
 
-use super::{super::SessionStore, CountedSession, MeteredForest, SessionTimestamp, placed_at};
+use super::{
+    super::{
+        SessionStore,
+        cost_coverage::{CostContribution, add_cost, tree_contributions},
+    },
+    CountedSession, MeteredForest, SessionTimestamp, placed_at,
+};
 
 /// Why an Insights query is refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,15 +53,18 @@ impl SessionStore {
             .expect("Session store lock is not poisoned")
             .copied_sessions();
         let forest = MeteredForest::index(copied);
+        let roots = forest.cost_tree_heads();
         let mut fold = InsightsFold::default();
-        for CountedSession { session_id, .. } in forest.counted_sessions(&forest.cost_tree_heads())
-        {
-            let held = forest.sessions[&session_id]
-                .turns
-                .iter()
-                .filter(|turn| placed_at(turn).is_some_and(|at| interval.contains(at)));
-            for turn in held {
-                fold.add_turn(turn);
+        for CountedSession { session_id, .. } in forest.counted_sessions(&roots) {
+            for turn in &forest.sessions[&session_id].turns {
+                if let Some(at) = placed_at(turn).filter(|at| interval.contains(*at)) {
+                    fold.add_turn(session_id, turn, at);
+                }
+            }
+        }
+        for root in roots {
+            for contribution in tree_contributions(&forest, root) {
+                fold.add_cost(&contribution);
             }
         }
         Ok(fold.into_report())
@@ -58,18 +75,73 @@ impl SessionStore {
 #[derive(Default)]
 struct InsightsFold {
     turns: TurnTally,
+    quarter_hours: QuarterHourTally,
 }
 
 impl InsightsFold {
-    /// Adds a Turn the interval holds.
-    fn add_turn(&mut self, turn: &Turn) {
+    /// Adds a Turn of `session_id` the interval holds, placed `at`.
+    fn add_turn(&mut self, session_id: SessionId, turn: &Turn, at: SessionTimestamp) {
         self.turns.add(turn);
+        self.quarter_hours.add_turn(session_id, turn, at);
+    }
+
+    /// Adds a Cost contribution of the counted trees, where the interval
+    /// holds the Turn carrying it.
+    fn add_cost(&mut self, contribution: &CostContribution) {
+        self.quarter_hours.add_cost(contribution);
     }
 
     fn into_report(self) -> InsightsReport {
         InsightsReport {
             turns: self.turns.into_insights(),
+            quarter_hours: self.quarter_hours.into_quarter_hours(),
         }
+    }
+}
+
+/// The interval's Turns by the UTC quarter-hour each is placed in, and
+/// which quarter-hour holds each Turn, for the Cost it carries to land
+/// beside it.
+#[derive(Default)]
+struct QuarterHourTally {
+    /// Each quarter-hour a Turn is placed in, by its place since the epoch.
+    quarters: BTreeMap<u64, QuarterHourTurns>,
+    placed: HashMap<(SessionId, TurnId), u64>,
+}
+
+impl QuarterHourTally {
+    fn add_turn(&mut self, session_id: SessionId, turn: &Turn, at: SessionTimestamp) {
+        let place = at.0 / QUARTER_HOUR_MS;
+        let quarter = self.quarters.entry(place).or_insert(QuarterHourTurns {
+            start: SessionTimestamp(place * QUARTER_HOUR_MS),
+            turns: 0,
+            tokens: None,
+            cost: None,
+            is_cost_partial: false,
+        });
+        quarter.turns += 1;
+        if let Some(tokens) = turn.usage.as_ref().and_then(Usage::blended_tokens) {
+            quarter.tokens = Some(quarter.tokens.unwrap_or(0).saturating_add(tokens));
+        }
+        self.placed.insert((session_id, turn.id), place);
+    }
+
+    fn add_cost(&mut self, contribution: &CostContribution) {
+        let Some(quarter) = self
+            .placed
+            .get(&(contribution.session_id, contribution.turn_id))
+            .and_then(|place| self.quarters.get_mut(place))
+        else {
+            return;
+        };
+        if let Some(amount) = contribution.amount {
+            quarter.cost = Some(add_cost(quarter.cost, amount.cost));
+        }
+        quarter.is_cost_partial |= contribution.is_partial;
+    }
+
+    fn into_quarter_hours(self) -> Vec<QuarterHourTurns> {
+        self.quarters.into_values().collect()
     }
 }
 

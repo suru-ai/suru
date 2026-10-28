@@ -86,6 +86,7 @@ fn worked() -> InsightsReport {
             failed: 40,
             interrupted: 31,
         },
+        quarter_hours: Vec::new(),
     }
 }
 
@@ -383,6 +384,7 @@ fn turns_that_ended_without_both_moments_are_counted_but_give_no_durations() {
             completed: 3,
             ..TurnInsights::default()
         },
+        ..InsightsReport::default()
     }));
 
     let rows = screen(&application);
