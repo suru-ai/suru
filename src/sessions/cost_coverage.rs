@@ -44,6 +44,29 @@ pub(crate) struct CountedCost {
     pub(crate) basis: CostBasis,
 }
 
+impl CostContribution {
+    /// Work of this Turn whose Cost no counted amount accounts for: it adds
+    /// nothing, and leaves the total partial.
+    fn unaccounted(session_id: SessionId, turn_id: TurnId) -> Self {
+        Self {
+            session_id,
+            turn_id,
+            amount: None,
+            is_partial: true,
+        }
+    }
+}
+
+/// How far an ancestor's whole-tree amount covers one Session's running
+/// total.
+enum Coverage {
+    NotCovered,
+    Covered,
+    /// Overlapping, but not wholly within it, or either cannot say what
+    /// work it spans.
+    PartlyCovered,
+}
+
 /// The Cost a set of contributions adds up to: absent where none of them
 /// counts a known amount, never a zero nobody measured, and partial where
 /// any of them is.
@@ -90,12 +113,7 @@ impl SessionStoreState {
                     Some((*owner, turn.id))
                 })
             {
-                contributions.push(CostContribution {
-                    session_id: owner,
-                    turn_id,
-                    amount: None,
-                    is_partial: true,
-                });
+                contributions.push(CostContribution::unaccounted(owner, turn_id));
             }
             contributions.extend(theirs);
         }
@@ -113,7 +131,8 @@ impl SessionStoreState {
     /// Applies each Provider-declared coverage window to the frozen Cost
     /// records of `sessions`, a Session and some of what lies beneath it. A
     /// subtree report is cumulative only inside its reporting lifetime, where
-    /// each report contributes its increment over the ones before it, and
+    /// each report contributes its increment over the highest total reported
+    /// before it (see [`RunningTotal`]), and
     /// receipt order alone never proves that late descendant evidence falls
     /// outside a report.
     fn contributions_of(&self, sessions: &[SessionId]) -> Vec<CostContribution> {
@@ -148,52 +167,49 @@ impl SessionStoreState {
         let running_totals = lifetimes
             .into_values()
             .map(|reports| {
-                let increments = running_total_increments(
-                    reports.into_iter().map(|report| (report, &report.record)),
-                );
-                RunningTotal {
-                    latest: latest_report(&increments),
-                    increments,
-                }
+                RunningTotal::new(reports.into_iter().map(|report| (report, &report.record)))
             })
             .collect::<Vec<_>>();
 
         let mut contributions = Vec::new();
         let mut included = Vec::new();
         for candidate in &running_totals {
-            let candidate_interval = cost_interval(candidate.latest, &lifetime_starts);
-            let covered = running_totals.iter().find_map(|cover| {
-                let (cover, candidate) = (cover.latest, candidate.latest);
-                if cover.owner == candidate.owner || !self.covers(cover.owner, candidate.owner) {
-                    return None;
-                }
-                let (Some(candidate_interval), Some(cover_interval)) =
-                    (candidate_interval, cost_interval(cover, &lifetime_starts))
-                else {
-                    return Some(true);
-                };
-                intervals_overlap(candidate_interval, cover_interval)
-                    .then(|| !interval_contains(cover_interval, candidate_interval))
-            });
-            match covered {
+            let latest = candidate.latest().report;
+            let candidate_interval = cost_interval(latest, &lifetime_starts);
+            let coverage = running_totals
+                .iter()
+                .find_map(|cover| {
+                    let cover = cover.latest().report;
+                    if cover.owner == latest.owner || !self.covers(cover.owner, latest.owner) {
+                        return None;
+                    }
+                    let (Some(candidate_interval), Some(cover_interval)) =
+                        (candidate_interval, cost_interval(cover, &lifetime_starts))
+                    else {
+                        return Some(Coverage::PartlyCovered);
+                    };
+                    intervals_overlap(candidate_interval, cover_interval).then(|| {
+                        if interval_contains(cover_interval, candidate_interval) {
+                            Coverage::Covered
+                        } else {
+                            Coverage::PartlyCovered
+                        }
+                    })
+                })
+                .unwrap_or(Coverage::NotCovered);
+            match coverage {
                 // A report an ancestor's whole-tree amount covers adds
                 // nothing; one it covers only in part leaves the sum partial.
-                Some(is_partial) => {
-                    if is_partial {
-                        contributions.push(CostContribution {
-                            session_id: candidate.latest.owner,
-                            turn_id: candidate.latest.turn_id,
-                            amount: None,
-                            is_partial: true,
-                        });
-                    }
+                Coverage::Covered => {}
+                Coverage::PartlyCovered => {
+                    contributions.push(CostContribution::unaccounted(latest.owner, latest.turn_id))
                 }
-                None => {
+                Coverage::NotCovered => {
                     // A report whose lifetime never began on a timed Turn
                     // cannot say what work it spans, as the startup fold
                     // also reads it.
                     let untimed = candidate_interval.is_none();
-                    contributions.extend(candidate.increments.iter().map(|increment| {
+                    contributions.extend(candidate.increments().iter().map(|increment| {
                         CostContribution {
                             session_id: increment.report.owner,
                             turn_id: increment.report.turn_id,
@@ -204,7 +220,7 @@ impl SessionStoreState {
                             is_partial: increment.is_partial || untimed,
                         }
                     }));
-                    included.push(candidate.latest);
+                    included.push(latest);
                 }
             }
         }
@@ -243,11 +259,7 @@ impl SessionStoreState {
                 let coverage = cost_interval(aggregate, &lifetime_starts)
                     .expect("an overlapping aggregate has an interval");
                 if !interval_contains(coverage, interval) {
-                    contributions.push(CostContribution {
-                        amount: None,
-                        is_partial: true,
-                        ..counted
-                    });
+                    contributions.push(CostContribution::unaccounted(record.owner, record.turn_id));
                 }
             } else {
                 contributions.push(counted);
@@ -282,12 +294,7 @@ impl SessionStoreState {
                     turn.cost.is_none() || turn.status == TurnStatus::Active
                 };
                 if unaccounted {
-                    contributions.push(CostContribution {
-                        session_id: owner,
-                        turn_id: turn.id,
-                        amount: None,
-                        is_partial: true,
-                    });
+                    contributions.push(CostContribution::unaccounted(owner, turn.id));
                 }
             }
         }
@@ -328,48 +335,60 @@ struct ScopedCost {
 }
 
 fn cost_records(owner: SessionId, turn: &Turn) -> Vec<ScopedCost> {
-    let Some(cost) = turn.cost else {
-        return Vec::new();
-    };
-    let (Some(basis), Some(details)) = (turn.cost_basis, turn.cost_details.as_ref()) else {
-        return Vec::new();
-    };
-    let mut records = details
-        .prior
-        .iter()
-        .cloned()
+    turn_cost_records(turn)
+        .into_iter()
         .map(|record| ScopedCost {
             owner,
             turn_id: turn.id,
             turn_started_at: turn.started_at,
             record,
         })
-        .collect::<Vec<_>>();
-    records.push(ScopedCost {
-        owner,
-        turn_id: turn.id,
-        turn_started_at: turn.started_at,
-        record: CostRecord {
-            cost,
-            basis,
-            coverage: details.coverage.clone(),
-            recorded_at: details.recorded_at,
-            is_partial: details.is_partial,
-        },
+        .collect()
+}
+
+/// Every frozen Cost record a Turn carries: those of earlier reporting
+/// lifetimes it kept, then its current one. A Turn with no Cost, or one
+/// stored without saying what it covers, carries none.
+pub(super) fn turn_cost_records(turn: &Turn) -> Vec<CostRecord> {
+    let Some(cost) = turn.cost else {
+        return Vec::new();
+    };
+    let (Some(basis), Some(details)) = (turn.cost_basis, turn.cost_details.as_ref()) else {
+        return Vec::new();
+    };
+    let mut records = details.prior.clone();
+    records.push(CostRecord {
+        cost,
+        basis,
+        coverage: details.coverage.clone(),
+        recorded_at: details.recorded_at,
+        is_partial: details.is_partial,
     });
     records
 }
 
-/// One reporting lifetime's running totals, from one Session, as Cost
-/// Coverage reads them: placed in time by their increments, and spanning the
-/// work up to the latest of them.
-struct RunningTotal<'a> {
-    latest: &'a ScopedCost,
-    increments: Vec<Increment<&'a ScopedCost>>,
+/// One reporting lifetime's running totals, from one Session, placed in time
+/// by their increments and spanning the work up to the latest of them.
+///
+/// Taken in the order they were recorded, the first report contributes its
+/// whole amount and each later one what it adds to the highest total
+/// reported before it, so the increments add up to the highest total the
+/// lifetime reported. A report lower than one before it contradicts that
+/// running total: it adds nothing, and its increment is partial.
+///
+/// Whether the total is otherwise complete is the latest report's to say,
+/// since it restates the whole lifetime: an earlier report's partial flag is
+/// settled by a later complete one, so only the latest report's increment
+/// carries it. A slice an earlier partial report placed may therefore be
+/// misplaced in time without being marked, while the lifetime's total is
+/// exactly as complete as it reads.
+pub(super) struct RunningTotal<T> {
+    increments: Vec<Increment<T>>,
+    latest: usize,
 }
 
-/// What one running-total report adds to the ones recorded before it in its
-/// reporting lifetime.
+/// What one running-total report adds to the highest total recorded before
+/// it in its reporting lifetime.
 pub(super) struct Increment<T> {
     pub(super) report: T,
     pub(super) recorded_at: SessionTimestamp,
@@ -377,47 +396,63 @@ pub(super) struct Increment<T> {
     pub(super) is_partial: bool,
 }
 
-/// Places one reporting lifetime's running totals in time. Taken in the
-/// order they were recorded, the first report contributes its whole amount
-/// and each later one what it adds to the highest total reported before it,
-/// so the increments add up to the highest total the lifetime reported. A
-/// report lower than one before it contradicts that running total: it adds
-/// nothing, and leaves its contribution partial.
-pub(super) fn running_total_increments<'a, T>(
-    reports: impl IntoIterator<Item = (T, &'a CostRecord)>,
-) -> Vec<Increment<T>> {
-    let mut reports = reports.into_iter().collect::<Vec<_>>();
-    reports.sort_by_key(|(_, record)| record.recorded_at);
-    let mut highest = None::<Cost>;
-    reports
-        .into_iter()
-        .map(|(report, record)| {
-            let before = highest.map_or(0, Cost::nano_usd);
-            let reported = record.cost.nano_usd();
-            highest = Some(Cost::from_nano_usd(before.max(reported)));
-            Increment {
-                report,
-                recorded_at: record.recorded_at,
-                cost: Cost::from_nano_usd(reported.saturating_sub(before)),
-                is_partial: record.is_partial || reported < before,
-            }
-        })
-        .collect()
-}
+impl<T> RunningTotal<T> {
+    /// Reads one lifetime's reports, given in the order they were found, so
+    /// two recorded at the same moment keep that order.
+    pub(super) fn new<'a>(reports: impl IntoIterator<Item = (T, &'a CostRecord)>) -> Self {
+        let mut reports = reports.into_iter().collect::<Vec<_>>();
+        reports.sort_by_key(|(_, record)| record.recorded_at);
+        let end = reports
+            .last()
+            .expect("a lifetime holds at least one report")
+            .1
+            .recorded_at;
+        // The latest report, and the first of several recorded at its moment.
+        let latest = reports
+            .iter()
+            .position(|(_, record)| record.recorded_at == end)
+            .expect("the latest moment is some report's");
+        let mut highest = 0;
+        let increments = reports
+            .into_iter()
+            .enumerate()
+            .map(|(index, (report, record))| {
+                let reported = record.cost.nano_usd();
+                let before = highest;
+                highest = highest.max(reported);
+                Increment {
+                    report,
+                    recorded_at: record.recorded_at,
+                    cost: Cost::from_nano_usd(reported.saturating_sub(before)),
+                    is_partial: reported < before || index == latest && record.is_partial,
+                }
+            })
+            .collect();
+        Self { increments, latest }
+    }
 
-/// The report a lifetime's running total spans the work up to: the latest
-/// recorded, and the first of several recorded at the same moment.
-pub(super) fn latest_report<T: Copy>(increments: &[Increment<T>]) -> T {
-    let end = increments
-        .iter()
-        .map(|increment| increment.recorded_at)
-        .max()
-        .expect("a lifetime holds at least one report");
-    increments
-        .iter()
-        .find(|increment| increment.recorded_at == end)
-        .expect("the latest moment is some report's")
-        .report
+    pub(super) fn increments(&self) -> &[Increment<T>] {
+        &self.increments
+    }
+
+    /// The report the running total spans the work up to.
+    pub(super) fn latest(&self) -> &Increment<T> {
+        &self.increments[self.latest]
+    }
+
+    /// What the increments add up to: the highest total the lifetime
+    /// reported, partial where any increment is.
+    pub(super) fn total(&self) -> CostTotal {
+        CostTotal {
+            cost: self
+                .increments
+                .iter()
+                .fold(Cost::from_nano_usd(0), |total, increment| {
+                    total.saturating_add(increment.cost)
+                }),
+            is_partial: self.increments.iter().any(|increment| increment.is_partial),
+        }
+    }
 }
 
 fn reporting_lifetime(record: &CostRecord) -> Option<&str> {

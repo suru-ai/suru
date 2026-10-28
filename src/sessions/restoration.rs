@@ -10,8 +10,8 @@ use crate::protocol::{
 use super::{
     SessionStoreState,
     cost_coverage::{
-        add_cost_totals, interval_contains, latest_report, running_total_increments,
-        with_unpriced_work, work_exceeds_coverage,
+        RunningTotal, add_cost_totals, interval_contains, turn_cost_records, with_unpriced_work,
+        work_exceeds_coverage,
     },
     projection::derived_session_status,
 };
@@ -151,7 +151,7 @@ impl SessionStoreState {
         // A Subsession heads a tree of its own, so the fold above never
         // reached its Sidekick's Session; its tree Cost adds there whole,
         // and its unpriced work leaves the sum partial, as the live
-        // derivation reads them (see `cost_total`).
+        // derivation reads them (see `tree_cost_contributions`).
         let mut subsession_costs = HashMap::<SessionId, (Vec<CostTotal>, bool)>::new();
         for (&id, record) in &self.sessions {
             record_work(1);
@@ -285,25 +285,19 @@ impl RestoredCostState {
             .map(|(lifetime, records)| {
                 // The same reading of a running total the live derivation
                 // makes: its increments add up to what it counts.
-                let increments = running_total_increments(
-                    records
-                        .iter()
-                        .map(|(turn_id, record)| ((*turn_id, record.recorded_at), record)),
-                );
-                let (turn_id, recorded_at) = latest_report(&increments);
+                let running_total =
+                    RunningTotal::new(records.iter().map(|(turn_id, record)| (*turn_id, record)));
+                let latest = running_total.latest();
+                let total = running_total.total();
                 RestoredReport {
                     interval: lifetime_starts
                         .get(&lifetime)
                         .copied()
-                        .map(|start| (start, recorded_at)),
+                        .map(|start| (start, latest.recorded_at)),
                     lifetime,
-                    turn_id,
-                    partial: increments.iter().any(|increment| increment.is_partial),
-                    cost: increments
-                        .iter()
-                        .fold(Cost::from_nano_usd(0), |total, increment| {
-                            total.saturating_add(increment.cost)
-                        }),
+                    turn_id: latest.report,
+                    partial: total.is_partial,
+                    cost: total.cost,
                 }
             })
             .collect::<Vec<_>>();
@@ -515,24 +509,6 @@ struct RestoredWork {
     last_output_at: Option<SessionTimestamp>,
     active: bool,
     covered: bool,
-}
-
-fn turn_cost_records(turn: &Turn) -> Vec<CostRecord> {
-    let Some(cost) = turn.cost else {
-        return Vec::new();
-    };
-    let (Some(basis), Some(details)) = (turn.cost_basis, turn.cost_details.as_ref()) else {
-        return Vec::new();
-    };
-    let mut records = details.prior.clone();
-    records.push(CostRecord {
-        cost,
-        basis,
-        coverage: details.coverage.clone(),
-        recorded_at: details.recorded_at,
-        is_partial: details.is_partial,
-    });
-    records
 }
 
 /// Disjoint, ordered components of the union of durable Turn intervals.

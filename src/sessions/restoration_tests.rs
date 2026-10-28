@@ -1502,3 +1502,45 @@ async fn a_prior_record_from_an_earlier_lifetime_contributes_beside_the_current_
     assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_complete_running_total_settles_an_earlier_partial_report_in_its_lifetime() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut earlier = priced_turn(Some(10), 0.05, subtree("process"), 12);
+    // A later Usage update with no Cost left this report partial.
+    earlier.cost_details.as_mut().unwrap().is_partial = true;
+    let later = priced_turn(Some(13), 0.08, subtree("process"), 20);
+    for (turns, expected, case) in [
+        (
+            vec![earlier.clone(), later.clone()],
+            known(0.08, false),
+            "a later complete total restates the whole lifetime",
+        ),
+        (
+            vec![later.clone(), {
+                let mut latest = earlier.clone();
+                latest.started_at = Some(SessionTimestamp(21));
+                latest.cost_details.as_mut().unwrap().recorded_at = SessionTimestamp(22);
+                latest.cost = Cost::from_usd(0.09);
+                latest
+            }],
+            known(0.09, true),
+            "a partial latest total leaves the lifetime partial",
+        ),
+    ] {
+        let mut session = persisted(workspace.path(), None);
+        session.snapshot.turns = turns;
+        let id = session.snapshot.session.id;
+        let (store, writer) = restore(workspace.path(), vec![session]).await;
+        assert_eq!(
+            costs(&store, id),
+            Costs {
+                tree: expected,
+                own: expected,
+            },
+            "{case}"
+        );
+        assert_contributions_add_up(&store);
+        writer.shutdown().await.unwrap();
+    }
+}
