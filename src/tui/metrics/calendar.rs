@@ -58,6 +58,18 @@ impl MetricsRange {
         }
     }
 
+    /// How the range bar names the range where it has no room for
+    /// [`Self::label`].
+    pub(crate) fn short_label(self) -> &'static str {
+        match self {
+            Self::Today => "Today",
+            Self::SevenDays => "7d",
+            Self::ThirtyDays => "30d",
+            Self::Year => "Year",
+            Self::AllTime => "All",
+        }
+    }
+
     /// How a heading names the span the range covers.
     pub(crate) fn title(self) -> &'static str {
         match self {

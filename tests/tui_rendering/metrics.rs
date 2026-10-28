@@ -2659,41 +2659,6 @@ fn a_refresh_keeps_the_selected_day_where_the_new_range_still_holds_it() {
     assert!(legend_heading(&application).starts_with("Last 30 days"));
 }
 
-#[test]
-fn where_too_narrow_to_draw_every_bar_the_selection_stops_at_the_last_drawn() {
-    const NARROW: u16 = 30;
-    let mut application = thirty_days_of_tokens();
-    let marks = |application: &Application| {
-        let buffer = rendered_application_buffer(application, NARROW, HEIGHT);
-        let (axis_x, axis_y) = text_position(&buffer, "└");
-        let bars = (0..NARROW)
-            .filter(|x| buffer[(*x, axis_y - 1)].symbol() != " " && *x > axis_x)
-            .count();
-        let marked: Vec<u16> = (0..NARROW)
-            .filter(|x| buffer[(*x, axis_y + 1)].symbol() == "▔")
-            .map(|x| x - axis_x - 1)
-            .collect();
-        (bars, marked)
-    };
-    // One column apiece, and room for fewer than thirty.
-    let (drawn, _) = marks(&application);
-    assert!(drawn < 30, "{drawn} bars");
-
-    key(&mut application, KeyCode::End);
-    let last = u16::try_from(drawn - 1).unwrap();
-    assert_eq!(marks(&application).1, vec![last]);
-    key(&mut application, KeyCode::Right);
-    assert_eq!(marks(&application).1, vec![last]);
-    invoke(
-        &mut application,
-        SemanticCommandId::MetricsBucketSelect { bucket: 29 },
-    );
-    assert_eq!(marks(&application).1, vec![last]);
-    key(&mut application, KeyCode::Home);
-    key(&mut application, KeyCode::Right);
-    assert_eq!(marks(&application).1, vec![1]);
-}
-
 /// The ticks up the y-axis, lowest first.
 fn ticks(application: &Application) -> Vec<String> {
     let mut ticks: Vec<String> = screen(application)
@@ -3138,57 +3103,6 @@ fn other_is_a_series_to_hide_or_show_alone() {
     }
     space(&mut application, KeyModifiers::NONE);
     assert_eq!(legend_row_dimmed(&application, "Other"), Some(true));
-}
-
-#[test]
-fn where_too_short_to_list_every_series_the_focus_stops_at_the_last_drawn() {
-    // The headline's three rows and the one after them, then the legend's
-    // heading and its first row.
-    const SHORT: u16 = 13;
-    let mut application = thirty_days_of_tokens();
-    let rows = rendered_application_rows_at(&application, WIDTH, SHORT);
-    assert!(
-        rows.iter().any(|row| row.contains("Claude Opus 5.5"))
-            && !rows.iter().any(|row| row.contains("GPT-5.5 Codex")),
-        "{rows:#?}"
-    );
-
-    key(&mut application, KeyCode::Up);
-    key(&mut application, KeyCode::Down);
-    assert_eq!(
-        application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
-            KeyCode::Char(' '),
-            KeyModifiers::NONE
-        ))),
-        Some(CommandId::InvokeSemantic(
-            SemanticCommandId::MetricsSeriesToggle { series: 0 }
-        ))
-    );
-}
-
-#[test]
-fn where_too_short_to_list_any_series_nothing_can_be_focused() {
-    // Under the headline, twelve rows leave the legend its heading alone;
-    // ten leave it nothing.
-    for short in [12, 10] {
-        let mut application = thirty_days_of_tokens();
-        let rows = rendered_application_rows_at(&application, WIDTH, short);
-        assert!(
-            !rows.iter().any(|row| row.contains("Claude Opus 5.5")),
-            "{rows:#?}"
-        );
-
-        key(&mut application, KeyCode::Down);
-        key(&mut application, KeyCode::Up);
-        assert_eq!(
-            application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
-                KeyCode::Char(' '),
-                KeyModifiers::NONE
-            ))),
-            None,
-            "{short} rows"
-        );
-    }
 }
 
 fn usd(usd: f64) -> Option<Cost> {
@@ -3945,4 +3859,539 @@ fn a_session_read_from_a_server_the_outlook_has_turned_from_is_not_opened() {
     assert_eq!(origin, Outlook::Local);
     answer(&mut application, request_id, Ok(with_top_sessions(&query)));
     assert!(!screen(&application).join("\n").contains("Not opened"));
+}
+
+/// The narrowest frame the view draws itself in.
+const NARROW: u16 = 80;
+/// The shortest.
+const SHORTEST: u16 = 24;
+
+fn narrow_screen(application: &Application) -> Vec<String> {
+    rendered_application_rows_at(application, NARROW, HEIGHT)
+}
+
+/// The row of controls: three under the title bar.
+fn controls(rows: &[String]) -> &str {
+    &rows[rendered_row(rows, "esc ✕") + 3]
+}
+
+/// The row of labels under the x-axis: two under its line.
+fn axis_labels(rows: &[String]) -> Vec<String> {
+    let axis = rendered_row(rows, "└");
+    rows[axis + 2]
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// The view of `range_key`'s range of `report` at 80 columns, its range
+/// read and answered.
+fn eighty_columns_of(range_key: char) -> Application {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(priced_report(&query)));
+    if range_key != '3' {
+        let (_, request_id, query) = expect_read(press(&mut application, range_key));
+        answer(&mut application, request_id, Ok(priced_report(&query)));
+    }
+    narrow_screen(&application);
+    application
+}
+
+#[test]
+fn at_eighty_columns_today_thirty_days_and_a_year_show_every_control_and_the_legend_unbroken() {
+    for (range_key, chosen, heading) in [
+        ('1', "▐Today▌", "Today · "),
+        ('3', "▐30d▌", "Last 30 days · "),
+        ('4', "▐Year▌", "Last 12 months · "),
+    ] {
+        let application = eighty_columns_of(range_key);
+        let rows = narrow_screen(&application);
+        let shown = rows.join("\n");
+        eprintln!("{shown}");
+
+        let title = &rows[rendered_row(&rows, "esc ✕")];
+        assert!(
+            in_order(title, &["Metrics", "r refresh", "esc ✕"]),
+            "{title:?}"
+        );
+        // The ranges in their short words, the breakdown at its choice.
+        let controls = controls(&rows);
+        assert!(
+            in_order(
+                controls,
+                &[
+                    "Today",
+                    "7d",
+                    "30d",
+                    "Year",
+                    "All",
+                    "Cost",
+                    "Tokens",
+                    "Sessions",
+                    "by",
+                    "▐Model▌"
+                ]
+            ),
+            "{range_key}: {controls:?}"
+        );
+        assert!(controls.contains(chosen), "{controls:?}");
+        assert!(
+            !controls.contains("Provider") && !controls.contains("7 days"),
+            "{controls:?}"
+        );
+
+        // The legend's series flow along one line beneath its heading.
+        let at = rendered_row(&rows, heading);
+        let line = &rows[at + 1];
+        assert!(
+            in_order(
+                line,
+                &[
+                    "█ Claude Opus 5.5",
+                    "$",
+                    "█ GPT-5.5 Codex",
+                    "$",
+                    "█ copilot · GPT-5.5",
+                    "$0.00+"
+                ]
+            ),
+            "{range_key}: {line:?}"
+        );
+
+        // Every label under the axis whole, none run into the next.
+        let labels = axis_labels(&rows);
+        assert!(labels.len() >= 4, "{labels:?}");
+        let whole = match range_key {
+            '1' => labels.iter().all(|label| {
+                label.len() == 5
+                    && label.as_bytes()[2] == b':'
+                    && label.replace(':', "").parse::<u16>().is_ok()
+            }),
+            '3' => labels.chunks(2).all(|pair| {
+                pair.len() == 2
+                    && pair[0]
+                        .parse::<u8>()
+                        .is_ok_and(|day| (1..=31).contains(&day))
+                    && MONTHS.contains(&pair[1].as_str())
+            }),
+            _ => labels.chunks(2).all(|pair| {
+                pair.len() == 2
+                    && MONTHS.contains(&pair[0].as_str())
+                    && pair[1].parse::<u16>().is_ok()
+            }),
+        };
+        assert!(whole, "{range_key}: {labels:?}");
+    }
+}
+
+#[test]
+fn every_breakdown_s_collapsed_control_stands_whole_at_eighty_columns() {
+    let mut application = eighty_columns_of('1');
+    for breakdown in ["Provider", "Workspace", "Model"] {
+        let (_, request_id, query) = expect_read(press(&mut application, 'b'));
+        assert_eq!(
+            query.buckets.len(),
+            24,
+            "the range stays Today: {breakdown}"
+        );
+        answer(&mut application, request_id, Ok(empty_report(&query, None)));
+        let rows = narrow_screen(&application);
+        let controls = controls(&rows);
+        assert!(
+            controls.trim_end().ends_with(&format!("by ▐{breakdown}▌")),
+            "{controls:?}"
+        );
+    }
+}
+
+#[test]
+fn the_ranges_shorten_before_the_breakdowns_collapse() {
+    let application = eighty_columns_of('3');
+    let rows = rendered_application_rows_at(&application, 100, HEIGHT);
+    let at_hundred = controls(&rows);
+    assert!(
+        in_order(
+            at_hundred,
+            &[
+                "7d",
+                "▐30d▌",
+                "All",
+                "Sessions",
+                "by",
+                "▐Model▌",
+                "Provider",
+                "Workspace"
+            ]
+        ),
+        "{at_hundred:?}"
+    );
+    let rows = screen(&application);
+    assert!(
+        in_order(controls(&rows), &["7 days", "▐30 days▌", "All time"]),
+        "{rows:#?}"
+    );
+}
+
+#[test]
+fn at_eighty_columns_a_click_on_a_short_range_or_the_collapsed_breakdown_chooses_as_the_keys_do() {
+    let mut application = eighty_columns_of('3');
+    let buffer = rendered_application_buffer(&application, NARROW, HEIGHT);
+
+    let (seven_x, seven_y) = text_position(&buffer, "7d");
+    let (_, request_id, clicked) = expect_read(press_at(&mut application, (seven_x, seven_y)));
+    let mut by_key = eighty_columns_of('3');
+    let (_, _, pressed) = expect_read(press(&mut by_key, '2'));
+    assert_eq!(new_york_starts(&clicked), new_york_starts(&pressed));
+    answer(&mut application, request_id, Ok(priced_report(&clicked)));
+
+    // The breakdown, collapsed to its choice, takes the next on a click,
+    // as `b` does.
+    let buffer = rendered_application_buffer(&application, NARROW, HEIGHT);
+    let (model_x, model_y) = text_position(&buffer, "Model");
+    let (_, request_id, query) = expect_read(press_at(&mut application, (model_x, model_y)));
+    assert_eq!(query.breakdown, UsageMetricsBreakdown::Provider);
+    assert_eq!(query.buckets.len(), 7, "seven days still");
+    answer(&mut application, request_id, Ok(by_provider(&query)));
+    let rows = narrow_screen(&application);
+    assert!(controls(&rows).contains("by ▐Provider▌"), "{rows:#?}");
+    let buffer = rendered_application_buffer(&application, NARROW, HEIGHT);
+    let (provider_x, provider_y) = text_position(&buffer, "▐Provider▌");
+    // Its brackets are the control's as well.
+    let (_, _, query) = expect_read(press_at(&mut application, (provider_x, provider_y)));
+    assert_eq!(query.breakdown, UsageMetricsBreakdown::Workspace);
+}
+
+/// Where the legend item naming `label` stands at 80 columns: a column of
+/// its figures.
+fn narrow_legend_item_at(application: &Application, label: &str) -> (u16, u16) {
+    let buffer = rendered_application_buffer(application, NARROW, HEIGHT);
+    let (x, y) = text_position(&buffer, label);
+    (x + 2, y)
+}
+
+#[test]
+fn a_click_on_an_item_of_the_one_line_legend_hides_it_or_shows_it_alone() {
+    let thirty_days = || {
+        let mut application = reader_in(NEW_YORK, afternoon());
+        let (_, request_id, query) = ask(&mut application);
+        answer(&mut application, request_id, Ok(report(&query)));
+        show_tokens(&mut application);
+        narrow_screen(&application);
+        application
+    };
+    let mut application = thirty_days();
+    let codex = narrow_legend_item_at(&application, "GPT-5.5 Codex");
+    let opus = narrow_legend_item_at(&application, "Claude Opus 5.5");
+    assert_eq!(codex.1, opus.1, "on one line");
+    click_with(&mut application, codex, KeyModifiers::NONE);
+
+    let mut by_keys = thirty_days();
+    key(&mut by_keys, KeyCode::Down);
+    key(&mut by_keys, KeyCode::Down);
+    space(&mut by_keys, KeyModifiers::NONE);
+    assert_eq!(narrow_screen(&application), narrow_screen(&by_keys));
+    let rows = narrow_screen(&application);
+    let line = &rows[usize::from(codex.1)];
+    assert!(
+        line.contains("›░ GPT-5.5 Codex"),
+        "hidden and focused: {line:?}"
+    );
+
+    // Ctrl, Alt, or Shift held over the item shows it alone; the axis
+    // rescales to its 1M.
+    let mut application = thirty_days();
+    click_with(&mut application, codex, KeyModifiers::CONTROL);
+    let mut by_keys = thirty_days();
+    key(&mut by_keys, KeyCode::Down);
+    key(&mut by_keys, KeyCode::Down);
+    space(&mut by_keys, KeyModifiers::SHIFT);
+    assert_eq!(narrow_screen(&application), narrow_screen(&by_keys));
+    let tick = narrow_screen(&application)
+        .iter()
+        .filter_map(|row| Some(row.split_once(" ┤")?.0.trim().to_owned()))
+        .next();
+    assert_eq!(tick.as_deref(), Some("1M"));
+
+    // Between two items, nothing stands to hide.
+    let mut application = thirty_days();
+    let buffer = rendered_application_buffer(&application, NARROW, HEIGHT);
+    let (swatch, y) = text_position(&buffer, "█ GPT-5.5 Codex");
+    click_with(&mut application, (swatch - 2, y), KeyModifiers::NONE);
+    assert_eq!(
+        narrow_screen(&application),
+        narrow_screen(&thirty_days()),
+        "nothing hidden or focused"
+    );
+}
+
+#[test]
+fn at_eighty_columns_thirty_days_stand_one_column_wide_a_column_apart() {
+    let application = eighty_columns_of('3');
+    let buffer = rendered_application_buffer(&application, NARROW, HEIGHT);
+    let (axis_x, axis_y) = text_position(&buffer, "└");
+    let foot: Vec<u16> = (axis_x + 1..NARROW)
+        .filter(|x| buffer[(*x, axis_y - 1)].symbol() != " ")
+        .collect();
+    assert_eq!(foot.len(), 30, "{foot:?}");
+    assert!(
+        foot.windows(2).all(|pair| pair[1] - pair[0] == 2),
+        "{foot:?}"
+    );
+}
+
+#[test]
+fn at_eighty_columns_the_headline_s_columns_stand_evenly_apart() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(
+        &mut application,
+        request_id,
+        Ok(headlined(&query, Some(the_month_before()))),
+    );
+
+    let rows = narrow_screen(&application);
+    let [figures, compared, details] = headline(&rows);
+    eprintln!("{figures}\n{compared}\n{details}");
+    let column = |line: &str, text: &str| {
+        let at = line
+            .find(text)
+            .unwrap_or_else(|| panic!("{text:?} in {line:?}"));
+        line[..at].chars().count()
+    };
+    let width = |text: &str| text.chars().count();
+    // Each column as wide as its figure and its comparison, and as what is
+    // said beneath them where the next column says something there too;
+    // otherwise that runs on beneath the next.
+    let columns = [
+        (column(&figures, "$412.86+"), width("▲ 18% vs prev 30d")),
+        (column(&figures, "27M tokens"), width("27M tokens")),
+        (column(&figures, "96 Sessions"), width("12 Subagents")),
+        (column(&figures, "1.28K Turns"), width("1.28K Turns")),
+        (column(&figures, "71% from cache"), width("71% from cache")),
+    ];
+    let gaps: Vec<usize> = columns
+        .windows(2)
+        .map(|pair| pair[1].0 - pair[0].0 - pair[0].1)
+        .collect();
+    assert!(
+        gaps.iter().all(|gap| *gap == gaps[0] && *gap >= 2),
+        "{gaps:?}"
+    );
+    assert!(compared.contains("▲ 18% vs prev 30d"), "{compared:?}");
+    assert!(
+        details.contains("$37.10 estimated") && details.contains("40 failed · 31 interrupted"),
+        "the longer words, with room for them: {details:?}"
+    );
+}
+
+/// A report of `query`'s buckets with a day's tokens of Opus in each.
+fn steady(query: &UsageMetricsQuery) -> UsageMetricsReport {
+    let mut report = report(query);
+    for bucket in &mut report.buckets {
+        *bucket = UsageMetricsBucket {
+            total: UsageMetricsAggregate {
+                sessions: 1,
+                turns: 1,
+                ..tokens(1_000_000)
+            },
+            by_key: vec![KeyedUsageMetrics {
+                key: opus(),
+                aggregate: UsageMetricsAggregate {
+                    sessions: 1,
+                    ..tokens(1_000_000)
+                },
+            }],
+        };
+    }
+    take_together(&mut report);
+    report
+}
+
+/// All time since 1970, a year a bar: as many bars as any range draws,
+/// since no Turn is timed before then.
+fn since_the_epoch() -> Application {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    let earliest = in_new_york(date(1970, 1, 1).at(9, 0, 0, 0));
+    answer(
+        &mut application,
+        request_id,
+        Ok(empty_report(&query, Some(earliest))),
+    );
+    let (_, request_id, query) = expect_read(press(&mut application, '5'));
+    assert_eq!(query.buckets.len(), 57, "a bar for each year");
+    answer(&mut application, request_id, Ok(steady(&query)));
+    show_tokens(&mut application);
+    application
+}
+
+/// The columns of bar a frame `width` wide draws, and those it marks as
+/// selected, each by its place from the axis.
+fn drawn_and_marked(application: &Application, width: u16) -> (Vec<u16>, Vec<u16>) {
+    let buffer = rendered_application_buffer(application, width, HEIGHT);
+    let (axis_x, axis_y) = text_position(&buffer, "└");
+    let columns = |row: u16, drawn: &dyn Fn(&str) -> bool| {
+        (axis_x + 1..width)
+            .filter(|x| drawn(buffer[(*x, row)].symbol()))
+            .map(|x| x - axis_x - 1)
+            .collect()
+    };
+    (
+        columns(axis_y - 1, &|symbol| symbol != " "),
+        columns(axis_y + 1, &|symbol| symbol == "▔"),
+    )
+}
+
+#[test]
+fn the_narrowest_frame_draws_every_bar_so_a_selection_made_wider_stays_marked_and_read() {
+    let mut application = since_the_epoch();
+    key(&mut application, KeyCode::End);
+    // Two columns to a bar, and the last marked.
+    let (bars, marked) = drawn_and_marked(&application, 200);
+    assert_eq!(bars.len(), 57 * 2);
+    assert_eq!(marked, bars[bars.len() - 2..]);
+
+    // Narrower, every bar still stands, one column apiece with no gap, and
+    // the selection stays marked under its own and read in the legend.
+    assert_eq!(
+        drawn_and_marked(&application, NARROW),
+        ((0..57).collect(), vec![56])
+    );
+    let in_legend = |application: &Application| {
+        narrow_screen(application)
+            .iter()
+            .any(|row| row.trim_start().starts_with("2026 · "))
+    };
+    assert!(
+        in_legend(&application),
+        "{:#?}",
+        narrow_screen(&application)
+    );
+
+    // Through a frame too small to draw it, and back.
+    rendered_application_rows_at(&application, NARROW - 1, HEIGHT);
+    assert_eq!(
+        drawn_and_marked(&application, NARROW),
+        ((0..57).collect(), vec![56])
+    );
+    assert!(in_legend(&application));
+}
+
+#[test]
+fn in_the_shortest_frame_the_legend_flows_and_its_focus_stops_at_the_last_item_drawn() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    ask(&mut application);
+    expect_read(press(&mut application, 'b'));
+    let (_, request_id, query) = expect_read(press(&mut application, 'b'));
+    answer(&mut application, request_id, Ok(many_workspaces(&query, 9)));
+    show_tokens(&mut application);
+
+    for width in [NARROW, WIDTH] {
+        let rows = rendered_application_rows_at(&application, width, SHORTEST);
+        let shown = rows.join("\n");
+        eprintln!("{shown}");
+        // The chart keeps its floor, and the Usage mix strip its rows.
+        assert!(
+            rows.iter().filter(|row| row.contains('┤')).count() >= 2,
+            "{shown}"
+        );
+        row(&rows, "Usage mix");
+        let heading = rendered_row(&rows, "Last 30 days · ");
+        let line = &rows[heading + 1];
+        assert!(
+            line.contains("workspace-0") && line.contains("workspace-1"),
+            "{line:?}"
+        );
+        assert!(!shown.contains("Other"), "no room for the last: {shown}");
+        let drawn = (0..9)
+            .filter(|index| shown.contains(&format!("workspace-{index}")))
+            .count();
+
+        for _ in 0..10 {
+            key(&mut application, KeyCode::Down);
+        }
+        assert_eq!(
+            application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE
+            ))),
+            Some(CommandId::InvokeSemantic(
+                SemanticCommandId::MetricsSeriesToggle { series: drawn - 1 }
+            )),
+            "{width} columns"
+        );
+        invoke(&mut application, SemanticCommandId::MetricsFocusClear);
+    }
+}
+
+#[test]
+fn below_the_smallest_frame_only_a_message_stands_and_nothing_can_be_pointed_at_or_moved() {
+    let small_frames = [(NARROW - 1, HEIGHT), (WIDTH, SHORTEST - 1), (40, 12)];
+    for (width, height) in small_frames {
+        let mut application = thirty_days_of_tokens();
+        let rows = rendered_application_rows_at(&application, width, height);
+        let shown: Vec<&str> = rows
+            .iter()
+            .map(|row| row.trim())
+            .filter(|row| !row.is_empty())
+            .collect();
+        assert!(
+            shown
+                .first()
+                .is_some_and(|row| row.starts_with("Make the terminal larger")),
+            "{width}×{height}: {shown:#?}"
+        );
+        assert!(shown.len() <= 2, "the message alone: {shown:#?}");
+        assert!(
+            shown
+                .iter()
+                .all(|row| !row.contains("esc ✕") && !row.contains('┤')),
+            "{shown:#?}"
+        );
+
+        // Nothing drawn, so nothing to select, focus, or click.
+        key(&mut application, KeyCode::Right);
+        key(&mut application, KeyCode::Down);
+        assert_eq!(
+            application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE
+            ))),
+            None
+        );
+        let before = screen(&application);
+        rendered_application_rows_at(&application, width, height);
+        for y in (0..height).step_by(2) {
+            for x in (0..width).step_by(3) {
+                assert_eq!(
+                    press_at(&mut application, (x, y)),
+                    ApplicationTransition::Continue,
+                    "({x}, {y})"
+                );
+            }
+        }
+        assert_eq!(
+            screen(&application),
+            before,
+            "nothing chosen, hidden, or closed"
+        );
+        rendered_application_rows_at(&application, width, height);
+        // Esc still closes.
+        assert_eq!(
+            application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE
+            ))),
+            Some(CommandId::InvokeSemantic(SemanticCommandId::MetricsClose))
+        );
+        // A frame large enough again shows the view, no bar selected.
+        let rows = screen(&application);
+        assert_eq!(legend_heading(&application), "Last 30 days · 109M tokens");
+        assert!(!rows.join("\n").contains('▔'));
+    }
 }

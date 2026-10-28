@@ -512,10 +512,11 @@ const LOWER_EIGHTHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆',
 
 /// Draws `series` stacked over `buckets` into `area`: the y-axis and its tick
 /// labels down the left, a bar per bucket, the x-axis beneath them, a mark
-/// under the `selected` bar, and the thinned bucket labels under that. Each
-/// segment boundary falling inside a cell is drawn with an eighth block in
-/// the lower segment's colour over the upper segment's, so a segment's
-/// height reads to an eighth of a row. Answers where it drew the bars.
+/// under the `selected` bar, or the last drawn where it is past them, and
+/// the thinned bucket labels under that. Each segment boundary falling
+/// inside a cell is drawn with an eighth block in the lower segment's colour
+/// over the upper segment's, so a segment's height reads to an eighth of a
+/// row. Answers where it drew the bars.
 pub(crate) fn render_chart(
     buffer: &mut Buffer,
     area: Rect,
@@ -601,10 +602,6 @@ pub(crate) fn render_chart(
             break;
         }
         drawn = index + 1;
-        if selected == Some(index) {
-            let mark = "▔".repeat(usize::from(bar_width));
-            buffer.set_string(bar_x, axis_y + 1, mark, theme.accent.primary);
-        }
         // Where each segment ends, in eighths of a row from the foot.
         let mut boundaries = Vec::with_capacity(series.len());
         let mut running: u128 = 0;
@@ -633,6 +630,19 @@ pub(crate) fn render_chart(
         }
     }
 
+    // A selection past the last bar drawn stands at that bar.
+    if let Some(index) = selected
+        .zip(drawn.checked_sub(1))
+        .map(|(at, last)| at.min(last))
+    {
+        let bar_x = plot_x
+            + u16::try_from(index)
+                .unwrap_or(u16::MAX)
+                .saturating_mul(slot)
+            + (slot - bar_width);
+        let mark = "▔".repeat(usize::from(bar_width));
+        buffer.set_string(bar_x, axis_y + 1, mark, theme.accent.primary);
+    }
     let labels: Vec<String> = buckets
         .iter()
         .map(|bucket| bucket_label(bucket, range.unit))

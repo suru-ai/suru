@@ -29,6 +29,9 @@ pub(super) use view::render;
 /// which the list draws fewer of where it has less room.
 const TOP_SESSIONS: usize = 5;
 
+/// The most series a legend lists: every key a chart keeps, and Other.
+pub(super) const LEGEND_SERIES: usize = chart::KEYED_SERIES + 1;
+
 /// Every breakdown, in the order the view offers them.
 pub(super) const BREAKDOWNS: [UsageMetricsBreakdown; 3] = [
     UsageMetricsBreakdown::Model,
@@ -212,10 +215,11 @@ struct Targets {
     chart: Option<Rect>,
     /// The bars the chart drew, each a column of it a pointer selects by.
     bars: Option<BarStrip>,
-    /// The legend's series rows it drew, one series to a row, the first at
-    /// the top: none where a frame drew a report with no room for any, and
-    /// no rect at all before any frame has drawn one.
-    legend: Option<Rect>,
+    /// Where it drew each of the legend's series, in their order — a row
+    /// apiece, or a place along the lines they flow on — none past the last
+    /// it had room for, and nothing at all before any frame has drawn a
+    /// report.
+    legend: Option<[Option<Rect>; LEGEND_SERIES]>,
     /// The rows of the Sessions that cost the most it drew, one Session to a
     /// row, on the same terms as the legend's.
     sessions: Option<Rect>,
@@ -349,8 +353,9 @@ impl MetricsView {
 
     /// How many buckets a selection can move among: those of the report
     /// shown that its chart draws, so a selection always has its bar and
-    /// mark. A frame too narrow for every bar draws the first few; before
-    /// any frame has drawn the report's bars, all of them count.
+    /// mark. A frame too small for the view draws none, and one too narrow
+    /// for every bar would draw the first few; before any frame has drawn
+    /// the report's bars, all of them count.
     fn selectable(&self) -> usize {
         let buckets = match &self.shown {
             Some((_, buckets, report)) if !chart::holds_nothing(report) => buckets.buckets.len(),
@@ -368,12 +373,14 @@ impl MetricsView {
     }
 
     /// Moves the bucket selection, which stops at the first and last
-    /// bucket. With no bars drawn there is nothing to select.
+    /// bucket drawn, from the last where the one selected is past it. With
+    /// no bars drawn there is nothing to select.
     pub(super) fn move_selection(&mut self, to: BucketMove) {
         let Some(last) = self.selectable().checked_sub(1) else {
             return;
         };
-        self.selected = Some(match (to, self.selected) {
+        let selected = self.selected.map(|selected| selected.min(last));
+        self.selected = Some(match (to, selected) {
             (BucketMove::Previous, Some(selected)) => selected.saturating_sub(1),
             (BucketMove::Next, Some(selected)) => (selected + 1).min(last),
             (BucketMove::Previous | BucketMove::Last, _) => last,
@@ -413,16 +420,21 @@ impl MetricsView {
     /// row, or every one before any frame has drawn them.
     fn list_rows(&self) -> Vec<ListRow> {
         let targets = self.targets.get();
-        let drawn = |rows: Option<Rect>| rows.map_or(usize::MAX, |rows| usize::from(rows.height));
+        let legend = targets
+            .legend
+            .map_or(usize::MAX, |items| items.iter().flatten().count());
+        let sessions = targets
+            .sessions
+            .map_or(usize::MAX, |rows| usize::from(rows.height));
         let series = self
             .series_ids()
             .into_iter()
-            .take(drawn(targets.legend))
+            .take(legend)
             .map(ListRow::Series);
         let sessions = self
             .top_session_ids()
             .into_iter()
-            .take(drawn(targets.sessions))
+            .take(sessions)
             .map(ListRow::Session);
         series.chain(sessions).collect()
     }
@@ -719,8 +731,8 @@ impl MetricsView {
         self.update_targets(|targets| targets.bars = Some(bars));
     }
 
-    pub(super) fn record_legend_targets(&self, rows: Rect) {
-        self.update_targets(|targets| targets.legend = Some(rows));
+    pub(super) fn record_legend_targets(&self, items: [Option<Rect>; LEGEND_SERIES]) {
+        self.update_targets(|targets| targets.legend = Some(items));
     }
 
     pub(super) fn record_session_targets(&self, rows: Rect) {
@@ -773,8 +785,12 @@ impl MetricsView {
                 }
             });
         }
-        if let Some(rows) = targets.legend.filter(|rows| rows.contains(position)) {
-            return Some(MetricsTarget::Series(usize::from(position.y - rows.y)));
+        if let Some(place) = targets.legend.and_then(|items| {
+            items
+                .iter()
+                .position(|item| item.is_some_and(|item| item.contains(position)))
+        }) {
+            return Some(MetricsTarget::Series(place));
         }
         if let Some(rows) = targets.sessions.filter(|rows| rows.contains(position)) {
             return Some(MetricsTarget::Session(usize::from(position.y - rows.y)));

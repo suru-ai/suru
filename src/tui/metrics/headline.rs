@@ -54,18 +54,52 @@ struct Column {
 }
 
 impl Column {
-    fn width(&self, short: bool) -> usize {
-        let detail = self
-            .detail
-            .as_ref()
-            .map(|(long, brief)| if short { brief } else { long });
-        [Some(&self.figure), self.compared.as_ref(), detail]
+    /// The columns its figure and comparison take: what it says beneath
+    /// them may run on under the columns after it.
+    fn width(&self) -> usize {
+        [Some(&self.figure), self.compared.as_ref()]
             .into_iter()
             .flatten()
             .map(|line| line.width())
             .max()
             .unwrap_or(0)
     }
+
+    fn detail(&self, short: bool) -> Option<&String> {
+        self.detail
+            .as_ref()
+            .map(|(long, brief)| if short { brief } else { long })
+    }
+}
+
+/// Where each of `columns` begins, counted from the headline's left edge,
+/// each `gap` columns after the one before it ends, and the columns they all
+/// take. A column is as wide as its figure and its comparison; what it says
+/// beneath them runs on under the columns after it that say nothing there,
+/// so a long word or two pushes nothing aside, and widens it only as far as
+/// that leaves a gap before the next column to say something beneath.
+fn place(columns: &[Column], short: bool, gap: usize) -> (Vec<usize>, usize) {
+    let details: Vec<Option<usize>> = columns
+        .iter()
+        .map(|column| column.detail(short).map(|detail| detail.width()))
+        .collect();
+    let mut widths: Vec<usize> = columns.iter().map(Column::width).collect();
+    for at in 0..columns.len() {
+        let Some(detail) = details[at] else { continue };
+        let Some(next) = (at + 1..columns.len()).find(|next| details[*next].is_some()) else {
+            continue;
+        };
+        let beneath: usize = widths[at + 1..next].iter().map(|width| width + gap).sum();
+        widths[at] = widths[at].max(detail.saturating_sub(beneath));
+    }
+    let mut starts = Vec::with_capacity(columns.len());
+    let (mut x, mut end) = (0, 0);
+    for (width, detail) in widths.iter().zip(&details) {
+        starts.push(x);
+        end = end.max(x + width).max(x + detail.unwrap_or(0));
+        x += width + gap;
+    }
+    (starts, end)
 }
 
 /// Draws the headline in the first [`HEADLINE_ROWS`] of `area`: `whole`'s
@@ -84,10 +118,12 @@ pub(super) fn render_headline(
     let before = before.filter(|before| holds_usage(before));
     let unnamed = columns(whole, before);
     let room = usize::from(area.width);
-    let gaps = unnamed.len().saturating_sub(1).max(1);
-    let spare = |columns: &[Column], short: bool| {
-        let used: usize = columns.iter().map(|column| column.width(short)).sum();
-        room.saturating_sub(used) / gaps
+    // The widest gap, up to the widest allowed, that leaves the columns
+    // within the headline's room, where even the narrowest allowed does.
+    let widest_gap = |columns: &[Column], short: bool| {
+        (NARROWEST_GAP..=WIDEST_GAP)
+            .rev()
+            .find(|gap| place(columns, short, *gap).1 <= room)
     };
     // The period is named after the first comparison where there is room
     // for it; then the longer words are kept where they leave room, and
@@ -100,26 +136,24 @@ pub(super) fn render_headline(
         first.push(' ');
         first.push_str(&label);
     }
-    let (columns, short) = if spare(&named, false) >= NARROWEST_GAP {
-        (named, false)
+    let (columns, short, gap) = if let Some(gap) = widest_gap(&named, false) {
+        (named, false, gap)
+    } else if let Some(gap) = widest_gap(&unnamed, false) {
+        (unnamed, false, gap)
     } else {
-        let short = spare(&unnamed, false) < NARROWEST_GAP;
-        (unnamed, short)
+        let gap = widest_gap(&unnamed, true).unwrap_or(1);
+        (unnamed, true, gap)
     };
-    let gap = spare(&columns, short).clamp(1, WIDEST_GAP);
+    let (starts, _) = place(&columns, short, gap);
 
     let compared = before.is_some();
-    let mut x = usize::from(area.x);
-    for column in &columns {
-        let width = column.width(short);
-        let left = room.saturating_sub(x - usize::from(area.x));
+    for (column, start) in columns.iter().zip(starts) {
+        let left = room.saturating_sub(start);
         if left == 0 {
             break;
         }
-        let detail = column
-            .detail
-            .as_ref()
-            .map(|(long, brief)| if short { brief } else { long });
+        let x = usize::from(area.x) + start;
+        let detail = column.detail(short);
         let lines = [
             Some((
                 &column.figure,
@@ -150,7 +184,6 @@ pub(super) fn render_headline(
             let at = u16::try_from(x).unwrap_or(u16::MAX);
             buffer.set_string(at, y, truncate_to_width(text, left), style);
         }
-        x += width + gap;
     }
 }
 

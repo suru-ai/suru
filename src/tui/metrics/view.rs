@@ -3,10 +3,13 @@
 //! headline figures, the chart, and its legend — with the Usage mix strip
 //! under it for Tokens — and the Sessions that cost the most beneath them,
 //! or what stands in for them while a read is on its way, when it was
-//! refused, or when the range holds no Usage.
+//! refused, or when the range holds no Usage. Where the frame is narrow the
+//! controls shorten and the legend's series flow along a line; where it is
+//! smaller than the view can be drawn in, it asks for a larger terminal.
 
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
 };
@@ -21,7 +24,8 @@ use crate::{
 
 use super::{
     super::slots::truncate_to_width,
-    BREAKDOWNS, FocusedRow, MetricsContent, MetricsView, OfferedBreakdown, UsageMetricsReadRefusal,
+    BREAKDOWNS, BarStrip, FocusedRow, LEGEND_SERIES, MetricsContent, MetricsView, OfferedBreakdown,
+    UsageMetricsReadRefusal,
     calendar::{MetricsRange, RangeBuckets},
     chart::{self, MetricsMeasure, Series},
     headline::{self, HEADLINE_ROWS},
@@ -57,6 +61,31 @@ const SESSION_GAPS: usize = 6;
 const SESSION_TITLE: usize = 40;
 const SESSION_MODEL: usize = 24;
 const SESSION_WORKSPACE: usize = 20;
+/// Labels in a legend whose series flow along a line are cut to this many
+/// columns.
+const FLOWED_LABEL: usize = 24;
+/// Columns between one series and the next along a line of them.
+const FLOWED_GAP: usize = 2;
+/// The fewest rows a legend whose series flow along a line is drawn in: its
+/// heading and one line of them.
+const FLOWED_LEGEND_FLOOR: u16 = 2;
+/// The rows above the headline: the title bar, its rule, a blank row, the
+/// controls, and the row under them that says what became of a read.
+const HEAD_ROWS: u16 = 5;
+/// The narrowest frame the view is drawn in: the controls row stands whole
+/// in 80 columns with the ranges in their short words and the widest
+/// breakdown collapsed beside the measures, as do the headline's columns in
+/// their short words; and every bar any range draws — no more than 57,
+/// since no Turn is timed before 1970 — stands at least a column wide.
+pub(super) const MIN_WIDTH: u16 = 80;
+/// The shortest frame the view is drawn in: the rows above the headline,
+/// the headline and the blank row under it, the chart at its floor, a blank
+/// row, a legend flowing along one line, the Usage mix strip a blank row
+/// under it, and the blank row the frame ends with — 24 rows.
+pub(super) const MIN_HEIGHT: u16 =
+    HEAD_ROWS + HEADLINE_ROWS + 1 + CHART_FLOOR + 1 + FLOWED_LEGEND_FLOOR + 1 + MIX_ROWS + 1;
+/// What the view says in place of itself in a smaller frame.
+const TOO_SMALL: &str = "Make the terminal larger to see Usage Metrics";
 /// What stands in for the chart where All time's every Turn is untimed.
 const UNCHARTED: &str =
     "This Usage was recorded before Suru timed Turns, so none of it can be charted.";
@@ -65,6 +94,10 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
     let area = frame.area();
     let buffer = frame.buffer_mut();
     view.forget_targets();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        render_too_small(buffer, area, view, theme);
+        return;
+    }
     let subdued = theme.text.subdued;
     let primary = theme.text.primary;
 
@@ -86,12 +119,14 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
 
     let range = view.range();
     let measure = view.measure();
+    let breakdown = view.breakdown();
+    let controls = Controls::fitting(area.width, breakdown);
     let controls_y = area.y + 3;
     let bar_end = render_tabs(
         buffer,
         area.x + INSET - 1,
         controls_y,
-        MetricsRange::ALL.map(|chosen| (chosen.label(), chosen == range)),
+        MetricsRange::ALL.map(|chosen| (controls.range_label(chosen), chosen == range)),
         |place, at| view.record_range_target(MetricsRange::ALL[place], at),
         theme,
     );
@@ -103,17 +138,29 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
         |place, at| view.record_measure_target(MetricsMeasure::ALL[place], at),
         theme,
     );
-    let breakdown = view.breakdown();
     let lead_x = measures_end + CONTROL_GAP;
     buffer.set_string(lead_x, controls_y, BREAKDOWN_LEAD, subdued);
-    render_tabs(
-        buffer,
-        lead_x + u16::try_from(BREAKDOWN_LEAD.width()).unwrap_or(0),
-        controls_y,
-        BREAKDOWNS.map(|chosen| (chosen.label(), chosen == breakdown)),
-        |place, at| view.record_breakdown_target(BREAKDOWNS[place], at),
-        theme,
-    );
+    let breakdowns_x = lead_x + u16::try_from(BREAKDOWN_LEAD.width()).unwrap_or(0);
+    if controls.collapsed {
+        // Collapsed to its choice, the control takes the next, as `b` does.
+        render_tabs(
+            buffer,
+            breakdowns_x,
+            controls_y,
+            [(breakdown.label(), true)],
+            |_, at| view.record_breakdown_target(breakdown.next(), at),
+            theme,
+        );
+    } else {
+        render_tabs(
+            buffer,
+            breakdowns_x,
+            controls_y,
+            BREAKDOWNS.map(|chosen| (chosen.label(), chosen == breakdown)),
+            |place, at| view.record_breakdown_target(BREAKDOWNS[place], at),
+            theme,
+        );
+    }
     // What is happening to the figures shown takes the row under the
     // controls, where it has the whole width to say it in.
     let status_y = controls_y + 1;
@@ -133,9 +180,9 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
 
     let mut body = Rect::new(
         area.x + INSET,
-        area.y + 5,
+        area.y + HEAD_ROWS,
         area.width.saturating_sub(INSET * 2),
-        area.height.saturating_sub(6),
+        area.height.saturating_sub(HEAD_ROWS + 1),
     );
     // The headline states the range's figures above everything the report
     // draws, the hidden series among them: All time's count every Turn,
@@ -165,7 +212,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
     if matches!(view.content(), MetricsContent::Report { .. }) {
         // No legend or Session rows drawn until they say otherwise, so a
         // frame with no room for any leaves none to focus.
-        view.record_legend_targets(Rect::new(body.x, body.y, body.width, 0));
+        view.record_legend_targets([None; LEGEND_SERIES]);
         view.record_session_targets(Rect::new(body.x, body.y, body.width, 0));
     }
     if body.is_empty() {
@@ -230,11 +277,24 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 .and_then(|index| Legend::of_bucket(&series, measure, buckets, report, index));
             // Room is kept for a note either legend needs, so selecting a
             // bar never moves the chart.
-            let noted = across.noted || selected.as_ref().is_some_and(|legend| legend.noted);
+            let noted =
+                u16::from(across.noted || selected.as_ref().is_some_and(|legend| legend.noted));
             let mixed = measure == MetricsMeasure::Tokens;
-            let legend_rows = u16::try_from(series.len() + 1 + usize::from(noted))
-                .unwrap_or(u16::MAX)
-                .saturating_add(if mixed { MIX_ROWS + 1 } else { 0 });
+            let mix_rows = if mixed { MIX_ROWS + 1 } else { 0 };
+            // A row to each series where the frame is wide enough and the
+            // chart keeps its floor beside them; otherwise they flow along
+            // as few lines as hold them, and as many as there is room for.
+            let in_rows = u16::try_from(series.len()).unwrap_or(u16::MAX);
+            let flowed = (controls.collapsed
+                || body.height < CHART_FLOOR + 1 + 1 + in_rows + noted + mix_rows)
+                .then(|| Flowed::of(&series, measure, body.width));
+            let series_rows = flowed.as_ref().map_or(in_rows, |flowed| {
+                flowed.lines().min(
+                    body.height
+                        .saturating_sub(CHART_FLOOR + 1 + 1 + noted + mix_rows),
+                )
+            });
+            let legend_rows = 1 + series_rows + noted + mix_rows;
             // The Sessions that cost the most stand a blank row under the
             // legend, headed, as many as there is room for down to the
             // chart's floor, and none at all below the list's own.
@@ -262,7 +322,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 .filter(|series| !view.is_hidden(&series.id))
                 .cloned()
                 .collect();
-            if let Some(bars) = chart::render_chart(
+            let bars = chart::render_chart(
                 buffer,
                 chart_area,
                 buckets,
@@ -270,7 +330,8 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 measure,
                 view.selected_bucket(),
                 theme,
-            ) {
+            );
+            if let Some(bars) = bars {
                 view.record_bar_targets(bars);
             }
             let legend = Rect::new(
@@ -279,13 +340,28 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 body.width,
                 body.height.saturating_sub(chart_rows + 1 + list_rows),
             );
-            let shown = selected.unwrap_or(across);
-            render_legend(frame, legend, &series, &shown, view, theme);
+            // The legend reads the selected bar's figures, or the last
+            // drawn's where it is past them, as the mark under it stands.
+            let shown = view
+                .selected_bucket()
+                .zip(bars.and_then(|bars| bars.count.checked_sub(1)))
+                .and_then(|(at, last)| {
+                    Legend::of_bucket(&series, measure, buckets, report, at.min(last))
+                })
+                .unwrap_or(across);
+            let legend_area = Rect {
+                height: legend.height.min(1 + series_rows + noted),
+                ..legend
+            };
+            match &flowed {
+                Some(flowed) => {
+                    render_flowed_legend(frame, legend_area, &series, &shown, flowed, view, theme);
+                }
+                None => render_legend(frame, legend_area, &series, &shown, view, theme),
+            }
             if mixed {
                 // Under the legend, a blank row apart, reading what it reads.
-                let after = u16::try_from(series.len() + 2 + usize::from(noted))
-                    .unwrap_or(u16::MAX)
-                    .min(legend.height);
+                let after = (1 + series_rows + noted + 1).min(legend.height);
                 let mix = Rect::new(
                     legend.x,
                     legend.y + after,
@@ -300,6 +376,105 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
             }
         }
     }
+}
+
+/// What the view draws in a frame smaller than it can be drawn in: a request
+/// for a larger terminal, centred, saying how large and how to leave, and
+/// nothing a pointer or a key could act on.
+fn render_too_small(buffer: &mut Buffer, area: Rect, view: &MetricsView, theme: &Theme) {
+    view.record_bar_targets(BarStrip {
+        area: Rect::new(area.x, area.y, 0, 0),
+        slot: 1,
+        count: 0,
+    });
+    view.record_legend_targets([None; LEGEND_SERIES]);
+    view.record_session_targets(Rect::new(area.x, area.y, 0, 0));
+    let lines = [
+        (TOO_SMALL.to_owned(), theme.text.primary),
+        (
+            format!(
+                "It needs {MIN_WIDTH} × {MIN_HEIGHT} and has {} × {}. Esc closes.",
+                area.width, area.height
+            ),
+            theme.text.subdued,
+        ),
+    ];
+    let top = area.y + area.height.saturating_sub(2) / 2;
+    for (row, (line, style)) in lines.iter().enumerate() {
+        let Some(y) = u16::try_from(row)
+            .ok()
+            .map(|row| top + row)
+            .filter(|y| *y < area.bottom())
+        else {
+            break;
+        };
+        let line = truncate_to_width(line, usize::from(area.width));
+        let width = u16::try_from(line.width()).unwrap_or(area.width);
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        buffer.set_string(x, y, line, *style);
+    }
+}
+
+/// How the controls row is drawn: the ranges in their long words or their
+/// short, and every breakdown offered or the one chosen alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Controls {
+    short_ranges: bool,
+    collapsed: bool,
+}
+
+impl Controls {
+    /// The fullest controls row that stands whole in a frame `width` wide
+    /// with `breakdown` chosen: the ranges shortened first, then the
+    /// breakdowns collapsed, and the narrowest where even that does not.
+    fn fitting(width: u16, breakdown: UsageMetricsBreakdown) -> Self {
+        let narrowest = Self {
+            short_ranges: true,
+            collapsed: true,
+        };
+        [
+            Self {
+                short_ranges: false,
+                collapsed: false,
+            },
+            Self {
+                short_ranges: true,
+                collapsed: false,
+            },
+        ]
+        .into_iter()
+        .find(|controls| controls.width(breakdown) <= usize::from(width))
+        .unwrap_or(narrowest)
+    }
+
+    fn range_label(self, range: MetricsRange) -> &'static str {
+        if self.short_ranges {
+            range.short_label()
+        } else {
+            range.label()
+        }
+    }
+
+    /// The columns of a frame the row takes with `breakdown` chosen, the
+    /// insets either side counted, as [`render`] lays it out.
+    fn width(self, breakdown: UsageMetricsBreakdown) -> usize {
+        let ranges = tabs_width(MetricsRange::ALL.map(|range| self.range_label(range)));
+        let measures = tabs_width(MetricsMeasure::ALL.map(MetricsMeasure::label));
+        let breakdowns = if self.collapsed {
+            tabs_width([breakdown.label()])
+        } else {
+            tabs_width(BREAKDOWNS.map(OfferedBreakdown::label))
+        };
+        let inset = usize::from(INSET - 1);
+        let gap = usize::from(CONTROL_GAP);
+        inset + ranges + gap - 1 + measures + gap + BREAKDOWN_LEAD.width() + breakdowns + inset
+    }
+}
+
+/// The columns [`render_tabs`] draws `labels` in.
+fn tabs_width<const N: usize>(labels: [&str; N]) -> usize {
+    let tabs: usize = labels.iter().map(|label| label.width() + 2).sum();
+    tabs + usize::from(TAB_GAP) * N.saturating_sub(1)
 }
 
 /// The Sessions that cost the most under their heading, one to a row as
@@ -519,10 +694,11 @@ fn render_legend(
 ) {
     let buffer = frame.buffer_mut();
     let measure = view.measure();
-    let drawn = u16::try_from(series.len())
-        .unwrap_or(u16::MAX)
-        .min(area.height.saturating_sub(1));
-    view.record_legend_targets(Rect::new(area.x, area.y + 1, area.width, drawn));
+    let mut rows = [None; LEGEND_SERIES];
+    for (row, place) in rows.iter_mut().take(series.len()).zip(1..area.height) {
+        *row = Some(Rect::new(area.x, area.y + place, area.width, 1));
+    }
+    view.record_legend_targets(rows);
     if area.height == 0 {
         return;
     }
@@ -618,6 +794,153 @@ fn render_legend(
         let note = overlap_note(view.breakdown());
         let note = truncate_to_width(&note, usize::from(area.width));
         buffer.set_string(area.x, y, note, theme.text.subdued);
+    }
+}
+
+/// Where the series of a legend flow along its lines: each at a column of
+/// a line, in their order, as wide as its widest figure in any bucket or
+/// across them all needs, so none moves as a bar is selected.
+struct Flowed {
+    /// Each series' place: its column from the legend's left edge, and its
+    /// line from the first.
+    places: Vec<(u16, u16)>,
+    label_widths: Vec<usize>,
+    value_widths: Vec<usize>,
+}
+
+impl Flowed {
+    fn of(series: &[Series], measure: MetricsMeasure, room: u16) -> Self {
+        let label_widths: Vec<usize> = series
+            .iter()
+            .map(|series| series.label.width().min(FLOWED_LABEL))
+            .collect();
+        let value_widths: Vec<usize> = series
+            .iter()
+            .map(|series| {
+                series
+                    .values
+                    .iter()
+                    .zip(&series.partials)
+                    .map(|(value, partial)| measure.figure(*value, *partial).width())
+                    .chain([measure.figure(series.total, series.is_partial).width()])
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        let room = usize::from(room);
+        let (mut x, mut line) = (0, 0);
+        let mut places = Vec::with_capacity(series.len());
+        for (label, value) in label_widths.iter().zip(&value_widths) {
+            let width = Self::item_width(*label, *value).min(room);
+            if x > 0 && x + width > room {
+                line += 1;
+                x = 0;
+            }
+            places.push((
+                u16::try_from(x).unwrap_or(u16::MAX),
+                u16::try_from(line).unwrap_or(u16::MAX),
+            ));
+            x += width + FLOWED_GAP;
+        }
+        Self {
+            places,
+            label_widths,
+            value_widths,
+        }
+    }
+
+    /// A series' swatch and the column after it, then its label and its
+    /// figure a column apart.
+    fn item_width(label: usize, value: usize) -> usize {
+        2 + label + 1 + value
+    }
+
+    /// How many lines the series flow along.
+    fn lines(&self) -> u16 {
+        self.places.last().map_or(0, |(_, line)| line + 1)
+    }
+}
+
+/// The legend's heading, then its series flowing along the lines under it
+/// as `flowed` places them, as many lines as `area` has room for, in the
+/// chart's order: each its colour, label, and figure — its share is left to
+/// a legend with a row to each — a hidden series' subdued. Where the figures
+/// count more than the whole, a note under them says why.
+fn render_flowed_legend(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    series: &[Series],
+    legend: &Legend,
+    flowed: &Flowed,
+    view: &MetricsView,
+    theme: &Theme,
+) {
+    let buffer = frame.buffer_mut();
+    let measure = view.measure();
+    let lines = flowed
+        .lines()
+        .min(area.height.saturating_sub(1 + u16::from(legend.noted)));
+    let mut items = [None; LEGEND_SERIES];
+    if area.height == 0 {
+        view.record_legend_targets(items);
+        return;
+    }
+    buffer.set_string(
+        area.x,
+        area.y,
+        &legend.heading,
+        theme.text.primary.add_modifier(Modifier::BOLD),
+    );
+    let focused = view.focused_row();
+    let room = usize::from(area.width);
+    for (place, (((series, (x, line)), (label_width, value_width)), (figure, is_partial))) in series
+        .iter()
+        .zip(&flowed.places)
+        .zip(flowed.label_widths.iter().zip(&flowed.value_widths))
+        .zip(&legend.figures)
+        .enumerate()
+    {
+        if *line >= lines {
+            break;
+        }
+        let y = area.y + 1 + line;
+        let at = area.x + x;
+        let hidden = view.is_hidden(&series.id);
+        let glyph = if hidden { "░" } else { "█" };
+        buffer.set_string(at, y, glyph, Style::default().fg(series.color));
+        let focused = focused == Some(FocusedRow::Series(place));
+        let style = if focused {
+            theme.selection.focused
+        } else {
+            theme.text.primary
+        };
+        let style = if hidden {
+            style.patch(theme.text.subdued)
+        } else {
+            style
+        };
+        if focused && let Some(x) = at.checked_sub(1) {
+            // Marked in the column before the swatch, so no series moves.
+            buffer.set_string(x, y, "›", style);
+        }
+        let label = truncate_to_width(&series.label, *label_width);
+        let padding = " ".repeat(label_width.saturating_sub(label.width()));
+        let text = format!(
+            "{label}{padding} {value:>value_width$}",
+            value = measure.figure(*figure, *is_partial),
+        );
+        let left = room.saturating_sub(usize::from(*x) + 2);
+        let text = truncate_to_width(&text, left);
+        buffer.set_string(at + 2, y, &text, style);
+        let width = u16::try_from(2 + text.width()).unwrap_or(u16::MAX);
+        items[place] = Some(Rect::new(at, y, width, 1));
+    }
+    view.record_legend_targets(items);
+    let note_y = area.y + 1 + lines;
+    if legend.noted && note_y < area.bottom() {
+        let note = overlap_note(view.breakdown());
+        let note = truncate_to_width(&note, room);
+        buffer.set_string(area.x, note_y, note, theme.text.subdued);
     }
 }
 
