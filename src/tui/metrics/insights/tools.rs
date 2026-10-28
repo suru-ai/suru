@@ -9,7 +9,7 @@ use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    protocol::{InsightsTool, ToolUses},
+    protocol::{InsightsTool, ToolTally},
     theme::Theme,
 };
 
@@ -53,19 +53,18 @@ impl ToolsSort {
 }
 
 /// How many items the panel offers for selection: a Tool apiece.
-pub(super) fn items(tools: &[ToolUses]) -> usize {
+pub(super) fn items(tools: &[ToolTally]) -> usize {
     tools.len()
 }
 
 /// `tools` in the order `sort` lists them. The Server sends them the most
-/// used first, those as often used the most failed first; sorted by
-/// failures, those as often failed are the most used first, and those
-/// alike in both keep the Server's order.
-fn ordered(tools: &[ToolUses], sort: ToolsSort) -> Vec<&ToolUses> {
+/// used first, which is that order as it stands; sorted by failures, those
+/// as often failed are the most used first, and those alike in both keep
+/// the Server's order.
+fn ordered(tools: &[ToolTally], sort: ToolsSort) -> Vec<&ToolTally> {
     let mut ordered = tools.iter().collect::<Vec<_>>();
-    match sort {
-        ToolsSort::Uses => ordered.sort_by_key(|tool| Reverse((tool.uses, tool.failed))),
-        ToolsSort::Failures => ordered.sort_by_key(|tool| Reverse((tool.failed, tool.uses))),
+    if sort == ToolsSort::Failures {
+        ordered.sort_by_key(|tool| Reverse((tool.failed, tool.uses)));
     }
     ordered
 }
@@ -90,7 +89,7 @@ fn label(tool: &InsightsTool) -> Cow<'_, str> {
 pub(super) fn render(
     buffer: &mut Buffer,
     area: Rect,
-    tools: &[ToolUses],
+    tools: &[ToolTally],
     range: MetricsRange,
     selected: Option<usize>,
     view: &InsightsView,
@@ -120,7 +119,9 @@ pub(super) fn render(
     let header = line("Tool", uses, failed);
     buffer.set_string(area.x, area.y, truncate_to_width(&header, room), subdued);
     let ordered = ordered(tools, sort);
-    let window = RowWindow::new(ordered.len(), SHOWN, view.scrolled(InsightsPanel::Tools));
+    let panel = InsightsPanel::Tools;
+    let lines = panel.room().expect("the Tools panel scrolls");
+    let window = RowWindow::new(ordered.len(), lines, view.scrolled(panel));
     let rows = ordered
         .iter()
         .enumerate()
@@ -148,12 +149,13 @@ pub(super) fn render(
     }
     if window.folded > 0 {
         let y = area.y + 1 + u16::try_from(window.shown).unwrap_or(u16::MAX);
-        let fold = format!("({} more)", grouped_count(window.folded as u64));
+        let folded = u64::try_from(window.folded).unwrap_or(u64::MAX);
+        let fold = format!("({} more)", grouped_count(folded));
         buffer.set_string(area.x, y, truncate_to_width(&fold, room), subdued);
     }
     let shown = u16::try_from(window.shown).unwrap_or(u16::MAX);
     view.record_item_targets(
-        InsightsPanel::Tools,
+        panel,
         Rect::new(area.x, area.y + 1, area.width, shown),
         area.width,
         window.first,

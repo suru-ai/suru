@@ -15,7 +15,7 @@ use ratatui::{buffer::Buffer, style::Style};
 use suru::{
     protocol::{
         Cost, InsightsQuery, InsightsReport, InsightsTool, Outlook, QUARTER_HOUR_MS,
-        QuarterHourTurns, ToolUses, TurnDurations, TurnInsights, UsageMetricsInterval,
+        QuarterHourTurns, ToolTally, TurnDurations, TurnInsights, UsageMetricsInterval,
         UsageMetricsQuery,
     },
     tui::{
@@ -93,8 +93,8 @@ fn worked() -> InsightsReport {
     }
 }
 
-fn tool(tool: InsightsTool, uses: u64, failed: u64) -> ToolUses {
-    ToolUses { tool, uses, failed }
+fn tool(tool: InsightsTool, uses: u64, failed: u64) -> ToolTally {
+    ToolTally { tool, uses, failed }
 }
 
 fn named(server: Option<&str>, name: &str) -> InsightsTool {
@@ -106,7 +106,7 @@ fn named(server: Option<&str>, name: &str) -> InsightsTool {
 
 /// The Tools the mockup's reader's Agents used, the most used first as the
 /// Server sends them: more than the panel has rows for.
-fn worked_tools() -> Vec<ToolUses> {
+fn worked_tools() -> Vec<ToolTally> {
     vec![
         tool(InsightsTool::Command, 4_210, 212),
         tool(InsightsTool::FileChange, 2_987, 9),

@@ -21,7 +21,7 @@ use crate::{
     protocol::{
         AgentSelection, CheckoutAssociation, ExecutionDirectory, InsightsTool, Outlook, PromptId,
         ProviderId, RepositoryLocation, SessionId, SessionSnapshot, SessionSummary,
-        SessionTimestamp, ToolUses, TranscriptItem, TurnId, UnreadableSessionSummary, Workspace,
+        SessionTimestamp, ToolTally, TranscriptItem, TurnId, UnreadableSessionSummary, Workspace,
         WorkspaceDescription, WorkspaceId,
     },
     provider::{ProviderResumeState, ProviderSubagentId},
@@ -804,19 +804,19 @@ impl StorageRepository {
     /// how many of those uses failed, read from the Activities storage holds
     /// without reading any Session's history in (ADR 0056). Each row gives up
     /// only its kind, status, and Tool name and server, and the Turn owning
-    /// it; no payload is decoded whole. Storage lags a Session open in
+    /// it; no payload is deserialized. Storage lags a Session open in
     /// memory by whatever it has not saved yet, which the read accepts.
     ///
     /// The rows are read a few Sessions at a time, so no query binds more
     /// than [`SESSIONS_PER_TOOL_READ`] of them, and streamed into the tally
     /// rather than held: a Session's rows are read whole, whichever of its
     /// Turns they belong to, and those of a Turn not named left out here.
-    pub(crate) async fn tool_uses(
+    pub(crate) async fn tool_tallies(
         &self,
         turns: HashMap<SessionId, HashSet<TurnId>>,
-    ) -> Result<Vec<ToolUses>, StorageError> {
+    ) -> Result<Vec<ToolTally>, StorageError> {
         let path = self.database_path.clone();
-        on_blocking_task("reading Tool uses", move || {
+        on_blocking_task("reading Tool tallies", move || {
             let mut connection = connect(&path)?;
             let turns = turns
                 .into_iter()
@@ -842,7 +842,7 @@ impl StorageRepository {
                         diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.name')"),
                         diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.server')"),
                     ))
-                    .load_iter::<ToolUseRow, diesel::connection::DefaultLoadingMode>(
+                    .load_iter::<ToolTallyRow, diesel::connection::DefaultLoadingMode>(
                         &mut connection,
                     )
                     .map_err(|error| StorageError::Read(error.to_string()))?;
@@ -865,7 +865,7 @@ impl StorageRepository {
             }
             Ok(tally
                 .into_iter()
-                .map(|(tool, (uses, failed))| ToolUses { tool, uses, failed })
+                .map(|(tool, (uses, failed))| ToolTally { tool, uses, failed })
                 .collect())
         })
         .await
@@ -1789,13 +1789,13 @@ fn refuse_newer_schema(connection: &mut SqliteConnection) -> Result<(), StorageE
     Ok(())
 }
 
-/// How many Sessions one query of [`StorageRepository::tool_uses`] binds,
+/// How many Sessions one query of [`StorageRepository::tool_tallies`] binds,
 /// well within the fewest host parameters any SQLite build allows.
 const SESSIONS_PER_TOOL_READ: usize = 500;
 
-/// What [`StorageRepository::tool_uses`] reads of an Activity row: its
+/// What [`StorageRepository::tool_tallies`] reads of an Activity row: its
 /// Session and Turn, and its kind, status, Tool name, and MCP server.
-type ToolUseRow = (
+type ToolTallyRow = (
     String,
     String,
     String,
@@ -1805,7 +1805,7 @@ type ToolUseRow = (
 );
 
 /// The Tool an Activity of `kind` used, named `name` and hosted by `server`
-/// where it is a Tool Call: none where the row is no Tool's use, or a Tool
+/// where it is a Tool Call: none where the row records no use of a Tool, or a Tool
 /// Call's name is missing.
 fn used_tool(kind: &str, name: Option<String>, server: Option<String>) -> Option<InsightsTool> {
     match kind {

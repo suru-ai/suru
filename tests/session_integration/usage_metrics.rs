@@ -7,7 +7,7 @@ use std::time::Duration;
 use suru::{
     protocol::{
         Cost, InsightsQuery, InsightsReport, InsightsTool, QUARTER_HOUR_MS, RuntimeDescriptor,
-        SessionError, SessionErrorCode, SessionTimestamp, TURN_DURATION_BINS, ToolUses,
+        SessionError, SessionErrorCode, SessionTimestamp, TURN_DURATION_BINS, ToolTally,
         TurnDurations, TurnInsights, Usage, UsageMetricsAggregate, UsageMetricsBreakdown,
         UsageMetricsInterval, UsageMetricsKey, UsageMetricsQuery, UsageMetricsReport,
     },
@@ -257,7 +257,7 @@ async fn insights_are_read_over_the_api_and_a_backwards_interval_is_refused() {
 
     assert_eq!(
         report.tools,
-        vec![ToolUses {
+        vec![ToolTally {
             tool: InsightsTool::Named {
                 name: "create_issue".to_owned(),
                 server: Some("github".to_owned()),

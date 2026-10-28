@@ -272,7 +272,7 @@ pub struct InsightsReport {
     /// used as often the most failed first. Each use is an Activity of a
     /// Turn the interval holds, read from storage, so a Session working
     /// now may have used a Tool more recently than this says.
-    pub tools: Vec<ToolUses>,
+    pub tools: Vec<ToolTally>,
 }
 
 /// A Tool an Agent used, as the Insights tab tells them apart.
@@ -283,8 +283,9 @@ pub enum InsightsTool {
     Command,
     /// A File Change made to the Workspace.
     FileChange,
-    /// A Subagent the Agent delegated work to, natively or through the
-    /// Broker.
+    /// A delegation to a Subagent — spawn or resume — natively or through
+    /// the Broker: each stretch of a Subagent's work stands as a Subagent
+    /// row of its own.
     Subagent,
     /// Any other Tool, by its name as its Provider spells it, and the MCP
     /// server hosting it where it has one.
@@ -298,7 +299,7 @@ pub enum InsightsTool {
 /// uses failed.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ToolUses {
+pub struct ToolTally {
     pub tool: InsightsTool,
     pub uses: u64,
     pub failed: u64,

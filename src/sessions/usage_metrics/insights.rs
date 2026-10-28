@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::protocol::{
     InsightsQuery, InsightsReport, QUARTER_HOUR_MS, QuarterHourTurns, SessionId,
-    TURN_DURATION_BIN_ENDS_MS, TURN_DURATION_BINS, ToolUses, Turn, TurnDurations, TurnId,
+    TURN_DURATION_BIN_ENDS_MS, TURN_DURATION_BINS, ToolTally, Turn, TurnDurations, TurnId,
     TurnInsights, TurnStatus, Usage,
 };
 
@@ -83,13 +83,13 @@ impl SessionStore {
                 fold.add_cost(&contribution);
             }
         }
-        // A store restored with no storage behind it holds every history in
-        // memory and none in storage, so it has no Tools to read.
+        // Only a store restored without storage, as some tests restore one,
+        // lacks a repository; its Tools are in memory, and are not counted.
         if let Some(repository) = repository
             && !fold.held_turns.is_empty()
         {
             let held = std::mem::take(&mut fold.held_turns);
-            let tools = repository.tool_uses(held).await.map_err(|error| {
+            let tools = repository.tool_tallies(held).await.map_err(|error| {
                 tracing::warn!(%error, "reading the Tools Insights counts failed");
                 InsightsRefusal::Storage
             })?;
@@ -105,10 +105,10 @@ struct InsightsFold {
     turns: TurnTally,
     quarter_hours: QuarterHourTally,
     /// The Turns the interval holds of each Session, whose Activities are
-    /// the Tool uses it counts.
+    /// the uses of Tools it counts.
     held_turns: HashMap<SessionId, HashSet<TurnId>>,
     /// How often each Tool was used, in no order yet.
-    tools: Vec<ToolUses>,
+    tools: Vec<ToolTally>,
 }
 
 impl InsightsFold {
@@ -140,7 +140,7 @@ impl InsightsFold {
 /// `tools` the most used first, those used as often the most failed first,
 /// and those alike in both as their Tools are ordered, so the order is the
 /// same at every read.
-fn most_used_first(mut tools: Vec<ToolUses>) -> Vec<ToolUses> {
+fn most_used_first(mut tools: Vec<ToolTally>) -> Vec<ToolTally> {
     tools.sort_unstable_by(|left, right| {
         (right.uses, right.failed)
             .cmp(&(left.uses, left.failed))

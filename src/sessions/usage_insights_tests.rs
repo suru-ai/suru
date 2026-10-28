@@ -13,7 +13,7 @@ use crate::{
     protocol::{
         Activity, ActivityId, ActivityStatus, Author, Cost, InsightsQuery, InsightsReport,
         InsightsTool, QUARTER_HOUR_MS, QuarterHourTurns, SessionListItem, SessionTimestamp,
-        ToolUses, TranscriptItem, Turn, TurnDurations, TurnId, TurnInsights, TurnStatus,
+        ToolTally, TranscriptItem, Turn, TurnDurations, TurnId, TurnInsights, TurnStatus,
         UsageMetricsInterval, UsageTotal,
     },
     sidekick::SidekickWorkspace,
@@ -432,6 +432,25 @@ fn tool_call(
 }
 
 fn spawned(turn_id: TurnId, status: ActivityStatus, brokered: bool) -> Activity {
+    delegated(turn_id, status, brokered, crate::protocol::SessionId::new())
+}
+
+/// A later stretch of the delegation `spawn` began, resuming the same
+/// Subagent in the Turn `turn_id`: a Subagent row of its own.
+fn resumed(spawn: &Activity, turn_id: TurnId, status: ActivityStatus) -> Activity {
+    let Activity::Subagent { session_id, .. } = spawn else {
+        panic!("a Subagent row resumes a Subagent row's Subagent");
+    };
+    delegated(turn_id, status, false, *session_id)
+}
+
+/// A Subagent row delegating to the Subagent of `session_id`.
+fn delegated(
+    turn_id: TurnId,
+    status: ActivityStatus,
+    brokered: bool,
+    session_id: crate::protocol::SessionId,
+) -> Activity {
     Activity::Subagent {
         id: ActivityId::new(),
         turn_id,
@@ -439,7 +458,7 @@ fn spawned(turn_id: TurnId, status: ActivityStatus, brokered: bool) -> Activity 
         name: "explorer".to_owned(),
         description: "map the seams".to_owned(),
         model: None,
-        session_id: crate::protocol::SessionId::new(),
+        session_id,
         brokered,
         duration_ms: None,
         delegated_at: None,
@@ -465,8 +484,8 @@ fn named(server: Option<&str>, name: &str) -> InsightsTool {
     }
 }
 
-fn uses(tool: InsightsTool, uses: u64, failed: u64) -> ToolUses {
-    ToolUses { tool, uses, failed }
+fn tally(tool: InsightsTool, uses: u64, failed: u64) -> ToolTally {
+    ToolTally { tool, uses, failed }
 }
 
 #[tokio::test]
@@ -482,6 +501,7 @@ async fn tools_are_tallied_from_the_stored_activities_of_the_interval_s_turns() 
         ended(TurnStatus::Completed, None, None),
     ];
     let [first, last, before, untimed] = [0, 1, 2, 3].map(|turn| parent.snapshot.turns[turn].id);
+    let explorer = spawned(first, Completed, false);
     for activity in [
         command(first, Completed),
         command(first, Failed),
@@ -495,9 +515,11 @@ async fn tools_are_tallied_from_the_stored_activities_of_the_interval_s_turns() 
         // of the same name that none does as from one another hosts.
         tool_call(first, Some("github"), "create_pr", Failed),
         tool_call(last, Some("fs"), "Read", Completed),
-        spawned(first, Completed, false),
+        // Each delegation counts, a resume of a Subagent as its spawn does.
+        resumed(&explorer, last, Completed),
+        explorer,
         spawned(last, Failed, true),
-        // No Tool's use.
+        // No use of a Tool.
         reasoned(first),
         // Uses by Turns the interval does not hold.
         command(before, Failed),
@@ -518,14 +540,13 @@ async fn tools_are_tallied_from_the_stored_activities_of_the_interval_s_turns() 
     assert_eq!(
         report.tools,
         vec![
-            uses(InsightsTool::Command, 4, 1),
-            // As often used: the most failed first, and then as their
-            // kinds are ordered.
-            uses(InsightsTool::FileChange, 2, 1),
-            uses(InsightsTool::Subagent, 2, 1),
-            uses(named(None, "Read"), 2, 0),
-            uses(named(Some("github"), "create_pr"), 1, 1),
-            uses(named(Some("fs"), "Read"), 1, 0),
+            tally(InsightsTool::Command, 4, 1),
+            tally(InsightsTool::Subagent, 3, 1),
+            // As often used: the most failed first.
+            tally(InsightsTool::FileChange, 2, 1),
+            tally(named(None, "Read"), 2, 0),
+            tally(named(Some("github"), "create_pr"), 1, 1),
+            tally(named(Some("fs"), "Read"), 1, 0),
         ]
     );
     writer.shutdown().await.unwrap();
@@ -583,7 +604,7 @@ async fn tools_are_tallied_only_for_the_sessions_the_read_counts() {
 
     let tools = read(&store, &over(START, END)).await.tools;
 
-    assert_eq!(tools, vec![uses(InsightsTool::Command, 1, 0)]);
+    assert_eq!(tools, vec![tally(InsightsTool::Command, 1, 0)]);
     writer.shutdown().await.unwrap();
 }
 
@@ -613,7 +634,7 @@ async fn tools_are_read_from_storage_without_hydrating_a_deferred_session() {
 
     let tools = read(&store, &over(START, END)).await.tools;
 
-    assert_eq!(tools, vec![uses(InsightsTool::Command, 1, 1)]);
+    assert_eq!(tools, vec![tally(InsightsTool::Command, 1, 1)]);
     assert_eq!(read_state(&store), before, "no history was read in");
     writer.shutdown().await.unwrap();
 }
@@ -633,6 +654,6 @@ async fn an_open_session_s_tools_are_read_from_storage_as_well() {
 
     let tools = read(&store, &over(START, END)).await.tools;
 
-    assert_eq!(tools, vec![uses(InsightsTool::FileChange, 1, 0)]);
+    assert_eq!(tools, vec![tally(InsightsTool::FileChange, 1, 0)]);
     writer.shutdown().await.unwrap();
 }
