@@ -22,8 +22,6 @@ use super::SessionStoreState;
 /// record it carries each count, and work that leaves a total partial is
 /// stated beside any amount.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-// Read by Usage Metrics (#559), which places each contribution by its Turn.
-#[allow(dead_code)]
 pub(crate) struct CostContribution {
     /// The Session whose Turn carries the Cost.
     pub(crate) session_id: SessionId,
@@ -39,8 +37,6 @@ pub(crate) struct CostContribution {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CountedCost {
     pub(crate) cost: Cost,
-    // Read by Usage Metrics (#559), which states the Estimated portion apart.
-    #[allow(dead_code)]
     pub(crate) basis: CostBasis,
 }
 

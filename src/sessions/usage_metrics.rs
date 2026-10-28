@@ -5,19 +5,23 @@
 //! Every Session's Turns are in memory from startup, its history deferred or
 //! not (ADR 0022), so the read never hydrates one. It copies what it needs of
 //! each Turn under the store lock and adds them up outside it, so a large
-//! history holds up no other reader. A Remote's Session that a Sidekick here
+//! history holds up no other reader. Cost is read through Cost Coverage, as
+//! the tree Costs a listing shows are (ADR 0054): each contribution lands
+//! where the Turn carrying it does, so over all of time the buckets add up to
+//! the Server's root Sessions' tree Costs. A Remote's Session that a Sidekick here
 //! acted on is held apart from the Sessions living here (ADR 0049), so it is
 //! never counted: its own Server counts it.
 
 use std::collections::HashMap;
 
 use crate::protocol::{
-    KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS, ModelCatalog, SessionTimestamp, Turn, Usage,
-    UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsBucket, UsageMetricsKey,
-    UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport,
+    CostBasis, KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS, ModelCatalog, SessionId,
+    SessionTimestamp, Turn, TurnId, Usage, UsageMetricsAggregate, UsageMetricsBreakdown,
+    UsageMetricsBucket, UsageMetricsKey, UsageMetricsKeyLabel, UsageMetricsQuery,
+    UsageMetricsReport,
 };
 
-use super::{SessionStore, SessionStoreState};
+use super::{SessionStore, SessionStoreState, cost_coverage::CostContribution};
 
 /// Why a Usage Metrics query is refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,12 +57,21 @@ impl UsageMetricsRefusal {
     }
 }
 
-/// What the read copies of one Turn: where it is placed in time, the key it
-/// is broken down under, and its Usage.
+/// What the read copies of one Turn: which it is, where it is placed in
+/// time, the key it is broken down under, and its Usage.
 struct MeteredTurn {
+    session_id: SessionId,
+    turn_id: TurnId,
     placed_at: Option<SessionTimestamp>,
     key: UsageMetricsKey,
     usage: Option<Usage>,
+}
+
+/// What the read copies out of the store: every Turn living here, and what
+/// each adds to the Server's Cost.
+struct Metered {
+    turns: Vec<MeteredTurn>,
+    costs: Vec<CostContribution>,
 }
 
 impl SessionStore {
@@ -73,27 +86,58 @@ impl SessionStore {
         if let Some(refusal) = UsageMetricsRefusal::of(query) {
             return Err(refusal);
         }
-        let turns = self
+        let metered = self
             .state
             .lock()
             .expect("Session store lock is not poisoned")
-            .metered_turns(query.breakdown);
-        Ok(fold(query, turns, catalog))
+            .metered(query.breakdown);
+        Ok(fold(query, metered, catalog))
     }
 }
 
 impl SessionStoreState {
-    /// Every Turn of every Session living here, as the read needs it.
-    fn metered_turns(&self, breakdown: UsageMetricsBreakdown) -> Vec<MeteredTurn> {
-        self.sessions
-            .values()
-            .flat_map(|record| &record.snapshot.turns)
-            .map(|turn| MeteredTurn {
-                placed_at: turn.started_at.or(turn.settled_at),
-                key: key_of(breakdown, turn),
-                usage: turn.usage.clone(),
+    /// Every Turn of every Session living here, as the read needs it, and
+    /// the Cost contributions of every tree of Sessions here.
+    fn metered(&self, breakdown: UsageMetricsBreakdown) -> Metered {
+        let turns = self
+            .sessions
+            .iter()
+            .flat_map(|(session_id, record)| {
+                record.snapshot.turns.iter().map(|turn| MeteredTurn {
+                    session_id: *session_id,
+                    turn_id: turn.id,
+                    placed_at: turn.started_at.or(turn.settled_at),
+                    key: key_of(breakdown, turn),
+                    usage: turn.usage.clone(),
+                })
             })
-            .collect()
+            .collect();
+        let costs = self
+            .sessions
+            .keys()
+            .filter(|session_id| self.heads_a_cost_tree(**session_id))
+            .flat_map(|root| self.tree_cost_contributions(*root))
+            .collect();
+        Metered { turns, costs }
+    }
+
+    /// Whether this Session's tree Cost is one of those the Server's Cost
+    /// adds up: a root Session's, unless it is a Subsession whose Sidekick's
+    /// tree Cost already carries it. Every Session reached from a root is
+    /// then counted once: a Subagent in its root's tree, and a Subsession in
+    /// its Sidekick's.
+    fn heads_a_cost_tree(&self, session_id: SessionId) -> bool {
+        let is_root = |session_id: SessionId| {
+            self.sessions
+                .get(&session_id)
+                .is_some_and(|record| record.snapshot.session.parent.is_none())
+        };
+        is_root(session_id)
+            && self.sessions[&session_id]
+                .summary
+                .session
+                .sidekick()
+                .is_none_or(|sidekick| !is_root(sidekick))
     }
 }
 
@@ -126,6 +170,11 @@ impl Tally {
         }
     }
 
+    fn add_cost(&mut self, key: UsageMetricsKey, contribution: &CostContribution) {
+        add_contribution(&mut self.total, contribution);
+        add_contribution(self.by_key.entry(key).or_default(), contribution);
+    }
+
     fn into_bucket(mut self, keys: &[UsageMetricsKey]) -> UsageMetricsBucket {
         UsageMetricsBucket {
             total: self.total,
@@ -142,35 +191,69 @@ impl Tally {
     }
 }
 
-fn fold(
-    query: &UsageMetricsQuery,
-    turns: Vec<MeteredTurn>,
-    catalog: &ModelCatalog,
-) -> UsageMetricsReport {
+/// Adds what one Turn contributes to a Cost: its amount, and its Estimated
+/// portion, where it counts one, and its partial mark.
+fn add_contribution(aggregate: &mut UsageMetricsAggregate, contribution: &CostContribution) {
+    if let Some(amount) = contribution.amount {
+        let add = |held: Option<crate::protocol::Cost>| {
+            Some(held.map_or(amount.cost, |held| held.saturating_add(amount.cost)))
+        };
+        aggregate.cost = add(aggregate.cost);
+        if amount.basis == CostBasis::Estimated {
+            aggregate.estimated_cost = add(aggregate.estimated_cost);
+        }
+    }
+    aggregate.is_cost_partial |= contribution.is_partial;
+}
+
+fn fold(query: &UsageMetricsQuery, metered: Metered, catalog: &ModelCatalog) -> UsageMetricsReport {
     let mut buckets = query
         .buckets
         .iter()
         .map(|_| Tally::default())
         .collect::<Vec<_>>();
     let mut untimed = Tally::default();
-    let mut earliest_turn_at = None::<SessionTimestamp>;
-    for turn in turns {
-        let Some(placed_at) = turn.placed_at else {
-            untimed.add(turn);
-            continue;
-        };
-        earliest_turn_at = Some(earliest_turn_at.map_or(placed_at, |held| held.min(placed_at)));
-        // The buckets run in order without overlapping, so the one that can
-        // hold the moment is the first not over before it.
+    // The bucket a moment falls in, if any: the buckets run in order without
+    // overlapping, so the one that can hold it is the first not over before it.
+    let bucket_of = |placed_at: SessionTimestamp| {
         let index = query
             .buckets
             .partition_point(|bucket| bucket.end <= placed_at);
-        if query
+        query
             .buckets
             .get(index)
             .is_some_and(|bucket| bucket.contains(placed_at))
-        {
-            buckets[index].add(turn);
+            .then_some(index)
+    };
+    let mut earliest_turn_at = None::<SessionTimestamp>;
+    // Where each Turn landed, for the Cost it carries to land beside it.
+    let mut placed = HashMap::with_capacity(metered.turns.len());
+    for turn in metered.turns {
+        let place = turn.placed_at.map(bucket_of);
+        placed.insert((turn.session_id, turn.turn_id), (place, turn.key.clone()));
+        match place {
+            None => untimed.add(turn),
+            Some(index) => {
+                let placed_at = turn.placed_at.expect("a placed Turn is timed");
+                earliest_turn_at =
+                    Some(earliest_turn_at.map_or(placed_at, |held| held.min(placed_at)));
+                if let Some(index) = index {
+                    buckets[index].add(turn);
+                }
+            }
+        }
+    }
+    for contribution in &metered.costs {
+        // Every contribution is of a Turn the store holds; one that were not
+        // would still count, with nothing to place it by.
+        let (place, key) = placed
+            .get(&(contribution.session_id, contribution.turn_id))
+            .cloned()
+            .unwrap_or((None, UsageMetricsKey::Unknown));
+        match place {
+            None => untimed.add_cost(key, contribution),
+            Some(Some(index)) => buckets[index].add_cost(key, contribution),
+            Some(None) => {}
         }
     }
 

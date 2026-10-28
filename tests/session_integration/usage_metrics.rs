@@ -5,11 +5,11 @@
 use crate::session_integration::support::{read_session_until, working_turn};
 use suru::{
     protocol::{
-        RuntimeDescriptor, SessionError, SessionErrorCode, SessionTimestamp, Usage,
+        Cost, RuntimeDescriptor, SessionError, SessionErrorCode, SessionTimestamp, Usage,
         UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsQuery,
         UsageMetricsReport,
     },
-    provider::ProviderEvent,
+    provider::{MeteredCost, ProviderEvent},
 };
 
 fn by_model(buckets: Vec<UsageMetricsInterval>) -> UsageMetricsQuery {
@@ -46,7 +46,7 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
                 output_tokens: Some(1_000),
                 ..Usage::default()
             },
-            cost: None,
+            cost: Some(MeteredCost::reported(Cost::from_usd(0.25).unwrap())),
         })
         .await;
     let snapshot = read_session_until(
@@ -87,6 +87,9 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
     let measured = UsageMetricsAggregate {
         fresh_input_tokens: Some(4_000),
         output_tokens: Some(1_000),
+        cost: Cost::from_usd(0.25),
+        // The Turn is working still, past what its Cost says.
+        is_cost_partial: true,
         ..UsageMetricsAggregate::default()
     };
     assert_eq!(report.buckets.len(), 2);

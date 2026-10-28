@@ -6,19 +6,20 @@ use std::path::Path;
 use super::{Pairing, RemoteAct, SessionStore, UsageMetricsRefusal, restoration_tests::persisted};
 use crate::{
     protocol::{
-        AgentId, AgentIdentity, AgentSelection, Author, KeyedUsageMetrics,
-        MAX_USAGE_METRICS_BUCKETS, ModelAvailability, ModelCatalog, ModelDescriptor, ModelId,
-        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, SessionListItem, SessionTimestamp,
-        Turn, TurnId, TurnStatus, Usage, UsageMetricsAggregate, UsageMetricsBreakdown,
-        UsageMetricsBucket, UsageMetricsInterval, UsageMetricsKey, UsageMetricsKeyLabel,
-        UsageMetricsQuery, UsageMetricsReport, UsageTotal,
+        AgentId, AgentIdentity, AgentSelection, Author, Cost, CostBasis, CostCoverage, CostDetails,
+        KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS, ModelAvailability, ModelCatalog,
+        ModelDescriptor, ModelId, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
+        SessionListItem, SessionTimestamp, Turn, TurnId, TurnStatus, Usage, UsageMetricsAggregate,
+        UsageMetricsBreakdown, UsageMetricsBucket, UsageMetricsInterval, UsageMetricsKey,
+        UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport, UsageTotal,
     },
     sidekick::SidekickWorkspace,
     storage::{PersistedSession, RestoredSessions, StorageRepository, StorageWriter},
 };
 
 /// A Turn of `model` under `provider`, Settled as Completed, that began at
-/// `started_at`, Settled at `settled_at`, and reported `output` tokens.
+/// `started_at`, Settled at `settled_at`, and reported `output` tokens, with
+/// no Cost.
 fn metered(
     agent: Option<(&str, &str)>,
     started_at: Option<u64>,
@@ -82,9 +83,12 @@ fn by_model(buckets: &[(u64, u64)]) -> UsageMetricsQuery {
     }
 }
 
+/// `tokens` of output from Turns that recorded no Cost, so their Cost is
+/// unknown.
 fn output(tokens: u64) -> UsageMetricsAggregate {
     UsageMetricsAggregate {
         output_tokens: Some(tokens),
+        is_cost_partial: true,
         ..Default::default()
     }
 }
@@ -239,6 +243,9 @@ async fn a_part_no_turn_reported_stays_absent_and_failed_interrupted_and_active_
         cache_write_tokens: None,
         output_tokens: Some(7),
         reasoning_tokens: Some(3),
+        cost: None,
+        is_cost_partial: true,
+        estimated_cost: None,
     };
     assert_eq!(
         report.buckets,
@@ -466,5 +473,272 @@ async fn reading_never_hydrates_a_deferred_session_and_moves_no_revision() {
     assert_eq!(report.buckets, vec![only(fable(), 11)]);
     assert_eq!(deferred(&store), [true, true], "no history was read in");
     assert_eq!(revisions(&store), before);
+    writer.shutdown().await.unwrap();
+}
+
+const OPUS: Option<(&str, &str)> = Some(("claude", "claude-opus-5-5"));
+const SONNET: Option<(&str, &str)> = Some(("claude", "claude-sonnet-5-5"));
+const CODEX: Option<(&str, &str)> = Some(("codex", "gpt-5.5-codex"));
+
+fn key(agent: Option<(&str, &str)>) -> UsageMetricsKey {
+    let (provider, model) = agent.expect("a known Agent");
+    UsageMetricsKey::Model {
+        provider: ProviderId::new(provider),
+        model: ModelId::new(model),
+    }
+}
+
+fn usd(usd: f64) -> Option<Cost> {
+    Some(Cost::from_usd(usd).unwrap())
+}
+
+/// `turn`, its Cost `usd` as `basis` says it was computed, covering what
+/// `coverage` says and recorded at `recorded_at`.
+fn priced(
+    turn: Turn,
+    usd: f64,
+    basis: CostBasis,
+    coverage: CostCoverage,
+    recorded_at: u64,
+) -> Turn {
+    Turn {
+        cost: Cost::from_usd(usd),
+        cost_basis: Some(basis),
+        cost_details: Some(CostDetails {
+            coverage,
+            recorded_at: SessionTimestamp(recorded_at),
+            is_partial: false,
+            prior: Vec::new(),
+        }),
+        ..turn
+    }
+}
+
+/// A Turn of `agent` begun at `started_at` whose own Cost is `usd`, recorded
+/// as it Settled one moment later.
+fn turn_scoped(agent: Option<(&str, &str)>, started_at: u64, usd: f64) -> Turn {
+    priced(
+        metered(agent, Some(started_at), Some(started_at + 1), 1),
+        usd,
+        CostBasis::Reported,
+        CostCoverage::Turn,
+        started_at + 1,
+    )
+}
+
+/// A Turn of `agent` begun at `started_at` carrying `usd`, the running total
+/// of its Session's tree in `lifetime`, recorded as it Settled.
+fn running_total(agent: Option<(&str, &str)>, started_at: u64, usd: f64, lifetime: &str) -> Turn {
+    priced(
+        metered(agent, Some(started_at), Some(started_at + 1), 1),
+        usd,
+        CostBasis::Reported,
+        CostCoverage::SessionSubtree {
+            reporting_lifetime: lifetime.to_owned(),
+        },
+        started_at + 1,
+    )
+}
+
+/// What a bucket or a key's part of it says it cost: the amount, whether it
+/// is partial, and its Estimated portion.
+fn cost(aggregate: &UsageMetricsAggregate) -> (Option<Cost>, bool, Option<Cost>) {
+    (
+        aggregate.cost,
+        aggregate.is_cost_partial,
+        aggregate.estimated_cost,
+    )
+}
+
+fn keyed(bucket: &UsageMetricsBucket, key: &UsageMetricsKey) -> UsageMetricsAggregate {
+    bucket
+        .by_key
+        .iter()
+        .find(|keyed| &keyed.key == key)
+        .unwrap_or_else(|| panic!("{key:?} in {bucket:?}"))
+        .aggregate
+}
+
+fn tree_cost(store: &SessionStore, id: crate::protocol::SessionId) -> Option<Cost> {
+    store
+        .subscribe(id)
+        .unwrap()
+        .snapshot
+        .total_cost
+        .map(|total| total.cost)
+}
+
+#[tokio::test]
+async fn a_turn_scoped_cost_lands_in_its_turn_s_bucket_with_its_estimated_portion_apart() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![
+        turn_scoped(OPUS, 11, 0.10),
+        priced(
+            metered(OPUS, Some(12), Some(13), 1),
+            0.05,
+            CostBasis::Estimated,
+            CostCoverage::Turn,
+            13,
+        ),
+        turn_scoped(CODEX, 25, 0.20),
+    ];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+
+    let report = read(&store, &by_model(&[(10, 20), (20, 30)]));
+
+    assert_eq!(
+        cost(&report.buckets[0].total),
+        (usd(0.15), false, usd(0.05)),
+        "the Estimated portion is part of the Cost, and stated apart"
+    );
+    assert_eq!(
+        cost(&keyed(&report.buckets[0], &key(OPUS))),
+        (usd(0.15), false, usd(0.05))
+    );
+    assert_eq!(
+        cost(&report.buckets[1].total),
+        (usd(0.20), false, None),
+        "a Cost the Provider reported has no Estimated portion"
+    );
+    assert_eq!(
+        cost(&keyed(&report.buckets[1], &key(CODEX))),
+        (usd(0.20), false, None)
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_running_total_s_increments_land_in_the_buckets_of_the_turns_carrying_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![
+        running_total(OPUS, 11, 0.10, "first-process"),
+        running_total(OPUS, 21, 0.25, "first-process"),
+        running_total(OPUS, 31, 0.30, "first-process"),
+        // A second process restates its own total from nothing, and adds.
+        running_total(OPUS, 41, 0.07, "second-process"),
+    ];
+    let id = session.snapshot.session.id;
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+
+    let report = read(&store, &by_model(&[(10, 20), (20, 30), (30, 40), (40, 50)]));
+
+    assert_eq!(
+        report
+            .buckets
+            .iter()
+            .map(|bucket| cost(&bucket.total))
+            .collect::<Vec<_>>(),
+        [0.10, 0.15, 0.05, 0.07].map(|amount| (usd(amount), false, None)),
+        "each report adds what it adds to the highest total before it"
+    );
+    assert_eq!(
+        tree_cost(&store, id),
+        usd(0.37),
+        "the buckets add up to the Cost each lifetime last reported"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_whole_tree_report_counts_under_the_model_carrying_it_and_a_brokered_subagent_under_its_own()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let mut parent = persisted(directory.path(), None);
+    // Claude's whole-tree report covers the native Subagent it ran, and says
+    // nothing of how the amount divides between them.
+    parent.snapshot.turns = vec![running_total(OPUS, 10, 0.30, "parent-process")];
+    parent.snapshot.turns[0]
+        .cost_details
+        .as_mut()
+        .unwrap()
+        .recorded_at = SessionTimestamp(30);
+    let parent_id = parent.snapshot.session.id;
+    let mut native = persisted(directory.path(), Some(parent_id));
+    native.snapshot.turns = vec![turn_scoped(SONNET, 12, 0.05)];
+    let mut brokered = persisted(directory.path(), Some(parent_id));
+    brokered.brokered = true;
+    brokered.snapshot.turns = vec![turn_scoped(CODEX, 14, 0.08)];
+    let (store, writer) = restore(directory.path(), vec![parent, native, brokered]).await;
+
+    let report = read(&store, &by_model(&[(0, 100)]));
+
+    let bucket = &report.buckets[0];
+    assert_eq!(cost(&keyed(bucket, &key(OPUS))), (usd(0.30), false, None));
+    assert_eq!(
+        cost(&keyed(bucket, &key(SONNET))),
+        (None, false, None),
+        "the native Subagent's own Cost is inside its parent's report"
+    );
+    assert_eq!(
+        keyed(bucket, &key(SONNET)).output_tokens,
+        Some(1),
+        "though its Usage is its own"
+    );
+    assert_eq!(cost(&keyed(bucket, &key(CODEX))), (usd(0.08), false, None));
+    assert_eq!(cost(&bucket.total), (usd(0.38), false, None));
+    assert_eq!(tree_cost(&store, parent_id), usd(0.38));
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_sidekick_s_subsessions_are_counted_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut sidekick = persisted(directory.path(), None);
+    sidekick.snapshot.turns = vec![turn_scoped(OPUS, 11, 0.10)];
+    let sidekick_id = sidekick.snapshot.session.id;
+    let begun_by = Some(Author::Sidekick {
+        session_id: sidekick_id,
+        title: "Sidekick".to_owned(),
+    });
+    let mut subsession = persisted(directory.path(), None);
+    subsession.snapshot.session.begun_by = begun_by.clone();
+    subsession.summary.session.begun_by = begun_by;
+    subsession.snapshot.turns = vec![turn_scoped(CODEX, 12, 0.05)];
+    let subsession_id = subsession.snapshot.session.id;
+    let mut subagent = persisted(directory.path(), Some(subsession_id));
+    subagent.snapshot.turns = vec![turn_scoped(CODEX, 13, 0.02)];
+    let (store, writer) = restore(directory.path(), vec![sidekick, subsession, subagent]).await;
+
+    let report = read(&store, &by_model(&[(10, 20)]));
+
+    assert_eq!(
+        cost(&report.buckets[0].total),
+        (usd(0.17), false, None),
+        "the Subsession is counted beneath its Sidekick, and not again as a root"
+    );
+    assert_eq!(
+        cost(&keyed(&report.buckets[0], &key(CODEX))),
+        (usd(0.07), false, None)
+    );
+    assert_eq!(tree_cost(&store, sidekick_id), usd(0.17));
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_unpriced_turn_marks_its_bucket_its_key_and_the_untimed_figures_partial() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![
+        turn_scoped(OPUS, 11, 0.10),
+        metered(CODEX, Some(25), Some(26), 1),
+        metered(OPUS, None, None, 1),
+    ];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+
+    let report = read(&store, &by_model(&[(10, 20), (20, 30)]));
+
+    assert_eq!(cost(&report.buckets[0].total), (usd(0.10), false, None));
+    assert_eq!(
+        cost(&report.buckets[1].total),
+        (None, true, None),
+        "work with no known Cost is partial, not free"
+    );
+    assert_eq!(
+        cost(&keyed(&report.buckets[1], &key(CODEX))),
+        (None, true, None)
+    );
+    assert_eq!(cost(&report.untimed.total), (None, true, None));
     writer.shutdown().await.unwrap();
 }

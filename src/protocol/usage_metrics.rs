@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{ModelId, ProviderId, SessionTimestamp};
+use super::{Cost, ModelId, ProviderId, SessionTimestamp};
 
 /// The most buckets one query may ask for: enough for every hour of a day,
 /// every day of a year, or every month of decades, and few enough that a
@@ -106,7 +106,7 @@ pub struct KeyedUsageMetrics {
 
 /// What a set of Turns consumed together: the five parts of their Usage,
 /// each absent where no Turn among them reported it, as a Session's total
-/// keeps it.
+/// keeps it, and what their Cost Coverage contributions add up to.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageMetricsAggregate {
@@ -115,6 +115,18 @@ pub struct UsageMetricsAggregate {
     pub cache_write_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
+    /// The Cost the Turns contribute once every overlap is removed (ADR
+    /// 0054), a running total's increments placed on the Turns that carried
+    /// them; absent where none contributes a known amount, never a zero
+    /// nobody measured.
+    pub cost: Option<Cost>,
+    /// Whether work among the Turns has a Cost no counted amount accounts
+    /// for, so `cost` says less than they cost. It holds where `cost` is
+    /// absent too: unpriced work is still work.
+    pub is_cost_partial: bool,
+    /// The part of `cost` Suru estimated rather than the Provider reported;
+    /// absent where no contribution was Estimated.
+    pub estimated_cost: Option<Cost>,
 }
 
 impl UsageMetricsAggregate {

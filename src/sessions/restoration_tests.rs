@@ -9,9 +9,10 @@ use super::{
 use crate::{
     protocol::{
         Activity, ActivityId, ActivityStatus, Cost, CostBasis, CostCoverage, CostDetails,
-        CostTotal, ModelAvailability, Session, SessionId, SessionRevision, SessionSnapshot,
-        SessionStandingInputs, SessionStatus, SessionSummary, SessionTimestamp, TranscriptItem,
-        Turn, TurnId, TurnStatus, Usage, UsageTotal, Workspace,
+        CostTotal, ModelAvailability, ModelCatalog, Session, SessionId, SessionRevision,
+        SessionSnapshot, SessionStandingInputs, SessionStatus, SessionSummary, SessionTimestamp,
+        TranscriptItem, Turn, TurnId, TurnStatus, Usage, UsageMetricsAggregate,
+        UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsQuery, UsageTotal, Workspace,
     },
     storage::{PersistedSession, RestoredSessions, StorageRepository, StorageWriter},
 };
@@ -1261,12 +1262,88 @@ fn assert_same_contributions(
     assert!(actual.is_empty(), "{case}: unexpected {actual:?}");
 }
 
+/// The Usage Metrics invariant (ADR 0054): over a bucket holding all of time
+/// and the untimed figures beside it, the Server's Cost is its root
+/// Sessions' tree Costs added, each Session counted once — a Sidekick's
+/// Subsessions beneath it, not again as roots of their own — and partial
+/// exactly where one of those trees holds work no counted amount accounts
+/// for, a tree whose Cost is wholly unknown included. The keys divide that
+/// Cost without adding to it.
+fn assert_all_time_metrics_add_up_to_root_tree_costs(store: &SessionStore) {
+    let report = store
+        .usage_metrics(
+            &UsageMetricsQuery {
+                buckets: vec![UsageMetricsInterval {
+                    start: SessionTimestamp(0),
+                    end: SessionTimestamp(u64::MAX),
+                }],
+                breakdown: UsageMetricsBreakdown::Model,
+            },
+            &ModelCatalog {
+                providers: Vec::new(),
+            },
+        )
+        .expect("an all-time query is answered");
+    let added = |aggregates: &[UsageMetricsAggregate]| {
+        (
+            aggregates
+                .iter()
+                .filter_map(|aggregate| aggregate.cost)
+                .reduce(Cost::saturating_add),
+            aggregates.iter().any(|aggregate| aggregate.is_cost_partial),
+        )
+    };
+    let all_time = added(&[report.buckets[0].total, report.untimed.total]);
+    let by_key = added(
+        &report
+            .buckets
+            .iter()
+            .chain([&report.untimed])
+            .flat_map(|bucket| bucket.by_key.iter().map(|keyed| keyed.aggregate))
+            .collect::<Vec<_>>(),
+    );
+
+    let state = store.state.lock().unwrap();
+    let roots = state
+        .sessions
+        .iter()
+        .filter(|(_, record)| {
+            record.snapshot.session.parent.is_none()
+                && record
+                    .summary
+                    .session
+                    .sidekick()
+                    .is_none_or(|sidekick| !state.sessions.contains_key(&sidekick))
+        })
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    let tree_costs = (
+        roots
+            .iter()
+            .filter_map(|id| state.sessions[id].snapshot.total_cost)
+            .map(|total| total.cost)
+            .reduce(Cost::saturating_add),
+        roots.iter().any(|id| {
+            state
+                .tree_cost_contributions(*id)
+                .iter()
+                .any(|contribution| contribution.is_partial)
+        }),
+    );
+    assert_eq!(
+        all_time, tree_costs,
+        "all of time costs what the root Sessions' trees do"
+    );
+    assert_eq!(by_key, all_time, "the keys divide the Cost exactly");
+}
+
 /// Restoration states, for every root it folded, the tree Cost the
 /// contributions under that root add up to, and for every Session beneath,
 /// the own Cost its own contributions add up to. The live roll-up reads both
 /// as those sums, so this holds the startup fold to the same reading of Cost
 /// Coverage; `costs` holds it there for any Session a test names.
 fn assert_contributions_add_up(store: &SessionStore) {
+    assert_all_time_metrics_add_up_to_root_tree_costs(store);
     let state = store.state.lock().unwrap();
     let mut walk = state
         .sessions
