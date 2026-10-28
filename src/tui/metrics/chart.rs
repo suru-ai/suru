@@ -246,12 +246,14 @@ pub(crate) fn holds_nothing(report: &UsageMetricsReport) -> bool {
 }
 
 /// The colours series take in turn: the Theme's accent, then the bright
-/// ANSI hues it names, each once and none the canvas is painted with — as
+/// ANSI hues it names, each once, and none the canvas is painted with nor
+/// [`other_color`], so no key reads as the canvas or as Other — as
 /// many as [`KEYED_SERIES`] where the Theme's hues are all distinct. A Theme
 /// naming fewer distinct hues has them taken in turn again.
 fn palette(theme: &Theme) -> Vec<Color> {
     let bright = theme.ansi.bright;
     let canvas = theme.surface.base.bg;
+    let other = other_color(theme);
     let mut palette: Vec<Color> = Vec::new();
     for color in [
         theme.accent.primary.fg,
@@ -265,7 +267,11 @@ fn palette(theme: &Theme) -> Vec<Color> {
     .into_iter()
     .flatten()
     {
-        if color != Color::Reset && Some(color) != canvas && !palette.contains(&color) {
+        if color != Color::Reset
+            && Some(color) != canvas
+            && color != other
+            && !palette.contains(&color)
+        {
             palette.push(color);
         }
     }
@@ -276,8 +282,8 @@ fn palette(theme: &Theme) -> Vec<Color> {
 }
 
 /// The colour of the [`OTHER`] series: the Theme's subdued text, a neutral
-/// no key's colour is drawn from, so the folded keys never read as one of
-/// those shown.
+/// [`palette`] leaves out, so the folded keys never read as one of those
+/// shown.
 fn other_color(theme: &Theme) -> Color {
     theme
         .text
@@ -563,6 +569,20 @@ fn segment_at(boundaries: &[(u32, Color)], eighth: u32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_key_takes_other_s_colour_or_the_canvas_s() {
+        let mut theme = Theme::system();
+        theme.text.subdued = Style::default().fg(theme.ansi.bright.blue);
+        theme.surface.base = Style::default().bg(theme.ansi.bright.green);
+
+        let palette = palette(&theme);
+
+        assert_eq!(other_color(&theme), theme.ansi.bright.blue);
+        assert!(!palette.contains(&theme.ansi.bright.blue), "{palette:?}");
+        assert!(!palette.contains(&theme.ansi.bright.green), "{palette:?}");
+        assert!(!palette.is_empty());
+    }
 
     #[test]
     fn an_axis_steps_by_one_two_or_five_times_a_power_of_ten() {
