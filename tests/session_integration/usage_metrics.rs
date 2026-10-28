@@ -17,6 +17,7 @@ fn by_model(buckets: Vec<UsageMetricsInterval>) -> UsageMetricsQuery {
         buckets,
         breakdown: UsageMetricsBreakdown::Model,
         comparison: None,
+        top_sessions: 0,
     }
 }
 
@@ -76,6 +77,7 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
         &descriptor,
         &UsageMetricsQuery {
             comparison: Some(the_turn),
+            top_sessions: 3,
             ..by_model(vec![
                 UsageMetricsInterval {
                     start: SessionTimestamp(0),
@@ -122,6 +124,15 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
     assert_eq!(
         report.across_buckets.total, measured,
         "the buckets taken together hold the one Session's Turn"
+    );
+    assert_eq!(
+        report
+            .top_sessions
+            .iter()
+            .map(|session| (session.session_id, session.cost, session.is_cost_partial))
+            .collect::<Vec<_>>(),
+        vec![(fixture.session_id, Cost::from_usd(0.25).unwrap(), true)],
+        "the one Session that cost anything, its Turn working still"
     );
 
     // By Workspace, the Turn counts under its Session's, named as a

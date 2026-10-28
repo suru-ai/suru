@@ -38,10 +38,10 @@ use crate::protocol::{
     AUTHOR_HEADER, Activity, AdmitPromptRequest, AgentSelection, Author, CloneWorkspaceRequest,
     ClonedWorkspace, CompactSessionRequest, CreateSessionRequest, InterruptOutcome,
     IssueInviteRequest, LifecycleState, ListDirectoryRequest, ListenerState,
-    MAX_USAGE_METRICS_BUCKETS, MODEL_CATALOG_EVENT, Message, MessageId, MessageRole, MessageStatus,
-    ModelCatalog, ONBOARDED_EVENT, PROMPT_ADMISSION_HEADER, PROTOCOL_VERSION, Peer, ProviderId,
-    RELAYS_EVENT, RedeemInviteRequest, RelayListing, Remote, ResolveWorkspaceRequest,
-    RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SERVING_LISTENER_EVENT,
+    MAX_USAGE_METRICS_BUCKETS, MAX_USAGE_METRICS_TOP_SESSIONS, MODEL_CATALOG_EVENT, Message,
+    MessageId, MessageRole, MessageStatus, ModelCatalog, ONBOARDED_EVENT, PROMPT_ADMISSION_HEADER,
+    PROTOCOL_VERSION, Peer, ProviderId, RELAYS_EVENT, RedeemInviteRequest, RelayListing, Remote,
+    ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SERVING_LISTENER_EVENT,
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_ERROR_CODE_HEADER,
     SESSION_READING_PATH, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
     SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT,
@@ -3751,6 +3751,10 @@ async fn read_usage_metrics(State(state): State<AppState>, request: Request) -> 
                 UsageMetricsRefusal::Overlapping => {
                     "A Usage Metrics query's buckets overlap".to_owned()
                 }
+                UsageMetricsRefusal::TooManyTopSessions => format!(
+                    "A Usage Metrics query asks for at most {MAX_USAGE_METRICS_TOP_SESSIONS} top \
+                     Sessions"
+                ),
             },
         ),
     }

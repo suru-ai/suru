@@ -149,6 +149,7 @@ fn report(query: &UsageMetricsQuery) -> UsageMetricsReport {
         })
         .collect();
     let mut report = UsageMetricsReport {
+        top_sessions: Vec::new(),
         buckets,
         untimed: UsageMetricsBucket::default(),
         across_buckets_and_untimed: UsageMetricsAggregate::default(),
@@ -505,6 +506,7 @@ fn a_range_without_usage_says_so() {
         &mut application,
         request_id,
         Ok(UsageMetricsReport {
+            top_sessions: Vec::new(),
             buckets: vec![UsageMetricsBucket::default(); query.buckets.len()],
             untimed: UsageMetricsBucket::default(),
             across_buckets_and_untimed: UsageMetricsAggregate::default(),
@@ -903,6 +905,7 @@ fn empty_report(
     earliest: Option<SessionTimestamp>,
 ) -> UsageMetricsReport {
     UsageMetricsReport {
+        top_sessions: Vec::new(),
         buckets: vec![UsageMetricsBucket::default(); query.buckets.len()],
         untimed: UsageMetricsBucket::default(),
         across_buckets_and_untimed: UsageMetricsAggregate::default(),
@@ -1955,6 +1958,7 @@ fn many_workspaces(query: &UsageMetricsQuery, keys: u64) -> UsageMetricsReport {
         },
     };
     let mut report = UsageMetricsReport {
+        top_sessions: Vec::new(),
         buckets: query
             .buckets
             .iter()
@@ -3431,6 +3435,7 @@ fn all_time_with_no_timed_turn_still_heads_the_view_with_its_untimed_figures() {
         ..UsageMetricsAggregate::default()
     };
     let only_untimed = |query: &UsageMetricsQuery| UsageMetricsReport {
+        top_sessions: Vec::new(),
         untimed: UsageMetricsBucket {
             total: untimed,
             by_key: Vec::new(),

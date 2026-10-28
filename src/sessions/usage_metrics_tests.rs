@@ -4,6 +4,7 @@
 use std::{collections::HashMap, path::Path};
 
 use super::{Pairing, RemoteAct, SessionStore, UsageMetricsRefusal, restoration_tests::persisted};
+use crate::protocol::{MAX_USAGE_METRICS_TOP_SESSIONS, SessionId, UsageMetricsSession};
 use crate::{
     protocol::{
         AgentId, AgentIdentity, AgentSelection, Author, Cost, CostBasis, CostCoverage, CostDetails,
@@ -85,6 +86,7 @@ fn by_model(buckets: &[(u64, u64)]) -> UsageMetricsQuery {
             .collect(),
         breakdown: UsageMetricsBreakdown::Model,
         comparison: None,
+        top_sessions: 0,
     }
 }
 
@@ -1307,6 +1309,251 @@ async fn the_buckets_and_the_untimed_turns_together_count_each_session_once() {
             ..Default::default()
         },
         "a Session with timed and untimed work counts once, not once in each"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+/// [`by_model`], asking for the `limit` Sessions that cost the most.
+fn top(buckets: &[(u64, u64)], limit: usize) -> UsageMetricsQuery {
+    UsageMetricsQuery {
+        top_sessions: limit,
+        ..by_model(buckets)
+    }
+}
+
+/// Each top Session's identity and in-range Cost, most first.
+fn ranked(report: &UsageMetricsReport) -> Vec<(SessionId, Option<Cost>, bool)> {
+    report
+        .top_sessions
+        .iter()
+        .map(|session| {
+            (
+                session.session_id,
+                Some(session.cost),
+                session.is_cost_partial,
+            )
+        })
+        .collect()
+}
+
+/// A top-level Session in `workspace` titled `title` whose Turns are `turns`.
+fn titled(workspace: &Path, title: &str, turns: Vec<Turn>) -> PersistedSession {
+    let mut session = persisted(workspace, None);
+    session.summary.title = title.to_owned();
+    session.snapshot.turns = turns;
+    session
+}
+
+#[tokio::test]
+async fn the_top_sessions_are_ordered_by_their_cost_in_range_not_their_lifetime_cost() {
+    let directory = tempfile::tempdir().unwrap();
+    // The dearer over its lifetime, nearly all of it before the range.
+    let lifelong = titled(
+        directory.path(),
+        "Lifelong",
+        vec![turn_scoped(OPUS, 1, 0.90), turn_scoped(OPUS, 11, 0.10)],
+    );
+    let recent = titled(
+        directory.path(),
+        "Recent",
+        vec![turn_scoped(CODEX, 12, 0.50)],
+    );
+    let (lifelong_id, recent_id) = (lifelong.snapshot.session.id, recent.snapshot.session.id);
+    let (store, writer) = restore(directory.path(), vec![lifelong, recent]).await;
+
+    let report = read(&store, &top(&[(10, 20)], 5));
+
+    assert_eq!(
+        ranked(&report),
+        vec![
+            (recent_id, usd(0.50), false),
+            (lifelong_id, usd(0.10), false)
+        ]
+    );
+    let name = directory
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        report.top_sessions[0],
+        UsageMetricsSession {
+            session_id: recent_id,
+            title: "Recent".to_owned(),
+            workspace: name,
+            // The catalog names no Model: its id stands.
+            model: Some("gpt-5.5-codex".to_owned()),
+            cost: Cost::from_usd(0.50).unwrap(),
+            is_cost_partial: false,
+        }
+    );
+    assert_eq!(
+        read(&store, &by_model(&[(10, 20)])).top_sessions,
+        Vec::new(),
+        "a query asking for none is answered with none"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn as_many_top_sessions_are_named_as_were_asked_for_and_too_many_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let sessions: Vec<PersistedSession> = [0.30, 0.10, 0.40, 0.20, 0.05]
+        .into_iter()
+        .enumerate()
+        .map(|(at, usd)| {
+            titled(
+                directory.path(),
+                &format!("{usd}"),
+                vec![turn_scoped(OPUS, 11 + at as u64, usd)],
+            )
+        })
+        .collect();
+    let (store, writer) = restore(directory.path(), sessions).await;
+
+    let titles = |limit| {
+        read(&store, &top(&[(10, 20)], limit))
+            .top_sessions
+            .into_iter()
+            .map(|session| session.title)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(titles(3), ["0.4", "0.3", "0.2"]);
+    assert_eq!(titles(1), ["0.4"]);
+    assert_eq!(titles(10), ["0.4", "0.3", "0.2", "0.1", "0.05"]);
+    assert_eq!(
+        store
+            .usage_metrics(
+                &top(&[(10, 20)], MAX_USAGE_METRICS_TOP_SESSIONS + 1),
+                &ModelCatalog {
+                    providers: Vec::new()
+                },
+                &WorkspacePaths::default(),
+            )
+            .unwrap_err(),
+        UsageMetricsRefusal::TooManyTopSessions
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_partly_priced_session_is_flagged_and_one_of_no_known_cost_is_not_listed() {
+    let directory = tempfile::tempdir().unwrap();
+    let partly = titled(
+        directory.path(),
+        "Partly",
+        vec![
+            turn_scoped(OPUS, 11, 0.10),
+            metered(OPUS, Some(12), None, 5),
+        ],
+    );
+    let unpriced = titled(
+        directory.path(),
+        "Unpriced",
+        vec![metered(OPUS, Some(13), None, 500)],
+    );
+    let partly_id = partly.snapshot.session.id;
+    let (store, writer) = restore(directory.path(), vec![partly, unpriced]).await;
+
+    let report = read(&store, &top(&[(10, 20)], 5));
+
+    assert_eq!(ranked(&report), vec![(partly_id, usd(0.10), true)]);
+    assert_eq!(
+        read(&store, &top(&[(12, 20)], 5)).top_sessions,
+        Vec::new(),
+        "where none of the range's work has a known Cost, no Session is named"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_subagent_s_cost_counts_toward_its_top_level_session_and_a_subsession_stands_alone() {
+    let directory = tempfile::tempdir().unwrap();
+    let parent = titled(
+        directory.path(),
+        "Parent",
+        vec![turn_scoped(OPUS, 11, 0.10)],
+    );
+    let parent_id = parent.snapshot.session.id;
+    // A brokered Subagent keeps its own Cost, which its parent's work drove.
+    let mut brokered = persisted(directory.path(), Some(parent_id));
+    brokered.brokered = true;
+    brokered.snapshot.turns = vec![turn_scoped(CODEX, 12, 0.25)];
+    let sidekick = titled(
+        directory.path(),
+        "Sidekick",
+        vec![turn_scoped(OPUS, 13, 0.01)],
+    );
+    let sidekick_id = sidekick.snapshot.session.id;
+    let begun_by = Some(Author::Sidekick {
+        session_id: sidekick_id,
+        title: "Sidekick".to_owned(),
+    });
+    let mut subsession = titled(
+        directory.path(),
+        "Subsession",
+        vec![turn_scoped(SONNET, 14, 0.05)],
+    );
+    subsession.snapshot.session.begun_by = begun_by.clone();
+    subsession.summary.session.begun_by = begun_by;
+    let subsession_id = subsession.snapshot.session.id;
+    let (store, writer) = restore(
+        directory.path(),
+        vec![parent, brokered, sidekick, subsession],
+    )
+    .await;
+
+    let report = read(&store, &top(&[(10, 20)], 5));
+
+    assert_eq!(
+        ranked(&report),
+        vec![
+            (parent_id, usd(0.35), false),
+            (subsession_id, usd(0.05), false),
+            (sidekick_id, usd(0.01), false),
+        ],
+        "the Subagent's Cost rolls up into the Session it works for, and a \
+         Subsession, a Session of its own, is listed apart from its Sidekick"
+    );
+    assert_eq!(
+        report.top_sessions[0].model.as_deref(),
+        Some("gpt-5.5-codex"),
+        "the Model the Session's work cost the most under, its Subagent's too"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_top_session_s_model_is_the_one_its_work_cost_most_under_else_used_most_of() {
+    let directory = tempfile::tempdir().unwrap();
+    // Free work: no Model cost more than another, so the one used most.
+    let free = titled(
+        directory.path(),
+        "Free",
+        vec![
+            turn_scoped(OPUS, 11, 0.0),
+            Turn {
+                usage: Some(Usage {
+                    output_tokens: Some(1_000),
+                    ..Default::default()
+                }),
+                ..turn_scoped(CODEX, 12, 0.0)
+            },
+        ],
+    );
+    let (store, writer) = restore(directory.path(), vec![free]).await;
+
+    let report = read(&store, &top(&[(10, 20)], 5));
+
+    assert_eq!(
+        report.top_sessions.len(),
+        1,
+        "a known Cost of nothing is known"
+    );
+    assert_eq!(
+        report.top_sessions[0].model.as_deref(),
+        Some("gpt-5.5-codex")
     );
     writer.shutdown().await.unwrap();
 }

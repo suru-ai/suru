@@ -25,6 +25,11 @@ use chart::{MetricsMeasure, SeriesId};
 
 pub(super) use view::render;
 
+/// How many of the Sessions that cost the most the view asks for: as many
+/// as its list has room for beneath a legend of every series in a frame of
+/// common height, the list drawing fewer where it has less.
+const TOP_SESSIONS: usize = 5;
+
 /// Every breakdown, in the order the view offers them.
 pub(super) const BREAKDOWNS: [UsageMetricsBreakdown; 3] = [
     UsageMetricsBreakdown::Model,
@@ -516,6 +521,7 @@ impl MetricsView {
             buckets,
             breakdown: self.breakdown,
             comparison,
+            top_sessions: TOP_SESSIONS,
         };
         self.asked = Some((request_id, asked));
         self.refusal = None;

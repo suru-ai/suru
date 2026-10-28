@@ -27,14 +27,26 @@
 //! taken together on their own, and the buckets and the untimed Turns
 //! together likewise. A comparison interval stands apart from the buckets:
 //! a Turn it holds counts there whether or not a bucket holds it too.
+//!
+//! The Sessions that cost the most across the buckets are the top-level
+//! Sessions a reader can open, each owning the Cost its Turns and those of
+//! every Subagent beneath it contribute there: a Subagent's work is what the
+//! conversation that delegated it drove, and is opened from it. A Subsession
+//! owns its own, apart from the Sidekick that began it, since it is a Session
+//! of its own, listed and counted as one. Each is ranked once its Cost is
+//! added, the few asked for picked out without sorting the rest.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+};
 
 use crate::protocol::{
-    Cost, CostBasis, KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS, ModelCatalog, SessionId,
-    SessionTimestamp, Turn, TurnId, TurnStatus, Usage, UsageMetricsAggregate,
-    UsageMetricsBreakdown, UsageMetricsBucket, UsageMetricsKey, UsageMetricsKeyLabel,
-    UsageMetricsQuery, UsageMetricsReport, Workspace, WorkspaceId, WorkspacePaths,
+    Cost, CostBasis, KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS, MAX_USAGE_METRICS_TOP_SESSIONS,
+    ModelCatalog, SessionId, SessionTimestamp, Turn, TurnId, TurnStatus, Usage,
+    UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsBucket, UsageMetricsKey,
+    UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport, UsageMetricsSession, Workspace,
+    WorkspaceId, WorkspacePaths,
 };
 
 use super::{
@@ -52,6 +64,8 @@ pub(crate) enum UsageMetricsRefusal {
     OutOfOrder,
     /// A bucket begins before the one ahead of it ends.
     Overlapping,
+    /// It asks for more top Sessions than [`MAX_USAGE_METRICS_TOP_SESSIONS`].
+    TooManyTopSessions,
 }
 
 impl UsageMetricsRefusal {
@@ -62,6 +76,9 @@ impl UsageMetricsRefusal {
     fn of(query: &UsageMetricsQuery) -> Option<Self> {
         if query.buckets.len() > MAX_USAGE_METRICS_BUCKETS {
             return Some(Self::TooManyBuckets);
+        }
+        if query.top_sessions > MAX_USAGE_METRICS_TOP_SESSIONS {
+            return Some(Self::TooManyTopSessions);
         }
         if query
             .buckets
@@ -84,14 +101,19 @@ impl UsageMetricsRefusal {
 }
 
 /// What the read takes of one Turn: which it is, whether a Subagent ran it,
-/// where it is placed in time, the key it is broken down under, how it
-/// ended, and its Usage.
+/// the top-level Session its Cost is owned by, where it is placed in time,
+/// the key it is broken down under and the Model that ran it, how it ended,
+/// and its Usage.
 struct MeteredTurn {
     session_id: SessionId,
     turn_id: TurnId,
     is_subagent: bool,
+    owner: SessionId,
     placed_at: Option<SessionTimestamp>,
     key: UsageMetricsKey,
+    /// The Model key of the Agent that ran it, whatever the breakdown,
+    /// absent where its Agent is not known.
+    model: Option<UsageMetricsKey>,
     status: TurnStatus,
     usage: Option<Usage>,
 }
@@ -130,20 +152,22 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned")
-            .copied_forest(query.breakdown);
-        let metered = MeteredForest::index(copied).metered(query.breakdown);
+            .copied_forest();
+        let forest = MeteredForest::index(copied);
+        let metered = forest.metered(query.breakdown);
         let names = KeyNames {
             catalog,
             workspace_paths,
             workspaces,
         };
-        Ok(fold(query, metered, &names))
+        Ok(fold(query, metered, &forest, &names))
     }
 }
 
-/// What the read copies of one Session under the store lock: its Turns,
-/// and where it stands in its forest.
+/// What the read copies of one Session under the store lock: its Title, its
+/// Turns, and where it stands in its forest.
 struct CopiedSession {
+    title: String,
     parent: Option<SessionId>,
     workspace: WorkspaceId,
     is_brokered_subagent: bool,
@@ -154,13 +178,13 @@ struct CopiedSession {
 
 impl SessionStoreState {
     /// Every Session living here, copied as the read needs it and nothing
-    /// more worked out while the lock is held, and — for a breakdown by
-    /// Workspace — each of their Workspaces as the Workspace Registry
-    /// presents it, which is how every listing of Workspaces names them, or
-    /// as one of its Sessions does where its entry says nowhere.
+    /// more worked out while the lock is held, and each of their Workspaces
+    /// — which a breakdown by Workspace and the top Sessions name — as the
+    /// Workspace Registry presents it, which is how every listing of
+    /// Workspaces names them, or as one of its Sessions does where its entry
+    /// says nowhere.
     fn copied_forest(
         &self,
-        breakdown: UsageMetricsBreakdown,
     ) -> (
         HashMap<SessionId, CopiedSession>,
         HashMap<WorkspaceId, Workspace>,
@@ -172,10 +196,9 @@ impl SessionStoreState {
             .map(|(session_id, record)| {
                 record_work(1 + record.snapshot.turns.len());
                 let workspace = &record.snapshot.session.workspace;
-                if breakdown == UsageMetricsBreakdown::Workspace {
-                    sessions_copy.entry(&workspace.id).or_insert(workspace);
-                }
+                sessions_copy.entry(&workspace.id).or_insert(workspace);
                 let copied = CopiedSession {
+                    title: record.summary.title.clone(),
                     parent: record.snapshot.session.parent,
                     workspace: workspace.id.clone(),
                     is_brokered_subagent: record.is_brokered_subagent(),
@@ -259,8 +282,14 @@ impl MeteredForest {
         let mut counted = HashSet::new();
         let mut turns = Vec::new();
         for root in roots {
+            // A Subsession heads a tree of its own, owning its Cost.
             let trees = std::iter::once(root).chain(self.subsessions_begun_by(root));
-            for session_id in trees.flat_map(|head| self.subtree_of(head)) {
+            let owned = trees.flat_map(|head| {
+                self.subtree_of(head)
+                    .into_iter()
+                    .map(move |session_id| (head, session_id))
+            });
+            for (owner, session_id) in owned {
                 if !counted.insert(session_id) {
                     continue;
                 }
@@ -269,8 +298,13 @@ impl MeteredForest {
                     session_id,
                     turn_id: turn.id,
                     is_subagent: session.parent.is_some(),
+                    owner,
                     placed_at: turn.started_at.or(turn.settled_at),
                     key: key_of(breakdown, session, turn),
+                    model: match key_of(UsageMetricsBreakdown::Model, session, turn) {
+                        UsageMetricsKey::Unknown => None,
+                        model => Some(model),
+                    },
                     status: turn.status,
                     usage: turn.usage.clone(),
                 }));
@@ -440,6 +474,93 @@ impl Tally {
     }
 }
 
+/// What a top-level Session's work across the buckets adds up to, as it is
+/// added: its Cost, and each Model's part of it and of its tokens, from
+/// which the Model it ran most is named.
+#[derive(Default)]
+struct OwnedCost {
+    cost: Option<Cost>,
+    is_partial: bool,
+    models: HashMap<UsageMetricsKey, ModelShare>,
+}
+
+/// One Model's part of a Session's work across the buckets.
+#[derive(Clone, Copy, Default)]
+struct ModelShare {
+    cost: Option<Cost>,
+    tokens: u64,
+}
+
+impl OwnedCost {
+    fn add_turn(&mut self, turn: &MeteredTurn) {
+        let Some(model) = &turn.model else {
+            return;
+        };
+        let tokens = turn.usage.as_ref().and_then(Usage::blended_tokens);
+        let share = match self.models.get_mut(model) {
+            Some(share) => share,
+            None => self.models.entry(model.clone()).or_default(),
+        };
+        share.tokens = share.tokens.saturating_add(tokens.unwrap_or(0));
+    }
+
+    fn add_cost(&mut self, model: Option<&UsageMetricsKey>, contribution: &CostContribution) {
+        self.is_partial |= contribution.is_partial;
+        let Some(amount) = contribution.amount else {
+            return;
+        };
+        self.cost = Some(add_cost(self.cost, amount.cost));
+        if let Some(model) = model {
+            let share = self.models.entry(model.clone()).or_default();
+            share.cost = Some(add_cost(share.cost, amount.cost));
+        }
+    }
+
+    /// The Model the work cost the most under, or used the most tokens of
+    /// where none cost more than another, the first in a report's order
+    /// among any still alike.
+    fn main_model(&self) -> Option<&UsageMetricsKey> {
+        let weight = |share: &ModelShare| (share.cost.map_or(0, Cost::nano_usd), share.tokens);
+        self.models
+            .iter()
+            .max_by(|(left_key, left), (right_key, right)| {
+                weight(left)
+                    .cmp(&weight(right))
+                    .then_with(|| key_order(right_key).cmp(&key_order(left_key)))
+            })
+            .map(|(model, _)| model)
+    }
+}
+
+/// The order top Sessions stand in: the dearest first, and among those that
+/// cost alike, by identity, so a report names the same ones every time.
+fn dearest_first(left: &(SessionId, Cost), right: &(SessionId, Cost)) -> Ordering {
+    right
+        .1
+        .nano_usd()
+        .cmp(&left.1.nano_usd())
+        .then_with(|| left.0.as_uuid().cmp(&right.0.as_uuid()))
+}
+
+/// The `limit` Sessions of `owned` that cost the most, the dearest first:
+/// only those with a known Cost, the few picked out in time linear in all of
+/// them and only those few sorted.
+fn top_owners(owned: &HashMap<SessionId, OwnedCost>, limit: usize) -> Vec<SessionId> {
+    let mut priced: Vec<(SessionId, Cost)> = owned
+        .iter()
+        .filter_map(|(owner, owned)| Some((*owner, owned.cost?)))
+        .collect();
+    if limit == 0 {
+        return Vec::new();
+    }
+    if priced.len() > limit {
+        priced.select_nth_unstable_by(limit - 1, dearest_first);
+        priced.truncate(limit);
+    }
+    priced.sort_unstable_by(dearest_first);
+    priced.into_iter().map(|(owner, _)| owner).collect()
+}
+
 /// Adds what one Turn contributes to a Cost: its amount, and its Estimated
 /// portion, where it counts one, and its partial mark.
 fn add_contribution(aggregate: &mut UsageMetricsAggregate, contribution: &CostContribution) {
@@ -453,7 +574,35 @@ fn add_contribution(aggregate: &mut UsageMetricsAggregate, contribution: &CostCo
     aggregate.is_cost_partial |= contribution.is_partial;
 }
 
-fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageMetricsReport {
+/// Where a Turn landed, the key it counts under, and the top-level Session
+/// and Model its Cost is owned by, for the Cost it carries to land beside it.
+#[derive(Clone)]
+struct Placed {
+    place: Place,
+    key: UsageMetricsKey,
+    owner: Option<SessionId>,
+    model: Option<UsageMetricsKey>,
+}
+
+impl Default for Placed {
+    /// Where the Cost of a Turn the store does not hold lands: among the
+    /// untimed, under Unknown, owned by no Session.
+    fn default() -> Self {
+        Self {
+            place: Place::default(),
+            key: UsageMetricsKey::Unknown,
+            owner: None,
+            model: None,
+        }
+    }
+}
+
+fn fold(
+    query: &UsageMetricsQuery,
+    metered: Metered,
+    forest: &MeteredForest,
+    names: &KeyNames,
+) -> UsageMetricsReport {
     let mut buckets = query
         .buckets
         .iter()
@@ -492,6 +641,8 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
         }
     };
     let mut earliest_turn_at = None::<SessionTimestamp>;
+    // What each top-level Session's work across the buckets adds up to.
+    let mut owned = HashMap::<SessionId, OwnedCost>::new();
     // Where each Turn landed, for the Cost it carries to land beside it.
     let mut placed = HashMap::with_capacity(metered.turns.len());
     for turn in metered.turns {
@@ -504,7 +655,12 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
         }
         placed.insert(
             (turn.session_id, turn.turn_id),
-            (place.clone(), turn.key.clone()),
+            Placed {
+                place: place.clone(),
+                key: turn.key.clone(),
+                owner: Some(turn.owner),
+                model: turn.model.clone(),
+            },
         );
         if let Some(placed_at) = turn.placed_at {
             earliest_turn_at = Some(earliest_turn_at.map_or(placed_at, |held| held.min(placed_at)));
@@ -513,6 +669,7 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
             Landing::Bucket(index) => {
                 buckets[index].add(&turn);
                 across_buckets.add(&turn);
+                owned.entry(turn.owner).or_default().add_turn(&turn);
             }
             Landing::Untimed => untimed.add(&turn),
             Landing::Outside => continue,
@@ -522,10 +679,15 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
     for contribution in &metered.costs {
         // Every contribution is of a Turn the store holds; one that were not
         // would still count, among the untimed.
-        let (place, key) = placed
+        let Placed {
+            place,
+            key,
+            owner,
+            model,
+        } = placed
             .get(&(contribution.session_id, contribution.turn_id))
             .cloned()
-            .unwrap_or((Place::default(), UsageMetricsKey::Unknown));
+            .unwrap_or_default();
         if let Some(comparison) = comparison.as_mut().filter(|_| place.compared) {
             add_contribution(&mut comparison.aggregate, contribution);
         }
@@ -533,6 +695,12 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
             Landing::Bucket(index) => {
                 buckets[index].add_cost(&key, contribution);
                 across_buckets.add_cost(&key, contribution);
+                if let Some(owner) = owner {
+                    owned
+                        .entry(owner)
+                        .or_default()
+                        .add_cost(model.as_ref(), contribution);
+                }
             }
             Landing::Untimed => untimed.add_cost(&key, contribution),
             Landing::Outside => continue,
@@ -548,7 +716,40 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
         .collect::<Vec<_>>();
     keys.sort_by(|left, right| key_order(left).cmp(&key_order(right)));
     keys.dedup();
-    let labels = labels(&keys, names);
+    let top = top_owners(&owned, query.top_sessions);
+    // The top Sessions' Workspaces and Models are named with the keys, so a
+    // Workspace is told apart from every other the report names alike.
+    let named = top.iter().flat_map(|owner| {
+        let workspace = UsageMetricsKey::Workspace {
+            workspace: forest.sessions[owner].workspace.clone(),
+        };
+        std::iter::once(workspace).chain(owned[owner].main_model().cloned())
+    });
+    let mut named = keys.iter().cloned().chain(named).collect::<Vec<_>>();
+    named.sort_by(|left, right| key_order(left).cmp(&key_order(right)));
+    named.dedup();
+    let mut labels: HashMap<UsageMetricsKey, String> =
+        named.iter().cloned().zip(labels(&named, names)).collect();
+    let top_sessions = top
+        .into_iter()
+        .map(|owner| {
+            let session = &forest.sessions[&owner];
+            let owned = &owned[&owner];
+            let workspace = UsageMetricsKey::Workspace {
+                workspace: session.workspace.clone(),
+            };
+            UsageMetricsSession {
+                session_id: owner,
+                title: session.title.clone(),
+                workspace: labels.get(&workspace).cloned().unwrap_or_default(),
+                model: owned
+                    .main_model()
+                    .and_then(|model| labels.get(model).cloned()),
+                cost: owned.cost.expect("a top Session has a known Cost"),
+                is_cost_partial: owned.is_partial,
+            }
+        })
+        .collect();
     UsageMetricsReport {
         buckets: buckets
             .into_iter()
@@ -561,9 +762,12 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
         earliest_turn_at,
         keys: keys
             .into_iter()
-            .zip(labels)
-            .map(|(key, label)| UsageMetricsKeyLabel { key, label })
+            .map(|key| UsageMetricsKeyLabel {
+                label: labels.remove(&key).unwrap_or_default(),
+                key,
+            })
             .collect(),
+        top_sessions,
     }
 }
 

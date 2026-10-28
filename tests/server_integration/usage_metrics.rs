@@ -35,6 +35,7 @@ async fn usage_metrics_are_read_from_the_server_the_outlook_names() {
                 buckets: vec![day],
                 breakdown: UsageMetricsBreakdown::Model,
                 comparison: None,
+                top_sessions: 5,
             })
             .await
             .unwrap_or_else(|error| panic!("{way}: {error:#}"));
@@ -45,6 +46,11 @@ async fn usage_metrics_are_read_from_the_server_the_outlook_names() {
             "{way}: one bucket, as asked, holding nothing"
         );
         assert_eq!(report.earliest_turn_at, None, "{way}");
+        assert_eq!(
+            report.top_sessions,
+            Vec::new(),
+            "{way}: no Session cost anything"
+        );
     }
     pair.shutdown().await;
 }

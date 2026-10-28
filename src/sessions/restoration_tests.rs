@@ -1302,6 +1302,8 @@ fn all_time_metrics(
                 }],
                 breakdown,
                 comparison: None,
+                // Enough to rank every tree, so ranking them is measured.
+                top_sessions: 5,
             },
             &ModelCatalog {
                 providers: Vec::new(),
