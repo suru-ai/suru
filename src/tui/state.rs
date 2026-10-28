@@ -9629,6 +9629,25 @@ impl Application {
         ApplicationTransition::Continue
     }
 
+    /// Opens the `place`-th of the Sessions the open Usage Metrics view lists
+    /// as costing the most, closing the view, as a Sidebar row opens one: it
+    /// lives on the Server the view reads, the one the Outlook is turned
+    /// toward, so the route moves now and the attach follows it. The Session
+    /// already open is only uncovered.
+    fn open_metrics_session(&mut self, place: usize) -> ApplicationTransition {
+        let view = &mut self.state.metrics_view;
+        let Some(session_id) = view.is_open().then(|| view.top_session(place)).flatten() else {
+            return ApplicationTransition::Continue;
+        };
+        view.close();
+        let session = SessionReference::new(self.state.outlook.clone(), session_id);
+        if self.state.route.as_ref() == Some(&session) && !self.state.open_session_can_retry() {
+            return ApplicationTransition::Continue;
+        }
+        self.state.open_session_route(session.clone());
+        ApplicationTransition::ViewAndAttachSession(session)
+    }
+
     /// Asks the Server the Outlook is turned toward for the Usage Metrics
     /// view's buckets, cut by the reader's calendar now.
     fn read_usage_metrics(&mut self) -> ApplicationTransition {
@@ -11585,6 +11604,9 @@ impl Application {
                     self.state.metrics_view.solo_series(series);
                 }
                 Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::MetricsSessionOpen { session } => {
+                Ok(self.open_metrics_session(session))
             }
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,

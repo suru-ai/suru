@@ -16,7 +16,7 @@ use ratatui::layout::{Position, Rect};
 use uuid::Uuid;
 
 use crate::protocol::{
-    SessionTimestamp, UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsQuery,
+    SessionId, SessionTimestamp, UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsQuery,
     UsageMetricsReport,
 };
 
@@ -131,11 +131,13 @@ pub(super) struct MetricsView {
 /// A row of one of the view's lists, by what it shows rather than where it
 /// stands, so a focus outlasts a change of measure or a refresh that moves
 /// it. ↑/↓ walk the rows of every list in the order they stand on screen,
-/// from the legend down; the legend is the only list yet.
+/// from the legend down to the Sessions that cost the most.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ListRow {
     /// A legend row, by its series.
     Series(SeriesId),
+    /// A row of the Sessions that cost the most, by its Session.
+    Session(SessionId),
 }
 
 /// The focused row as the keys act on it: by its place among its list's
@@ -144,6 +146,9 @@ enum ListRow {
 pub(super) enum FocusedRow {
     /// The legend row at that place, counted from the first.
     Series(usize),
+    /// The row of the Sessions that cost the most at that place, counted
+    /// from the first.
+    Session(usize),
 }
 
 /// Where a list focus moves to.
@@ -209,6 +214,9 @@ struct Targets {
     /// the top: none where a frame drew a report with no room for any, and
     /// no rect at all before any frame has drawn one.
     legend: Option<Rect>,
+    /// The rows of the Sessions that cost the most it drew, one Session to a
+    /// row, on the same terms as the legend's.
+    sessions: Option<Rect>,
 }
 
 /// Where the last frame drew the chart's bars: `count` slots `slot` columns
@@ -247,6 +255,8 @@ pub(super) enum MetricsTarget {
     },
     /// A legend row, by its series' place among them.
     Series(usize),
+    /// A row of the Sessions that cost the most, by its place among them.
+    Session(usize),
 }
 
 /// Where a bucket selection moves to.
@@ -381,20 +391,36 @@ impl MetricsView {
         }
     }
 
+    /// The Sessions the report shown names as costing the most, in its
+    /// order, none where it holds nothing to draw.
+    fn top_session_ids(&self) -> Vec<SessionId> {
+        match &self.shown {
+            Some((_, report)) if !chart::holds_nothing(report) => report
+                .top_sessions
+                .iter()
+                .map(|session| session.session_id)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Every row of the view's lists a focus can rest on, in the order they
     /// stand on screen: those the last frame drew, so a focus always has its
     /// row, or every one before any frame has drawn them.
     fn list_rows(&self) -> Vec<ListRow> {
-        let drawn = self
-            .targets
-            .get()
-            .legend
-            .map_or(usize::MAX, |rows| usize::from(rows.height));
-        self.series_ids()
+        let targets = self.targets.get();
+        let drawn = |rows: Option<Rect>| rows.map_or(usize::MAX, |rows| usize::from(rows.height));
+        let series = self
+            .series_ids()
             .into_iter()
-            .take(drawn)
-            .map(ListRow::Series)
-            .collect()
+            .take(drawn(targets.legend))
+            .map(ListRow::Series);
+        let sessions = self
+            .top_session_ids()
+            .into_iter()
+            .take(drawn(targets.sessions))
+            .map(ListRow::Session);
+        series.chain(sessions).collect()
     }
 
     /// Moves the focus among the rows of the view's lists, which stops at
@@ -429,7 +455,18 @@ impl MetricsView {
                 .iter()
                 .position(|series| series == id)
                 .map(FocusedRow::Series),
+            ListRow::Session(id) => self
+                .top_session_ids()
+                .iter()
+                .position(|session| session == id)
+                .map(FocusedRow::Session),
         }
+    }
+
+    /// The `place`-th of the Sessions the view lists as costing the most,
+    /// where it lists that many.
+    pub(super) fn top_session(&self, place: usize) -> Option<SessionId> {
+        self.top_session_ids().get(place).copied()
     }
 
     /// Hides the `place`-th series in the legend from the chart, or shows it
@@ -664,6 +701,10 @@ impl MetricsView {
         self.update_targets(|targets| targets.legend = Some(rows));
     }
 
+    pub(super) fn record_session_targets(&self, rows: Rect) {
+        self.update_targets(|targets| targets.sessions = Some(rows));
+    }
+
     fn update_targets(&self, update: impl FnOnce(&mut Targets)) {
         let mut targets = self.targets.get();
         update(&mut targets);
@@ -712,6 +753,9 @@ impl MetricsView {
         }
         if let Some(rows) = targets.legend.filter(|rows| rows.contains(position)) {
             return Some(MetricsTarget::Series(usize::from(position.y - rows.y)));
+        }
+        if let Some(rows) = targets.sessions.filter(|rows| rows.contains(position)) {
+            return Some(MetricsTarget::Session(usize::from(position.y - rows.y)));
         }
         on(targets.chart).then_some(MetricsTarget::Chart { toward: None })
     }

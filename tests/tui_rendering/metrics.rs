@@ -15,10 +15,10 @@ use ratatui::style::Color;
 use suru::{
     managed_client::{ManagedEvent, RecoveryStatus},
     protocol::{
-        Cost, EffectiveSettings, KeyedUsageMetrics, ModelId, Outlook, ProviderId, SessionTimestamp,
-        SidebarVisibility, UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsBucket,
-        UsageMetricsInterval, UsageMetricsKey, UsageMetricsKeyLabel, UsageMetricsQuery,
-        UsageMetricsReport,
+        Cost, EffectiveSettings, KeyedUsageMetrics, ModelId, Outlook, ProviderId, SessionId,
+        SessionReference, SessionTimestamp, SidebarVisibility, UsageMetricsAggregate,
+        UsageMetricsBreakdown, UsageMetricsBucket, UsageMetricsInterval, UsageMetricsKey,
+        UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport, UsageMetricsSession,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, MetricsMeasure,
@@ -3624,5 +3624,289 @@ fn the_headline_fits_eighty_columns() {
     assert!(
         in_order(&details, &["$37.10", "12 Subagents", "40 failed", "31"]),
         "{details:?}"
+    );
+}
+
+/// A top Session titled `title` whose work in range cost `usd`.
+fn top_session(title: &str, usd: f64, model: Option<&str>, workspace: &str) -> UsageMetricsSession {
+    UsageMetricsSession {
+        session_id: SessionId::new(),
+        title: title.to_owned(),
+        workspace: workspace.to_owned(),
+        model: model.map(str::to_owned),
+        cost: Cost::from_usd(usd).unwrap(),
+        is_cost_partial: false,
+    }
+}
+
+/// [`priced_report`], naming three Sessions that cost the most in range,
+/// the first of them partly unpriced.
+fn with_top_sessions(query: &UsageMetricsQuery) -> UsageMetricsReport {
+    let mut report = priced_report(query);
+    report.top_sessions = vec![
+        UsageMetricsSession {
+            is_cost_partial: true,
+            ..top_session(
+                "Introduce relay pairing",
+                28.40,
+                Some("Claude Opus 5.5"),
+                "suru",
+            )
+        },
+        top_session(
+            "Fix Windows path fixtures",
+            19.12,
+            Some("GPT-5.5 Codex"),
+            "suru",
+        ),
+        top_session("Untangle the theme", 3.05, None, "atlas"),
+    ];
+    report
+}
+
+/// A view of thirty days of [`with_top_sessions`], drawn once so its rows
+/// can be pointed at, and the Sessions it names.
+fn thirty_days_of_top_sessions(
+    mut application: Application,
+) -> (Application, Vec<UsageMetricsSession>) {
+    let (_, request_id, query) = ask(&mut application);
+    let report = with_top_sessions(&query);
+    let top = report.top_sessions.clone();
+    answer(&mut application, request_id, Ok(report));
+    rendered_application_buffer(&application, WIDTH, HEIGHT);
+    (application, top)
+}
+
+/// The Session row the keyboard acts on, by its Title.
+fn focused_session(application: &Application) -> Option<String> {
+    let rows = screen(application);
+    let focused: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| {
+            let row = row.trim_start().strip_prefix('›')?.trim_start();
+            row.starts_with('$').then_some(row)
+        })
+        .collect();
+    assert!(focused.len() <= 1, "{rows:#?}");
+    focused.first().map(|row| {
+        row.split("  ")
+            .map(str::trim)
+            .find(|part| !part.is_empty() && !part.starts_with('$'))
+            .unwrap()
+            .to_owned()
+    })
+}
+
+#[test]
+fn the_most_expensive_sessions_are_listed_under_the_legend() {
+    assert_eq!(
+        SemanticCommandId::MetricsSessionOpen { session: 0 }.as_str(),
+        "metrics.session.open"
+    );
+    let (application, _) = thirty_days_of_top_sessions(reader_in(NEW_YORK, afternoon()));
+
+    let rows = screen(&application);
+    let heading = rendered_row(&rows, "Most expensive Sessions");
+    assert!(
+        rendered_row(&rows, "copilot · GPT-5.5") < heading,
+        "beneath the legend: {rows:#?}"
+    );
+    for (offset, words) in [
+        (
+            1,
+            &[
+                "$28.40+",
+                "Introduce relay pairing",
+                "Claude Opus 5.5",
+                "suru",
+            ][..],
+        ),
+        (
+            2,
+            &[
+                "$19.12",
+                "Fix Windows path fixtures",
+                "GPT-5.5 Codex",
+                "suru",
+            ],
+        ),
+        (3, &["$3.05", "Untangle the theme", "atlas"]),
+    ] {
+        let line = &rows[heading + offset];
+        assert!(in_order(line, words), "{words:?} in {line:?}");
+    }
+    // The figures stand aligned, each right against its column's edge.
+    let ends = (1..=3)
+        .map(|offset| {
+            let line = &rows[heading + offset];
+            line.find("  ").map(|at| line[..at].trim_end().len())
+        })
+        .collect::<Vec<_>>();
+    assert!(ends.windows(2).all(|pair| pair[0] == pair[1]), "{ends:?}");
+}
+
+#[test]
+fn a_range_with_no_priced_sessions_lists_none_under_no_heading() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(priced_report(&query)));
+
+    let shown = screen(&application).join("\n");
+    assert!(!shown.contains("Most expensive Sessions"), "{shown}");
+}
+
+#[test]
+fn down_past_the_legend_focuses_the_sessions_and_enter_opens_one_closing_the_view() {
+    let (mut application, top) = thirty_days_of_top_sessions(reader_in(NEW_YORK, afternoon()));
+    // Enter with nothing focused, or a legend row, opens nothing.
+    assert_eq!(
+        application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        ))),
+        None
+    );
+    for _ in 0..3 {
+        key(&mut application, KeyCode::Down);
+    }
+    assert_eq!(
+        focused_row(&application).as_deref(),
+        Some("copilot · GPT-5.5")
+    );
+    assert_eq!(
+        application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        ))),
+        None
+    );
+
+    key(&mut application, KeyCode::Down);
+    assert_eq!(focused_row(&application), None);
+    assert_eq!(
+        focused_session(&application).as_deref(),
+        Some("Introduce relay pairing")
+    );
+    // Space hides a series, and a Session has none.
+    assert_eq!(
+        application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE
+        ))),
+        None
+    );
+    // The focus stops at the last Session, and ↑ walks back to the legend.
+    for _ in 0..5 {
+        key(&mut application, KeyCode::Down);
+    }
+    assert_eq!(
+        focused_session(&application).as_deref(),
+        Some("Untangle the theme")
+    );
+    key(&mut application, KeyCode::Up);
+    assert_eq!(
+        application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        ))),
+        Some(CommandId::InvokeSemantic(
+            SemanticCommandId::MetricsSessionOpen { session: 1 }
+        ))
+    );
+
+    assert_eq!(
+        key(&mut application, KeyCode::Enter),
+        ApplicationTransition::ViewAndAttachSession(SessionReference::new(
+            Outlook::Local,
+            top[1].session_id
+        ))
+    );
+    assert!(
+        !screen(&application)[0].starts_with(" Metrics"),
+        "opening a Session closes the view"
+    );
+}
+
+#[test]
+fn a_click_on_a_session_row_opens_it_from_the_server_the_view_reads() {
+    let (mut application, top) = thirty_days_of_top_sessions(reader_in(NEW_YORK, afternoon()));
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let (x, y) = text_position(&buffer, "Untangle the theme");
+
+    assert_eq!(
+        press_at(&mut application, (x, y)),
+        ApplicationTransition::ViewAndAttachSession(SessionReference::new(
+            Outlook::Local,
+            top[2].session_id
+        ))
+    );
+    assert!(!screen(&application)[0].starts_with(" Metrics"));
+
+    // A remote Outlook's Sessions open on that Remote.
+    let (mut remote, top) = thirty_days_of_top_sessions(
+        application_looking_at_studio()
+            .with_session_clock(afternoon)
+            .with_time_zone(zone(NEW_YORK)),
+    );
+    let buffer = rendered_application_buffer(&remote, WIDTH, HEIGHT);
+    let (x, y) = text_position(&buffer, "Fix Windows path fixtures");
+    assert_eq!(
+        press_at(&mut remote, (x, y)),
+        ApplicationTransition::ViewAndAttachSession(SessionReference::new(
+            Outlook::Remote("studio".to_owned()),
+            top[1].session_id
+        ))
+    );
+}
+
+#[test]
+fn the_session_already_open_closes_the_view_back_onto_it() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path())
+        .with_session_clock(afternoon)
+        .with_time_zone(zone(NEW_YORK));
+    let (open, _) = enter_session(&mut application, workspace.path());
+    let beneath = screen(&application);
+    let (_, request_id, query) = ask(&mut application);
+    let mut report = with_top_sessions(&query);
+    report.top_sessions[0].session_id = open;
+    answer(&mut application, request_id, Ok(report));
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let (x, y) = text_position(&buffer, "Introduce relay pairing");
+
+    assert_eq!(
+        press_at(&mut application, (x, y)),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(screen(&application), beneath);
+}
+
+#[test]
+fn where_too_short_to_list_every_session_the_list_and_its_focus_stop_at_the_last_drawn() {
+    // Room under the legend for the list's heading and one Session.
+    const SHORT: u16 = 26;
+    let (mut application, _) = thirty_days_of_top_sessions(reader_in(NEW_YORK, afternoon()));
+    let rows = rendered_application_rows_at(&application, WIDTH, SHORT);
+    let shown = rows.join("\n");
+    assert!(
+        shown.contains("Introduce relay pairing") && !shown.contains("Fix Windows path fixtures"),
+        "{shown}"
+    );
+    assert!(
+        rows.iter().filter(|row| row.contains('┤')).count() >= 2,
+        "the chart keeps its room: {shown}"
+    );
+
+    for _ in 0..8 {
+        key(&mut application, KeyCode::Down);
+    }
+    assert_eq!(
+        application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        ))),
+        Some(CommandId::InvokeSemantic(
+            SemanticCommandId::MetricsSessionOpen { session: 0 }
+        ))
     );
 }

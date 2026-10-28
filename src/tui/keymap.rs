@@ -281,7 +281,8 @@ pub(super) fn command_for_context_overlay_event(event: InputEvent) -> Option<Com
 /// it to either end, as a click on a bar or a drag across them does; ↑/↓
 /// focus a row of its lists, on which Space hides or shows a legend row's
 /// series and Shift+Space or `o` shows it alone, as a click on the row or a
-/// modified one does; Esc clears the bucket selection, as a click on the
+/// modified one does, and Enter opens a listed Session, as a click on its
+/// row does; Esc clears the bucket selection, as a click on the
 /// chart away from its bars does, then the focus, and with neither left Esc
 /// or a click on its ✕ closes it — the selection first, since it changes
 /// what the legend reads, where a focus only marks a row — `r` reads it
@@ -314,12 +315,20 @@ pub(super) fn command_for_metrics_view_event(
                 (KeyCode::Down, KeyModifiers::NONE) => SemanticCommandId::MetricsFocusNext,
                 (KeyCode::Char(' '), KeyModifiers::NONE) => match focused? {
                     FocusedRow::Series(series) => SemanticCommandId::MetricsSeriesToggle { series },
+                    FocusedRow::Session(_) => return None,
+                },
+                (KeyCode::Enter, KeyModifiers::NONE) => match focused? {
+                    FocusedRow::Session(session) => {
+                        SemanticCommandId::MetricsSessionOpen { session }
+                    }
+                    FocusedRow::Series(_) => return None,
                 },
                 // Most terminals send Shift+Space as Space alone, so `o`, for
                 // "only", does the same wherever Shift+Space cannot.
                 (KeyCode::Char(' '), KeyModifiers::SHIFT)
                 | (KeyCode::Char('o'), KeyModifiers::NONE) => match focused? {
                     FocusedRow::Series(series) => SemanticCommandId::MetricsSeriesSolo { series },
+                    FocusedRow::Session(_) => return None,
                 },
                 (KeyCode::Home, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketFirst,
                 (KeyCode::End, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketLast,
@@ -379,6 +388,9 @@ pub(super) fn command_for_metrics_view_event(
                 }
                 (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Series(series)) => {
                     SemanticCommandId::MetricsSeriesToggle { series }
+                }
+                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Session(session)) => {
+                    SemanticCommandId::MetricsSessionOpen { session }
                 }
                 // A drag scrubs: the selection follows the pointer along the
                 // bars, staying at the end it passed beyond either.

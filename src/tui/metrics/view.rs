@@ -1,8 +1,9 @@
 //! Draws the Usage Metrics view over the whole frame: a title bar with its
 //! close control, the range bar and the measures beside it, then the range's
 //! headline figures, the chart, and its legend — with the Usage mix strip
-//! under it for Tokens — or what stands in for them while a read is on its
-//! way, when it was refused, or when the range holds no Usage.
+//! under it for Tokens — and the Sessions that cost the most beneath them,
+//! or what stands in for them while a read is on its way, when it was
+//! refused, or when the range holds no Usage.
 
 use ratatui::{
     Frame,
@@ -12,7 +13,9 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    protocol::{UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsReport},
+    protocol::{
+        UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsReport, UsageMetricsSession,
+    },
     theme::Theme,
 };
 
@@ -40,6 +43,15 @@ const CONTROL_GAP: u16 = 4;
 const TAB_GAP: u16 = 1;
 /// What stands before the breakdowns on the controls row.
 const BREAKDOWN_LEAD: &str = "by ";
+/// What heads the Sessions that cost the most.
+const TOP_SESSIONS_HEADING: &str = "Most expensive Sessions";
+/// The fewest rows the chart keeps however many Sessions are listed under
+/// it: the list takes room from the chart only down to this.
+const CHART_FLOOR: u16 = 8;
+/// Columns a listed Session's Title, Model, and Workspace are each cut to.
+const SESSION_TITLE: usize = 40;
+const SESSION_MODEL: usize = 24;
+const SESSION_WORKSPACE: usize = 20;
 /// What stands in for the chart where All time's every Turn is untimed.
 const UNCHARTED: &str =
     "This Usage was recorded before Suru timed Turns, so none of it can be charted.";
@@ -141,9 +153,10 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
         }
     }
     if matches!(view.content(), MetricsContent::Report { .. }) {
-        // No legend rows drawn until the legend says otherwise, so a frame
-        // with no room for any leaves none to focus.
+        // No legend or Session rows drawn until they say otherwise, so a
+        // frame with no room for any leaves none to focus.
         view.record_legend_targets(Rect::new(body.x, body.y, body.width, 0));
+        view.record_session_targets(Rect::new(body.x, body.y, body.width, 0));
     }
     if body.is_empty() {
         return;
@@ -212,7 +225,24 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
             let legend_rows = u16::try_from(series.len() + 1 + usize::from(noted))
                 .unwrap_or(u16::MAX)
                 .saturating_add(if mixed { MIX_ROWS + 1 } else { 0 });
-            let chart_rows = body.height.saturating_sub(legend_rows + 1).min(24);
+            // The Sessions that cost the most stand a blank row under the
+            // legend, headed, as many as there is room for down to the
+            // chart's floor; a heading with no row under it is left out.
+            let listed = u16::try_from(report.top_sessions.len()).unwrap_or(u16::MAX);
+            let list_rows = if listed == 0 {
+                0
+            } else {
+                listed.saturating_add(2).min(
+                    body.height
+                        .saturating_sub(legend_rows + 1)
+                        .saturating_sub(CHART_FLOOR),
+                )
+            };
+            let list_rows = if list_rows < 3 { 0 } else { list_rows };
+            let chart_rows = body
+                .height
+                .saturating_sub(legend_rows + 1 + list_rows)
+                .min(24);
             let chart_area = Rect::new(body.x, body.y, body.width, chart_rows);
             view.record_chart_target(chart_area);
             // Hidden series drop out of the stacks, so the axis rises only as
@@ -237,7 +267,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 body.x,
                 body.y + chart_rows + 1,
                 body.width,
-                body.height.saturating_sub(chart_rows + 1),
+                body.height.saturating_sub(chart_rows + 1 + list_rows),
             );
             let shown = selected.unwrap_or(across);
             render_legend(frame, legend, &series, &shown, view, theme);
@@ -254,7 +284,86 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 );
                 mix::render(frame.buffer_mut(), mix, &shown.aggregate, theme);
             }
+            if list_rows > 0 {
+                let list = Rect::new(body.x, legend.bottom() + 1, body.width, list_rows - 1);
+                render_top_sessions(frame, list, &report.top_sessions, view, theme);
+            }
         }
+    }
+}
+
+/// The Sessions that cost the most under their heading, one to a row as
+/// many as `area` has room for: each its Cost, with a `+` where it is
+/// partial, its Title, the Model it cost the most under, and its Workspace,
+/// in columns aligned down the list.
+fn render_top_sessions(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    sessions: &[UsageMetricsSession],
+    view: &MetricsView,
+    theme: &Theme,
+) {
+    let buffer = frame.buffer_mut();
+    let drawn = u16::try_from(sessions.len())
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(1));
+    view.record_session_targets(Rect::new(area.x, area.y + 1, area.width, drawn));
+    if area.height == 0 {
+        return;
+    }
+    buffer.set_string(
+        area.x,
+        area.y,
+        TOP_SESSIONS_HEADING,
+        theme.text.primary.add_modifier(Modifier::BOLD),
+    );
+    let sessions = &sessions[..usize::from(drawn)];
+    let costs: Vec<String> = sessions
+        .iter()
+        .map(|session| {
+            MetricsMeasure::Cost.figure(session.cost.nano_usd(), session.is_cost_partial)
+        })
+        .collect();
+    let widest = |width: &dyn Fn(&UsageMetricsSession) -> usize, most: usize| {
+        sessions.iter().map(width).max().unwrap_or(0).min(most)
+    };
+    let cost_width = costs.iter().map(|cost| cost.width()).max().unwrap_or(0);
+    let model_width = widest(
+        &|session| session.model.as_deref().map_or(0, UnicodeWidthStr::width),
+        SESSION_MODEL,
+    );
+    let workspace_width = widest(&|session| session.workspace.width(), SESSION_WORKSPACE);
+    // The Title gives way first where the row is narrow, down to nothing
+    // before the Model and Workspace are cut off the row's end.
+    let title_width = widest(&|session| session.title.width(), SESSION_TITLE).min(
+        usize::from(area.width).saturating_sub(cost_width + model_width + workspace_width + 6),
+    );
+    let focused = view.focused_row();
+    for (place, (session, cost)) in sessions.iter().zip(&costs).enumerate() {
+        let y = area.y + 1 + u16::try_from(place).unwrap_or(u16::MAX);
+        let focused = focused == Some(FocusedRow::Session(place));
+        let style = if focused {
+            theme.selection.focused
+        } else {
+            theme.text.primary
+        };
+        if focused && let Some(x) = area.x.checked_sub(1) {
+            // Marked in the inset before the figure, as a legend row is.
+            buffer.set_string(x, y, "›", style);
+        }
+        let padded = |text: &str, width: usize| {
+            let text = truncate_to_width(text, width);
+            let padding = " ".repeat(width.saturating_sub(text.width()));
+            format!("{text}{padding}")
+        };
+        let line = format!(
+            "{cost:>cost_width$}  {}  {}  {}",
+            padded(&session.title, title_width),
+            padded(session.model.as_deref().unwrap_or(""), model_width),
+            padded(&session.workspace, workspace_width),
+        );
+        let line = truncate_to_width(line.trim_end(), usize::from(area.width));
+        buffer.set_string(area.x, y, line, style);
     }
 }
 

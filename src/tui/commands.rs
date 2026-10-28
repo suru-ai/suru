@@ -173,6 +173,12 @@ pub enum SemanticCommandId {
     MetricsFocusNext,
     /// Lets go of the Usage Metrics view's list focus.
     MetricsFocusClear,
+    /// Opens one of the Sessions the Usage Metrics view lists as costing the
+    /// most, by its place among them, counted from the first, closing the
+    /// view.
+    MetricsSessionOpen {
+        session: usize,
+    },
     /// Opens the Icon Picker over a Session, which the picker only does while
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
     /// menu item stays quiet rather than opening a picker no glyph could draw.
@@ -754,6 +760,7 @@ impl SemanticCommandId {
             Self::MetricsFocusPrevious => "metrics.focus.previous",
             Self::MetricsFocusNext => "metrics.focus.next",
             Self::MetricsFocusClear => "metrics.focus.clear",
+            Self::MetricsSessionOpen { .. } => "metrics.session.open",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::SessionRename => "session.rename",
@@ -2030,6 +2037,16 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Clear Metrics Focus",
         reach: SemanticReach::Client,
         description: "Let go of the Usage Metrics view's focused row",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        // The Session's place among those listed is invocation data, as a
+        // series' is; opening it is the open-Session path every list takes.
+        id: SemanticCommandId::MetricsSessionOpen { session: 0 },
+        title: "Open Metrics Session",
+        reach: SemanticReach::Client,
+        description: "Open one of the Sessions the Usage Metrics view lists as costing the most",
         slash: None,
         keybinding: None,
     },
@@ -3331,6 +3348,9 @@ pub(super) fn descriptor(id: SemanticCommandId) -> &'static SemanticCommandDescr
                     ) | (
                         SemanticCommandId::MetricsSeriesSolo { .. },
                         SemanticCommandId::MetricsSeriesSolo { .. }
+                    ) | (
+                        SemanticCommandId::MetricsSessionOpen { .. },
+                        SemanticCommandId::MetricsSessionOpen { .. }
                     )
                 )
         })
