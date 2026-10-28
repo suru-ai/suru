@@ -3,25 +3,30 @@
 //! for.
 //!
 //! Every Session's Turns are in memory from startup, its history deferred or
-//! not (ADR 0022), so the read never hydrates one. It copies what it needs of
-//! each Turn under the store lock and adds them up outside it, so a large
-//! history holds up no other reader. Cost is read through Cost Coverage, as
-//! the tree Costs a listing shows are (ADR 0054): each contribution lands
-//! where the Turn carrying it does, so over all of time the buckets add up to
-//! the Server's root Sessions' tree Costs. A Remote's Session that a Sidekick here
-//! acted on is held apart from the Sessions living here (ADR 0049), so it is
-//! never counted: its own Server counts it.
+//! not (ADR 0022), so the read never hydrates one. Under the store lock it
+//! only copies each Session's Turns and where it stands in its forest; it
+//! indexes that copy, reads Cost Coverage from it, and adds everything up
+//! outside the lock, so a large history holds up no other reader. Cost is
+//! read through the same Cost Coverage the tree Costs a listing shows are
+//! (ADR 0054): each contribution lands where the Turn carrying it does, so
+//! over all of time the buckets add up to the Server's root Sessions' tree
+//! Costs. A Remote's Session that a Sidekick here acted on is held apart from
+//! the Sessions living here (ADR 0049), so it is never counted: its own
+//! Server counts it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::protocol::{
-    CostBasis, KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS, ModelCatalog, SessionId,
+    Cost, CostBasis, KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS, ModelCatalog, SessionId,
     SessionTimestamp, Turn, TurnId, Usage, UsageMetricsAggregate, UsageMetricsBreakdown,
     UsageMetricsBucket, UsageMetricsKey, UsageMetricsKeyLabel, UsageMetricsQuery,
     UsageMetricsReport,
 };
 
-use super::{SessionStore, SessionStoreState, cost_coverage::CostContribution};
+use super::{
+    SessionStore, SessionStoreState,
+    cost_coverage::{CostContribution, CostForest, add_cost, tree_contributions},
+};
 
 /// Why a Usage Metrics query is refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,7 +62,7 @@ impl UsageMetricsRefusal {
     }
 }
 
-/// What the read copies of one Turn: which it is, where it is placed in
+/// What the read takes of one Turn: which it is, where it is placed in
 /// time, the key it is broken down under, and its Usage.
 struct MeteredTurn {
     session_id: SessionId,
@@ -67,8 +72,8 @@ struct MeteredTurn {
     usage: Option<Usage>,
 }
 
-/// What the read copies out of the store: every Turn living here, and what
-/// each adds to the Server's Cost.
+/// What the read takes of the store: every Turn it counts, and what each
+/// adds to the Server's Cost.
 struct Metered {
     turns: Vec<MeteredTurn>,
     costs: Vec<CostContribution>,
@@ -86,59 +91,173 @@ impl SessionStore {
         if let Some(refusal) = UsageMetricsRefusal::of(query) {
             return Err(refusal);
         }
-        let metered = self
+        let copied = self
             .state
             .lock()
             .expect("Session store lock is not poisoned")
-            .metered(query.breakdown);
+            .copied_forest();
+        let metered = MeteredForest::index(copied).metered(query.breakdown);
         Ok(fold(query, metered, catalog))
     }
 }
 
+/// What the read copies of one Session under the store lock: its Turns,
+/// and where it stands in its forest.
+struct CopiedSession {
+    parent: Option<SessionId>,
+    is_brokered_subagent: bool,
+    /// The Sidekick's Session that began it, where one did.
+    sidekick: Option<SessionId>,
+    turns: Vec<Turn>,
+}
+
 impl SessionStoreState {
-    /// Every Turn of every Session living here, as the read needs it, and
-    /// the Cost contributions of every tree of Sessions here.
-    fn metered(&self, breakdown: UsageMetricsBreakdown) -> Metered {
-        let turns = self
-            .sessions
+    /// Every Session living here, copied as the read needs it and nothing
+    /// more worked out while the lock is held.
+    fn copied_forest(&self) -> HashMap<SessionId, CopiedSession> {
+        self.sessions
             .iter()
-            .flat_map(|(session_id, record)| {
-                record.snapshot.turns.iter().map(|turn| MeteredTurn {
-                    session_id: *session_id,
-                    turn_id: turn.id,
-                    placed_at: turn.started_at.or(turn.settled_at),
-                    key: key_of(breakdown, turn),
-                    usage: turn.usage.clone(),
-                })
+            .map(|(session_id, record)| {
+                record_work(1 + record.snapshot.turns.len());
+                let copied = CopiedSession {
+                    parent: record.snapshot.session.parent,
+                    is_brokered_subagent: record.is_brokered_subagent(),
+                    sidekick: record.summary.session.sidekick(),
+                    turns: record.snapshot.turns.clone(),
+                };
+                (*session_id, copied)
             })
-            .collect();
-        let costs = self
-            .sessions
-            .keys()
-            .filter(|session_id| self.heads_a_cost_tree(**session_id))
-            .flat_map(|root| self.tree_cost_contributions(*root))
-            .collect();
-        Metered { turns, costs }
+            .collect()
+    }
+}
+
+/// The copied Sessions, indexed once so each tree is walked from its root
+/// without searching the whole forest at every Session.
+struct MeteredForest {
+    sessions: HashMap<SessionId, CopiedSession>,
+    children: HashMap<SessionId, Vec<SessionId>>,
+    subsessions: HashMap<SessionId, Vec<SessionId>>,
+}
+
+impl MeteredForest {
+    fn index(sessions: HashMap<SessionId, CopiedSession>) -> Self {
+        let mut children = HashMap::<SessionId, Vec<SessionId>>::new();
+        let mut subsessions = HashMap::<SessionId, Vec<SessionId>>::new();
+        for (session_id, session) in &sessions {
+            record_work(1);
+            if let Some(parent) = session.parent {
+                children.entry(parent).or_default().push(*session_id);
+            }
+            if let Some(sidekick) = session.sidekick {
+                subsessions.entry(sidekick).or_default().push(*session_id);
+            }
+        }
+        Self {
+            sessions,
+            children,
+            subsessions,
+        }
     }
 
     /// Whether this Session's tree Cost is one of those the Server's Cost
-    /// adds up: a root Session's, unless it is a Subsession whose Sidekick's
-    /// tree Cost already carries it. Every Session reached from a root is
-    /// then counted once: a Subagent in its root's tree, and a Subsession in
-    /// its Sidekick's.
-    fn heads_a_cost_tree(&self, session_id: SessionId) -> bool {
-        let is_root = |session_id: SessionId| {
-            self.sessions
-                .get(&session_id)
-                .is_some_and(|record| record.snapshot.session.parent.is_none())
-        };
-        is_root(session_id)
-            && self.sessions[&session_id]
-                .summary
-                .session
-                .sidekick()
-                .is_none_or(|sidekick| !is_root(sidekick))
+    /// adds up: a top-level Session's, unless it is a Subsession whose
+    /// Sidekick lives here, since the Sidekick's tree Cost carries it. Every
+    /// Session reached from one of these is then counted once: a Subagent in
+    /// its root's tree, and a Subsession in its Sidekick's.
+    fn heads_a_cost_tree(&self, session: &CopiedSession) -> bool {
+        session.parent.is_none()
+            && session
+                .sidekick
+                .is_none_or(|sidekick| !self.sessions.contains_key(&sidekick))
     }
+
+    /// The Turns of every Session in a tree headed here, and every Cost
+    /// contribution of those trees. A Session in no such tree — a Subagent
+    /// whose parent is gone, or one of a cycle — is in no tree Cost a
+    /// listing shows, so neither its Usage nor its Cost is counted, and the
+    /// two measures cover the same Sessions.
+    fn metered(&self, breakdown: UsageMetricsBreakdown) -> Metered {
+        let roots: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| self.heads_a_cost_tree(session))
+            .map(|(session_id, _)| *session_id)
+            .collect();
+        let costs = roots
+            .iter()
+            .flat_map(|root| tree_contributions(self, *root))
+            .collect();
+        let mut counted = HashSet::new();
+        let mut turns = Vec::new();
+        for root in roots {
+            let trees = std::iter::once(root).chain(self.subsessions_begun_by(root));
+            for session_id in trees.flat_map(|head| self.subtree_of(head)) {
+                if !counted.insert(session_id) {
+                    continue;
+                }
+                turns.extend(
+                    self.sessions[&session_id]
+                        .turns
+                        .iter()
+                        .map(|turn| MeteredTurn {
+                            session_id,
+                            turn_id: turn.id,
+                            placed_at: turn.started_at.or(turn.settled_at),
+                            key: key_of(breakdown, turn),
+                            usage: turn.usage.clone(),
+                        }),
+                );
+            }
+        }
+        Metered { turns, costs }
+    }
+}
+
+impl CostForest for MeteredForest {
+    fn turns(&self, session_id: SessionId) -> Option<&[Turn]> {
+        Some(&self.sessions.get(&session_id)?.turns)
+    }
+
+    fn parent(&self, session_id: SessionId) -> Option<SessionId> {
+        self.sessions.get(&session_id)?.parent
+    }
+
+    fn is_brokered_subagent(&self, session_id: SessionId) -> bool {
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|session| session.is_brokered_subagent)
+    }
+
+    /// Walks the children index, each Session once, so even a Subagent
+    /// caught in a cycle is reached no more than once.
+    fn subtree_of(&self, session_id: SessionId) -> Vec<SessionId> {
+        let mut walk = vec![session_id];
+        let mut seen = HashSet::from([session_id]);
+        let mut visit = 0;
+        while visit < walk.len() {
+            record_work(1);
+            for child in self.children.get(&walk[visit]).into_iter().flatten() {
+                if seen.insert(*child) {
+                    walk.push(*child);
+                }
+            }
+            visit += 1;
+        }
+        walk
+    }
+
+    fn subsessions_begun_by(&self, sidekick: SessionId) -> Vec<SessionId> {
+        self.subsessions.get(&sidekick).cloned().unwrap_or_default()
+    }
+}
+
+// Count the Sessions and Turns the read visits in tests, as restoration's
+// are, so a read that searches the whole forest at every Session shows;
+// production builds erase this instrumentation entirely.
+#[inline]
+fn record_work(_count: usize) {
+    #[cfg(test)]
+    super::restoration_tests::record_work(_count);
 }
 
 fn key_of(breakdown: UsageMetricsBreakdown, turn: &Turn) -> UsageMetricsKey {
@@ -195,9 +314,7 @@ impl Tally {
 /// portion, where it counts one, and its partial mark.
 fn add_contribution(aggregate: &mut UsageMetricsAggregate, contribution: &CostContribution) {
     if let Some(amount) = contribution.amount {
-        let add = |held: Option<crate::protocol::Cost>| {
-            Some(held.map_or(amount.cost, |held| held.saturating_add(amount.cost)))
-        };
+        let add = |held: Option<Cost>| Some(add_cost(held, amount.cost));
         aggregate.cost = add(aggregate.cost);
         if amount.basis == CostBasis::Estimated {
             aggregate.estimated_cost = add(aggregate.estimated_cost);
@@ -231,16 +348,13 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, catalog: &ModelCatalog) -> 
     for turn in metered.turns {
         let place = turn.placed_at.map(bucket_of);
         placed.insert((turn.session_id, turn.turn_id), (place, turn.key.clone()));
-        match place {
-            None => untimed.add(turn),
-            Some(index) => {
-                let placed_at = turn.placed_at.expect("a placed Turn is timed");
-                earliest_turn_at =
-                    Some(earliest_turn_at.map_or(placed_at, |held| held.min(placed_at)));
-                if let Some(index) = index {
-                    buckets[index].add(turn);
-                }
-            }
+        let Some(placed_at) = turn.placed_at else {
+            untimed.add(turn);
+            continue;
+        };
+        earliest_turn_at = Some(earliest_turn_at.map_or(placed_at, |held| held.min(placed_at)));
+        if let Some(Some(index)) = place {
+            buckets[index].add(turn);
         }
     }
     for contribution in &metered.costs {

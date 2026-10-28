@@ -797,12 +797,24 @@ async fn malformed_relationships_do_not_promote_children_into_listed_roots() {
     let directory = tempfile::tempdir().unwrap();
     let repository = StorageRepository::open(directory.path()).await.unwrap();
     let (writer, sink) = StorageWriter::spawn(repository);
-    let root = persisted(directory.path(), None);
-    let orphan = persisted(directory.path(), Some(SessionId::new()));
+    let mut root = persisted(directory.path(), None);
+    let mut orphan = persisted(directory.path(), Some(SessionId::new()));
     let mut cycle = persisted(directory.path(), None);
-    let other = persisted(directory.path(), Some(cycle.snapshot.session.id));
+    let mut other = persisted(directory.path(), Some(cycle.snapshot.session.id));
     cycle.snapshot.session.parent = Some(other.snapshot.session.id);
     cycle.summary.session.parent = cycle.snapshot.session.parent;
+    // Priced, so that Usage Metrics leaving the orphan and the cycle out is
+    // pinned on purpose: they are in no tree Cost a listing shows, so the
+    // read counts neither their Cost nor their Usage, and its two measures
+    // cover the same Sessions.
+    for (record, usd) in [
+        (&mut root, 0.01),
+        (&mut orphan, 0.10),
+        (&mut cycle, 1.00),
+        (&mut other, 10.00),
+    ] {
+        record.snapshot.turns = vec![priced_turn(Some(10), usd, CostCoverage::Turn, 12)];
+    }
     let root_id = root.snapshot.session.id;
     let store = SessionStore::new(
         RestoredSessions {
@@ -816,6 +828,12 @@ async fn malformed_relationships_do_not_promote_children_into_listed_roots() {
     store.reconcile_approval_postures(&crate::protocol::EffectiveSettings::default());
     assert_eq!(store.list(None).len(), 1);
     assert!(store.subscribe(root_id).is_some());
+    let all_time = all_time_metrics(&store).buckets[0].total;
+    assert_eq!(
+        (all_time.cost, all_time.output_tokens),
+        (Cost::from_usd(0.01), Some(1)),
+        "only the listed root's Turn counts"
+    );
     assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
 }
@@ -1262,15 +1280,9 @@ fn assert_same_contributions(
     assert!(actual.is_empty(), "{case}: unexpected {actual:?}");
 }
 
-/// The Usage Metrics invariant (ADR 0054): over a bucket holding all of time
-/// and the untimed figures beside it, the Server's Cost is its root
-/// Sessions' tree Costs added, each Session counted once — a Sidekick's
-/// Subsessions beneath it, not again as roots of their own — and partial
-/// exactly where one of those trees holds work no counted amount accounts
-/// for, a tree whose Cost is wholly unknown included. The keys divide that
-/// Cost without adding to it.
-fn assert_all_time_metrics_add_up_to_root_tree_costs(store: &SessionStore) {
-    let report = store
+/// Usage Metrics over one bucket holding all of time.
+fn all_time_metrics(store: &SessionStore) -> crate::protocol::UsageMetricsReport {
+    store
         .usage_metrics(
             &UsageMetricsQuery {
                 buckets: vec![UsageMetricsInterval {
@@ -1283,7 +1295,76 @@ fn assert_all_time_metrics_add_up_to_root_tree_costs(store: &SessionStore) {
                 providers: Vec::new(),
             },
         )
-        .expect("an all-time query is answered");
+        .expect("an all-time query is answered")
+}
+
+#[tokio::test]
+async fn reading_usage_metrics_over_a_wide_forest_walks_each_tree_once() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut records = Vec::new();
+    // 128 roots, each reporting its tree's running total over a native
+    // Subagent beside a brokered one, and a Sidekick that began 64
+    // Subsessions: 449 Sessions.
+    for index in 0..128 {
+        let mut root = persisted(workspace.path(), None);
+        root.snapshot.turns = vec![priced_turn(
+            Some(10),
+            0.10,
+            subtree(&format!("root-{index}")),
+            30,
+        )];
+        let root_id = root.snapshot.session.id;
+        let mut native = persisted(workspace.path(), Some(root_id));
+        native.snapshot.turns = vec![priced_turn(Some(12), 0.05, CostCoverage::Turn, 14)];
+        let mut brokered = persisted(workspace.path(), Some(root_id));
+        brokered.brokered = true;
+        brokered.snapshot.turns = vec![priced_turn(Some(12), 0.02, CostCoverage::Turn, 14)];
+        records.extend([root, native, brokered]);
+    }
+    let mut sidekick = persisted(workspace.path(), None);
+    sidekick.snapshot.turns = vec![priced_turn(Some(10), 0.01, CostCoverage::Turn, 11)];
+    let begun_by = Some(crate::protocol::Author::Sidekick {
+        session_id: sidekick.snapshot.session.id,
+        title: "Sidekick".to_owned(),
+    });
+    records.push(sidekick);
+    for _ in 0..64 {
+        let mut subsession = persisted(workspace.path(), None);
+        subsession.snapshot.session.begun_by = begun_by.clone();
+        subsession.summary.session.begun_by = begun_by.clone();
+        subsession.snapshot.turns = vec![priced_turn(Some(12), 0.01, CostCoverage::Turn, 13)];
+        records.push(subsession);
+    }
+    let sessions = records.len();
+    let (store, writer) = restore(workspace.path(), records).await;
+
+    WORK.set(0);
+    let report = all_time_metrics(&store);
+    let work = WORK.get();
+
+    assert!(
+        work <= sessions * 8,
+        "{sessions} Sessions required {work} operations to read"
+    );
+    assert_eq!(
+        report.buckets[0].total.cost,
+        Cost::from_usd(128.0 * 0.12 + 0.65),
+        "every tree once: each root's report and its brokered Subagent, and \
+         the Sidekick with its Subsessions"
+    );
+    assert_contributions_add_up(&store);
+    writer.shutdown().await.unwrap();
+}
+
+/// The Usage Metrics invariant (ADR 0054): over a bucket holding all of time
+/// and the untimed figures beside it, the Server's Cost is its root
+/// Sessions' tree Costs added, each Session counted once — a Sidekick's
+/// Subsessions beneath it, not again as roots of their own — and partial
+/// exactly where one of those trees holds work no counted amount accounts
+/// for, a tree whose Cost is wholly unknown included. The keys divide that
+/// Cost without adding to it.
+fn assert_all_time_metrics_add_up_to_root_tree_costs(store: &SessionStore) {
+    let report = all_time_metrics(store);
     let added = |aggregates: &[UsageMetricsAggregate]| {
         (
             aggregates
