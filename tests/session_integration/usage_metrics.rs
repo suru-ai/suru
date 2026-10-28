@@ -1,0 +1,121 @@
+//! Usage Metrics asked of the Server over its HTTP API. What the read adds up
+//! is the Session store's to show; this shows the query and the report cross
+//! the wire.
+
+use crate::session_integration::support::{read_session_until, working_turn};
+use suru::{
+    protocol::{
+        RuntimeDescriptor, SessionError, SessionErrorCode, SessionTimestamp, Usage,
+        UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsQuery,
+        UsageMetricsReport,
+    },
+    provider::ProviderEvent,
+};
+
+fn by_model(buckets: Vec<UsageMetricsInterval>) -> UsageMetricsQuery {
+    UsageMetricsQuery {
+        buckets,
+        breakdown: UsageMetricsBreakdown::Model,
+    }
+}
+
+async fn ask(
+    client: &reqwest::Client,
+    descriptor: &RuntimeDescriptor,
+    query: &UsageMetricsQuery,
+) -> reqwest::Response {
+    client
+        .post(format!("{}/v1/usage-metrics", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(query)
+        .send()
+        .await
+        .expect("send the Usage Metrics read")
+}
+
+#[tokio::test]
+async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
+    let state = tempfile::tempdir().unwrap();
+    let fixture = working_turn(state.path(), "usage-metrics-read").await;
+    let descriptor = fixture.server.descriptor().clone();
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::Usage {
+            usage: Usage {
+                fresh_input_tokens: Some(4_000),
+                output_tokens: Some(1_000),
+                ..Usage::default()
+            },
+            cost: None,
+        })
+        .await;
+    let snapshot = read_session_until(
+        &fixture.client,
+        &descriptor,
+        fixture.session_id,
+        "the Turn records its Usage",
+        |snapshot| {
+            snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.usage.is_some())
+        },
+    )
+    .await;
+    let started_at = snapshot.turns[0]
+        .started_at
+        .expect("a Turn begun now is timed");
+
+    let response = ask(
+        &fixture.client,
+        &descriptor,
+        &by_model(vec![
+            UsageMetricsInterval {
+                start: SessionTimestamp(0),
+                end: started_at,
+            },
+            UsageMetricsInterval {
+                start: started_at,
+                end: SessionTimestamp(started_at.0 + 1),
+            },
+        ]),
+    )
+    .await;
+
+    assert!(response.status().is_success(), "{}", response.status());
+    let report = response.json::<UsageMetricsReport>().await.unwrap();
+    let measured = UsageMetricsAggregate {
+        fresh_input_tokens: Some(4_000),
+        output_tokens: Some(1_000),
+        ..UsageMetricsAggregate::default()
+    };
+    assert_eq!(report.buckets.len(), 2);
+    assert_eq!(report.buckets[0].total, UsageMetricsAggregate::default());
+    assert_eq!(report.buckets[1].total, measured);
+    assert_eq!(report.buckets[1].by_key.len(), 1);
+    assert_eq!(report.buckets[1].by_key[0].aggregate, measured);
+    assert_eq!(
+        report
+            .keys
+            .iter()
+            .map(|label| &label.key)
+            .collect::<Vec<_>>(),
+        vec![&report.buckets[1].by_key[0].key]
+    );
+    assert_eq!(report.earliest_turn_at, Some(started_at));
+
+    let overlapping = UsageMetricsInterval {
+        start: SessionTimestamp(0),
+        end: SessionTimestamp(started_at.0 + 1),
+    };
+    let refused = ask(
+        &fixture.client,
+        &descriptor,
+        &by_model(vec![overlapping, overlapping]),
+    )
+    .await;
+    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+    let refused = refused.json::<SessionError>().await.unwrap();
+    assert_eq!(refused.code, SessionErrorCode::InvalidUsageMetricsQuery);
+    fixture.server.shutdown().await.unwrap();
+}

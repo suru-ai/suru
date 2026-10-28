@@ -32,6 +32,7 @@ mod support;
 mod titles;
 mod turns;
 mod usage;
+mod usage_metrics;
 mod viewed;
 mod watch_outcomes;
 mod working;

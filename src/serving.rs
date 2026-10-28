@@ -6911,6 +6911,23 @@ mod tests {
         }
     }
 
+    /// A Peer reads what a Client of this Server could, short of its
+    /// administration: a Remote's Usage Metrics are read through the
+    /// Pairing, by whichever way it was reached, as its Sessions are.
+    #[test]
+    fn a_peer_reads_usage_metrics_as_it_reads_sessions() {
+        for (method, path) in [
+            (Method::GET, "/v1/sessions"),
+            (Method::POST, "/v1/usage-metrics"),
+        ] {
+            assert!(
+                peer_route_class(&method, path) == PeerRouteClass::Api,
+                "{method} {path}"
+            );
+            assert!(!takes_an_author(&method, path), "{method} {path}");
+        }
+    }
+
     /// An Invite names a Relay it offers by the one way a Relay's address is
     /// written, as the Server that issued it wrote it; one written any other
     /// way was written by nothing that issues Invites.

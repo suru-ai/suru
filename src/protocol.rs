@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 106;
+pub const PROTOCOL_VERSION: u32 = 107;
 mod attachment;
 mod reading;
 mod relay;
@@ -5320,6 +5320,9 @@ pub enum SessionErrorCode {
     ContextBreakdownUnavailable,
     /// The Provider was asked for a Context Breakdown and gave none.
     ContextBreakdownFailed,
+    /// A Usage Metrics query asked for more buckets than one may, or for
+    /// buckets out of order or overlapping.
+    InvalidUsageMetricsQuery,
     PromptConflict,
     PromptNotFound,
     PromptNotPending,

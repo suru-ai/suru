@@ -37,21 +37,22 @@ use crate::model_catalog::{CatalogMemory, ModelCatalogService};
 use crate::protocol::{
     AUTHOR_HEADER, Activity, AdmitPromptRequest, AgentSelection, Author, CloneWorkspaceRequest,
     ClonedWorkspace, CompactSessionRequest, CreateSessionRequest, InterruptOutcome,
-    IssueInviteRequest, LifecycleState, ListDirectoryRequest, ListenerState, MODEL_CATALOG_EVENT,
-    Message, MessageId, MessageRole, MessageStatus, ModelCatalog, ONBOARDED_EVENT,
-    PROMPT_ADMISSION_HEADER, PROTOCOL_VERSION, Peer, ProviderId, RELAYS_EVENT, RedeemInviteRequest,
-    RelayListing, Remote, ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
-    SERVING_LISTENER_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
-    SESSION_ERROR_CODE_HEADER, SESSION_READING_PATH, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
-    SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT,
-    SUBAGENT_TREE_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision,
-    SessionChange, SessionError, SessionErrorCode, SessionId, SessionReadingQuery, SessionRevision,
-    SessionTitleProposal, SessionTitleProposalOffer, SessionUpdate, SetSessionIconRequest,
-    SetSessionTitleRequest, SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest,
-    SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
-    SkillCatalogRequest, SubagentTreeRevision, SubagentTreeUpdate, TurnId,
-    UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
-    WORKSPACE_LISTING_EVENT, WorkspaceListing, WorkspaceListingRevision,
+    IssueInviteRequest, LifecycleState, ListDirectoryRequest, ListenerState,
+    MAX_USAGE_METRICS_BUCKETS, MODEL_CATALOG_EVENT, Message, MessageId, MessageRole, MessageStatus,
+    ModelCatalog, ONBOARDED_EVENT, PROMPT_ADMISSION_HEADER, PROTOCOL_VERSION, Peer, ProviderId,
+    RELAYS_EVENT, RedeemInviteRequest, RelayListing, Remote, ResolveWorkspaceRequest,
+    RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SERVING_LISTENER_EVENT,
+    SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_ERROR_CODE_HEADER,
+    SESSION_READING_PATH, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
+    SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT,
+    ServerIdentity, ServerShutdown, SessionCatalogRevision, SessionChange, SessionError,
+    SessionErrorCode, SessionId, SessionReadingQuery, SessionRevision, SessionTitleProposal,
+    SessionTitleProposalOffer, SessionUpdate, SetSessionIconRequest, SetSessionTitleRequest,
+    SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot,
+    SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest, SubagentTreeRevision,
+    SubagentTreeUpdate, TurnId, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest,
+    UsageMetricsQuery, ViewSessionRequest, WORKSPACE_LISTING_EVENT, WorkspaceListing,
+    WorkspaceListingRevision,
 };
 use crate::provider::{
     ContextBreakdownError, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate,
@@ -63,7 +64,7 @@ use crate::sessions::{
     AgentSelectionMutationError, ApprovalPostureMutationError, CompactSessionError,
     DeleteSessionError, Derivation, PromptMutationError, ProposalRefusal, SessionCatalogFeed,
     SessionFeed, SessionStore, SetIconError, SetTitleError, SetWorkspaceDescriptionError,
-    SetWorkspaceIconError, StoreOutcome,
+    SetWorkspaceIconError, StoreOutcome, UsageMetricsRefusal,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
@@ -1961,6 +1962,7 @@ async fn start(
             get(attachments::fetch_attachment).head(attachments::head_attachment),
         )
         .route("/v1/sessions", get(list_sessions).post(create_session))
+        .route("/v1/usage-metrics", post(read_usage_metrics))
         .merge(
             Router::new()
                 .route(
@@ -3715,6 +3717,40 @@ async fn context_breakdown(
             StatusCode::BAD_GATEWAY,
             SessionErrorCode::ContextBreakdownFailed,
             message,
+        ),
+    }
+}
+
+/// Usage Metrics of every Session living on this Server. The query rides
+/// the body, since its buckets are too many for a query string; the read
+/// changes nothing and reads no history in, so it passes no hydration.
+async fn read_usage_metrics(State(state): State<AppState>, request: Request) -> Response {
+    let query =
+        match decode_session_command::<UsageMetricsQuery>(&state, request, "Usage Metrics read")
+            .await
+        {
+            Ok(query) => query,
+            Err(response) => return response,
+        };
+    match state
+        .sessions
+        .usage_metrics(&query, &state.model_catalog.current())
+    {
+        Ok(report) => Json(report).into_response(),
+        Err(refusal) => session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidUsageMetricsQuery,
+            match refusal {
+                UsageMetricsRefusal::TooManyBuckets => format!(
+                    "A Usage Metrics query asks for at most {MAX_USAGE_METRICS_BUCKETS} buckets"
+                ),
+                UsageMetricsRefusal::OutOfOrder => {
+                    "A Usage Metrics query's buckets run out of order".to_owned()
+                }
+                UsageMetricsRefusal::Overlapping => {
+                    "A Usage Metrics query's buckets overlap".to_owned()
+                }
+            },
         ),
     }
 }
