@@ -57,7 +57,11 @@ pub enum SemanticCommandId {
     /// Pastes what the host clipboard holds into the composer: an image as an
     /// Attachment, text as a bracketed paste of it would, and nothing else.
     ComposerClipboardPaste,
-    PointerClick,
+    /// A click on the screen cell its subject names, with `modifiers` held,
+    /// which the surface resolving it may read it differently by.
+    PointerClick {
+        modifiers: KeyModifiers,
+    },
     PointerDrag,
     HyperlinkOpen,
     /// Opens an Attachment at full size from its thumbnail. Reserved, and
@@ -678,7 +682,7 @@ impl SemanticCommandId {
             Self::QuestionnaireReview => "questionnaire.review",
             Self::QuestionnaireSubmit => "questionnaire.submit",
             Self::QuestionnaireDecline => "questionnaire.decline",
-            Self::PointerClick => "pointer.click",
+            Self::PointerClick { .. } => "pointer.click",
             Self::PointerDrag => "pointer.drag",
             Self::HyperlinkOpen => "hyperlink.open",
             Self::AttachmentOpen => "attachment.open",
@@ -2825,7 +2829,10 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         keybinding: None,
     },
     SemanticCommandDescriptor {
-        id: SemanticCommandId::PointerClick,
+        // The modifiers held are invocation data, as a bucket's place is.
+        id: SemanticCommandId::PointerClick {
+            modifiers: KeyModifiers::NONE,
+        },
         title: "Click",
         reach: SemanticReach::Client,
         description: "Act on a screen cell in the active surface",
@@ -3312,6 +3319,9 @@ pub(super) fn descriptor(id: SemanticCommandId) -> &'static SemanticCommandDescr
                     ) | (
                         SemanticCommandId::AsideWidthSet { .. },
                         SemanticCommandId::AsideWidthSet { .. }
+                    ) | (
+                        SemanticCommandId::PointerClick { .. },
+                        SemanticCommandId::PointerClick { .. }
                     ) | (
                         SemanticCommandId::MetricsBucketSelect { .. },
                         SemanticCommandId::MetricsBucketSelect { .. }

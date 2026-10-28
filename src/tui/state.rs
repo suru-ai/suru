@@ -579,9 +579,6 @@ struct LandingLocation {
 pub struct TuiState {
     hyperlinks: bool,
     left_press: Option<LeftPress>,
-    /// The modifiers held over the click being resolved, for as long as it
-    /// is, and none otherwise.
-    click_modifiers: KeyModifiers,
     last_click: Option<LastClick>,
     click_interval: Duration,
     pub(super) text_selection: Cell<Option<TextSelection>>,
@@ -1030,7 +1027,6 @@ impl TuiState {
         Self {
             hyperlinks: false,
             left_press: None,
-            click_modifiers: KeyModifiers::NONE,
             last_click: None,
             click_interval: CLICK_INTERVAL,
             text_selection: Cell::new(None),
@@ -10309,35 +10305,32 @@ impl Application {
         }
     }
 
-    /// Clicks at `position` with `modifiers` held, which the surface that
-    /// resolves the click may read it differently by.
+    /// Clicks at `position` with `modifiers` held.
     fn click(
         &mut self,
         position: Position,
         modifiers: KeyModifiers,
     ) -> Result<ApplicationTransition> {
-        self.state.click_modifiers = modifiers;
-        let transition = self.invoke_semantic(SemanticInvocation {
-            id: SemanticCommandId::PointerClick,
+        self.invoke_semantic(SemanticInvocation {
+            id: SemanticCommandId::PointerClick { modifiers },
             subject: SemanticSubject::ScreenPosition(position),
-        });
-        self.state.click_modifiers = KeyModifiers::NONE;
-        transition
+        })
     }
 
-    /// Resolves a pointer gesture at `position` through the same mode table
-    /// as other input, so the surface that owns the pointer acts on it, with
-    /// whatever modifiers were held over a click.
+    /// Resolves a pointer gesture at `position`, with `modifiers` held,
+    /// through the same mode table as other input, so the surface that owns
+    /// the pointer acts on it.
     fn resolve_pointer(
         &mut self,
         kind: MouseEventKind,
         position: Position,
+        modifiers: KeyModifiers,
     ) -> Result<ApplicationTransition> {
         let event = InputEvent::Mouse(MouseEvent {
             kind,
             column: position.x,
             row: position.y,
-            modifiers: self.state.click_modifiers,
+            modifiers,
         });
         self.command_for_input_mode(event)
             .map_or(Ok(ApplicationTransition::Continue), |command| {
@@ -10588,7 +10581,7 @@ impl Application {
                         ApplicationTransition::OpenHyperlink(target.to_owned())
                     }))
             }
-            SemanticCommandId::PointerClick => {
+            SemanticCommandId::PointerClick { modifiers } => {
                 let SemanticSubject::ScreenPosition(position) = invocation.subject else {
                     return Ok(ApplicationTransition::Continue);
                 };
@@ -10608,7 +10601,7 @@ impl Application {
                 }
                 // Resolve a recognized click through the same mode table as other
                 // input, so overlays retain their ownership of pointer actions.
-                self.resolve_pointer(MouseEventKind::Up(MouseButton::Left), position)
+                self.resolve_pointer(MouseEventKind::Up(MouseButton::Left), position, modifiers)
             }
             SemanticCommandId::PointerDrag => {
                 // The Usage Metrics view covers the whole frame and holds no
@@ -10622,7 +10615,11 @@ impl Application {
                     if let Some(press) = &mut self.state.left_press {
                         press.move_to(position);
                     }
-                    return self.resolve_pointer(MouseEventKind::Drag(MouseButton::Left), position);
+                    return self.resolve_pointer(
+                        MouseEventKind::Drag(MouseButton::Left),
+                        position,
+                        KeyModifiers::NONE,
+                    );
                 }
                 if self.state.sidebar.column().edge_is_held() {
                     let SemanticSubject::ScreenPosition(position) = &invocation.subject else {
