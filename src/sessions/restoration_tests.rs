@@ -2,7 +2,10 @@
 
 use std::{cell::Cell, collections::HashMap, path::Path};
 
-use super::SessionStore;
+use super::{
+    SessionStore,
+    cost_coverage::{CostContribution, CountedCost, sum_contributions},
+};
 use crate::{
     protocol::{
         Activity, ActivityId, ActivityStatus, Cost, CostBasis, CostCoverage, CostDetails,
@@ -174,6 +177,7 @@ async fn an_untimed_descendant_aggregate_is_suppressed_but_an_untimed_turn_cost_
     assert_eq!(untimed_total.cost, Cost::from_usd(0.10));
     assert!(untimed_total.cost_is_partial);
 
+    assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
 }
 
@@ -244,6 +248,7 @@ async fn restored_usage_folds_descendants_without_spending_revisions_or_writes()
         assert_eq!(summary.session.working_since, snapshot.working_since());
         assert_eq!(summary.updated_at, SessionTimestamp(2));
     }
+    assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
     assert!(
         repository
@@ -368,6 +373,7 @@ async fn a_subagent_turn_left_open_by_a_stop_settles_as_failed_at_the_next_start
 
     // The repair is durable: the next process reads it back rather than
     // deciding it again.
+    assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
     let reloaded_child = repository
         .session(child_id)
@@ -439,6 +445,7 @@ async fn a_root_turn_left_open_by_a_stop_settles_as_failed_at_the_next_start() {
     assert_eq!(summary.session.status, SessionStatus::Idle);
     assert_eq!(summary.session.working_since, None);
 
+    assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
     let reloaded = repository
         .session(root_id)
@@ -489,6 +496,7 @@ async fn a_subagent_already_settled_is_left_exactly_as_it_was() {
         (ActivityStatus::Active, None),
         "a row the last process left open over a settled Turn is not this repair's to close"
     );
+    assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
     assert!(
         repository
@@ -556,6 +564,7 @@ async fn a_resume_row_a_sibling_holds_settles_with_the_turn_left_open_by_a_stop(
         (ActivityStatus::Completed, Some(8)),
         "the spawn's row keeps what its own stretch settled with"
     );
+    assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
 }
 
@@ -607,6 +616,7 @@ async fn restore_tree(wide: bool) {
         Some(1)
     );
     assert_eq!(store.list(None).len(), 1);
+    assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
 }
 
@@ -679,6 +689,7 @@ async fn restoring_many_disjoint_reporting_lifetimes_uses_indexed_coverage() {
         .expect("reported totals");
     assert_eq!(total.cost, Cost::from_usd(2.56));
     assert!(!total.cost_is_partial);
+    assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
 }
 
@@ -776,6 +787,7 @@ async fn restored_balanced_tree_matches_the_durable_interval_union() {
         assert_eq!(snapshot.working_since(), since, "Working for {id}");
         assert_eq!(snapshot.total_usage(), usage, "Usage for {id}");
     }
+    assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
 }
 
@@ -803,6 +815,7 @@ async fn malformed_relationships_do_not_promote_children_into_listed_roots() {
     store.reconcile_approval_postures(&crate::protocol::EffectiveSettings::default());
     assert_eq!(store.list(None).len(), 1);
     assert!(store.subscribe(root_id).is_some());
+    assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
 }
 
@@ -888,6 +901,7 @@ async fn restoring_independent_roots_does_linear_relationship_work() {
         work <= 128 * 8,
         "128 roots required {work} restoration operations"
     );
+    assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
 }
 
@@ -987,6 +1001,7 @@ async fn a_whole_tree_report_covers_a_native_child_but_never_a_brokered_one() {
                 own: known(0.05, false),
             }
         );
+        assert_contributions_add_up(&store);
         writer.shutdown().await.unwrap();
     }
 }
@@ -1042,7 +1057,22 @@ async fn a_sidekicks_tree_cost_carries_its_subsessions_whole_trees() {
         "a Subsession's own tree Cost carries nothing of its Sidekick's"
     );
     assert_eq!(costs(&store, unpriced_id).tree, None);
+    {
+        let state = store.state.lock().unwrap();
+        let counted_under_sidekick = state
+            .tree_cost_contributions(sidekick_id)
+            .into_iter()
+            .filter(|contribution| {
+                contribution.session_id == subsession_id && contribution.amount.is_some()
+            })
+            .count();
+        assert_eq!(
+            counted_under_sidekick, 1,
+            "a Subsession's Turn counts once beneath its Sidekick"
+        );
+    }
 
+    assert_contributions_add_up(&store);
     // A Subsession deleted takes its Cost out of its Sidekick's tree Cost.
     store.delete(subsession_id).unwrap();
     store.delete(unpriced_id).unwrap();
@@ -1054,6 +1084,7 @@ async fn a_sidekicks_tree_cost_carries_its_subsessions_whole_trees() {
         },
         "a deleted Subsession's Cost leaves its Sidekick's tree Cost"
     );
+    assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
 }
 
@@ -1142,6 +1173,7 @@ async fn a_brokered_subagent_covers_its_own_native_descendants_and_counts_its_br
         (Cost::from_usd(0.22), known(0.10, false)),
         "a listing reads the same two figures an open Session does"
     );
+    assert_contributions_add_up(&store);
     writer.shutdown().await.unwrap();
 }
 
@@ -1195,6 +1227,278 @@ async fn own_cost_counts_each_reporting_lifetime_once_and_every_turn_scoped_cost
             },
             "{case}"
         );
+        assert_contributions_add_up(&store);
         writer.shutdown().await.unwrap();
     }
+}
+
+/// One Turn's counted Cost contribution, Reported, as a test states it.
+fn counted(session_id: SessionId, turn: &Turn, usd: f64, is_partial: bool) -> CostContribution {
+    CostContribution {
+        session_id,
+        turn_id: turn.id,
+        amount: Some(CountedCost {
+            cost: Cost::from_usd(usd).unwrap(),
+            basis: CostBasis::Reported,
+        }),
+        is_partial,
+    }
+}
+
+/// `actual` and `expected` hold the same contributions, in any order.
+fn assert_same_contributions(
+    mut actual: Vec<CostContribution>,
+    expected: &[CostContribution],
+    case: &str,
+) {
+    for contribution in expected {
+        let position = actual
+            .iter()
+            .position(|found| found == contribution)
+            .unwrap_or_else(|| panic!("{case}: {contribution:?} missing from {actual:?}"));
+        actual.remove(position);
+    }
+    assert!(actual.is_empty(), "{case}: unexpected {actual:?}");
+}
+
+/// Restoration states, for every root it folded, the tree Cost the
+/// contributions under that root add up to, and for every Session beneath,
+/// the own Cost its own contributions add up to. The live roll-up reads both
+/// as those sums, so this holds the startup fold to the same reading of Cost
+/// Coverage; `costs` holds it there for any Session a test names.
+fn assert_contributions_add_up(store: &SessionStore) {
+    let state = store.state.lock().unwrap();
+    let mut walk = state
+        .sessions
+        .iter()
+        .filter(|(_, record)| record.snapshot.session.parent.is_none())
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    while let Some(id) = walk.pop() {
+        walk.extend(
+            state
+                .sessions
+                .iter()
+                .filter(|(_, record)| record.snapshot.session.parent == Some(id))
+                .map(|(child, _)| *child),
+        );
+        let snapshot = &state.sessions[&id].snapshot;
+        if snapshot.session.parent.is_none() {
+            assert_eq!(
+                sum_contributions(&state.tree_cost_contributions(id)),
+                snapshot.total_cost,
+                "tree Cost of the root {id}"
+            );
+        }
+        assert_eq!(
+            sum_contributions(&state.own_cost_contributions(id)),
+            snapshot.own_cost,
+            "own Cost of {id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn running_total_reports_contribute_their_increments_and_turn_scoped_costs_their_own() {
+    let workspace = tempfile::tempdir().unwrap();
+    let reports = |first: (f64, &str, u64), second: (f64, &str, u64)| {
+        vec![
+            priced_turn(Some(10), first.0, subtree(first.1), first.2),
+            priced_turn(Some(13), second.0, subtree(second.1), second.2),
+        ]
+    };
+    for (turns, increments, expected, case) in [
+        (
+            reports((0.05, "process", 12), (0.08, "process", 20)),
+            [(0.05, false), (0.03, false)],
+            known(0.08, false),
+            "two running totals in one lifetime: the first amount, then the increase",
+        ),
+        (
+            reports((0.08, "first-process", 12), (0.03, "second-process", 20)),
+            [(0.08, false), (0.03, false)],
+            known(0.11, false),
+            "two lifetimes add",
+        ),
+        (
+            reports((0.08, "process", 12), (0.05, "process", 20)),
+            [(0.08, false), (0.0, true)],
+            known(0.08, true),
+            "a report lower than the one before it adds nothing, and says so",
+        ),
+        (
+            vec![
+                priced_turn(Some(10), 0.01, CostCoverage::Turn, 12),
+                priced_turn(Some(13), 0.02, CostCoverage::Turn, 15),
+            ],
+            [(0.01, false), (0.02, false)],
+            known(0.03, false),
+            "Turn-scoped Costs contribute whole",
+        ),
+    ] {
+        let mut session = persisted(workspace.path(), None);
+        session.snapshot.turns = turns.clone();
+        let id = session.snapshot.session.id;
+        let (store, writer) = restore(workspace.path(), vec![session]).await;
+        let expected_contributions = turns
+            .iter()
+            .zip(increments)
+            .map(|(turn, (usd, is_partial))| counted(id, turn, usd, is_partial))
+            .collect::<Vec<_>>();
+        {
+            let state = store.state.lock().unwrap();
+            assert_same_contributions(
+                state.own_cost_contributions(id),
+                &expected_contributions,
+                case,
+            );
+            assert_same_contributions(
+                state.tree_cost_contributions(id),
+                &expected_contributions,
+                case,
+            );
+        }
+        assert_eq!(
+            costs(&store, id),
+            Costs {
+                tree: expected,
+                own: expected,
+            },
+            "{case}"
+        );
+        assert_contributions_add_up(&store);
+        writer.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_covered_native_subagent_contributes_nothing_and_a_brokered_one_its_own_cost() {
+    let workspace = tempfile::tempdir().unwrap();
+    for brokered in [false, true] {
+        let mut parent = persisted(workspace.path(), None);
+        parent.snapshot.turns = vec![priced_turn(Some(10), 0.10, subtree("parent-process"), 20)];
+        let parent_id = parent.snapshot.session.id;
+        let mut child = persisted(workspace.path(), Some(parent_id));
+        child.brokered = brokered;
+        child.snapshot.turns = vec![priced_turn(Some(12), 0.05, CostCoverage::Turn, 15)];
+        let child_id = child.snapshot.session.id;
+        let parent_counted = counted(parent_id, &parent.snapshot.turns[0], 0.10, false);
+        let child_counted = counted(child_id, &child.snapshot.turns[0], 0.05, false);
+        let (store, writer) = restore(workspace.path(), vec![parent, child]).await;
+        {
+            let state = store.state.lock().unwrap();
+            let expected = if brokered {
+                vec![parent_counted, child_counted]
+            } else {
+                vec![parent_counted]
+            };
+            assert_same_contributions(
+                state.tree_cost_contributions(parent_id),
+                &expected,
+                &format!("beneath the parent, brokered: {brokered}"),
+            );
+            assert_same_contributions(
+                state.own_cost_contributions(child_id),
+                &[child_counted],
+                "the child's own Cost counts its own Turn either way",
+            );
+        }
+        assert_contributions_add_up(&store);
+        writer.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_contribution_carries_its_cost_basis() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut session = persisted(workspace.path(), None);
+    let reported = priced_turn(Some(10), 0.02, CostCoverage::Turn, 12);
+    let mut estimated = priced_turn(Some(13), 0.03, CostCoverage::Turn, 15);
+    estimated.cost_basis = Some(CostBasis::Estimated);
+    session.snapshot.turns = vec![reported.clone(), estimated.clone()];
+    let id = session.snapshot.session.id;
+    let (store, writer) = restore(workspace.path(), vec![session]).await;
+    let mut estimated_counted = counted(id, &estimated, 0.03, false);
+    estimated_counted.amount = estimated_counted.amount.map(|amount| CountedCost {
+        basis: CostBasis::Estimated,
+        ..amount
+    });
+    assert_same_contributions(
+        store.state.lock().unwrap().tree_cost_contributions(id),
+        &[counted(id, &reported, 0.02, false), estimated_counted],
+        "each Turn's Basis rides with its amount",
+    );
+    assert_contributions_add_up(&store);
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reading_contributions_moves_no_revision_and_changes_no_turn() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut parent = persisted(workspace.path(), None);
+    parent.snapshot.turns = vec![
+        priced_turn(Some(10), 0.05, subtree("parent-process"), 12),
+        priced_turn(Some(13), 0.08, subtree("parent-process"), 20),
+    ];
+    let parent_id = parent.snapshot.session.id;
+    let mut child = persisted(workspace.path(), Some(parent_id));
+    child.snapshot.turns = vec![priced_turn(Some(14), 0.01, CostCoverage::Turn, 16)];
+    let child_id = child.snapshot.session.id;
+    let (store, writer) = restore(workspace.path(), vec![parent, child]).await;
+    let before = [parent_id, child_id].map(|id| store.subscribe(id).unwrap().snapshot);
+    {
+        let state = store.state.lock().unwrap();
+        for id in [parent_id, child_id] {
+            state.tree_cost_contributions(id);
+            state.own_cost_contributions(id);
+        }
+    }
+    let after = [parent_id, child_id].map(|id| store.subscribe(id).unwrap().snapshot);
+    for (before, after) in before.iter().zip(&after) {
+        assert_eq!(before.revision, after.revision);
+        assert_eq!(before.turns, after.turns);
+    }
+    assert_contributions_add_up(&store);
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_prior_record_from_an_earlier_lifetime_contributes_beside_the_current_one() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut session = persisted(workspace.path(), None);
+    let mut reconnected = priced_turn(Some(10), 0.06, subtree("second-process"), 20);
+    reconnected
+        .cost_details
+        .as_mut()
+        .unwrap()
+        .prior
+        .push(crate::protocol::CostRecord {
+            cost: Cost::from_usd(0.04).unwrap(),
+            basis: CostBasis::Reported,
+            coverage: subtree("first-process"),
+            recorded_at: SessionTimestamp(12),
+            is_partial: false,
+        });
+    let later = priced_turn(Some(22), 0.09, subtree("second-process"), 25);
+    session.snapshot.turns = vec![reconnected.clone(), later.clone()];
+    let id = session.snapshot.session.id;
+    let (store, writer) = restore(workspace.path(), vec![session]).await;
+    assert_same_contributions(
+        store.state.lock().unwrap().own_cost_contributions(id),
+        &[
+            counted(id, &reconnected, 0.04, false),
+            counted(id, &reconnected, 0.06, false),
+            counted(id, &later, 0.03, false),
+        ],
+        "the earlier lifetime's record counts whole, and the later lifetime by its increments",
+    );
+    assert_eq!(
+        costs(&store, id),
+        Costs {
+            tree: known(0.13, false),
+            own: known(0.13, false),
+        }
+    );
+    assert_contributions_add_up(&store);
+    writer.shutdown().await.unwrap();
 }

@@ -10,7 +10,8 @@ use crate::protocol::{
 use super::{
     SessionStoreState,
     cost_coverage::{
-        add_cost_totals, interval_contains, with_unpriced_work, work_exceeds_coverage,
+        add_cost_totals, interval_contains, latest_report, running_total_increments,
+        with_unpriced_work, work_exceeds_coverage,
     },
     projection::derived_session_status,
 };
@@ -240,7 +241,7 @@ impl RestoredCostState {
         turns: &[Turn],
         lifetime_starts: &HashMap<String, SessionTimestamp>,
     ) {
-        let mut reports = HashMap::<String, (TurnId, CostRecord)>::new();
+        let mut reports = HashMap::<String, Vec<(TurnId, CostRecord)>>::new();
         for turn in turns {
             record_work(1);
             for record in turn_cost_records(turn) {
@@ -255,14 +256,10 @@ impl RestoredCostState {
                             .map(|started_at| (started_at, record.recorded_at)),
                         is_partial: record.is_partial || turn.started_at.is_none(),
                     }),
-                    CostCoverage::SessionSubtree { reporting_lifetime } => {
-                        let replace = reports
-                            .get(reporting_lifetime)
-                            .is_none_or(|(_, current)| current.recorded_at < record.recorded_at);
-                        if replace {
-                            reports.insert(reporting_lifetime.clone(), (turn.id, record));
-                        }
-                    }
+                    CostCoverage::SessionSubtree { reporting_lifetime } => reports
+                        .entry(reporting_lifetime.clone())
+                        .or_default()
+                        .push((turn.id, record)),
                 }
             }
             if turn.cost.is_none()
@@ -285,15 +282,29 @@ impl RestoredCostState {
         }
         let mut reports = reports
             .into_iter()
-            .map(|(lifetime, (turn_id, record))| RestoredReport {
-                interval: lifetime_starts
-                    .get(&lifetime)
-                    .copied()
-                    .map(|start| (start, record.recorded_at)),
-                lifetime,
-                turn_id,
-                partial: record.is_partial,
-                cost: record.cost,
+            .map(|(lifetime, records)| {
+                // The same reading of a running total the live derivation
+                // makes: its increments add up to what it counts.
+                let increments = running_total_increments(
+                    records
+                        .iter()
+                        .map(|(turn_id, record)| ((*turn_id, record.recorded_at), record)),
+                );
+                let (turn_id, recorded_at) = latest_report(&increments);
+                RestoredReport {
+                    interval: lifetime_starts
+                        .get(&lifetime)
+                        .copied()
+                        .map(|start| (start, recorded_at)),
+                    lifetime,
+                    turn_id,
+                    partial: increments.iter().any(|increment| increment.is_partial),
+                    cost: increments
+                        .iter()
+                        .fold(Cost::from_nano_usd(0), |total, increment| {
+                            total.saturating_add(increment.cost)
+                        }),
+                }
             })
             .collect::<Vec<_>>();
         if reports.is_empty() {
