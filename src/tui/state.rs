@@ -11578,7 +11578,9 @@ impl Application {
             }
             SemanticCommandId::MetricsFocusNext => Ok(self.move_metrics_focus(FocusMove::Next)),
             SemanticCommandId::MetricsFocusClear => {
-                self.state.metrics_view.clear_focus();
+                if self.state.metrics_view.is_open() {
+                    self.state.metrics_view.clear_focus();
+                }
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::MetricsSeriesSolo { series } => {

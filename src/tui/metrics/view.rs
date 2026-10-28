@@ -355,6 +355,7 @@ fn render_legend(
         .max()
         .unwrap_or(0)
         .max(1);
+    let focused = view.focused_row();
     let fixed = 2 + label_width + 2 + value_width + 2 + 4 + 2;
     let bar_room = usize::from(area.width)
         .saturating_sub(fixed)
@@ -376,7 +377,7 @@ fn render_legend(
         let glyph = if hidden { "░" } else { "█" };
         let swatch = Style::default().fg(series.color);
         buffer.set_string(area.x, y, glyph, swatch);
-        let focused = view.focused_row() == Some(FocusedRow::Series(row));
+        let focused = focused == Some(FocusedRow::Series(row));
         let text_style = if focused {
             theme.selection.focused
         } else {

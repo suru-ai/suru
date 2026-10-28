@@ -7,7 +7,7 @@ pub(crate) mod calendar;
 pub(crate) mod chart;
 mod view;
 
-use std::cell::Cell;
+use std::{cell::Cell, collections::HashSet};
 
 use jiff::tz::TimeZone;
 use ratatui::layout::{Position, Rect};
@@ -111,7 +111,7 @@ pub(super) struct MetricsView {
     /// are rather than where they stand, so they stay hidden through a
     /// change of measure or a refresh. Only a new range or breakdown, whose
     /// series are others, lets them go.
-    hidden: Vec<SeriesId>,
+    hidden: HashSet<SeriesId>,
     /// The row of one of the view's lists the keyboard acts on.
     focused: Option<ListRow>,
     /// When the earliest timed Turn was, as the last report since opening
@@ -433,10 +433,8 @@ impl MetricsView {
             return;
         };
         self.focused = Some(ListRow::Series(id.clone()));
-        if let Some(at) = self.hidden.iter().position(|hidden| *hidden == id) {
-            self.hidden.remove(at);
-        } else {
-            self.hidden.push(id);
+        if !self.hidden.remove(&id) {
+            self.hidden.insert(id);
         }
     }
 
@@ -453,7 +451,7 @@ impl MetricsView {
             .iter()
             .all(|other| (other == id) != self.is_hidden(other));
         self.hidden = if alone {
-            Vec::new()
+            HashSet::new()
         } else {
             ids.iter().filter(|other| *other != id).cloned().collect()
         };
