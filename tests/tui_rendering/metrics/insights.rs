@@ -14,9 +14,10 @@ use jiff::civil::date;
 use ratatui::{buffer::Buffer, style::Style};
 use suru::{
     protocol::{
-        ApprovalInsights, CompactionCounts, CompactionInsights, Cost, FreedShare, InsightsQuery,
-        InsightsReport, InsightsTool, Outlook, QUARTER_HOUR_MS, QuarterHourTurns, ToolTally,
-        TurnDurations, TurnInsights, UsageMetricsInterval, UsageMetricsQuery,
+        ApprovalInsights, CompactionCounts, CompactionInsights, Cost, DelegationInsights,
+        FreedShare, InsightsQuery, InsightsReport, InsightsTool, Outlook, QUARTER_HOUR_MS,
+        QuarterHourTurns, RoleCost, ToolTally, TurnDurations, TurnInsights, UsageMetricsInterval,
+        UsageMetricsQuery,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, InsightsPanel, MetricsTab,
@@ -92,7 +93,27 @@ fn worked() -> InsightsReport {
         tools: worked_tools(),
         compactions: worked_compactions(),
         approvals: worked_approvals(),
-        delegation: Default::default(),
+        delegation: worked_delegation(),
+    }
+}
+
+/// What `usd` dollars cost a role, partial where `partial` says.
+fn role(usd: f64, partial: bool) -> RoleCost {
+    RoleCost {
+        cost: Cost::from_usd(usd),
+        is_cost_partial: partial,
+    }
+}
+
+/// The mockup's $412.86 divided: 71% the user's own Sessions', 22% their
+/// Subagents', 9% of it brokered, 6% Sidekicks', and 1% Subsessions'.
+fn worked_delegation() -> DelegationInsights {
+    DelegationInsights {
+        own_sessions: role(293.13, false),
+        native_subagents: role(53.67, false),
+        brokered_subagents: role(37.16, false),
+        sidekicks: role(24.77, false),
+        subsessions: role(4.13, false),
     }
 }
 
@@ -403,7 +424,7 @@ fn tab_or_a_click_focuses_a_panel_and_highlights_its_border() {
     key(&mut application, KeyCode::BackTab);
     assert_eq!(
         (
-            border(&application, " Approvals "),
+            border(&application, " Delegation "),
             heatmap_border(&application)
         ),
         (focused, unfocused),
@@ -1066,6 +1087,12 @@ fn panels_stand_as_the_mockup_lays_them_out() {
         "Approvals stand beneath Compactions"
     );
     assert!(approvals.1 > compactions.1);
+    let delegation = title_at(&application, " Delegation ");
+    assert_eq!(
+        delegation.0, approvals.0,
+        "Delegation stands in the right-hand column, as beneath Tools in the mockup"
+    );
+    assert!(delegation.1 > approvals.1);
 }
 
 #[test]
@@ -1171,5 +1198,69 @@ fn a_range_with_no_approvals_says_so_in_the_panel() {
     assert_eq!(
         panel_lines(&application, " Approvals ")[0],
         "No Approvals asked in the last 30 days"
+    );
+}
+
+fn delegation_panel(application: &Application) -> Vec<String> {
+    panel_lines(application, "Delegation (Cost)")
+}
+
+#[test]
+fn the_delegation_panel_divides_cost_by_role_with_brokered_subagents_beside_theirs() {
+    assert_eq!(
+        SemanticCommandId::MetricsPanelFocus(InsightsPanel::Delegation).as_str(),
+        "metrics.panel.delegation"
+    );
+    let application = on_insights(Ok(worked()));
+
+    assert_eq!(
+        delegation_panel(&application),
+        vec![
+            "own Sessions 71% $293.13 ███████████████▋",
+            "Subagents 22% $90.83 ████▉ brokered 9%",
+            "Sidekicks 6% $24.77 █▍",
+            "Subsessions 1% $4.13 ▎",
+            "A Claude Session's native Subagents are in its Cost",
+        ]
+    );
+}
+
+#[test]
+fn a_role_whose_cost_is_partial_says_so_with_a_plus() {
+    let mut report = worked();
+    report.delegation.brokered_subagents.is_cost_partial = true;
+    report.delegation.subsessions = RoleCost {
+        cost: None,
+        is_cost_partial: true,
+    };
+    report.delegation.sidekicks = RoleCost::default();
+    let application = on_insights(Ok(report));
+
+    let lines = delegation_panel(&application);
+    assert_eq!(
+        lines[1], "Subagents 24% $90.83+ █████▎ brokered 10%",
+        "partial where its brokered part is"
+    );
+    assert_eq!(lines[2], "Sidekicks 0% —", "no work, so no Cost to state");
+    assert_eq!(
+        lines[3], "Subsessions 0% unpriced",
+        "work, none of it priced, is never a zero"
+    );
+}
+
+#[test]
+fn a_range_with_no_cost_says_so_in_the_delegation_panel() {
+    let application = on_insights(Ok(InsightsReport::default()));
+    assert_eq!(
+        delegation_panel(&application)[0],
+        "No Cost in the last 30 days"
+    );
+
+    let mut report = InsightsReport::default();
+    report.delegation.own_sessions.is_cost_partial = true;
+    let application = on_insights(Ok(report));
+    assert_eq!(
+        delegation_panel(&application)[0],
+        "No work priced in the last 30 days"
     );
 }

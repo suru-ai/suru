@@ -23,6 +23,7 @@
 
 mod approvals;
 mod compactions;
+mod delegation;
 pub(super) mod heatmap;
 pub(super) mod tools;
 pub(super) mod turns;
@@ -59,13 +60,16 @@ pub enum InsightsPanel {
     Compactions,
     /// How many Approvals were asked, and how each was decided.
     Approvals,
+    /// How Cost divides between the user's own Sessions and the work
+    /// delegated to Subagents, Sidekicks, and Subsessions.
+    Delegation,
 }
 
 impl InsightsPanel {
     /// Every panel, in the order [`Self::GRID`] places them row by row
     /// across its two columns, which is the order focus moves among them.
-    pub(crate) const ALL: [Self; 5] = {
-        let mut all = [Self::WhenYouWork; 5];
+    pub(crate) const ALL: [Self; 6] = {
+        let mut all = [Self::WhenYouWork; 6];
         let mut placed = 0;
         let mut row = 0;
         while row < Self::GRID.len() {
@@ -85,11 +89,14 @@ impl InsightsPanel {
 
     /// Where each panel stands in an interim grid of two columns, row by
     /// row, keeping to the neighbours the Insights mockup gives the panels
-    /// built so far; the empty place is the Cache panel's, yet to be.
-    pub(super) const GRID: [[Option<Self>; 2]; 3] = [
+    /// built so far: the empty place beside Approvals is the Cache panel's,
+    /// yet to be, and Delegation stands in the right-hand column, as it
+    /// stands beneath Tools in the mockup.
+    pub(super) const GRID: [[Option<Self>; 2]; 4] = [
         [Some(Self::WhenYouWork), Some(Self::Tools)],
         [Some(Self::Turns), Some(Self::Compactions)],
         [None, Some(Self::Approvals)],
+        [None, Some(Self::Delegation)],
     ];
 
     pub(crate) fn place(self) -> usize {
@@ -106,6 +113,7 @@ impl InsightsPanel {
             Self::Tools => "Tools used",
             Self::Compactions => "Compactions",
             Self::Approvals => "Approvals",
+            Self::Delegation => "Delegation (Cost)",
         }
     }
 
@@ -116,7 +124,7 @@ impl InsightsPanel {
             Self::WhenYouWork => heatmap::items(&kept.heatmap),
             Self::Turns => turns::items(&kept.report.turns),
             Self::Tools => tools::items(&kept.report.tools),
-            Self::Compactions | Self::Approvals => 0,
+            Self::Compactions | Self::Approvals | Self::Delegation => 0,
         }
     }
 
@@ -125,7 +133,7 @@ impl InsightsPanel {
         match self {
             Self::WhenYouWork => heatmap::HOURS,
             Self::Turns => crate::protocol::TURN_DURATION_BINS,
-            Self::Tools | Self::Compactions | Self::Approvals => 1,
+            Self::Tools | Self::Compactions | Self::Approvals | Self::Delegation => 1,
         }
     }
 
@@ -133,7 +141,11 @@ impl InsightsPanel {
     /// have more than fit, so that it scrolls; none where all stand in view.
     fn room(self) -> Option<usize> {
         match self {
-            Self::WhenYouWork | Self::Turns | Self::Compactions | Self::Approvals => None,
+            Self::WhenYouWork
+            | Self::Turns
+            | Self::Compactions
+            | Self::Approvals
+            | Self::Delegation => None,
             Self::Tools => Some(tools::SHOWN),
         }
     }

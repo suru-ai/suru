@@ -825,6 +825,7 @@ impl SemanticCommandId {
                 InsightsPanel::Tools => "metrics.panel.tools",
                 InsightsPanel::Compactions => "metrics.panel.compactions",
                 InsightsPanel::Approvals => "metrics.panel.approvals",
+                InsightsPanel::Delegation => "metrics.panel.delegation",
             },
             Self::MetricsPanelFocusNext => "metrics.panel.next",
             Self::MetricsPanelFocusPrevious => "metrics.panel.previous",
@@ -2180,6 +2181,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     metrics_panel_descriptor(InsightsPanel::Tools, "Focus Tools Insights"),
     metrics_panel_descriptor(InsightsPanel::Compactions, "Focus Compactions Insights"),
     metrics_panel_descriptor(InsightsPanel::Approvals, "Focus Approvals Insights"),
+    metrics_panel_descriptor(InsightsPanel::Delegation, "Focus Delegation Insights"),
     SemanticCommandDescriptor {
         id: SemanticCommandId::MetricsPanelFocusNext,
         title: "Next Insights Panel",

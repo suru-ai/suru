@@ -557,7 +557,8 @@ fn command_for_insights_panel_wheel(
             InsightsPanel::WhenYouWork
             | InsightsPanel::Turns
             | InsightsPanel::Compactions
-            | InsightsPanel::Approvals,
+            | InsightsPanel::Approvals
+            | InsightsPanel::Delegation,
             _,
         ) => None,
         (InsightsPanel::Tools, MouseEventKind::ScrollUp) => {

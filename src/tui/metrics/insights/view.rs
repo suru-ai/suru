@@ -15,8 +15,8 @@ use crate::theme::Theme;
 
 use super::{
     super::{UsageMetricsReadRefusal, calendar::MetricsRange},
-    InsightsContent, InsightsPanel, InsightsView, KeptReport, approvals, compactions, heatmap,
-    tools, turns,
+    InsightsContent, InsightsPanel, InsightsView, KeptReport, approvals, compactions, delegation,
+    heatmap, tools, turns,
 };
 use crate::{protocol::Outlook, tui::slots::truncate_to_width};
 
@@ -96,6 +96,7 @@ fn height(panel: InsightsPanel) -> u16 {
         InsightsPanel::Tools => tools::ROWS,
         InsightsPanel::Compactions => compactions::ROWS,
         InsightsPanel::Approvals => approvals::ROWS,
+        InsightsPanel::Delegation => delegation::ROWS,
     };
     rows + 2
 }
@@ -167,6 +168,9 @@ fn render_panel(
         }
         InsightsPanel::Approvals => {
             approvals::render(buffer, inner, &kept.report.approvals, range, theme);
+        }
+        InsightsPanel::Delegation => {
+            delegation::render(buffer, inner, &kept.report.delegation, range, theme);
         }
     }
 }
