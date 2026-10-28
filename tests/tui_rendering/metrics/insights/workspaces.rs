@@ -206,13 +206,19 @@ fn the_panel_says_while_its_workspaces_are_read_and_why_they_could_not_be() {
 
 /// Whether each of `labels`' legend rows on Overview is dimmed, its series
 /// hidden.
-fn dimmed<const N: usize>(application: &Application, labels: [&str; N]) -> [Option<bool>; N] {
+pub(super) fn dimmed<const N: usize>(
+    application: &Application,
+    labels: [&str; N],
+) -> [Option<bool>; N] {
     labels.map(|label| legend_row_dimmed(application, label))
 }
 
 /// Overview's read of the Workspaces an opened row brings, answered with
 /// the mockup's Workspaces in each of its buckets.
-fn answer_overview_by_workspace(application: &mut Application, transition: ApplicationTransition) {
+pub(super) fn answer_overview_by_workspace(
+    application: &mut Application,
+    transition: ApplicationTransition,
+) {
     let (_, request_id, query) = expect_read(transition);
     assert_eq!(query.breakdown, UsageMetricsBreakdown::Workspace);
     answer(application, request_id, Ok(spent(&query, &MOCKUP)));

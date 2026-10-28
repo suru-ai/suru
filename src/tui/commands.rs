@@ -239,6 +239,15 @@ pub enum SemanticCommandId {
     },
     /// Sorts the Insights Tools panel by failures, or by uses again.
     MetricsToolsSortToggle,
+    /// Scrolls the Insights tab's panels a frame back toward the first.
+    MetricsInsightsPageUp,
+    /// Scrolls the Insights tab's panels a frame on toward the last.
+    MetricsInsightsPageDown,
+    /// Scrolls the Insights tab's panels a wheel's step back toward the
+    /// first.
+    MetricsInsightsScrollUp,
+    /// Scrolls the Insights tab's panels a wheel's step on toward the last.
+    MetricsInsightsScrollDown,
     /// Opens the Icon Picker over a Session, which the picker only does while
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
     /// menu item stays quiet rather than opening a picker no glyph could draw.
@@ -850,6 +859,10 @@ impl SemanticCommandId {
             Self::MetricsPanelScrollUp { .. } => "metrics.panel.scroll.up",
             Self::MetricsPanelScrollDown { .. } => "metrics.panel.scroll.down",
             Self::MetricsToolsSortToggle => "metrics.tools.sort",
+            Self::MetricsInsightsPageUp => "metrics.insights.page-up",
+            Self::MetricsInsightsPageDown => "metrics.insights.page-down",
+            Self::MetricsInsightsScrollUp => "metrics.insights.scroll.up",
+            Self::MetricsInsightsScrollDown => "metrics.insights.scroll.down",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::SessionRename => "session.rename",
@@ -2316,6 +2329,39 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Sort Insights Tools",
         reach: SemanticReach::Client,
         description: "Sort the Insights Tools panel by failures, or by uses again",
+        slash: None,
+        keybinding: None,
+    },
+    // Scrolling the panels reads nothing, as scrolling a panel's rows does.
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsInsightsPageUp,
+        title: "Insights Page Up",
+        reach: SemanticReach::Client,
+        description: "Scroll the Insights panels a frame back toward the first",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsInsightsPageDown,
+        title: "Insights Page Down",
+        reach: SemanticReach::Client,
+        description: "Scroll the Insights panels a frame on toward the last",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsInsightsScrollUp,
+        title: "Scroll Insights Up",
+        reach: SemanticReach::Client,
+        description: "Scroll the Insights panels a wheel's step back toward the first",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsInsightsScrollDown,
+        title: "Scroll Insights Down",
+        reach: SemanticReach::Client,
+        description: "Scroll the Insights panels a wheel's step on toward the last",
         slash: None,
         keybinding: None,
     },

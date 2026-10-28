@@ -19,6 +19,12 @@
 //! the wheel scrolls it, and a selection moving past either end of the
 //! window scrolls it along.
 //!
+//! Wherever the panels run past the foot of the frame — stacked in one
+//! column below the mockup's width, or a short frame of the grid — the
+//! body scrolls: PageUp/PageDown a page, the wheel a step anywhere but
+//! over a panel's own rows, which it scrolls first and carries on past
+//! once they end, and focus moving to a panel scrolls it into view.
+//!
 //! A report is kept with its quarter-hours folded into the week of the zone
 //! its range was cut in, once as it arrives rather than at every frame.
 
@@ -87,11 +93,13 @@ pub(super) enum Place {
 }
 
 /// A column of the layout: its places stacked top to bottom, each beneath
-/// the last whatever stands beside it, and its share of the width it
-/// stands in, by weight among the columns beside it.
+/// the last whatever stands beside it, its share of the width it stands
+/// in, by weight among the columns beside it, and the narrowest it stands
+/// beside them in: narrower, the columns stack instead.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Column {
     pub(super) weight: u16,
+    pub(super) narrowest: u16,
     pub(super) places: &'static [Place],
 }
 
@@ -105,18 +113,27 @@ impl InsightsPanel {
     /// briefest figures, and Delegation its bars beside their Costs. Each
     /// column stacks its own panels, so a short one never waits on its
     /// neighbour's height.
+    ///
+    /// The left-hand column stands beside the right from 50 columns, as
+    /// wide as the mockup's own frame of 100 makes it: narrower, the two
+    /// would cut short the hours of When you work and the names Workspaces
+    /// and Tools give, so every panel stacks in one column as wide as the
+    /// frame, which scrolls.
     pub(super) const LAYOUT: Place = Place::Beside(&[
         Column {
             weight: 61,
+            narrowest: 50,
             places: &[
                 Place::Panel(Self::WhenYouWork),
                 Place::Beside(&[
                     Column {
                         weight: 29,
+                        narrowest: view::BESIDE_WIDTH,
                         places: &[Place::Panel(Self::Turns), Place::Panel(Self::Cache)],
                     },
                     Column {
                         weight: 30,
+                        narrowest: view::BESIDE_WIDTH,
                         places: &[
                             Place::Panel(Self::Compactions),
                             Place::Panel(Self::Approvals),
@@ -127,6 +144,7 @@ impl InsightsPanel {
         },
         Column {
             weight: 53,
+            narrowest: view::BESIDE_WIDTH,
             places: &[
                 Place::Panel(Self::Workspaces),
                 Place::Panel(Self::Tools),
@@ -330,6 +348,8 @@ pub(in crate::tui) enum PanelMove {
 /// A part of the Insights tab a pointer can act on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InsightsTarget {
+    /// The panels' body, between and beside them, which the wheel scrolls.
+    Body,
     /// A panel, away from anything within it a pointer selects.
     Panel(InsightsPanel),
     /// An item of a panel a reader can select, by its place among them.
@@ -337,9 +357,11 @@ pub enum InsightsTarget {
 }
 
 impl InsightsTarget {
-    pub(in crate::tui) fn panel(self) -> InsightsPanel {
+    /// The panel the target stands in: none for the body between them.
+    pub(in crate::tui) fn panel(self) -> Option<InsightsPanel> {
         match self {
-            Self::Panel(panel) | Self::Item { panel, .. } => panel,
+            Self::Panel(panel) | Self::Item { panel, .. } => Some(panel),
+            Self::Body => None,
         }
     }
 }
@@ -508,6 +530,82 @@ struct Targets {
     /// apiece in one row, the heatmap's hours two apiece in a row for each
     /// day, and the Tools panel's Tools a row apiece from the first in view.
     items: [Option<(Rect, u16, usize)>; InsightsPanel::ALL.len()],
+    /// The part of the body the panels were shown through.
+    body: Option<Rect>,
+    /// Where the panels were laid out, before any was scrolled.
+    laid: Option<Laid>,
+}
+
+/// Where the last frame laid the panels out in the body, from its top
+/// before any scroll: the rows each took, how many they all took, and how
+/// many of those the body showed at once.
+#[derive(Clone, Copy, Debug)]
+struct Laid {
+    /// Each panel's first row and how many it took, in
+    /// [`InsightsPanel::ALL`] order.
+    panels: [Option<(u16, u16)>; InsightsPanel::ALL.len()],
+    height: u16,
+    shown: u16,
+}
+
+impl Laid {
+    /// The furthest the body scrolls: the last rows of panels at its foot.
+    fn furthest(self) -> u16 {
+        self.height.saturating_sub(self.shown)
+    }
+
+    /// Each panel's first row and the row past its last.
+    fn spans(self) -> impl Iterator<Item = (u16, u16)> {
+        self.panels
+            .into_iter()
+            .flatten()
+            .map(|(top, height)| (top, top + height))
+    }
+
+    /// How far a page down from `scroll` scrolls: the first panel the foot
+    /// cuts short, or the first beneath it, brought to the top, so that it
+    /// reads whole; and never more than a frame, so a panel taller than
+    /// the body is read a frame at a time.
+    fn page_down(self, scroll: u16) -> u16 {
+        let foot = scroll + self.shown;
+        let next = self
+            .spans()
+            .filter(|(top, end)| *end > foot && *top > scroll)
+            .map(|(top, _)| top)
+            .min()
+            .unwrap_or(foot);
+        next.min(foot).min(self.furthest())
+    }
+
+    /// How far a page up from `scroll` scrolls: the last panel the top cuts
+    /// short, or the last above it, brought to the foot, and never more
+    /// than a frame, as [`Self::page_down`] pages down.
+    fn page_up(self, scroll: u16) -> u16 {
+        let foot = scroll + self.shown;
+        let back = scroll.saturating_sub(self.shown);
+        self.spans()
+            .filter(|(top, end)| *top < scroll && *end < foot)
+            .map(|(_, end)| end.saturating_sub(self.shown))
+            .max()
+            .map_or(back, |previous| previous.max(back))
+    }
+
+    /// How far the body scrolled `scroll` rows down scrolls to show
+    /// `panel` whole: as far as it is where it shows it already, and
+    /// otherwise only as far as brings it into view, its top first where it
+    /// is taller than the body.
+    fn showing(self, scroll: u16, panel: InsightsPanel) -> u16 {
+        let Some((top, height)) = self.panels[panel.place()] else {
+            return scroll;
+        };
+        if top < scroll || height > self.shown {
+            top
+        } else if top + height > scroll + self.shown {
+            top + height - self.shown
+        } else {
+            scroll
+        }
+    }
 }
 
 /// The tab's state: the reports it read, kept by range, and the panel the
@@ -528,6 +626,9 @@ pub(in crate::tui) struct InsightsView {
     /// stand in view.
     scrolled: [usize; InsightsPanel::ALL.len()],
     tools_sort: ToolsSort,
+    /// How many rows the panels are scrolled up the body, from their top;
+    /// shown no further than their last rows stand at its foot.
+    body_scroll: u16,
     targets: Cell<Targets>,
 }
 
@@ -719,12 +820,53 @@ impl InsightsView {
         self.focused
     }
 
-    /// Focuses `panel`, letting go of what another panel had selected.
+    /// Focuses `panel`, letting go of what another panel had selected, and
+    /// scrolls the body just far enough to show it whole.
     pub(in crate::tui) fn focus(&mut self, panel: InsightsPanel) {
         if self.focused != Some(panel) {
             self.selected = None;
         }
         self.focused = Some(panel);
+        if let Some(laid) = self.targets.get().laid {
+            self.body_scroll = laid.showing(self.shown_scroll(laid), panel);
+        }
+    }
+
+    /// How many rows the panels are scrolled up the body.
+    pub(super) fn body_scroll(&self) -> u16 {
+        self.body_scroll
+    }
+
+    /// How far the body laid out as `laid` showed its panels scrolled.
+    fn shown_scroll(&self, laid: Laid) -> u16 {
+        self.body_scroll.min(laid.furthest())
+    }
+
+    /// Scrolls the body a page `to`, as the last frame laid the panels out
+    /// in it: nowhere where no panels were drawn.
+    pub(in crate::tui) fn page(&mut self, to: RowScroll) {
+        let Some(laid) = self.targets.get().laid else {
+            return;
+        };
+        let scroll = self.shown_scroll(laid);
+        self.body_scroll = match to {
+            RowScroll::Up => laid.page_up(scroll),
+            RowScroll::Down => laid.page_down(scroll),
+        };
+    }
+
+    /// Scrolls the body `rows` rows `to`, stopping at either end, as the
+    /// last frame laid the panels out in it: nowhere where no panels were
+    /// drawn.
+    pub(in crate::tui) fn scroll_body(&mut self, to: RowScroll, rows: u16) {
+        let Some(laid) = self.targets.get().laid else {
+            return;
+        };
+        let scroll = self.shown_scroll(laid);
+        self.body_scroll = match to {
+            RowScroll::Up => scroll.saturating_sub(rows),
+            RowScroll::Down => scroll.saturating_add(rows).min(laid.furthest()),
+        };
     }
 
     pub(in crate::tui) fn move_focus(&mut self, to: PanelMove) {
@@ -780,25 +922,28 @@ impl InsightsView {
     }
 
     /// Scrolls `panel`'s rows in the report shown for `range` from `origin`
-    /// a row `to`, stopping at either end, whether or not it is focused. A
-    /// panel whose rows all stand in view does not scroll.
+    /// a row `to`, stopping at either end, whether or not it is focused,
+    /// and answers whether they moved. A panel whose rows all stand in view
+    /// does not scroll.
     pub(in crate::tui) fn scroll(
         &mut self,
         origin: &Outlook,
         range: MetricsRange,
         panel: InsightsPanel,
         to: RowScroll,
-    ) {
+    ) -> bool {
         let Some(room) = panel.room() else {
-            return;
+            return false;
         };
         let rows = self.items(origin, range, panel).div_ceil(panel.across());
         let scrolled = self.scrolled(panel);
         let window = RowWindow::new(rows, room, scrolled);
-        self.scrolled[panel.place()] = match to {
+        let first = match to {
             RowScroll::Up => window.first.saturating_sub(1),
             RowScroll::Down => RowWindow::new(rows, room, window.first + 1).first,
         };
+        self.scrolled[panel.place()] = first;
+        first != window.first
     }
 
     /// Scrolls the focused panel just far enough to show the row of the
@@ -885,6 +1030,43 @@ impl InsightsView {
         self.update_targets(|targets| targets.items[panel.place()] = Some((area, width, first)));
     }
 
+    /// Moves what the panels recorded, drawn from the top of a body
+    /// `height` rows tall, to where it is shown through `body`, scrolled
+    /// `scroll` rows down: each part cut to the rows shown, and forgotten
+    /// where none of it is, so a pointer acts only on what it is over.
+    pub(super) fn show_targets(&self, body: Rect, scroll: u16, height: u16) {
+        self.update_targets(|targets| {
+            let window = Rect::new(body.x, scroll, body.width, body.height);
+            let shown = |area: Rect| {
+                let cut = area.intersection(window);
+                (!cut.is_empty()).then(|| Rect {
+                    y: cut.y - scroll + body.y,
+                    ..cut
+                })
+            };
+            targets.laid = Some(Laid {
+                panels: targets
+                    .panels
+                    .map(|area| area.map(|area| (area.y, area.height))),
+                height,
+                shown: body.height,
+            });
+            targets.panels = targets.panels.map(|area| area.and_then(shown));
+            for (items, panel) in targets.items.iter_mut().zip(InsightsPanel::ALL) {
+                *items = items.and_then(|(area, width, first)| {
+                    let cut = shown(area)?;
+                    // Each row scrolled out of view above takes its items.
+                    let above = usize::from(cut.y + scroll - body.y - area.y);
+                    Some((cut, width, first + above * panel.across()))
+                });
+            }
+            targets.body = Some(Rect {
+                height: body.height.min(height - scroll),
+                ..body
+            });
+        });
+    }
+
     fn update_targets(&self, update: impl FnOnce(&mut Targets)) {
         let mut targets = self.targets.get();
         update(&mut targets);
@@ -894,9 +1076,14 @@ impl InsightsView {
     /// What the last frame drew at `position` that a pointer can act on.
     pub(in crate::tui) fn target_at(&self, position: Position) -> Option<InsightsTarget> {
         let targets = self.targets.get();
-        let panel = InsightsPanel::ALL.into_iter().find(|panel| {
+        let Some(panel) = InsightsPanel::ALL.into_iter().find(|panel| {
             targets.panels[panel.place()].is_some_and(|area| area.contains(position))
-        })?;
+        }) else {
+            return targets
+                .body
+                .filter(|body| body.contains(position))
+                .map(|_| InsightsTarget::Body);
+        };
         let item = targets.items[panel.place()]
             .filter(|(area, _, _)| area.contains(position))
             .map(|(area, width, first)| {

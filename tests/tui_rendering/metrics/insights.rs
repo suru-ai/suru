@@ -26,6 +26,7 @@ use suru::{
 };
 use uuid::Uuid;
 
+mod stacked;
 mod workspaces;
 
 fn ctrl(application: &mut Application, code: KeyCode) -> ApplicationTransition {

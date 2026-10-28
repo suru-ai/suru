@@ -471,7 +471,9 @@ fn command_for_overview_pointer(
 }
 
 /// Insights' own keys: Tab and Shift+Tab move focus among its panels, the
-/// last turning round to the first, as a click on a panel focuses it; `f`
+/// last turning round to the first, as a click on a panel focuses it, each
+/// scrolling the panel focused into view; PageUp/PageDown scroll the panels
+/// through the body wherever they run past it; `f`
 /// sorts the Tools panel by failures, or by uses again; Esc
 /// clears what the focused panel has selected, then leaves the panel, and
 /// with neither left closes the view; every other key is the focused
@@ -486,6 +488,8 @@ fn command_for_insights_key(key: KeyEvent, keys: MetricsKeys) -> Option<Semantic
         }
         (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::MetricsClose,
         (KeyCode::Tab, KeyModifiers::NONE) => SemanticCommandId::MetricsPanelFocusNext,
+        (KeyCode::PageUp, KeyModifiers::NONE) => SemanticCommandId::MetricsInsightsPageUp,
+        (KeyCode::PageDown, KeyModifiers::NONE) => SemanticCommandId::MetricsInsightsPageDown,
         // The one panel that sorts is the Tools panel, so `f` sorts it
         // whichever panel is focused, or none.
         (KeyCode::Char('f'), KeyModifiers::NONE) => SemanticCommandId::MetricsToolsSortToggle,
@@ -533,9 +537,8 @@ fn command_for_insights_panel_key(
 
 /// Insights' own clicks and wheel: a click on a Workspaces row opens it, a
 /// click on what another panel lets a reader select selects it, focusing
-/// the panel, and one anywhere else on a panel focuses it; the wheel is the
-/// panel's under the pointer, whether or not it is focused, as
-/// [`command_for_insights_panel_wheel`] gives it.
+/// the panel, and one anywhere else on a panel focuses it; the wheel is
+/// [`command_for_insights_wheel`]'s.
 fn command_for_insights_pointer(
     mouse: MouseEvent,
     target: InsightsTarget,
@@ -555,39 +558,46 @@ fn command_for_insights_pointer(
             Some(SemanticCommandId::MetricsPanelFocus(panel))
         }
         (MouseEventKind::ScrollUp | MouseEventKind::ScrollDown, target) => {
-            command_for_insights_panel_wheel(target.panel(), mouse.kind)
+            command_for_insights_wheel(target.panel(), mouse.kind)
         }
         _ => None,
     }
 }
 
-/// What the wheel does over an Insights panel, whether up or down by
-/// `kind`: over the Tools panel, whose rows run past its border, it scrolls
-/// them a row; over the others, whose figures all stand in view, nothing;
-/// and never a step of the range, which the wheel over Overview's chart
-/// takes.
-fn command_for_insights_panel_wheel(
-    panel: InsightsPanel,
+/// What the wheel does over the Insights tab, whether up or down by `kind`,
+/// over `panel` or the body between panels, focused or not: over the Tools
+/// and Workspaces panels, whose rows run past their borders, it scrolls
+/// them a row, and once they stand at that end carries on scrolling the
+/// panels through the body; anywhere else it scrolls the panels through
+/// the body — which, where they all stand in view, does nothing. It never
+/// steps the range, which the wheel over Overview's chart does.
+fn command_for_insights_wheel(
+    panel: Option<InsightsPanel>,
     kind: MouseEventKind,
 ) -> Option<SemanticCommandId> {
-    match (panel, kind) {
-        (
+    let rows = match panel {
+        Some(panel @ (InsightsPanel::Tools | InsightsPanel::Workspaces)) => Some(panel),
+        None
+        | Some(
             InsightsPanel::WhenYouWork
             | InsightsPanel::Turns
             | InsightsPanel::Compactions
             | InsightsPanel::Cache
             | InsightsPanel::Approvals
             | InsightsPanel::Delegation,
-            _,
         ) => None,
-        (InsightsPanel::Tools | InsightsPanel::Workspaces, MouseEventKind::ScrollUp) => {
-            Some(SemanticCommandId::MetricsPanelScrollUp { panel })
+    };
+    Some(match (rows, kind) {
+        (Some(panel), MouseEventKind::ScrollUp) => {
+            SemanticCommandId::MetricsPanelScrollUp { panel }
         }
-        (InsightsPanel::Tools | InsightsPanel::Workspaces, MouseEventKind::ScrollDown) => {
-            Some(SemanticCommandId::MetricsPanelScrollDown { panel })
+        (Some(panel), MouseEventKind::ScrollDown) => {
+            SemanticCommandId::MetricsPanelScrollDown { panel }
         }
-        (InsightsPanel::Tools | InsightsPanel::Workspaces, _) => None,
-    }
+        (None, MouseEventKind::ScrollUp) => SemanticCommandId::MetricsInsightsScrollUp,
+        (None, MouseEventKind::ScrollDown) => SemanticCommandId::MetricsInsightsScrollDown,
+        _ => return None,
+    })
 }
 
 /// The Serve overlay owns the keys while it is visible. Its picker of the

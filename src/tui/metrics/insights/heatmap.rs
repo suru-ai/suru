@@ -44,6 +44,9 @@ const DAY_NAMES: [&str; DAYS] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"
 /// The columns of a day's name and the gap after it, before its hours.
 const LABEL_WIDTH: u16 = 5;
 
+/// What the panel says in place of a week too wide for it.
+const TOO_NARROW: &str = "Too narrow to show the week";
+
 /// The glyph of each shade a cell holding Turns takes, the lightest first:
 /// each a denser block than the one before it, and none the empty cell's
 /// dot.
@@ -164,6 +167,14 @@ pub(super) fn render(
         1
     };
     if area.width < LABEL_WIDTH + width * hours || area.height < ROWS {
+        // No column is laid out this narrow, but were one, it would say why
+        // it stands empty rather than seem broken.
+        buffer.set_string(
+            area.x,
+            area.y,
+            truncate_to_width(TOO_NARROW, room),
+            theme.text.subdued,
+        );
         return;
     }
     let grid_x = area.x + LABEL_WIDTH;
@@ -401,6 +412,35 @@ mod tests {
             held(&heatmap),
             vec![(5, 23, 1), (SUNDAY, 1, 2), (SUNDAY, 2, 1)]
         );
+    }
+
+    #[test]
+    fn a_panel_too_narrow_for_the_week_says_so_and_offers_no_cell_to_click() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let heatmap = Heatmap::fold(
+            &[quarter(date(2026, 10, 26).at(9, 0, 0, 0), 10, 5)],
+            &TimeZone::UTC,
+        );
+        let view = super::InsightsView::default();
+        let area = Rect::new(0, 0, 28, super::ROWS);
+        let mut buffer = Buffer::empty(area);
+
+        super::render(
+            &mut buffer,
+            area,
+            &heatmap,
+            super::MetricsRange::ThirtyDays,
+            None,
+            &view,
+            &crate::theme::Theme::system(),
+        );
+
+        let first: String = (0..area.width)
+            .map(|x| buffer[(x, 0)].symbol().to_owned())
+            .collect();
+        assert_eq!(first.trim_end(), "Too narrow to show the week");
+        assert_eq!(view.target_at(ratatui::layout::Position::new(10, 2)), None);
     }
 
     #[test]

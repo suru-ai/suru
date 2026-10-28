@@ -3,11 +3,19 @@
 //! focused one's border in the accent; or what stands in for them while the
 //! read is on its way, or where it was refused.
 //!
-//! Columns stand side by side where each is at least [`BESIDE_WIDTH`]
-//! wide, and otherwise stack one after another in the order they are read,
-//! so a frame too narrow for the mockup's three columns beneath When you
-//! work keeps two. The one scrolling column a small terminal stacks every
-//! panel in (#580) is that rule reaching the outermost columns too.
+//! Columns stand side by side where each is at least as wide as it says it
+//! needs, and otherwise stack one after another in the order they are read,
+//! any columns within them stacking too: so a frame too narrow for the
+//! mockup's three columns beneath When you work keeps two, and one
+//! narrower than the mockup stacks every panel in one column as wide as
+//! the frame.
+//!
+//! The panels are laid out first, as tall as they need, then drawn whole
+//! and shown through the body as through a window, scrolled as far down as
+//! [`InsightsView::body_scroll`] says: wherever they run past the foot of
+//! the frame — in one column or in the grid — every one of them can be
+//! scrolled into view, and none is lost. What a pointer can act on is
+//! recorded where it is shown, and nowhere it is scrolled out of view.
 
 use ratatui::{
     buffer::Buffer,
@@ -24,6 +32,7 @@ use super::{
     Column, InsightsContent, InsightsPanel, InsightsView, KeptReport, Place, approvals, cache,
     compactions, delegation, heatmap, tools, turns, workspaces,
 };
+
 use crate::{
     protocol::Outlook,
     tui::{slots::truncate_to_width, usage::grouped_count},
@@ -32,9 +41,9 @@ use crate::{
 /// Columns between two columns standing side by side.
 const COLUMN_GAP: u16 = 2;
 
-/// The narrowest a column stands beside another in: room for the briefest
-/// figures of the small panels, inside their borders.
-const BESIDE_WIDTH: u16 = 28;
+/// The narrowest a column stands beside another in where it says no more:
+/// room for the briefest figures of the small panels, inside their borders.
+pub(super) const BESIDE_WIDTH: u16 = 28;
 
 /// How many of a panel's columns its border and the column of room either
 /// side of its figures take.
@@ -87,43 +96,86 @@ pub(in crate::tui) fn render(
                 range,
                 theme,
             };
-            render_place(buffer, body, InsightsPanel::LAYOUT, &drawing);
+            render_report(buffer, body, &drawing);
         }
     }
 }
 
-/// Draws `place` from the top of `area`, as wide as it is, answering how
-/// many rows it took; none where its first panel would run past the foot
-/// of `area`, which nothing is drawn past.
-fn render_place(
-    buffer: &mut Buffer,
-    area: Rect,
+/// Lays the panels out from the top of a body as wide as `body`, draws
+/// them whole, and shows those rows of them the body's scroll reaches,
+/// with a word at its foot where more stand above or below.
+fn render_report(buffer: &mut Buffer, body: Rect, drawing: &Drawing<'_>) {
+    let view = drawing.view;
+    let mut laid = Vec::with_capacity(InsightsPanel::COUNT);
+    let height = lay_out(
+        InsightsPanel::LAYOUT,
+        (body.x, 0, body.width),
+        false,
+        drawing.kept,
+        &mut laid,
+    );
+    let scroll = view.body_scroll().min(height.saturating_sub(body.height));
+    let mut drawn = Buffer::empty(Rect::new(body.x, 0, body.width, height));
+    for (panel, area) in laid {
+        render_panel(&mut drawn, area, panel, drawing);
+    }
+    for row in 0..body.height.min(height - scroll) {
+        for x in body.x..body.right() {
+            buffer[(x, body.y + row)] = drawn[(x, scroll + row)].clone();
+        }
+    }
+    view.show_targets(body, scroll, height);
+    render_scroll_hint(buffer, body, scroll, height, drawing.theme);
+}
+
+/// Says at the foot of `body`, beneath the panels, which way more of them
+/// stand and the key that pages to them: none where all are in view.
+fn render_scroll_hint(buffer: &mut Buffer, body: Rect, scroll: u16, height: u16, theme: &Theme) {
+    let above = scroll > 0;
+    let below = scroll + body.height < height;
+    let hint = match (above, below) {
+        (false, false) => return,
+        (true, false) => "↑ PgUp",
+        (false, true) => "↓ PgDn",
+        (true, true) => "↑ PgUp  ↓ PgDn",
+    };
+    let width = u16::try_from(hint.width()).unwrap_or(u16::MAX);
+    let x = body.right().saturating_sub(width);
+    buffer.set_string(x, body.bottom(), hint, theme.text.subdued);
+}
+
+/// Lays `place` out from row `y`, `width` columns wide from column `x`,
+/// adding where each of its panels stands to `laid`, and answers how many
+/// rows it takes. Where `stacked`, columns that stacked hold it, and any
+/// within it stack too, so that a frame too narrow for two columns lays
+/// every panel out in one.
+fn lay_out(
     place: Place,
-    drawing: &Drawing<'_>,
-) -> Option<u16> {
+    (x, y, width): (u16, u16, u16),
+    stacked: bool,
+    kept: &KeptReport,
+    laid: &mut Vec<(InsightsPanel, Rect)>,
+) -> u16 {
     match place {
         Place::Panel(panel) => {
-            let height = height(panel, area.width, drawing.kept);
-            if area.y + height > area.bottom() {
-                return None;
-            }
-            render_panel(buffer, Rect { height, ..area }, panel, drawing);
-            Some(height)
+            let height = height(panel, width, kept);
+            laid.push((panel, Rect::new(x, y, width, height)));
+            height
         }
         Place::Beside(columns) => {
-            let widths = beside(area.width, columns);
+            let widths = beside(width, columns).filter(|_| !stacked);
             let Some(widths) = widths else {
                 // Too narrow to stand side by side, the columns stack.
                 let places = columns
                     .iter()
                     .flat_map(|column| column.places.iter().copied());
-                return render_stack(buffer, area, places, drawing);
+                return lay_out_stack(places, (x, y, width), true, kept, laid);
             };
-            let mut x = area.x;
-            let mut tallest = None;
+            let mut x = x;
+            let mut tallest = 0;
             for (column, width) in columns.iter().zip(widths) {
-                let area = Rect { x, width, ..area };
-                let height = render_stack(buffer, area, column.places.iter().copied(), drawing);
+                let places = column.places.iter().copied();
+                let height = lay_out_stack(places, (x, y, width), false, kept, laid);
                 tallest = tallest.max(height);
                 x += width + COLUMN_GAP;
             }
@@ -132,34 +184,27 @@ fn render_place(
     }
 }
 
-/// Draws `places` one beneath another from the top of `area`, a blank row
-/// between each, stopping at the first that would run past its foot, and
-/// answers how many rows they took; none where the first would.
-fn render_stack(
-    buffer: &mut Buffer,
-    area: Rect,
+/// Lays `places` out one beneath another from row `y`, a blank row between
+/// each, as [`lay_out`] lays each, and answers how many rows they take.
+fn lay_out_stack(
     places: impl IntoIterator<Item = Place>,
-    drawing: &Drawing<'_>,
-) -> Option<u16> {
+    (x, y, width): (u16, u16, u16),
+    stacked: bool,
+    kept: &KeptReport,
+    laid: &mut Vec<(InsightsPanel, Rect)>,
+) -> u16 {
     let mut taken = None;
     for place in places {
-        let y = taken.map_or(area.y, |taken| area.y + taken + 1);
-        let rest = Rect {
-            y,
-            height: area.bottom().saturating_sub(y),
-            ..area
-        };
-        let Some(height) = render_place(buffer, rest, place, drawing) else {
-            break;
-        };
-        taken = Some(y + height - area.y);
+        let at = taken.map_or(y, |taken| y + taken + 1);
+        let height = lay_out(place, (x, at, width), stacked, kept, laid);
+        taken = Some(at + height - y);
     }
-    taken
+    taken.unwrap_or(0)
 }
 
 /// How wide each of `columns` stands in `width`, a gap between each, by
 /// their weights, the last taking what rounding leaves; none where any
-/// would be narrower than [`BESIDE_WIDTH`].
+/// would be narrower than it stands beside another in.
 fn beside(width: u16, columns: &[Column]) -> Option<Vec<u16>> {
     let gaps = COLUMN_GAP * u16::try_from(columns.len().saturating_sub(1)).ok()?;
     let room = u32::from(width.checked_sub(gaps)?);
@@ -177,7 +222,8 @@ fn beside(width: u16, columns: &[Column]) -> Option<Vec<u16>> {
     }
     widths
         .iter()
-        .all(|width| *width >= BESIDE_WIDTH)
+        .zip(columns)
+        .all(|(width, column)| *width >= column.narrowest)
         .then_some(widths)
 }
 

@@ -115,6 +115,9 @@ mod live_output_tests;
 
 /// Rows scrolled per mouse wheel tick, matching common terminal conventions.
 pub(super) const WHEEL_SCROLL_ROWS: usize = 3;
+/// [`WHEEL_SCROLL_ROWS`] as the rows the Insights panels scroll through
+/// their body.
+const METRICS_WHEEL_ROWS: u16 = WHEEL_SCROLL_ROWS as u16;
 const INTERRUPT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long an optimistic Session shell stays visually quiet before it asks
 /// the reader to wait. This is fixed presentation behavior, not a Setting.
@@ -9729,6 +9732,22 @@ impl Application {
 
     /// Acts on the open Usage Metrics view's Insights, which reads nothing:
     /// the report shown holds every panel's figures.
+    /// Scrolls an Insights panel's rows a row `to`; where they stand at
+    /// that end already, or all in view, the panels scroll through the
+    /// body a wheel's step instead, so the wheel carries on past a panel's
+    /// rows as it would have scrolled past a panel without any.
+    fn scroll_metrics_panel(
+        &mut self,
+        panel: InsightsPanel,
+        to: RowScroll,
+    ) -> ApplicationTransition {
+        self.act_on_metrics_insights(|insights, origin, range| {
+            if !insights.scroll(origin, range, panel, to) {
+                insights.scroll_body(to, METRICS_WHEEL_ROWS);
+            }
+        })
+    }
+
     fn act_on_metrics_insights(
         &mut self,
         act: impl FnOnce(&mut InsightsView, &Outlook, MetricsRange),
@@ -11834,16 +11853,29 @@ impl Application {
                 | InsightsPanel::Delegation => Ok(ApplicationTransition::Continue),
             },
             SemanticCommandId::MetricsPanelScrollUp { panel } => {
-                Ok(self.act_on_metrics_insights(|insights, origin, range| {
-                    insights.scroll(origin, range, panel, RowScroll::Up)
-                }))
+                Ok(self.scroll_metrics_panel(panel, RowScroll::Up))
             }
-            SemanticCommandId::MetricsPanelScrollDown { panel } => Ok(self
-                .act_on_metrics_insights(|insights, origin, range| {
-                    insights.scroll(origin, range, panel, RowScroll::Down)
-                })),
+            SemanticCommandId::MetricsPanelScrollDown { panel } => {
+                Ok(self.scroll_metrics_panel(panel, RowScroll::Down))
+            }
             SemanticCommandId::MetricsToolsSortToggle => {
                 Ok(self.act_on_metrics_insights(|insights, _, _| insights.toggle_tools_sort()))
+            }
+            SemanticCommandId::MetricsInsightsPageUp => {
+                Ok(self.act_on_metrics_insights(|insights, _, _| insights.page(RowScroll::Up)))
+            }
+            SemanticCommandId::MetricsInsightsPageDown => {
+                Ok(self.act_on_metrics_insights(|insights, _, _| insights.page(RowScroll::Down)))
+            }
+            SemanticCommandId::MetricsInsightsScrollUp => {
+                Ok(self.act_on_metrics_insights(|insights, _, _| {
+                    insights.scroll_body(RowScroll::Up, METRICS_WHEEL_ROWS)
+                }))
+            }
+            SemanticCommandId::MetricsInsightsScrollDown => {
+                Ok(self.act_on_metrics_insights(|insights, _, _| {
+                    insights.scroll_body(RowScroll::Down, METRICS_WHEEL_ROWS)
+                }))
             }
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,
