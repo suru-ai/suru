@@ -355,14 +355,15 @@ async fn a_model_under_two_providers_is_two_keys_and_a_turn_of_no_known_agent_is
     assert_eq!(
         report.keys,
         vec![
+            // Each named for its Provider, since they read alike.
             UsageMetricsKeyLabel {
                 key: model("codex"),
-                label: "GPT-5.5".to_owned(),
+                label: "codex · GPT-5.5".to_owned(),
             },
             // The catalog names no such Model under Copilot: its id stands.
             UsageMetricsKeyLabel {
                 key: model("copilot"),
-                label: "gpt-5.5".to_owned(),
+                label: "copilot · gpt-5.5".to_owned(),
             },
             UsageMetricsKeyLabel {
                 key: UsageMetricsKey::Unknown,
@@ -388,6 +389,148 @@ async fn a_model_under_two_providers_is_two_keys_and_a_turn_of_no_known_agent_is
         ]
     );
     assert_eq!(report.buckets[0].total, output_of(1111, 4));
+    writer.shutdown().await.unwrap();
+}
+
+/// A Model `display_name` names under `provider`, as its catalog lists it.
+fn listed(provider: &str, id: &str, display_name: &str) -> ModelDescriptor {
+    ModelDescriptor {
+        provider: ProviderId::new(provider),
+        id: ModelId::new(id),
+        display_name: display_name.to_owned(),
+        description: String::new(),
+        is_default: false,
+        availability: ModelAvailability::Available,
+        options: Vec::new(),
+        details: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn models_that_would_read_alike_are_told_apart_in_the_keys_and_the_top_sessions() {
+    let directory = tempfile::tempdir().unwrap();
+    let records = vec![
+        titled(
+            directory.path(),
+            "Through Copilot",
+            vec![turn_scoped(Some(("copilot", "gpt-5.5")), 11, 0.40)],
+        ),
+        titled(
+            directory.path(),
+            "Through Codex",
+            vec![turn_scoped(Some(("codex", "gpt-5.5")), 12, 0.30)],
+        ),
+        titled(
+            directory.path(),
+            "By alias",
+            vec![
+                turn_scoped(Some(("claude", "opus")), 13, 0.20),
+                turn_scoped(Some(("claude", "claude-opus-5-5")), 14, 0.01),
+            ],
+        ),
+        titled(
+            directory.path(),
+            "Pinned",
+            vec![
+                turn_scoped(Some(("claude", "claude-opus-5-5")), 15, 0.10),
+                turn_scoped(SONNET, 16, 0.01),
+            ],
+        ),
+    ];
+    let (store, writer) = restore(directory.path(), records).await;
+    let catalog = |provider: &str, models: Vec<ModelDescriptor>| ProviderModelCatalog {
+        provider: ProviderId::new(provider),
+        display_name: provider.to_owned(),
+        models,
+        status: ProviderCatalogStatus::Fresh,
+    };
+    let catalog = ModelCatalog {
+        providers: vec![
+            catalog(
+                "claude",
+                vec![
+                    listed("claude", "opus", "Opus 5.5"),
+                    listed("claude", "claude-sonnet-5-5", "Sonnet 5.5"),
+                ],
+            ),
+            catalog("codex", vec![listed("codex", "gpt-5.5", "GPT-5.5")]),
+            catalog("copilot", vec![listed("copilot", "gpt-5.5", "GPT-5.5")]),
+        ],
+    };
+
+    let report = store
+        .usage_metrics(&top(&[(10, 20)], 5), &catalog, &WorkspacePaths::default())
+        .unwrap();
+
+    let model = |provider: &str, model: &str| UsageMetricsKey::Model {
+        provider: ProviderId::new(provider),
+        model: ModelId::new(model),
+    };
+    assert_eq!(
+        labels(&report),
+        vec![
+            // One Provider's alias and the id it stands for read alike once
+            // the Provider's name is taken off the id: the alias says which
+            // it is, and the id already does.
+            (model("claude", "claude-opus-5-5"), "claude-opus-5-5"),
+            (model("claude", "claude-sonnet-5-5"), "Sonnet 5.5"),
+            (model("claude", "opus"), "Opus 5.5 (opus)"),
+            // One name under two Providers: each says whose it is.
+            (model("codex", "gpt-5.5"), "codex · GPT-5.5"),
+            (model("copilot", "gpt-5.5"), "copilot · GPT-5.5"),
+        ]
+    );
+    assert_eq!(
+        report
+            .top_sessions
+            .iter()
+            .map(|session| (session.title.as_str(), session.model.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Through Copilot", Some("copilot · GPT-5.5")),
+            ("Through Codex", Some("codex · GPT-5.5")),
+            ("By alias", Some("Opus 5.5 (opus)")),
+            ("Pinned", Some("claude-opus-5-5")),
+        ],
+        "a top Session's Model as the keys name it"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_top_session_s_model_is_told_apart_from_one_the_keys_do_not_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let records = vec![
+        titled(
+            directory.path(),
+            "Through Copilot",
+            vec![turn_scoped(Some(("copilot", "gpt-5.5")), 11, 0.40)],
+        ),
+        titled(
+            directory.path(),
+            "Through Codex",
+            vec![turn_scoped(Some(("codex", "gpt-5.5")), 12, 0.30)],
+        ),
+    ];
+    let (store, writer) = restore(directory.path(), records).await;
+
+    let report = read(
+        &store,
+        &UsageMetricsQuery {
+            breakdown: UsageMetricsBreakdown::Workspace,
+            ..top(&[(10, 20)], 5)
+        },
+    );
+
+    assert_eq!(
+        report
+            .top_sessions
+            .iter()
+            .map(|session| session.model.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("copilot · gpt-5.5"), Some("codex · gpt-5.5")],
+        "under a breakdown by Workspace, still told apart"
+    );
     writer.shutdown().await.unwrap();
 }
 
