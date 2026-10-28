@@ -172,7 +172,10 @@ pub struct UsageMetricsAggregate {
     /// How many Turns there are among them, Settled or still working, each
     /// counted once however it ended.
     pub turns: u64,
-    /// How many of those Turns Failed.
+    /// How many of those Turns Failed. A Turn a stopped process left working
+    /// in a history still deferred reads as Active until its Session is
+    /// hydrated, which settles it as Failed (ADR 0029), so opening a Session
+    /// can raise this count without any new work.
     pub failed_turns: u64,
     /// How many of those Turns were Interrupted.
     pub interrupted_turns: u64,

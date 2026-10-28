@@ -351,13 +351,25 @@ fn key_of(
     }
 }
 
-/// Where a Turn, and the Cost it carries, lands: in the bucket at an index,
-/// in none (`Some(None)`), or among the untimed (`None`); and whether in
-/// the comparison interval besides.
+/// Where a Turn, and the Cost it carries, lands among the buckets, and
+/// whether in the comparison interval besides.
 #[derive(Clone, Default)]
 struct Place {
-    bucket: Option<Option<usize>>,
+    bucket: Landing,
     compared: bool,
+}
+
+/// Where among the buckets a Turn lands.
+#[derive(Clone, Copy, Default)]
+enum Landing {
+    /// In the bucket at this index.
+    Bucket(usize),
+    /// At a moment no bucket holds.
+    Outside,
+    /// At no recorded moment: among the untimed. A Cost of a Turn the store
+    /// does not hold, with nothing to place it by, lands here too.
+    #[default]
+    Untimed,
 }
 
 /// One bucket's figures as they are added up.
@@ -462,22 +474,29 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
     };
     // The bucket a moment falls in, if any: the buckets run in order without
     // overlapping, so the one that can hold it is the first not over before it.
-    let bucket_of = |placed_at: SessionTimestamp| {
+    let landing = |placed_at: Option<SessionTimestamp>| {
+        let Some(placed_at) = placed_at else {
+            return Landing::Untimed;
+        };
         let index = query
             .buckets
             .partition_point(|bucket| bucket.end <= placed_at);
-        query
+        if query
             .buckets
             .get(index)
             .is_some_and(|bucket| bucket.contains(placed_at))
-            .then_some(index)
+        {
+            Landing::Bucket(index)
+        } else {
+            Landing::Outside
+        }
     };
     let mut earliest_turn_at = None::<SessionTimestamp>;
     // Where each Turn landed, for the Cost it carries to land beside it.
     let mut placed = HashMap::with_capacity(metered.turns.len());
     for turn in metered.turns {
         let place = Place {
-            bucket: turn.placed_at.map(bucket_of),
+            bucket: landing(turn.placed_at),
             compared: compared(turn.placed_at),
         };
         if let Some(comparison) = comparison.as_mut().filter(|_| place.compared) {
@@ -487,21 +506,22 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
             (turn.session_id, turn.turn_id),
             (place.clone(), turn.key.clone()),
         );
-        let Some(placed_at) = turn.placed_at else {
-            untimed.add(&turn);
-            across_buckets_and_untimed.add(&turn);
-            continue;
-        };
-        earliest_turn_at = Some(earliest_turn_at.map_or(placed_at, |held| held.min(placed_at)));
-        if let Some(Some(index)) = place.bucket {
-            buckets[index].add(&turn);
-            across_buckets.add(&turn);
-            across_buckets_and_untimed.add(&turn);
+        if let Some(placed_at) = turn.placed_at {
+            earliest_turn_at = Some(earliest_turn_at.map_or(placed_at, |held| held.min(placed_at)));
         }
+        match place.bucket {
+            Landing::Bucket(index) => {
+                buckets[index].add(&turn);
+                across_buckets.add(&turn);
+            }
+            Landing::Untimed => untimed.add(&turn),
+            Landing::Outside => continue,
+        }
+        across_buckets_and_untimed.add(&turn);
     }
     for contribution in &metered.costs {
         // Every contribution is of a Turn the store holds; one that were not
-        // would still count, with nothing to place it by.
+        // would still count, among the untimed.
         let (place, key) = placed
             .get(&(contribution.session_id, contribution.turn_id))
             .cloned()
@@ -510,12 +530,12 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
             add_contribution(&mut comparison.aggregate, contribution);
         }
         match place.bucket {
-            None => untimed.add_cost(&key, contribution),
-            Some(Some(index)) => {
+            Landing::Bucket(index) => {
                 buckets[index].add_cost(&key, contribution);
                 across_buckets.add_cost(&key, contribution);
             }
-            Some(None) => continue,
+            Landing::Untimed => untimed.add_cost(&key, contribution),
+            Landing::Outside => continue,
         }
         add_contribution(&mut across_buckets_and_untimed.aggregate, contribution);
     }
