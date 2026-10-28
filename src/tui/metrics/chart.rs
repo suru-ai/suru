@@ -177,7 +177,8 @@ pub(crate) fn bucket_label(bucket: &CalendarBucket, unit: BucketUnit) -> String 
     let begins = bucket.begins;
     let month = MONTHS[usize::try_from(begins.month() - 1).unwrap_or(0)];
     match unit {
-        BucketUnit::Hour => format!("{:02}:00", begins.hour()),
+        // Minutes too, for the hours a half-hour transition leaves at :30.
+        BucketUnit::Hour => format!("{:02}:{:02}", begins.hour(), begins.minute()),
         BucketUnit::Day => format!("{} {month}", begins.day()),
         BucketUnit::Month => format!("{month} {}", begins.year()),
         BucketUnit::Quarter => format!("Q{} {}", (begins.month() - 1) / 3 + 1, begins.year()),
@@ -234,8 +235,11 @@ pub(crate) fn thinned_labels(
         .find(|stride| stride.saturating_mul(slot) >= needed)
         .unwrap_or_else(|| needed.div_ceil(slot))
         .max(1);
-    // The last bucket a stride from `anchor` labels.
-    let rightmost = last - (last % stride + stride - anchor % stride) % stride;
+    // The last bucket a stride from `anchor` labels, or the last bucket
+    // where none in range is, so an axis too short to reach a stride from
+    // its anchor still names the present.
+    let behind = (last % stride + stride - anchor % stride) % stride;
+    let rightmost = last.checked_sub(behind).unwrap_or(last);
     let mut placed: Vec<(usize, u16)> = Vec::new();
     let width = usize::from(width);
     for index in (0..=rightmost).rev().step_by(stride) {
@@ -534,6 +538,19 @@ mod tests {
                 .all(|label| label.parse::<i32>().unwrap() % 5 == 0),
             "{kept:?}"
         );
+    }
+
+    #[test]
+    fn an_axis_too_short_to_reach_a_stride_from_its_anchor_names_its_last_bucket() {
+        // Two months from a November: a stride of three counted from
+        // January labels neither.
+        let labels: Vec<String> = ["Nov 2026", "Dec 2026"].map(str::to_owned).into();
+
+        let placed = thinned_labels(&labels, BucketUnit::Month.label_strides(), 2, 3, 20);
+
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].0, 1);
+        assert!(thinned_labels(&[], &[3], 2, 3, 6).is_empty());
     }
 
     #[test]
