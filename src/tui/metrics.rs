@@ -466,8 +466,9 @@ impl MetricsView {
         self.breakdown
     }
 
-    /// The query for the view's range at `now` in `zone`, which the view now
-    /// awaits the answer to under the request it answers with. A report
+    /// The query for the view's range at `now` in `zone`, compared with the
+    /// period before it as the calendar cuts that, which the view now awaits
+    /// the answer to under the request it answers with. A report
     /// already shown stays until the answer replaces it. A moment the
     /// calendar cannot place is refused in the view instead.
     ///
@@ -482,7 +483,7 @@ impl MetricsView {
     ) -> Option<(Uuid, UsageMetricsQuery)> {
         let earliest = match self.earliest {
             EarliestTurn::Unknown if self.range == MetricsRange::AllTime => {
-                return Some(self.await_answer(Asked::EarliestTurn, Vec::new()));
+                return Some(self.await_answer(Asked::EarliestTurn, Vec::new(), None));
             }
             EarliestTurn::At(earliest) => Some(earliest),
             EarliestTurn::Unknown | EarliestTurn::Untimed => None,
@@ -498,19 +499,21 @@ impl MetricsView {
             .iter()
             .map(|bucket| bucket.interval)
             .collect();
-        Some(self.await_answer(Asked::Range(buckets), intervals))
+        let comparison = buckets.comparison;
+        Some(self.await_answer(Asked::Range(buckets), intervals, comparison))
     }
 
     fn await_answer(
         &mut self,
         asked: Asked,
         buckets: Vec<UsageMetricsInterval>,
+        comparison: Option<UsageMetricsInterval>,
     ) -> (Uuid, UsageMetricsQuery) {
         let request_id = Uuid::new_v4();
         let query = UsageMetricsQuery {
             buckets,
             breakdown: self.breakdown,
-            comparison: None,
+            comparison,
         };
         self.asked = Some((request_id, asked));
         self.refusal = None;

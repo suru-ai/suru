@@ -127,13 +127,16 @@ impl BucketUnit {
     }
 }
 
-/// A range as the reader's calendar cuts it: the unit of its buckets, and
-/// the buckets, earliest first and each beginning where the one before it
-/// ends.
+/// A range as the reader's calendar cuts it: the unit of its buckets, the
+/// buckets, earliest first and each beginning where the one before it ends,
+/// and the interval its figures are compared with, where any comes before.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RangeBuckets {
     pub(crate) unit: BucketUnit,
     pub(crate) buckets: Vec<CalendarBucket>,
+    /// The range moved back by its own length, up to the moment as far into
+    /// it as now is into the range: see [`resolve`].
+    pub(crate) comparison: Option<UsageMetricsInterval>,
 }
 
 /// One bucket as the reader's calendar cuts it: the interval asked of the
@@ -148,6 +151,15 @@ pub(crate) struct CalendarBucket {
 /// with the month of `earliest`, the earliest timed Turn, and is this month
 /// alone where no Turn is timed; no other range consults it. `None` where
 /// `now` lies beyond what the calendar can place.
+///
+/// Every range but All time, before which nothing comes, is compared with
+/// the period of the same length before it, in the reader's calendar: as
+/// many local days or calendar months back from its first, up to the same
+/// reading of the clock as many days or months before now. So the range so
+/// far is compared with as much of the period before: Today with yesterday
+/// up to this time of day, 30 days with the 30 local days before as far
+/// into the last of them, and Year with the 12 months before as far into
+/// the twelfth, a day past the end of a shorter month taken as its last.
 pub(crate) fn resolve(
     range: MetricsRange,
     now: SessionTimestamp,
@@ -157,6 +169,13 @@ pub(crate) fn resolve(
     let now = zoned(now, zone)?;
     let today = now.date();
     let this_month = today.first_of_month();
+    let length = match range {
+        MetricsRange::Today => Some(1.day()),
+        MetricsRange::SevenDays => Some(7.days()),
+        MetricsRange::ThirtyDays => Some(30.days()),
+        MetricsRange::Year => Some(12.months()),
+        MetricsRange::AllTime => None,
+    };
     let (unit, buckets) = match range {
         MetricsRange::Today => (BucketUnit::Hour, hours(&now)?),
         MetricsRange::SevenDays => (BucketUnit::Day, days(today, 7, zone)?),
@@ -174,7 +193,54 @@ pub(crate) fn resolve(
             all_time(earliest, today, zone)?
         }
     };
-    Some(RangeBuckets { unit, buckets })
+    let comparison = match (length, buckets.first()) {
+        (Some(length), Some(first)) => Some(compared(first, &now, length, zone)?),
+        _ => None,
+    };
+    Some(RangeBuckets {
+        unit,
+        buckets,
+        comparison,
+    })
+}
+
+/// The range whose first bucket is `first` moved back by `length`, up to
+/// `now` moved back by it: from the first moment of the day `length` before
+/// the first's, to the same reading of the clock `length` before now — or
+/// the nearest that exists, where the clock skipped it — and never before
+/// it begins.
+fn compared(
+    first: &CalendarBucket,
+    now: &Zoned,
+    length: Span,
+    zone: &TimeZone,
+) -> Option<UsageMetricsInterval> {
+    let begins = first
+        .begins
+        .date()
+        .checked_sub(length)
+        .ok()?
+        .to_zoned(zone.clone())
+        .ok()?
+        .start_of_day()
+        .ok()?;
+    let ends = now.checked_sub(length).ok()?;
+    let ends = if ends.timestamp() < begins.timestamp() {
+        begins.clone()
+    } else {
+        ends
+    };
+    Some(UsageMetricsInterval {
+        start: moment(&begins)?,
+        end: moment(&ends)?,
+    })
+}
+
+/// The Session timestamp of `zoned`.
+fn moment(zoned: &Zoned) -> Option<SessionTimestamp> {
+    u64::try_from(zoned.timestamp().as_millisecond())
+        .ok()
+        .map(SessionTimestamp)
 }
 
 /// From the month of `earliest` through the month of `today`: by the month
@@ -290,11 +356,6 @@ fn between(edges: &[Zoned]) -> Option<Vec<CalendarBucket>> {
 }
 
 fn bucket(begins: &Zoned, ends: &Zoned) -> Option<CalendarBucket> {
-    let moment = |zoned: &Zoned| {
-        u64::try_from(zoned.timestamp().as_millisecond())
-            .ok()
-            .map(SessionTimestamp)
-    };
     Some(CalendarBucket {
         interval: UsageMetricsInterval {
             start: moment(begins)?,
@@ -711,5 +772,113 @@ mod tests {
         assert_eq!(skipped.begins, date(2026, 9, 6).at(1, 0, 0, 0));
         assert_eq!(hours(skipped.interval), 23);
         assert!(contiguous(&buckets));
+    }
+    /// The comparison interval `range` is compared with at `now` in the zone
+    /// named, as the wall-clock readings it begins and ends at there.
+    fn compared(
+        range: MetricsRange,
+        now: DateTime,
+        zone_name: &str,
+    ) -> Option<(SessionTimestamp, SessionTimestamp)> {
+        resolve(range, at(zone_name, now), &zone(zone_name), None)
+            .expect("a moment the calendar places")
+            .comparison
+            .map(|comparison| (comparison.start, comparison.end))
+    }
+
+    #[test]
+    fn thirty_days_are_compared_with_the_thirty_local_days_before_as_far_into_them() {
+        let compared = compared(
+            MetricsRange::ThirtyDays,
+            date(2026, 10, 28).at(14, 30, 0, 0),
+            "America/New_York",
+        );
+
+        // The range began on 29 September, and is fourteen and a half hours
+        // into its thirtieth day.
+        assert_eq!(
+            compared,
+            Some((
+                at("America/New_York", date(2026, 8, 30).at(0, 0, 0, 0)),
+                at("America/New_York", date(2026, 9, 28).at(14, 30, 0, 0)),
+            ))
+        );
+    }
+
+    #[test]
+    fn seven_days_are_compared_with_the_seven_local_days_before() {
+        assert_eq!(
+            compared(
+                MetricsRange::SevenDays,
+                date(2026, 10, 28).at(9, 0, 0, 0),
+                "Europe/London",
+            ),
+            Some((
+                at("Europe/London", date(2026, 10, 15).at(0, 0, 0, 0)),
+                at("Europe/London", date(2026, 10, 21).at(9, 0, 0, 0)),
+            ))
+        );
+    }
+
+    #[test]
+    fn today_is_compared_with_yesterday_up_to_the_same_time_of_day() {
+        assert_eq!(
+            compared(
+                MetricsRange::Today,
+                date(2026, 10, 28).at(14, 30, 0, 0),
+                "Asia/Tokyo",
+            ),
+            Some((
+                at("Asia/Tokyo", date(2026, 10, 27).at(0, 0, 0, 0)),
+                at("Asia/Tokyo", date(2026, 10, 27).at(14, 30, 0, 0)),
+            ))
+        );
+        // New York falls back on 1 November: yesterday is read to the same
+        // reading of the clock, not the same hours elapsed.
+        assert_eq!(
+            compared(
+                MetricsRange::Today,
+                date(2026, 11, 1).at(12, 0, 0, 0),
+                "America/New_York",
+            ),
+            Some((
+                at("America/New_York", date(2026, 10, 31).at(0, 0, 0, 0)),
+                at("America/New_York", date(2026, 10, 31).at(12, 0, 0, 0)),
+            ))
+        );
+    }
+
+    #[test]
+    fn a_year_is_compared_with_the_twelve_months_before_as_far_into_them() {
+        assert_eq!(
+            compared(
+                MetricsRange::Year,
+                date(2026, 10, 28).at(9, 0, 0, 0),
+                "Europe/London",
+            ),
+            Some((
+                at("Europe/London", date(2024, 11, 1).at(0, 0, 0, 0)),
+                at("Europe/London", date(2025, 10, 28).at(9, 0, 0, 0)),
+            ))
+        );
+        // A year after a leap day has none: it ends on the last day of
+        // that February.
+        assert_eq!(
+            compared(MetricsRange::Year, date(2028, 2, 29).at(9, 0, 0, 0), "UTC"),
+            Some((
+                at("UTC", date(2026, 3, 1).at(0, 0, 0, 0)),
+                at("UTC", date(2027, 2, 28).at(9, 0, 0, 0)),
+            ))
+        );
+    }
+
+    #[test]
+    fn all_time_is_compared_with_nothing() {
+        let now = at("UTC", date(2026, 10, 28).at(9, 0, 0, 0));
+        let earliest = Some(at("UTC", date(2025, 1, 15).at(0, 0, 0, 0)));
+
+        let cut = resolve(MetricsRange::AllTime, now, &zone("UTC"), earliest).unwrap();
+
+        assert_eq!(cut.comparison, None, "no time comes before all of it");
     }
 }

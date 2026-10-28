@@ -302,6 +302,14 @@ fn slash_metrics_reads_the_last_thirty_local_days_by_model() {
             .collect::<Vec<_>>(),
         "29 September to 28 October, each from one New York midnight to the next"
     );
+    assert_eq!(
+        query.comparison,
+        Some(UsageMetricsInterval {
+            start: in_new_york(date(2026, 8, 30).at(0, 0, 0, 0)),
+            end: in_new_york(date(2026, 9, 28).at(14, 30, 0, 0)),
+        }),
+        "compared with the thirty New York days before, as far into the last"
+    );
     let rows = screen(&application);
     assert!(rows[0].starts_with(" Metrics"), "{rows:#?}");
     row(&rows, "Reading Usage Metrics…");
@@ -987,7 +995,7 @@ fn all_time_with_no_report_yet_first_reads_when_the_earliest_turn_was() {
     // Chosen before any report has landed, so nothing says where it begins.
     let (_, probe, first) = expect_read(press(&mut application, '5'));
     assert!(
-        first.buckets.is_empty(),
+        first.buckets.is_empty() && first.comparison.is_none(),
         "the first read asks only when the earliest Turn was"
     );
     let earliest = in_new_york(date(2025, 6, 14).at(9, 0, 0, 0));
@@ -1020,6 +1028,10 @@ fn all_time_with_no_report_yet_first_reads_when_the_earliest_turn_was() {
         new_york_starts(&all_time),
         months,
         "every month from the earliest Turn's to this one"
+    );
+    assert_eq!(
+        all_time.comparison, None,
+        "nothing comes before all of time"
     );
     assert!(contiguous(&all_time));
     row(&screen(&application), "Reading Usage Metrics…");
