@@ -692,3 +692,43 @@ fn a_remote_outlook_reads_the_remote_and_its_silence_is_explained() {
     assert!(!rows[0].starts_with(" Metrics"));
     row(&rows, "studio is unreachable");
 }
+
+/// Selects the last few characters of the composer's draft from the keys.
+fn select_the_draft_s_end(application: &mut Application) {
+    for _ in 0..4 {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::SHIFT,
+            )))
+            .expect("extend the selection");
+    }
+}
+
+#[test]
+fn a_selection_left_beneath_the_view_takes_neither_esc_nor_ctrl_c_from_it() {
+    let (mut application, _workspace) = beside_a_session();
+    type_terminal_text(&mut application, "half a thought");
+
+    select_the_draft_s_end(&mut application);
+    invoke(&mut application, SemanticCommandId::MetricsShow);
+    key(&mut application, KeyCode::Esc);
+    assert!(
+        !screen(&application)[0].starts_with(" Metrics"),
+        "the first Esc closes the view"
+    );
+
+    select_the_draft_s_end(&mut application);
+    invoke(&mut application, SemanticCommandId::MetricsShow);
+    let quit = application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .expect("press Ctrl+C");
+    assert_eq!(
+        quit,
+        ApplicationTransition::Exit,
+        "Ctrl+C leaves rather than copies"
+    );
+}

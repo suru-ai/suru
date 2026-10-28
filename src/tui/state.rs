@@ -11387,6 +11387,9 @@ impl Application {
             SemanticCommandId::MetricsShow => {
                 self.state.command_mode = CommandMode::Composer;
                 self.state.submission_error = None;
+                // A selection left beneath would take the first Esc or Ctrl+C
+                // ahead of the view, which nothing on screen could explain.
+                self.invoke_semantic(SemanticCommandId::TextSelectionClear)?;
                 self.state.metrics_view.open();
                 Ok(self.read_usage_metrics())
             }
