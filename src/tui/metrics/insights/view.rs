@@ -14,12 +14,9 @@ use crate::theme::Theme;
 
 use super::{
     super::{UsageMetricsReadRefusal, calendar::MetricsRange},
-    InsightsContent, InsightsPanel, InsightsView, turns,
+    InsightsContent, InsightsPanel, InsightsView, KeptReport, heatmap, turns,
 };
-use crate::{
-    protocol::{InsightsReport, Outlook},
-    tui::slots::truncate_to_width,
-};
+use crate::{protocol::Outlook, tui::slots::truncate_to_width};
 
 /// Columns between the grid's two columns.
 const COLUMN_GAP: u16 = 2;
@@ -54,7 +51,7 @@ pub(in crate::tui) fn render(
                 buffer.set_string(body.x, body.y + 1, reason, theme.feedback.error);
             }
         }
-        InsightsContent::Report(report) => render_grid(buffer, body, view, report, range, theme),
+        InsightsContent::Report(kept) => render_grid(buffer, body, view, kept, range, theme),
     }
 }
 
@@ -64,7 +61,7 @@ fn render_grid(
     buffer: &mut Buffer,
     body: Rect,
     view: &InsightsView,
-    report: &InsightsReport,
+    kept: &KeptReport,
     range: MetricsRange,
     theme: &Theme,
 ) {
@@ -78,7 +75,7 @@ fn render_grid(
         for (column, panel) in (0u16..).zip(row) {
             let x = body.x + column * (column_width + COLUMN_GAP);
             let area = Rect::new(x, y, column_width, height(*panel));
-            render_panel(buffer, area, *panel, view, report, range, theme);
+            render_panel(buffer, area, *panel, view, kept, range, theme);
         }
         y += tallest + 1;
     }
@@ -87,6 +84,7 @@ fn render_grid(
 /// How many rows `panel` takes, its border included.
 fn height(panel: InsightsPanel) -> u16 {
     let rows = match panel {
+        InsightsPanel::WhenYouWork => heatmap::ROWS,
         InsightsPanel::Turns => turns::ROWS,
     };
     rows + 2
@@ -97,7 +95,7 @@ fn render_panel(
     area: Rect,
     panel: InsightsPanel,
     view: &InsightsView,
-    report: &InsightsReport,
+    kept: &KeptReport,
     range: MetricsRange,
     theme: &Theme,
 ) {
@@ -127,10 +125,21 @@ fn render_panel(
         inner.width.saturating_sub(2),
         inner.height,
     );
+    let selected = view.selected_item().filter(|_| focused);
     match panel {
+        InsightsPanel::WhenYouWork => {
+            heatmap::render(buffer, inner, &kept.heatmap, range, selected, view, theme);
+        }
         InsightsPanel::Turns => {
-            let selected = view.selected_item().filter(|_| focused);
-            turns::render(buffer, inner, &report.turns, range, selected, view, theme);
+            turns::render(
+                buffer,
+                inner,
+                &kept.report.turns,
+                range,
+                selected,
+                view,
+                theme,
+            );
         }
     }
 }

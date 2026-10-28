@@ -7,10 +7,16 @@
 //! its title, its height, and how it draws itself — what it says where the
 //! range holds nothing for it among them — are its module's; and so are the
 //! items it lets a reader select, by their place, which the panel commands
-//! move among and select whichever panel holds them. Only the focused panel
-//! holds a selection, so Esc clears that, then leaves the panel, then
-//! closes the view.
+//! move among and select whichever panel holds them. A panel's items stand
+//! in rows of as many as [`InsightsPanel::across`] says, the first row
+//! first, so ←/→ step through them in order and ↑/↓ move a row. Only the
+//! focused panel holds a selection, so Esc clears that, then leaves the
+//! panel, then closes the view.
+//!
+//! A report is kept with its quarter-hours folded into the week of the zone
+//! its range was cut in, once as it arrives rather than at every frame.
 
+pub(super) mod heatmap;
 pub(super) mod turns;
 mod view;
 
@@ -26,12 +32,15 @@ use super::{
     UsageMetricsReadRefusal,
     calendar::{self, MetricsRange},
 };
+use heatmap::Heatmap;
 
 pub(super) use view::render;
 
 /// A panel of the Insights tab.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum InsightsPanel {
+    /// The Turns started in each hour of the reader's week.
+    WhenYouWork,
     /// How long Turns took to Settle, and how they ended.
     Turns,
 }
@@ -39,7 +48,7 @@ pub enum InsightsPanel {
 impl InsightsPanel {
     /// Every panel, in the order the grid lays them out, row by row across
     /// its two columns, and focus moves among them.
-    pub(crate) const ALL: [Self; 1] = [Self::Turns];
+    pub(crate) const ALL: [Self; 2] = [Self::WhenYouWork, Self::Turns];
 
     pub(crate) fn place(self) -> usize {
         Self::ALL
@@ -50,15 +59,25 @@ impl InsightsPanel {
 
     pub(crate) fn title(self) -> &'static str {
         match self {
+            Self::WhenYouWork => "When you work (Turns started)",
             Self::Turns => "Turns",
         }
     }
 
-    /// How many items `report` gives the panel for a reader to select among,
+    /// How many items `kept` gives the panel for a reader to select among,
     /// in the order its keys move through them.
-    fn items(self, report: &InsightsReport) -> usize {
+    fn items(self, kept: &KeptReport) -> usize {
         match self {
-            Self::Turns => turns::items(&report.turns),
+            Self::WhenYouWork => heatmap::items(&kept.heatmap),
+            Self::Turns => turns::items(&kept.report.turns),
+        }
+    }
+
+    /// How many of the panel's items stand in each row.
+    fn across(self) -> usize {
+        match self {
+            Self::WhenYouWork => heatmap::HOURS,
+            Self::Turns => crate::protocol::TURN_DURATION_BINS,
         }
     }
 }
@@ -70,6 +89,10 @@ pub(in crate::tui) enum ItemMove {
     Previous,
     /// The item after, or the first where none is selected.
     Next,
+    /// The item a row above, or the last where none is selected.
+    Up,
+    /// The item a row below, or the first where none is selected.
+    Down,
 }
 
 /// Where focus moves among the panels.
@@ -104,14 +127,26 @@ impl InsightsTarget {
 pub(super) enum InsightsContent<'a> {
     Reading,
     Refused(&'a UsageMetricsReadRefusal),
-    Report(&'a InsightsReport),
+    Report(&'a KeptReport),
 }
 
-/// How a panel's items stand where it drew them, from its first.
+/// A report kept for a range: the Outlook it was read from, and its
+/// quarter-hours folded into the week of the zone the range was cut in.
+#[derive(Clone, Debug)]
+pub(super) struct KeptReport {
+    origin: Outlook,
+    pub(super) report: InsightsReport,
+    pub(super) heatmap: Heatmap,
+}
+
+/// How a panel's items stand where it drew them, from its first: in rows
+/// a line apiece, `across` items to a row, each `width` columns wide — the
+/// Turns panel's bins a column apiece in one row, the heatmap's hours two
+/// apiece in a row for each day.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ItemRun {
-    /// Side by side, a column apiece, as the Turns panel's bins are.
-    Across,
+pub(super) struct ItemGrid {
+    pub(super) width: u16,
+    pub(super) across: u16,
 }
 
 /// Where the last frame drew each part of the tab a pointer can act on.
@@ -122,20 +157,20 @@ struct Targets {
     panels: [Option<Rect>; InsightsPanel::ALL.len()],
     /// Where each panel drew the items a reader selects among, and how they
     /// stand, in the same order.
-    items: [Option<(Rect, ItemRun)>; InsightsPanel::ALL.len()],
+    items: [Option<(Rect, ItemGrid)>; InsightsPanel::ALL.len()],
 }
 
 /// The tab's state: the reports it read, kept by range, and the panel the
 /// keys act on. What it read does not outlive the view's closing.
 #[derive(Clone, Debug, Default)]
 pub(in crate::tui) struct InsightsView {
-    /// The read it awaits: its request, the Outlook it asked, and the range
-    /// it asked for.
-    asked: Option<(Uuid, Outlook, MetricsRange)>,
-    /// The last report read of each range, with the Outlook it was read
-    /// from, so switching between tabs or ranges reads nothing again. Only a
-    /// report read from the Outlook the view is turned toward is shown.
-    read: HashMap<MetricsRange, (Outlook, InsightsReport)>,
+    /// The read it awaits: its request, the Outlook it asked, the range it
+    /// asked for, and the zone that range was cut in.
+    asked: Option<(Uuid, Outlook, MetricsRange, TimeZone)>,
+    /// The last report read of each range, so switching between tabs or
+    /// ranges reads nothing again. Only a report read from the Outlook the
+    /// view is turned toward is shown.
+    read: HashMap<MetricsRange, KeptReport>,
     /// Why the last read of a range, from an Outlook, gave no report.
     refused: Option<(Outlook, MetricsRange, UsageMetricsReadRefusal)>,
     focused: Option<InsightsPanel>,
@@ -147,11 +182,8 @@ pub(in crate::tui) struct InsightsView {
 
 impl InsightsView {
     /// The report kept for `range` from `origin`, where one is.
-    fn report(&self, origin: &Outlook, range: MetricsRange) -> Option<&InsightsReport> {
-        self.read
-            .get(&range)
-            .filter(|(read_from, _)| read_from == origin)
-            .map(|(_, report)| report)
+    fn report(&self, origin: &Outlook, range: MetricsRange) -> Option<&KeptReport> {
+        self.read.get(&range).filter(|kept| kept.origin == *origin)
     }
 
     /// Whether `range` lacks a report from `origin` with none on its way, so
@@ -182,7 +214,7 @@ impl InsightsView {
             return None;
         };
         let request_id = Uuid::new_v4();
-        self.asked = Some((request_id, origin, range));
+        self.asked = Some((request_id, origin, range, zone.clone()));
         self.refused = None;
         Some((request_id, InsightsQuery { interval }))
     }
@@ -205,14 +237,20 @@ impl InsightsView {
         if !self
             .asked
             .as_ref()
-            .is_some_and(|(asked, _, _)| *asked == request_id)
+            .is_some_and(|(asked, _, _, _)| *asked == request_id)
         {
             return;
         }
-        let (_, origin, range) = self.asked.take().expect("the awaited read");
+        let (_, origin, range, zone) = self.asked.take().expect("the awaited read");
         match result {
             Ok(report) => {
-                self.read.insert(range, (origin, report));
+                let heatmap = Heatmap::fold(&report.quarter_hours, &zone);
+                let kept = KeptReport {
+                    origin,
+                    report,
+                    heatmap,
+                };
+                self.read.insert(range, kept);
             }
             Err(refusal) => self.refuse(origin, range, refusal),
         }
@@ -240,7 +278,7 @@ impl InsightsView {
     pub(in crate::tui) fn is_reading(&self, origin: &Outlook, range: MetricsRange) -> bool {
         self.asked
             .as_ref()
-            .is_some_and(|(_, asked_of, asked)| asked_of == origin && *asked == range)
+            .is_some_and(|(_, asked_of, asked, _)| asked_of == origin && *asked == range)
     }
 
     fn refusal_of(
@@ -327,16 +365,22 @@ impl InsightsView {
         };
         let Some(last) = self
             .report(origin, range)
-            .and_then(|report| panel.items(report).checked_sub(1))
+            .and_then(|kept| panel.items(kept).checked_sub(1))
         else {
             return;
         };
-        self.selected = Some(match (to, self.selected) {
-            (ItemMove::Previous, Some(item)) => item.saturating_sub(1).min(last),
-            (ItemMove::Next, Some(item)) => (item + 1).min(last),
-            (ItemMove::Previous, None) => last,
-            (ItemMove::Next, None) => 0,
-        });
+        let across = panel.across();
+        let item = match (to, self.selected) {
+            (ItemMove::Previous, Some(item)) => item.saturating_sub(1),
+            (ItemMove::Next, Some(item)) => item + 1,
+            // A row up from the first row, or down from the last, stays put.
+            (ItemMove::Up, Some(item)) => item.checked_sub(across).unwrap_or(item),
+            (ItemMove::Down, Some(item)) if item + across <= last => item + across,
+            (ItemMove::Down, Some(item)) => item,
+            (ItemMove::Previous | ItemMove::Up, None) => last,
+            (ItemMove::Next | ItemMove::Down, None) => 0,
+        };
+        self.selected = Some(item.min(last));
     }
 
     /// Selects `panel`'s `item` in the report shown for `range` from
@@ -350,7 +394,7 @@ impl InsightsView {
     ) {
         let held = self
             .report(origin, range)
-            .is_some_and(|report| item < panel.items(report));
+            .is_some_and(|kept| item < panel.items(kept));
         if held {
             self.focus(panel);
             self.selected = Some(item);
@@ -366,10 +410,10 @@ impl InsightsView {
         self.update_targets(|targets| targets.panels[panel.place()] = Some(area));
     }
 
-    /// Records where `panel` drew its items, standing as `run` from the
+    /// Records where `panel` drew its items, standing as `grid` from the
     /// corner of `area`.
-    pub(super) fn record_item_targets(&self, panel: InsightsPanel, area: Rect, run: ItemRun) {
-        self.update_targets(|targets| targets.items[panel.place()] = Some((area, run)));
+    pub(super) fn record_item_targets(&self, panel: InsightsPanel, area: Rect, grid: ItemGrid) {
+        self.update_targets(|targets| targets.items[panel.place()] = Some((area, grid)));
     }
 
     fn update_targets(&self, update: impl FnOnce(&mut Targets)) {
@@ -386,8 +430,10 @@ impl InsightsView {
         })?;
         let item = targets.items[panel.place()]
             .filter(|(area, _)| area.contains(position))
-            .map(|(area, run)| match run {
-                ItemRun::Across => usize::from(position.x - area.x),
+            .map(|(area, grid)| {
+                let row = usize::from(position.y - area.y);
+                let column = usize::from((position.x - area.x) / grid.width.max(1));
+                row * usize::from(grid.across) + column
             });
         Some(match item {
             Some(item) => InsightsTarget::Item { panel, item },

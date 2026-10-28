@@ -2,19 +2,20 @@
 //! Outlook's Server worked over the range the Overview tab shares with it.
 
 use super::{
-    HEIGHT, NEW_YORK, WIDTH, afternoon, answer, ask, press, press_at, reader_in, report, row,
-    screen, wheel, zone,
+    HEIGHT, NEW_YORK, WIDTH, afternoon, answer, ask, in_new_york, press, press_at, reader_in,
+    report, row, screen, wheel, zone,
 };
 use crate::tui_rendering::support::{
     application_looking_at_studio, grace_elapses, invoke, key, rendered_application_buffer,
     studio_stops_answering, text_position,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+use jiff::civil::date;
 use ratatui::{buffer::Buffer, style::Style};
 use suru::{
     protocol::{
-        InsightsQuery, InsightsReport, Outlook, TurnDurations, TurnInsights, UsageMetricsInterval,
-        UsageMetricsQuery,
+        Cost, InsightsQuery, InsightsReport, Outlook, QUARTER_HOUR_MS, QuarterHourTurns,
+        TurnDurations, TurnInsights, UsageMetricsInterval, UsageMetricsQuery,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, InsightsPanel, MetricsTab,
@@ -86,8 +87,50 @@ fn worked() -> InsightsReport {
             failed: 40,
             interrupted: 31,
         },
-        quarter_hours: Vec::new(),
+        quarter_hours: worked_hours(),
     }
+}
+
+/// `turns` Turns of `tokens` tokens costing `usd`, placed in the quarter-hour
+/// beginning at `minute` past `hour` on `day` of October 2026 in New York.
+fn new_york_quarter(
+    day: i8,
+    hour: i8,
+    minute: i8,
+    turns: u64,
+    tokens: u64,
+    usd: f64,
+) -> QuarterHourTurns {
+    let start = in_new_york(date(2026, 10, day).at(hour, minute, 0, 0));
+    assert_eq!(start.0 % QUARTER_HOUR_MS, 0);
+    QuarterHourTurns {
+        start,
+        turns,
+        tokens: Some(tokens),
+        cost: Cost::from_usd(usd),
+        is_cost_partial: false,
+    }
+}
+
+/// When the mockup's reader worked, in New York: the busiest hour Tuesday
+/// 27 October at 14:00, its 40 Turns in two quarter-hours, and the hours
+/// after it each quieter — 30, 20, 10, then 1 Turn — so they shade a level
+/// apiece less; and one Turn late on the Wednesday before, whose Cost is
+/// partial.
+fn worked_hours() -> Vec<QuarterHourTurns> {
+    let mut hours = vec![
+        new_york_quarter(27, 14, 0, 25, 1_300_000, 9.20),
+        new_york_quarter(27, 14, 45, 15, 800_000, 5.00),
+        new_york_quarter(27, 15, 0, 30, 900_000, 3.00),
+        new_york_quarter(27, 16, 30, 20, 600_000, 2.00),
+        new_york_quarter(27, 17, 15, 10, 300_000, 1.00),
+        new_york_quarter(27, 18, 0, 1, 30_000, 0.10),
+    ];
+    hours.push(QuarterHourTurns {
+        is_cost_partial: true,
+        ..new_york_quarter(21, 23, 45, 1, 500, 0.05)
+    });
+    hours
 }
 
 /// The view opened on 30 days, its Overview answered, then Insights shown,
@@ -242,7 +285,7 @@ fn ctrl_arrows_and_clicks_on_the_tab_bar_switch_tabs_alike() {
 /// The style of the Turns panel's top-left border corner.
 fn turns_border(application: &Application) -> Style {
     let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
-    let (x, y) = text_position(&buffer, "Turns");
+    let (x, y) = text_position(&buffer, " Turns ");
     corner_left_of(&buffer, x, y)
 }
 
@@ -272,16 +315,24 @@ fn tab_or_a_click_focuses_a_panel_and_highlights_its_border() {
     let unfocused = turns_border(&application);
 
     assert_eq!(press_tab(&mut application), ApplicationTransition::Continue);
+    assert_eq!(
+        turns_border(&application),
+        unfocused,
+        "focus begins at the first panel"
+    );
+    press_tab(&mut application);
     let focused = turns_border(&application);
     assert_ne!(focused, unfocused, "the focused panel's border stands out");
     assert_eq!(
         key(&mut application, KeyCode::BackTab),
         ApplicationTransition::Continue
     );
+    assert_eq!(turns_border(&application), unfocused);
+    key(&mut application, KeyCode::BackTab);
     assert_eq!(
         turns_border(&application),
         focused,
-        "with one panel, focus moves round to it"
+        "from the first panel, focus moves round to the last"
     );
 
     let mut clicked = on_insights(Ok(worked()));
@@ -299,6 +350,7 @@ fn press_tab(application: &mut Application) -> ApplicationTransition {
 fn esc_clears_the_selection_then_leaves_the_panel_then_closes_the_view() {
     let mut application = on_insights(Ok(worked()));
     let unfocused = turns_border(&application);
+    press_tab(&mut application);
     press_tab(&mut application);
     let focused = turns_border(&application);
     key(&mut application, KeyCode::Right);
@@ -461,6 +513,7 @@ fn g_and_i_switch_tabs_where_the_system_takes_ctrl_arrows() {
 fn a_new_range_lets_go_of_the_selection_its_figures_were_made_for() {
     let mut application = on_insights(Ok(worked()));
     press_tab(&mut application);
+    press_tab(&mut application);
     key(&mut application, KeyCode::Right);
     let focused = turns_border(&application);
 
@@ -517,4 +570,180 @@ fn a_tab_whose_read_was_refused_reads_again_when_shown_again() {
 
     expect_metrics_read(ctrl(&mut application, KeyCode::Left));
     expect_insights_read(ctrl(&mut application, KeyCode::Right));
+}
+
+/// The heatmap's row for `day`, from its label to the end of its cells.
+fn heat_row(rows: &[String], day: &str) -> String {
+    let row = row(rows, &format!("{day}  "));
+    let start = row.find(&format!("{day}  ")).expect("the label");
+    row[start..].chars().take(5 + 48).collect()
+}
+
+/// The cell of `day`'s row at `hour`, a Monday-first weekday name.
+fn cell_position(application: &Application, day: &str, hour: u16) -> (u16, u16) {
+    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    let (x, y) = text_position(&buffer, &format!("{day}  "));
+    (x + 5 + hour * 2, y)
+}
+
+#[test]
+fn when_you_work_shades_each_local_hour_of_the_week_by_its_share_of_the_busiest() {
+    assert_eq!(
+        SemanticCommandId::MetricsPanelFocus(InsightsPanel::WhenYouWork).as_str(),
+        "metrics.panel.when-you-work"
+    );
+    let application = on_insights(Ok(worked()));
+
+    let rows = screen(&application);
+
+    row(&rows, "When you work (Turns started)");
+    assert!(
+        row(&rows, "00      04      08      12      16      20").contains("00      04"),
+        "{rows:#?}"
+    );
+    assert_eq!(
+        heat_row(&rows, "Tue"),
+        format!("Tue  {}██▓▓▒▒░░░░{}", "· ".repeat(14), "· ".repeat(5)),
+        "the busiest hour shades fullest and each quieter one a level less"
+    );
+    assert_eq!(
+        heat_row(&rows, "Wed"),
+        format!("Wed  {}░░", "· ".repeat(23)),
+        "a Turn at 23:45 New York time, 03:45 UTC on Thursday, is Wednesday's"
+    );
+    for day in ["Mon", "Thu", "Fri", "Sat", "Sun"] {
+        assert_eq!(heat_row(&rows, day), format!("{day}  {}", "· ".repeat(24)));
+    }
+    let tue = rows.iter().position(|row| row.contains("Tue  ")).unwrap();
+    let mon = rows.iter().position(|row| row.contains("Mon  ")).unwrap();
+    let sun = rows.iter().position(|row| row.contains("Sun  ")).unwrap();
+    assert_eq!((tue - mon, sun - mon), (1, 6), "weeks begin on Monday");
+
+    // The lightest level's colour is not the rest's, so the two shades
+    // that share a glyph still read apart.
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let (x, y) = cell_position(&application, "Tue", 17);
+    let (lightest, lighter) = (buffer[(x + 2, y)].style(), buffer[(x, y)].style());
+    assert_eq!(buffer[(x + 2, y)].symbol(), "░");
+    assert_ne!(lightest.fg, lighter.fg);
+}
+
+#[test]
+fn shading_is_relative_to_the_busiest_hour_however_busy_that_is() {
+    let light = on_insights(Ok(worked()));
+    let mut heavy_report = worked();
+    for quarter in &mut heavy_report.quarter_hours {
+        quarter.turns *= 100;
+    }
+    let heavy = on_insights(Ok(heavy_report));
+
+    for day in ["Tue", "Wed"] {
+        assert_eq!(
+            heat_row(&screen(&light), day),
+            heat_row(&screen(&heavy), day)
+        );
+    }
+}
+
+#[test]
+fn a_cell_selected_by_keys_or_by_a_click_states_its_hour_turns_tokens_and_cost() {
+    assert_eq!(
+        SemanticCommandId::MetricsPanelItemUp.as_str(),
+        "metrics.panel.item.up"
+    );
+    assert_eq!(
+        SemanticCommandId::MetricsPanelItemDown.as_str(),
+        "metrics.panel.item.down"
+    );
+    let mut keyed = on_insights(Ok(worked()));
+    press_tab(&mut keyed);
+    let arrow = |application: &Application, code| {
+        application
+            .command_for_terminal_input(InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    };
+    for (code, command) in [
+        (KeyCode::Left, SemanticCommandId::MetricsPanelItemPrevious),
+        (KeyCode::Right, SemanticCommandId::MetricsPanelItemNext),
+        (KeyCode::Up, SemanticCommandId::MetricsPanelItemUp),
+        (KeyCode::Down, SemanticCommandId::MetricsPanelItemDown),
+    ] {
+        assert_eq!(
+            arrow(&keyed, code),
+            Some(CommandId::InvokeSemantic(command))
+        );
+    }
+    // Down to Monday's first hour, then Tuesday's, then along to 14:00.
+    key(&mut keyed, KeyCode::Down);
+    key(&mut keyed, KeyCode::Down);
+    for _ in 0..14 {
+        key(&mut keyed, KeyCode::Right);
+    }
+    let rows = screen(&keyed);
+    row(&rows, "Tue 14:00–15:00 · 40 Turns · 2.1M tokens · $14.20");
+
+    // A click selects the cell by its place, Tuesday's fifteenth hour, as
+    // the semantic command does, and either of a cell's columns is it.
+    let mut invoked = on_insights(Ok(worked()));
+    invoke(
+        &mut invoked,
+        SemanticCommandId::MetricsPanelItemSelect {
+            panel: InsightsPanel::WhenYouWork,
+            item: 24 + 14,
+        },
+    );
+    assert_eq!(
+        screen(&invoked),
+        rows,
+        "the command selects what the keys did"
+    );
+    let mut clicked = on_insights(Ok(worked()));
+    let cell = cell_position(&clicked, "Tue", 14);
+    press_at(&mut clicked, (cell.0 + 1, cell.1));
+    assert_eq!(
+        screen(&clicked),
+        rows,
+        "the click selects what the keys did"
+    );
+
+    // Up from Wednesday's last hour is Tuesday's, and ← steps back an hour.
+    key(&mut clicked, KeyCode::Down);
+    for _ in 14..23 {
+        key(&mut clicked, KeyCode::Right);
+    }
+    row(
+        &screen(&clicked),
+        "Wed 23:00–24:00 · 1 Turn · 500 tokens · $0.05+",
+    );
+    key(&mut clicked, KeyCode::Up);
+    key(&mut clicked, KeyCode::Left);
+    row(&screen(&clicked), "Tue 22:00–23:00 · no Turns");
+}
+
+#[test]
+fn esc_clears_a_selected_cell_before_it_leaves_the_heatmap() {
+    let mut application = on_insights(Ok(worked()));
+    let cell = cell_position(&application, "Tue", 14);
+    press_at(&mut application, cell);
+    row(&screen(&application), "Tue 14:00–15:00");
+    let focused = heatmap_border(&application);
+
+    key(&mut application, KeyCode::Esc);
+    let rows = screen(&application);
+    assert!(!rows.iter().any(|row| row.contains("Tue 14:00–15:00")));
+    assert_eq!(
+        heatmap_border(&application),
+        focused,
+        "the panel keeps focus"
+    );
+
+    key(&mut application, KeyCode::Esc);
+    assert_ne!(heatmap_border(&application), focused);
+    row(&screen(&application), "When you work");
+}
+
+/// The style of the When you work panel's top-left border corner.
+fn heatmap_border(application: &Application) -> Style {
+    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    let (x, y) = text_position(&buffer, "When you work");
+    corner_left_of(&buffer, x, y)
 }

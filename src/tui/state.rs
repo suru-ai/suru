@@ -11765,6 +11765,16 @@ impl Application {
                     insights.move_item(origin, range, ItemMove::Next)
                 }))
             }
+            SemanticCommandId::MetricsPanelItemUp => {
+                Ok(self.act_on_metrics_insights(|insights, origin, range| {
+                    insights.move_item(origin, range, ItemMove::Up)
+                }))
+            }
+            SemanticCommandId::MetricsPanelItemDown => {
+                Ok(self.act_on_metrics_insights(|insights, origin, range| {
+                    insights.move_item(origin, range, ItemMove::Down)
+                }))
+            }
             SemanticCommandId::MetricsPanelItemSelect { panel, item } => Ok(self
                 .act_on_metrics_insights(|insights, origin, range| {
                     insights.select_item(origin, range, panel, item)

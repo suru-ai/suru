@@ -17,7 +17,7 @@ use super::{
         calendar::MetricsRange,
         view::share,
     },
-    InsightsPanel, InsightsView, ItemRun,
+    InsightsPanel, InsightsView, ItemGrid,
 };
 
 /// The rows the panel draws inside its border.
@@ -102,7 +102,7 @@ pub(super) fn render(
 }
 
 /// `count` Turns, written whole.
-fn counted(count: u64) -> String {
+pub(super) fn counted(count: u64) -> String {
     match count {
         1 => "1 Turn".to_owned(),
         count => format!("{} Turns", grouped_count(count)),
@@ -142,7 +142,10 @@ fn render_bins(
     view.record_item_targets(
         InsightsPanel::Turns,
         Rect::new(area.x, y, bins, 1),
-        ItemRun::Across,
+        ItemGrid {
+            width: 1,
+            across: bins,
+        },
     );
     let timed: u64 = durations.bins.iter().sum();
     let caption = match selected {

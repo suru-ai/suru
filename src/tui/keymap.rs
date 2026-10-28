@@ -493,17 +493,24 @@ fn command_for_insights_key(key: KeyEvent, keys: MetricsKeys) -> Option<Semantic
 }
 
 /// A key the focused Insights panel acts on: the keys that move along its
-/// items the way they stand — on Turns, ←/→ along its sparkline's bins.
+/// items the way they stand — on Turns, ←/→ along its sparkline's bins; on
+/// When you work, ←/→ an hour along the week and ↑/↓ a day, the same hour.
 fn command_for_insights_panel_key(
     panel: InsightsPanel,
     key: KeyEvent,
 ) -> Option<SemanticCommandId> {
     match (panel, key.code, key.modifiers) {
-        (InsightsPanel::Turns, KeyCode::Left, KeyModifiers::NONE) => {
+        (InsightsPanel::Turns | InsightsPanel::WhenYouWork, KeyCode::Left, KeyModifiers::NONE) => {
             Some(SemanticCommandId::MetricsPanelItemPrevious)
         }
-        (InsightsPanel::Turns, KeyCode::Right, KeyModifiers::NONE) => {
+        (InsightsPanel::Turns | InsightsPanel::WhenYouWork, KeyCode::Right, KeyModifiers::NONE) => {
             Some(SemanticCommandId::MetricsPanelItemNext)
+        }
+        (InsightsPanel::WhenYouWork, KeyCode::Up, KeyModifiers::NONE) => {
+            Some(SemanticCommandId::MetricsPanelItemUp)
+        }
+        (InsightsPanel::WhenYouWork, KeyCode::Down, KeyModifiers::NONE) => {
+            Some(SemanticCommandId::MetricsPanelItemDown)
         }
         _ => None,
     }
@@ -533,15 +540,15 @@ fn command_for_insights_pointer(
 
 /// What the wheel does over an Insights panel, whether up or down by
 /// `_kind`: the seam a panel whose rows run past its border scrolls them
-/// through, as the Tools panel will. Over Turns, whose figures all stand in
-/// view, nothing; and never a step of the range, which the wheel over
-/// Overview's chart takes.
+/// through, as the Tools panel will. Over Turns and When you work, whose
+/// figures all stand in view, nothing; and never a step of the range, which
+/// the wheel over Overview's chart takes.
 fn command_for_insights_panel_wheel(
     panel: InsightsPanel,
     _kind: MouseEventKind,
 ) -> Option<SemanticCommandId> {
     match panel {
-        InsightsPanel::Turns => None,
+        InsightsPanel::WhenYouWork | InsightsPanel::Turns => None,
     }
 }
 

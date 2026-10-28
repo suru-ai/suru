@@ -206,6 +206,13 @@ pub enum SemanticCommandId {
     /// Selects the item after the one the focused Insights panel has
     /// selected, or its first where none is.
     MetricsPanelItemNext,
+    /// Selects the item a row above the one the focused Insights panel has
+    /// selected — the same hour of the day before, on the heatmap — or its
+    /// last where none is.
+    MetricsPanelItemUp,
+    /// Selects the item a row below the one the focused Insights panel has
+    /// selected, or its first where none is.
+    MetricsPanelItemDown,
     /// Selects one of an Insights panel's items by its place among them,
     /// counted from the first, focusing the panel.
     MetricsPanelItemSelect {
@@ -801,6 +808,7 @@ impl SemanticCommandId {
             Self::MetricsTabNext => "metrics.tab.next",
             Self::MetricsTabPrevious => "metrics.tab.previous",
             Self::MetricsPanelFocus(panel) => match panel {
+                InsightsPanel::WhenYouWork => "metrics.panel.when-you-work",
                 InsightsPanel::Turns => "metrics.panel.turns",
             },
             Self::MetricsPanelFocusNext => "metrics.panel.next",
@@ -809,6 +817,8 @@ impl SemanticCommandId {
             Self::MetricsPanelSelectionClear => "metrics.panel.selection.clear",
             Self::MetricsPanelItemPrevious => "metrics.panel.item.previous",
             Self::MetricsPanelItemNext => "metrics.panel.item.next",
+            Self::MetricsPanelItemUp => "metrics.panel.item.up",
+            Self::MetricsPanelItemDown => "metrics.panel.item.down",
             Self::MetricsPanelItemSelect { .. } => "metrics.panel.item.select",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
@@ -2147,6 +2157,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: None,
         keybinding: None,
     },
+    metrics_panel_descriptor(InsightsPanel::WhenYouWork, "Focus When You Work Insights"),
     metrics_panel_descriptor(InsightsPanel::Turns, "Focus Turns Insights"),
     SemanticCommandDescriptor {
         id: SemanticCommandId::MetricsPanelFocusNext,
@@ -2195,6 +2206,22 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Next Insights Item",
         reach: SemanticReach::Client,
         description: "Select the item after the focused Insights panel's selected one",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsPanelItemUp,
+        title: "Insights Item Above",
+        reach: SemanticReach::Client,
+        description: "Select the item a row above the focused Insights panel's selected one",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsPanelItemDown,
+        title: "Insights Item Below",
+        reach: SemanticReach::Client,
+        description: "Select the item a row below the focused Insights panel's selected one",
         slash: None,
         keybinding: None,
     },
