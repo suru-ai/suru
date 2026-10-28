@@ -175,6 +175,10 @@ _Avoid_: Cost Basis (which describes origin), billing coverage
 Where a Cost came from: **Reported** when the Provider itself stated the figure, **Estimated** when Suru computed it from a rate table. Basis records who computed the number rather than whether money changed hands — a Reported Cost under a subscription may still have billed nothing.
 _Avoid_: Cost source, cost type
 
+**Usage Metrics**:
+What the Sessions living on one Server consumed over a span of time, divided into time buckets and broken down by Model, Provider, or Workspace. It is read on request and never stored. The reader cuts the buckets at its own local boundaries and asks for them as spans of time, so the Server keeps no calendar, and a remote Server's Usage Metrics are read in the reader's days. Only the Sessions that live on that Server count, so one it merely reads from another Server is never counted twice.
+_Avoid_: Usage stats, analytics, spend, token count
+
 **Prompt**:
 Input submitted for delivery to an agent: the user's own, or a Sidekick's sent on the user's behalf. A delivered Prompt becomes either the user Message that begins a Turn or a later user Message that steers its active Turn. A Prompt a Sidekick sent says so as a typed property naming the Sidekick's Session, and its Message is drawn apart from one the user wrote and leads back to that Session, so a reader always knows which words were theirs.
 _Avoid_: Request, draft, message
