@@ -86,20 +86,20 @@ struct MeteredTurn {
     usage: Option<Usage>,
 }
 
-/// What the read takes of the store: every Turn it counts, what each adds
-/// to the Server's Cost, and how each Workspace a Turn may be counted under
-/// is presented.
+/// What the read takes of the store: every Turn it counts, and what each
+/// adds to the Server's Cost.
 struct Metered {
     turns: Vec<MeteredTurn>,
     costs: Vec<CostContribution>,
-    workspaces: HashMap<WorkspaceId, Workspace>,
 }
 
 /// What names a report's keys: the Model Catalog, naming each Model and
-/// Provider, and the Server's paths, naming each Workspace.
+/// Provider, and the Server's paths and how each Workspace a Turn may be
+/// counted under is presented, naming each Workspace.
 struct KeyNames<'a> {
     catalog: &'a ModelCatalog,
     workspace_paths: &'a WorkspacePaths,
+    workspaces: HashMap<WorkspaceId, Workspace>,
 }
 
 impl SessionStore {
@@ -121,10 +121,11 @@ impl SessionStore {
             .lock()
             .expect("Session store lock is not poisoned")
             .copied_forest(query.breakdown);
-        let metered = MeteredForest::index(copied).metered(query.breakdown, workspaces);
+        let metered = MeteredForest::index(copied).metered(query.breakdown);
         let names = KeyNames {
             catalog,
             workspace_paths,
+            workspaces,
         };
         Ok(fold(query, metered, &names))
     }
@@ -236,11 +237,7 @@ impl MeteredForest {
     /// whose parent is gone, or one of a cycle — is in no tree Cost a
     /// listing shows, so neither its Usage nor its Cost is counted, and the
     /// two measures cover the same Sessions.
-    fn metered(
-        &self,
-        breakdown: UsageMetricsBreakdown,
-        workspaces: HashMap<WorkspaceId, Workspace>,
-    ) -> Metered {
+    fn metered(&self, breakdown: UsageMetricsBreakdown) -> Metered {
         let roots: Vec<SessionId> = self
             .sessions
             .iter()
@@ -270,11 +267,7 @@ impl MeteredForest {
                 }));
             }
         }
-        Metered {
-            turns,
-            costs,
-            workspaces,
-        }
+        Metered { turns, costs }
     }
 }
 
@@ -486,7 +479,7 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
         .collect::<Vec<_>>();
     keys.sort_by(|left, right| key_order(left).cmp(&key_order(right)));
     keys.dedup();
-    let labels = labels(&keys, names, &metered.workspaces);
+    let labels = labels(&keys, names);
     UsageMetricsReport {
         buckets: buckets
             .into_iter()
@@ -520,13 +513,10 @@ fn key_order(key: &UsageMetricsKey) -> (bool, &str, &str) {
 /// name there, each otherwise by its id; and a Workspace's name, as
 /// wherever Workspaces are listed — or, where two Workspaces go by one
 /// name, where each is, so no two series read alike.
-fn labels(
-    keys: &[UsageMetricsKey],
-    names: &KeyNames,
-    workspaces: &HashMap<WorkspaceId, Workspace>,
-) -> Vec<String> {
+fn labels(keys: &[UsageMetricsKey], names: &KeyNames) -> Vec<String> {
     let catalog = names.catalog;
     let paths = names.workspace_paths;
+    let workspaces = &names.workspaces;
     let workspace_name = |id: &WorkspaceId| {
         workspaces
             .get(id)
