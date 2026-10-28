@@ -122,9 +122,19 @@ impl MetricsMeasure {
     }
 }
 
+/// Which series a figure belongs to, whatever place it stands in: one key,
+/// or every key folded into [`OTHER`]. Hiding a series holds on to this,
+/// so it outlasts a change of measure and a refresh that reorders the rows.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum SeriesId {
+    Key(UsageMetricsKey),
+    Other,
+}
+
 /// One key's part of every bucket, in the measure the chart plots.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Series {
+    pub(crate) id: SeriesId,
     pub(crate) label: String,
     pub(crate) color: Color,
     /// The series' figure in each bucket, in the order of the buckets.
@@ -170,15 +180,77 @@ pub(crate) fn series(
     measure: MetricsMeasure,
     theme: &Theme,
 ) -> Vec<Series> {
-    let part = |bucket: &UsageMetricsBucket, key: &UsageMetricsKey| {
-        bucket
-            .by_key
+    let (ranked, folded) = ranked(report);
+    let values = |keys: &[RankedKey<'_>]| {
+        report
+            .buckets
             .iter()
-            .find(|keyed| keyed.key == *key)
-            .map(|keyed| keyed.aggregate)
-            .unwrap_or_default()
+            .map(|bucket| {
+                keys.iter()
+                    .map(|(label, _)| measure.value(&part(bucket, &label.key)))
+                    .fold(0, u64::saturating_add)
+            })
+            .collect()
     };
-    let mut ranked: Vec<(&UsageMetricsKeyLabel, UsageMetricsAggregate)> = report
+    let partials = |keys: &[RankedKey<'_>]| {
+        report
+            .buckets
+            .iter()
+            .map(|bucket| {
+                keys.iter()
+                    .any(|(label, _)| measure.is_partial(&part(bucket, &label.key)))
+            })
+            .collect()
+    };
+    let palette = palette(theme);
+    let mut series: Vec<Series> = ranked
+        .iter()
+        .enumerate()
+        .map(|(place, keyed)| Series {
+            id: SeriesId::Key(keyed.0.key.clone()),
+            label: keyed.0.label.clone(),
+            color: palette[place % palette.len()],
+            values: values(std::slice::from_ref(keyed)),
+            partials: partials(std::slice::from_ref(keyed)),
+            total: measure.value(&keyed.1),
+            is_partial: measure.is_partial(&keyed.1),
+        })
+        .collect();
+    if !folded.is_empty() {
+        series.push(Series {
+            id: SeriesId::Other,
+            label: OTHER.to_owned(),
+            color: other_color(theme),
+            values: values(&folded),
+            partials: partials(&folded),
+            total: folded
+                .iter()
+                .map(|(_, whole)| measure.value(whole))
+                .fold(0, u64::saturating_add),
+            is_partial: folded.iter().any(|(_, whole)| measure.is_partial(whole)),
+        });
+    }
+    series
+}
+
+/// Which series [`series`] makes of `report`, in the same order, without
+/// working out any figure.
+pub(crate) fn series_ids(report: &UsageMetricsReport) -> Vec<SeriesId> {
+    let (ranked, folded) = ranked(report);
+    ranked
+        .into_iter()
+        .map(|(label, _)| SeriesId::Key(label.key.clone()))
+        .chain((!folded.is_empty()).then_some(SeriesId::Other))
+        .collect()
+}
+
+/// A key and its figures over the range taken together.
+type RankedKey<'a> = (&'a UsageMetricsKeyLabel, UsageMetricsAggregate);
+
+/// `report`'s keys in the order [`series`] stacks them, split into the
+/// largest few it keeps and the rest it folds into Other.
+fn ranked(report: &UsageMetricsReport) -> (Vec<RankedKey<'_>>, Vec<RankedKey<'_>>) {
+    let mut ranked: Vec<RankedKey<'_>> = report
         .keys
         .iter()
         .map(|label| (label, part(&report.across_buckets, &label.key)))
@@ -201,54 +273,17 @@ pub(crate) fn series(
     } else {
         Vec::new()
     };
-    let values = |keys: &[(&UsageMetricsKeyLabel, UsageMetricsAggregate)]| {
-        report
-            .buckets
-            .iter()
-            .map(|bucket| {
-                keys.iter()
-                    .map(|(label, _)| measure.value(&part(bucket, &label.key)))
-                    .fold(0, u64::saturating_add)
-            })
-            .collect()
-    };
-    let partials = |keys: &[(&UsageMetricsKeyLabel, UsageMetricsAggregate)]| {
-        report
-            .buckets
-            .iter()
-            .map(|bucket| {
-                keys.iter()
-                    .any(|(label, _)| measure.is_partial(&part(bucket, &label.key)))
-            })
-            .collect()
-    };
-    let palette = palette(theme);
-    let mut series: Vec<Series> = ranked
+    (ranked, folded)
+}
+
+/// `key`'s part of `bucket`, nothing where it did no work there.
+fn part(bucket: &UsageMetricsBucket, key: &UsageMetricsKey) -> UsageMetricsAggregate {
+    bucket
+        .by_key
         .iter()
-        .enumerate()
-        .map(|(place, keyed)| Series {
-            label: keyed.0.label.clone(),
-            color: palette[place % palette.len()],
-            values: values(std::slice::from_ref(keyed)),
-            partials: partials(std::slice::from_ref(keyed)),
-            total: measure.value(&keyed.1),
-            is_partial: measure.is_partial(&keyed.1),
-        })
-        .collect();
-    if !folded.is_empty() {
-        series.push(Series {
-            label: OTHER.to_owned(),
-            color: other_color(theme),
-            values: values(&folded),
-            partials: partials(&folded),
-            total: folded
-                .iter()
-                .map(|(_, whole)| measure.value(whole))
-                .fold(0, u64::saturating_add),
-            is_partial: folded.iter().any(|(_, whole)| measure.is_partial(whole)),
-        });
-    }
-    series
+        .find(|keyed| keyed.key == *key)
+        .map(|keyed| keyed.aggregate)
+        .unwrap_or_default()
 }
 
 /// Whether `report` holds nothing any measure could plot: no Usage, no Cost,

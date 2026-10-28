@@ -149,6 +149,26 @@ pub enum SemanticCommandId {
     /// Clears the Usage Metrics view's bucket selection, so its legend reads
     /// the range again.
     MetricsBucketClear,
+    /// Hides one of the Usage Metrics view's series from its chart, or shows
+    /// it again, by its place among the legend's rows, counted from the
+    /// first.
+    MetricsSeriesToggle {
+        series: usize,
+    },
+    /// Shows one of the Usage Metrics view's series alone, hiding every
+    /// other, by its place among the legend's rows; where it is already shown
+    /// alone, shows every series again.
+    MetricsSeriesSolo {
+        series: usize,
+    },
+    /// Focuses the row before the Usage Metrics view's focused one among its
+    /// lists, or the last where none is focused.
+    MetricsFocusPrevious,
+    /// Focuses the row after the Usage Metrics view's focused one among its
+    /// lists, or the first where none is focused.
+    MetricsFocusNext,
+    /// Lets go of the Usage Metrics view's list focus.
+    MetricsFocusClear,
     /// Opens the Icon Picker over a Session, which the picker only does while
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
     /// menu item stays quiet rather than opening a picker no glyph could draw.
@@ -725,6 +745,11 @@ impl SemanticCommandId {
             Self::MetricsBucketLast => "metrics.bucket.last",
             Self::MetricsBucketSelect { .. } => "metrics.bucket.select",
             Self::MetricsBucketClear => "metrics.bucket.clear",
+            Self::MetricsSeriesToggle { .. } => "metrics.series.toggle",
+            Self::MetricsSeriesSolo { .. } => "metrics.series.solo",
+            Self::MetricsFocusPrevious => "metrics.focus.previous",
+            Self::MetricsFocusNext => "metrics.focus.next",
+            Self::MetricsFocusClear => "metrics.focus.clear",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::SessionRename => "session.rename",
@@ -1958,6 +1983,49 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Clear Metrics Bucket",
         reach: SemanticReach::Client,
         description: "Clear the Usage Metrics view's bucket selection",
+        slash: None,
+        keybinding: None,
+    },
+    // Hiding a series changes only the chart, never the figures read, so it
+    // reads nothing either.
+    SemanticCommandDescriptor {
+        // The series' place is invocation data, as a bucket's is.
+        id: SemanticCommandId::MetricsSeriesToggle { series: 0 },
+        title: "Toggle Metrics Series",
+        reach: SemanticReach::Client,
+        description: "Hide or show one of the Usage Metrics view's series",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsSeriesSolo { series: 0 },
+        title: "Show Metrics Series Alone",
+        reach: SemanticReach::Client,
+        description: "Show one of the Usage Metrics view's series alone, or every series again",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsFocusPrevious,
+        title: "Previous Metrics Row",
+        reach: SemanticReach::Client,
+        description: "Focus the row before the Usage Metrics view's focused one",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsFocusNext,
+        title: "Next Metrics Row",
+        reach: SemanticReach::Client,
+        description: "Focus the row after the Usage Metrics view's focused one",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsFocusClear,
+        title: "Clear Metrics Focus",
+        reach: SemanticReach::Client,
+        description: "Let go of the Usage Metrics view's focused row",
         slash: None,
         keybinding: None,
     },
@@ -3247,6 +3315,12 @@ pub(super) fn descriptor(id: SemanticCommandId) -> &'static SemanticCommandDescr
                     ) | (
                         SemanticCommandId::MetricsBucketSelect { .. },
                         SemanticCommandId::MetricsBucketSelect { .. }
+                    ) | (
+                        SemanticCommandId::MetricsSeriesToggle { .. },
+                        SemanticCommandId::MetricsSeriesToggle { .. }
+                    ) | (
+                        SemanticCommandId::MetricsSeriesSolo { .. },
+                        SemanticCommandId::MetricsSeriesSolo { .. }
                     )
                 )
         })

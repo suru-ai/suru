@@ -19,7 +19,7 @@ use crate::protocol::{
 };
 
 use calendar::{MetricsRange, RangeBuckets};
-use chart::MetricsMeasure;
+use chart::{MetricsMeasure, SeriesId};
 
 pub(super) use view::render;
 
@@ -107,11 +107,45 @@ pub(super) struct MetricsView {
     /// The bucket whose figures the legend shows in place of the range's,
     /// by its place among the shown report's buckets.
     selected: Option<usize>,
+    /// The series the chart leaves out of its stacks, by which series they
+    /// are rather than where they stand, so they stay hidden through a
+    /// change of measure or a refresh. Only a new range or breakdown, whose
+    /// series are others, lets them go.
+    hidden: Vec<SeriesId>,
+    /// The row of one of the view's lists the keyboard acts on.
+    focused: Option<ListRow>,
     /// When the earliest timed Turn was, as the last report since opening
     /// said, from which All time begins.
     earliest: EarliestTurn,
     /// Where the last frame drew what a pointer can act on.
     targets: Cell<Targets>,
+}
+
+/// A row of one of the view's lists, by what it shows rather than where it
+/// stands, so a focus outlasts a change of measure or a refresh that moves
+/// it. ↑/↓ walk the rows of every list in the order they stand on screen,
+/// from the legend down; the legend is the only list yet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ListRow {
+    /// A legend row, by its series.
+    Series(SeriesId),
+}
+
+/// The focused row as the keys act on it: by its place among its list's
+/// rows, which is how the commands they invoke name it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FocusedRow {
+    /// The legend row at that place, counted from the first.
+    Series(usize),
+}
+
+/// Where a list focus moves to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FocusMove {
+    /// The row before, or the last where none is focused.
+    Previous,
+    /// The row after, or the first where none is focused.
+    Next,
 }
 
 /// What a read the view awaits asked for.
@@ -164,6 +198,9 @@ struct Targets {
     chart: Option<Rect>,
     /// The bars the chart drew, each a column of it a pointer selects by.
     bars: Option<BarStrip>,
+    /// The legend's series rows it drew, one series to a row, the first at
+    /// the top.
+    legend: Option<Rect>,
 }
 
 /// Where the last frame drew the chart's bars: `count` slots `slot` columns
@@ -200,6 +237,8 @@ pub(super) enum MetricsTarget {
     Chart {
         toward: Option<usize>,
     },
+    /// A legend row, by its series' place among them.
+    Series(usize),
 }
 
 /// Where a bucket selection moves to.
@@ -237,6 +276,8 @@ impl MetricsView {
         self.shown = None;
         self.refusal = None;
         self.selected = None;
+        self.hidden.clear();
+        self.focused = None;
         self.earliest = EarliestTurn::Unknown;
     }
 
@@ -280,6 +321,8 @@ impl MetricsView {
         self.shown = None;
         self.refusal = None;
         self.selected = None;
+        self.hidden.clear();
+        self.focused = None;
     }
 
     /// How many buckets a selection can move among: those of the report
@@ -319,6 +362,105 @@ impl MetricsView {
 
     pub(super) fn clear_selection(&mut self) {
         self.selected = None;
+    }
+
+    /// The series of the report shown, in the legend's order, none where
+    /// it holds nothing to draw.
+    fn series_ids(&self) -> Vec<SeriesId> {
+        match &self.shown {
+            Some((_, report)) if !chart::holds_nothing(report) => chart::series_ids(report),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Every row of the view's lists a focus can rest on, in the order they
+    /// stand on screen: those the last frame drew, so a focus always has its
+    /// row, or every one before any frame has drawn them.
+    fn list_rows(&self) -> Vec<ListRow> {
+        let drawn = self
+            .targets
+            .get()
+            .legend
+            .map_or(usize::MAX, |rows| usize::from(rows.height));
+        self.series_ids()
+            .into_iter()
+            .take(drawn)
+            .map(ListRow::Series)
+            .collect()
+    }
+
+    /// Moves the focus among the rows of the view's lists, which stops at
+    /// the first and last row. With no rows there is nothing to focus.
+    pub(super) fn move_focus(&mut self, to: FocusMove) {
+        let rows = self.list_rows();
+        let Some(last) = rows.len().checked_sub(1) else {
+            return;
+        };
+        let at = self
+            .focused
+            .as_ref()
+            .and_then(|focused| rows.iter().position(|row| row == focused));
+        let place = match (to, at) {
+            (FocusMove::Previous, Some(at)) => at.saturating_sub(1),
+            (FocusMove::Next, Some(at)) => (at + 1).min(last),
+            (FocusMove::Previous, None) => last,
+            (FocusMove::Next, None) => 0,
+        };
+        self.focused = rows.into_iter().nth(place);
+    }
+
+    pub(super) fn clear_focus(&mut self) {
+        self.focused = None;
+    }
+
+    /// The focused row, by its place in its list, where one is focused.
+    pub(super) fn focused_row(&self) -> Option<FocusedRow> {
+        match self.focused.as_ref()? {
+            ListRow::Series(id) => self
+                .series_ids()
+                .iter()
+                .position(|series| series == id)
+                .map(FocusedRow::Series),
+        }
+    }
+
+    /// Hides the `place`-th series in the legend from the chart, or shows it
+    /// again where it was hidden, focusing its row, as a click on it does. A
+    /// place past the last names none.
+    pub(super) fn toggle_series(&mut self, place: usize) {
+        let Some(id) = self.series_ids().into_iter().nth(place) else {
+            return;
+        };
+        self.focused = Some(ListRow::Series(id.clone()));
+        if let Some(at) = self.hidden.iter().position(|hidden| *hidden == id) {
+            self.hidden.remove(at);
+        } else {
+            self.hidden.push(id);
+        }
+    }
+
+    /// Shows the `place`-th series in the legend alone, hiding every other,
+    /// or, where it is already the only one shown, shows them all again,
+    /// focusing its row.
+    pub(super) fn solo_series(&mut self, place: usize) {
+        let ids = self.series_ids();
+        let Some(id) = ids.get(place) else {
+            return;
+        };
+        self.focused = Some(ListRow::Series(id.clone()));
+        let alone = ids
+            .iter()
+            .all(|other| (other == id) != self.is_hidden(other));
+        self.hidden = if alone {
+            Vec::new()
+        } else {
+            ids.iter().filter(|other| *other != id).cloned().collect()
+        };
+    }
+
+    /// Whether the chart leaves `series` out of its stacks.
+    pub(super) fn is_hidden(&self, series: &SeriesId) -> bool {
+        self.hidden.contains(series)
     }
 
     pub(super) fn breakdown(&self) -> UsageMetricsBreakdown {
@@ -507,6 +649,10 @@ impl MetricsView {
         self.update_targets(|targets| targets.bars = Some(bars));
     }
 
+    pub(super) fn record_legend_targets(&self, rows: Rect) {
+        self.update_targets(|targets| targets.legend = Some(rows));
+    }
+
     fn update_targets(&self, update: impl FnOnce(&mut Targets)) {
         let mut targets = self.targets.get();
         update(&mut targets);
@@ -552,6 +698,9 @@ impl MetricsView {
                     toward: Some(nearest),
                 }
             });
+        }
+        if let Some(rows) = targets.legend.filter(|rows| rows.contains(position)) {
+            return Some(MetricsTarget::Series(usize::from(position.y - rows.y)));
         }
         on(targets.chart).then_some(MetricsTarget::Chart { toward: None })
     }

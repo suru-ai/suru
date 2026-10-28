@@ -17,7 +17,7 @@ use crate::{
 
 use super::{
     super::slots::truncate_to_width,
-    BREAKDOWNS, MetricsContent, MetricsView, OfferedBreakdown, UsageMetricsReadRefusal,
+    BREAKDOWNS, FocusedRow, MetricsContent, MetricsView, OfferedBreakdown, UsageMetricsReadRefusal,
     calendar::{MetricsRange, RangeBuckets},
     chart::{self, MetricsMeasure, Series},
 };
@@ -139,6 +139,9 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 return;
             }
             let series = chart::series(report, measure, theme);
+            // Hiding a series changes only the chart: the legend's heading,
+            // figures, and shares stay those of every series, hidden or not,
+            // as the headline figures above it will.
             let across = Legend::of_range(&series, measure, range, &report.across_buckets.total);
             let selected = view
                 .selected_bucket()
@@ -151,11 +154,18 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
             let chart_rows = body.height.saturating_sub(legend_rows + 1).min(24);
             let chart_area = Rect::new(body.x, body.y, body.width, chart_rows);
             view.record_chart_target(chart_area);
+            // Hidden series drop out of the stacks, so the axis rises only as
+            // far as the series still shown reach.
+            let stacked: Vec<Series> = series
+                .iter()
+                .filter(|series| !view.is_hidden(&series.id))
+                .cloned()
+                .collect();
             if let Some(bars) = chart::render_chart(
                 buffer,
                 chart_area,
                 buckets,
-                &series,
+                &stacked,
                 measure,
                 view.selected_bucket(),
                 theme,
@@ -293,8 +303,8 @@ impl Legend {
 /// The legend's heading, then one row per series in the chart's order —
 /// ranked by Cost over the range whatever the measure or bucket, Other last —
 /// each its colour, label, figure, share of the legend's whole, and a bar
-/// proportional to the largest figure shown. Where the figures count more
-/// than the whole, a note under them says why.
+/// proportional to the largest figure shown, a hidden series' row dimmed.
+/// Where the figures count more than the whole, a note under them says why.
 fn render_legend(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -350,8 +360,25 @@ fn render_legend(
         else {
             break;
         };
-        let swatch = Style::default().fg(series.color);
+        // A hidden series keeps its row and figures, dimmed, so it can be
+        // found and shown again.
+        let dim = if view.is_hidden(&series.id) {
+            Modifier::DIM
+        } else {
+            Modifier::empty()
+        };
+        let swatch = Style::default().fg(series.color).add_modifier(dim);
         buffer.set_string(area.x, y, "█", swatch);
+        let focused = view.focused_row() == Some(FocusedRow::Series(row));
+        let text_style = if focused {
+            // Marked in the inset before the swatch, so no row moves.
+            if let Some(x) = area.x.checked_sub(1) {
+                buffer.set_string(x, y, "›", theme.selection.focused.add_modifier(dim));
+            }
+            theme.selection.focused
+        } else {
+            theme.text.primary
+        };
         // Padded by the columns it is drawn in, not its characters, so a
         // wide glyph in one label leaves the figures beside every row aligned.
         let label = truncate_to_width(&series.label, label_width);
@@ -360,7 +387,7 @@ fn render_legend(
             "{label}{padding}  {value:>value_width$}  {share:>4}",
             share = share(*figure, total),
         );
-        buffer.set_string(area.x + 2, y, &text, theme.text.primary);
+        buffer.set_string(area.x + 2, y, &text, text_style.add_modifier(dim));
         let bar = usize::try_from(u128::from(*figure) * bar_room as u128 / u128::from(largest))
             .unwrap_or(0);
         let bar = if *figure > 0 { bar.max(1) } else { 0 };
@@ -368,6 +395,12 @@ fn render_legend(
         if bar > 0 && bar_x < area.right() {
             buffer.set_string(bar_x, y, "█".repeat(bar), swatch);
         }
+    }
+    let drawn = u16::try_from(series.len())
+        .unwrap_or(u16::MAX)
+        .min(area.height - 1);
+    if drawn > 0 {
+        view.record_legend_targets(Rect::new(area.x, area.y + 1, area.width, drawn));
     }
     let note_y = u16::try_from(series.len() + 1)
         .ok()

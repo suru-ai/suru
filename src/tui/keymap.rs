@@ -13,7 +13,7 @@ use super::{
         descriptor,
     },
     connect_overlay::ConnectInputMode,
-    metrics::{MetricsTarget, calendar::MetricsRange, chart::MetricsMeasure},
+    metrics::{FocusedRow, MetricsTarget, calendar::MetricsRange, chart::MetricsMeasure},
     relay_overlay::RelayInputMode,
     settings_panel::PanelKeys,
     state::{CommandId, ScrollDirection},
@@ -278,9 +278,13 @@ pub(super) fn command_for_context_overlay_event(event: InputEvent) -> Option<Com
 
 /// The Usage Metrics view owns every key and click while it is open, since
 /// it covers the whole frame: ←/→ move a bucket selection and Home/End take
-/// it to either end, as a click on a bar or a drag across them does; Esc
-/// clears that selection, as a click on the chart away from its bars does,
-/// and with nothing selected Esc or a click on its ✕ closes it, `r` reads it
+/// it to either end, as a click on a bar or a drag across them does; ↑/↓
+/// focus a row of its lists, on which Space hides or shows a legend row's
+/// series and Shift+Space or `o` shows it alone, as a click on the row or a
+/// modified one does; Esc clears the bucket selection, as a click on the
+/// chart away from its bars does, then the focus, and with neither left Esc
+/// or a click on its ✕ closes it — the selection first, since it changes
+/// what the legend reads, where a focus only marks a row — `r` reads it
 /// again, `1`–`5` or a click in the range bar choose a range, `[`/`]` or the
 /// wheel over the chart step to the range before or after, `c`/`t`/`s` or a
 /// click on a measure choose what the chart plots and Tab the next, `b` splits
@@ -291,6 +295,7 @@ pub(super) fn command_for_context_overlay_event(event: InputEvent) -> Option<Com
 pub(super) fn command_for_metrics_view_event(
     event: InputEvent,
     bucket_selected: bool,
+    focused: Option<FocusedRow>,
     target_at: impl Fn(Position) -> Option<MetricsTarget>,
 ) -> Option<CommandId> {
     let command = match event {
@@ -299,9 +304,23 @@ pub(super) fn command_for_metrics_view_event(
                 (KeyCode::Esc, KeyModifiers::NONE) if bucket_selected => {
                     SemanticCommandId::MetricsBucketClear
                 }
+                (KeyCode::Esc, KeyModifiers::NONE) if focused.is_some() => {
+                    SemanticCommandId::MetricsFocusClear
+                }
                 (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::MetricsClose,
                 (KeyCode::Left, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketPrevious,
                 (KeyCode::Right, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketNext,
+                (KeyCode::Up, KeyModifiers::NONE) => SemanticCommandId::MetricsFocusPrevious,
+                (KeyCode::Down, KeyModifiers::NONE) => SemanticCommandId::MetricsFocusNext,
+                (KeyCode::Char(' '), KeyModifiers::NONE) => match focused? {
+                    FocusedRow::Series(series) => SemanticCommandId::MetricsSeriesToggle { series },
+                },
+                // Most terminals send Shift+Space as Space alone, so `o`, for
+                // "only", does the same wherever Shift+Space cannot.
+                (KeyCode::Char(' '), KeyModifiers::SHIFT)
+                | (KeyCode::Char('o'), KeyModifiers::NONE) => match focused? {
+                    FocusedRow::Series(series) => SemanticCommandId::MetricsSeriesSolo { series },
+                },
                 (KeyCode::Home, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketFirst,
                 (KeyCode::End, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketLast,
                 (KeyCode::Char('r'), KeyModifiers::NONE) => SemanticCommandId::MetricsRefresh,
@@ -347,6 +366,19 @@ pub(super) fn command_for_metrics_view_event(
                 }
                 (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Chart { .. }) => {
                     SemanticCommandId::MetricsBucketClear
+                }
+                // Any modifier will do, since terminals keep some for their
+                // own: many take a Shift-click to select text, and macOS
+                // Terminal makes a Ctrl-click a right one.
+                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Series(series))
+                    if mouse.modifiers.intersects(
+                        KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
+                    ) =>
+                {
+                    SemanticCommandId::MetricsSeriesSolo { series }
+                }
+                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Series(series)) => {
+                    SemanticCommandId::MetricsSeriesToggle { series }
                 }
                 // A drag scrubs: the selection follows the pointer along the
                 // bars, staying at the end it passed beyond either.

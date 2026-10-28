@@ -11,7 +11,7 @@ use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use jiff::{ToSpan, civil::date, tz::TimeZone};
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier};
 use suru::{
     managed_client::{ManagedEvent, RecoveryStatus},
     protocol::{
@@ -2448,7 +2448,8 @@ fn dragging_across_the_bars_moves_the_selection_with_the_pointer() {
     assert_eq!(
         command_for(&application, MouseEventKind::Down(MouseButton::Left), start),
         Some(CommandId::PressAt {
-            position: ratatui::layout::Position::new(start.0, start.1)
+            position: ratatui::layout::Position::new(start.0, start.1),
+            modifiers: KeyModifiers::NONE,
         })
     );
 
@@ -2659,4 +2660,483 @@ fn where_too_narrow_to_draw_every_bar_the_selection_stops_at_the_last_drawn() {
     key(&mut application, KeyCode::Home);
     key(&mut application, KeyCode::Right);
     assert_eq!(marks(&application).1, vec![1]);
+}
+
+/// The ticks up the y-axis, lowest first.
+fn ticks(application: &Application) -> Vec<String> {
+    let mut ticks: Vec<String> = screen(application)
+        .iter()
+        .filter_map(|row| {
+            let (label, _) = row.split_once(" ┤")?;
+            Some(label.trim().to_owned())
+        })
+        .collect();
+    ticks.reverse();
+    ticks
+}
+
+#[test]
+fn hiding_the_largest_series_rescales_the_axis_to_what_remains() {
+    assert_eq!(
+        SemanticCommandId::MetricsSeriesToggle { series: 0 }.as_str(),
+        "metrics.series.toggle"
+    );
+    let mut application = thirty_days_of_tokens();
+    assert_eq!(ticks(&application).last().map(String::as_str), Some("7M"));
+
+    // Without Opus, the busiest day holds Codex's 1M and Copilot's 250K,
+    // which the axis reaches in steps of 200K.
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsSeriesToggle { series: 0 },
+    );
+
+    let shown = screen(&application).join("\n");
+    eprintln!("{shown}");
+    assert_eq!(
+        ticks(&application).last().map(String::as_str),
+        Some("1.4M"),
+        "{shown}"
+    );
+    // The legend still reads the whole range.
+    row(&screen(&application), "Last 30 days · 109M tokens");
+    row(&screen(&application), "Claude Opus 5.5");
+
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsSeriesToggle { series: 0 },
+    );
+    assert_eq!(ticks(&application).last().map(String::as_str), Some("7M"));
+}
+
+/// Whether every drawn cell of the legend row naming `label` is dimmed, or
+/// none is.
+fn legend_row_dimmed(application: &Application, label: &str) -> Option<bool> {
+    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    let (_, y) = text_position(&buffer, label);
+    let dimmed: Vec<bool> = (0..WIDTH)
+        .map(|x| &buffer[(x, y)])
+        .filter(|cell| cell.symbol() != " ")
+        .map(|cell| cell.modifier.contains(Modifier::DIM))
+        .collect();
+    if dimmed.iter().all(|dim| *dim) {
+        Some(true)
+    } else if dimmed.iter().all(|dim| !*dim) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+#[test]
+fn a_hidden_series_legend_row_is_dimmed_and_keeps_its_figures() {
+    let mut application = thirty_days_of_tokens();
+    assert_eq!(
+        legend_row_dimmed(&application, "GPT-5.5 Codex"),
+        Some(false)
+    );
+
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsSeriesToggle { series: 1 },
+    );
+
+    assert_eq!(legend_row_dimmed(&application, "GPT-5.5 Codex"), Some(true));
+    assert_eq!(
+        legend_row_dimmed(&application, "Claude Opus 5.5"),
+        Some(false)
+    );
+    let rows = screen(&application);
+    let codex = row(&rows, "GPT-5.5 Codex");
+    assert!(codex.contains("15M") && codex.contains("14%"), "{codex}");
+}
+
+#[test]
+fn showing_one_series_alone_hides_every_other_and_again_restores_them_all() {
+    assert_eq!(
+        SemanticCommandId::MetricsSeriesSolo { series: 0 }.as_str(),
+        "metrics.series.solo"
+    );
+    let mut application = thirty_days_of_tokens();
+    let dimmed = |application: &Application| {
+        ["Claude Opus 5.5", "GPT-5.5 Codex", "copilot · GPT-5.5"]
+            .map(|label| legend_row_dimmed(application, label))
+    };
+    let solo_codex = |application: &mut Application| {
+        invoke(
+            application,
+            SemanticCommandId::MetricsSeriesSolo { series: 1 },
+        );
+    };
+
+    solo_codex(&mut application);
+    assert_eq!(dimmed(&application), [Some(true), Some(false), Some(true)]);
+    // Codex alone does 1M on its busiest days.
+    assert_eq!(ticks(&application).last().map(String::as_str), Some("1M"));
+
+    solo_codex(&mut application);
+    assert_eq!(dimmed(&application), [Some(false); 3]);
+    assert_eq!(ticks(&application).last().map(String::as_str), Some("7M"));
+
+    // Shown alone after being hidden, a series is shown, and only it.
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsSeriesToggle { series: 1 },
+    );
+    solo_codex(&mut application);
+    assert_eq!(dimmed(&application), [Some(true), Some(false), Some(true)]);
+}
+
+fn space(application: &mut Application, modifiers: KeyModifiers) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            modifiers,
+        )))
+        .expect("press Space")
+}
+
+/// The legend row the keyboard acts on, by its label.
+fn focused_row(application: &Application) -> Option<String> {
+    let rows = screen(application);
+    let focused: Vec<&String> = rows
+        .iter()
+        .filter(|row| row.trim_start().starts_with("›█"))
+        .collect();
+    assert!(focused.len() <= 1, "{rows:#?}");
+    focused.first().map(|row| {
+        row.trim_start()
+            .trim_start_matches("›█")
+            .split("  ")
+            .next()
+            .unwrap()
+            .trim()
+            .to_owned()
+    })
+}
+
+#[test]
+fn up_and_down_focus_a_legend_row_that_space_hides_and_shift_space_shows_alone() {
+    assert_eq!(
+        [
+            SemanticCommandId::MetricsFocusPrevious,
+            SemanticCommandId::MetricsFocusNext,
+        ]
+        .map(SemanticCommandId::as_str),
+        ["metrics.focus.previous", "metrics.focus.next"]
+    );
+    let mut application = thirty_days_of_tokens();
+    assert_eq!(focused_row(&application), None);
+    // With no row focused, Space has nothing to act on.
+    assert_eq!(
+        application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE
+        ))),
+        None
+    );
+
+    key(&mut application, KeyCode::Down);
+    assert_eq!(
+        focused_row(&application).as_deref(),
+        Some("Claude Opus 5.5")
+    );
+    space(&mut application, KeyModifiers::NONE);
+    assert_eq!(
+        legend_row_dimmed(&application, "Claude Opus 5.5"),
+        Some(true)
+    );
+    assert_eq!(ticks(&application).last().map(String::as_str), Some("1.4M"));
+    space(&mut application, KeyModifiers::NONE);
+    assert_eq!(
+        legend_row_dimmed(&application, "Claude Opus 5.5"),
+        Some(false)
+    );
+
+    // The focus stops at either end, and ↑ with none focused takes the last.
+    for _ in 0..5 {
+        key(&mut application, KeyCode::Down);
+    }
+    assert_eq!(
+        focused_row(&application).as_deref(),
+        Some("copilot · GPT-5.5")
+    );
+    key(&mut application, KeyCode::Up);
+    assert_eq!(focused_row(&application).as_deref(), Some("GPT-5.5 Codex"));
+    assert_eq!(
+        application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::SHIFT
+        ))),
+        Some(CommandId::InvokeSemantic(
+            SemanticCommandId::MetricsSeriesSolo { series: 1 }
+        ))
+    );
+    space(&mut application, KeyModifiers::SHIFT);
+    assert_eq!(ticks(&application).last().map(String::as_str), Some("1M"));
+    // `o`, for "only", does the same where a terminal sends Shift+Space as
+    // Space alone.
+    press(&mut application, 'o');
+    assert_eq!(ticks(&application).last().map(String::as_str), Some("7M"));
+
+    let mut from_the_end = thirty_days_of_tokens();
+    key(&mut from_the_end, KeyCode::Up);
+    assert_eq!(
+        focused_row(&from_the_end).as_deref(),
+        Some("copilot · GPT-5.5")
+    );
+    key(&mut from_the_end, KeyCode::Up);
+    key(&mut from_the_end, KeyCode::Up);
+    key(&mut from_the_end, KeyCode::Up);
+    assert_eq!(
+        focused_row(&from_the_end).as_deref(),
+        Some("Claude Opus 5.5")
+    );
+}
+
+#[test]
+fn esc_clears_the_selection_then_the_focus_and_then_closes() {
+    assert_eq!(
+        SemanticCommandId::MetricsFocusClear.as_str(),
+        "metrics.focus.clear"
+    );
+    let mut application = thirty_days_of_tokens();
+    let esc = InputEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    key(&mut application, KeyCode::End);
+    key(&mut application, KeyCode::Down);
+    space(&mut application, KeyModifiers::NONE);
+
+    assert_eq!(
+        application.command_for_terminal_input(esc.clone()),
+        Some(CommandId::InvokeSemantic(
+            SemanticCommandId::MetricsBucketClear
+        ))
+    );
+    key(&mut application, KeyCode::Esc);
+    assert!(legend_heading(&application).starts_with("Last 30 days"));
+    assert_eq!(
+        focused_row(&application).as_deref(),
+        Some("Claude Opus 5.5")
+    );
+
+    assert_eq!(
+        application.command_for_terminal_input(esc.clone()),
+        Some(CommandId::InvokeSemantic(
+            SemanticCommandId::MetricsFocusClear
+        ))
+    );
+    key(&mut application, KeyCode::Esc);
+    assert_eq!(focused_row(&application), None);
+    // Letting go of the focus shows nothing hidden again.
+    assert_eq!(
+        legend_row_dimmed(&application, "Claude Opus 5.5"),
+        Some(true)
+    );
+
+    assert_eq!(
+        application.command_for_terminal_input(esc),
+        Some(CommandId::InvokeSemantic(SemanticCommandId::MetricsClose))
+    );
+}
+
+fn click_with(
+    application: &mut Application,
+    (column, row): (u16, u16),
+    modifiers: KeyModifiers,
+) -> ApplicationTransition {
+    click_mouse(
+        application,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers,
+        },
+    )
+    .expect("click the pointer")
+}
+
+/// Where the legend row naming `label` stands: a column of its figures.
+fn legend_row_at(application: &Application, label: &str) -> (u16, u16) {
+    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    let (x, y) = text_position(&buffer, label);
+    (x + 2, y)
+}
+
+#[test]
+fn a_click_on_a_legend_row_hides_it_and_a_modified_click_shows_it_alone() {
+    let mut application = thirty_days_of_tokens();
+    let codex = legend_row_at(&application, "GPT-5.5 Codex");
+    press_at(&mut application, codex);
+
+    let mut by_keys = thirty_days_of_tokens();
+    key(&mut by_keys, KeyCode::Down);
+    key(&mut by_keys, KeyCode::Down);
+    space(&mut by_keys, KeyModifiers::NONE);
+    assert_eq!(screen(&application), screen(&by_keys));
+    let mut by_command = thirty_days_of_tokens();
+    invoke(
+        &mut by_command,
+        SemanticCommandId::MetricsSeriesToggle { series: 1 },
+    );
+    assert_eq!(screen(&application), screen(&by_command));
+    assert_eq!(legend_row_dimmed(&application, "GPT-5.5 Codex"), Some(true));
+
+    // The swatch, and the row's width beyond its figures, are the row's too.
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let (swatch, y) = text_position(&buffer, "GPT-5.5 Codex");
+    press_at(&mut application, (swatch - 2, y));
+    assert_eq!(
+        legend_row_dimmed(&application, "GPT-5.5 Codex"),
+        Some(false)
+    );
+
+    // Shift is often kept by the terminal for its own selection, so Ctrl or
+    // Alt held over a click shows the series alone as well.
+    for modifiers in [
+        KeyModifiers::SHIFT,
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+    ] {
+        let mut application = thirty_days_of_tokens();
+        let codex = legend_row_at(&application, "GPT-5.5 Codex");
+        click_with(&mut application, codex, modifiers);
+        let mut by_keys = thirty_days_of_tokens();
+        key(&mut by_keys, KeyCode::Down);
+        key(&mut by_keys, KeyCode::Down);
+        space(&mut by_keys, KeyModifiers::SHIFT);
+        assert_eq!(screen(&application), screen(&by_keys), "{modifiers:?}");
+        assert_eq!(ticks(&application).last().map(String::as_str), Some("1M"));
+        click_with(&mut application, codex, modifiers);
+        assert_eq!(ticks(&application).last().map(String::as_str), Some("7M"));
+    }
+
+    // Under the legend's last row, nothing stands to hide.
+    let mut application = thirty_days_of_tokens();
+    let (column, y) = legend_row_at(&application, "copilot · GPT-5.5");
+    press_at(&mut application, (column, y + 1));
+    assert_eq!(focused_row(&application), None);
+}
+
+/// [`report`] with Opus a hundredth as busy, so it ranks last.
+fn opus_falls_behind(query: &UsageMetricsQuery) -> UsageMetricsReport {
+    let mut answered = report(query);
+    for bucket in &mut answered.buckets {
+        for keyed in &mut bucket.by_key {
+            if keyed.key == opus() {
+                keyed.aggregate.fresh_input_tokens = keyed
+                    .aggregate
+                    .fresh_input_tokens
+                    .map(|tokens| tokens / 100);
+            }
+        }
+    }
+    take_together(&mut answered);
+    answered
+}
+
+#[test]
+fn a_hidden_series_stays_hidden_through_a_measure_and_a_refresh_but_not_a_new_range_or_breakdown() {
+    let mut application = thirty_days_of_tokens();
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsSeriesToggle { series: 0 },
+    );
+
+    key(&mut application, KeyCode::Tab);
+    assert_eq!(
+        legend_row_dimmed(&application, "Claude Opus 5.5"),
+        Some(true)
+    );
+    show_tokens(&mut application);
+
+    // Refreshed, Opus ranks last, and it is Opus that stays hidden.
+    let (_, request_id, query) = expect_read(press(&mut application, 'r'));
+    answer(&mut application, request_id, Ok(opus_falls_behind(&query)));
+    let rows = screen(&application);
+    assert!(
+        rendered_row(&rows, "Claude Opus 5.5") > rendered_row(&rows, "copilot · GPT-5.5"),
+        "{rows:#?}"
+    );
+    assert_eq!(
+        legend_row_dimmed(&application, "Claude Opus 5.5"),
+        Some(true)
+    );
+    assert_eq!(
+        legend_row_dimmed(&application, "GPT-5.5 Codex"),
+        Some(false)
+    );
+    assert_eq!(
+        focused_row(&application).as_deref(),
+        Some("Claude Opus 5.5")
+    );
+
+    let (_, request_id, query) = expect_read(press(&mut application, '2'));
+    answer(&mut application, request_id, Ok(report(&query)));
+    assert_eq!(
+        legend_row_dimmed(&application, "Claude Opus 5.5"),
+        Some(false)
+    );
+    assert_eq!(focused_row(&application), None);
+
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsSeriesToggle { series: 0 },
+    );
+    let (_, request_id, query) = expect_read(press(&mut application, 'b'));
+    answer(&mut application, request_id, Ok(report(&query)));
+    assert_eq!(
+        legend_row_dimmed(&application, "Claude Opus 5.5"),
+        Some(false)
+    );
+}
+
+#[test]
+fn other_is_a_series_to_hide_or_show_alone() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    ask(&mut application);
+    expect_read(press(&mut application, 'b'));
+    let (_, request_id, query) = expect_read(press(&mut application, 'b'));
+    answer(&mut application, request_id, Ok(many_workspaces(&query, 9)));
+    show_tokens(&mut application);
+
+    key(&mut application, KeyCode::Up);
+    assert_eq!(focused_row(&application).as_deref(), Some("Other"));
+    press(&mut application, 'o');
+
+    // Other's three do 900K a day between them.
+    assert_eq!(ticks(&application).last().map(String::as_str), Some("900K"));
+    assert_eq!(legend_row_dimmed(&application, "Other"), Some(false));
+    for index in 0..6 {
+        assert_eq!(
+            legend_row_dimmed(&application, &format!("workspace-{index}")),
+            Some(true)
+        );
+    }
+    space(&mut application, KeyModifiers::NONE);
+    assert_eq!(legend_row_dimmed(&application, "Other"), Some(true));
+}
+
+#[test]
+fn where_too_short_to_list_every_series_the_focus_stops_at_the_last_drawn() {
+    const SHORT: u16 = 9;
+    let mut application = thirty_days_of_tokens();
+    let rows = rendered_application_rows_at(&application, WIDTH, SHORT);
+    assert!(
+        rows.iter().any(|row| row.contains("Claude Opus 5.5"))
+            && !rows.iter().any(|row| row.contains("GPT-5.5 Codex")),
+        "{rows:#?}"
+    );
+
+    key(&mut application, KeyCode::Up);
+    key(&mut application, KeyCode::Down);
+    assert_eq!(
+        application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE
+        ))),
+        Some(CommandId::InvokeSemantic(
+            SemanticCommandId::MetricsSeriesToggle { series: 0 }
+        ))
+    );
 }

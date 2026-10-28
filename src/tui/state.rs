@@ -75,7 +75,7 @@ use super::{
         command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
     },
     metrics::{
-        BucketMove, MetricsView, OfferedBreakdown, Receipt as MetricsReceipt,
+        BucketMove, FocusMove, MetricsView, OfferedBreakdown, Receipt as MetricsReceipt,
         UsageMetricsReadRefusal, calendar::MetricsRange, chart::MetricsMeasure,
     },
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
@@ -579,6 +579,9 @@ struct LandingLocation {
 pub struct TuiState {
     hyperlinks: bool,
     left_press: Option<LeftPress>,
+    /// The modifiers held over the click being resolved, for as long as it
+    /// is, and none otherwise.
+    click_modifiers: KeyModifiers,
     last_click: Option<LastClick>,
     click_interval: Duration,
     pub(super) text_selection: Cell<Option<TextSelection>>,
@@ -1027,6 +1030,7 @@ impl TuiState {
         Self {
             hyperlinks: false,
             left_press: None,
+            click_modifiers: KeyModifiers::NONE,
             last_click: None,
             click_interval: CLICK_INTERVAL,
             text_selection: Cell::new(None),
@@ -4988,6 +4992,9 @@ impl LastClick {
 #[derive(Clone, Debug)]
 struct LeftPress {
     position: Position,
+    /// The modifiers held as it was pressed, which a surface may read a
+    /// click differently by.
+    modifiers: KeyModifiers,
     pointer: Position,
     dragged: bool,
     outside_overlay: bool,
@@ -5455,6 +5462,7 @@ pub enum CommandId {
     /// Begins a left-button gesture without acting on the surface beneath it.
     PressAt {
         position: Position,
+        modifiers: KeyModifiers,
     },
     ReleaseAt {
         position: Position,
@@ -7325,7 +7333,10 @@ impl Application {
                 self.state.wheel_at(position, direction);
                 Ok(ApplicationTransition::Continue)
             }
-            CommandId::PressAt { position } => {
+            CommandId::PressAt {
+                position,
+                modifiers,
+            } => {
                 // The edge is a pointer surface only in the plain
                 // Sidebar-beside-main state. Check it before any row,
                 // composer, or Text Selection can claim the press; overlays
@@ -7390,6 +7401,7 @@ impl Application {
                     });
                 self.state.left_press = Some(LeftPress {
                     position,
+                    modifiers,
                     pointer: position,
                     dragged: false,
                     outside_overlay: self
@@ -7440,10 +7452,7 @@ impl Application {
                     .is_some_and(|press| press.outside_overlay)
                 {
                     let press = self.state.left_press.take().expect("outside press exists");
-                    return self.invoke_semantic(SemanticInvocation {
-                        id: SemanticCommandId::PointerClick,
-                        subject: SemanticSubject::ScreenPosition(press.position),
-                    });
+                    return self.click(press.position, press.modifiers);
                 }
                 if self
                     .state
@@ -7467,10 +7476,7 @@ impl Application {
                 };
                 let mut transition = ApplicationTransition::Continue;
                 if !press.dragged && press.position == position {
-                    transition = self.invoke_semantic(SemanticInvocation {
-                        id: SemanticCommandId::PointerClick,
-                        subject: SemanticSubject::ScreenPosition(position),
-                    })?;
+                    transition = self.click(position, press.modifiers)?;
                 }
                 // A press that marked a word or Line made a selection the way a drag
                 // does, so its release copies the way a drag's does; the copy
@@ -9617,6 +9623,16 @@ impl Application {
         ApplicationTransition::Continue
     }
 
+    /// Moves the open Usage Metrics view's focus among the rows of its
+    /// lists, which reads nothing.
+    fn move_metrics_focus(&mut self, to: FocusMove) -> ApplicationTransition {
+        let view = &mut self.state.metrics_view;
+        if view.is_open() {
+            view.move_focus(to);
+        }
+        ApplicationTransition::Continue
+    }
+
     /// Asks the Server the Outlook is turned toward for the Usage Metrics
     /// view's buckets, cut by the reader's calendar now.
     fn read_usage_metrics(&mut self) -> ApplicationTransition {
@@ -10293,8 +10309,25 @@ impl Application {
         }
     }
 
+    /// Clicks at `position` with `modifiers` held, which the surface that
+    /// resolves the click may read it differently by.
+    fn click(
+        &mut self,
+        position: Position,
+        modifiers: KeyModifiers,
+    ) -> Result<ApplicationTransition> {
+        self.state.click_modifiers = modifiers;
+        let transition = self.invoke_semantic(SemanticInvocation {
+            id: SemanticCommandId::PointerClick,
+            subject: SemanticSubject::ScreenPosition(position),
+        });
+        self.state.click_modifiers = KeyModifiers::NONE;
+        transition
+    }
+
     /// Resolves a pointer gesture at `position` through the same mode table
-    /// as other input, so the surface that owns the pointer acts on it.
+    /// as other input, so the surface that owns the pointer acts on it, with
+    /// whatever modifiers were held over a click.
     fn resolve_pointer(
         &mut self,
         kind: MouseEventKind,
@@ -10304,7 +10337,7 @@ impl Application {
             kind,
             column: position.x,
             row: position.y,
-            modifiers: KeyModifiers::NONE,
+            modifiers: self.state.click_modifiers,
         });
         self.command_for_input_mode(event)
             .map_or(Ok(ApplicationTransition::Continue), |command| {
@@ -11532,6 +11565,28 @@ impl Application {
                 self.state.metrics_view.clear_selection();
                 Ok(ApplicationTransition::Continue)
             }
+            // Hiding a series changes only what the chart draws, so it reads
+            // nothing: the report shown holds every series' figures.
+            SemanticCommandId::MetricsSeriesToggle { series } => {
+                if self.state.metrics_view.is_open() {
+                    self.state.metrics_view.toggle_series(series);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::MetricsFocusPrevious => {
+                Ok(self.move_metrics_focus(FocusMove::Previous))
+            }
+            SemanticCommandId::MetricsFocusNext => Ok(self.move_metrics_focus(FocusMove::Next)),
+            SemanticCommandId::MetricsFocusClear => {
+                self.state.metrics_view.clear_focus();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::MetricsSeriesSolo { series } => {
+                if self.state.metrics_view.is_open() {
+                    self.state.metrics_view.solo_series(series);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,
             // so on the Landing there is nothing to set aside and the view
@@ -12628,7 +12683,10 @@ impl Application {
             let position = Position::new(mouse.column, mouse.row);
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    return Some(CommandId::PressAt { position });
+                    return Some(CommandId::PressAt {
+                        position,
+                        modifiers: mouse.modifiers,
+                    });
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
                     return Some(CommandId::DragAt { position });
@@ -12672,6 +12730,7 @@ impl Application {
                     return command_for_metrics_view_event(
                         event,
                         view.selected_bucket().is_some(),
+                        view.focused_row(),
                         |position| view.target_at(position),
                     );
                 }
