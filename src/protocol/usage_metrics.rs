@@ -128,8 +128,8 @@ pub struct UsageMetricsReport {
     pub top_sessions: Vec<UsageMetricsSession>,
 }
 
-/// A top-level Session among those whose work cost the most across a
-/// report's buckets, a Subsession among them. Its Cost is what its own Turns
+/// One of the top-level Sessions whose work cost the most across a report's
+/// buckets; a Sidekick's Subsession can be one. Its Cost is what its own Turns
 /// and those of the Subagents beneath it contribute there, Cost Coverage
 /// overlaps removed (ADR 0054), however much it cost outside them; a
 /// Subsession's is its own, apart from the Sidekick whose tree Cost rolls it

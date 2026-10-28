@@ -16,8 +16,8 @@ use ratatui::layout::{Position, Rect};
 use uuid::Uuid;
 
 use crate::protocol::{
-    SessionId, SessionTimestamp, UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsQuery,
-    UsageMetricsReport,
+    Outlook, SessionId, SessionReference, SessionTimestamp, UsageMetricsBreakdown,
+    UsageMetricsInterval, UsageMetricsQuery, UsageMetricsReport,
 };
 
 use calendar::{MetricsRange, RangeBuckets};
@@ -25,9 +25,8 @@ use chart::{MetricsMeasure, SeriesId};
 
 pub(super) use view::render;
 
-/// How many of the Sessions that cost the most the view asks for: as many
-/// as its list has room for beneath a legend of every series in a frame of
-/// common height, the list drawing fewer where it has less.
+/// How many of the Sessions that cost the most the view asks for: five,
+/// which the list draws fewer of where it has less room.
 const TOP_SESSIONS: usize = 5;
 
 /// Every breakdown, in the order the view offers them.
@@ -105,10 +104,13 @@ pub(super) struct MetricsView {
     range: MetricsRange,
     measure: MetricsMeasure,
     breakdown: UsageMetricsBreakdown,
-    /// The read the view awaits, and what it asked for.
-    asked: Option<(Uuid, Asked)>,
-    /// The last report read, with the buckets it answers.
-    shown: Option<(RangeBuckets, UsageMetricsReport)>,
+    /// The read the view awaits, the Outlook it asked, and what it asked for.
+    asked: Option<(Uuid, Outlook, Asked)>,
+    /// The last report read, with the Outlook it was read from and the
+    /// buckets it answers.
+    shown: Option<(Outlook, RangeBuckets, UsageMetricsReport)>,
+    /// Why the last Session the view was asked to open was not opened.
+    unopened: Option<String>,
     /// Why the last read gave no report.
     refusal: Option<UsageMetricsReadRefusal>,
     /// The bucket whose figures the legend shows in place of the range's,
@@ -292,6 +294,7 @@ impl MetricsView {
         self.open = true;
         self.asked = None;
         self.shown = None;
+        self.unopened = None;
         self.refusal = None;
         self.selected = None;
         self.hidden.clear();
@@ -337,6 +340,7 @@ impl MetricsView {
     fn forget_figures(&mut self) {
         self.asked = None;
         self.shown = None;
+        self.unopened = None;
         self.refusal = None;
         self.selected = None;
         self.hidden.clear();
@@ -349,7 +353,7 @@ impl MetricsView {
     /// any frame has drawn the report's bars, all of them count.
     fn selectable(&self) -> usize {
         let buckets = match &self.shown {
-            Some((buckets, report)) if !chart::holds_nothing(report) => buckets.buckets.len(),
+            Some((_, buckets, report)) if !chart::holds_nothing(report) => buckets.buckets.len(),
             _ => return 0,
         };
         self.targets
@@ -386,7 +390,7 @@ impl MetricsView {
     /// it holds nothing to draw.
     fn series_ids(&self) -> Vec<SeriesId> {
         match &self.shown {
-            Some((_, report)) if !chart::holds_nothing(report) => chart::series_ids(report),
+            Some((_, _, report)) if !chart::holds_nothing(report) => chart::series_ids(report),
             _ => Vec::new(),
         }
     }
@@ -395,7 +399,7 @@ impl MetricsView {
     /// order, none where it holds nothing to draw.
     fn top_session_ids(&self) -> Vec<SessionId> {
         match &self.shown {
-            Some((_, report)) if !chart::holds_nothing(report) => report
+            Some((_, _, report)) if !chart::holds_nothing(report) => report
                 .top_sessions
                 .iter()
                 .map(|session| session.session_id)
@@ -464,9 +468,23 @@ impl MetricsView {
     }
 
     /// The `place`-th of the Sessions the view lists as costing the most,
-    /// where it lists that many.
-    pub(super) fn top_session(&self, place: usize) -> Option<SessionId> {
-        self.top_session_ids().get(place).copied()
+    /// on the Server the report naming it was read from, where it lists
+    /// that many.
+    pub(super) fn top_session(&self, place: usize) -> Option<SessionReference> {
+        let (origin, _, _) = self.shown.as_ref()?;
+        let session_id = *self.top_session_ids().get(place)?;
+        Some(SessionReference::new(origin.clone(), session_id))
+    }
+
+    /// Says why a listed Session was not opened, above the figures.
+    pub(super) fn refuse_opening(&mut self, reason: String) {
+        self.unopened = Some(reason);
+    }
+
+    /// Why the last Session the view was asked to open was not opened,
+    /// until it reads again.
+    pub(super) fn unopened_because(&self) -> Option<&str> {
+        self.unopened.as_deref()
     }
 
     /// Hides the `place`-th series in the legend from the chart, or shows it
@@ -510,7 +528,8 @@ impl MetricsView {
         self.breakdown
     }
 
-    /// The query for the view's range at `now` in `zone`, compared with the
+    /// The query `origin` is asked for the view's range at `now` in `zone`,
+    /// compared with the
     /// period before it as the calendar cuts that, which the view now awaits
     /// the answer to under the request it answers with. A report
     /// already shown stays until the answer replaces it. A moment the
@@ -522,12 +541,13 @@ impl MetricsView {
     /// [`Self::receive`] has the view read again.
     pub(super) fn ask(
         &mut self,
+        origin: Outlook,
         now: SessionTimestamp,
         zone: &TimeZone,
     ) -> Option<(Uuid, UsageMetricsQuery)> {
         let earliest = match self.earliest {
             EarliestTurn::Unknown if self.range == MetricsRange::AllTime => {
-                return Some(self.await_answer(Asked::EarliestTurn, Vec::new(), None));
+                return Some(self.await_answer(origin, Asked::EarliestTurn, Vec::new(), None));
             }
             EarliestTurn::At(earliest) => Some(earliest),
             EarliestTurn::Unknown | EarliestTurn::Untimed => None,
@@ -544,11 +564,12 @@ impl MetricsView {
             .map(|bucket| bucket.interval)
             .collect();
         let comparison = buckets.comparison;
-        Some(self.await_answer(Asked::Range(buckets), intervals, comparison))
+        Some(self.await_answer(origin, Asked::Range(buckets), intervals, comparison))
     }
 
     fn await_answer(
         &mut self,
+        origin: Outlook,
         asked: Asked,
         buckets: Vec<UsageMetricsInterval>,
         comparison: Option<UsageMetricsInterval>,
@@ -560,8 +581,9 @@ impl MetricsView {
             comparison,
             top_sessions: TOP_SESSIONS,
         };
-        self.asked = Some((request_id, asked));
+        self.asked = Some((request_id, origin, asked));
         self.refusal = None;
+        self.unopened = None;
         (request_id, query)
     }
 
@@ -577,11 +599,11 @@ impl MetricsView {
         if !self
             .asked
             .as_ref()
-            .is_some_and(|(asked, _)| *asked == request_id)
+            .is_some_and(|(asked, _, _)| *asked == request_id)
         {
             return Receipt::Settled;
         }
-        let (_, asked) = self.asked.take().expect("the awaited read");
+        let (_, origin, asked) = self.asked.take().expect("the awaited read");
         let report = match result {
             Ok(report) => report,
             Err(refusal) => {
@@ -612,15 +634,15 @@ impl MetricsView {
         let chosen = self
             .selected
             .zip(self.shown.as_ref())
-            .and_then(|(selected, (shown, _))| shown.buckets.get(selected))
+            .and_then(|(selected, (_, shown, _))| shown.buckets.get(selected))
             .map(|bucket| bucket.interval.start);
-        self.shown = Some((buckets, report));
+        self.shown = Some((origin, buckets, report));
         self.refusal = None;
         let selectable = self.selectable();
         self.selected = chosen.and_then(|start| {
             self.shown
                 .as_ref()?
-                .0
+                .1
                 .buckets
                 .iter()
                 .position(|bucket| bucket.interval.start == start)
@@ -662,7 +684,7 @@ impl MetricsView {
 
     pub(super) fn content(&self) -> MetricsContent<'_> {
         match (&self.shown, &self.refusal) {
-            (Some((buckets, report)), _) => MetricsContent::Report { buckets, report },
+            (Some((_, buckets, report)), _) => MetricsContent::Report { buckets, report },
             (None, Some(refusal)) => MetricsContent::Refused(refusal),
             (None, None) => MetricsContent::Reading,
         }

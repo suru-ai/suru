@@ -1929,12 +1929,11 @@ impl Sidebar {
     /// that the reader is done choosing, and the composer takes the keys back.
     /// An unreachable Remote row retries that Origin immediately and remains
     /// until a fresh snapshot arrives.
-    pub(super) fn activate(
-        &mut self,
-        open: Option<&SessionReference>,
-        retry_open: bool,
-    ) -> SidebarActivation {
-        let activation = self.act_on_focus(open, retry_open);
+    ///
+    /// `settled` is the Session already open that opening again would only
+    /// uncover, none where an attach would retry it.
+    pub(super) fn activate(&mut self, settled: Option<&SessionReference>) -> SidebarActivation {
+        let activation = self.act_on_focus(settled);
         self.release_borrowed_focus();
         activation
     }
@@ -1942,11 +1941,7 @@ impl Sidebar {
     /// What acting on the entry row focus stands over comes to, which is the
     /// whole of [`Self::activate`] but the borrowed-focus bookkeeping around
     /// it.
-    fn act_on_focus(
-        &mut self,
-        open: Option<&SessionReference>,
-        retry_open: bool,
-    ) -> SidebarActivation {
+    fn act_on_focus(&mut self, settled: Option<&SessionReference>) -> SidebarActivation {
         let Some(focus) = self.focus.clone() else {
             return SidebarActivation::Answered;
         };
@@ -1985,7 +1980,7 @@ impl Sidebar {
         if !self.is_readable(&wanted) {
             return SidebarActivation::Answered;
         }
-        if open == Some(&wanted) && !retry_open {
+        if settled == Some(&wanted) {
             self.hand_back_keys();
             return SidebarActivation::Answered;
         }
@@ -3083,7 +3078,7 @@ mod tests {
         sidebar.focus_on(SidebarTarget::Session(reference.clone()));
         assert!(
             matches!(
-                sidebar.activate(None, false),
+                sidebar.activate(None),
                 SidebarActivation::Attach { session, .. } if session == reference
             ),
             "row activation carries the same Origin"
@@ -3343,7 +3338,7 @@ mod tests {
         );
 
         assert_eq!(
-            sidebar.activate(Some(&reference), false),
+            sidebar.activate(Some(&reference)),
             SidebarActivation::Answered
         );
         assert!(
@@ -3507,7 +3502,7 @@ mod tests {
         assert_eq!(focused(&sidebar), None);
 
         assert_eq!(
-            sidebar.activate(None, false),
+            sidebar.activate(None),
             SidebarActivation::Answered,
             "asking for more of the shelf attaches nothing"
         );
@@ -3519,7 +3514,7 @@ mod tests {
         );
         assert_eq!(revealed[36], "Show 5 more");
 
-        let _ = sidebar.activate(None, false);
+        let _ = sidebar.activate(None);
 
         assert_eq!(
             drawn(&sidebar).len(),
@@ -3610,7 +3605,7 @@ mod tests {
         let mut sidebar = showing(set_aside_shelf(12));
         // Up off the selector wraps to the affordance at the shelf's foot.
         sidebar.focus_previous();
-        let _ = sidebar.activate(None, false);
+        let _ = sidebar.activate(None);
         assert_eq!(drawn(&sidebar).len(), 13, "the whole shelf is on show");
 
         sidebar.toggle(None);
@@ -3908,7 +3903,7 @@ mod tests {
             sidebar.press_at(Position::new(4, 4)),
             SidebarPress::Invoke(_)
         ));
-        let _ = sidebar.activate(None, false);
+        let _ = sidebar.activate(None);
 
         assert_eq!(
             drawn_opening_on(&sidebar, 5, &pressed),
@@ -4105,7 +4100,7 @@ mod tests {
                 .collect(),
         );
         // Opening with no Session open starts the keys on the selector.
-        let _ = sidebar.activate(None, false);
+        let _ = sidebar.activate(None);
         let entries = drawn(&sidebar);
         assert_eq!(
             entries.len(),

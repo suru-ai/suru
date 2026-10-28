@@ -3910,3 +3910,39 @@ fn where_too_short_to_list_every_session_the_list_and_its_focus_stop_at_the_last
         ))
     );
 }
+
+#[test]
+fn a_session_read_from_a_server_the_outlook_has_turned_from_is_not_opened() {
+    let (mut application, _) = thirty_days_of_top_sessions(
+        application_looking_at_studio()
+            .with_session_clock(afternoon)
+            .with_time_zone(zone(NEW_YORK)),
+    );
+    // Removing the Remote turns the Outlook home beneath the view.
+    application
+        .handle_event(ApplicationEvent::RemoteRemoved {
+            name: "studio".to_owned(),
+            result: Ok(suru::protocol::RemoteRemoval {
+                name: "studio".to_owned(),
+                acknowledged: true,
+            }),
+        })
+        .expect("remove the Remote");
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let (x, y) = text_position(&buffer, "Fix Windows path fixtures");
+
+    assert_eq!(
+        press_at(&mut application, (x, y)),
+        ApplicationTransition::Continue,
+        "nothing is asked of this machine for studio's Session"
+    );
+    let rows = screen(&application);
+    assert!(rows[0].starts_with(" Metrics"), "the view stays open");
+    row(&rows, "Not opened: the Session is on studio");
+
+    // Reading again lets the note go.
+    let (origin, request_id, query) = expect_read(press(&mut application, 'r'));
+    assert_eq!(origin, Outlook::Local);
+    answer(&mut application, request_id, Ok(with_top_sessions(&query)));
+    assert!(!screen(&application).join("\n").contains("Not opened"));
+}

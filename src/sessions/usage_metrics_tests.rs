@@ -1557,3 +1557,75 @@ async fn a_top_session_s_model_is_the_one_its_work_cost_most_under_else_used_mos
     );
     writer.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn top_sessions_that_cost_alike_stand_in_the_order_of_their_identities() {
+    let directory = tempfile::tempdir().unwrap();
+    let sessions: Vec<PersistedSession> = (0..4)
+        .map(|at| {
+            titled(
+                directory.path(),
+                &format!("{at}"),
+                vec![turn_scoped(OPUS, 11 + at, 0.10)],
+            )
+        })
+        .collect();
+    let mut identities: Vec<SessionId> = sessions
+        .iter()
+        .map(|session| session.snapshot.session.id)
+        .collect();
+    identities.sort_by_key(|id| id.as_uuid());
+    let (store, writer) = restore(directory.path(), sessions).await;
+
+    for limit in [4, 2] {
+        let named: Vec<SessionId> = read(&store, &top(&[(10, 20)], limit))
+            .top_sessions
+            .iter()
+            .map(|session| session.session_id)
+            .collect();
+        assert_eq!(named, identities[..limit], "the first {limit} of a tie");
+    }
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_top_session_s_workspace_is_told_apart_whatever_the_breakdown() {
+    let directory = tempfile::tempdir().unwrap();
+    let mine = directory.path().join("mine").join("suru");
+    let theirs = directory.path().join("theirs").join("suru");
+    let records = vec![
+        titled(&mine, "Mine", vec![turn_scoped(OPUS, 11, 0.20)]),
+        titled(&theirs, "Theirs", vec![turn_scoped(CODEX, 12, 0.10)]),
+    ];
+    let (store, writer) = restore(directory.path(), records).await;
+
+    let paths = WorkspacePaths::default();
+    let report = read(
+        &store,
+        &UsageMetricsQuery {
+            breakdown: UsageMetricsBreakdown::Provider,
+            ..top(&[(10, 20)], 5)
+        },
+    );
+
+    assert_eq!(
+        report
+            .top_sessions
+            .iter()
+            .map(|session| (session.title.as_str(), session.workspace.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Mine", paths.label(&mine)),
+            ("Theirs", paths.label(&theirs))
+        ],
+        "two Workspaces of one name, by where each is, as a Workspace key is"
+    );
+    assert!(
+        report
+            .keys
+            .iter()
+            .all(|label| matches!(label.key, UsageMetricsKey::Provider { .. })),
+        "naming the Sessions' Workspaces adds no Workspace key"
+    );
+    writer.shutdown().await.unwrap();
+}

@@ -3912,6 +3912,15 @@ impl TuiState {
         self.opening_error.is_some()
     }
 
+    /// The Session already open, where opening it again would only uncover
+    /// it rather than retry a failed attach: what every list that opens a
+    /// Session leaves be.
+    fn settled_open_session(&self) -> Option<&SessionReference> {
+        self.route
+            .as_ref()
+            .filter(|_| !self.open_session_can_retry())
+    }
+
     /// Whether the Session the main view has open is still on its way: the
     /// reader has been carried into it and its snapshot has not landed. This
     /// is what every act needing a Session — delivering a Prompt, choosing an
@@ -8749,49 +8758,46 @@ impl Application {
             SemanticCommandId::SidebarNext => self.state.sidebar.focus_next(),
             SemanticCommandId::SidebarLeave => self.state.sidebar.leave(),
             SemanticCommandId::SidebarAttach => {
-                let open = self.state.route.clone();
-                let retry_open = self.state.open_session_can_retry();
-                return Ok(
-                    match self.state.sidebar.activate(open.as_ref(), retry_open) {
-                        SidebarActivation::Answered => ApplicationTransition::Continue,
-                        SidebarActivation::ListEverywhereRemotes => {
-                            ApplicationTransition::ListEverywhereRemotes(
-                                self.state
-                                    .sidebar
-                                    .take_everywhere_remote_request()
-                                    .expect("choosing Everywhere queues its Remote discovery"),
-                            )
+                let settled = self.state.settled_open_session().cloned();
+                return Ok(match self.state.sidebar.activate(settled.as_ref()) {
+                    SidebarActivation::Answered => ApplicationTransition::Continue,
+                    SidebarActivation::ListEverywhereRemotes => {
+                        ApplicationTransition::ListEverywhereRemotes(
+                            self.state
+                                .sidebar
+                                .take_everywhere_remote_request()
+                                .expect("choosing Everywhere queues its Remote discovery"),
+                        )
+                    }
+                    SidebarActivation::CatalogOriginsChanged => {
+                        ApplicationTransition::ReconcileCatalogOrigins {
+                            catalog_origins: self.state.catalog_origins(),
+                            requests: Vec::new(),
                         }
-                        SidebarActivation::CatalogOriginsChanged => {
-                            ApplicationTransition::ReconcileCatalogOrigins {
+                    }
+                    // The `[unreachable]` row's offer is the banner's, on the
+                    // same terms: a login where one is needed, else a retry.
+                    SidebarActivation::RetryOrigin(outlook) => self.retry_origin(outlook),
+                    // Enter and a press both arrive here, so both open the
+                    // Session the same way: the route moves now and the
+                    // attach follows it.
+                    SidebarActivation::Attach { session, context } => {
+                        if session.origin == self.state.outlook {
+                            self.state.open_session_route(session.clone());
+                            ApplicationTransition::ViewAndAttachSession(session)
+                        } else {
+                            self.state
+                                .turn_outlook_for_session(session.clone(), *context);
+                            ApplicationTransition::TurnOutlookAndViewAndAttach {
                                 catalog_origins: self.state.catalog_origins(),
-                                requests: Vec::new(),
+                                session,
                             }
                         }
-                        // The `[unreachable]` row's offer is the banner's, on the
-                        // same terms: a login where one is needed, else a retry.
-                        SidebarActivation::RetryOrigin(outlook) => self.retry_origin(outlook),
-                        // Enter and a press both arrive here, so both open the
-                        // Session the same way: the route moves now and the
-                        // attach follows it.
-                        SidebarActivation::Attach { session, context } => {
-                            if session.origin == self.state.outlook {
-                                self.state.open_session_route(session.clone());
-                                ApplicationTransition::ViewAndAttachSession(session)
-                            } else {
-                                self.state
-                                    .turn_outlook_for_session(session.clone(), *context);
-                                ApplicationTransition::TurnOutlookAndViewAndAttach {
-                                    catalog_origins: self.state.catalog_origins(),
-                                    session,
-                                }
-                            }
-                        }
-                        SidebarActivation::NewSession => {
-                            return self.new_session_from_sidebar();
-                        }
-                    },
-                );
+                    }
+                    SidebarActivation::NewSession => {
+                        return self.new_session_from_sidebar();
+                    }
+                });
             }
             _ => {}
         }
@@ -9631,17 +9637,26 @@ impl Application {
 
     /// Opens the `place`-th of the Sessions the open Usage Metrics view lists
     /// as costing the most, closing the view, as a Sidebar row opens one: it
-    /// lives on the Server the view reads, the one the Outlook is turned
-    /// toward, so the route moves now and the attach follows it. The Session
-    /// already open is only uncovered.
+    /// lives on the Server the report naming it was read from, so the route
+    /// moves now and the attach follows it. Should the Outlook have turned
+    /// from that Server since, the view says so and opens nothing rather
+    /// than ask another Server for it. The Session already open is only
+    /// uncovered.
     fn open_metrics_session(&mut self, place: usize) -> ApplicationTransition {
         let view = &mut self.state.metrics_view;
-        let Some(session_id) = view.is_open().then(|| view.top_session(place)).flatten() else {
+        let Some(session) = view.is_open().then(|| view.top_session(place)).flatten() else {
             return ApplicationTransition::Continue;
         };
+        if session.origin != self.state.outlook {
+            let read_from = session.origin.remote_name().unwrap_or("this machine");
+            view.refuse_opening(format!(
+                "Not opened: the Session is on {read_from}, which the Outlook has turned \
+                 from since — press r to read again"
+            ));
+            return ApplicationTransition::Continue;
+        }
         view.close();
-        let session = SessionReference::new(self.state.outlook.clone(), session_id);
-        if self.state.route.as_ref() == Some(&session) && !self.state.open_session_can_retry() {
+        if self.state.settled_open_session() == Some(&session) {
             return ApplicationTransition::Continue;
         }
         self.state.open_session_route(session.clone());
@@ -9659,7 +9674,7 @@ impl Application {
         }
         let now = self.state.session_now();
         let zone = self.state.local_zone.now();
-        match self.state.metrics_view.ask(now, &zone) {
+        match self.state.metrics_view.ask(origin.clone(), now, &zone) {
             Some((request_id, query)) => ApplicationTransition::ReadUsageMetrics {
                 origin,
                 request_id,

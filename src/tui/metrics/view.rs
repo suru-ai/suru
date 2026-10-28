@@ -48,6 +48,11 @@ const TOP_SESSIONS_HEADING: &str = "Most expensive Sessions";
 /// The fewest rows the chart keeps however many Sessions are listed under
 /// it: the list takes room from the chart only down to this.
 const CHART_FLOOR: u16 = 8;
+/// The fewest rows the list is drawn in: a blank row, its heading, and one
+/// Session, since a heading with no Session under it says nothing.
+const LIST_FLOOR: u16 = 3;
+/// Columns between a listed Session's figure, Title, Model, and Workspace.
+const SESSION_GAPS: usize = 6;
 /// Columns a listed Session's Title, Model, and Workspace are each cut to.
 const SESSION_TITLE: usize = 40;
 const SESSION_MODEL: usize = 24;
@@ -113,7 +118,12 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
     // controls, where it has the whole width to say it in.
     let status_y = controls_y + 1;
     let room = usize::from(area.width.saturating_sub(INSET * 2));
-    if let Some(refusal) = view.stale_because() {
+    if let Some(reason) = view.unopened_because() {
+        // A listed Session that could not be opened says why where the
+        // reader looks for what became of their press.
+        let note = truncate_to_width(reason, room);
+        buffer.set_string(area.x + INSET, status_y, note, theme.feedback.error);
+    } else if let Some(refusal) = view.stale_because() {
         // Figures that could not be read again stay, saying why above them.
         let note = truncate_to_width(&stale_note(refusal), room);
         buffer.set_string(area.x + INSET, status_y, note, theme.feedback.error);
@@ -227,7 +237,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 .saturating_add(if mixed { MIX_ROWS + 1 } else { 0 });
             // The Sessions that cost the most stand a blank row under the
             // legend, headed, as many as there is room for down to the
-            // chart's floor; a heading with no row under it is left out.
+            // chart's floor, and none at all below the list's own.
             let listed = u16::try_from(report.top_sessions.len()).unwrap_or(u16::MAX);
             let list_rows = if listed == 0 {
                 0
@@ -238,7 +248,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                         .saturating_sub(CHART_FLOOR),
                 )
             };
-            let list_rows = if list_rows < 3 { 0 } else { list_rows };
+            let list_rows = if list_rows < LIST_FLOOR { 0 } else { list_rows };
             let chart_rows = body
                 .height
                 .saturating_sub(legend_rows + 1 + list_rows)
@@ -336,7 +346,8 @@ fn render_top_sessions(
     // The Title gives way first where the row is narrow, down to nothing
     // before the Model and Workspace are cut off the row's end.
     let title_width = widest(&|session| session.title.width(), SESSION_TITLE).min(
-        usize::from(area.width).saturating_sub(cost_width + model_width + workspace_width + 6),
+        usize::from(area.width)
+            .saturating_sub(cost_width + model_width + workspace_width + SESSION_GAPS),
     );
     let focused = view.focused_row();
     for (place, (session, cost)) in sessions.iter().zip(&costs).enumerate() {

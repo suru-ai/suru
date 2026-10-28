@@ -497,10 +497,7 @@ impl OwnedCost {
             return;
         };
         let tokens = turn.usage.as_ref().and_then(Usage::blended_tokens);
-        let share = match self.models.get_mut(model) {
-            Some(share) => share,
-            None => self.models.entry(model.clone()).or_default(),
-        };
+        let share = self.models.entry(model.clone()).or_default();
         share.tokens = share.tokens.saturating_add(tokens.unwrap_or(0));
     }
 
@@ -546,13 +543,13 @@ fn dearest_first(left: &(SessionId, Cost), right: &(SessionId, Cost)) -> Orderin
 /// only those with a known Cost, the few picked out in time linear in all of
 /// them and only those few sorted.
 fn top_owners(owned: &HashMap<SessionId, OwnedCost>, limit: usize) -> Vec<SessionId> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let mut priced: Vec<(SessionId, Cost)> = owned
         .iter()
         .filter_map(|(owner, owned)| Some((*owner, owned.cost?)))
         .collect();
-    if limit == 0 {
-        return Vec::new();
-    }
     if priced.len() > limit {
         priced.select_nth_unstable_by(limit - 1, dearest_first);
         priced.truncate(limit);
@@ -741,10 +738,16 @@ fn fold(
             UsageMetricsSession {
                 session_id: owner,
                 title: session.title.clone(),
-                workspace: labels.get(&workspace).cloned().unwrap_or_default(),
-                model: owned
-                    .main_model()
-                    .and_then(|model| labels.get(model).cloned()),
+                workspace: labels
+                    .get(&workspace)
+                    .cloned()
+                    .expect("every top Session's Workspace is named"),
+                model: owned.main_model().map(|model| {
+                    labels
+                        .get(model)
+                        .cloned()
+                        .expect("every top Session's Model is named")
+                }),
                 cost: owned.cost.expect("a top Session has a known Cost"),
                 is_cost_partial: owned.is_partial,
             }
@@ -763,7 +766,7 @@ fn fold(
         keys: keys
             .into_iter()
             .map(|key| UsageMetricsKeyLabel {
-                label: labels.remove(&key).unwrap_or_default(),
+                label: labels.remove(&key).expect("every key is named"),
                 key,
             })
             .collect(),
