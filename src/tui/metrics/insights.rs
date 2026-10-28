@@ -39,7 +39,7 @@ pub(super) use view::render;
 /// A panel of the Insights tab.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum InsightsPanel {
-    /// The Turns started in each hour of the reader's week.
+    /// The Turns placed in each hour of the reader's week.
     WhenYouWork,
     /// How long Turns took to Settle, and how they ended.
     Turns,
@@ -59,7 +59,7 @@ impl InsightsPanel {
 
     pub(crate) fn title(self) -> &'static str {
         match self {
-            Self::WhenYouWork => "When you work (Turns started)",
+            Self::WhenYouWork => "When you work (Turns by hour)",
             Self::Turns => "Turns",
         }
     }
@@ -135,18 +135,8 @@ pub(super) enum InsightsContent<'a> {
 #[derive(Clone, Debug)]
 pub(super) struct KeptReport {
     origin: Outlook,
-    pub(super) report: InsightsReport,
-    pub(super) heatmap: Heatmap,
-}
-
-/// How a panel's items stand where it drew them, from its first: in rows
-/// a line apiece, `across` items to a row, each `width` columns wide — the
-/// Turns panel's bins a column apiece in one row, the heatmap's hours two
-/// apiece in a row for each day.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ItemGrid {
-    pub(super) width: u16,
-    pub(super) across: u16,
+    report: InsightsReport,
+    heatmap: Heatmap,
 }
 
 /// Where the last frame drew each part of the tab a pointer can act on.
@@ -155,9 +145,12 @@ struct Targets {
     /// Each panel's place in the grid, borders included, in
     /// [`InsightsPanel::ALL`] order.
     panels: [Option<Rect>; InsightsPanel::ALL.len()],
-    /// Where each panel drew the items a reader selects among, and how they
-    /// stand, in the same order.
-    items: [Option<(Rect, ItemGrid)>; InsightsPanel::ALL.len()],
+    /// Where each panel drew the items a reader selects among, and how many
+    /// columns each takes, in the same order. They stand in rows a line
+    /// apiece, as many to a row as [`InsightsPanel::across`] says: the
+    /// Turns panel's bins a column apiece in one row, the heatmap's hours
+    /// two apiece in a row for each day.
+    items: [Option<(Rect, u16)>; InsightsPanel::ALL.len()],
 }
 
 /// The tab's state: the reports it read, kept by range, and the panel the
@@ -410,10 +403,10 @@ impl InsightsView {
         self.update_targets(|targets| targets.panels[panel.place()] = Some(area));
     }
 
-    /// Records where `panel` drew its items, standing as `grid` from the
-    /// corner of `area`.
-    pub(super) fn record_item_targets(&self, panel: InsightsPanel, area: Rect, grid: ItemGrid) {
-        self.update_targets(|targets| targets.items[panel.place()] = Some((area, grid)));
+    /// Records where `panel` drew its items, from the corner of `area`,
+    /// each `width` columns wide.
+    pub(super) fn record_item_targets(&self, panel: InsightsPanel, area: Rect, width: u16) {
+        self.update_targets(|targets| targets.items[panel.place()] = Some((area, width)));
     }
 
     fn update_targets(&self, update: impl FnOnce(&mut Targets)) {
@@ -430,10 +423,10 @@ impl InsightsView {
         })?;
         let item = targets.items[panel.place()]
             .filter(|(area, _)| area.contains(position))
-            .map(|(area, grid)| {
+            .map(|(area, width)| {
                 let row = usize::from(position.y - area.y);
-                let column = usize::from((position.x - area.x) / grid.width.max(1));
-                row * usize::from(grid.across) + column
+                let column = usize::from((position.x - area.x) / width.max(1));
+                row * panel.across() + column
             });
         Some(match item {
             Some(item) => InsightsTarget::Item { panel, item },

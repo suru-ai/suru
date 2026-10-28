@@ -114,9 +114,9 @@ fn new_york_quarter(
 
 /// When the mockup's reader worked, in New York: the busiest hour Tuesday
 /// 27 October at 14:00, its 40 Turns in two quarter-hours, and the hours
-/// after it each quieter — 30, 20, 10, then 1 Turn — so they shade a level
-/// apiece less; and one Turn late on the Wednesday before, whose Cost is
-/// partial.
+/// after it each quieter — 30, 20, then 10 Turns — so they shade a level
+/// apiece less, and then 1 Turn, still the lightest shade rather than none;
+/// and one Turn late on the Wednesday before, whose Cost is partial.
 fn worked_hours() -> Vec<QuarterHourTurns> {
     let mut hours = vec![
         new_york_quarter(27, 14, 0, 25, 1_300_000, 9.20),
@@ -596,7 +596,8 @@ fn when_you_work_shades_each_local_hour_of_the_week_by_its_share_of_the_busiest(
 
     let rows = screen(&application);
 
-    row(&rows, "When you work (Turns started)");
+    row(&rows, "When you work (Turns by hour)");
+    row(&rows, "fewer ░▒▓█ more");
     assert!(
         row(&rows, "00      04      08      12      16      20").contains("00      04"),
         "{rows:#?}"
@@ -618,14 +619,6 @@ fn when_you_work_shades_each_local_hour_of_the_week_by_its_share_of_the_busiest(
     let mon = rows.iter().position(|row| row.contains("Mon  ")).unwrap();
     let sun = rows.iter().position(|row| row.contains("Sun  ")).unwrap();
     assert_eq!((tue - mon, sun - mon), (1, 6), "weeks begin on Monday");
-
-    // The lightest level's colour is not the rest's, so the two shades
-    // that share a glyph still read apart.
-    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
-    let (x, y) = cell_position(&application, "Tue", 17);
-    let (lightest, lighter) = (buffer[(x + 2, y)].style(), buffer[(x, y)].style());
-    assert_eq!(buffer[(x + 2, y)].symbol(), "░");
-    assert_ne!(lightest.fg, lighter.fg);
 }
 
 #[test]

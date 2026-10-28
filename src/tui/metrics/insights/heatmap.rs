@@ -3,6 +3,10 @@
 //! many Turns each cell holds of the busiest's, a cell of which a reader
 //! can select to read its Turns, tokens, and Cost.
 //!
+//! A cell takes one of five looks: a dot where it holds no Turn, otherwise
+//! one of four shades, each its own glyph, so they read apart on a Theme of
+//! few colours or none.
+//!
 //! The report gives Turns by UTC quarter-hour. Every UTC offset in use is a
 //! whole number of quarter-hours, so each quarter-hour falls wholly within
 //! one local hour, and the fold is exact. Which hour that is depends on the
@@ -10,11 +14,7 @@
 //! placed by its own instant rather than by one offset for the range.
 
 use jiff::{Timestamp, tz::TimeZone};
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Modifier, Style},
-};
+use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
@@ -24,15 +24,15 @@ use crate::{
 
 use super::{
     super::{super::slots::truncate_to_width, calendar::MetricsRange, chart::MetricsMeasure},
-    InsightsPanel, InsightsView, ItemGrid,
+    InsightsPanel, InsightsView,
     turns::counted,
 };
 
 /// Days in a week, Monday first.
-pub(crate) const DAYS: usize = 7;
+pub(super) const DAYS: usize = 7;
 
 /// Hours in a day.
-pub(crate) const HOURS: usize = 24;
+pub(super) const HOURS: usize = 24;
 
 /// The rows the panel draws inside its border: the hours above the grid,
 /// a row for each day, and the line beneath naming the selected cell.
@@ -44,18 +44,20 @@ const DAY_NAMES: [&str; DAYS] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"
 /// The columns of a day's name and the gap after it, before its hours.
 const LABEL_WIDTH: u16 = 5;
 
-/// How many shades a cell holding Turns takes, the busiest the fullest.
-const SHADES: u64 = 5;
+/// The glyph of each shade a cell holding Turns takes, the lightest first:
+/// each a denser block than the one before it, and none the empty cell's
+/// dot.
+const SHADES: [&str; 4] = ["░", "▒", "▓", "█"];
 
 /// The Turns placed in one local hour of the week, and what they consumed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct HourCell {
-    pub(crate) turns: u64,
+pub(super) struct HourCell {
+    pub(super) turns: u64,
     /// Absent where none of them reported tokens.
-    pub(crate) tokens: Option<u64>,
+    pub(super) tokens: Option<u64>,
     /// Absent where none of them contributes a known amount.
-    pub(crate) cost: Option<Cost>,
-    pub(crate) is_cost_partial: bool,
+    pub(super) cost: Option<Cost>,
+    pub(super) is_cost_partial: bool,
 }
 
 impl HourCell {
@@ -65,8 +67,7 @@ impl HourCell {
             self.tokens = Some(self.tokens.unwrap_or(0).saturating_add(tokens));
         }
         if let Some(cost) = quarter.cost {
-            let held = self.cost.map_or(0, Cost::nano_usd);
-            self.cost = Some(Cost::from_nano_usd(held.saturating_add(cost.nano_usd())));
+            self.cost = Some(self.cost.map_or(cost, |held| held.saturating_add(cost)));
         }
         self.is_cost_partial |= quarter.is_cost_partial;
     }
@@ -74,13 +75,13 @@ impl HourCell {
 
 /// The week's hours, Monday's first, each holding the Turns placed in it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Heatmap {
+pub(super) struct Heatmap {
     cells: [[HourCell; HOURS]; DAYS],
 }
 
 impl Heatmap {
     /// Folds `quarter_hours` into the local hours of `zone`'s week.
-    pub(crate) fn fold(quarter_hours: &[QuarterHourTurns], zone: &TimeZone) -> Self {
+    pub(super) fn fold(quarter_hours: &[QuarterHourTurns], zone: &TimeZone) -> Self {
         let mut heatmap = Self::default();
         for quarter in quarter_hours {
             let Some((day, hour)) = local_hour(quarter, zone) else {
@@ -92,12 +93,12 @@ impl Heatmap {
     }
 
     /// The cell of `day`, counted from Monday, at `hour`.
-    pub(crate) fn cell(&self, day: usize, hour: usize) -> &HourCell {
+    pub(super) fn cell(&self, day: usize, hour: usize) -> &HourCell {
         &self.cells[day][hour]
     }
 
     /// How many Turns the busiest cell holds.
-    pub(crate) fn busiest(&self) -> u64 {
+    pub(super) fn busiest(&self) -> u64 {
         self.cells
             .iter()
             .flatten()
@@ -117,32 +118,18 @@ pub(super) fn items(heatmap: &Heatmap) -> usize {
     }
 }
 
-/// The shade, from 1 to [`SHADES`], of a cell holding `turns` of the
-/// busiest cell's `busiest`: the share rounded up, so a cell holding any
-/// Turn shows one, and only the busiest and those near it the fullest. None
-/// for a cell holding none.
-fn shade(turns: u64, busiest: u64) -> Option<usize> {
+/// The glyph of the shade of a cell holding `turns` of the busiest cell's
+/// `busiest`: the share of [`SHADES`] rounded up, so a cell holding any
+/// Turn shows the lightest, and only the busiest and those near it the
+/// fullest. None for a cell holding none.
+fn shade(turns: u64, busiest: u64) -> Option<&'static str> {
     if turns == 0 || busiest == 0 {
         return None;
     }
-    let shade = (u128::from(turns) * u128::from(SHADES)).div_ceil(u128::from(busiest));
-    usize::try_from(shade.min(u128::from(SHADES))).ok()
-}
-
-/// The glyph and style each shade is drawn in, the lightest first: the
-/// lightest in the Theme's subdued text, a neutral that reads as barely
-/// there, and the rest in its accent, as the chart's first series is,
-/// each a denser block than the one before it. Every one is the Theme's,
-/// so the heatmap follows it wherever it is drawn.
-fn shades(theme: &Theme) -> [(&'static str, Style); SHADES as usize] {
-    let accent = theme.accent.primary;
-    [
-        ("░", theme.text.subdued),
-        ("░", accent),
-        ("▒", accent),
-        ("▓", accent),
-        ("█", accent),
-    ]
+    let levels = SHADES.len() as u128;
+    let level = (u128::from(turns) * levels).div_ceil(u128::from(busiest));
+    let level = usize::try_from(level.clamp(1, levels)).ok()?;
+    Some(SHADES[level - 1])
 }
 
 /// Draws the panel's grid in `area`, inside its border — the hours across
@@ -187,16 +174,13 @@ pub(super) fn render(
         let x = grid_x + hour * width;
         buffer.set_string(x, area.y, format!("{hour:02}"), theme.text.subdued);
     }
-    let shades = shades(theme);
+    let accent = theme.accent.primary;
     for (day, name) in DAY_NAMES.iter().enumerate() {
         let y = area.y + 1 + day as u16;
         buffer.set_string(area.x, y, name, theme.text.subdued);
         for hour in 0..HOURS {
             let (glyph, style) = match shade(heatmap.cell(day, hour).turns, busiest) {
-                Some(shade) => {
-                    let (glyph, style) = shades[shade - 1];
-                    (glyph.repeat(usize::from(width)), style)
-                }
+                Some(shade) => (shade.repeat(usize::from(width)), accent),
                 None => {
                     let dot = if width == 2 { "· " } else { "·" };
                     (dot.to_owned(), theme.border.subdued)
@@ -213,10 +197,7 @@ pub(super) fn render(
     view.record_item_targets(
         InsightsPanel::WhenYouWork,
         Rect::new(grid_x, area.y + 1, width * hours, DAYS as u16),
-        ItemGrid {
-            width,
-            across: hours,
-        },
+        width,
     );
     let y = area.y + 1 + DAYS as u16;
     match selected {
@@ -229,7 +210,7 @@ pub(super) fn render(
                 theme.text.primary,
             );
         }
-        None => render_legend(buffer, Rect::new(area.x, y, area.width, 1), &shades, theme),
+        None => render_legend(buffer, Rect::new(area.x, y, area.width, 1), theme),
     }
 }
 
@@ -259,15 +240,10 @@ fn named_cell(heatmap: &Heatmap, day: usize, hour: usize) -> String {
 
 /// The shades from the lightest to the fullest, between the words that say
 /// which way they run.
-fn render_legend(
-    buffer: &mut Buffer,
-    area: Rect,
-    shades: &[(&'static str, Style); SHADES as usize],
-    theme: &Theme,
-) {
+fn render_legend(buffer: &mut Buffer, area: Rect, theme: &Theme) {
     let mut x = area.x;
     let pieces = std::iter::once(("fewer ", theme.text.subdued))
-        .chain(shades.iter().copied())
+        .chain(SHADES.map(|shade| (shade, theme.accent.primary)))
         .chain(std::iter::once((" more", theme.text.subdued)));
     for (text, style) in pieces {
         let left = usize::from(area.right().saturating_sub(x));
@@ -281,11 +257,9 @@ fn render_legend(
 /// `zone`; none for a moment the calendar cannot place.
 fn local_hour(quarter: &QuarterHourTurns, zone: &TimeZone) -> Option<(usize, usize)> {
     let millisecond = i64::try_from(quarter.start.0).ok()?;
-    let zoned = Timestamp::from_millisecond(millisecond)
-        .ok()?
-        .to_zoned(zone.clone());
-    let day = usize::try_from(zoned.weekday().to_monday_zero_offset()).ok()?;
-    let hour = usize::try_from(zoned.hour()).ok()?;
+    let local = zone.to_datetime(Timestamp::from_millisecond(millisecond).ok()?);
+    let day = usize::try_from(local.weekday().to_monday_zero_offset()).ok()?;
+    let hour = usize::try_from(local.hour()).ok()?;
     Some((day, hour))
 }
 
