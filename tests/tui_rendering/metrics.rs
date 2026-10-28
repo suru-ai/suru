@@ -538,8 +538,14 @@ fn a_remote_outlook_reads_the_remote_and_its_silence_is_explained() {
         "a refresh waits for the Remote"
     );
     row(&screen(&application), "studio is unreachable");
-
     key(&mut application, KeyCode::Esc);
+    assert!(
+        !screen(&application)
+            .join("\n")
+            .contains("this waits until it answers"),
+        "the refusal stayed in the view"
+    );
+
     type_terminal_text(&mut application, "/metrics");
     assert_eq!(
         key(&mut application, KeyCode::Enter),

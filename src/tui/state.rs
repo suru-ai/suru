@@ -7715,9 +7715,11 @@ impl Application {
         if self.state.workspace_picker.is_open() {
             self.state.workspace_picker.refuse(refusal.clone());
         }
-        // So does the Usage Metrics view, over the whole frame.
+        // The Usage Metrics view covers the whole frame, so it says so itself,
+        // and leaves nothing behind for the screen it returns to.
         if self.state.metrics_view.is_open() {
-            self.state.metrics_view.refuse(refusal.clone());
+            self.state.metrics_view.refuse(refusal);
+            return true;
         }
         self.state.submission_error = Some(refusal);
         true
