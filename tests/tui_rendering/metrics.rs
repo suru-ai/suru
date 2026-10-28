@@ -1857,8 +1857,12 @@ fn b_and_clicks_choose_a_breakdown_and_read_it_anew() {
                 .any(|row| row.contains("Reading Usage Metrics")),
             "{expected:?}"
         );
-        let chosen = format!("▐{}▌", expected.label());
-        assert!(controls(&application).contains(&chosen), "{chosen}");
+        let chosen = match expected {
+            UsageMetricsBreakdown::Model => "▐Model▌",
+            UsageMetricsBreakdown::Provider => "▐Provider▌",
+            UsageMetricsBreakdown::Workspace => "▐Workspace▌",
+        };
+        assert!(controls(&application).contains(chosen), "{chosen}");
         answer(&mut application, request_id, Ok(empty_report(&query, None)));
     }
 

@@ -17,7 +17,7 @@ use crate::{
 
 use super::{
     super::slots::truncate_to_width,
-    MetricsContent, MetricsView, UsageMetricsReadRefusal,
+    BREAKDOWNS, MetricsContent, MetricsView, OfferedBreakdown, UsageMetricsReadRefusal,
     calendar::MetricsRange,
     chart::{self, MetricsMeasure, Series},
 };
@@ -87,8 +87,8 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
         buffer,
         lead_x + u16::try_from(BREAKDOWN_LEAD.width()).unwrap_or(0),
         controls_y,
-        UsageMetricsBreakdown::ALL.map(|chosen| (chosen.label(), chosen == breakdown)),
-        |place, at| view.record_breakdown_target(UsageMetricsBreakdown::ALL[place], at),
+        BREAKDOWNS.map(|chosen| (chosen.label(), chosen == breakdown)),
+        |place, at| view.record_breakdown_target(BREAKDOWNS[place], at),
         theme,
     );
     // What is happening to the figures shown takes the row under the
@@ -192,10 +192,11 @@ fn render_tabs<const N: usize>(
     x - TAB_GAP
 }
 
-/// A heading naming the range's whole, then one row per series from the
-/// largest, Other last: its colour, label, figure, share, and a bar
-/// proportional to the largest series. Where the series count more than the whole, `noted`, a
-/// note under them says why.
+/// A heading naming the range's whole, then one row per series in the
+/// chart's order — ranked by Cost whatever the measure, Other last — each
+/// its colour, label, figure, share, and a bar proportional to the largest
+/// series in the measure shown. Where the series count more than the
+/// whole, `noted`, a note under them says why.
 fn render_legend(
     frame: &mut Frame<'_>,
     area: Rect,

@@ -23,6 +23,55 @@ use chart::MetricsMeasure;
 
 pub(super) use view::render;
 
+/// Every breakdown, in the order the view offers them.
+pub(super) const BREAKDOWNS: [UsageMetricsBreakdown; 3] = [
+    UsageMetricsBreakdown::Model,
+    UsageMetricsBreakdown::Provider,
+    UsageMetricsBreakdown::Workspace,
+];
+
+/// A breakdown as the view offers it: in turn among [`BREAKDOWNS`], and in
+/// the words its controls and notes use.
+pub(super) trait OfferedBreakdown: Sized {
+    /// The breakdown after this one, the last turning back to the first.
+    fn next(self) -> Self;
+    /// Where the breakdown stands in [`BREAKDOWNS`].
+    fn place(self) -> usize;
+    /// What one of its keys is called.
+    fn label(self) -> &'static str;
+    /// What several of its keys are called.
+    fn plural(self) -> &'static str;
+}
+
+impl OfferedBreakdown for UsageMetricsBreakdown {
+    fn next(self) -> Self {
+        BREAKDOWNS[(self.place() + 1) % BREAKDOWNS.len()]
+    }
+
+    fn place(self) -> usize {
+        BREAKDOWNS
+            .iter()
+            .position(|breakdown| *breakdown == self)
+            .expect("every breakdown is offered")
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Model => "Model",
+            Self::Provider => "Provider",
+            Self::Workspace => "Workspace",
+        }
+    }
+
+    fn plural(self) -> &'static str {
+        match self {
+            Self::Model => "Models",
+            Self::Provider => "Providers",
+            Self::Workspace => "Workspaces",
+        }
+    }
+}
+
 /// Why the view has no fresh figures to show.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UsageMetricsReadRefusal {
@@ -106,9 +155,8 @@ struct Targets {
     ranges: [Option<Rect>; MetricsRange::ALL.len()],
     /// Each measure's place beside it, in [`MetricsMeasure::ALL`] order.
     measures: [Option<Rect>; MetricsMeasure::ALL.len()],
-    /// Each breakdown's place after them, in [`UsageMetricsBreakdown::ALL`]
-    /// order.
-    breakdowns: [Option<Rect>; UsageMetricsBreakdown::ALL.len()],
+    /// Each breakdown's place after them, in [`BREAKDOWNS`] order.
+    breakdowns: [Option<Rect>; BREAKDOWNS.len()],
     /// The chart, or where it stands while there is none to draw.
     chart: Option<Rect>,
 }
@@ -378,7 +426,7 @@ impl MetricsView {
         {
             return Some(MetricsTarget::Measure(measure));
         }
-        if let Some(breakdown) = UsageMetricsBreakdown::ALL
+        if let Some(breakdown) = BREAKDOWNS
             .into_iter()
             .find(|breakdown| on(targets.breakdowns[breakdown.place()]))
         {

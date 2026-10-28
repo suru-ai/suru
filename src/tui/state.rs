@@ -29,8 +29,8 @@ use crate::{
         SessionChange, SessionErrorCode, SessionId, SessionListItem, SessionReference,
         SessionSnapshot, SettingMutation, SettingsDiagnostic, SettingsSnapshot, ShutdownReason,
         SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TranscriptSettings, TurnId,
-        TurnStatus, UnreachableReason, UpdateAgentSelectionRequest, Workspace, WorkspaceId,
-        one_line_title,
+        TurnStatus, UnreachableReason, UpdateAgentSelectionRequest, UsageMetricsBreakdown,
+        Workspace, WorkspaceId, one_line_title,
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
@@ -75,8 +75,8 @@ use super::{
         command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
     },
     metrics::{
-        MetricsView, Receipt as MetricsReceipt, UsageMetricsReadRefusal, calendar::MetricsRange,
-        chart::MetricsMeasure,
+        MetricsView, OfferedBreakdown, Receipt as MetricsReceipt, UsageMetricsReadRefusal,
+        calendar::MetricsRange, chart::MetricsMeasure,
     },
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
@@ -9579,7 +9579,7 @@ impl Application {
     /// them where that changed what the view shows, as a range is chosen.
     fn choose_metrics_breakdown(
         &mut self,
-        breakdown: crate::protocol::UsageMetricsBreakdown,
+        breakdown: UsageMetricsBreakdown,
     ) -> ApplicationTransition {
         let view = &mut self.state.metrics_view;
         if view.is_open() && view.choose_breakdown(breakdown) {

@@ -1280,6 +1280,13 @@ fn assert_same_contributions(
     assert!(actual.is_empty(), "{case}: unexpected {actual:?}");
 }
 
+/// Every breakdown a Usage Metrics read can be asked for.
+const BREAKDOWNS: [UsageMetricsBreakdown; 3] = [
+    UsageMetricsBreakdown::Model,
+    UsageMetricsBreakdown::Provider,
+    UsageMetricsBreakdown::Workspace,
+];
+
 /// Usage Metrics over one bucket holding all of time, broken down by
 /// `breakdown`.
 fn all_time_metrics(
@@ -1343,7 +1350,7 @@ async fn reading_usage_metrics_over_a_wide_forest_walks_each_tree_once() {
     let sessions = records.len();
     let (store, writer) = restore(workspace.path(), records).await;
 
-    for breakdown in UsageMetricsBreakdown::ALL {
+    for breakdown in BREAKDOWNS {
         WORK.set(0);
         all_time_metrics(&store, breakdown);
         let work = WORK.get();
@@ -1378,7 +1385,7 @@ async fn reading_usage_metrics_over_a_wide_forest_walks_each_tree_once() {
 /// for, a tree whose Cost is wholly unknown included. The keys of every
 /// breakdown divide that Cost without adding to it.
 fn assert_all_time_metrics_add_up_to_root_tree_costs(store: &SessionStore) {
-    for breakdown in UsageMetricsBreakdown::ALL {
+    for breakdown in BREAKDOWNS {
         assert_all_time_metrics_by_add_up_to_root_tree_costs(store, breakdown);
     }
 }
