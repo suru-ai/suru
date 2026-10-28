@@ -167,8 +167,9 @@ pub(super) fn render(
         1
     };
     if area.width < LABEL_WIDTH + width * hours || area.height < ROWS {
-        // No column is laid out this narrow, but were one, it would say why
-        // it stands empty rather than seem broken.
+        // A deliberate guard: no layout gives the panel a column this
+        // narrow, but were one to, it says why it stands empty rather than
+        // seem broken.
         buffer.set_string(
             area.x,
             area.y,

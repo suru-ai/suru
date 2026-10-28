@@ -32,7 +32,6 @@ use super::{
     Column, InsightsContent, InsightsPanel, InsightsView, KeptReport, Place, approvals, cache,
     compactions, delegation, heatmap, tools, turns, workspaces,
 };
-
 use crate::{
     protocol::Outlook,
     tui::{slots::truncate_to_width, usage::grouped_count},
@@ -114,7 +113,7 @@ fn render_report(buffer: &mut Buffer, body: Rect, drawing: &Drawing<'_>) {
         drawing.kept,
         &mut laid,
     );
-    let scroll = view.body_scroll().min(height.saturating_sub(body.height));
+    let scroll = view.settle_body_scroll(height.saturating_sub(body.height));
     let mut drawn = Buffer::empty(Rect::new(body.x, 0, body.width, height));
     for (panel, area) in laid {
         render_panel(&mut drawn, area, panel, drawing);

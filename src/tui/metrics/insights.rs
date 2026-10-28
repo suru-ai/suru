@@ -562,10 +562,16 @@ impl Laid {
             .map(|(top, height)| (top, top + height))
     }
 
+    /// The fewest rows a page moves where it can: half a frame.
+    fn half(self) -> u16 {
+        (self.shown / 2).max(1)
+    }
+
     /// How far a page down from `scroll` scrolls: the first panel the foot
     /// cuts short, or the first beneath it, brought to the top, so that it
-    /// reads whole; and never more than a frame, so a panel taller than
-    /// the body is read a frame at a time.
+    /// reads whole. A page moves a whole frame instead where that would
+    /// move it less than half of one, and never more, so a panel taller
+    /// than the body is read a frame at a time.
     fn page_down(self, scroll: u16) -> u16 {
         let foot = scroll + self.shown;
         let next = self
@@ -573,13 +579,15 @@ impl Laid {
             .filter(|(top, end)| *end > foot && *top > scroll)
             .map(|(top, _)| top)
             .min()
+            .filter(|top| top - scroll >= self.half())
             .unwrap_or(foot);
         next.min(foot).min(self.furthest())
     }
 
-    /// How far a page up from `scroll` scrolls: the last panel the top cuts
-    /// short, or the last above it, brought to the foot, and never more
-    /// than a frame, as [`Self::page_down`] pages down.
+    /// How far a page up from `scroll` scrolls, as [`Self::page_down`]
+    /// pages down: the last panel the top cuts short, or the last above
+    /// it, brought to the foot, or a whole frame where that would move less
+    /// than half of one, and never more.
     fn page_up(self, scroll: u16) -> u16 {
         let foot = scroll + self.shown;
         let back = scroll.saturating_sub(self.shown);
@@ -587,6 +595,7 @@ impl Laid {
             .filter(|(top, end)| *top < scroll && *end < foot)
             .map(|(_, end)| end.saturating_sub(self.shown))
             .max()
+            .filter(|previous| scroll - previous >= self.half())
             .map_or(back, |previous| previous.max(back))
     }
 
@@ -626,9 +635,11 @@ pub(in crate::tui) struct InsightsView {
     /// stand in view.
     scrolled: [usize; InsightsPanel::ALL.len()],
     tools_sort: ToolsSort,
-    /// How many rows the panels are scrolled up the body, from their top;
-    /// shown no further than their last rows stand at its foot.
-    body_scroll: u16,
+    /// How many rows the panels are scrolled up the body, from their top.
+    /// Each frame settles it no further than brings their last rows to its
+    /// foot, so a frame or report that grows and shrinks again never jumps
+    /// back to an older offset; a new range scrolls back to the top.
+    body_scroll: Cell<u16>,
     targets: Cell<Targets>,
 }
 
@@ -828,18 +839,22 @@ impl InsightsView {
         }
         self.focused = Some(panel);
         if let Some(laid) = self.targets.get().laid {
-            self.body_scroll = laid.showing(self.shown_scroll(laid), panel);
+            let scroll = laid.showing(self.shown_scroll(laid), panel);
+            self.body_scroll.set(scroll);
         }
     }
 
-    /// How many rows the panels are scrolled up the body.
-    pub(super) fn body_scroll(&self) -> u16 {
-        self.body_scroll
+    /// Settles how many rows the panels are scrolled up the body at no
+    /// more than `furthest`, as a frame draws them, and answers it.
+    pub(super) fn settle_body_scroll(&self, furthest: u16) -> u16 {
+        let scroll = self.body_scroll.get().min(furthest);
+        self.body_scroll.set(scroll);
+        scroll
     }
 
     /// How far the body laid out as `laid` showed its panels scrolled.
     fn shown_scroll(&self, laid: Laid) -> u16 {
-        self.body_scroll.min(laid.furthest())
+        self.body_scroll.get().min(laid.furthest())
     }
 
     /// Scrolls the body a page `to`, as the last frame laid the panels out
@@ -849,10 +864,10 @@ impl InsightsView {
             return;
         };
         let scroll = self.shown_scroll(laid);
-        self.body_scroll = match to {
+        self.body_scroll.set(match to {
             RowScroll::Up => laid.page_up(scroll),
             RowScroll::Down => laid.page_down(scroll),
-        };
+        });
     }
 
     /// Scrolls the body `rows` rows `to`, stopping at either end, as the
@@ -863,10 +878,10 @@ impl InsightsView {
             return;
         };
         let scroll = self.shown_scroll(laid);
-        self.body_scroll = match to {
+        self.body_scroll.set(match to {
             RowScroll::Up => scroll.saturating_sub(rows),
             RowScroll::Down => scroll.saturating_add(rows).min(laid.furthest()),
-        };
+        });
     }
 
     pub(in crate::tui) fn move_focus(&mut self, to: PanelMove) {
@@ -900,6 +915,7 @@ impl InsightsView {
     pub(in crate::tui) fn leave_range(&mut self) {
         self.selected = None;
         self.scrolled = Default::default();
+        self.body_scroll.set(0);
     }
 
     /// How far down `panel`'s rows are scrolled.
@@ -1100,8 +1116,66 @@ impl InsightsView {
 
 #[cfg(test)]
 mod tests {
-    use super::{InsightsContent, InsightsPanel, InsightsView, MetricsRange, Outlook};
+    use super::{InsightsContent, InsightsPanel, InsightsView, Laid, MetricsRange, Outlook};
     use crate::protocol::{InsightsReport, SessionTimestamp};
+
+    /// Panels laid out at each of `spans` — a first row and a height — in a
+    /// body showing `shown` rows at once.
+    fn laid(shown: u16, spans: &[(u16, u16)]) -> Laid {
+        let mut panels = [None; InsightsPanel::ALL.len()];
+        for (panel, span) in panels.iter_mut().zip(spans) {
+            *panel = Some(*span);
+        }
+        let height = spans.iter().map(|(top, height)| top + height).max();
+        Laid {
+            panels,
+            height: height.unwrap_or(0),
+            shown,
+        }
+    }
+
+    #[test]
+    fn a_page_brings_the_panel_cut_short_to_the_far_edge_and_a_page_back_returns() {
+        // When you work, Turns, Cache, Compactions, Approvals, Workspaces,
+        // and Tools, stacked in an 18-row body.
+        let laid = laid(
+            18,
+            &[
+                (0, 11),
+                (12, 5),
+                (18, 4),
+                (23, 4),
+                (28, 6),
+                (35, 7),
+                (43, 8),
+            ],
+        );
+
+        assert_eq!(laid.page_down(0), 18, "Cache, cut short at the foot");
+        assert_eq!(laid.page_up(18), 0, "and back");
+        assert_eq!(laid.page_down(18), 33, "no further than the last rows");
+        assert_eq!(laid.page_up(33), 16, "Approvals, cut short at the top");
+    }
+
+    #[test]
+    fn a_panel_taller_than_the_body_pages_a_frame_at_a_time_either_way() {
+        let laid = laid(20, &[(5, 35), (41, 19)]);
+
+        // Bringing the tall panel to the top would move only five rows.
+        assert_eq!(laid.page_down(0), 20);
+        assert_eq!(laid.page_down(20), 40);
+        assert_eq!(laid.page_up(40), 20);
+        assert_eq!(laid.page_up(20), 0);
+    }
+
+    #[test]
+    fn a_page_past_either_end_stays_there() {
+        let ends = laid(18, &[(0, 11), (12, 5), (18, 4), (23, 4)]);
+
+        assert_eq!(ends.page_up(0), 0);
+        assert_eq!(ends.page_down(ends.furthest()), ends.furthest());
+        assert_eq!(laid(18, &[(0, 11), (12, 5)]).page_down(0), 0, "all in view");
+    }
 
     /// The layout places each panel once, so each has a place of its own.
     #[test]

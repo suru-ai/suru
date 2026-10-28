@@ -9730,8 +9730,6 @@ impl Application {
         self.read_metrics_tab_lacking()
     }
 
-    /// Acts on the open Usage Metrics view's Insights, which reads nothing:
-    /// the report shown holds every panel's figures.
     /// Scrolls an Insights panel's rows a row `to`; where they stand at
     /// that end already, or all in view, the panels scroll through the
     /// body a wheel's step instead, so the wheel carries on past a panel's
@@ -9748,6 +9746,8 @@ impl Application {
         })
     }
 
+    /// Acts on the open Usage Metrics view's Insights, which reads nothing:
+    /// the report shown holds every panel's figures.
     fn act_on_metrics_insights(
         &mut self,
         act: impl FnOnce(&mut InsightsView, &Outlook, MetricsRange),

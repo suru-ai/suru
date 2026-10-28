@@ -411,3 +411,29 @@ fn a_panel_scrolled_out_of_view_takes_no_click() {
         "the panel shown there is the one focused"
     );
 }
+
+#[test]
+fn a_frame_that_grows_and_shrinks_again_or_a_new_range_scrolls_back_to_the_top() {
+    let mut application = on_insights(Ok(worked()));
+    rendered_application_buffer(&application, NARROW, SHORT);
+    for _ in 0..5 {
+        key(&mut application, KeyCode::PageDown);
+    }
+    assert!(!shows(&application, NARROW, SHORT, "When you work"));
+
+    rendered_application_buffer(&application, NARROW, TALL);
+    assert!(
+        shows_whole(&application, NARROW, SHORT, "When you work"),
+        "a frame tall enough for every panel settles the scroll at the top"
+    );
+
+    for _ in 0..5 {
+        key(&mut application, KeyCode::PageDown);
+    }
+    key(&mut application, KeyCode::Char('['));
+    key(&mut application, KeyCode::Char(']'));
+    assert!(
+        shows_whole(&application, NARROW, SHORT, "When you work"),
+        "a new range scrolls back to the top"
+    );
+}

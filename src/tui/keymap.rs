@@ -575,7 +575,7 @@ fn command_for_insights_wheel(
     panel: Option<InsightsPanel>,
     kind: MouseEventKind,
 ) -> Option<SemanticCommandId> {
-    let rows = match panel {
+    let scrolling = match panel {
         Some(panel @ (InsightsPanel::Tools | InsightsPanel::Workspaces)) => Some(panel),
         None
         | Some(
@@ -587,7 +587,7 @@ fn command_for_insights_wheel(
             | InsightsPanel::Delegation,
         ) => None,
     };
-    Some(match (rows, kind) {
+    Some(match (scrolling, kind) {
         (Some(panel), MouseEventKind::ScrollUp) => {
             SemanticCommandId::MetricsPanelScrollUp { panel }
         }
