@@ -15,9 +15,9 @@ use ratatui::{buffer::Buffer, style::Style};
 use suru::{
     protocol::{
         ApprovalInsights, CacheInsights, CompactionCounts, CompactionInsights, Cost,
-        DelegationInsights, FreedShare, InsightsQuery, InsightsReport, InsightsTool, Outlook,
-        QUARTER_HOUR_MS, QuarterHourTurns, RoleCost, ToolTally, TurnDurations, TurnInsights,
-        UsageMetricsInterval, UsageMetricsQuery,
+        DelegationInsights, EstimatedSaving, FreedShare, InsightsQuery, InsightsReport,
+        InsightsTool, Outlook, QUARTER_HOUR_MS, QuarterHourTurns, RoleCost, ToolTally,
+        TurnDurations, TurnInsights, UsageMetricsInterval, UsageMetricsQuery,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, InsightsPanel, MetricsTab,
@@ -94,7 +94,21 @@ fn worked() -> InsightsReport {
         compactions: worked_compactions(),
         approvals: worked_approvals(),
         delegation: worked_delegation(),
-        cache: CacheInsights::default(),
+        cache: worked_cache(),
+    }
+}
+
+/// The mockup's cache: 71% of 10M tokens of input read from cache, which
+/// saved about $1,104 at today's rates.
+fn worked_cache() -> CacheInsights {
+    CacheInsights {
+        fresh_input_tokens: Some(1_400_000),
+        cache_read_tokens: Some(7_100_000),
+        cache_write_tokens: Some(1_500_000),
+        saving: EstimatedSaving {
+            nano_usd: Some(1_104_000_000_000),
+            is_partial: false,
+        },
     }
 }
 
@@ -1088,6 +1102,12 @@ fn panels_stand_as_the_mockup_lays_them_out() {
         "Approvals stand beneath Compactions"
     );
     assert!(approvals.1 > compactions.1);
+    let cache = title_at(&application, " Cache ");
+    assert_eq!(
+        (cache.0, cache.1),
+        (turns.0, approvals.1),
+        "Cache stands beneath Turns, beside Approvals"
+    );
     let delegation = title_at(&application, " Delegation ");
     assert_eq!(
         delegation.0, approvals.0,
@@ -1264,4 +1284,65 @@ fn a_range_with_no_cost_says_so_in_the_delegation_panel() {
         delegation_panel(&application)[0],
         "No work priced in the last 30 days"
     );
+}
+
+fn cache_panel(application: &Application) -> Vec<String> {
+    panel_lines(application, " Cache ")
+}
+
+#[test]
+fn the_cache_panel_states_the_share_read_from_cache_and_the_estimated_saving() {
+    assert_eq!(
+        SemanticCommandId::MetricsPanelFocus(InsightsPanel::Cache).as_str(),
+        "metrics.panel.cache"
+    );
+    let application = on_insights(Ok(worked()));
+
+    assert_eq!(
+        cache_panel(&application),
+        vec!["71% of input from cache", "saved ≈ $1104.00 (est.)"]
+    );
+}
+
+#[test]
+fn a_saving_some_model_had_no_rates_for_says_so_with_a_plus() {
+    let mut report = worked();
+    report.cache.saving.is_partial = true;
+    let application = on_insights(Ok(report));
+
+    assert_eq!(cache_panel(&application)[1], "saved ≈ $1104.00+ (est.)");
+}
+
+#[test]
+fn cache_writes_that_cost_more_than_reads_saved_save_less_than_nothing() {
+    let mut report = worked();
+    report.cache.saving = EstimatedSaving {
+        nano_usd: Some(-2_000_000_000),
+        is_partial: false,
+    };
+    let application = on_insights(Ok(report));
+
+    assert_eq!(cache_panel(&application)[1], "saved ≈ −$2.00 (est.)");
+}
+
+#[test]
+fn a_saving_no_model_s_rates_could_estimate_is_left_unstated() {
+    let mut report = worked();
+    report.cache.saving = EstimatedSaving {
+        nano_usd: None,
+        is_partial: true,
+    };
+    let application = on_insights(Ok(report));
+
+    assert_eq!(
+        cache_panel(&application)[1],
+        "No rates to estimate a saving at"
+    );
+}
+
+#[test]
+fn a_range_with_no_input_says_so_in_the_cache_panel() {
+    let application = on_insights(Ok(InsightsReport::default()));
+
+    assert_eq!(cache_panel(&application)[0], "No input in the last 30 days");
 }

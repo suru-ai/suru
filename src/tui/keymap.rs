@@ -557,6 +557,7 @@ fn command_for_insights_panel_wheel(
             InsightsPanel::WhenYouWork
             | InsightsPanel::Turns
             | InsightsPanel::Compactions
+            | InsightsPanel::Cache
             | InsightsPanel::Approvals
             | InsightsPanel::Delegation,
             _,

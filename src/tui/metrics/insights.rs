@@ -22,6 +22,7 @@
 //! its range was cut in, once as it arrives rather than at every frame.
 
 mod approvals;
+mod cache;
 mod compactions;
 mod delegation;
 pub(super) mod heatmap;
@@ -58,6 +59,9 @@ pub enum InsightsPanel {
     /// How many Compactions there were, of each trigger and how many
     /// failed, and how much of the context they freed.
     Compactions,
+    /// How much of the input was read from cache, and an estimate of
+    /// what that saved.
+    Cache,
     /// How many Approvals were asked, and how each was decided.
     Approvals,
     /// How Cost divides between the user's own Sessions and the work
@@ -68,8 +72,8 @@ pub enum InsightsPanel {
 impl InsightsPanel {
     /// Every panel, in the order [`Self::GRID`] places them row by row
     /// across its two columns, which is the order focus moves among them.
-    pub(crate) const ALL: [Self; 6] = {
-        let mut all = [Self::WhenYouWork; 6];
+    pub(crate) const ALL: [Self; 7] = {
+        let mut all = [Self::WhenYouWork; 7];
         let mut placed = 0;
         let mut row = 0;
         while row < Self::GRID.len() {
@@ -88,17 +92,16 @@ impl InsightsPanel {
     };
 
     /// Where each panel stands in an interim grid of two columns, row by
-    /// row, keeping to the neighbours the Insights mockup gives the panels
-    /// built so far: the empty place beside Approvals is the Cache panel's,
-    /// yet to be, and Delegation stands in the right-hand column, as it
-    /// stands beneath Tools in the mockup. The place beside Delegation is
+    /// row, keeping to the neighbours the Insights mockup gives the panels:
+    /// Cache beneath Turns and beside Approvals, and Delegation in the
+    /// right-hand column, as it stands beneath Tools in the mockup. The place beside Delegation is
     /// empty only because the grid is interim: the mockup's three-column
     /// layout (#579) puts the small panels side by side beneath When you
     /// work, and Delegation beneath Tools.
     pub(super) const GRID: [[Option<Self>; 2]; 4] = [
         [Some(Self::WhenYouWork), Some(Self::Tools)],
         [Some(Self::Turns), Some(Self::Compactions)],
-        [None, Some(Self::Approvals)],
+        [Some(Self::Cache), Some(Self::Approvals)],
         [None, Some(Self::Delegation)],
     ];
 
@@ -115,6 +118,7 @@ impl InsightsPanel {
             Self::Turns => "Turns",
             Self::Tools => "Tools used",
             Self::Compactions => "Compactions",
+            Self::Cache => "Cache",
             Self::Approvals => "Approvals",
             Self::Delegation => "Delegation (Cost)",
         }
@@ -127,7 +131,7 @@ impl InsightsPanel {
             Self::WhenYouWork => heatmap::items(&kept.heatmap),
             Self::Turns => turns::items(&kept.report.turns),
             Self::Tools => tools::items(&kept.report.tools),
-            Self::Compactions | Self::Approvals | Self::Delegation => 0,
+            Self::Compactions | Self::Cache | Self::Approvals | Self::Delegation => 0,
         }
     }
 
@@ -136,7 +140,7 @@ impl InsightsPanel {
         match self {
             Self::WhenYouWork => heatmap::HOURS,
             Self::Turns => crate::protocol::TURN_DURATION_BINS,
-            Self::Tools | Self::Compactions | Self::Approvals | Self::Delegation => 1,
+            Self::Tools | Self::Compactions | Self::Cache | Self::Approvals | Self::Delegation => 1,
         }
     }
 
@@ -147,6 +151,7 @@ impl InsightsPanel {
             Self::WhenYouWork
             | Self::Turns
             | Self::Compactions
+            | Self::Cache
             | Self::Approvals
             | Self::Delegation => None,
             Self::Tools => Some(tools::SHOWN),
