@@ -15,14 +15,14 @@ use ratatui::style::Color;
 use suru::{
     managed_client::{ManagedEvent, RecoveryStatus},
     protocol::{
-        EffectiveSettings, KeyedUsageMetrics, ModelId, Outlook, ProviderId, SessionTimestamp,
+        Cost, EffectiveSettings, KeyedUsageMetrics, ModelId, Outlook, ProviderId, SessionTimestamp,
         SidebarVisibility, UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsBucket,
         UsageMetricsInterval, UsageMetricsKey, UsageMetricsKeyLabel, UsageMetricsQuery,
         UsageMetricsReport,
     },
     tui::{
-        Application, ApplicationEvent, ApplicationTransition, CommandId, MetricsRange,
-        SemanticCommandId, UsageMetricsReadRefusal,
+        Application, ApplicationEvent, ApplicationTransition, CommandId, MetricsMeasure,
+        MetricsRange, SemanticCommandId, UsageMetricsReadRefusal,
     },
 };
 use uuid::Uuid;
@@ -153,6 +153,11 @@ fn report(query: &UsageMetricsQuery) -> UsageMetricsReport {
     }
 }
 
+/// Shows the Tokens measure, which reads nothing again.
+fn show_tokens(application: &mut Application) {
+    assert_eq!(press(application, 't'), ApplicationTransition::Continue);
+}
+
 fn screen(application: &Application) -> Vec<String> {
     rendered_application_rows_at(application, WIDTH, HEIGHT)
 }
@@ -241,12 +246,13 @@ fn a_report_draws_stacked_bars_over_a_nice_axis_with_a_legend() {
     let mut application = reader_in(NEW_YORK, afternoon());
     let (_, request_id, query) = ask(&mut application);
     answer(&mut application, request_id, Ok(report(&query)));
+    show_tokens(&mut application);
 
     let rows = screen(&application);
     let shown = rows.join("\n");
     eprintln!("{shown}");
     assert!(rows[0].trim_end().ends_with("esc ✕"), "{shown}");
-    let controls = row(&rows, "Tokens by Model");
+    let controls = row(&rows, "by Model");
     assert!(
         controls.starts_with("  Today   7 days  ▐30 days▌  Year   All time"),
         "the range bar, thirty days chosen: {controls:?}"
@@ -305,6 +311,7 @@ fn each_bar_stacks_its_models_largest_first_in_theme_colours_to_an_eighth_of_a_r
     let mut application = reader_in(NEW_YORK, afternoon());
     let (_, request_id, query) = ask(&mut application);
     answer(&mut application, request_id, Ok(report(&query)));
+    show_tokens(&mut application);
 
     let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
     let (axis_x, axis_y) = text_position(&buffer, "└");
@@ -379,6 +386,7 @@ fn colours_follow_the_series_order_not_the_order_the_report_lists_them_in() {
             }
         }
         answer(&mut application, request_id, Ok(report));
+        show_tokens(&mut application);
         let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
         ["Claude Opus 5.5", "GPT-5.5 Codex", "copilot · GPT-5.5"].map(|label| {
             let (x, y) = text_position(&buffer, label);
@@ -460,7 +468,7 @@ fn a_refused_refresh_keeps_the_figures_and_says_why_above_them() {
 
     let rows = screen(&application);
     row(&rows, "Claude Opus 5.5");
-    let controls = rendered_row(&rows, "Tokens by Model");
+    let controls = rendered_row(&rows, "by Model");
     let note = rendered_row(&rows, "Could not refresh: connection refused");
     assert_eq!(note, controls + 1, "beneath the controls");
     assert!(!rows.join("\n").contains("Refreshing…"));
@@ -485,6 +493,7 @@ fn a_wide_label_leaves_the_legend_s_figures_aligned() {
     let mut report = report(&query);
     report.keys[1].label = "模型 Codex".to_owned();
     answer(&mut application, request_id, Ok(report));
+    show_tokens(&mut application);
 
     let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
     let column = |figure: &str| {
@@ -1091,7 +1100,7 @@ fn brackets_clicks_and_the_wheel_choose_ranges_as_the_keys_do() {
         rendered_application_buffer(&application, WIDTH, HEIGHT);
         let (_, _, query) = expect_read(act(&mut application));
         let rows = screen(&application);
-        (query.buckets, row(&rows, "Tokens by Model").to_owned())
+        (query.buckets, row(&rows, "by Model").to_owned())
     };
     let semantic = |command| move |application: &mut Application| invoke(application, command);
     let chart = |application: &Application| {
@@ -1268,4 +1277,231 @@ fn a_range_chosen_while_the_remote_is_unreachable_is_refused_in_the_view() {
     let rows = screen(&application);
     row(&rows, "▐7 days▌");
     row(&rows, "studio is unreachable");
+}
+
+/// `report`'s thirty days, priced: Opus at a dollar for each million tokens
+/// it took, Codex at two, all of it Estimated, and Copilot not at all, so
+/// every day it worked leaves its figures partial. Over the range that is
+/// $90 of Opus and $30 of Codex, and the busiest day holds $7.
+fn priced_report(query: &UsageMetricsQuery) -> UsageMetricsReport {
+    let mut report = report(query);
+    for bucket in &mut report.buckets {
+        let mut total = UsageMetricsAggregate {
+            cost: None,
+            ..bucket.total
+        };
+        for keyed in &mut bucket.by_key {
+            let tokens = keyed.aggregate.fresh_input_tokens.unwrap_or(0);
+            let aggregate = &mut keyed.aggregate;
+            if keyed.key == opus() {
+                aggregate.cost = Some(Cost::from_nano_usd(tokens * 1_000));
+            } else if keyed.key == codex() {
+                aggregate.cost = Some(Cost::from_nano_usd(tokens * 2_000));
+                aggregate.estimated_cost = aggregate.cost;
+            } else {
+                aggregate.is_cost_partial = tokens > 0;
+            }
+            if let Some(cost) = aggregate.cost {
+                total.cost = Some(total.cost.map_or(cost, |held| held.saturating_add(cost)));
+            }
+            total.is_cost_partial |= aggregate.is_cost_partial;
+        }
+        bucket.total = total;
+    }
+    report
+}
+
+#[test]
+fn cost_is_shown_first_in_dollars_with_a_plus_after_every_partial_figure() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(priced_report(&query)));
+
+    let rows = screen(&application);
+    let shown = rows.join("\n");
+    eprintln!("{shown}");
+    let controls = row(&rows, "by Model");
+    assert!(
+        controls.contains("▐Cost▌  Tokens"),
+        "Cost chosen beside the range bar: {controls:?}"
+    );
+    // The busiest day holds $7, so the axis climbs a dollar a tick.
+    for tick in ["$1.00", "$7.00"] {
+        assert!(
+            rows.iter()
+                .any(|row| row.trim_start().starts_with(&format!("{tick} ┤"))),
+            "a tick at {tick}: {shown}"
+        );
+    }
+    assert!(!shown.contains("$8.00 ┤"), "{shown}");
+    row(&rows, "Last 30 days · $120.00+");
+    for (label, figures) in [
+        ("Claude Opus 5.5", ["$90.00 ", "75%"]),
+        ("GPT-5.5 Codex", ["$30.00 ", "25%"]),
+        ("copilot · GPT-5.5", ["$0.00+", "0%"]),
+    ] {
+        let line = row(&rows, label);
+        for figure in figures {
+            assert!(line.contains(figure), "{figure} in {line:?}");
+        }
+    }
+    let legend_at = |label: &str| rendered_row(&rows, label);
+    assert!(legend_at("Claude Opus 5.5") < legend_at("GPT-5.5 Codex"));
+    assert!(legend_at("GPT-5.5 Codex") < legend_at("copilot · GPT-5.5"));
+}
+
+#[test]
+fn work_with_no_known_cost_is_not_shown_as_no_usage() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    let mut report = empty_report(&query, None);
+    report.keys = vec![UsageMetricsKeyLabel {
+        key: copilot(),
+        label: "copilot · GPT-5.5".to_owned(),
+    }];
+    let unpriced = UsageMetricsAggregate {
+        is_cost_partial: true,
+        ..tokens(1_000)
+    };
+    report.buckets[29] = UsageMetricsBucket {
+        total: unpriced,
+        by_key: vec![KeyedUsageMetrics {
+            key: copilot(),
+            aggregate: unpriced,
+        }],
+    };
+    answer(&mut application, request_id, Ok(report));
+
+    let rows = screen(&application);
+    assert!(!rows.join("\n").contains("No Usage"), "{rows:#?}");
+    row(&rows, "Last 30 days · $0.00+");
+}
+
+#[test]
+fn measure_keys_tab_and_clicks_choose_a_measure_without_reading_again() {
+    assert_eq!(
+        [
+            SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Cost),
+            SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Tokens),
+            SemanticCommandId::MetricsMeasureNext,
+        ]
+        .map(SemanticCommandId::as_str),
+        [
+            "metrics.measure.cost",
+            "metrics.measure.tokens",
+            "metrics.measure.next",
+        ]
+    );
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(priced_report(&query)));
+    let shows = |application: &Application, chosen: &str, total: &str| {
+        let rows = screen(application);
+        let controls = row(&rows, "by Model");
+        assert!(controls.contains(chosen), "{chosen} in {controls:?}");
+        row(&rows, total);
+    };
+    let tokens = ("▐Tokens▌", "Last 30 days · 109M tokens");
+    let cost = ("▐Cost▌", "Last 30 days · $120.00+");
+    shows(&application, cost.0, cost.1);
+    let label_at = |application: &Application, label: &str| {
+        let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+        let (_, controls_y) = text_position(&buffer, "by Model");
+        let rows = screen(application);
+        let x = rows[usize::from(controls_y)].find(label).unwrap();
+        // The row holds wide glyphs before the label: count its columns.
+        let x = unicode_width::UnicodeWidthStr::width(&rows[usize::from(controls_y)][..x]);
+        (u16::try_from(x).unwrap(), controls_y)
+    };
+
+    // Every way of choosing a measure shows it at once, reading nothing.
+    for (act, expected) in [
+        (
+            Box::new(|application: &mut Application| press(application, 't'))
+                as Box<dyn Fn(&mut Application) -> ApplicationTransition>,
+            tokens,
+        ),
+        (
+            Box::new(|application: &mut Application| press(application, 'c')),
+            cost,
+        ),
+        (
+            Box::new(|application: &mut Application| key(application, KeyCode::Tab)),
+            tokens,
+        ),
+        (
+            Box::new(|application: &mut Application| key(application, KeyCode::Tab)),
+            cost,
+        ),
+        (
+            Box::new(|application: &mut Application| {
+                let at = label_at(application, "Tokens");
+                press_at(application, at)
+            }),
+            tokens,
+        ),
+        (
+            Box::new(|application: &mut Application| {
+                let at = label_at(application, "Cost");
+                press_at(application, at)
+            }),
+            cost,
+        ),
+        (
+            Box::new(|application: &mut Application| {
+                invoke(
+                    application,
+                    SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Tokens),
+                )
+            }),
+            tokens,
+        ),
+        (
+            Box::new(|application: &mut Application| {
+                invoke(application, SemanticCommandId::MetricsMeasureNext)
+            }),
+            cost,
+        ),
+    ] {
+        assert_eq!(act(&mut application), ApplicationTransition::Continue);
+        shows(&application, expected.0, expected.1);
+    }
+
+    // The keys name the very commands the invocations do; a click is
+    // resolved where it is released, and lands as they do above.
+    let command_for = |event| application.command_for_terminal_input(event);
+    let semantic_command = |command| Some(CommandId::InvokeSemantic(command));
+    let key_event = |code| InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE));
+    assert_eq!(
+        command_for(key_event(KeyCode::Char('c'))),
+        semantic_command(SemanticCommandId::MetricsMeasureSelect(
+            MetricsMeasure::Cost
+        ))
+    );
+    assert_eq!(
+        command_for(key_event(KeyCode::Char('t'))),
+        semantic_command(SemanticCommandId::MetricsMeasureSelect(
+            MetricsMeasure::Tokens
+        ))
+    );
+    assert_eq!(
+        command_for(key_event(KeyCode::Tab)),
+        semantic_command(SemanticCommandId::MetricsMeasureNext)
+    );
+}
+
+#[test]
+fn the_measure_outlives_the_view_and_is_chosen_while_a_read_is_on_its_way() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    // Chosen before the report lands, it reads nothing, and the report
+    // still lands under the read asked for.
+    show_tokens(&mut application);
+    answer(&mut application, request_id, Ok(priced_report(&query)));
+    row(&screen(&application), "Last 30 days · 109M tokens");
+
+    key(&mut application, KeyCode::Esc);
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(priced_report(&query)));
+    row(&screen(&application), "Last 30 days · 109M tokens");
 }

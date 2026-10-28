@@ -10,33 +10,70 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    protocol::{UsageMetricsAggregate, UsageMetricsReport},
+    protocol::{Cost, UsageMetricsAggregate, UsageMetricsReport},
     theme::Theme,
 };
 
 use super::{
-    super::usage::compact_count,
+    super::usage::{compact_cost, compact_count},
     calendar::{BucketUnit, CalendarBucket, RangeBuckets},
 };
 
-/// What the y-axis measures.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum MetricsMeasure {
-    /// The blended token figure every other surface shows.
+/// What the y-axis measures. Every report carries them all, so choosing
+/// one reads nothing.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum MetricsMeasure {
+    /// Cost, in billionths of a dollar, as Cost Coverage counts it.
     #[default]
+    Cost,
+    /// The blended token figure every other surface shows.
     Tokens,
 }
 
 impl MetricsMeasure {
+    /// Every measure, in the order the view offers them.
+    pub const ALL: [Self; 2] = [Self::Cost, Self::Tokens];
+
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::Cost => "Cost",
             Self::Tokens => "Tokens",
         }
     }
 
+    /// The measure after this one, the last turning back to the first.
+    pub(crate) fn next(self) -> Self {
+        Self::ALL[(self.place() + 1) % Self::ALL.len()]
+    }
+
+    pub(crate) fn place(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|measure| *measure == self)
+            .expect("every measure is listed")
+    }
+
     fn value(self, aggregate: &UsageMetricsAggregate) -> u64 {
         match self {
+            Self::Cost => aggregate.cost.map_or(0, Cost::nano_usd),
             Self::Tokens => aggregate.blended_tokens().unwrap_or(0),
+        }
+    }
+
+    /// Whether `aggregate`'s figure says less than its Turns consumed.
+    fn is_partial(self, aggregate: &UsageMetricsAggregate) -> bool {
+        match self {
+            Self::Cost => aggregate.is_cost_partial,
+            Self::Tokens => false,
+        }
+    }
+
+    /// The smallest step the y-axis climbs by: a cent, the least a Cost is
+    /// written to, and a single token.
+    fn resolution(self) -> u64 {
+        match self {
+            Self::Cost => 10_000_000,
+            Self::Tokens => 1,
         }
     }
 
@@ -44,14 +81,22 @@ impl MetricsMeasure {
     /// writes it.
     pub(crate) fn format(self, value: u64) -> String {
         match self {
+            Self::Cost => compact_cost(Cost::from_nano_usd(value)),
             Self::Tokens => compact_count(value),
         }
     }
 
+    /// A figure, with a `+` after it where it says less than was consumed.
+    pub(crate) fn figure(self, value: u64, is_partial: bool) -> String {
+        let figure = self.format(value);
+        if is_partial { figure + "+" } else { figure }
+    }
+
     /// A range's whole, named in the measure's unit.
-    pub(crate) fn total(self, value: u64) -> String {
+    pub(crate) fn total(self, value: u64, is_partial: bool) -> String {
         match self {
-            Self::Tokens => format!("{} tokens", compact_count(value)),
+            Self::Cost => self.figure(value, is_partial),
+            Self::Tokens => format!("{} tokens", self.figure(value, is_partial)),
         }
     }
 }
@@ -64,6 +109,9 @@ pub(crate) struct Series {
     /// The series' figure in each bucket, in the order of the buckets.
     pub(crate) values: Vec<u64>,
     pub(crate) total: u64,
+    /// Whether the total says less than the key's Turns consumed, as a
+    /// partial Cost does.
+    pub(crate) is_partial: bool,
 }
 
 /// The series a report stacks, bottom first: the largest range total at the
@@ -79,7 +127,7 @@ pub(crate) fn series(
         .keys
         .iter()
         .map(|label| {
-            let values: Vec<u64> = report
+            let parts: Vec<Option<&UsageMetricsAggregate>> = report
                 .buckets
                 .iter()
                 .map(|bucket| {
@@ -87,13 +135,21 @@ pub(crate) fn series(
                         .by_key
                         .iter()
                         .find(|keyed| keyed.key == label.key)
-                        .map_or(0, |keyed| measure.value(&keyed.aggregate))
+                        .map(|keyed| &keyed.aggregate)
                 })
+                .collect();
+            let values: Vec<u64> = parts
+                .iter()
+                .map(|part| part.map_or(0, |aggregate| measure.value(aggregate)))
                 .collect();
             Series {
                 label: label.label.clone(),
                 color: Color::Reset,
-                total: values.iter().sum(),
+                total: values.iter().copied().fold(0, u64::saturating_add),
+                is_partial: parts
+                    .iter()
+                    .flatten()
+                    .any(|aggregate| measure.is_partial(aggregate)),
                 values,
             }
         })
@@ -104,6 +160,16 @@ pub(crate) fn series(
         series.color = palette[place % palette.len()];
     }
     series
+}
+
+/// Whether `report` holds nothing any measure could plot: no Usage, no Cost,
+/// and no work whose Cost is unknown.
+pub(crate) fn holds_nothing(report: &UsageMetricsReport) -> bool {
+    report.buckets.iter().all(|bucket| {
+        MetricsMeasure::ALL
+            .into_iter()
+            .all(|measure| measure.value(&bucket.total) == 0 && !measure.is_partial(&bucket.total))
+    })
 }
 
 /// The colours series take in turn: the Theme's accent, then the bright
@@ -287,8 +353,14 @@ pub(crate) fn render_chart(
         .map(|index| series.iter().map(|series| series.values[index]).sum())
         .collect();
     let max = totals.iter().copied().max().unwrap_or(0);
-    // A tick every other row at most, so the axis never reads as a ladder.
-    let axis = nice_axis(max, u64::from(plot_rows / 2).max(1));
+    // A tick every other row at most, so the axis never reads as a ladder,
+    // and none finer than the measure can write.
+    let resolution = measure.resolution();
+    let axis = nice_axis(max.div_ceil(resolution), u64::from(plot_rows / 2).max(1));
+    let axis = Axis {
+        top: axis.top.saturating_mul(resolution),
+        step: axis.step.saturating_mul(resolution),
+    };
     let ticks = u16::try_from(axis.ticks()).unwrap_or(u16::MAX).max(1);
     let rows_per_tick = (plot_rows / ticks).max(1);
     let plot_rows = rows_per_tick.saturating_mul(ticks).min(plot_rows);

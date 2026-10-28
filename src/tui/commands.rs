@@ -3,7 +3,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
 
-use super::{metrics::calendar::MetricsRange, text_layout::CursorTarget};
+use super::{
+    metrics::{calendar::MetricsRange, chart::MetricsMeasure},
+    text_layout::CursorTarget,
+};
 
 use crate::protocol::{
     ApprovalId, AttachmentId, Outlook, QuestionnaireId, SessionReference, TurnId, WorkspaceId,
@@ -115,6 +118,12 @@ pub enum SemanticCommandId {
     MetricsRangeNext,
     /// Shows the range before the Usage Metrics view's in its range bar.
     MetricsRangePrevious,
+    /// Plots one measure in the Usage Metrics view, from the figures it
+    /// already holds.
+    MetricsMeasureSelect(MetricsMeasure),
+    /// Plots the measure after the Usage Metrics view's, the last turning
+    /// back to the first.
+    MetricsMeasureNext,
     /// Opens the Icon Picker over a Session, which the picker only does while
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
     /// menu item stays quiet rather than opening a picker no glyph could draw.
@@ -673,6 +682,11 @@ impl SemanticCommandId {
             },
             Self::MetricsRangeNext => "metrics.range.next",
             Self::MetricsRangePrevious => "metrics.range.previous",
+            Self::MetricsMeasureSelect(measure) => match measure {
+                MetricsMeasure::Cost => "metrics.measure.cost",
+                MetricsMeasure::Tokens => "metrics.measure.tokens",
+            },
+            Self::MetricsMeasureNext => "metrics.measure.next",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::SessionRename => "session.rename",
@@ -927,6 +941,22 @@ const fn metrics_range_descriptor(
         title,
         reach: SemanticReach::Client,
         description: "Show one range in the Usage Metrics view",
+        slash: None,
+        keybinding: None,
+    }
+}
+
+/// A report carries every measure, so choosing one reads nothing and
+/// reaches only the Client.
+const fn metrics_measure_descriptor(
+    measure: MetricsMeasure,
+    title: &'static str,
+) -> SemanticCommandDescriptor {
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsMeasureSelect(measure),
+        title,
+        reach: SemanticReach::Client,
+        description: "Plot one measure in the Usage Metrics view",
         slash: None,
         keybinding: None,
     }
@@ -1797,6 +1827,16 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Previous Metrics Range",
         reach: SemanticReach::Client,
         description: "Show the previous, shorter range in the Usage Metrics view",
+        slash: None,
+        keybinding: None,
+    },
+    metrics_measure_descriptor(MetricsMeasure::Cost, "Show Cost Metrics"),
+    metrics_measure_descriptor(MetricsMeasure::Tokens, "Show Token Metrics"),
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsMeasureNext,
+        title: "Next Metrics Measure",
+        reach: SemanticReach::Client,
+        description: "Plot the next measure in the Usage Metrics view",
         slash: None,
         keybinding: None,
     },

@@ -76,6 +76,7 @@ use super::{
     },
     metrics::{
         MetricsView, Receipt as MetricsReceipt, UsageMetricsReadRefusal, calendar::MetricsRange,
+        chart::MetricsMeasure,
     },
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
@@ -9574,6 +9575,15 @@ impl Application {
         }
     }
 
+    /// Plots `measure` in the open Usage Metrics view, as a range is chosen
+    /// only there.
+    fn choose_metrics_measure(&mut self, measure: MetricsMeasure) {
+        let view = &mut self.state.metrics_view;
+        if view.is_open() {
+            view.choose_measure(measure);
+        }
+    }
+
     /// Asks the Server the Outlook is turned toward for the Usage Metrics
     /// view's buckets, cut by the reader's calendar now.
     fn read_usage_metrics(&mut self) -> ApplicationTransition {
@@ -11431,6 +11441,15 @@ impl Application {
             SemanticCommandId::MetricsRangePrevious => {
                 let range = self.state.metrics_view.range().previous();
                 Ok(self.choose_metrics_range(range))
+            }
+            // The report holds every measure, so none is read for.
+            SemanticCommandId::MetricsMeasureSelect(measure) => {
+                self.choose_metrics_measure(measure);
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::MetricsMeasureNext => {
+                self.choose_metrics_measure(self.state.metrics_view.measure().next());
+                Ok(ApplicationTransition::Continue)
             }
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,

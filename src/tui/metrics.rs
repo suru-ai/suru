@@ -103,6 +103,8 @@ struct Targets {
     close: Option<Rect>,
     /// Each range's place in the range bar, in [`MetricsRange::ALL`] order.
     ranges: [Option<Rect>; MetricsRange::ALL.len()],
+    /// Each measure's place beside it, in [`MetricsMeasure::ALL`] order.
+    measures: [Option<Rect>; MetricsMeasure::ALL.len()],
     /// The chart, or where it stands while there is none to draw.
     chart: Option<Rect>,
 }
@@ -112,6 +114,7 @@ struct Targets {
 pub(super) enum MetricsTarget {
     Close,
     Range(MetricsRange),
+    Measure(MetricsMeasure),
     Chart,
 }
 
@@ -275,6 +278,12 @@ impl MetricsView {
         self.measure
     }
 
+    /// Chooses what the chart plots, from the figures the view already
+    /// holds: a report carries every measure.
+    pub(super) fn choose_measure(&mut self, measure: MetricsMeasure) {
+        self.measure = measure;
+    }
+
     /// Whether a read is on its way.
     pub(super) fn is_reading(&self) -> bool {
         self.asked.is_some()
@@ -301,6 +310,10 @@ impl MetricsView {
         self.update_targets(|targets| targets.ranges[range.place()] = Some(area));
     }
 
+    pub(super) fn record_measure_target(&self, measure: MetricsMeasure, area: Rect) {
+        self.update_targets(|targets| targets.measures[measure.place()] = Some(area));
+    }
+
     pub(super) fn record_chart_target(&self, area: Rect) {
         self.update_targets(|targets| targets.chart = Some(area));
     }
@@ -323,6 +336,12 @@ impl MetricsView {
             .find(|range| on(targets.ranges[range.place()]))
         {
             return Some(MetricsTarget::Range(range));
+        }
+        if let Some(measure) = MetricsMeasure::ALL
+            .into_iter()
+            .find(|measure| on(targets.measures[measure.place()]))
+        {
+            return Some(MetricsTarget::Measure(measure));
         }
         on(targets.chart).then_some(MetricsTarget::Chart)
     }

@@ -1,7 +1,7 @@
 //! Draws the Usage Metrics view over the whole frame: a title bar with its
-//! close control, the range bar, then the chart and its legend, or what
-//! stands in for them while a read is on its way, when it was refused, or
-//! when the range holds no Usage.
+//! close control, the range bar and the measures beside it, then the chart
+//! and its legend, or what stands in for them while a read is on its way,
+//! when it was refused, or when the range holds no Usage.
 
 use ratatui::{
     Frame,
@@ -16,7 +16,7 @@ use super::{
     super::slots::truncate_to_width,
     MetricsContent, MetricsView, UsageMetricsReadRefusal,
     calendar::MetricsRange,
-    chart::{self, Series},
+    chart::{self, MetricsMeasure, Series},
 };
 
 /// The close control, pointable as a whole.
@@ -28,10 +28,10 @@ const INSET: u16 = 2;
 const LEGEND_BAR: u16 = 24;
 /// Labels in the legend are cut to this many columns.
 const LEGEND_LABEL: usize = 32;
-/// Columns between the range bar and what follows it on its row.
+/// Columns between a row of tabs and what follows it on the controls row.
 const CONTROL_GAP: u16 = 4;
-/// Columns between one range's place in the range bar and the next's.
-const RANGE_GAP: u16 = 1;
+/// Columns between one tab's place in a row of them and the next's.
+const TAB_GAP: u16 = 1;
 
 pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &Theme) {
     let area = frame.area();
@@ -59,9 +59,23 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
     let range = view.range();
     let measure = view.measure();
     let controls_y = area.y + 3;
-    let bar_end = render_range_bar(buffer, area.x + INSET - 1, controls_y, view, theme);
-    let subtitle = format!("{} by Model", measure.label());
-    buffer.set_string(bar_end + CONTROL_GAP, controls_y, &subtitle, subdued);
+    let bar_end = render_tabs(
+        buffer,
+        area.x + INSET - 1,
+        controls_y,
+        MetricsRange::ALL.map(|chosen| (chosen.label(), chosen == range)),
+        |place, at| view.record_range_target(MetricsRange::ALL[place], at),
+        theme,
+    );
+    let measures_end = render_tabs(
+        buffer,
+        bar_end + CONTROL_GAP - 1,
+        controls_y,
+        MetricsMeasure::ALL.map(|chosen| (chosen.label(), chosen == measure)),
+        |place, at| view.record_measure_target(MetricsMeasure::ALL[place], at),
+        theme,
+    );
+    buffer.set_string(measures_end + CONTROL_GAP, controls_y, "by Model", subdued);
     // What is happening to the figures shown takes the row under the
     // controls, where it has the whole width to say it in.
     let status_y = controls_y + 1;
@@ -105,12 +119,15 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
             buffer.set_string(body.x, body.y + 1, reason, theme.feedback.error);
         }
         MetricsContent::Report { buckets, report } => {
-            let series = chart::series(report, measure, theme);
-            let total: u64 = series.iter().map(|series| series.total).sum();
-            if total == 0 {
+            if chart::holds_nothing(report) {
                 buffer.set_string(body.x, body.y, range.no_usage(), subdued);
                 return;
             }
+            let series = chart::series(report, measure, theme);
+            let total = series
+                .iter()
+                .map(|series| series.total)
+                .fold(0, u64::saturating_add);
             let legend_rows = u16::try_from(series.len() + 1).unwrap_or(u16::MAX);
             let chart_rows = body.height.saturating_sub(legend_rows + 1).min(24);
             let chart_area = Rect::new(body.x, body.y, body.width, chart_rows);
@@ -127,22 +144,22 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
     }
 }
 
-/// Every range from `x` along row `y`, each a label with a column either side
-/// that a pointer can choose it by, the chosen one drawn as a filled tab in
-/// those columns, so no label moves as the choice does. Answers the column
-/// after the last.
-fn render_range_bar(
+/// Every tab from `x` along row `y`, each a label with a column either side
+/// that a pointer can choose it by, recorded by its place in `tabs`, the
+/// chosen one drawn as a filled tab in those columns, so no label moves as
+/// the choice does. Answers the column after the last.
+fn render_tabs<const N: usize>(
     buffer: &mut ratatui::buffer::Buffer,
     mut x: u16,
     y: u16,
-    view: &MetricsView,
+    tabs: [(&str, bool); N],
+    record: impl Fn(usize, Rect),
     theme: &Theme,
 ) -> u16 {
     let accent = theme.accent.primary;
-    for range in MetricsRange::ALL {
-        let label = range.label();
+    for (place, (label, chosen)) in tabs.into_iter().enumerate() {
         let label_width = u16::try_from(label.width()).unwrap_or(u16::MAX);
-        if range == view.range() {
+        if chosen {
             buffer.set_string(x, y, "▐", accent);
             buffer.set_string(
                 x + 1,
@@ -155,10 +172,10 @@ fn render_range_bar(
             buffer.set_string(x + 1, y, label, theme.text.subdued);
         }
         let width = label_width + 2;
-        view.record_range_target(range, Rect::new(x, y, width, 1));
-        x += width + RANGE_GAP;
+        record(place, Rect::new(x, y, width, 1));
+        x += width + TAB_GAP;
     }
-    x - RANGE_GAP
+    x - TAB_GAP
 }
 
 /// A heading naming the range's whole, then one row per series from the
@@ -180,7 +197,11 @@ fn render_legend(
     buffer.set_string(
         area.x,
         area.y,
-        format!("{} · {}", view.range().title(), measure.total(total)),
+        format!(
+            "{} · {}",
+            view.range().title(),
+            measure.total(total, series.iter().any(|series| series.is_partial))
+        ),
         theme.text.primary.add_modifier(Modifier::BOLD),
     );
     let label_width = series
@@ -191,7 +212,7 @@ fn render_legend(
         .min(LEGEND_LABEL);
     let values: Vec<String> = series
         .iter()
-        .map(|series| measure.format(series.total))
+        .map(|series| measure.figure(series.total, series.is_partial))
         .collect();
     let value_width = values.iter().map(|value| value.width()).max().unwrap_or(0);
     let largest = series.first().map_or(0, |series| series.total).max(1);
