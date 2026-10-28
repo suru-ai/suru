@@ -455,7 +455,6 @@ fn tab_or_a_click_focuses_a_panel_and_highlights_its_border() {
     );
     assert_eq!(turns_border(&application), unfocused);
     press_tab(&mut application);
-    press_tab(&mut application);
     let focused = turns_border(&application);
     assert_ne!(focused, unfocused, "the focused panel's border stands out");
     assert_eq!(
@@ -463,10 +462,9 @@ fn tab_or_a_click_focuses_a_panel_and_highlights_its_border() {
         ApplicationTransition::Continue
     );
     assert_eq!(
-        (tools_border(&application), turns_border(&application)),
+        (heatmap_border(&application), turns_border(&application)),
         (focused, unfocused)
     );
-    key(&mut application, KeyCode::BackTab);
     key(&mut application, KeyCode::BackTab);
     assert_eq!(
         (
@@ -488,9 +486,9 @@ fn press_tab(application: &mut Application) -> ApplicationTransition {
     key(application, KeyCode::Tab)
 }
 
-/// Tabs through When you work and Tools to the Turns panel.
+/// Tabs through When you work to the Turns panel.
 fn tab_to_turns(application: &mut Application) {
-    for _ in 0..3 {
+    for _ in 0..2 {
         press_tab(application);
     }
 }
@@ -510,11 +508,11 @@ fn esc_clears_the_selection_then_leaves_the_panel_then_closes_the_view() {
     let focused = turns_border(&application);
     key(&mut application, KeyCode::Right);
     key(&mut application, KeyCode::Right);
-    row(&screen(&application), "10–30s · 30 Turns");
+    row(&screen(&application), "10–30s · 30 · ");
 
     key(&mut application, KeyCode::Esc);
     let rows = screen(&application);
-    assert!(!rows.iter().any(|row| row.contains("10–30s · 30 Turns")));
+    assert!(!rows.iter().any(|row| row.contains("10–30s · 30 · ")));
     assert_eq!(turns_border(&application), focused, "the panel keeps focus");
 
     key(&mut application, KeyCode::Esc);
@@ -538,7 +536,8 @@ fn a_click_on_a_bin_selects_it_and_focuses_its_panel() {
 
     press_at(&mut application, (x + 3, y));
 
-    row(&screen(&application), "1–2m · 80 Turns · 26%");
+    // The Turns column is too narrow at 120 columns for the word "Turns".
+    row(&screen(&application), "1–2m · 80 · 26%");
     assert_ne!(
         turns_border(&application),
         turns_border(&on_insights(Ok(worked())))
@@ -568,9 +567,11 @@ fn the_turns_panel_states_durations_their_spread_and_how_turns_ended() {
     let rows = screen(&application);
 
     row(&rows, "Turns");
-    row(&rows, "median 48s · p90 6m 12s · longest 41m 5s");
+    // As briefly as the mockup at 120 columns, where the Turns column is
+    // narrow; the longest and the endings' names stand where it is wider.
+    row(&rows, "median 48s · p90 6m 12s  ");
     row(&rows, "▁▃▇█▆▃▂▁  <10s … 30m+");
-    row(&rows, "✓ 1,213 completed  ✗ 40 failed  ⊘ 31 interrupted");
+    row(&rows, "✓ 1,213  ✗ 40  ⊘ 31  ");
 }
 
 #[test]
@@ -596,8 +597,8 @@ fn turns_that_ended_without_both_moments_are_counted_but_give_no_durations() {
 
     let rows = screen(&application);
 
-    row(&rows, "No Turn recorded how long it took");
-    row(&rows, "✓ 3 completed  ✗ 0 failed  ⊘ 0 interrupted");
+    row(&rows, "No durations recorded");
+    row(&rows, "✓ 3  ✗ 0  ⊘ 0  ");
 }
 
 #[test]
@@ -677,7 +678,7 @@ fn a_new_range_lets_go_of_the_selection_its_figures_were_made_for() {
     assert!(
         !screen(&application)
             .iter()
-            .any(|row| row.contains("<10s · 10 Turns")),
+            .any(|row| row.contains("<10s · 10 · ")),
         "no bin is selected"
     );
     assert_eq!(turns_border(&application), focused, "the panel keeps focus");
@@ -888,11 +889,6 @@ fn esc_clears_a_selected_cell_before_it_leaves_the_heatmap() {
     row(&screen(&application), "When you work");
 }
 
-/// The style of the Tools panel's top-left border corner.
-fn tools_border(application: &Application) -> Style {
-    border(application, "Tools used")
-}
-
 /// The style of the When you work panel's top-left border corner.
 fn heatmap_border(application: &Application) -> Style {
     border(application, "When you work")
@@ -901,7 +897,13 @@ fn heatmap_border(application: &Application) -> Style {
 /// The lines of the panel titled `title` beneath its title, inside its
 /// border, each with runs of spaces closed up.
 fn panel_lines(application: &Application, title: &str) -> Vec<String> {
-    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    panel_lines_at(application, title, WIDTH)
+}
+
+/// The lines of the panel titled `title`, as [`panel_lines`] has them, in a
+/// frame `width` columns wide.
+fn panel_lines_at(application: &Application, title: &str, width: u16) -> Vec<String> {
+    let buffer = rendered_application_buffer(application, width, HEIGHT);
     let (x, y) = text_position(&buffer, title);
     let symbol = |column: u16, row: u16| buffer[(column, row)].symbol().to_owned();
     let left = (0..x)
@@ -1107,44 +1109,95 @@ fn a_range_whose_turns_used_no_tool_says_so_in_the_panel() {
     );
 }
 
-/// Where the title of the panel titled `title` stands.
-fn title_at(application: &Application, title: &str) -> (u16, u16) {
-    text_position(
-        &rendered_application_buffer(application, WIDTH, HEIGHT),
-        title,
-    )
+/// Every panel's title, in the order the mockup reads them: down its left
+/// column beneath When you work, then down its middle one, then down its
+/// right-hand column.
+const READING_ORDER: [&str; 8] = [
+    "When you work",
+    " Turns ",
+    " Cache ",
+    " Compactions ",
+    " Approvals ",
+    "Workspaces by Cost",
+    "Tools used",
+    " Delegation ",
+];
+
+/// Where the top-left border corner of the panel titled `title` stands.
+fn corner_at(application: &Application, title: &str) -> (u16, u16) {
+    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    let (x, y) = text_position(&buffer, title);
+    let corner = (0..x)
+        .rev()
+        .find(|column| buffer[(*column, y)].symbol() == "╭")
+        .expect("the panel's corner");
+    (corner, y)
 }
 
 #[test]
 fn panels_stand_as_the_mockup_lays_them_out() {
     let application = on_insights(Ok(worked()));
-    let heatmap = title_at(&application, "When you work");
-    let tools = title_at(&application, "Tools used");
-    let turns = title_at(&application, " Turns ");
-    let compactions = title_at(&application, " Compactions ");
-    let approvals = title_at(&application, " Approvals ");
+    let [
+        heatmap,
+        turns,
+        cache,
+        compactions,
+        approvals,
+        workspaces,
+        tools,
+        delegation,
+    ] = READING_ORDER.map(|title| corner_at(&application, title));
 
-    assert_eq!(tools.1, heatmap.1, "Tools stand beside When you work");
-    assert!(tools.0 > heatmap.0);
-    assert_eq!(compactions.1, turns.1, "Compactions stand beside Turns");
-    assert!(turns.1 > heatmap.1 && compactions.0 > turns.0);
     assert_eq!(
-        approvals.0, compactions.0,
-        "Approvals stand beneath Compactions"
+        workspaces.1, heatmap.1,
+        "Workspaces stand beside When you work"
+    );
+    assert!(workspaces.0 > compactions.0 && compactions.0 > turns.0);
+    assert_eq!(
+        (turns.0, cache.0),
+        (heatmap.0, heatmap.0),
+        "Turns, then Cache, stand beneath When you work, at its left edge"
+    );
+    assert!(heatmap.1 < turns.1 && turns.1 < cache.1);
+    assert_eq!(
+        (compactions.1, approvals.0),
+        (turns.1, compactions.0),
+        "Compactions stand beside Turns beneath When you work, Approvals beneath them"
     );
     assert!(approvals.1 > compactions.1);
-    let cache = title_at(&application, " Cache ");
     assert_eq!(
-        (cache.0, cache.1),
-        (turns.0, approvals.1),
-        "Cache stands beneath Turns, beside Approvals"
+        (tools.0, delegation.0),
+        (workspaces.0, workspaces.0),
+        "Tools, then Delegation, stand beneath Workspaces in the right-hand column"
     );
-    let delegation = title_at(&application, " Delegation ");
-    assert_eq!(
-        delegation.0, approvals.0,
-        "Delegation stands in the right-hand column, as beneath Tools in the mockup"
+    assert!(workspaces.1 < tools.1 && tools.1 < delegation.1);
+    assert!(
+        tools.1 < turns.1 && approvals.1 < cache.1,
+        "each column stacks its own panels, none waiting on its neighbour's height"
     );
-    assert!(delegation.1 > approvals.1);
+}
+
+#[test]
+fn tab_moves_focus_through_the_panels_in_the_order_they_are_read() {
+    let mut application = on_insights(Ok(worked()));
+    let unfocused = READING_ORDER.map(|title| border(&application, title));
+
+    for (place, title) in READING_ORDER.iter().enumerate() {
+        press_tab(&mut application);
+        let focused: Vec<&str> = READING_ORDER
+            .iter()
+            .zip(&unfocused)
+            .filter(|(title, unfocused)| border(&application, title) != **unfocused)
+            .map(|(title, _)| *title)
+            .collect();
+        assert_eq!(focused, vec![*title], "Tab {}", place + 1);
+    }
+    press_tab(&mut application);
+    assert_ne!(
+        border(&application, READING_ORDER[0]),
+        unfocused[0],
+        "from the last panel, focus moves round to the first"
+    );
 }
 
 #[test]
@@ -1157,10 +1210,7 @@ fn the_compactions_panel_states_how_many_how_many_were_manual_and_failed_and_wha
 
     assert_eq!(
         panel_lines(&application, " Compactions "),
-        vec![
-            "27 Compactions · 6 manual · ✗ 1 failed",
-            "frees 61% of context on average",
-        ]
+        vec!["27 · 6 manual · ✗ 1 failed", "frees 61% on average"]
     );
 }
 
@@ -1178,10 +1228,7 @@ fn compactions_that_could_not_say_what_they_freed_leave_it_unstated() {
 
     assert_eq!(
         panel_lines(&application, " Compactions "),
-        vec![
-            "1 Compaction · 1 manual · ✗ 0 failed",
-            "No Compaction recorded what it freed",
-        ]
+        vec!["1 · 1 manual · ✗ 0 failed", "No record of what it freed"]
     );
 }
 
@@ -1196,7 +1243,7 @@ fn compactions_that_left_more_context_than_they_found_say_so() {
 
     assert_eq!(
         panel_lines(&application, " Compactions ")[1],
-        "leaves 5% more context on average"
+        "leaves 5% more on average"
     );
 }
 
@@ -1211,7 +1258,7 @@ fn compactions_that_left_less_than_half_a_percent_more_free_none() {
 
     assert_eq!(
         panel_lines(&application, " Compactions ")[1],
-        "frees 0% of context on average"
+        "frees 0% on average"
     );
 }
 
@@ -1221,7 +1268,7 @@ fn a_range_with_no_compactions_says_so_in_the_panel() {
 
     assert_eq!(
         panel_lines(&application, " Compactions ")[0],
-        "No Compactions in the last 30 days"
+        "No Compactions"
     );
 }
 
@@ -1237,8 +1284,9 @@ fn the_approvals_panel_states_how_many_were_asked_and_how_each_was_decided() {
         panel_lines(&application, " Approvals "),
         vec![
             "188 asked",
-            "✓ 171 accepted ✗ 12 declined ⧗ 5 waiting or expired",
-            "11 for the Session · 2 also interrupted the Turn",
+            "✓ 171 ✗ 12 ⧗ 5",
+            "11 for the Session",
+            "2 interrupted the Turn",
         ]
     );
 }
@@ -1249,7 +1297,7 @@ fn a_range_with_no_approvals_says_so_in_the_panel() {
 
     assert_eq!(
         panel_lines(&application, " Approvals ")[0],
-        "No Approvals asked in the last 30 days"
+        "No Approvals asked"
     );
 }
 
@@ -1268,11 +1316,11 @@ fn the_delegation_panel_divides_cost_by_role_with_brokered_subagents_beside_thei
     assert_eq!(
         delegation_panel(&application),
         vec![
-            "own Sessions 71% $293.13 ██████████████▉",
-            "Subagents 22% $90.83 ████▋ brokered 9%",
-            "Sidekicks 6% $24.77 █▎",
-            "Subsessions 1% $4.13 ▎",
-            "A Claude Session's native Subagents are in its Cost",
+            "own Sessions 71% $293.13 ████████████▏",
+            "Subagents 22% $90.83 ███▊ brokered 9%",
+            "Sidekicks 6% $24.77 █",
+            "Subsessions 1% $4.13 ▏",
+            "A Claude Session's Subagents are in its Cost",
         ]
     );
 }
@@ -1288,9 +1336,10 @@ fn a_role_whose_cost_is_partial_says_so_with_a_plus() {
     report.delegation.sidekicks = RoleCost::default();
     let application = on_insights(Ok(report));
 
-    let lines = delegation_panel(&application);
+    // Wide enough for every Cost beside the bars and the brokered share.
+    let lines = panel_lines_at(&application, "Delegation (Cost)", 140);
     assert_eq!(
-        lines[1], "Subagents 24%+ $90.83+ █████ brokered 10%+",
+        lines[1], "Subagents 24%+ $90.83+ ██████▍ brokered 10%+",
         "partial where its brokered part is, and its shares of a partial whole"
     );
     assert_eq!(lines[2], "Sidekicks 0% —", "no work, so no Cost to state");
@@ -1365,15 +1414,80 @@ fn a_saving_no_model_s_rates_could_estimate_is_left_unstated() {
     };
     let application = on_insights(Ok(report));
 
-    assert_eq!(
-        cache_panel(&application)[1],
-        "No rates to estimate a saving at"
-    );
+    assert_eq!(cache_panel(&application)[1], "No rates for an estimate");
 }
 
 #[test]
 fn a_range_with_no_input_says_so_in_the_cache_panel() {
     let application = on_insights(Ok(InsightsReport::default()));
 
-    assert_eq!(cache_panel(&application)[0], "No input in the last 30 days");
+    assert_eq!(cache_panel(&application)[0], "No input");
+}
+
+#[test]
+fn delegation_leaves_its_costs_out_where_they_would_crowd_the_brokered_share() {
+    let mut report = worked();
+    report.delegation.brokered_subagents.is_cost_partial = true;
+    let application = on_insights(Ok(report));
+
+    assert_eq!(
+        delegation_panel(&application)[..2],
+        [
+            "own Sessions 71%+ ████████████████████▋",
+            "Subagents 22%+ ██████▍ brokered 9%+"
+        ]
+    );
+}
+
+/// The widest frame the small panels stack in beneath When you work, in a
+/// column as wide as its hours need.
+const STACKED_WIDTH: u16 = 113;
+
+#[test]
+fn below_the_mockup_s_width_the_small_panels_stack_and_say_it_all_where_they_fit() {
+    let application = on_insights(Ok(worked()));
+    let buffer = rendered_application_buffer(&application, STACKED_WIDTH, HEIGHT);
+    let corner = |title: &str| {
+        let (x, y) = text_position(&buffer, title);
+        let corner = (0..x)
+            .rev()
+            .find(|column| buffer[(*column, y)].symbol() == "╭")
+            .expect("the panel's corner");
+        (corner, y)
+    };
+    let left: Vec<(u16, u16)> = READING_ORDER[..5]
+        .iter()
+        .map(|title| corner(title))
+        .collect();
+
+    assert!(
+        left.iter().all(|(x, _)| *x == left[0].0) && left.windows(2).all(|two| two[0].1 < two[1].1),
+        "When you work, Turns, Cache, Compactions, and Approvals stack in one column: {left:?}"
+    );
+    let lines = |title| panel_lines_at(&application, title, STACKED_WIDTH);
+    assert_eq!(
+        lines(" Turns ")
+            .into_iter()
+            .map(|line| line.replace("▁▃▇█▆▃▂▁ ", ""))
+            .collect::<Vec<_>>(),
+        [
+            "median 48s · p90 6m 12s · longest 41m 5s",
+            "<10s … 30m+",
+            "✓ 1,213 completed ✗ 40 failed ⊘ 31 interrupted",
+        ]
+    );
+    assert_eq!(
+        lines(" Compactions "),
+        [
+            "27 Compactions · 6 manual · ✗ 1 failed",
+            "frees 61% of context on average",
+        ]
+    );
+    assert_eq!(
+        lines(" Approvals ")[1..3],
+        [
+            "✓ 171 accepted ✗ 12 declined ⧗ 5 waiting or expired",
+            "11 for the Session · 2 also interrupted the Turn",
+        ]
+    );
 }

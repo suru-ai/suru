@@ -1,7 +1,8 @@
 //! The Turns panel: how long the range's Turns took to Settle — the median,
 //! the p90, and the longest, then the spread across fixed bins as a
 //! sparkline whose bins a reader can select — and how many Completed,
-//! Failed, and were Interrupted.
+//! Failed, and were Interrupted. Where its column is narrow it leaves out
+//! the longest, the names of how Turns ended, and the word "Turns".
 
 use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
 
@@ -17,7 +18,7 @@ use super::{
         view::share,
     },
     InsightsPanel, InsightsView,
-    view::render_spans,
+    view::{fitting, render_fitting_spans},
 };
 
 /// The rows the panel draws inside its border.
@@ -56,24 +57,37 @@ pub(super) fn render(
     let subdued = theme.text.subdued;
     let primary = theme.text.primary;
     if turns.completed + turns.failed + turns.interrupted == 0 {
-        let note = format!("No Turns {}", range.within());
-        buffer.set_string(area.x, area.y, truncate_to_width(&note, room), subdued);
+        let note = fitting(
+            room,
+            [
+                format!("No Turns {}", range.within()),
+                "No Turns".to_owned(),
+            ],
+        );
+        buffer.set_string(area.x, area.y, note, subdued);
         return;
     }
     match &turns.durations {
         Some(durations) => {
-            let stated = format!(
-                "median {} · p90 {} · longest {}",
+            let spread = format!(
+                "median {} · p90 {}",
                 humanized_duration(durations.median_ms),
                 humanized_duration(durations.p90_ms),
-                humanized_duration(durations.longest_ms),
             );
-            buffer.set_string(area.x, area.y, truncate_to_width(&stated, room), primary);
+            let longest = humanized_duration(durations.longest_ms);
+            let stated = fitting(room, [format!("{spread} · longest {longest}"), spread]);
+            buffer.set_string(area.x, area.y, stated, primary);
             render_bins(buffer, area, durations, selected, view, theme);
         }
         None => {
-            let note = "No Turn recorded how long it took";
-            buffer.set_string(area.x, area.y, truncate_to_width(note, room), subdued);
+            let note = fitting(
+                room,
+                [
+                    "No Turn recorded how long it took".to_owned(),
+                    "No durations recorded".to_owned(),
+                ],
+            );
+            buffer.set_string(area.x, area.y, note, subdued);
         }
     }
     let ended = [
@@ -86,17 +100,23 @@ pub(super) fn render(
             theme.feedback.warning,
         ),
     ];
-    let spans = ended
-        .into_iter()
-        .enumerate()
-        .flat_map(|(place, (glyph, count, name, style))| {
-            let gap = if place == 0 { "" } else { "  " };
-            [
-                (format!("{gap}{glyph} "), style),
-                (format!("{} {name}", grouped_count(count)), primary),
-            ]
-        });
-    render_spans(buffer, area, area.y + 2, spans);
+    let spans = |named: bool| {
+        ended
+            .iter()
+            .enumerate()
+            .flat_map(|(place, (glyph, count, name, style))| {
+                let gap = if place == 0 { "" } else { "  " };
+                let count = grouped_count(*count);
+                let figure = if named {
+                    format!("{count} {name}")
+                } else {
+                    count
+                };
+                [(format!("{gap}{glyph} "), *style), (figure, primary)]
+            })
+            .collect()
+    };
+    render_fitting_spans(buffer, area, area.y + 2, [spans(true), spans(false)]);
 }
 
 /// `count` Turns, written whole.
@@ -139,17 +159,23 @@ fn render_bins(
     }
     view.record_item_targets(InsightsPanel::Turns, Rect::new(area.x, y, bins, 1), 1, 0);
     let timed: u64 = durations.bins.iter().sum();
-    let caption = match selected {
-        Some(bin) => format!(
-            "{} · {} · {}",
-            BIN_LABELS[bin],
-            counted(durations.bins[bin]),
-            share(durations.bins[bin], timed),
-        ),
-        None => format!("{} … {}", BIN_LABELS[0], BIN_LABELS[TURN_DURATION_BINS - 1]),
-    };
     let x = area.x + bins + 2;
     let room = usize::from(area.right().saturating_sub(x));
+    let caption = match selected {
+        Some(bin) => {
+            let count = durations.bins[bin];
+            let share = share(count, timed);
+            let label = BIN_LABELS[bin];
+            fitting(
+                room,
+                [
+                    format!("{label} · {} · {share}", counted(count)),
+                    format!("{label} · {} · {share}", grouped_count(count)),
+                ],
+            )
+        }
+        None => format!("{} … {}", BIN_LABELS[0], BIN_LABELS[TURN_DURATION_BINS - 1]),
+    };
     let style = if selected.is_some() {
         theme.text.primary
     } else {

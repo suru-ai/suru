@@ -1,9 +1,10 @@
 //! The Insights tab of the Usage Metrics view: how the Sessions on the
-//! Server worked over the range the Overview tab shares with it, as a grid
+//! Server worked over the range the Overview tab shares with it, as columns
 //! of panels each reading its own part of one report.
 //!
 //! A panel is a variant of [`InsightsPanel`]: where it stands among the
-//! others and in the order focus moves through them is [`InsightsPanel::ALL`];
+//! others is [`InsightsPanel::LAYOUT`], and the order focus moves through
+//! them, the order they are read in there, [`InsightsPanel::ALL`];
 //! its title, its height, and how it draws itself — what it says where the
 //! range holds nothing for it among them — are its module's; and so are the
 //! items it lets a reader select, by their place, which the panel commands
@@ -77,41 +78,98 @@ pub enum InsightsPanel {
     Workspaces,
 }
 
+/// A part of the tab's layout: a panel, or columns standing side by side
+/// within the width it is given.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Place {
+    Panel(InsightsPanel),
+    Beside(&'static [Column]),
+}
+
+/// A column of the layout: its places stacked top to bottom, each beneath
+/// the last whatever stands beside it, and its share of the width it
+/// stands in, by weight among the columns beside it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Column {
+    pub(super) weight: u16,
+    pub(super) places: &'static [Place],
+}
+
 impl InsightsPanel {
-    /// Every panel, in the order [`Self::GRID`] places them row by row
-    /// across its two columns, which is the order focus moves among them.
+    /// Where each panel stands, as the Insights mockup lays them out: When
+    /// you work at the top left, Turns then Cache in a column beneath it
+    /// beside Compactions then Approvals, and Workspaces, Tools, then
+    /// Delegation in the right-hand column. The weights share 120 columns
+    /// as near as the panels' figures allow to the mockup's shares: When
+    /// you work its hours two columns apiece, the small panels their
+    /// briefest figures, and Delegation its bars beside their Costs. Each
+    /// column stacks its own panels, so a short one never waits on its
+    /// neighbour's height.
+    pub(super) const LAYOUT: Place = Place::Beside(&[
+        Column {
+            weight: 61,
+            places: &[
+                Place::Panel(Self::WhenYouWork),
+                Place::Beside(&[
+                    Column {
+                        weight: 29,
+                        places: &[Place::Panel(Self::Turns), Place::Panel(Self::Cache)],
+                    },
+                    Column {
+                        weight: 30,
+                        places: &[
+                            Place::Panel(Self::Compactions),
+                            Place::Panel(Self::Approvals),
+                        ],
+                    },
+                ]),
+            ],
+        },
+        Column {
+            weight: 53,
+            places: &[
+                Place::Panel(Self::Workspaces),
+                Place::Panel(Self::Tools),
+                Place::Panel(Self::Delegation),
+            ],
+        },
+    ]);
+
+    /// Every panel, in the order [`Self::LAYOUT`] reads them — down each
+    /// column, the left first, columns standing beside one another read
+    /// before the place beneath them — which is the order focus moves
+    /// among them.
     pub(crate) const ALL: [Self; 8] = {
         let mut all = [Self::WhenYouWork; 8];
-        let mut placed = 0;
-        let mut row = 0;
-        while row < Self::GRID.len() {
-            let mut column = 0;
-            while column < Self::GRID[row].len() {
-                if let Some(panel) = Self::GRID[row][column] {
-                    all[placed] = panel;
-                    placed += 1;
-                }
-                column += 1;
-            }
-            row += 1;
-        }
-        assert!(placed == all.len(), "the grid places every panel");
+        let placed = Self::gather(&Self::LAYOUT, &mut all, 0);
+        assert!(placed == all.len(), "the layout places every panel");
         all
     };
 
-    /// Where each panel stands in an interim grid of two columns, row by
-    /// row, keeping to the neighbours the Insights mockup gives the panels:
-    /// Cache beneath Turns and beside Approvals, and Delegation in the
-    /// right-hand column, as it stands beneath Tools in the mockup. The place beside Delegation is
-    /// empty only because the grid is interim: the mockup's three-column
-    /// layout (#579) puts the small panels side by side beneath When you
-    /// work, and Delegation beneath Tools.
-    pub(super) const GRID: [[Option<Self>; 2]; 4] = [
-        [Some(Self::WhenYouWork), Some(Self::Tools)],
-        [Some(Self::Turns), Some(Self::Compactions)],
-        [Some(Self::Cache), Some(Self::Approvals)],
-        [Some(Self::Workspaces), Some(Self::Delegation)],
-    ];
+    /// Places `place`'s panels in `all` in reading order from `placed` on,
+    /// answering how many are placed then.
+    const fn gather(place: &Place, all: &mut [Self; 8], placed: usize) -> usize {
+        match place {
+            Place::Panel(panel) => {
+                all[placed] = *panel;
+                placed + 1
+            }
+            Place::Beside(columns) => {
+                let mut placed = placed;
+                let mut column = 0;
+                while column < columns.len() {
+                    let places = columns[column].places;
+                    let mut at = 0;
+                    while at < places.len() {
+                        placed = Self::gather(&places[at], all, placed);
+                        at += 1;
+                    }
+                    column += 1;
+                }
+                placed
+            }
+        }
+    }
 
     pub(crate) fn place(self) -> usize {
         Self::ALL
@@ -329,7 +387,7 @@ pub(super) struct KeptReport {
 /// Where the last frame drew each part of the tab a pointer can act on.
 #[derive(Clone, Copy, Debug, Default)]
 struct Targets {
-    /// Each panel's place in the grid, borders included, in
+    /// Each panel's place in the layout, borders included, in
     /// [`InsightsPanel::ALL`] order.
     panels: [Option<Rect>; InsightsPanel::ALL.len()],
     /// Where each panel drew the items a reader selects among, how many
@@ -808,9 +866,9 @@ mod tests {
     use super::{InsightsContent, InsightsPanel, InsightsView, MetricsRange, Outlook};
     use crate::protocol::{InsightsReport, SessionTimestamp};
 
-    /// The grid places each panel once, so each has a place of its own.
+    /// The layout places each panel once, so each has a place of its own.
     #[test]
-    fn the_grid_places_every_panel_once() {
+    fn the_layout_places_every_panel_once() {
         for (place, panel) in InsightsPanel::ALL.into_iter().enumerate() {
             assert_eq!(panel.place(), place, "{panel:?} is placed once");
         }

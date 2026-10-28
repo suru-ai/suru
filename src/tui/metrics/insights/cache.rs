@@ -9,9 +9,12 @@ use crate::{
     theme::Theme,
 };
 
-use super::super::{
-    super::{slots::truncate_to_width, usage::compact_dollars},
-    calendar::MetricsRange,
+use super::{
+    super::{
+        super::{slots::truncate_to_width, usage::compact_dollars},
+        calendar::MetricsRange,
+    },
+    view::fitting,
 };
 
 /// The rows the panel draws inside its border.
@@ -29,19 +32,37 @@ pub(super) fn render(
     let subdued = theme.text.subdued;
     let primary = theme.text.primary;
     let Some(share) = cache.read_share() else {
-        let note = format!("No input {}", range.within());
-        buffer.set_string(area.x, area.y, truncate_to_width(&note, room), subdued);
+        let note = fitting(
+            room,
+            [
+                format!("No input {}", range.within()),
+                "No input".to_owned(),
+            ],
+        );
+        buffer.set_string(area.x, area.y, note, subdued);
         return;
     };
     // Rounded to the whole percent as the headline rounds it.
     let share = format!("{}% of input from cache", (share + 50) / 100);
     buffer.set_string(area.x, area.y, truncate_to_width(&share, room), primary);
     let (saving, style) = match saved(cache.saving) {
-        Some(saved) => (saved, primary),
-        None if cache.saving.is_partial => ("No rates to estimate a saving at".to_owned(), subdued),
-        None => ("Nothing read from or written to cache".to_owned(), subdued),
+        Some(saved) => (vec![saved], primary),
+        None if cache.saving.is_partial => (
+            vec![
+                "No rates to estimate a saving at".to_owned(),
+                "No rates for an estimate".to_owned(),
+            ],
+            subdued,
+        ),
+        None => (
+            vec![
+                "Nothing read from or written to cache".to_owned(),
+                "No cache reads or writes".to_owned(),
+            ],
+            subdued,
+        ),
     };
-    buffer.set_string(area.x, area.y + 1, truncate_to_width(&saving, room), style);
+    buffer.set_string(area.x, area.y + 1, fitting(room, saving), style);
 }
 
 /// What `saving` says caching saved, a `+` after it where a Model's Turns

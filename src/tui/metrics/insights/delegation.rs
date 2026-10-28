@@ -8,6 +8,7 @@
 //! reports a whole tree's Cost on the Session it runs them in.
 
 use ratatui::{buffer::Buffer, layout::Rect};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     protocol::{Cost, DelegationInsights, RoleCost},
@@ -15,8 +16,8 @@ use crate::{
 };
 
 use super::{
-    super::{super::slots::truncate_to_width, calendar::MetricsRange, view::share},
-    view::{bar, render_spans, stated_cost},
+    super::{calendar::MetricsRange, view::share},
+    view::{bar, fitting, render_spans, stated_cost},
 };
 
 /// The rows the panel draws inside its border: a role apiece, then the
@@ -37,7 +38,14 @@ const COST_WIDTH: usize = 10;
 /// between them.
 const LEAD_WIDTH: usize = LABEL_WIDTH + 1 + SHARE_WIDTH + 2 + COST_WIDTH + 2;
 
-const NOTE: &str = "A Claude Session's native Subagents are in its Cost";
+/// What stands before a role's bar where its Cost is left out.
+const BRIEF_LEAD_WIDTH: usize = LABEL_WIDTH + 1 + SHARE_WIDTH + 2;
+
+/// The note beneath the roles, fully and briefly.
+const NOTE: [&str; 2] = [
+    "A Claude Session's native Subagents are in its Cost",
+    "A Claude Session's Subagents are in its Cost",
+];
 
 /// Draws the panel's figures in `area`, inside its border.
 pub(super) fn render(
@@ -53,11 +61,15 @@ pub(super) fn render(
     let total = delegation.total();
     let Some(whole) = total.cost.map(Cost::nano_usd) else {
         let note = if total.is_cost_partial {
-            format!("No work priced {}", range.within())
+            "No work priced"
         } else {
-            format!("No Cost {}", range.within())
+            "No Cost"
         };
-        buffer.set_string(area.x, area.y, truncate_to_width(&note, room), subdued);
+        let note = fitting(
+            room,
+            [format!("{note} {}", range.within()), note.to_owned()],
+        );
+        buffer.set_string(area.x, area.y, note, subdued);
         return;
     };
     let subagents = delegation
@@ -69,31 +81,51 @@ pub(super) fn render(
         ("Sidekicks", delegation.sidekicks, None),
         ("Subsessions", delegation.subsessions, None),
     ];
-    let bar_width = room.saturating_sub(LEAD_WIDTH);
-    for (y, (label, cost, brokered)) in (area.y..).zip(roles) {
-        let part = nano_usd(cost);
-        let lead = format!(
-            "{label:<LABEL_WIDTH$} {:>SHARE_WIDTH$}  {:>COST_WIDTH$}  ",
-            share_of(cost, total),
-            stated(cost),
-        );
-        // The brokered share stands beside its Subagents wherever any of
-        // their work was brokered.
+    // The brokered share stands beside its Subagents wherever any of their
+    // work was brokered.
+    let roles = roles.map(|(label, cost, brokered)| {
         let brokered = brokered
             .filter(|brokered| brokered.cost.is_some() || brokered.is_cost_partial)
-            .map(|brokered| format!("  brokered {}", share_of(brokered, total)));
+            .map(|brokered| format!("  brokered {}", share_of(brokered, total)))
+            .unwrap_or_default();
+        (label, cost, brokered)
+    });
+    // Each role's Cost stands beside its share where every bar and the
+    // brokered share after its own still fit, and is left out where they
+    // would not: the share says how much, and the bars and the brokered
+    // share are the panel's point.
+    let fits = |lead: usize| {
+        let bar_width = room.saturating_sub(lead);
+        roles.iter().all(|(_, cost, brokered)| {
+            bar(nano_usd(*cost), whole, bar_width).width() + brokered.width() <= bar_width
+        })
+    };
+    let costed = fits(LEAD_WIDTH);
+    let lead_width = if costed { LEAD_WIDTH } else { BRIEF_LEAD_WIDTH };
+    let bar_width = room.saturating_sub(lead_width);
+    for (y, (label, cost, brokered)) in (area.y..).zip(roles) {
+        let share = share_of(cost, total);
+        let lead = if costed {
+            format!(
+                "{label:<LABEL_WIDTH$} {share:>SHARE_WIDTH$}  {:>COST_WIDTH$}  ",
+                stated(cost),
+            )
+        } else {
+            format!("{label:<LABEL_WIDTH$} {share:>SHARE_WIDTH$}  ")
+        };
         render_spans(
             buffer,
             area,
             y,
             [
                 (lead, primary),
-                (bar(part, whole, bar_width), theme.accent.primary),
-                (brokered.unwrap_or_default(), subdued),
+                (bar(nano_usd(cost), whole, bar_width), theme.accent.primary),
+                (brokered, subdued),
             ],
         );
     }
-    buffer.set_string(area.x, area.y + 4, truncate_to_width(NOTE, room), subdued);
+    let note = fitting(room, NOTE.map(str::to_owned));
+    buffer.set_string(area.x, area.y + 4, note, subdued);
 }
 
 /// `cost`'s share of `whole`, `+` where the whole is partial and `cost`

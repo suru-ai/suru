@@ -1,7 +1,13 @@
-//! Draws the Insights tab beneath the range bar: its panels in a grid of two
-//! columns, each bordered and titled, the focused one's border in the
-//! accent; or what stands in for them while the read is on its way, or
-//! where it was refused.
+//! Draws the Insights tab beneath the range bar: its panels in the columns
+//! [`InsightsPanel::LAYOUT`] stands them in, each bordered and titled, the
+//! focused one's border in the accent; or what stands in for them while the
+//! read is on its way, or where it was refused.
+//!
+//! Columns stand side by side where each is at least [`BESIDE_WIDTH`]
+//! wide, and otherwise stack one after another in the order they are read,
+//! so a frame too narrow for the mockup's three columns beneath When you
+//! work keeps two. The one scrolling column a small terminal stacks every
+//! panel in (#580) is that rule reaching the outermost columns too.
 
 use ratatui::{
     buffer::Buffer,
@@ -15,13 +21,26 @@ use crate::{protocol::Cost, theme::Theme};
 
 use super::{
     super::{UsageMetricsReadRefusal, calendar::MetricsRange, chart::MetricsMeasure},
-    InsightsContent, InsightsPanel, InsightsView, KeptReport, approvals, cache, compactions,
-    delegation, heatmap, tools, turns, workspaces,
+    Column, InsightsContent, InsightsPanel, InsightsView, KeptReport, Place, approvals, cache,
+    compactions, delegation, heatmap, tools, turns, workspaces,
 };
 use crate::{protocol::Outlook, tui::slots::truncate_to_width};
 
-/// Columns between the grid's two columns.
+/// Columns between two columns standing side by side.
 const COLUMN_GAP: u16 = 2;
+
+/// The narrowest a column stands beside another in: room for the briefest
+/// figures of the small panels, inside their borders.
+const BESIDE_WIDTH: u16 = 28;
+
+/// What every panel is drawn from.
+struct Drawing<'a> {
+    view: &'a InsightsView,
+    kept: &'a KeptReport,
+    origin: &'a Outlook,
+    range: MetricsRange,
+    theme: &'a Theme,
+}
 
 /// Draws the tab's report for `range` from `origin` in `body`.
 pub(in crate::tui) fn render(
@@ -54,41 +73,105 @@ pub(in crate::tui) fn render(
             }
         }
         InsightsContent::Report(kept) => {
-            render_grid(buffer, body, view, kept, origin, range, theme);
+            let drawing = Drawing {
+                view,
+                kept,
+                origin,
+                range,
+                theme,
+            };
+            render_place(buffer, body, InsightsPanel::LAYOUT, &drawing);
         }
     }
 }
 
-/// The panels row by row across two columns where [`InsightsPanel::GRID`]
-/// places them, each row as tall as its tallest panel, and none drawn past
-/// the foot of `body`.
-fn render_grid(
+/// Draws `place` from the top of `area`, as wide as it is, answering how
+/// many rows it took; none where its first panel would run past the foot
+/// of `area`, which nothing is drawn past.
+fn render_place(
     buffer: &mut Buffer,
-    body: Rect,
-    view: &InsightsView,
-    kept: &KeptReport,
-    origin: &Outlook,
-    range: MetricsRange,
-    theme: &Theme,
-) {
-    let column_width = body.width.saturating_sub(COLUMN_GAP) / 2;
-    let mut y = body.y;
-    for row in InsightsPanel::GRID {
-        let tallest = row.iter().flatten().map(|panel| height(*panel)).max();
-        let tallest = tallest.unwrap_or(0);
-        if y + tallest > body.bottom() {
-            break;
+    area: Rect,
+    place: Place,
+    drawing: &Drawing<'_>,
+) -> Option<u16> {
+    match place {
+        Place::Panel(panel) => {
+            let height = height(panel);
+            if area.y + height > area.bottom() {
+                return None;
+            }
+            render_panel(buffer, Rect { height, ..area }, panel, drawing);
+            Some(height)
         }
-        for (column, panel) in (0u16..).zip(row) {
-            let Some(panel) = panel else {
-                continue;
+        Place::Beside(columns) => {
+            let widths = beside(area.width, columns);
+            let Some(widths) = widths else {
+                // Too narrow to stand side by side, the columns stack.
+                let places = columns
+                    .iter()
+                    .flat_map(|column| column.places.iter().copied());
+                return render_stack(buffer, area, places, drawing);
             };
-            let x = body.x + column * (column_width + COLUMN_GAP);
-            let area = Rect::new(x, y, column_width, height(panel));
-            render_panel(buffer, area, panel, view, kept, origin, range, theme);
+            let mut x = area.x;
+            let mut tallest = None;
+            for (column, width) in columns.iter().zip(widths) {
+                let area = Rect { x, width, ..area };
+                let height = render_stack(buffer, area, column.places.iter().copied(), drawing);
+                tallest = tallest.max(height);
+                x += width + COLUMN_GAP;
+            }
+            tallest
         }
-        y += tallest + 1;
     }
+}
+
+/// Draws `places` one beneath another from the top of `area`, a blank row
+/// between each, stopping at the first that would run past its foot, and
+/// answers how many rows they took; none where the first would.
+fn render_stack(
+    buffer: &mut Buffer,
+    area: Rect,
+    places: impl IntoIterator<Item = Place>,
+    drawing: &Drawing<'_>,
+) -> Option<u16> {
+    let mut taken = None;
+    for place in places {
+        let y = taken.map_or(area.y, |taken| area.y + taken + 1);
+        let rest = Rect {
+            y,
+            height: area.bottom().saturating_sub(y),
+            ..area
+        };
+        let Some(height) = render_place(buffer, rest, place, drawing) else {
+            break;
+        };
+        taken = Some(y + height - area.y);
+    }
+    taken
+}
+
+/// How wide each of `columns` stands in `width`, a gap between each, by
+/// their weights, the last taking what rounding leaves; none where any
+/// would be narrower than [`BESIDE_WIDTH`].
+fn beside(width: u16, columns: &[Column]) -> Option<Vec<u16>> {
+    let gaps = COLUMN_GAP * u16::try_from(columns.len().saturating_sub(1)).ok()?;
+    let room = u32::from(width.checked_sub(gaps)?);
+    let weights: u32 = columns.iter().map(|column| u32::from(column.weight)).sum();
+    let mut left = room;
+    let mut widths = Vec::with_capacity(columns.len());
+    for (place, column) in columns.iter().enumerate() {
+        let share = if place + 1 == columns.len() {
+            left
+        } else {
+            room * u32::from(column.weight) / weights.max(1)
+        };
+        left -= share;
+        widths.push(u16::try_from(share).ok()?);
+    }
+    widths
+        .iter()
+        .all(|width| *width >= BESIDE_WIDTH)
+        .then_some(widths)
 }
 
 /// How many rows `panel` takes, its border included.
@@ -106,17 +189,14 @@ fn height(panel: InsightsPanel) -> u16 {
     rows + 2
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_panel(
-    buffer: &mut Buffer,
-    area: Rect,
-    panel: InsightsPanel,
-    view: &InsightsView,
-    kept: &KeptReport,
-    origin: &Outlook,
-    range: MetricsRange,
-    theme: &Theme,
-) {
+fn render_panel(buffer: &mut Buffer, area: Rect, panel: InsightsPanel, drawing: &Drawing<'_>) {
+    let Drawing {
+        view,
+        kept,
+        origin,
+        range,
+        theme,
+    } = *drawing;
     let focused = view.focused() == Some(panel);
     let border = if focused {
         theme.accent.primary
@@ -204,6 +284,41 @@ pub(super) fn render_spans(
         buffer.set_string(x, y, &text, style);
         x += u16::try_from(text.width()).unwrap_or(u16::MAX);
     }
+}
+
+/// The fullest of `forms`, given fullest first, that fits in `room`
+/// columns: the briefest, cut short, where none does. A panel says what it
+/// can in the width its column gives it.
+pub(super) fn fitting(room: usize, forms: impl IntoIterator<Item = String>) -> String {
+    let mut briefest = String::new();
+    for form in forms {
+        if form.width() <= room {
+            return form;
+        }
+        briefest = form;
+    }
+    truncate_to_width(&briefest, room)
+}
+
+/// Draws the fullest of `forms` — each spans in their own styles, given
+/// fullest first — that fits along the row `y` of `area`, as
+/// [`render_spans`] does: the briefest, cut short, where none does.
+pub(super) fn render_fitting_spans(
+    buffer: &mut Buffer,
+    area: Rect,
+    y: u16,
+    forms: impl IntoIterator<Item = Vec<(String, Style)>>,
+) {
+    let room = usize::from(area.width);
+    let mut chosen = Vec::new();
+    for form in forms {
+        let fits = form.iter().map(|(text, _)| text.width()).sum::<usize>() <= room;
+        chosen = form;
+        if fits {
+            break;
+        }
+    }
+    render_spans(buffer, area, y, chosen);
 }
 
 /// The glyphs a bar's last cell is drawn in, an eighth of a cell full to
