@@ -95,25 +95,7 @@ impl SessionStoreState {
     /// Subsession is metered by a Provider actor of its own, so no report of
     /// the Sidekick's covers it and its contributions add whole.
     pub(super) fn tree_cost_contributions(&self, session_id: SessionId) -> Vec<CostContribution> {
-        let mut contributions = self.contributions_of(&self.subtree(session_id));
-        for subsession in self.subsessions_of(session_id) {
-            let subtree = self.subtree(subsession);
-            let theirs = self.contributions_of(&subtree);
-            // A Subsession whose work has no known Cost leaves the sum
-            // partial, whatever its Turns could say for themselves.
-            if theirs
-                .iter()
-                .all(|contribution| contribution.amount.is_none())
-                && let Some((owner, turn_id)) = subtree.iter().find_map(|owner| {
-                    let turn = self.sessions[owner].snapshot.turns.first()?;
-                    Some((*owner, turn.id))
-                })
-            {
-                contributions.push(CostContribution::unaccounted(owner, turn_id));
-            }
-            contributions.extend(theirs);
-        }
-        contributions
+        tree_contributions(self, session_id)
     }
 
     /// What each of this Session's own Turns adds to its own Cost: the
@@ -121,205 +103,269 @@ impl SessionStoreState {
     /// Coverage applied to its Turns alone, so a reporting lifetime's running
     /// total counts once rather than once per Turn that carried one.
     pub(super) fn own_cost_contributions(&self, session_id: SessionId) -> Vec<CostContribution> {
-        self.contributions_of(&[session_id])
+        contributions_of(self, &[session_id])
+    }
+}
+
+/// What Cost Coverage reads of the Sessions it counts: each one's Turns and
+/// where it stands in its forest. The store answers from its own records,
+/// and a reading that adds Cost up outside the store lock answers from a
+/// copy of them, so either way there is one reading of Cost Coverage (ADR
+/// 0054).
+pub(super) trait CostForest {
+    /// The Turns of a Session held here, or nothing where none is.
+    fn turns(&self, session_id: SessionId) -> Option<&[Turn]>;
+    fn parent(&self, session_id: SessionId) -> Option<SessionId>;
+    /// Whether it is a brokered Subagent's Session (ADR 0035).
+    fn is_brokered_subagent(&self, session_id: SessionId) -> bool;
+    /// This Session and every Subagent Session below it, to any depth.
+    fn subtree_of(&self, session_id: SessionId) -> Vec<SessionId>;
+    /// The Sessions the Sidekick's Session `sidekick` began.
+    fn subsessions_begun_by(&self, sidekick: SessionId) -> Vec<SessionId>;
+}
+
+impl CostForest for SessionStoreState {
+    fn turns(&self, session_id: SessionId) -> Option<&[Turn]> {
+        Some(&self.sessions.get(&session_id)?.snapshot.turns)
     }
 
-    /// Applies each Provider-declared coverage window to the frozen Cost
-    /// records of `sessions`, a Session and some of what lies beneath it. A
-    /// subtree report is cumulative only inside its reporting lifetime, where
-    /// each report contributes its increment over the highest total reported
-    /// before it (see [`RunningTotal`]), and
-    /// receipt order alone never proves that late descendant evidence falls
-    /// outside a report.
-    fn contributions_of(&self, sessions: &[SessionId]) -> Vec<CostContribution> {
-        let mut records = Vec::new();
-        for &owner in sessions {
-            let Some(session) = self.sessions.get(&owner) else {
-                continue;
-            };
-            for turn in &session.snapshot.turns {
-                records.extend(cost_records(owner, turn));
-            }
-        }
+    fn parent(&self, session_id: SessionId) -> Option<SessionId> {
+        self.sessions.get(&session_id)?.snapshot.session.parent
+    }
 
-        let mut lifetime_starts = HashMap::<String, SessionTimestamp>::new();
-        let mut lifetimes = HashMap::<(SessionId, String), Vec<&ScopedCost>>::new();
-        for record in &records {
-            let CostCoverage::SessionSubtree { reporting_lifetime } = &record.record.coverage
-            else {
-                continue;
-            };
-            if let Some(started_at) = record.turn_started_at {
-                lifetime_starts
-                    .entry(reporting_lifetime.clone())
-                    .and_modify(|current| *current = (*current).min(started_at))
-                    .or_insert(started_at);
-            }
-            lifetimes
-                .entry((record.owner, reporting_lifetime.clone()))
-                .or_default()
-                .push(record);
-        }
-        let running_totals = lifetimes
-            .into_values()
-            .map(|reports| {
-                RunningTotal::new(reports.into_iter().map(|report| (report, &report.record)))
-            })
-            .collect::<Vec<_>>();
+    fn is_brokered_subagent(&self, session_id: SessionId) -> bool {
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|record| record.is_brokered_subagent())
+    }
 
-        let mut contributions = Vec::new();
-        let mut included = Vec::new();
-        for candidate in &running_totals {
-            let latest = candidate.latest().report;
-            let candidate_interval = cost_interval(latest, &lifetime_starts);
-            let coverage = running_totals
-                .iter()
-                .find_map(|cover| {
-                    let cover = cover.latest().report;
-                    if cover.owner == latest.owner || !self.covers(cover.owner, latest.owner) {
-                        return None;
-                    }
-                    let (Some(candidate_interval), Some(cover_interval)) =
-                        (candidate_interval, cost_interval(cover, &lifetime_starts))
-                    else {
-                        return Some(Coverage::PartlyCovered);
-                    };
-                    intervals_overlap(candidate_interval, cover_interval).then(|| {
-                        if interval_contains(cover_interval, candidate_interval) {
-                            Coverage::Covered
-                        } else {
-                            Coverage::PartlyCovered
-                        }
-                    })
-                })
-                .unwrap_or(Coverage::NotCovered);
-            match coverage {
-                // A report an ancestor's whole-tree amount covers adds
-                // nothing; one it covers only in part leaves the sum partial.
-                Coverage::Covered => {}
-                Coverage::PartlyCovered => {
-                    contributions.push(CostContribution::unaccounted(latest.owner, latest.turn_id))
-                }
-                Coverage::NotCovered => {
-                    // A report whose lifetime never began on a timed Turn
-                    // cannot say what work it spans, as the startup fold
-                    // also reads it.
-                    let untimed = candidate_interval.is_none();
-                    contributions.extend(candidate.increments().iter().map(|increment| {
-                        CostContribution {
-                            session_id: increment.report.owner,
-                            turn_id: increment.report.turn_id,
-                            amount: Some(CountedCost {
-                                cost: increment.cost,
-                                basis: increment.report.record.basis,
-                            }),
-                            is_partial: increment.is_partial || untimed,
-                        }
-                    }));
-                    included.push(latest);
-                }
-            }
-        }
+    fn subtree_of(&self, session_id: SessionId) -> Vec<SessionId> {
+        self.subtree(session_id)
+    }
 
-        for record in records
+    fn subsessions_begun_by(&self, sidekick: SessionId) -> Vec<SessionId> {
+        self.subsessions_of(sidekick)
+    }
+}
+
+/// What each Turn adds to `session_id`'s tree Cost, read from `forest`: see
+/// [`SessionStoreState::tree_cost_contributions`].
+pub(super) fn tree_contributions(
+    forest: &impl CostForest,
+    session_id: SessionId,
+) -> Vec<CostContribution> {
+    let mut contributions = contributions_of(forest, &forest.subtree_of(session_id));
+    for subsession in forest.subsessions_begun_by(session_id) {
+        let subtree = forest.subtree_of(subsession);
+        let theirs = contributions_of(forest, &subtree);
+        // A Subsession whose work has no known Cost leaves the sum
+        // partial, whatever its Turns could say for themselves.
+        if theirs
             .iter()
-            .filter(|record| record.record.coverage == CostCoverage::Turn)
+            .all(|contribution| contribution.amount.is_none())
+            && let Some((owner, turn_id)) = subtree.iter().find_map(|owner| {
+                let turn = forest.turns(*owner)?.first()?;
+                Some((*owner, turn.id))
+            })
         {
-            let counted = CostContribution {
-                session_id: record.owner,
-                turn_id: record.turn_id,
-                amount: Some(CountedCost {
-                    cost: record.record.cost,
-                    basis: record.record.basis,
-                }),
-                is_partial: record.record.is_partial,
-            };
-            let Some(started_at) = record.turn_started_at else {
-                contributions.push(CostContribution {
-                    is_partial: true,
-                    ..counted
-                });
-                continue;
-            };
-            let interval = (started_at, record.record.recorded_at);
-            let overlapping = included
-                .iter()
-                .copied()
-                .filter(|aggregate| {
-                    self.covers(aggregate.owner, record.owner)
-                        && cost_interval(aggregate, &lifetime_starts)
-                            .is_some_and(|coverage| intervals_overlap(interval, coverage))
-                })
-                .max_by_key(|aggregate| aggregate.record.recorded_at);
-            if let Some(aggregate) = overlapping {
-                let coverage = cost_interval(aggregate, &lifetime_starts)
-                    .expect("an overlapping aggregate has an interval");
-                if !interval_contains(coverage, interval) {
-                    contributions.push(CostContribution::unaccounted(record.owner, record.turn_id));
-                }
-            } else {
-                contributions.push(counted);
-            }
+            contributions.push(CostContribution::unaccounted(owner, turn_id));
         }
+        contributions.extend(theirs);
+    }
+    contributions
+}
 
-        for &owner in sessions {
-            let Some(session) = self.sessions.get(&owner) else {
-                continue;
-            };
-            for turn in &session.snapshot.turns {
-                let covering = turn.started_at.and_then(|started_at| {
-                    included
-                        .iter()
-                        .copied()
-                        .filter(|aggregate| {
-                            self.covers(aggregate.owner, owner)
-                                && cost_interval(aggregate, &lifetime_starts).is_some_and(
-                                    |coverage| coverage.0 <= started_at && started_at <= coverage.1,
-                                )
-                        })
-                        .max_by_key(|aggregate| aggregate.record.recorded_at)
-                });
-                let unaccounted = if let Some(aggregate) = covering {
-                    work_exceeds_coverage(
-                        turn.last_output_at,
-                        turn.status == TurnStatus::Active,
-                        aggregate.owner == owner && aggregate.turn_id == turn.id,
-                        aggregate.record.recorded_at,
-                    )
-                } else {
-                    turn.cost.is_none() || turn.status == TurnStatus::Active
-                };
-                if unaccounted {
-                    contributions.push(CostContribution::unaccounted(owner, turn.id));
-                }
-            }
+/// Applies each Provider-declared coverage window to the frozen Cost
+/// records of `sessions`, a Session and some of what lies beneath it. A
+/// subtree report is cumulative only inside its reporting lifetime, where
+/// each report contributes its increment over the highest total reported
+/// before it (see [`RunningTotal`]), and
+/// receipt order alone never proves that late descendant evidence falls
+/// outside a report.
+fn contributions_of(forest: &impl CostForest, sessions: &[SessionId]) -> Vec<CostContribution> {
+    let mut records = Vec::new();
+    for &owner in sessions {
+        let Some(turns) = forest.turns(owner) else {
+            continue;
+        };
+        for turn in turns {
+            records.extend(cost_records(owner, turn));
         }
-
-        contributions
     }
 
-    /// Whether a whole-tree amount `reporter`'s Provider reported can cover
-    /// `worker`'s work: only where `worker` is `reporter` or a native
-    /// Subagent beneath it, reached without crossing a brokered Session. A
-    /// brokered Subagent's work is metered by a Provider actor of its own
-    /// (ADR 0035), so no report from above it ever holds that work (ADR
-    /// 0040).
-    fn covers(&self, reporter: SessionId, mut worker: SessionId) -> bool {
-        loop {
-            if reporter == worker {
-                return true;
-            }
-            let Some(record) = self.sessions.get(&worker) else {
-                return false;
-            };
-            if record.is_brokered_subagent() {
-                return false;
-            }
-            let Some(parent) = record.snapshot.session.parent else {
-                return false;
-            };
-            worker = parent;
+    let mut lifetime_starts = HashMap::<String, SessionTimestamp>::new();
+    let mut lifetimes = HashMap::<(SessionId, String), Vec<&ScopedCost>>::new();
+    for record in &records {
+        let CostCoverage::SessionSubtree { reporting_lifetime } = &record.record.coverage else {
+            continue;
+        };
+        if let Some(started_at) = record.turn_started_at {
+            lifetime_starts
+                .entry(reporting_lifetime.clone())
+                .and_modify(|current| *current = (*current).min(started_at))
+                .or_insert(started_at);
         }
+        lifetimes
+            .entry((record.owner, reporting_lifetime.clone()))
+            .or_default()
+            .push(record);
+    }
+    let running_totals = lifetimes
+        .into_values()
+        .map(|reports| {
+            RunningTotal::new(reports.into_iter().map(|report| (report, &report.record)))
+        })
+        .collect::<Vec<_>>();
+
+    let mut contributions = Vec::new();
+    let mut included = Vec::new();
+    for candidate in &running_totals {
+        let latest = candidate.latest().report;
+        let candidate_interval = cost_interval(latest, &lifetime_starts);
+        let coverage = running_totals
+            .iter()
+            .find_map(|cover| {
+                let cover = cover.latest().report;
+                if cover.owner == latest.owner || !covers(forest, cover.owner, latest.owner) {
+                    return None;
+                }
+                let (Some(candidate_interval), Some(cover_interval)) =
+                    (candidate_interval, cost_interval(cover, &lifetime_starts))
+                else {
+                    return Some(Coverage::PartlyCovered);
+                };
+                intervals_overlap(candidate_interval, cover_interval).then(|| {
+                    if interval_contains(cover_interval, candidate_interval) {
+                        Coverage::Covered
+                    } else {
+                        Coverage::PartlyCovered
+                    }
+                })
+            })
+            .unwrap_or(Coverage::NotCovered);
+        match coverage {
+            // A report an ancestor's whole-tree amount covers adds
+            // nothing; one it covers only in part leaves the sum partial.
+            Coverage::Covered => {}
+            Coverage::PartlyCovered => {
+                contributions.push(CostContribution::unaccounted(latest.owner, latest.turn_id))
+            }
+            Coverage::NotCovered => {
+                // A report whose lifetime never began on a timed Turn
+                // cannot say what work it spans, as the startup fold
+                // also reads it.
+                let untimed = candidate_interval.is_none();
+                contributions.extend(candidate.increments().iter().map(|increment| {
+                    CostContribution {
+                        session_id: increment.report.owner,
+                        turn_id: increment.report.turn_id,
+                        amount: Some(CountedCost {
+                            cost: increment.cost,
+                            basis: increment.report.record.basis,
+                        }),
+                        is_partial: increment.is_partial || untimed,
+                    }
+                }));
+                included.push(latest);
+            }
+        }
+    }
+
+    for record in records
+        .iter()
+        .filter(|record| record.record.coverage == CostCoverage::Turn)
+    {
+        let counted = CostContribution {
+            session_id: record.owner,
+            turn_id: record.turn_id,
+            amount: Some(CountedCost {
+                cost: record.record.cost,
+                basis: record.record.basis,
+            }),
+            is_partial: record.record.is_partial,
+        };
+        let Some(started_at) = record.turn_started_at else {
+            contributions.push(CostContribution {
+                is_partial: true,
+                ..counted
+            });
+            continue;
+        };
+        let interval = (started_at, record.record.recorded_at);
+        let overlapping = included
+            .iter()
+            .copied()
+            .filter(|aggregate| {
+                covers(forest, aggregate.owner, record.owner)
+                    && cost_interval(aggregate, &lifetime_starts)
+                        .is_some_and(|coverage| intervals_overlap(interval, coverage))
+            })
+            .max_by_key(|aggregate| aggregate.record.recorded_at);
+        if let Some(aggregate) = overlapping {
+            let coverage = cost_interval(aggregate, &lifetime_starts)
+                .expect("an overlapping aggregate has an interval");
+            if !interval_contains(coverage, interval) {
+                contributions.push(CostContribution::unaccounted(record.owner, record.turn_id));
+            }
+        } else {
+            contributions.push(counted);
+        }
+    }
+
+    for &owner in sessions {
+        let Some(turns) = forest.turns(owner) else {
+            continue;
+        };
+        for turn in turns {
+            let covering = turn.started_at.and_then(|started_at| {
+                included
+                    .iter()
+                    .copied()
+                    .filter(|aggregate| {
+                        covers(forest, aggregate.owner, owner)
+                            && cost_interval(aggregate, &lifetime_starts).is_some_and(|coverage| {
+                                coverage.0 <= started_at && started_at <= coverage.1
+                            })
+                    })
+                    .max_by_key(|aggregate| aggregate.record.recorded_at)
+            });
+            let unaccounted = if let Some(aggregate) = covering {
+                work_exceeds_coverage(
+                    turn.last_output_at,
+                    turn.status == TurnStatus::Active,
+                    aggregate.owner == owner && aggregate.turn_id == turn.id,
+                    aggregate.record.recorded_at,
+                )
+            } else {
+                turn.cost.is_none() || turn.status == TurnStatus::Active
+            };
+            if unaccounted {
+                contributions.push(CostContribution::unaccounted(owner, turn.id));
+            }
+        }
+    }
+
+    contributions
+}
+
+/// Whether a whole-tree amount `reporter`'s Provider reported can cover
+/// `worker`'s work: only where `worker` is `reporter` or a native
+/// Subagent beneath it, reached without crossing a brokered Session. A
+/// brokered Subagent's work is metered by a Provider actor of its own
+/// (ADR 0035), so no report from above it ever holds that work (ADR
+/// 0040).
+fn covers(forest: &impl CostForest, reporter: SessionId, mut worker: SessionId) -> bool {
+    loop {
+        if reporter == worker {
+            return true;
+        }
+        if forest.turns(worker).is_none() || forest.is_brokered_subagent(worker) {
+            return false;
+        }
+        let Some(parent) = forest.parent(worker) else {
+            return false;
+        };
+        worker = parent;
     }
 }
 
@@ -489,7 +535,7 @@ pub(super) fn work_exceeds_coverage(
     last_output_at.is_some_and(|output| output > coverage_end) || active && !is_report_carrier
 }
 
-fn add_cost(total: Option<Cost>, cost: Cost) -> Cost {
+pub(super) fn add_cost(total: Option<Cost>, cost: Cost) -> Cost {
     total.map_or(cost, |total| total.saturating_add(cost))
 }
 
