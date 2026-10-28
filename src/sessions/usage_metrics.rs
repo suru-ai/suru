@@ -121,8 +121,8 @@ impl Tally {
     fn add(&mut self, turn: MeteredTurn) {
         let keyed = self.by_key.entry(turn.key).or_default();
         if let Some(usage) = &turn.usage {
-            add_usage(&mut self.total, usage);
-            add_usage(keyed, usage);
+            self.total.add_usage(usage);
+            keyed.add_usage(usage);
         }
     }
 
@@ -212,31 +212,10 @@ fn key_order(key: &UsageMetricsKey) -> (bool, &str, &str) {
 /// Catalog where it carries one, otherwise its id.
 fn label(key: &UsageMetricsKey, catalog: &ModelCatalog) -> String {
     match key {
-        UsageMetricsKey::Model { provider, model } => catalog
-            .providers
-            .iter()
-            .filter(|catalog| catalog.provider == *provider)
-            .flat_map(|catalog| &catalog.models)
-            .find(|descriptor| descriptor.id == *model)
-            .map_or_else(
-                || model.as_str().to_owned(),
-                |descriptor| descriptor.display_name.clone(),
-            ),
+        UsageMetricsKey::Model { provider, model } => catalog.model(provider, model).map_or_else(
+            || model.as_str().to_owned(),
+            |descriptor| descriptor.display_name.clone(),
+        ),
         UsageMetricsKey::Unknown => "Unknown".to_owned(),
     }
-}
-
-/// Adds one Turn's Usage to an aggregate part by part, keeping a part absent
-/// where neither reported it.
-fn add_usage(aggregate: &mut UsageMetricsAggregate, usage: &Usage) {
-    let add = |held: &mut Option<u64>, added: Option<u64>| {
-        if let Some(added) = added {
-            *held = Some(held.unwrap_or(0).saturating_add(added));
-        }
-    };
-    add(&mut aggregate.fresh_input_tokens, usage.fresh_input_tokens);
-    add(&mut aggregate.cache_read_tokens, usage.cache_read_tokens);
-    add(&mut aggregate.cache_write_tokens, usage.cache_write_tokens);
-    add(&mut aggregate.output_tokens, usage.output_tokens);
-    add(&mut aggregate.reasoning_tokens, usage.reasoning_tokens);
 }

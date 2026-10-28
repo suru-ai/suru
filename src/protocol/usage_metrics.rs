@@ -87,8 +87,8 @@ pub struct UsageMetricsReport {
     pub keys: Vec<UsageMetricsKeyLabel>,
 }
 
-/// The figures of one bucket: its whole, and its part under each key that
-/// holds any of it.
+/// The figures of one bucket: its whole, and its part under each key a Turn
+/// in the bucket ran under, whether or not that Turn recorded any Usage.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageMetricsBucket {
@@ -118,6 +118,17 @@ pub struct UsageMetricsAggregate {
 }
 
 impl UsageMetricsAggregate {
+    /// Adds one Turn's Usage part by part, keeping a part absent where
+    /// neither reported it, as [`super::UsageTotal::saturating_add`] does.
+    pub fn add_usage(&mut self, usage: &super::Usage) {
+        let add = super::add_parts;
+        self.fresh_input_tokens = add(self.fresh_input_tokens, usage.fresh_input_tokens);
+        self.cache_read_tokens = add(self.cache_read_tokens, usage.cache_read_tokens);
+        self.cache_write_tokens = add(self.cache_write_tokens, usage.cache_write_tokens);
+        self.output_tokens = add(self.output_tokens, usage.output_tokens);
+        self.reasoning_tokens = add(self.reasoning_tokens, usage.reasoning_tokens);
+    }
+
     /// The compact figure a reader is shown, on the same terms as every
     /// other surface's: see [`super::Usage::blended_tokens`].
     pub fn blended_tokens(&self) -> Option<u64> {

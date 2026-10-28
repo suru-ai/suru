@@ -536,6 +536,18 @@ pub struct ModelCatalog {
     pub providers: Vec<ProviderModelCatalog>,
 }
 
+impl ModelCatalog {
+    /// The Model `model` as the catalog lists it under `provider`, where it
+    /// does.
+    pub fn model(&self, provider: &ProviderId, model: &ModelId) -> Option<&ModelDescriptor> {
+        self.providers
+            .iter()
+            .filter(|catalog| catalog.provider == *provider)
+            .flat_map(|catalog| &catalog.models)
+            .find(|descriptor| descriptor.id == *model)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SessionRevision(pub u64);
