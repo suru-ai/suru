@@ -273,6 +273,89 @@ pub struct InsightsReport {
     /// Turn the interval holds, read from storage, so a Session working
     /// now may have used a Tool more recently than this says.
     pub tools: Vec<ToolTally>,
+    /// The Compactions of the interval's Turns, read from storage as the
+    /// Tools are.
+    pub compactions: CompactionInsights,
+    /// The Approvals the interval's Turns asked, read from storage as the
+    /// Tools are.
+    pub approvals: ApprovalInsights,
+}
+
+/// How many Compactions the interval's Turns held, of each trigger and
+/// status, and how much of the context they freed.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionInsights {
+    /// Those the Provider chose to do.
+    pub automatic: CompactionCounts,
+    /// Those the user asked for.
+    pub manual: CompactionCounts,
+    /// The share of the context Compactions freed, on average; absent where
+    /// none can say.
+    pub freed: Option<FreedShare>,
+}
+
+impl CompactionInsights {
+    /// Every Compaction counted, of either trigger and any status.
+    pub fn total(&self) -> u64 {
+        self.automatic.total() + self.manual.total()
+    }
+}
+
+/// How many Compactions of one trigger stand at each status.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionCounts {
+    /// Still summarising when storage last saved them.
+    pub active: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub interrupted: u64,
+}
+
+impl CompactionCounts {
+    pub fn total(&self) -> u64 {
+        self.active + self.completed + self.failed + self.interrupted
+    }
+}
+
+/// The average share of the context a Compaction freed, (before − after) ÷
+/// before, over the Compactions that completed knowing both figures with
+/// some context before. One failed or interrupted left the context as it
+/// was, so says nothing of what a Compaction frees.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreedShare {
+    /// How many Compactions the average is over: at least one.
+    pub compactions: u64,
+    /// The average, in millionths of the context before: negative where
+    /// the context after was on average the larger, as a short history's
+    /// summary may leave it.
+    pub average_millionths: i64,
+}
+
+/// How many Approvals the interval's Turns asked, and how each stands by
+/// the Decision recorded for it. Every Approval asked is counted in exactly
+/// one of the other figures.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalInsights {
+    pub asked: u64,
+    /// Decided: Accept.
+    pub accepted: u64,
+    /// Decided: Accept for Session.
+    pub accepted_for_session: u64,
+    /// Decided: Decline.
+    pub declined: u64,
+    /// Decided: Decline and Interrupt, which also ended its Turn.
+    pub declined_and_interrupted: u64,
+    /// Still answerable, or with a Decision on its way to the Provider,
+    /// when storage last saved it.
+    pub waiting: u64,
+    /// Settled with no Decision recorded: withdrawn by its Provider, its
+    /// Turn ended first, its request no longer live, or a Decision whose
+    /// delivery stayed uncertain, which Suru never records as made.
+    pub expired: u64,
 }
 
 /// A Tool an Agent used, as the Insights tab tells them apart.

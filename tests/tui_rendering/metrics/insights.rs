@@ -14,9 +14,9 @@ use jiff::civil::date;
 use ratatui::{buffer::Buffer, style::Style};
 use suru::{
     protocol::{
-        Cost, InsightsQuery, InsightsReport, InsightsTool, Outlook, QUARTER_HOUR_MS,
-        QuarterHourTurns, ToolTally, TurnDurations, TurnInsights, UsageMetricsInterval,
-        UsageMetricsQuery,
+        ApprovalInsights, CompactionCounts, CompactionInsights, Cost, FreedShare, InsightsQuery,
+        InsightsReport, InsightsTool, Outlook, QUARTER_HOUR_MS, QuarterHourTurns, ToolTally,
+        TurnDurations, TurnInsights, UsageMetricsInterval, UsageMetricsQuery,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, InsightsPanel, MetricsTab,
@@ -90,6 +90,44 @@ fn worked() -> InsightsReport {
         },
         quarter_hours: worked_hours(),
         tools: worked_tools(),
+        compactions: worked_compactions(),
+        approvals: worked_approvals(),
+    }
+}
+
+/// The mockup's 27 Compactions: 6 manual, 1 failed, and on average 61% of
+/// the context freed by the 26 that completed knowing both figures.
+fn worked_compactions() -> CompactionInsights {
+    CompactionInsights {
+        automatic: CompactionCounts {
+            active: 0,
+            completed: 20,
+            failed: 1,
+            interrupted: 0,
+        },
+        manual: CompactionCounts {
+            active: 0,
+            completed: 6,
+            failed: 0,
+            interrupted: 0,
+        },
+        freed: Some(FreedShare {
+            compactions: 26,
+            average_millionths: 612_000,
+        }),
+    }
+}
+
+/// The mockup's 188 Approvals: 171 accepted, 12 declined, and 5 neither.
+fn worked_approvals() -> ApprovalInsights {
+    ApprovalInsights {
+        asked: 188,
+        accepted: 160,
+        accepted_for_session: 11,
+        declined: 10,
+        declined_and_interrupted: 2,
+        waiting: 1,
+        expired: 4,
     }
 }
 

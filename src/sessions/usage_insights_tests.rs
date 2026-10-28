@@ -11,10 +11,11 @@ use super::{
 };
 use crate::{
     protocol::{
-        Activity, ActivityId, ActivityStatus, Author, Cost, InsightsQuery, InsightsReport,
-        InsightsTool, QUARTER_HOUR_MS, QuarterHourTurns, SessionListItem, SessionTimestamp,
-        ToolTally, TranscriptItem, Turn, TurnDurations, TurnId, TurnInsights, TurnStatus,
-        UsageMetricsInterval, UsageTotal,
+        Activity, ActivityId, ActivityStatus, Approval, ApprovalId, ApprovalInsights,
+        ApprovalOutcome, ApprovalSubject, Author, CompactionCounts, CompactionTrigger, Cost,
+        Decision, FreedShare, InsightsQuery, InsightsReport, InsightsTool, QUARTER_HOUR_MS,
+        QuarterHourTurns, SessionListItem, SessionTimestamp, ToolTally, TranscriptItem, Turn,
+        TurnDurations, TurnId, TurnInsights, TurnStatus, UsageMetricsInterval, UsageTotal,
     },
     sidekick::SidekickWorkspace,
     storage::PersistedSession,
@@ -655,5 +656,259 @@ async fn an_open_session_s_tools_are_read_from_storage_as_well() {
     let tools = read(&store, &over(START, END)).await.tools;
 
     assert_eq!(tools, vec![tally(InsightsTool::FileChange, 1, 0)]);
+    writer.shutdown().await.unwrap();
+}
+
+fn compaction(
+    turn_id: TurnId,
+    trigger: CompactionTrigger,
+    status: ActivityStatus,
+    before_tokens: Option<u64>,
+    after_tokens: Option<u64>,
+) -> Activity {
+    Activity::Compaction {
+        id: ActivityId::new(),
+        turn_id,
+        status,
+        trigger,
+        instructions: None,
+        before_tokens,
+        after_tokens,
+        error: None,
+        summary: Some("a summary no tally reads".repeat(64)),
+        summary_truncated: false,
+    }
+}
+
+fn counts(active: u64, completed: u64, failed: u64, interrupted: u64) -> CompactionCounts {
+    CompactionCounts {
+        active,
+        completed,
+        failed,
+        interrupted,
+    }
+}
+
+#[tokio::test]
+async fn compactions_are_tallied_by_trigger_and_status_from_stored_activities() {
+    use ActivityStatus::{Active, Completed, Failed, Interrupted};
+    use CompactionTrigger::{Automatic, Manual};
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![took(START, 1), took(START - 1, 1)];
+    let [held, before] = [0, 1].map(|turn| session.snapshot.turns[turn].id);
+    for activity in [
+        compaction(held, Automatic, Completed, Some(100_000), Some(20_000)),
+        compaction(held, Automatic, Completed, Some(50_000), Some(40_000)),
+        compaction(held, Automatic, Failed, Some(90_000), None),
+        compaction(held, Automatic, Active, Some(80_000), None),
+        compaction(held, Manual, Completed, None, Some(10_000)),
+        compaction(held, Manual, Interrupted, None, None),
+        compaction(held, Manual, Failed, None, None),
+        // A Turn the interval does not hold.
+        compaction(before, Manual, Completed, Some(10), Some(1)),
+        command(held, Completed),
+    ] {
+        record(&mut session, activity);
+    }
+    let (store, writer) = restore_deferred(directory.path(), vec![session]).await;
+
+    let compactions = read(&store, &over(START, END)).await.compactions;
+
+    assert_eq!(
+        (
+            compactions.automatic,
+            compactions.manual,
+            compactions.total()
+        ),
+        (counts(1, 2, 1, 0), counts(0, 1, 1, 1), 7)
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn freed_share_averages_only_completed_compactions_that_knew_both_figures() {
+    use ActivityStatus::{Completed, Failed, Interrupted};
+    use CompactionTrigger::{Automatic, Manual};
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![took(START, 1)];
+    let turn = session.snapshot.turns[0].id;
+    for activity in [
+        // Frees 80%, and 20%.
+        compaction(turn, Automatic, Completed, Some(100_000), Some(20_000)),
+        compaction(turn, Manual, Completed, Some(50_000), Some(40_000)),
+        // A short history's summary can leave more than it found: -10%.
+        compaction(turn, Automatic, Completed, Some(10_000), Some(11_000)),
+        // Neither figure, one alone, or nothing before to free.
+        compaction(turn, Automatic, Completed, None, None),
+        compaction(turn, Automatic, Completed, Some(100_000), None),
+        compaction(turn, Automatic, Completed, None, Some(1_000)),
+        compaction(turn, Automatic, Completed, Some(0), Some(0)),
+        // Not completed, whatever it knew.
+        compaction(turn, Automatic, Failed, Some(100_000), Some(100_000)),
+        compaction(turn, Manual, Interrupted, Some(100_000), Some(0)),
+    ] {
+        record(&mut session, activity);
+    }
+    let (store, writer) = restore_deferred(directory.path(), vec![session]).await;
+
+    let compactions = read(&store, &over(START, END)).await.compactions;
+
+    assert_eq!(
+        compactions.freed,
+        Some(FreedShare {
+            compactions: 3,
+            average_millionths: 300_000,
+        })
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn no_compaction_that_could_say_leaves_the_freed_share_unknown() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![took(START, 1)];
+    let turn = session.snapshot.turns[0].id;
+    record(
+        &mut session,
+        compaction(
+            turn,
+            CompactionTrigger::Manual,
+            ActivityStatus::Interrupted,
+            Some(100_000),
+            Some(1_000),
+        ),
+    );
+    let (store, writer) = restore_deferred(directory.path(), vec![session]).await;
+
+    let compactions = read(&store, &over(START, END)).await.compactions;
+
+    assert_eq!(
+        (compactions.manual, compactions.freed),
+        (counts(0, 0, 0, 1), None)
+    );
+    writer.shutdown().await.unwrap();
+}
+
+fn approval(turn_id: TurnId, outcome: ApprovalOutcome, decision: Option<Decision>) -> Activity {
+    Activity::Approval {
+        id: ActivityId::new(),
+        turn_id,
+        approval: Approval {
+            id: ApprovalId::new(),
+            subject: ApprovalSubject::Command {
+                command: "rm -rf target".to_owned(),
+                cwd: None,
+                actions: Vec::new(),
+            },
+            reason: Some("a reason no tally reads".repeat(64)),
+        },
+        tool_activity_id: None,
+        detail_truncated: false,
+        outcome,
+        decision,
+        follow_up_error: None,
+        asked_at: None,
+    }
+}
+
+#[tokio::test]
+async fn approvals_are_tallied_by_the_decision_recorded_for_each() {
+    use ApprovalOutcome::{
+        Decided, DeliveryUncertain, Pending, SubmissionRejected, Submitting, TurnEnded,
+        Unavailable, Withdrawn,
+    };
+    use Decision::{Accept, AcceptForSession, Decline, DeclineAndInterrupt};
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![took(START, 1), took(START - 1, 1)];
+    let [held, before] = [0, 1].map(|turn| session.snapshot.turns[turn].id);
+    for activity in [
+        approval(held, Decided, Some(Accept)),
+        approval(held, Decided, Some(Accept)),
+        approval(held, Decided, Some(Accept)),
+        approval(held, Decided, Some(AcceptForSession)),
+        approval(held, Decided, Some(AcceptForSession)),
+        approval(held, Decided, Some(Decline)),
+        // A Decision that also ended its Turn is a Decline all the same,
+        // and told apart.
+        approval(held, Decided, Some(DeclineAndInterrupt)),
+        // Still waiting on a Decision, or on its delivery.
+        approval(held, Pending, None),
+        approval(held, Submitting, None),
+        approval(held, SubmissionRejected, None),
+        // Settled with no Decision recorded.
+        approval(held, Withdrawn, None),
+        approval(held, TurnEnded, None),
+        approval(held, Unavailable, None),
+        approval(held, DeliveryUncertain, None),
+        // A Turn the interval does not hold.
+        approval(before, Decided, Some(Decline)),
+    ] {
+        record(&mut session, activity);
+    }
+    let (store, writer) = restore_deferred(directory.path(), vec![session]).await;
+
+    let approvals = read(&store, &over(START, END)).await.approvals;
+
+    assert_eq!(
+        approvals,
+        ApprovalInsights {
+            asked: 14,
+            accepted: 3,
+            accepted_for_session: 2,
+            declined: 1,
+            declined_and_interrupted: 1,
+            waiting: 3,
+            expired: 4,
+        }
+    );
+    writer.shutdown().await.unwrap();
+}
+
+/// Compactions and Approvals are read in the same pass over storage as the
+/// Tools, loading no history in either.
+#[tokio::test]
+async fn compactions_and_approvals_are_read_without_hydrating_a_deferred_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut root = persisted(directory.path(), None);
+    root.snapshot.turns = vec![took(START, 1)];
+    let turn = root.snapshot.turns[0].id;
+    record(
+        &mut root,
+        compaction(
+            turn,
+            CompactionTrigger::Manual,
+            ActivityStatus::Failed,
+            None,
+            None,
+        ),
+    );
+    record(&mut root, approval(turn, ApprovalOutcome::Pending, None));
+    let root_id = root.snapshot.session.id;
+    let (store, writer) = restore_deferred(directory.path(), vec![root]).await;
+    let read_state = |store: &SessionStore| {
+        let state = store.state.lock().unwrap();
+        (
+            state.is_deferred(root_id),
+            state.sessions[&root_id].snapshot.revision,
+            state.sessions[&root_id].snapshot.activities.len(),
+        )
+    };
+    let before = read_state(&store);
+
+    let report = read(&store, &over(START, END)).await;
+
+    assert_eq!(
+        (
+            report.compactions.manual,
+            report.approvals.asked,
+            report.approvals.waiting
+        ),
+        (counts(0, 0, 1, 0), 1, 1)
+    );
+    assert_eq!(read_state(&store), before, "no history was read in");
     writer.shutdown().await.unwrap();
 }

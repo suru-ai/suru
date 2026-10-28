@@ -19,9 +19,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
-        AgentSelection, CheckoutAssociation, ExecutionDirectory, InsightsTool, Outlook, PromptId,
-        ProviderId, RepositoryLocation, SessionId, SessionSnapshot, SessionSummary,
-        SessionTimestamp, ToolTally, TranscriptItem, TurnId, UnreadableSessionSummary, Workspace,
+        AgentSelection, ApprovalInsights, CheckoutAssociation, CompactionInsights,
+        ExecutionDirectory, FreedShare, InsightsTool, Outlook, PromptId, ProviderId,
+        RepositoryLocation, SessionId, SessionSnapshot, SessionSummary, SessionTimestamp,
+        ToolTally, TranscriptItem, TurnId, UnreadableSessionSummary, Workspace,
         WorkspaceDescription, WorkspaceId,
     },
     provider::{ProviderResumeState, ProviderSubagentId},
@@ -800,23 +801,25 @@ impl StorageRepository {
         .await
     }
 
-    /// How often the Turns `turns` names of each Session used each Tool, and
-    /// how many of those uses failed, read from the Activities storage holds
-    /// without reading any Session's history in (ADR 0056). Each row gives up
-    /// only its kind, status, and Tool name and server, and the Turn owning
-    /// it; no payload is deserialized. Storage lags a Session open in
-    /// memory by whatever it has not saved yet, which the read accepts.
+    /// What the Activities storage holds of the Turns `turns` names of each
+    /// Session add up to, read without reading any Session's history in
+    /// (ADR 0056): how often they used each Tool and how many of those uses
+    /// failed, their Compactions, and the Approvals they asked. Each row
+    /// gives up only its kind, the Turn owning it, and the few fields of its
+    /// payload a tally reads; no payload is deserialized. Storage lags a
+    /// Session open in memory by whatever it has not saved yet, which the
+    /// read accepts.
     ///
     /// The rows are read a few Sessions at a time, so no query binds more
-    /// than [`SESSIONS_PER_TOOL_READ`] of them, and streamed into the tally
-    /// rather than held: a Session's rows are read whole, whichever of its
-    /// Turns they belong to, and those of a Turn not named left out here.
-    pub(crate) async fn tool_tallies(
+    /// than [`SESSIONS_PER_ACTIVITY_READ`] of them, and streamed into the
+    /// tally rather than held: a Session's rows are read whole, whichever of
+    /// its Turns they belong to, and those of a Turn not named left out here.
+    pub(crate) async fn activity_tallies(
         &self,
         turns: HashMap<SessionId, HashSet<TurnId>>,
-    ) -> Result<Vec<ToolTally>, StorageError> {
+    ) -> Result<ActivityTallies, StorageError> {
         let path = self.database_path.clone();
-        on_blocking_task("reading Tool tallies", move || {
+        on_blocking_task("reading Activity tallies", move || {
             let mut connection = connect(&path)?;
             let turns = turns
                 .into_iter()
@@ -826,13 +829,14 @@ impl StorageRepository {
                 })
                 .collect::<HashMap<_, _>>();
             let sessions = turns.keys().collect::<Vec<_>>();
-            let mut tally = HashMap::<InsightsTool, (u64, u64)>::new();
-            for sessions in sessions.chunks(SESSIONS_PER_TOOL_READ) {
+            let mut tally = ActivityTally::default();
+            for sessions in sessions.chunks(SESSIONS_PER_ACTIVITY_READ) {
                 let rows = activities::table
                     .filter(activities::session_id.eq_any(sessions))
                     .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
                         "json_extract(payload, '$.kind') IN \
-                         ('command', 'file_change', 'tool_call', 'subagent')",
+                         ('command', 'file_change', 'tool_call', 'subagent', \
+                          'compaction', 'approval')",
                     ))
                     .select((
                         activities::session_id,
@@ -841,32 +845,31 @@ impl StorageRepository {
                         diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.status')"),
                         diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.name')"),
                         diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.server')"),
+                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.trigger')"),
+                        diesel::dsl::sql::<Nullable<BigInt>>(
+                            "json_extract(payload, '$.before_tokens')",
+                        ),
+                        diesel::dsl::sql::<Nullable<BigInt>>(
+                            "json_extract(payload, '$.after_tokens')",
+                        ),
+                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.outcome')"),
+                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.decision')"),
                     ))
-                    .load_iter::<ToolTallyRow, diesel::connection::DefaultLoadingMode>(
+                    .load_iter::<ActivityTallyRow, diesel::connection::DefaultLoadingMode>(
                         &mut connection,
                     )
                     .map_err(|error| StorageError::Read(error.to_string()))?;
                 for row in rows {
-                    let (session_id, turn_id, kind, status, name, server) =
-                        row.map_err(|error| StorageError::Read(error.to_string()))?;
-                    if !turns
-                        .get(&session_id)
-                        .is_some_and(|turns| turns.contains(&turn_id))
+                    let row = row.map_err(|error| StorageError::Read(error.to_string()))?;
+                    if turns
+                        .get(&row.0)
+                        .is_some_and(|turns| turns.contains(&row.1))
                     {
-                        continue;
+                        tally.add(row);
                     }
-                    let Some(tool) = used_tool(&kind, name, server) else {
-                        continue;
-                    };
-                    let (uses, failed) = tally.entry(tool).or_default();
-                    *uses += 1;
-                    *failed += u64::from(status.as_deref() == Some("failed"));
                 }
             }
-            Ok(tally
-                .into_iter()
-                .map(|(tool, (uses, failed))| ToolTally { tool, uses, failed })
-                .collect())
+            Ok(tally.into_tallies())
         })
         .await
     }
@@ -1789,20 +1792,139 @@ fn refuse_newer_schema(connection: &mut SqliteConnection) -> Result<(), StorageE
     Ok(())
 }
 
-/// How many Sessions one query of [`StorageRepository::tool_tallies`] binds,
-/// well within the fewest host parameters any SQLite build allows.
-const SESSIONS_PER_TOOL_READ: usize = 500;
+/// How many Sessions one query of [`StorageRepository::activity_tallies`]
+/// binds, well within the fewest host parameters any SQLite build allows.
+const SESSIONS_PER_ACTIVITY_READ: usize = 500;
 
-/// What [`StorageRepository::tool_tallies`] reads of an Activity row: its
-/// Session and Turn, and its kind, status, Tool name, and MCP server.
-type ToolTallyRow = (
+/// What [`StorageRepository::activity_tallies`] reads of an Activity row:
+/// its Session and Turn, its kind, and its status, Tool name, MCP server,
+/// Compaction trigger, Context Fill before and after, Approval outcome, and
+/// Decision, each absent where its kind has none.
+type ActivityTallyRow = (
     String,
     String,
     String,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
     Option<String>,
     Option<String>,
 );
+
+/// What the Activities of a span's Turns add up to, as
+/// [`StorageRepository::activity_tallies`] reads them.
+#[derive(Debug, Default)]
+pub(crate) struct ActivityTallies {
+    /// How often each Tool was used, in no order.
+    pub(crate) tools: Vec<ToolTally>,
+    pub(crate) compactions: CompactionInsights,
+    pub(crate) approvals: ApprovalInsights,
+}
+
+/// The tallies as the rows stream in.
+#[derive(Default)]
+struct ActivityTally {
+    tools: HashMap<InsightsTool, (u64, u64)>,
+    compactions: CompactionInsights,
+    /// The freed shares of the Compactions that can say, added up, and how
+    /// many there are.
+    freed: (f64, u64),
+    approvals: ApprovalInsights,
+}
+
+impl ActivityTally {
+    fn add(&mut self, row: ActivityTallyRow) {
+        let (_, _, kind, status, name, server, trigger, before, after, outcome, decision) = row;
+        match kind.as_str() {
+            "compaction" => self.add_compaction(status, trigger, before, after),
+            "approval" => self.add_approval(outcome, decision),
+            kind => {
+                let Some(tool) = used_tool(kind, name, server) else {
+                    return;
+                };
+                let (uses, failed) = self.tools.entry(tool).or_default();
+                *uses += 1;
+                *failed += u64::from(status.as_deref() == Some("failed"));
+            }
+        }
+    }
+
+    /// Counts a Compaction by its trigger and status, and where it
+    /// completed knowing both figures with some context before, the share
+    /// of that context it freed.
+    fn add_compaction(
+        &mut self,
+        status: Option<String>,
+        trigger: Option<String>,
+        before: Option<i64>,
+        after: Option<i64>,
+    ) {
+        let counts = match trigger.as_deref() {
+            Some("automatic") => &mut self.compactions.automatic,
+            Some("manual") => &mut self.compactions.manual,
+            _ => return,
+        };
+        let count = match status.as_deref() {
+            Some("active") => &mut counts.active,
+            Some("completed") => &mut counts.completed,
+            Some("failed") => &mut counts.failed,
+            Some("interrupted") => &mut counts.interrupted,
+            _ => return,
+        };
+        *count += 1;
+        if status.as_deref() == Some("completed")
+            && let Some((before, after)) = before.zip(after)
+            && before > 0
+        {
+            let (shares, compactions) = &mut self.freed;
+            *shares += (before - after) as f64 / before as f64;
+            *compactions += 1;
+        }
+    }
+
+    /// Counts an Approval asked, and how it stands by the Decision
+    /// recorded for it.
+    fn add_approval(&mut self, outcome: Option<String>, decision: Option<String>) {
+        let approvals = &mut self.approvals;
+        approvals.asked += 1;
+        let count = match (outcome.as_deref(), decision.as_deref()) {
+            (Some("decided"), Some("accept")) => &mut approvals.accepted,
+            (Some("decided"), Some("accept_for_session")) => &mut approvals.accepted_for_session,
+            (Some("decided"), Some("decline")) => &mut approvals.declined,
+            (Some("decided"), Some("decline_and_interrupt")) => {
+                &mut approvals.declined_and_interrupted
+            }
+            (Some("pending" | "submitting" | "submission_rejected"), _) => &mut approvals.waiting,
+            // Withdrawn, its Turn ended, unavailable, or its delivery
+            // uncertain: settled, with no Decision recorded.
+            _ => &mut approvals.expired,
+        };
+        *count += 1;
+    }
+
+    fn into_tallies(self) -> ActivityTallies {
+        let (shares, compactions) = self.freed;
+        let freed = (compactions > 0).then(|| FreedShare {
+            compactions,
+            average_millionths: (shares / compactions as f64 * 1_000_000.0).round() as i64,
+        });
+        ActivityTallies {
+            tools: self
+                .tools
+                .into_iter()
+                .map(|(tool, (uses, failed))| ToolTally { tool, uses, failed })
+                .collect(),
+            compactions: CompactionInsights {
+                freed,
+                ..self.compactions
+            },
+            approvals: self.approvals,
+        }
+    }
+}
 
 /// The Tool an Activity of `kind` used, named `name` and hosted by `server`
 /// where it is a Tool Call: none where the row records no use of a Tool, or a Tool
