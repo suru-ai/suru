@@ -444,7 +444,7 @@ fn a_read_that_never_reached_a_server_says_so() {
 }
 
 #[test]
-fn a_refused_refresh_keeps_the_figures_and_says_why_beside_them() {
+fn a_refused_refresh_keeps_the_figures_and_says_why_above_them() {
     let mut application = reader_in(NEW_YORK, afternoon());
     let (_, first, query) = ask(&mut application);
     answer(&mut application, first, Ok(report(&query)));
@@ -460,17 +460,22 @@ fn a_refused_refresh_keeps_the_figures_and_says_why_beside_them() {
 
     let rows = screen(&application);
     row(&rows, "Claude Opus 5.5");
-    let subtitle = row(&rows, "Tokens by Model");
-    assert!(
-        subtitle.contains("could not refresh: connection refused"),
-        "{subtitle}"
-    );
-    assert!(!subtitle.contains("Refreshing…"), "{subtitle}");
+    let controls = rendered_row(&rows, "Tokens by Model");
+    let note = rendered_row(&rows, "Could not refresh: connection refused");
+    assert_eq!(note, controls + 1, "beneath the controls");
+    assert!(!rows.join("\n").contains("Refreshing…"));
+    // Its own row, so even 80 columns say all of it.
+    let narrow = rendered_application_rows_at(&application, 80, HEIGHT);
+    row(&narrow, "Could not refresh: connection refused");
 
     // A refresh that lands clears the note.
     let (_, third, _) = expect_read(key(&mut application, KeyCode::Char('r')));
     answer(&mut application, third, Ok(report(&query)));
-    assert!(!row(&screen(&application), "Tokens by Model").contains("could not refresh"));
+    assert!(
+        !screen(&application)
+            .join("\n")
+            .contains("Could not refresh")
+    );
 }
 
 #[test]

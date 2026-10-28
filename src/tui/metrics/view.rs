@@ -60,19 +60,18 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
     let measure = view.measure();
     let controls_y = area.y + 3;
     let bar_end = render_range_bar(buffer, area.x + INSET - 1, controls_y, view, theme);
-    let mut subtitle = format!("{} by Model", measure.label());
-    if view.is_reading() && matches!(view.content(), MetricsContent::Report { .. }) {
-        subtitle.push_str(" · Refreshing…");
-    }
-    let subtitle_x = bar_end + CONTROL_GAP;
-    let subtitle_width = u16::try_from(subtitle.width()).unwrap_or(u16::MAX);
-    buffer.set_string(subtitle_x, controls_y, &subtitle, subdued);
-    // Figures that could not be read again stay, saying why beside them.
+    let subtitle = format!("{} by Model", measure.label());
+    buffer.set_string(bar_end + CONTROL_GAP, controls_y, &subtitle, subdued);
+    // What is happening to the figures shown takes the row under the
+    // controls, where it has the whole width to say it in.
+    let status_y = controls_y + 1;
+    let room = usize::from(area.width.saturating_sub(INSET * 2));
     if let Some(refusal) = view.stale_because() {
-        let x = subtitle_x + subtitle_width;
-        let room = usize::from(area.right().saturating_sub(x + INSET));
-        let note = truncate_to_width(&format!(" · {}", stale_note(refusal)), room);
-        buffer.set_string(x, controls_y, note, theme.feedback.error);
+        // Figures that could not be read again stay, saying why above them.
+        let note = truncate_to_width(&stale_note(refusal), room);
+        buffer.set_string(area.x + INSET, status_y, note, theme.feedback.error);
+    } else if view.is_reading() && matches!(view.content(), MetricsContent::Report { .. }) {
+        buffer.set_string(area.x + INSET, status_y, "Refreshing…", subdued);
     }
 
     let body = Rect::new(
@@ -230,11 +229,11 @@ fn render_legend(
     }
 }
 
-/// What the subtitle says of figures a refresh could not replace.
+/// What the view says of figures a refresh could not replace.
 fn stale_note(refusal: &UsageMetricsReadRefusal) -> String {
     match refusal {
-        UsageMetricsReadRefusal::Refused(reason) => format!("not refreshed: {reason}"),
-        UsageMetricsReadRefusal::Failed(reason) => format!("could not refresh: {reason}"),
+        UsageMetricsReadRefusal::Refused(reason) => format!("Not refreshed: {reason}"),
+        UsageMetricsReadRefusal::Failed(reason) => format!("Could not refresh: {reason}"),
     }
 }
 
