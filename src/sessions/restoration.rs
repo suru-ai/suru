@@ -9,10 +9,10 @@ use crate::protocol::{
 
 use super::{
     SessionStoreState,
-    projection::{
-        add_cost_totals, derived_session_status, interval_contains, with_unpriced_work,
-        work_exceeds_coverage,
+    cost_coverage::{
+        add_cost_totals, interval_contains, with_unpriced_work, work_exceeds_coverage,
     },
+    projection::derived_session_status,
 };
 
 impl SessionStoreState {

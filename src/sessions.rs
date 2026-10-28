@@ -30,6 +30,7 @@ mod checkouts;
 pub(crate) use checkouts::CheckoutActivity;
 mod compaction_fill;
 mod compactions;
+mod cost_coverage;
 pub(crate) use compactions::CompactSessionError;
 mod eviction;
 pub(crate) use eviction::{
