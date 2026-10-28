@@ -308,7 +308,7 @@ impl Legend {
 /// The legend's heading, then one row per series in the chart's order —
 /// ranked by Cost over the range whatever the measure or bucket, Other last —
 /// each its colour, label, figure, share of the legend's whole, and a bar
-/// proportional to the largest figure shown, a hidden series' row dimmed.
+/// proportional to the largest figure shown, a hidden series' row subdued.
 /// Where the figures count more than the whole, a note under them says why.
 fn render_legend(
     frame: &mut Frame<'_>,
@@ -369,25 +369,28 @@ fn render_legend(
         else {
             break;
         };
-        // A hidden series keeps its row and figures, dimmed, so it can be
-        // found and shown again.
-        let dim = if view.is_hidden(&series.id) {
-            Modifier::DIM
-        } else {
-            Modifier::empty()
-        };
-        let swatch = Style::default().fg(series.color).add_modifier(dim);
-        buffer.set_string(area.x, y, "█", swatch);
+        // A hidden series keeps its row and figures, so it can be found and
+        // shown again, its swatch and bar hollow and its words subdued: no
+        // modifier a terminal may ignore says it alone.
+        let hidden = view.is_hidden(&series.id);
+        let glyph = if hidden { "░" } else { "█" };
+        let swatch = Style::default().fg(series.color);
+        buffer.set_string(area.x, y, glyph, swatch);
         let focused = view.focused_row() == Some(FocusedRow::Series(row));
         let text_style = if focused {
-            // Marked in the inset before the swatch, so no row moves.
-            if let Some(x) = area.x.checked_sub(1) {
-                buffer.set_string(x, y, "›", theme.selection.focused.add_modifier(dim));
-            }
             theme.selection.focused
         } else {
             theme.text.primary
         };
+        let text_style = if hidden {
+            text_style.patch(theme.text.subdued)
+        } else {
+            text_style
+        };
+        if focused && let Some(x) = area.x.checked_sub(1) {
+            // Marked in the inset before the swatch, so no row moves.
+            buffer.set_string(x, y, "›", text_style);
+        }
         // Padded by the columns it is drawn in, not its characters, so a
         // wide glyph in one label leaves the figures beside every row aligned.
         let label = truncate_to_width(&series.label, label_width);
@@ -396,13 +399,13 @@ fn render_legend(
             "{label}{padding}  {value:>value_width$}  {share:>4}",
             share = share(*figure, total),
         );
-        buffer.set_string(area.x + 2, y, &text, text_style.add_modifier(dim));
+        buffer.set_string(area.x + 2, y, &text, text_style);
         let bar = usize::try_from(u128::from(*figure) * bar_room as u128 / u128::from(largest))
             .unwrap_or(0);
         let bar = if *figure > 0 { bar.max(1) } else { 0 };
         let bar_x = area.x + u16::try_from(fixed).unwrap_or(u16::MAX);
         if bar > 0 && bar_x < area.right() {
-            buffer.set_string(bar_x, y, "█".repeat(bar), swatch);
+            buffer.set_string(bar_x, y, glyph.repeat(bar), swatch);
         }
     }
     let note_y = u16::try_from(series.len() + 1)

@@ -11,7 +11,7 @@ use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use jiff::{ToSpan, civil::date, tz::TimeZone};
-use ratatui::style::{Color, Modifier};
+use ratatui::style::Color;
 use suru::{
     managed_client::{ManagedEvent, RecoveryStatus},
     protocol::{
@@ -2709,23 +2709,17 @@ fn hiding_the_largest_series_rescales_the_axis_to_what_remains() {
     assert_eq!(ticks(&application).last().map(String::as_str), Some("7M"));
 }
 
-/// Whether every drawn cell of the legend row naming `label` is dimmed, or
-/// none is.
+/// Whether the legend row naming `label` reads as hidden — its swatch hollow
+/// and its label in the subdued colour the view's other quiet text takes —
+/// or as shown, with neither; `None` where it is half of each.
 fn legend_row_dimmed(application: &Application, label: &str) -> Option<bool> {
     let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
-    let (_, y) = text_position(&buffer, label);
-    let dimmed: Vec<bool> = (0..WIDTH)
-        .map(|x| &buffer[(x, y)])
-        .filter(|cell| cell.symbol() != " ")
-        .map(|cell| cell.modifier.contains(Modifier::DIM))
-        .collect();
-    if dimmed.iter().all(|dim| *dim) {
-        Some(true)
-    } else if dimmed.iter().all(|dim| !*dim) {
-        Some(false)
-    } else {
-        None
-    }
+    let (x, y) = text_position(&buffer, label);
+    let (refresh_x, refresh_y) = text_position(&buffer, "r refresh");
+    let subdued = buffer[(refresh_x, refresh_y)].fg;
+    let hollow = buffer[(x - 2, y)].symbol() == "░";
+    let quiet = buffer[(x, y)].fg == subdued;
+    (hollow == quiet).then_some(hollow)
 }
 
 #[test]
@@ -2799,20 +2793,17 @@ fn space(application: &mut Application, modifiers: KeyModifiers) -> ApplicationT
 /// The legend row the keyboard acts on, by its label.
 fn focused_row(application: &Application) -> Option<String> {
     let rows = screen(application);
-    let focused: Vec<&String> = rows
+    let focused: Vec<&str> = rows
         .iter()
-        .filter(|row| row.trim_start().starts_with("›█"))
+        .filter_map(|row| {
+            let row = row.trim_start();
+            row.strip_prefix("›█").or_else(|| row.strip_prefix("›░"))
+        })
         .collect();
     assert!(focused.len() <= 1, "{rows:#?}");
-    focused.first().map(|row| {
-        row.trim_start()
-            .trim_start_matches("›█")
-            .split("  ")
-            .next()
-            .unwrap()
-            .trim()
-            .to_owned()
-    })
+    focused
+        .first()
+        .map(|row| row.split("  ").next().unwrap().trim().to_owned())
 }
 
 #[test]
