@@ -69,16 +69,27 @@ impl MetricsRange {
         }
     }
 
-    /// How a comparison names the period the range is compared with, where
-    /// it is compared with any.
-    pub(crate) fn compared_with(self) -> Option<&'static str> {
+    /// How long the range is in the reader's calendar, ending with the
+    /// present: so many local days or calendar months. All time has no
+    /// length of its own; it runs from the earliest timed Turn.
+    pub(crate) fn length(self) -> Option<RangeLength> {
         match self {
-            Self::Today => Some("vs yesterday"),
-            Self::SevenDays => Some("vs prev 7d"),
-            Self::ThirtyDays => Some("vs prev 30d"),
-            Self::Year => Some("vs prev 12mo"),
+            Self::Today => Some(RangeLength::Days(1)),
+            Self::SevenDays => Some(RangeLength::Days(7)),
+            Self::ThirtyDays => Some(RangeLength::Days(30)),
+            Self::Year => Some(RangeLength::Months(12)),
             Self::AllTime => None,
         }
+    }
+
+    /// How a comparison names the period the range is compared with, where
+    /// it is compared with any.
+    pub(crate) fn compared_with(self) -> Option<String> {
+        Some(match self.length()? {
+            RangeLength::Days(1) => "vs yesterday".to_owned(),
+            RangeLength::Days(days) => format!("vs prev {days}d"),
+            RangeLength::Months(months) => format!("vs prev {months}mo"),
+        })
     }
 
     /// What the view says of the range where it holds no Usage.
@@ -111,6 +122,23 @@ impl MetricsRange {
             .iter()
             .position(|range| *range == self)
             .expect("every range is listed")
+    }
+}
+
+/// How long a range is: so many local days, a bucket each but the single
+/// day, which is cut by the hour, or so many calendar months, a bucket each.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RangeLength {
+    Days(i64),
+    Months(i64),
+}
+
+impl RangeLength {
+    fn span(self) -> Span {
+        match self {
+            Self::Days(days) => days.days(),
+            Self::Months(months) => months.months(),
+        }
     }
 }
 
@@ -182,22 +210,20 @@ pub(crate) fn resolve(
     let now = zoned(now, zone)?;
     let today = now.date();
     let this_month = today.first_of_month();
-    let length = match range {
-        MetricsRange::Today => Some(1.day()),
-        MetricsRange::SevenDays => Some(7.days()),
-        MetricsRange::ThirtyDays => Some(30.days()),
-        MetricsRange::Year => Some(12.months()),
-        MetricsRange::AllTime => None,
-    };
-    let (unit, buckets) = match range {
-        MetricsRange::Today => (BucketUnit::Hour, hours(&now)?),
-        MetricsRange::SevenDays => (BucketUnit::Day, days(today, 7, zone)?),
-        MetricsRange::ThirtyDays => (BucketUnit::Day, days(today, 30, zone)?),
-        MetricsRange::Year => (
+    let length = range.length();
+    let (unit, buckets) = match length {
+        Some(RangeLength::Days(1)) => (BucketUnit::Hour, hours(&now)?),
+        Some(RangeLength::Days(count)) => (BucketUnit::Day, days(today, count, zone)?),
+        Some(RangeLength::Months(count)) => (
             BucketUnit::Month,
-            periods(this_month.checked_sub(11.months()).ok()?, 12, 1, zone)?,
+            periods(
+                this_month.checked_sub((count - 1).months()).ok()?,
+                count,
+                1,
+                zone,
+            )?,
         ),
-        MetricsRange::AllTime => {
+        None => {
             // A Turn the clock places after now begins no earlier month.
             let earliest = match earliest {
                 Some(earliest) => zoned(earliest, zone)?.date().min(today),
@@ -207,7 +233,7 @@ pub(crate) fn resolve(
         }
     };
     let comparison = match (length, buckets.first()) {
-        (Some(length), Some(first)) => Some(compared(first, &now, length, zone)?),
+        (Some(length), Some(first)) => Some(compared(first, &now, length.span(), zone)?),
         _ => None,
     };
     Some(RangeBuckets {
@@ -786,9 +812,10 @@ mod tests {
         assert_eq!(hours(skipped.interval), 23);
         assert!(contiguous(&buckets));
     }
+
     /// The comparison interval `range` is compared with at `now` in the zone
     /// named, as the wall-clock readings it begins and ends at there.
-    fn compared(
+    fn comparison_of(
         range: MetricsRange,
         now: DateTime,
         zone_name: &str,
@@ -801,7 +828,7 @@ mod tests {
 
     #[test]
     fn thirty_days_are_compared_with_the_thirty_local_days_before_as_far_into_them() {
-        let compared = compared(
+        let compared = comparison_of(
             MetricsRange::ThirtyDays,
             date(2026, 10, 28).at(14, 30, 0, 0),
             "America/New_York",
@@ -821,7 +848,7 @@ mod tests {
     #[test]
     fn seven_days_are_compared_with_the_seven_local_days_before() {
         assert_eq!(
-            compared(
+            comparison_of(
                 MetricsRange::SevenDays,
                 date(2026, 10, 28).at(9, 0, 0, 0),
                 "Europe/London",
@@ -836,7 +863,7 @@ mod tests {
     #[test]
     fn today_is_compared_with_yesterday_up_to_the_same_time_of_day() {
         assert_eq!(
-            compared(
+            comparison_of(
                 MetricsRange::Today,
                 date(2026, 10, 28).at(14, 30, 0, 0),
                 "Asia/Tokyo",
@@ -849,7 +876,7 @@ mod tests {
         // New York falls back on 1 November: yesterday is read to the same
         // reading of the clock, not the same hours elapsed.
         assert_eq!(
-            compared(
+            comparison_of(
                 MetricsRange::Today,
                 date(2026, 11, 1).at(12, 0, 0, 0),
                 "America/New_York",
@@ -864,7 +891,7 @@ mod tests {
     #[test]
     fn a_year_is_compared_with_the_twelve_months_before_as_far_into_them() {
         assert_eq!(
-            compared(
+            comparison_of(
                 MetricsRange::Year,
                 date(2026, 10, 28).at(9, 0, 0, 0),
                 "Europe/London",
@@ -877,7 +904,7 @@ mod tests {
         // A year after a leap day has none: it ends on the last day of
         // that February.
         assert_eq!(
-            compared(MetricsRange::Year, date(2028, 2, 29).at(9, 0, 0, 0), "UTC"),
+            comparison_of(MetricsRange::Year, date(2028, 2, 29).at(9, 0, 0, 0), "UTC"),
             Some((
                 at("UTC", date(2026, 3, 1).at(0, 0, 0, 0)),
                 at("UTC", date(2027, 2, 28).at(9, 0, 0, 0)),

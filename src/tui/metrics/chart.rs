@@ -116,9 +116,18 @@ impl MetricsMeasure {
         match self {
             Self::Cost => self.figure(value, is_partial),
             Self::Tokens => format!("{} tokens", self.figure(value, is_partial)),
-            Self::Sessions if value == 1 => "1 Session".to_owned(),
-            Self::Sessions => format!("{} Sessions", self.figure(value, is_partial)),
+            Self::Sessions => counted(value, "Session", "Sessions"),
         }
+    }
+}
+
+/// `count` of a thing, as compactly as every other surface writes a count,
+/// named in the singular or the plural.
+pub(crate) fn counted(count: u64, one: &str, many: &str) -> String {
+    if count == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{} {many}", compact_count(count))
     }
 }
 

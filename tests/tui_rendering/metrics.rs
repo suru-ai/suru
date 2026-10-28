@@ -3460,6 +3460,12 @@ fn all_time_with_no_timed_turn_still_heads_the_view_with_its_untimed_figures() {
     assert!(!shown.contains("No Usage yet."), "{shown}");
     row(&rows, "none of it can be charted");
     assert!(!shown.contains('└'), "no empty chart is drawn");
+
+    // Under Tokens, the Usage mix of what the headline states.
+    show_tokens(&mut application);
+    let rows = screen(&application);
+    let key = &rows[rendered_row(&rows, "Usage mix") + 1];
+    assert!(key.contains("░ output 100%"), "{key:?}");
 }
 
 #[test]

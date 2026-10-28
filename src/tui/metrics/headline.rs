@@ -1,7 +1,6 @@
 //! The Usage Metrics headline: the range's figures taken together — Cost,
 //! Tokens, Sessions, Turns, and the share of input served from cache — each
-//! compared with the period before it, and the Usage mix strip the Tokens
-//! measure shows under its legend.
+//! compared with the period before it.
 
 use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
 use unicode_width::UnicodeWidthStr;
@@ -14,22 +13,16 @@ use super::{
         usage::{compact_cost, compact_count},
     },
     calendar::MetricsRange,
-    chart::MetricsMeasure,
+    chart::{MetricsMeasure, counted},
 };
 
 /// The rows the headline takes: its figures, their comparisons, and what
 /// each says of itself besides.
 pub(super) const HEADLINE_ROWS: u16 = 3;
-/// The rows the Usage mix strip takes: its bar, and the key beneath it.
-pub(super) const MIX_ROWS: u16 = 2;
 /// The widest the columns of the headline stand apart.
 const WIDEST_GAP: usize = 8;
 /// The narrowest they stand apart before their words are shortened.
 const NARROWEST_GAP: usize = 2;
-/// What stands before the Usage mix strip's bar.
-const MIX_LEAD: &str = "Usage mix ";
-/// The Usage mix strip's bar runs no longer than this.
-const MIX_BAR: usize = 64;
 
 /// Whether `aggregate` holds anything a headline could state: Usage, a
 /// Cost, work whose Cost is unknown, or Turns at all.
@@ -53,6 +46,7 @@ pub(super) fn holds_usage(aggregate: &UsageMetricsAggregate) -> bool {
 /// One column of the headline: a figure, how it compares with the period
 /// before, and what it says of itself besides, in a longer and a shorter
 /// form for a narrow frame.
+#[derive(Clone)]
 struct Column {
     figure: String,
     compared: Option<String>,
@@ -98,13 +92,13 @@ pub(super) fn render_headline(
     // The period is named after the first comparison where there is room
     // for it; then the longer words are kept where they leave room, and
     // the shorter taken where even those leave the columns crowded.
-    let mut named = columns(whole, before);
+    let mut named = unnamed.clone();
     if let (Some(label), Some(first)) = (
         range.compared_with(),
         named.iter_mut().find_map(|column| column.compared.as_mut()),
     ) {
         first.push(' ');
-        first.push_str(label);
+        first.push_str(&label);
     }
     let (columns, short) = if spare(&named, false) >= NARROWEST_GAP {
         (named, false)
@@ -140,7 +134,7 @@ pub(super) fn render_headline(
         // Each comparison keeps its row, so the details stand level, unless
         // nothing is compared at all.
         let rows = if compared {
-            vec![lines[0], lines[1], lines[2]]
+            lines.to_vec()
         } else {
             vec![lines[0], lines[2]]
         };
@@ -221,29 +215,20 @@ fn columns(whole: &UsageMetricsAggregate, before: Option<&UsageMetricsAggregate>
     ];
     if let Some(share) = cache_share(whole) {
         columns.push(Column {
-            figure: format!("{share}% from cache"),
+            figure: format!("{}% from cache", (share + 50) / 100),
             compared: before
                 .and_then(cache_share)
-                .map(|earlier| arrowed(i64::from(share) - i64::from(earlier), " pts")),
+                .map(|earlier| points_change(share, earlier)),
             detail: None,
         });
     }
     columns
 }
 
-/// `count` of a thing, named in the singular or the plural.
-fn counted(count: u64, one: &str, many: &str) -> String {
-    if count == 1 {
-        format!("1 {one}")
-    } else {
-        format!("{} {many}", compact_count(count))
-    }
-}
-
-/// The share of `aggregate`'s input its cache reads served, as a whole
-/// percentage: cache reads ÷ (fresh input + cache reads + cache writes),
+/// The share of `aggregate`'s input its cache reads served, in hundredths
+/// of a percent: cache reads ÷ (fresh input + cache reads + cache writes),
 /// where any input was recorded at all.
-fn cache_share(aggregate: &UsageMetricsAggregate) -> Option<u8> {
+fn cache_share(aggregate: &UsageMetricsAggregate) -> Option<u16> {
     let reads = aggregate.cache_read_tokens.unwrap_or(0);
     let input = [
         aggregate.fresh_input_tokens,
@@ -257,8 +242,18 @@ fn cache_share(aggregate: &UsageMetricsAggregate) -> Option<u8> {
     if input == 0 {
         return None;
     }
-    let percent = (u128::from(reads) * 100 + input / 2) / input;
-    u8::try_from(percent).ok()
+    let basis_points = (u128::from(reads) * 10_000 + input / 2) / input;
+    u16::try_from(basis_points).ok()
+}
+
+/// How far a share of `now` hundredths of a percent rose or fell from one
+/// of `before`, in whole percentage points, rounded once from the shares
+/// themselves rather than from the whole percentages each is shown as.
+fn points_change(now: u16, before: u16) -> String {
+    let change = i64::from(now) - i64::from(before);
+    // Rounded half away from nought, as a percent change is.
+    let points = (change * 2 + change.signum() * 100) / 200;
+    arrowed(points, if points.abs() == 1 { " pt" } else { " pts" })
 }
 
 /// How far `now` rose or fell from `before`, as a whole percentage of it;
@@ -283,150 +278,9 @@ fn arrowed(change: i64, unit: &str) -> String {
     }
 }
 
-/// The parts the Usage mix strip divides its bar among, in its order, each
-/// with the shade it is drawn in and its names in the key, long and short.
-const MIX_PARTS: [(char, &str, &str); 4] = [
-    ('█', "fresh input", "input"),
-    ('▓', "cache reads", "cache read"),
-    ('▒', "cache writes", "cache write"),
-    ('░', "output", "output"),
-];
-
-/// The parts of `aggregate`'s Usage the strip shows, in [`MIX_PARTS`]
-/// order: each one reported, however small, and none that was not.
-fn mix_parts(aggregate: &UsageMetricsAggregate) -> [Option<u64>; 4] {
-    [
-        aggregate.fresh_input_tokens,
-        aggregate.cache_read_tokens,
-        aggregate.cache_write_tokens,
-        aggregate.output_tokens,
-    ]
-}
-
-/// Draws the Usage mix strip in the first [`MIX_ROWS`] of `area`: one bar
-/// divided among fresh input, cache reads, cache writes, and output, each
-/// as its share of them all, and a key beneath naming each share and how
-/// much of the output was reasoning. A part never reported has no place in
-/// either; where nothing was reported there is no strip.
-pub(super) fn render_mix(
-    buffer: &mut Buffer,
-    area: Rect,
-    aggregate: &UsageMetricsAggregate,
-    theme: &Theme,
-) {
-    let parts = mix_parts(aggregate);
-    let whole: u64 = parts
-        .iter()
-        .flatten()
-        .fold(0, |sum, part| sum.saturating_add(*part));
-    if whole == 0 || area.height == 0 || area.is_empty() {
-        return;
-    }
-    let lead_width = u16::try_from(MIX_LEAD.width()).unwrap_or(u16::MAX);
-    buffer.set_string(area.x, area.y, MIX_LEAD, theme.text.subdued);
-    let bar_width = usize::from(area.width.saturating_sub(lead_width)).min(MIX_BAR);
-    let shade = theme.accent.primary;
-    let cells = cells(&parts, whole, bar_width);
-    let bar: String = MIX_PARTS
-        .iter()
-        .zip(&cells)
-        .map(|((glyph, _, _), cells)| glyph.to_string().repeat(*cells))
-        .collect();
-    buffer.set_string(area.x + lead_width, area.y, bar, shade);
-    if area.height < 2 {
-        return;
-    }
-    let key = |short: bool| {
-        let mut entries = Vec::new();
-        for ((glyph, long, brief), part) in MIX_PARTS.iter().zip(parts) {
-            let Some(part) = part else { continue };
-            let name = if short { brief } else { long };
-            let mut entry = format!("{glyph} {name} {}", share(part, whole));
-            if *glyph == '░'
-                && let Some(reasoning) = aggregate.reasoning_tokens
-                && part > 0
-            {
-                let reasoning = share(reasoning.min(part), part);
-                if short {
-                    entry.push_str(&format!(" ({reasoning} reasoning)"));
-                } else {
-                    entry.push_str(&format!(", {reasoning} of it reasoning"));
-                }
-            }
-            entries.push(entry);
-        }
-        entries.join("  ")
-    };
-    let room = usize::from(area.width);
-    let long = key(false);
-    let key = if long.width() <= room {
-        long
-    } else {
-        key(true)
-    };
-    let key = truncate_to_width(&key, room);
-    let y = area.y + 1;
-    buffer.set_string(area.x, y, &key, theme.text.subdued);
-    // The swatches take the bar's own shade.
-    let mut x = area.x;
-    for character in key.chars() {
-        if MIX_PARTS.iter().any(|(glyph, _, _)| *glyph == character) {
-            buffer.set_string(x, y, character.to_string(), shade);
-        }
-        x += u16::try_from(character.to_string().width()).unwrap_or(1);
-    }
-}
-
-/// How many of `width` cells each of `parts` takes, in proportion to its
-/// share of `whole`, by the largest remainder, so they fill the bar exactly
-/// and every part with any tokens takes a cell where there are cells enough.
-fn cells(parts: &[Option<u64>; 4], whole: u64, width: usize) -> [usize; 4] {
-    let whole = u128::from(whole.max(1));
-    let width_ = width as u128;
-    let exact = parts.map(|part| u128::from(part.unwrap_or(0)) * width_);
-    let mut cells = exact.map(|exact| usize::try_from(exact / whole).unwrap_or(0));
-    let mut left = width.saturating_sub(cells.iter().sum());
-    let mut by_remainder: Vec<usize> = (0..parts.len()).collect();
-    by_remainder.sort_by_key(|index| std::cmp::Reverse(exact[*index] % whole));
-    for index in by_remainder {
-        if left == 0 {
-            break;
-        }
-        if exact[index] > 0 {
-            cells[index] += 1;
-            left -= 1;
-        }
-    }
-    // A sliver still shows, taking its cell from the largest part.
-    for index in 0..parts.len() {
-        if parts[index].is_some_and(|part| part > 0) && cells[index] == 0 {
-            let largest = (0..parts.len())
-                .max_by_key(|other| cells[*other])
-                .expect("four parts");
-            if cells[largest] > 1 {
-                cells[largest] -= 1;
-                cells[index] = 1;
-            }
-        }
-    }
-    cells
-}
-
-/// `part` of `whole` as a whole percentage, a sliver that rounds to nothing
-/// still shown as there.
-fn share(part: u64, whole: u64) -> String {
-    let whole = u128::from(whole.max(1));
-    let percent = (u128::from(part) * 100 + whole / 2) / whole;
-    if percent == 0 && part > 0 {
-        "<1%".to_owned()
-    } else {
-        format!("{percent}%")
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{cells, percent_change};
+    use super::{percent_change, points_change};
 
     #[test]
     fn a_change_is_a_whole_percentage_of_the_period_before_rounded_either_way() {
@@ -439,14 +293,14 @@ mod tests {
     }
 
     #[test]
-    fn the_mix_fills_its_bar_and_a_sliver_still_takes_a_cell() {
-        assert_eq!(
-            cells(&[Some(1), Some(1), None, Some(2)], 4, 8),
-            [2, 2, 0, 4]
-        );
-        assert_eq!(
-            cells(&[Some(1), Some(10_000), None, Some(0)], 10_001, 10),
-            [1, 9, 0, 0]
-        );
+    fn a_share_s_change_is_rounded_once_from_the_shares_themselves() {
+        // 71.2% and 71.0% each show as 71%: no point between them.
+        assert_eq!(points_change(7_120, 7_100), "± 0 pts");
+        // 71.4% and 70.6% both show as 71%, yet are most of a point apart.
+        assert_eq!(points_change(7_140, 7_060), "▲ 1 pt");
+        // 70.4% and 70.6% show as 70% and 71%, yet are not a point apart.
+        assert_eq!(points_change(7_040, 7_060), "± 0 pts");
+        assert_eq!(points_change(7_100, 6_000), "▲ 11 pts");
+        assert_eq!(points_change(6_000, 7_150), "▼ 12 pts");
     }
 }

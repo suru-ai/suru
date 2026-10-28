@@ -21,7 +21,8 @@ use super::{
     BREAKDOWNS, FocusedRow, MetricsContent, MetricsView, OfferedBreakdown, UsageMetricsReadRefusal,
     calendar::{MetricsRange, RangeBuckets},
     chart::{self, MetricsMeasure, Series},
-    headline::{self, HEADLINE_ROWS, MIX_ROWS},
+    headline::{self, HEADLINE_ROWS},
+    mix::{self, MIX_ROWS},
 };
 
 /// The close control, pointable as a whole.
@@ -117,7 +118,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
     // The headline states the range's figures above everything the report
     // draws, the hidden series among them: All time's count every Turn,
     // untimed ones too, where the chart can place only the timed.
-    let mut headed = false;
+    let mut headed = None;
     if let MetricsContent::Report { report, .. } = view.content() {
         let whole = if range == MetricsRange::AllTime {
             &report.across_buckets_and_untimed
@@ -136,7 +137,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
             );
             let taken = (HEADLINE_ROWS + 1).min(body.height);
             body = Rect::new(body.x, body.y + taken, body.width, body.height - taken);
-            headed = true;
+            headed = Some(whole);
         }
     }
     if matches!(view.content(), MetricsContent::Report { .. }) {
@@ -172,13 +173,28 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
             if chart::holds_nothing(report) {
                 // Only All time's headline holds what its chart cannot: Turns
                 // stored before Suru recorded when they ran.
-                let note = if headed && range == MetricsRange::AllTime {
+                let uncharted = headed.filter(|_| range == MetricsRange::AllTime);
+                let note = if uncharted.is_some() {
                     UNCHARTED
                 } else {
                     range.no_usage()
                 };
                 let note = truncate_to_width(note, usize::from(body.width));
                 buffer.set_string(body.x, body.y, note, subdued);
+                // Under Tokens, the mix of what the headline states, a blank
+                // row under the note, as under a legend.
+                if let Some(whole) = uncharted
+                    && measure == MetricsMeasure::Tokens
+                {
+                    let below = 2.min(body.height);
+                    let mix = Rect::new(
+                        body.x,
+                        body.y + below,
+                        body.width,
+                        (body.height - below).min(MIX_ROWS),
+                    );
+                    mix::render(buffer, mix, whole, theme);
+                }
                 return;
             }
             let series = chart::series(report, measure, theme);
@@ -236,7 +252,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                     legend.width,
                     (legend.height - after).min(MIX_ROWS),
                 );
-                headline::render_mix(frame.buffer_mut(), mix, &shown.aggregate, theme);
+                mix::render(frame.buffer_mut(), mix, &shown.aggregate, theme);
             }
         }
     }
@@ -317,10 +333,7 @@ impl Legend {
                 heading.push_str(&MetricsMeasure::Sessions.total(whole.sessions, false));
             }
             heading.push_str(" · ");
-            heading.push_str(&match whole.turns {
-                1 => "1 Turn".to_owned(),
-                turns => format!("{} Turns", MetricsMeasure::Sessions.format(turns)),
-            });
+            heading.push_str(&chart::counted(whole.turns, "Turn", "Turns"));
         }
         Self {
             heading,
@@ -518,7 +531,7 @@ fn stale_note(refusal: &UsageMetricsReadRefusal) -> String {
 
 /// `part` of `whole` as a whole percentage, with a small part that rounds
 /// to nothing still shown as there.
-fn share(part: u64, whole: u64) -> String {
+pub(super) fn share(part: u64, whole: u64) -> String {
     if whole == 0 {
         return String::new();
     }
