@@ -161,8 +161,7 @@ impl MetricsView {
             return false;
         }
         self.range = range;
-        self.shown = None;
-        self.refusal = None;
+        self.forget_figures();
         true
     }
 
@@ -175,9 +174,18 @@ impl MetricsView {
             return false;
         }
         self.breakdown = breakdown;
+        self.forget_figures();
+        true
+    }
+
+    /// Lets go of every figure the view holds or awaits, once what it shows
+    /// is chosen anew: an answer to a read asked before the choice answers
+    /// for another, and must not land under the new choice's name even
+    /// where the read that choice brings is never asked.
+    fn forget_figures(&mut self) {
+        self.asked = None;
         self.shown = None;
         self.refusal = None;
-        true
     }
 
     pub(super) fn breakdown(&self) -> UsageMetricsBreakdown {

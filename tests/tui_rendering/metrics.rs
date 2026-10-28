@@ -2075,3 +2075,26 @@ fn each_series_keeps_its_colour_whatever_the_measure() {
     assert_eq!(by_cost, by_tokens);
     assert_eq!(by_cost, colours(&application));
 }
+
+#[test]
+fn an_answer_awaited_before_a_choice_the_origin_could_not_read_never_lands() {
+    for choose in ['b', '2'] {
+        let mut application = application_looking_at_studio()
+            .with_session_clock(afternoon)
+            .with_time_zone(zone(NEW_YORK));
+        let (_, request_id, query) = ask(&mut application);
+        studio_stops_answering(&mut application, 1, std::time::Duration::from_secs(5));
+        grace_elapses(&mut application, Outlook::Remote("studio".to_owned()));
+        assert_eq!(
+            press(&mut application, choose),
+            ApplicationTransition::Continue
+        );
+
+        // The thirty days by Model, asked before the choice, answer late.
+        answer(&mut application, request_id, Ok(report(&query)));
+
+        let shown = screen(&application).join("\n");
+        assert!(!shown.contains("Claude Opus 5.5"), "{choose}: {shown}");
+        assert!(shown.contains("studio is unreachable"), "{choose}: {shown}");
+    }
+}
