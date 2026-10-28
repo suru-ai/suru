@@ -80,7 +80,7 @@ pub(super) fn render(
         ("✓", turns.completed, "completed", theme.feedback.success),
         ("✗", turns.failed, "failed", theme.feedback.error),
         (
-            "⏹",
+            "⊘",
             turns.interrupted,
             "interrupted",
             theme.feedback.warning,

@@ -545,8 +545,9 @@ fn command_for_insights_pointer(
 
 /// What the wheel does over an Insights panel, whether up or down by
 /// `kind`: over the Tools panel, whose rows run past its border, it scrolls
-/// them a row; over the others, whose figures all stand in view, nothing; and never a step of the range, which the wheel over
-/// Overview's chart takes.
+/// them a row; over the others, whose figures all stand in view, nothing;
+/// and never a step of the range, which the wheel over Overview's chart
+/// takes.
 fn command_for_insights_panel_wheel(
     panel: InsightsPanel,
     kind: MouseEventKind,

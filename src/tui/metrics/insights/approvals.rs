@@ -48,7 +48,7 @@ pub(super) fn render(
             (format!("{} accepted", grouped_count(accepted)), primary),
             ("  ✗ ".to_owned(), theme.feedback.error),
             (format!("{} declined", grouped_count(declined)), primary),
-            ("  ⏱ ".to_owned(), theme.feedback.warning),
+            ("  ⧗ ".to_owned(), theme.feedback.warning),
             (
                 format!("{} waiting or expired", grouped_count(undecided)),
                 primary,

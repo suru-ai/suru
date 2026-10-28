@@ -502,7 +502,7 @@ fn the_turns_panel_states_durations_their_spread_and_how_turns_ended() {
     row(&rows, "Turns");
     row(&rows, "median 48s · p90 6m 12s · longest 41m 5s");
     row(&rows, "▁▃▇█▆▃▂▁  <10s … 30m+");
-    row(&rows, "✓ 1,213 completed  ✗ 40 failed  ⏹ 31 interrupted");
+    row(&rows, "✓ 1,213 completed  ✗ 40 failed  ⊘ 31 interrupted");
 }
 
 #[test]
@@ -529,7 +529,7 @@ fn turns_that_ended_without_both_moments_are_counted_but_give_no_durations() {
     let rows = screen(&application);
 
     row(&rows, "No Turn recorded how long it took");
-    row(&rows, "✓ 3 completed  ✗ 0 failed  ⏹ 0 interrupted");
+    row(&rows, "✓ 3 completed  ✗ 0 failed  ⊘ 0 interrupted");
 }
 
 #[test]
@@ -1121,6 +1121,21 @@ fn compactions_that_left_more_context_than_they_found_say_so() {
 }
 
 #[test]
+fn compactions_that_left_less_than_half_a_percent_more_free_none() {
+    let mut report = worked();
+    report.compactions.freed = Some(FreedShare {
+        compactions: 2,
+        average_millionths: -4_999,
+    });
+    let application = on_insights(Ok(report));
+
+    assert_eq!(
+        panel_lines(&application, " Compactions ")[1],
+        "frees 0% of context on average"
+    );
+}
+
+#[test]
 fn a_range_with_no_compactions_says_so_in_the_panel() {
     let application = on_insights(Ok(InsightsReport::default()));
 
@@ -1142,7 +1157,7 @@ fn the_approvals_panel_states_how_many_were_asked_and_how_each_was_decided() {
         panel_lines(&application, " Approvals "),
         vec![
             "188 asked",
-            "✓ 171 accepted ✗ 12 declined ⏱ 5 waiting or expired",
+            "✓ 171 accepted ✗ 12 declined ⧗ 5 waiting or expired",
             "11 for the Session · 2 also interrupted the Turn",
         ]
     );

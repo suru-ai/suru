@@ -66,10 +66,11 @@ pub(super) fn render(
 }
 
 /// What `freed` says of the context a Compaction leaves, to the nearest
-/// whole percent of what it found.
+/// whole percent of what it found: an average that rounds to none frees
+/// nothing, whichever side of none it lies.
 fn freed_on_average(freed: FreedShare) -> String {
     let percent = (freed.average_millionths.unsigned_abs() + 5_000) / 10_000;
-    if freed.average_millionths < 0 {
+    if freed.average_millionths < 0 && percent > 0 {
         format!("leaves {percent}% more context on average")
     } else {
         format!("frees {percent}% of context on average")

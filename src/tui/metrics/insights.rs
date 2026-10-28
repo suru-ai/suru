@@ -62,20 +62,30 @@ pub enum InsightsPanel {
 }
 
 impl InsightsPanel {
-    /// Every panel, in the order the grid lays them out, row by row across
-    /// its two columns as [`Self::GRID`] places them, and focus moves among
-    /// them.
-    pub(crate) const ALL: [Self; 5] = [
-        Self::WhenYouWork,
-        Self::Tools,
-        Self::Turns,
-        Self::Compactions,
-        Self::Approvals,
-    ];
+    /// Every panel, in the order [`Self::GRID`] places them row by row
+    /// across its two columns, which is the order focus moves among them.
+    pub(crate) const ALL: [Self; 5] = {
+        let mut all = [Self::WhenYouWork; 5];
+        let mut placed = 0;
+        let mut row = 0;
+        while row < Self::GRID.len() {
+            let mut column = 0;
+            while column < Self::GRID[row].len() {
+                if let Some(panel) = Self::GRID[row][column] {
+                    all[placed] = panel;
+                    placed += 1;
+                }
+                column += 1;
+            }
+            row += 1;
+        }
+        assert!(placed == all.len(), "the grid places every panel");
+        all
+    };
 
-    /// Where each panel stands in the grid, row by row across its two
-    /// columns, as the Insights mockup lays them out: the left column's
-    /// last place is the Cache panel's, which is yet to be.
+    /// Where each panel stands in an interim grid of two columns, row by
+    /// row, keeping to the neighbours the Insights mockup gives the panels
+    /// built so far; the empty place is the Cache panel's, yet to be.
     pub(super) const GRID: [[Option<Self>; 2]; 3] = [
         [Some(Self::WhenYouWork), Some(Self::Tools)],
         [Some(Self::Turns), Some(Self::Compactions)],
@@ -630,17 +640,12 @@ mod tests {
     use super::{InsightsContent, InsightsPanel, InsightsView, MetricsRange, Outlook};
     use crate::protocol::{InsightsReport, SessionTimestamp};
 
-    /// Focus moves through the panels in the order a reader reads the grid.
+    /// The grid places each panel once, so each has a place of its own.
     #[test]
-    fn the_grid_places_every_panel_once_in_their_order() {
-        let placed = InsightsPanel::GRID
-            .iter()
-            .flatten()
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
-
-        assert_eq!(placed, InsightsPanel::ALL);
+    fn the_grid_places_every_panel_once() {
+        for (place, panel) in InsightsPanel::ALL.into_iter().enumerate() {
+            assert_eq!(panel.place(), place, "{panel:?} is placed once");
+        }
     }
 
     /// A report read from one Server is never shown for another, which
