@@ -510,60 +510,156 @@ pub(crate) fn thinned_labels(
 /// Eighths of a cell filled from its foot.
 const LOWER_EIGHTHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
-/// Draws `series` stacked over `buckets` into `area`: the y-axis and its tick
-/// labels down the left, a bar per bucket, the x-axis beneath them, a mark
-/// under the `selected` bar, or the last drawn where it is past them, and
-/// the thinned bucket labels under that. Each segment boundary falling
+/// Where a chart stands in its area: its y-axis and the ticks up it, where
+/// the plot begins, and how its bars share the plot — worked out before
+/// anything is drawn, so the view knows which bars a selection can rest on
+/// before it draws the mark under one.
+pub(crate) struct ChartLayout {
+    area: Rect,
+    axis: Axis,
+    rows_per_tick: u16,
+    plot_rows: u16,
+    tick_labels: Vec<String>,
+    axis_x: u16,
+    plot_x: u16,
+    plot_width: u16,
+    top: u16,
+    axis_y: u16,
+    count: u16,
+    slot: u16,
+    bar_width: u16,
+    /// How many bars, from the first, stand within the area.
+    drawn: usize,
+}
+
+impl ChartLayout {
+    /// The layout of `series` stacked over `range`'s buckets in `area`, none
+    /// where it has no row to plot in or no bucket to plot.
+    pub(crate) fn of(
+        area: Rect,
+        range: &RangeBuckets,
+        series: &[Series],
+        measure: MetricsMeasure,
+    ) -> Option<Self> {
+        let buckets = &range.buckets;
+        // The x-axis, the selection's mark, and the labels beneath them take
+        // the last three rows.
+        let plot_rows = area.height.saturating_sub(FOOT_ROWS);
+        if plot_rows == 0 || buckets.is_empty() {
+            return None;
+        }
+        let max = (0..buckets.len())
+            .map(|index| series.iter().map(|series| series.values[index]).sum())
+            .max()
+            .unwrap_or(0u64);
+        // A tick every other row at most, so the axis never reads as a
+        // ladder, and none finer than the measure can write.
+        let resolution = measure.resolution();
+        let axis = nice_axis(max.div_ceil(resolution), u64::from(plot_rows / 2).max(1));
+        let axis = Axis {
+            top: axis.top.saturating_mul(resolution),
+            step: axis.step.saturating_mul(resolution),
+        };
+        let ticks = u16::try_from(axis.ticks()).unwrap_or(u16::MAX).max(1);
+        let rows_per_tick = (plot_rows / ticks).max(1);
+        let plot_rows = rows_per_tick.saturating_mul(ticks).min(plot_rows);
+        let tick_labels: Vec<String> = (1..=u64::from(ticks))
+            .map(|tick| measure.format(tick * axis.step))
+            .collect();
+        let label_width = u16::try_from(
+            tick_labels
+                .iter()
+                .map(|label| label.width())
+                .max()
+                .unwrap_or(0),
+        )
+        .unwrap_or(0);
+        let axis_x = area.x + label_width + 1;
+        let plot_x = axis_x + 1;
+        let plot_width = area.right().saturating_sub(plot_x);
+        let top = area.y + (area.height - FOOT_ROWS - plot_rows);
+        let count = u16::try_from(buckets.len()).unwrap_or(u16::MAX);
+        let slot = (plot_width / count).max(1);
+        let bar_width = if slot >= 2 { slot - 1 } else { 1 };
+        let mut layout = Self {
+            area,
+            axis,
+            rows_per_tick,
+            plot_rows,
+            tick_labels,
+            axis_x,
+            plot_x,
+            plot_width,
+            top,
+            axis_y: top + plot_rows,
+            count,
+            slot,
+            bar_width,
+            drawn: 0,
+        };
+        layout.drawn = (0..buckets.len())
+            .take_while(|index| layout.bar_x(*index) + bar_width <= area.right())
+            .count();
+        Some(layout)
+    }
+
+    /// The column the `index`-th bar begins at.
+    fn bar_x(&self, index: usize) -> u16 {
+        let slot_x = self.plot_x.saturating_add(
+            u16::try_from(index)
+                .unwrap_or(u16::MAX)
+                .saturating_mul(self.slot),
+        );
+        slot_x.saturating_add(self.slot - self.bar_width)
+    }
+
+    /// Where it draws its bars, where it draws any.
+    pub(crate) fn bars(&self) -> Option<BarStrip> {
+        (self.drawn > 0).then(|| BarStrip {
+            area: Rect::new(
+                self.plot_x,
+                self.area.y,
+                self.slot
+                    .saturating_mul(u16::try_from(self.drawn).unwrap_or(u16::MAX)),
+                self.area.height,
+            ),
+            slot: self.slot,
+            count: self.drawn,
+        })
+    }
+}
+
+/// Draws `series` stacked over `range`'s buckets as `layout` places them:
+/// the y-axis and its tick labels down the left, a bar per bucket, the
+/// x-axis beneath them, a mark under the `selected` bar where it is drawn,
+/// and the thinned bucket labels under that. Each segment boundary falling
 /// inside a cell is drawn with an eighth block in the lower segment's colour
 /// over the upper segment's, so a segment's height reads to an eighth of a
-/// row. Answers where it drew the bars.
+/// row.
 pub(crate) fn render_chart(
     buffer: &mut Buffer,
-    area: Rect,
+    layout: &ChartLayout,
     range: &RangeBuckets,
     series: &[Series],
-    measure: MetricsMeasure,
     selected: Option<usize>,
     theme: &Theme,
-) -> Option<BarStrip> {
-    let buckets = &range.buckets;
-    // The x-axis, the selection's mark, and the labels beneath them take
-    // the last three rows.
-    let plot_rows = area.height.saturating_sub(FOOT_ROWS);
-    if plot_rows == 0 || buckets.is_empty() {
-        return None;
-    }
-    let totals: Vec<u64> = (0..buckets.len())
-        .map(|index| series.iter().map(|series| series.values[index]).sum())
-        .collect();
-    let max = totals.iter().copied().max().unwrap_or(0);
-    // A tick every other row at most, so the axis never reads as a ladder,
-    // and none finer than the measure can write.
-    let resolution = measure.resolution();
-    let axis = nice_axis(max.div_ceil(resolution), u64::from(plot_rows / 2).max(1));
-    let axis = Axis {
-        top: axis.top.saturating_mul(resolution),
-        step: axis.step.saturating_mul(resolution),
-    };
-    let ticks = u16::try_from(axis.ticks()).unwrap_or(u16::MAX).max(1);
-    let rows_per_tick = (plot_rows / ticks).max(1);
-    let plot_rows = rows_per_tick.saturating_mul(ticks).min(plot_rows);
-    let tick_labels: Vec<String> = (1..=u64::from(ticks))
-        .map(|tick| measure.format(tick * axis.step))
-        .collect();
-    let label_width = u16::try_from(
-        tick_labels
-            .iter()
-            .map(|label| label.width())
-            .max()
-            .unwrap_or(0),
-    )
-    .unwrap_or(0);
-    let axis_x = area.x + label_width + 1;
-    let plot_x = axis_x + 1;
-    let plot_width = area.right().saturating_sub(plot_x);
-    let top = area.y + (area.height - FOOT_ROWS - plot_rows);
-    let axis_y = top + plot_rows;
+) {
+    let ChartLayout {
+        area,
+        axis,
+        rows_per_tick,
+        plot_rows,
+        ref tick_labels,
+        axis_x,
+        plot_x,
+        plot_width,
+        top,
+        axis_y,
+        count,
+        slot,
+        bar_width,
+        drawn,
+    } = *layout;
     let subdued = theme.text.subdued;
     let border = theme.border.subdued;
 
@@ -578,8 +674,6 @@ pub(crate) fn render_chart(
         }
         buffer.set_string(axis_x, y, if tick { "┤" } else { "│" }, border);
     }
-    let count = u16::try_from(buckets.len()).unwrap_or(u16::MAX);
-    let slot = (plot_width / count).max(1);
     // The axis runs as far as the bars do, and no further.
     buffer.set_string(axis_x, axis_y, "└", border);
     let axis_end = plot_x
@@ -589,19 +683,9 @@ pub(crate) fn render_chart(
     for x in plot_x..axis_end {
         buffer.set_string(x, axis_y, "─", border);
     }
-    let bar_width = if slot >= 2 { slot - 1 } else { 1 };
     let eighths = u128::from(plot_rows) * 8;
-    let mut drawn = 0;
-    for (index, _) in buckets.iter().enumerate() {
-        let bar_x = plot_x
-            + u16::try_from(index)
-                .unwrap_or(u16::MAX)
-                .saturating_mul(slot);
-        let bar_x = bar_x + (slot - bar_width);
-        if bar_x + bar_width > area.right() {
-            break;
-        }
-        drawn = index + 1;
+    for index in 0..drawn {
+        let bar_x = layout.bar_x(index);
         // Where each segment ends, in eighths of a row from the foot.
         let mut boundaries = Vec::with_capacity(series.len());
         let mut running: u128 = 0;
@@ -629,21 +713,13 @@ pub(crate) fn render_chart(
             }
         }
     }
-
-    // A selection past the last bar drawn stands at that bar.
-    if let Some(index) = selected
-        .zip(drawn.checked_sub(1))
-        .map(|(at, last)| at.min(last))
-    {
-        let bar_x = plot_x
-            + u16::try_from(index)
-                .unwrap_or(u16::MAX)
-                .saturating_mul(slot)
-            + (slot - bar_width);
+    if let Some(index) = selected.filter(|index| *index < drawn) {
         let mark = "▔".repeat(usize::from(bar_width));
-        buffer.set_string(bar_x, axis_y + 1, mark, theme.accent.primary);
+        buffer.set_string(layout.bar_x(index), axis_y + 1, mark, theme.accent.primary);
     }
-    let labels: Vec<String> = buckets
+
+    let labels: Vec<String> = range
+        .buckets
         .iter()
         .map(|bucket| bucket_label(bucket, range.unit))
         .collect();
@@ -657,16 +733,6 @@ pub(crate) fn render_chart(
     ) {
         buffer.set_string(plot_x + first_bar + at, axis_y + 2, &labels[index], subdued);
     }
-    (drawn > 0).then(|| BarStrip {
-        area: Rect::new(
-            plot_x,
-            area.y,
-            slot.saturating_mul(u16::try_from(drawn).unwrap_or(u16::MAX)),
-            area.height,
-        ),
-        slot,
-        count: drawn,
-    })
 }
 
 /// Rows the chart keeps under its bars: the x-axis, the selection's mark,

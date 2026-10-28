@@ -367,9 +367,18 @@ impl MetricsView {
             .map_or(buckets, |bars| bars.count.min(buckets))
     }
 
-    /// The bucket the legend reads, where one is selected.
+    /// The bucket chosen, where one is, whether or not the last frame drew
+    /// its bar: what Esc clears before it closes the view.
     pub(super) fn selected_bucket(&self) -> Option<usize> {
         self.selected
+    }
+
+    /// The bucket the chart marks and the legend reads: the one chosen, or
+    /// the last bar drawn where it is past them, and none where no bar is
+    /// drawn. Before any frame has drawn the report's bars, the one chosen.
+    pub(super) fn drawn_selection(&self) -> Option<usize> {
+        let last = self.selectable().checked_sub(1)?;
+        self.selected.map(|selected| selected.min(last))
     }
 
     /// Moves the bucket selection, which stops at the first and last
@@ -379,8 +388,7 @@ impl MetricsView {
         let Some(last) = self.selectable().checked_sub(1) else {
             return;
         };
-        let selected = self.selected.map(|selected| selected.min(last));
-        self.selected = Some(match (to, selected) {
+        self.selected = Some(match (to, self.drawn_selection()) {
             (BucketMove::Previous, Some(selected)) => selected.saturating_sub(1),
             (BucketMove::Next, Some(selected)) => (selected + 1).min(last),
             (BucketMove::Previous | BucketMove::Last, _) => last,

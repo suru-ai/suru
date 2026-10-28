@@ -272,18 +272,23 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
             // figures, and shares stay those of every series, hidden or not,
             // as the headline figures above it will.
             let across = Legend::of_range(&series, measure, range, &report.across_buckets.total);
-            let selected = view
-                .selected_bucket()
-                .and_then(|index| Legend::of_bucket(&series, measure, buckets, report, index));
-            // Room is kept for a note either legend needs, so selecting a
-            // bar never moves the chart.
-            let noted =
-                u16::from(across.noted || selected.as_ref().is_some_and(|legend| legend.noted));
+            // Room is kept for a note the range's legend or any bar's needs,
+            // so selecting a bar never moves the chart.
+            let noted = u16::from(
+                across.noted
+                    || (0..buckets.buckets.len()).any(|index| {
+                        Legend::of_bucket(&series, measure, buckets, report, index)
+                            .is_some_and(|legend| legend.noted)
+                    }),
+            );
             let mixed = measure == MetricsMeasure::Tokens;
             let mix_rows = if mixed { MIX_ROWS + 1 } else { 0 };
-            // A row to each series where the frame is wide enough and the
-            // chart keeps its floor beside them; otherwise they flow along
-            // as few lines as hold them, and as many as there is room for.
+            // A row to each series where the chart keeps its floor beside
+            // them; otherwise they flow along as few lines as hold them, and
+            // as many as there is room for. They flow, too, wherever the
+            // controls have collapsed: a row legend would fit there, but a
+            // frame that narrow is the compact view, whose legend takes one
+            // line so the chart keeps the rows.
             let in_rows = u16::try_from(series.len()).unwrap_or(u16::MAX);
             let flowed = (controls.collapsed
                 || body.height < CHART_FLOOR + 1 + 1 + in_rows + noted + mix_rows)
@@ -322,17 +327,19 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 .filter(|series| !view.is_hidden(&series.id))
                 .cloned()
                 .collect();
-            let bars = chart::render_chart(
-                buffer,
-                chart_area,
-                buckets,
-                &stacked,
-                measure,
-                view.selected_bucket(),
-                theme,
+            // Where the bars stand is recorded before anything is drawn, so
+            // the selection the chart marks and the legend reads is one the
+            // frame draws.
+            let layout = chart::ChartLayout::of(chart_area, buckets, &stacked, measure);
+            view.record_bar_targets(
+                layout
+                    .as_ref()
+                    .and_then(chart::ChartLayout::bars)
+                    .unwrap_or_else(|| no_bars(chart_area)),
             );
-            if let Some(bars) = bars {
-                view.record_bar_targets(bars);
+            let selected = view.drawn_selection();
+            if let Some(layout) = &layout {
+                chart::render_chart(buffer, layout, buckets, &stacked, selected, theme);
             }
             let legend = Rect::new(
                 body.x,
@@ -340,14 +347,9 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 body.width,
                 body.height.saturating_sub(chart_rows + 1 + list_rows),
             );
-            // The legend reads the selected bar's figures, or the last
-            // drawn's where it is past them, as the mark under it stands.
-            let shown = view
-                .selected_bucket()
-                .zip(bars.and_then(|bars| bars.count.checked_sub(1)))
-                .and_then(|(at, last)| {
-                    Legend::of_bucket(&series, measure, buckets, report, at.min(last))
-                })
+            // The legend reads the bar the chart marks.
+            let shown = selected
+                .and_then(|index| Legend::of_bucket(&series, measure, buckets, report, index))
                 .unwrap_or(across);
             let legend_area = Rect {
                 height: legend.height.min(1 + series_rows + noted),
@@ -382,11 +384,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
 /// for a larger terminal, centred, saying how large and how to leave, and
 /// nothing a pointer or a key could act on.
 fn render_too_small(buffer: &mut Buffer, area: Rect, view: &MetricsView, theme: &Theme) {
-    view.record_bar_targets(BarStrip {
-        area: Rect::new(area.x, area.y, 0, 0),
-        slot: 1,
-        count: 0,
-    });
+    view.record_bar_targets(no_bars(area));
     view.record_legend_targets([None; LEGEND_SERIES]);
     view.record_session_targets(Rect::new(area.x, area.y, 0, 0));
     let lines = [
@@ -412,6 +410,16 @@ fn render_too_small(buffer: &mut Buffer, area: Rect, view: &MetricsView, theme: 
         let width = u16::try_from(line.width()).unwrap_or(area.width);
         let x = area.x + area.width.saturating_sub(width) / 2;
         buffer.set_string(x, y, line, *style);
+    }
+}
+
+/// Where a frame drew no bar at all, at the corner of `area`: nothing to
+/// point at or select.
+fn no_bars(area: Rect) -> BarStrip {
+    BarStrip {
+        area: Rect::new(area.x, area.y, 0, 0),
+        slot: 1,
+        count: 0,
     }
 }
 

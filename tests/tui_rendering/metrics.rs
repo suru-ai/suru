@@ -3911,8 +3911,6 @@ fn at_eighty_columns_today_thirty_days_and_a_year_show_every_control_and_the_leg
     ] {
         let application = eighty_columns_of(range_key);
         let rows = narrow_screen(&application);
-        let shown = rows.join("\n");
-        eprintln!("{shown}");
 
         let title = &rows[rendered_row(&rows, "esc ✕")];
         assert!(
@@ -4156,7 +4154,6 @@ fn at_eighty_columns_the_headline_s_columns_stand_evenly_apart() {
 
     let rows = narrow_screen(&application);
     let [figures, compared, details] = headline(&rows);
-    eprintln!("{figures}\n{compared}\n{details}");
     let column = |line: &str, text: &str| {
         let at = line
             .find(text)
@@ -4294,7 +4291,6 @@ fn in_the_shortest_frame_the_legend_flows_and_its_focus_stops_at_the_last_item_d
     for width in [NARROW, WIDTH] {
         let rows = rendered_application_rows_at(&application, width, SHORTEST);
         let shown = rows.join("\n");
-        eprintln!("{shown}");
         // The chart keeps its floor, and the Usage mix strip its rows.
         assert!(
             rows.iter().filter(|row| row.contains('┤')).count() >= 2,
