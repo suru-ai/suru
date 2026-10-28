@@ -62,18 +62,19 @@ use super::{
         command_for_completion_event, command_for_connect_overlay_event,
         command_for_context_overlay_event, command_for_directory_browser_event,
         command_for_icon_picker_event, command_for_interrupt_confirmation_event,
-        command_for_leader_event, command_for_list_editor_event, command_for_model_options_event,
-        command_for_model_picker_event, command_for_monitoring_subagent_view_event,
-        command_for_numeric_editor_event, command_for_queued_prompt_event,
-        command_for_relay_overlay_event, command_for_rename_dialog_event,
-        command_for_serve_overlay_event, command_for_session_picker_event,
-        command_for_settings_panel_event, command_for_sidebar_event,
-        command_for_sidebar_menu_event, command_for_subagent_picker_event,
-        command_for_subagent_view_event, command_for_subagent_view_leader_event,
-        command_for_terminal_event, command_for_theme_picker_event,
-        command_for_workspace_description_editor_event, command_for_workspace_picker_event,
-        command_for_workspace_picker_menu_event,
+        command_for_leader_event, command_for_list_editor_event, command_for_metrics_view_event,
+        command_for_model_options_event, command_for_model_picker_event,
+        command_for_monitoring_subagent_view_event, command_for_numeric_editor_event,
+        command_for_queued_prompt_event, command_for_relay_overlay_event,
+        command_for_rename_dialog_event, command_for_serve_overlay_event,
+        command_for_session_picker_event, command_for_settings_panel_event,
+        command_for_sidebar_event, command_for_sidebar_menu_event,
+        command_for_subagent_picker_event, command_for_subagent_view_event,
+        command_for_subagent_view_leader_event, command_for_terminal_event,
+        command_for_theme_picker_event, command_for_workspace_description_editor_event,
+        command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
     },
+    metrics::MetricsView,
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
@@ -157,6 +158,29 @@ impl SessionClock {
 impl Default for SessionClock {
     fn default() -> Self {
         Self(Arc::new(crate::protocol::SessionTimestamp::now))
+    }
+}
+
+/// The time zone the reader's calendar is cut in, read each time it is
+/// asked so a zone the host moves to is followed.
+#[derive(Clone)]
+struct LocalZone(Arc<dyn Fn() -> jiff::tz::TimeZone + Send + Sync>);
+
+impl LocalZone {
+    fn now(&self) -> jiff::tz::TimeZone {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for LocalZone {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LocalZone(..)")
+    }
+}
+
+impl Default for LocalZone {
+    fn default() -> Self {
+        Self(Arc::new(jiff::tz::TimeZone::system))
     }
 }
 
@@ -680,6 +704,7 @@ pub struct TuiState {
     live_output_visibility: LiveOutputVisibility,
     presentation_clock: PresentationClock,
     session_clock: SessionClock,
+    local_zone: LocalZone,
     /// How long a self-presented Intervention panel ignores keys.
     intervention_arming_delay: Duration,
     /// When a self-presented Intervention panel starts taking keys. `None`
@@ -808,6 +833,8 @@ pub struct TuiState {
     pub(super) serving_listener: ListenerState,
     pub(super) relay_overlay: RelayOverlay,
     pub(super) context_overlay: ContextOverlay,
+    /// The Usage Metrics view, drawn over the whole frame while it is open.
+    pub(super) metrics_view: MetricsView,
     /// Onboarding, open over whatever is on screen while the reader takes it.
     pub(super) onboarding: Onboarding,
     /// Whether the Client's own Server has been onboarded, as it last said in
@@ -1055,6 +1082,7 @@ impl TuiState {
             live_output_visibility: LiveOutputVisibility::default(),
             presentation_clock: PresentationClock::default(),
             session_clock: SessionClock::default(),
+            local_zone: LocalZone::default(),
             intervention_arming_delay: INTERVENTION_ARMING_DELAY,
             intervention_armed_until: None,
             dismissed_interventions: HashMap::new(),
@@ -1108,6 +1136,7 @@ impl TuiState {
             serving_listener: ListenerState::default(),
             relay_overlay: RelayOverlay::default(),
             context_overlay: ContextOverlay::default(),
+            metrics_view: MetricsView::default(),
             onboarding: Onboarding::default(),
             local_onboarded: None,
             onboarding_taken: false,
@@ -4069,7 +4098,8 @@ impl TuiState {
     /// opened over it, and the row it stands on goes on saying which row it
     /// acts upon.
     pub(super) fn overlay_owns_input(&self) -> bool {
-        self.rename_dialog.is_open()
+        self.metrics_view.is_open()
+            || self.rename_dialog.is_open()
             || self.icon_picker.is_open()
             || self.theme_picker.is_open()
             || self.model_picker.is_open()
@@ -5357,6 +5387,12 @@ pub enum ApplicationEvent {
         request_id: uuid::Uuid,
         result: std::result::Result<crate::protocol::ContextBreakdown, ContextBreakdownRefusal>,
     },
+    /// The Usage Metrics a Server reported, or why it reported none, in
+    /// answer to [`ApplicationTransition::ReadUsageMetrics`].
+    UsageMetricsRead {
+        request_id: uuid::Uuid,
+        result: std::result::Result<crate::protocol::UsageMetricsReport, String>,
+    },
     /// The Client's own Server's answer to Onboarding's re-check `recheck`:
     /// the Model Catalog as every Provider was read anew, or why it was not.
     ProvidersRechecked {
@@ -5635,6 +5671,13 @@ pub enum ApplicationTransition {
     ReadContextBreakdown {
         session: SessionReference,
         request_id: uuid::Uuid,
+    },
+    /// Ask the Server `origin` names for its Usage Metrics, answering with
+    /// [`ApplicationEvent::UsageMetricsRead`] under the same request.
+    ReadUsageMetrics {
+        origin: Outlook,
+        request_id: uuid::Uuid,
+        query: crate::protocol::UsageMetricsQuery,
     },
     SubscribeSession(SessionReference),
     /// Report a root Session as Viewed without changing the main-view route.
@@ -5970,6 +6013,14 @@ impl Application {
         self
     }
 
+    /// Injects the time zone the Usage Metrics calendar is cut in.
+    /// Production reads the host's zone each time; tests name one, so a
+    /// local day is the same wherever they run.
+    pub fn with_time_zone(mut self, zone: jiff::tz::TimeZone) -> Self {
+        self.state.local_zone = LocalZone(Arc::new(move || zone.clone()));
+        self
+    }
+
     /// Injects how long after one left press a second one continues the click
     /// count. Production uses the fixed interval; tests shorten it or advance
     /// the presentation clock instead of waiting.
@@ -6167,6 +6218,10 @@ impl Application {
             }
             ApplicationEvent::ContextBreakdownRead { request_id, result } => {
                 self.state.context_overlay.receive(request_id, result);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::UsageMetricsRead { request_id, result } => {
+                self.state.metrics_view.receive(request_id, result);
                 Ok(ApplicationTransition::Continue)
             }
             // Only the re-check the flow awaits answers for the rows, and what
@@ -7659,6 +7714,10 @@ impl Application {
         }
         if self.state.workspace_picker.is_open() {
             self.state.workspace_picker.refuse(refusal.clone());
+        }
+        // So does the Usage Metrics view, over the whole frame.
+        if self.state.metrics_view.is_open() {
+            self.state.metrics_view.refuse(refusal.clone());
         }
         self.state.submission_error = Some(refusal);
         true
@@ -9492,6 +9551,21 @@ impl Application {
         }
     }
 
+    /// Asks the Server the Outlook is turned toward for the Usage Metrics
+    /// view's buckets, cut by the reader's calendar now.
+    fn read_usage_metrics(&mut self) -> ApplicationTransition {
+        let now = self.state.session_now();
+        let zone = self.state.local_zone.now();
+        match self.state.metrics_view.ask(now, &zone) {
+            Some((request_id, query)) => ApplicationTransition::ReadUsageMetrics {
+                origin: self.state.outlook.clone(),
+                request_id,
+                query,
+            },
+            None => ApplicationTransition::Continue,
+        }
+    }
+
     /// Asks for the host clipboard to be read into the composer that has the
     /// keys. Anywhere else the command does nothing, as Ctrl+V always has.
     fn paste_from_clipboard(&mut self) -> ApplicationTransition {
@@ -11302,6 +11376,21 @@ impl Application {
                 self.state.context_overlay.close();
                 Ok(ApplicationTransition::Continue)
             }
+            SemanticCommandId::MetricsShow => {
+                self.state.command_mode = CommandMode::Composer;
+                self.state.submission_error = None;
+                self.state.metrics_view.open();
+                Ok(self.read_usage_metrics())
+            }
+            SemanticCommandId::MetricsRefresh => Ok(if self.state.metrics_view.is_open() {
+                self.read_usage_metrics()
+            } else {
+                ApplicationTransition::Continue
+            }),
+            SemanticCommandId::MetricsClose => {
+                self.state.metrics_view.close();
+                Ok(ApplicationTransition::Continue)
+            }
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,
             // so on the Landing there is nothing to set aside and the view
@@ -12356,6 +12445,13 @@ impl Application {
     /// Translates a terminal event through the active input mode. `None` means
     /// the event changes nothing, so callers can skip redrawing.
     pub fn command_for_terminal_input(&self, event: InputEvent) -> Option<CommandId> {
+        // The Usage Metrics view covers the whole frame, so nothing it covers
+        // answers anything while it is open.
+        if self.state.metrics_view.is_open() {
+            return command_for_metrics_view_event(event, |position| {
+                self.state.metrics_view.close_target_contains(position)
+            });
+        }
         self.refresh_text_selection();
         if self.state.has_text_selection() {
             match &event {

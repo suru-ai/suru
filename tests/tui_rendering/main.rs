@@ -23,6 +23,7 @@ mod icon_picker;
 mod image_paste;
 mod interventions;
 mod landing_notice;
+mod metrics;
 mod model_options;
 mod model_picker;
 mod monitoring;

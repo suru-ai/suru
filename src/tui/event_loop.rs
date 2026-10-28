@@ -602,6 +602,8 @@ struct TaskChannels {
     thumbnails: UnboundedSender<ApplicationEvent>,
     /// What each Session's Provider said fills its context.
     context_breakdowns: UnboundedSender<ApplicationEvent>,
+    /// What each Server read of its Usage Metrics, or why it would not.
+    usage_metrics: UnboundedSender<ApplicationEvent>,
     /// What each Origin answered the rename dialog: whether it offers a
     /// Title proposal, the proposal, and how a rename went.
     renames: UnboundedSender<ApplicationEvent>,
@@ -677,6 +679,7 @@ async fn run_loop(
     let (attachments, mut attachment_rx) = tokio::sync::mpsc::unbounded_channel();
     let (thumbnails, mut thumbnail_rx) = tokio::sync::mpsc::unbounded_channel();
     let (context_breakdowns, mut context_breakdown_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (usage_metrics, mut usage_metrics_rx) = tokio::sync::mpsc::unbounded_channel();
     let (renames, mut rename_rx) = tokio::sync::mpsc::unbounded_channel();
     let (relays, mut relay_rx) = tokio::sync::mpsc::unbounded_channel();
     let (directories, mut directory_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -706,6 +709,7 @@ async fn run_loop(
             attachments,
             thumbnails,
             context_breakdowns,
+            usage_metrics,
             renames,
             relays,
             directories,
@@ -783,6 +787,7 @@ async fn run_loop(
             answer = attachment_rx.recv() => run.receive_attachment_answer(answer)?,
             thumbnail = thumbnail_rx.recv() => run.receive_thumbnail(thumbnail)?,
             breakdown = context_breakdown_rx.recv() => run.receive_context_breakdown(breakdown)?,
+            metrics = usage_metrics_rx.recv() => run.receive_usage_metrics(metrics)?,
             rename = rename_rx.recv() => run.receive_rename_answer(rename)?,
             relay = relay_rx.recv() => run.receive_relay_answer(relay)?,
             directory = directory_rx.recv() => run.receive_directory_listing(directory)?,
@@ -1013,6 +1018,16 @@ impl RunLoop {
         answer: Option<ApplicationEvent>,
     ) -> Result<ControlFlow<Exit>> {
         let answer = answer.ok_or_else(|| anyhow!("Context Breakdown task channel stopped"))?;
+        self.needs_redraw = true;
+        let transition = self.application.handle_event(answer)?;
+        Ok(self.dispatch_transition(transition))
+    }
+
+    fn receive_usage_metrics(
+        &mut self,
+        answer: Option<ApplicationEvent>,
+    ) -> Result<ControlFlow<Exit>> {
+        let answer = answer.ok_or_else(|| anyhow!("Usage Metrics task channel stopped"))?;
         self.needs_redraw = true;
         let transition = self.application.handle_event(answer)?;
         Ok(self.dispatch_transition(transition))
@@ -1349,6 +1364,18 @@ impl RunLoop {
                     session.session_id,
                     request_id,
                     self.channels.context_breakdowns.clone(),
+                );
+            }
+            ApplicationTransition::ReadUsageMetrics {
+                origin,
+                request_id,
+                query,
+            } => {
+                spawn_usage_metrics_read(
+                    self.client.session_commands_for(origin),
+                    query,
+                    request_id,
+                    self.channels.usage_metrics.clone(),
                 );
             }
             ApplicationTransition::DeleteSession(session) => {
@@ -1888,6 +1915,7 @@ impl RunLoop {
             | ApplicationTransition::InterruptSession { .. }
             | ApplicationTransition::CompactSession { .. }
             | ApplicationTransition::ReadContextBreakdown { .. }
+            | ApplicationTransition::ReadUsageMetrics { .. }
             | ApplicationTransition::SubscribeSession(_)
             | ApplicationTransition::ViewSession(_)
             | ApplicationTransition::ViewAndAttachSession(_)
@@ -3416,6 +3444,30 @@ fn spawn_context_breakdown_read(
             .await
             .map_err(|error| context_breakdown_refusal(&error));
         let _ = answers.send(ApplicationEvent::ContextBreakdownRead { request_id, result });
+    });
+}
+
+/// Asks the Server `commands` names for its Usage Metrics. Nothing aborts
+/// it: an answer the view no longer awaits is told apart by its request and
+/// moves nothing.
+fn spawn_usage_metrics_read(
+    commands: SessionCommandClient,
+    query: crate::protocol::UsageMetricsQuery,
+    request_id: uuid::Uuid,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let result =
+            commands
+                .usage_metrics(&query)
+                .await
+                .map_err(
+                    |error| match error.downcast_ref::<crate::protocol::SessionError>() {
+                        Some(refusal) => refusal.message.clone(),
+                        None => format!("{error:#}"),
+                    },
+                );
+        let _ = answers.send(ApplicationEvent::UsageMetricsRead { request_id, result });
     });
 }
 
@@ -6915,6 +6967,7 @@ mod ready_event_tests {
                 attachments: sender(),
                 thumbnails: sender(),
                 context_breakdowns: sender(),
+                usage_metrics: sender(),
                 renames: sender(),
                 relays: sender(),
                 directories: sender(),

@@ -102,6 +102,13 @@ pub enum SemanticCommandId {
     ContextPageUp,
     ContextPageDown,
     ContextClose,
+    /// Opens the Usage Metrics view over the whole frame and reads the
+    /// Usage Metrics of the Server the Outlook is turned toward.
+    MetricsShow,
+    /// Reads the Usage Metrics view's figures again.
+    MetricsRefresh,
+    /// Closes the Usage Metrics view, back to whatever it covered.
+    MetricsClose,
     /// Opens the Icon Picker over a Session, which the picker only does while
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
     /// menu item stays quiet rather than opening a picker no glyph could draw.
@@ -648,6 +655,9 @@ impl SemanticCommandId {
             Self::ContextPageUp => "context.page-up",
             Self::ContextPageDown => "context.page-down",
             Self::ContextClose => "context.close",
+            Self::MetricsShow => "metrics.show",
+            Self::MetricsRefresh => "metrics.refresh",
+            Self::MetricsClose => "metrics.close",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::SessionRename => "session.rename",
@@ -1704,6 +1714,36 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Close Context",
         reach: SemanticReach::Client,
         description: "Dismiss the Context Breakdown",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsShow,
+        title: "Show Metrics",
+        // It reads the Server the Outlook is turned toward, so an Origin
+        // that has stopped answering refuses it.
+        reach: SemanticReach::Origin,
+        description: "Show the Usage Metrics of every Session on the Outlook's Server",
+        slash: Some(SlashCommand {
+            name: "metrics",
+            aliases: &[],
+            takes_text: false,
+        }),
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsRefresh,
+        title: "Refresh Metrics",
+        reach: SemanticReach::Origin,
+        description: "Read the Usage Metrics view's figures again",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsClose,
+        title: "Close Metrics",
+        reach: SemanticReach::Client,
+        description: "Close the Usage Metrics view",
         slash: None,
         keybinding: None,
     },
@@ -3070,8 +3110,9 @@ pub(super) fn command_matches(query: &str) -> Vec<SemanticCommandId> {
     // Model Options action there, choosing a Remote before forming a Pairing
     // with one; any typed part of `connect` or `pair` ranks normally.
     // Onboarding is taken once, and again only on purpose, so it waits past
-    // that window rather than pushing Pairing out of it. Each command moves
-    // to just after the one it follows, in this order.
+    // that window rather than pushing Pairing out of it, and so does the
+    // Usage Metrics view, looked in on now and then rather than worked in.
+    // Each command moves to just after the one it follows, in this order.
     if query.is_empty() {
         for (id, follows) in [
             (
@@ -3082,6 +3123,10 @@ pub(super) fn command_matches(query: &str) -> Vec<SemanticCommandId> {
             (
                 SemanticCommandId::OnboardingOpen,
                 SemanticCommandId::PairOpen,
+            ),
+            (
+                SemanticCommandId::MetricsShow,
+                SemanticCommandId::OnboardingOpen,
             ),
         ] {
             let Some(position) = matches.iter().position(|(_, _, _, held)| *held == id) else {

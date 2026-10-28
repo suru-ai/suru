@@ -23,6 +23,7 @@ mod keymap;
 mod list_editor;
 mod list_window;
 mod markdown;
+mod metrics;
 mod model_details;
 mod model_options;
 mod model_picker;

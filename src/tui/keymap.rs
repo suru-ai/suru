@@ -275,6 +275,32 @@ pub(super) fn command_for_context_overlay_event(event: InputEvent) -> Option<Com
     Some(CommandId::InvokeSemantic(command))
 }
 
+/// The Usage Metrics view owns every key and press while it is open, since
+/// it covers the whole frame: Esc or a press on its ✕ closes it, and `r`
+/// reads it again.
+pub(super) fn command_for_metrics_view_event(
+    event: InputEvent,
+    close_target: impl Fn(Position) -> bool,
+) -> Option<CommandId> {
+    let command = match event {
+        InputEvent::Key(key) if key.kind == KeyEventKind::Press => {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::MetricsClose,
+                (KeyCode::Char('r'), KeyModifiers::NONE) => SemanticCommandId::MetricsRefresh,
+                _ => return None,
+            }
+        }
+        InputEvent::Mouse(mouse)
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                && close_target(Position::new(mouse.column, mouse.row)) =>
+        {
+            SemanticCommandId::MetricsClose
+        }
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(command))
+}
+
 /// The Serve overlay owns the keys while it is visible. Its picker of the
 /// ways an Invite offers follows the other picker surfaces, with Space changing membership rather
 /// than typing and Enter issuing the Invite for the complete chosen set.

@@ -214,6 +214,16 @@ pub(super) fn render_with_slots(
         render_terminal_too_small(frame, theme);
         return;
     }
+    // The Usage Metrics view takes over the whole frame, the Sidebar and the
+    // Aside included, so nothing it covers is drawn at all. Only the modal
+    // for this machine's own Server going away stands over it.
+    if state.metrics_view.is_open() {
+        super::metrics::render(frame, &state.metrics_view, theme);
+        if state.reconnect_overlay_visible() {
+            render_reconnect_overlay(frame, theme);
+        }
+        return;
+    }
     // The frame is laid out as Sidebar | main view | Aside, the main view's
     // floor outranking both columns and the Aside giving way first. The Aside
     // answers for an open Session, so on the Landing it takes nothing.

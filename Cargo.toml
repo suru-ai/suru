@@ -93,6 +93,10 @@ github-copilot-sdk = { version = "1.0.15-preview.3", default-features = false }
 syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 object = { version = "0.37", default-features = false, features = ["read_core", "elf", "macho", "pe", "std", "unaligned"] }
+# The reader's local time zone, which the Usage Metrics calendar cuts days at. Its defaults read the system zone on
+# every platform and the system tzdb on Unix, and bundle the tzdb on Windows, which keeps none; the `time` crate's
+# local offset is unreliable in a multithreaded process.
+jiff = "0.2.38"
 
 [dev-dependencies]
 # A real Relay in-process, which the Relay tests drive a Server against.
