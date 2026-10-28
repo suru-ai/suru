@@ -261,6 +261,12 @@ pub struct InsightsReport {
     /// UTC offset in use is a whole number of quarter-hours, so a reader
     /// folds these into its own calendar's hours exactly, daylight saving
     /// included, while the Server knows nothing of calendars.
+    ///
+    /// It grows with how many quarter-hours held work, never with how many
+    /// Turns: at most 96 a day, so 35,040 for a year of work in every
+    /// quarter-hour, each about 95 bytes as JSON — some 3.3 MB at most. All
+    /// time grows by at most that much for each year worked, and in practice
+    /// by the far fewer quarter-hours a reader works in.
     pub quarter_hours: Vec<QuarterHourTurns>,
 }
 

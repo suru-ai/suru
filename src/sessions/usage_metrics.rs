@@ -587,14 +587,61 @@ fn top_owners(owned: &HashMap<SessionId, OwnedCost>, limit: usize) -> Vec<Sessio
 /// Adds what one Turn contributes to a Cost: its amount, and its Estimated
 /// portion, where it counts one, and its partial mark.
 fn add_contribution(aggregate: &mut UsageMetricsAggregate, contribution: &CostContribution) {
+    add_counted(
+        &mut aggregate.cost,
+        &mut aggregate.is_cost_partial,
+        contribution,
+    );
+    if let Some(amount) = contribution
+        .amount
+        .filter(|amount| amount.basis == CostBasis::Estimated)
+    {
+        aggregate.estimated_cost = Some(add_cost(aggregate.estimated_cost, amount.cost));
+    }
+}
+
+/// Adds what one Turn contributes to `cost`, where it counts an amount, and
+/// its partial mark to `is_partial`: how every figure a read gives adds a
+/// contribution up.
+fn add_counted(cost: &mut Option<Cost>, is_partial: &mut bool, contribution: &CostContribution) {
     if let Some(amount) = contribution.amount {
-        let add = |held: Option<Cost>| Some(add_cost(held, amount.cost));
-        aggregate.cost = add(aggregate.cost);
-        if amount.basis == CostBasis::Estimated {
-            aggregate.estimated_cost = add(aggregate.estimated_cost);
+        *cost = Some(add_cost(*cost, amount.cost));
+    }
+    *is_partial |= contribution.is_partial;
+}
+
+/// Where each Turn a read counts landed, so each Cost Coverage contribution
+/// is filed beside the Turn carrying it: the one rule by which the metrics
+/// read's buckets and the Insights read's quarter-hours place Cost, so the
+/// two add up alike.
+struct TurnPlaces<P> {
+    places: HashMap<(SessionId, TurnId), P>,
+}
+
+impl<P> Default for TurnPlaces<P> {
+    fn default() -> Self {
+        Self::with_capacity(0)
+    }
+}
+
+impl<P> TurnPlaces<P> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            places: HashMap::with_capacity(capacity),
         }
     }
-    aggregate.is_cost_partial |= contribution.is_partial;
+
+    /// Records that the Turn `turn_id` of `session_id` landed at `place`.
+    fn place(&mut self, session_id: SessionId, turn_id: TurnId, place: P) {
+        self.places.insert((session_id, turn_id), place);
+    }
+
+    /// Where the Turn carrying `contribution` landed; none where the read
+    /// placed no such Turn.
+    fn of(&self, contribution: &CostContribution) -> Option<&P> {
+        self.places
+            .get(&(contribution.session_id, contribution.turn_id))
+    }
 }
 
 /// Where a Turn landed, the key it counts under, and the top-level Session
@@ -667,7 +714,7 @@ fn fold(
     // What each top-level Session's work across the buckets adds up to.
     let mut owned = HashMap::<SessionId, OwnedCost>::new();
     // Where each Turn landed, for the Cost it carries to land beside it.
-    let mut placed = HashMap::with_capacity(metered.turns.len());
+    let mut placed = TurnPlaces::with_capacity(metered.turns.len());
     for turn in metered.turns {
         let place = Place {
             bucket: landing(turn.placed_at),
@@ -676,8 +723,9 @@ fn fold(
         if let Some(comparison) = comparison.as_mut().filter(|_| place.compared) {
             comparison.add(&turn);
         }
-        placed.insert(
-            (turn.session_id, turn.turn_id),
+        placed.place(
+            turn.session_id,
+            turn.turn_id,
             Placed {
                 place: place.clone(),
                 key: turn.key.clone(),
@@ -707,10 +755,7 @@ fn fold(
             key,
             owner,
             model,
-        } = placed
-            .get(&(contribution.session_id, contribution.turn_id))
-            .cloned()
-            .unwrap_or_default();
+        } = placed.of(contribution).cloned().unwrap_or_default();
         if let Some(comparison) = comparison.as_mut().filter(|_| place.compared) {
             add_contribution(&mut comparison.aggregate, contribution);
         }

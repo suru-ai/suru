@@ -12,20 +12,20 @@
 //! carrying it does, so the quarter-hours of a span add up to the Cost the
 //! metrics read gives it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use crate::protocol::{
     InsightsQuery, InsightsReport, QUARTER_HOUR_MS, QuarterHourTurns, SessionId,
-    TURN_DURATION_BIN_ENDS_MS, TURN_DURATION_BINS, Turn, TurnDurations, TurnId, TurnInsights,
-    TurnStatus, Usage,
+    TURN_DURATION_BIN_ENDS_MS, TURN_DURATION_BINS, Turn, TurnDurations, TurnInsights, TurnStatus,
+    Usage,
 };
 
 use super::{
     super::{
         SessionStore,
-        cost_coverage::{CostContribution, add_cost, tree_contributions},
+        cost_coverage::{CostContribution, tree_contributions},
     },
-    CountedSession, MeteredForest, SessionTimestamp, placed_at,
+    CountedSession, MeteredForest, SessionTimestamp, TurnPlaces, add_counted, placed_at,
 };
 
 /// Why an Insights query is refused.
@@ -106,7 +106,7 @@ impl InsightsFold {
 struct QuarterHourTally {
     /// Each quarter-hour a Turn is placed in, by its place since the epoch.
     quarters: BTreeMap<u64, QuarterHourTurns>,
-    placed: HashMap<(SessionId, TurnId), u64>,
+    placed: TurnPlaces<u64>,
 }
 
 impl QuarterHourTally {
@@ -123,21 +123,22 @@ impl QuarterHourTally {
         if let Some(tokens) = turn.usage.as_ref().and_then(Usage::blended_tokens) {
             quarter.tokens = Some(quarter.tokens.unwrap_or(0).saturating_add(tokens));
         }
-        self.placed.insert((session_id, turn.id), place);
+        self.placed.place(session_id, turn.id, place);
     }
 
     fn add_cost(&mut self, contribution: &CostContribution) {
         let Some(quarter) = self
             .placed
-            .get(&(contribution.session_id, contribution.turn_id))
+            .of(contribution)
             .and_then(|place| self.quarters.get_mut(place))
         else {
             return;
         };
-        if let Some(amount) = contribution.amount {
-            quarter.cost = Some(add_cost(quarter.cost, amount.cost));
-        }
-        quarter.is_cost_partial |= contribution.is_partial;
+        add_counted(
+            &mut quarter.cost,
+            &mut quarter.is_cost_partial,
+            contribution,
+        );
     }
 
     fn into_quarter_hours(self) -> Vec<QuarterHourTurns> {
