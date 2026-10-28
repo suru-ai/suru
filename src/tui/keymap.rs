@@ -295,7 +295,7 @@ pub(super) fn command_for_metrics_view_event(
                 (KeyCode::Char('['), KeyModifiers::NONE) => SemanticCommandId::MetricsRangePrevious,
                 (KeyCode::Char(']'), KeyModifiers::NONE) => SemanticCommandId::MetricsRangeNext,
                 (KeyCode::Char(digit @ '1'..='5'), KeyModifiers::NONE) => {
-                    let place = usize::from(digit as u8 - b'1');
+                    let place = usize::try_from(digit.to_digit(10)?).ok()? - 1;
                     SemanticCommandId::MetricsRangeSelect(MetricsRange::ALL[place])
                 }
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => SemanticCommandId::ApplicationExit,

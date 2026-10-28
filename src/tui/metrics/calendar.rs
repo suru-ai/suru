@@ -68,6 +68,17 @@ impl MetricsRange {
         }
     }
 
+    /// What the view says of the range where it holds no Usage.
+    pub(crate) fn no_usage(self) -> &'static str {
+        match self {
+            Self::Today => "No Usage today.",
+            Self::SevenDays => "No Usage in the last 7 days.",
+            Self::ThirtyDays => "No Usage in the last 30 days.",
+            Self::Year => "No Usage in the last 12 months.",
+            Self::AllTime => "No Usage yet.",
+        }
+    }
+
     /// The range after this one in the range bar, or this one where it is
     /// the last: the wheel stops at either end rather than spinning round.
     pub(crate) fn next(self) -> Self {
@@ -412,6 +423,33 @@ mod tests {
         assert_eq!(buckets.len(), 23);
         assert_eq!(buckets[0].begins, date(2026, 9, 6).at(1, 0, 0, 0));
         assert_eq!(hours_of_the_day(&buckets), (1..24).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn today_keeps_whole_hours_through_a_half_hour_transition() {
+        // Lord Howe Island springs forward half an hour at 02:00 on
+        // 4 October 2026, so its day is 23½ hours long.
+        let now = at("Australia/Lord_Howe", date(2026, 10, 4).at(12, 0, 0, 0));
+
+        let buckets = cut(MetricsRange::Today, now, "Australia/Lord_Howe");
+
+        assert_eq!(buckets.len(), 24);
+        assert_eq!(buckets[2].begins, date(2026, 10, 4).at(2, 30, 0, 0));
+        assert!(
+            buckets[..23]
+                .iter()
+                .all(|bucket| hours(bucket.interval) == 1)
+        );
+        let last = buckets[23].interval;
+        assert_eq!(
+            last.end.0 - last.start.0,
+            30 * 60 * 1_000,
+            "the last half hour"
+        );
+        assert_eq!(
+            last.end,
+            at("Australia/Lord_Howe", date(2026, 10, 5).at(0, 0, 0, 0))
+        );
     }
 
     #[test]

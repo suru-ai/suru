@@ -14,10 +14,11 @@ use ratatui::layout::{Position, Rect};
 use uuid::Uuid;
 
 use crate::protocol::{
-    SessionTimestamp, UsageMetricsBreakdown, UsageMetricsQuery, UsageMetricsReport,
+    SessionTimestamp, UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsQuery,
+    UsageMetricsReport,
 };
 
-use calendar::{BucketUnit, MetricsRange, RangeBuckets};
+use calendar::{MetricsRange, RangeBuckets};
 use chart::MetricsMeasure;
 
 pub(super) use view::render;
@@ -47,19 +48,53 @@ pub(super) struct MetricsView {
     open: bool,
     range: MetricsRange,
     measure: MetricsMeasure,
-    /// The read the view awaits, and the buckets it asked for.
-    asked: Option<(Uuid, RangeBuckets)>,
+    /// The read the view awaits, and what it asked for.
+    asked: Option<(Uuid, Asked)>,
     /// The last report read, with the buckets it answers.
     shown: Option<(RangeBuckets, UsageMetricsReport)>,
     /// Why the last read gave no report.
     refusal: Option<UsageMetricsReadRefusal>,
     /// When the earliest timed Turn was, as the last report since opening
-    /// said — `Some(None)` where it said none is timed — from which All time
-    /// begins. `None` until a report says, so All time reads once first to
-    /// learn it.
-    earliest: Option<Option<SessionTimestamp>>,
+    /// said, from which All time begins.
+    earliest: EarliestTurn,
     /// Where the last frame drew what a pointer can act on.
     targets: Cell<Targets>,
+}
+
+/// What a read the view awaits asked for.
+#[derive(Clone, Debug)]
+enum Asked {
+    /// No buckets at all, only when the earliest timed Turn was, which All
+    /// time must learn before it can cut its own.
+    EarliestTurn,
+    /// The range's buckets, as the calendar cut them.
+    Range(RangeBuckets),
+}
+
+/// What the view knows of the earliest timed Turn on the Server.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum EarliestTurn {
+    /// No report since the view opened has said.
+    #[default]
+    Unknown,
+    /// A report said no Turn is timed.
+    Untimed,
+    At(SessionTimestamp),
+}
+
+impl From<Option<SessionTimestamp>> for EarliestTurn {
+    fn from(earliest: Option<SessionTimestamp>) -> Self {
+        earliest.map_or(Self::Untimed, Self::At)
+    }
+}
+
+/// What the view needs once an answer lands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Receipt {
+    /// Nothing more: the answer is shown, refused, or was not awaited.
+    Settled,
+    /// To read again, since All time has learned where it begins.
+    ReadAgain,
 }
 
 /// Where the last frame drew each part of the view a pointer can act on.
@@ -101,7 +136,7 @@ impl MetricsView {
         self.asked = None;
         self.shown = None;
         self.refusal = None;
-        self.earliest = None;
+        self.earliest = EarliestTurn::Unknown;
     }
 
     pub(super) fn close(&mut self) {
@@ -137,61 +172,75 @@ impl MetricsView {
         now: SessionTimestamp,
         zone: &TimeZone,
     ) -> Option<(Uuid, UsageMetricsQuery)> {
-        let buckets = match (self.range, self.earliest) {
-            (MetricsRange::AllTime, None) => Some(RangeBuckets {
-                unit: BucketUnit::Month,
-                buckets: Vec::new(),
-            }),
-            (range, earliest) => calendar::resolve(range, now, zone, earliest.flatten()),
+        let earliest = match self.earliest {
+            EarliestTurn::Unknown if self.range == MetricsRange::AllTime => {
+                return Some(self.await_answer(Asked::EarliestTurn, Vec::new()));
+            }
+            EarliestTurn::At(earliest) => Some(earliest),
+            EarliestTurn::Unknown | EarliestTurn::Untimed => None,
         };
-        let Some(buckets) = buckets else {
+        let Some(buckets) = calendar::resolve(self.range, now, zone, earliest) else {
             self.refuse(UsageMetricsReadRefusal::Failed(
                 "The clock reads a moment the calendar cannot place".to_owned(),
             ));
             return None;
         };
+        let intervals = buckets
+            .buckets
+            .iter()
+            .map(|bucket| bucket.interval)
+            .collect();
+        Some(self.await_answer(Asked::Range(buckets), intervals))
+    }
+
+    fn await_answer(
+        &mut self,
+        asked: Asked,
+        buckets: Vec<UsageMetricsInterval>,
+    ) -> (Uuid, UsageMetricsQuery) {
         let request_id = Uuid::new_v4();
         let query = UsageMetricsQuery {
-            buckets: buckets
-                .buckets
-                .iter()
-                .map(|bucket| bucket.interval)
-                .collect(),
+            buckets,
             breakdown: UsageMetricsBreakdown::Model,
         };
-        self.asked = Some((request_id, buckets));
+        self.asked = Some((request_id, asked));
         self.refusal = None;
-        Some((request_id, query))
+        (request_id, query)
     }
 
     /// Takes the Server's answer, unless the view has since closed or asked
-    /// again, and answers whether the view must read again: when All time
-    /// learns of a Turn earlier than the buckets it asked for begin, which
-    /// its first read, asking for none, always does where any Turn is timed.
+    /// again, and says whether the view must read again: after All time has
+    /// learned when the earliest Turn was, or of a Turn earlier than the
+    /// buckets it asked for begin.
     pub(super) fn receive(
         &mut self,
         request_id: Uuid,
         result: Result<UsageMetricsReport, UsageMetricsReadRefusal>,
-    ) -> bool {
+    ) -> Receipt {
         if !self
             .asked
             .as_ref()
             .is_some_and(|(asked, _)| *asked == request_id)
         {
-            return false;
+            return Receipt::Settled;
         }
-        let (_, buckets) = self.asked.take().expect("the awaited read");
+        let (_, asked) = self.asked.take().expect("the awaited read");
         let report = match result {
             Ok(report) => report,
             Err(refusal) => {
                 self.refuse(refusal);
-                return false;
+                return Receipt::Settled;
             }
         };
+        let earliest = EarliestTurn::from(report.earliest_turn_at);
         // Asked again only for an earliest Turn the cut did not begin from,
         // so a read whose buckets cannot reach back that far is asked once.
-        let learned = self.earliest != Some(report.earliest_turn_at);
-        self.earliest = Some(report.earliest_turn_at);
+        let learned = self.earliest != earliest;
+        self.earliest = earliest;
+        let buckets = match asked {
+            Asked::EarliestTurn => return Receipt::ReadAgain,
+            Asked::Range(buckets) => buckets,
+        };
         let uncovered = report.earliest_turn_at.is_some_and(|earliest| {
             buckets
                 .buckets
@@ -199,11 +248,11 @@ impl MetricsView {
                 .is_none_or(|first| earliest < first.interval.start)
         });
         if self.range == MetricsRange::AllTime && learned && uncovered {
-            return true;
+            return Receipt::ReadAgain;
         }
         self.shown = Some((buckets, report));
         self.refusal = None;
-        false
+        Receipt::Settled
     }
 
     /// Says why the view has no fresh figures, giving up any read it

@@ -976,7 +976,7 @@ fn all_time_reads_again_when_its_report_names_an_earlier_turn() {
 }
 
 #[test]
-fn all_time_without_a_timed_turn_says_so_after_one_read() {
+fn all_time_without_a_timed_turn_is_this_month_alone() {
     let mut application = reader_in(NEW_YORK, afternoon());
     ask(&mut application);
     let (_, probe, first) = expect_read(press(&mut application, '5'));
@@ -988,8 +988,46 @@ fn all_time_without_a_timed_turn_says_so_after_one_read() {
         })
         .expect("deliver the report");
 
-    assert_eq!(transition, ApplicationTransition::Continue);
+    let (_, request_id, this_month) = expect_read(transition);
+    assert_eq!(
+        new_york_starts(&this_month),
+        [date(2026, 10, 1).at(0, 0, 0, 0)]
+    );
+    let landed = application
+        .handle_event(ApplicationEvent::UsageMetricsRead {
+            request_id,
+            result: Ok(empty_report(&this_month, None)),
+        })
+        .expect("deliver the report");
+    assert_eq!(landed, ApplicationTransition::Continue);
     row(&screen(&application), "No Usage yet.");
+}
+
+#[test]
+fn a_range_chosen_while_all_time_learns_its_beginning_drops_that_answer() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    ask(&mut application);
+    let (_, probe, first) = expect_read(press(&mut application, '5'));
+    assert!(first.buckets.is_empty());
+
+    let (_, request_id, week) = expect_read(press(&mut application, '2'));
+    let late = application
+        .handle_event(ApplicationEvent::UsageMetricsRead {
+            request_id: probe,
+            result: Ok(empty_report(
+                &first,
+                Some(in_new_york(date(2025, 6, 14).at(9, 0, 0, 0))),
+            )),
+        })
+        .expect("deliver the late answer");
+
+    assert_eq!(late, ApplicationTransition::Continue, "nothing read again");
+    row(&screen(&application), "Reading Usage Metrics…");
+    answer(&mut application, request_id, Ok(report(&week)));
+    let rows = screen(&application);
+    row(&rows, "▐7 days▌");
+    row(&rows, "Last 7 days · ");
+    row(&rows, "28 Oct");
 }
 
 #[test]

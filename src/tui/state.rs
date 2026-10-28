@@ -74,7 +74,9 @@ use super::{
         command_for_theme_picker_event, command_for_workspace_description_editor_event,
         command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
     },
-    metrics::{MetricsView, UsageMetricsReadRefusal},
+    metrics::{
+        MetricsView, Receipt as MetricsReceipt, UsageMetricsReadRefusal, calendar::MetricsRange,
+    },
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
@@ -6225,10 +6227,9 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::UsageMetricsRead { request_id, result } => {
-                Ok(if self.state.metrics_view.receive(request_id, result) {
-                    self.read_usage_metrics()
-                } else {
-                    ApplicationTransition::Continue
+                Ok(match self.state.metrics_view.receive(request_id, result) {
+                    MetricsReceipt::ReadAgain => self.read_usage_metrics(),
+                    MetricsReceipt::Settled => ApplicationTransition::Continue,
                 })
             }
             // Only the re-check the flow awaits answers for the rows, and what
@@ -9562,6 +9563,17 @@ impl Application {
         }
     }
 
+    /// Shows `range` in the open Usage Metrics view, reading it where that
+    /// changed what the view shows.
+    fn choose_metrics_range(&mut self, range: MetricsRange) -> ApplicationTransition {
+        let view = &mut self.state.metrics_view;
+        if view.is_open() && view.choose_range(range) {
+            self.read_usage_metrics()
+        } else {
+            ApplicationTransition::Continue
+        }
+    }
+
     /// Asks the Server the Outlook is turned toward for the Usage Metrics
     /// view's buckets, cut by the reader's calendar now.
     fn read_usage_metrics(&mut self) -> ApplicationTransition {
@@ -11411,20 +11423,14 @@ impl Application {
                 self.state.metrics_view.close();
                 Ok(ApplicationTransition::Continue)
             }
-            command @ (SemanticCommandId::MetricsRangeSelect(_)
-            | SemanticCommandId::MetricsRangeNext
-            | SemanticCommandId::MetricsRangePrevious) => {
-                let view = &mut self.state.metrics_view;
-                let range = match command {
-                    SemanticCommandId::MetricsRangeSelect(range) => range,
-                    SemanticCommandId::MetricsRangeNext => view.range().next(),
-                    _ => view.range().previous(),
-                };
-                Ok(if view.is_open() && view.choose_range(range) {
-                    self.read_usage_metrics()
-                } else {
-                    ApplicationTransition::Continue
-                })
+            SemanticCommandId::MetricsRangeSelect(range) => Ok(self.choose_metrics_range(range)),
+            SemanticCommandId::MetricsRangeNext => {
+                let range = self.state.metrics_view.range().next();
+                Ok(self.choose_metrics_range(range))
+            }
+            SemanticCommandId::MetricsRangePrevious => {
+                let range = self.state.metrics_view.range().previous();
+                Ok(self.choose_metrics_range(range))
             }
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,

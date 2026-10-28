@@ -109,7 +109,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
             let series = chart::series(report, measure, theme);
             let total: u64 = series.iter().map(|series| series.total).sum();
             if total == 0 {
-                buffer.set_string(body.x, body.y, no_usage(range), subdued);
+                buffer.set_string(body.x, body.y, range.no_usage(), subdued);
                 return;
             }
             let legend_rows = u16::try_from(series.len() + 1).unwrap_or(u16::MAX);
@@ -160,17 +160,6 @@ fn render_range_bar(
         x += width + RANGE_GAP;
     }
     x - RANGE_GAP
-}
-
-/// What the view says of a range that holds no Usage.
-fn no_usage(range: MetricsRange) -> &'static str {
-    match range {
-        MetricsRange::Today => "No Usage today.",
-        MetricsRange::SevenDays => "No Usage in the last 7 days.",
-        MetricsRange::ThirtyDays => "No Usage in the last 30 days.",
-        MetricsRange::Year => "No Usage in the last 12 months.",
-        MetricsRange::AllTime => "No Usage yet.",
-    }
 }
 
 /// A heading naming the range's whole, then one row per series from the
