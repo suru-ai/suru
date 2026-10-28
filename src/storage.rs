@@ -11,7 +11,7 @@ use diesel::{
     OptionalExtension, QueryableByName, SqliteConnection,
     connection::SimpleConnection,
     prelude::*,
-    sql_types::{BigInt, Text},
+    sql_types::{BigInt, Nullable, Text},
 };
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use serde::{Deserialize, Serialize};
@@ -19,9 +19,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
-        AgentSelection, CheckoutAssociation, ExecutionDirectory, Outlook, PromptId, ProviderId,
-        RepositoryLocation, SessionId, SessionSnapshot, SessionSummary, SessionTimestamp,
-        TranscriptItem, UnreadableSessionSummary, Workspace, WorkspaceDescription, WorkspaceId,
+        AgentSelection, CheckoutAssociation, ExecutionDirectory, InsightsTool, Outlook, PromptId,
+        ProviderId, RepositoryLocation, SessionId, SessionSnapshot, SessionSummary,
+        SessionTimestamp, ToolUses, TranscriptItem, TurnId, UnreadableSessionSummary, Workspace,
+        WorkspaceDescription, WorkspaceId,
     },
     provider::{ProviderResumeState, ProviderSubagentId},
     runtime::protect_current_user_file,
@@ -795,6 +796,77 @@ impl StorageRepository {
                 }
             }
             Ok(spawned)
+        })
+        .await
+    }
+
+    /// How often the Turns `turns` names of each Session used each Tool, and
+    /// how many of those uses failed, read from the Activities storage holds
+    /// without reading any Session's history in (ADR 0056). Each row gives up
+    /// only its kind, status, and Tool name and server, and the Turn owning
+    /// it; no payload is decoded whole. Storage lags a Session open in
+    /// memory by whatever it has not saved yet, which the read accepts.
+    ///
+    /// The rows are read a few Sessions at a time, so no query binds more
+    /// than [`SESSIONS_PER_TOOL_READ`] of them, and streamed into the tally
+    /// rather than held: a Session's rows are read whole, whichever of its
+    /// Turns they belong to, and those of a Turn not named left out here.
+    pub(crate) async fn tool_uses(
+        &self,
+        turns: HashMap<SessionId, HashSet<TurnId>>,
+    ) -> Result<Vec<ToolUses>, StorageError> {
+        let path = self.database_path.clone();
+        on_blocking_task("reading Tool uses", move || {
+            let mut connection = connect(&path)?;
+            let turns = turns
+                .into_iter()
+                .map(|(session_id, turns)| {
+                    let turns = turns.iter().map(TurnId::to_string).collect::<HashSet<_>>();
+                    (session_id.to_string(), turns)
+                })
+                .collect::<HashMap<_, _>>();
+            let sessions = turns.keys().collect::<Vec<_>>();
+            let mut tally = HashMap::<InsightsTool, (u64, u64)>::new();
+            for sessions in sessions.chunks(SESSIONS_PER_TOOL_READ) {
+                let rows = activities::table
+                    .filter(activities::session_id.eq_any(sessions))
+                    .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                        "json_extract(payload, '$.kind') IN \
+                         ('command', 'file_change', 'tool_call', 'subagent')",
+                    ))
+                    .select((
+                        activities::session_id,
+                        activities::turn_id,
+                        diesel::dsl::sql::<Text>("json_extract(payload, '$.kind')"),
+                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.status')"),
+                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.name')"),
+                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.server')"),
+                    ))
+                    .load_iter::<ToolUseRow, diesel::connection::DefaultLoadingMode>(
+                        &mut connection,
+                    )
+                    .map_err(|error| StorageError::Read(error.to_string()))?;
+                for row in rows {
+                    let (session_id, turn_id, kind, status, name, server) =
+                        row.map_err(|error| StorageError::Read(error.to_string()))?;
+                    if !turns
+                        .get(&session_id)
+                        .is_some_and(|turns| turns.contains(&turn_id))
+                    {
+                        continue;
+                    }
+                    let Some(tool) = used_tool(&kind, name, server) else {
+                        continue;
+                    };
+                    let (uses, failed) = tally.entry(tool).or_default();
+                    *uses += 1;
+                    *failed += u64::from(status.as_deref() == Some("failed"));
+                }
+            }
+            Ok(tally
+                .into_iter()
+                .map(|(tool, (uses, failed))| ToolUses { tool, uses, failed })
+                .collect())
         })
         .await
     }
@@ -1715,6 +1787,37 @@ fn refuse_newer_schema(connection: &mut SqliteConnection) -> Result<(), StorageE
         });
     }
     Ok(())
+}
+
+/// How many Sessions one query of [`StorageRepository::tool_uses`] binds,
+/// well within the fewest host parameters any SQLite build allows.
+const SESSIONS_PER_TOOL_READ: usize = 500;
+
+/// What [`StorageRepository::tool_uses`] reads of an Activity row: its
+/// Session and Turn, and its kind, status, Tool name, and MCP server.
+type ToolUseRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// The Tool an Activity of `kind` used, named `name` and hosted by `server`
+/// where it is a Tool Call: none where the row is no Tool's use, or a Tool
+/// Call's name is missing.
+fn used_tool(kind: &str, name: Option<String>, server: Option<String>) -> Option<InsightsTool> {
+    match kind {
+        "command" => Some(InsightsTool::Command),
+        "file_change" => Some(InsightsTool::FileChange),
+        "subagent" => Some(InsightsTool::Subagent),
+        "tool_call" => Some(InsightsTool::Named {
+            name: name?,
+            server,
+        }),
+        _ => None,
+    }
 }
 
 async fn on_blocking_task<T>(

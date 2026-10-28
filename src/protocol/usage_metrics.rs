@@ -268,6 +268,40 @@ pub struct InsightsReport {
     /// time grows by at most that much for each year worked, and in practice
     /// by the far fewer quarter-hours a reader works in.
     pub quarter_hours: Vec<QuarterHourTurns>,
+    /// Every Tool the interval's Turns used, the most used first, those
+    /// used as often the most failed first. Each use is an Activity of a
+    /// Turn the interval holds, read from storage, so a Session working
+    /// now may have used a Tool more recently than this says.
+    pub tools: Vec<ToolUses>,
+}
+
+/// A Tool an Agent used, as the Insights tab tells them apart.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InsightsTool {
+    /// A Command run in a shell.
+    Command,
+    /// A File Change made to the Workspace.
+    FileChange,
+    /// A Subagent the Agent delegated work to, natively or through the
+    /// Broker.
+    Subagent,
+    /// Any other Tool, by its name as its Provider spells it, and the MCP
+    /// server hosting it where it has one.
+    Named {
+        name: String,
+        server: Option<String>,
+    },
+}
+
+/// How often the interval's Turns used one Tool, and how many of those
+/// uses failed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolUses {
+    pub tool: InsightsTool,
+    pub uses: u64,
+    pub failed: u64,
 }
 
 /// How long a quarter-hour of [`InsightsReport::quarter_hours`] lasts, in

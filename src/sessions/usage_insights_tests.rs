@@ -11,11 +11,13 @@ use super::{
 };
 use crate::{
     protocol::{
-        Author, Cost, InsightsQuery, InsightsReport, QUARTER_HOUR_MS, QuarterHourTurns,
-        SessionListItem, SessionTimestamp, Turn, TurnDurations, TurnInsights, TurnStatus,
+        Activity, ActivityId, ActivityStatus, Author, Cost, InsightsQuery, InsightsReport,
+        InsightsTool, QUARTER_HOUR_MS, QuarterHourTurns, SessionListItem, SessionTimestamp,
+        ToolUses, TranscriptItem, Turn, TurnDurations, TurnId, TurnInsights, TurnStatus,
         UsageMetricsInterval, UsageTotal,
     },
     sidekick::SidekickWorkspace,
+    storage::PersistedSession,
 };
 
 /// Insights over the half-open span from `start` up to `end`.
@@ -28,9 +30,10 @@ fn over(start: u64, end: u64) -> InsightsQuery {
     }
 }
 
-fn read(store: &SessionStore, query: &InsightsQuery) -> InsightsReport {
+async fn read(store: &SessionStore, query: &InsightsQuery) -> InsightsReport {
     store
         .usage_insights(query)
+        .await
         .expect("a well-formed query is answered")
 }
 
@@ -91,7 +94,7 @@ async fn turn_durations_are_read_from_settled_turns_with_both_moments_in_the_int
     ];
     let (store, writer) = restore_deferred(directory.path(), vec![session]).await;
 
-    let report = read(&store, &over(START, END));
+    let report = read(&store, &over(START, END)).await;
 
     assert_eq!(
         report.turns,
@@ -122,7 +125,7 @@ async fn a_duration_falls_in_the_bin_its_bound_begins() {
         .collect();
     let (store, writer) = restore(directory.path(), vec![session]).await;
 
-    let durations = read(&store, &over(START, END)).turns.durations;
+    let durations = read(&store, &over(START, END)).await.turns.durations;
 
     assert_eq!(
         durations.map(|durations| durations.bins),
@@ -142,7 +145,7 @@ async fn an_interval_with_no_timed_settled_turn_has_no_durations() {
     let (store, writer) = restore_deferred(directory.path(), vec![session]).await;
 
     assert_eq!(
-        read(&store, &over(START, END)).turns,
+        read(&store, &over(START, END)).await.turns,
         TurnInsights::default()
     );
     writer.shutdown().await.unwrap();
@@ -154,11 +157,11 @@ async fn an_interval_that_runs_backwards_is_refused_and_an_empty_one_is_not() {
     let (store, writer) = restore(directory.path(), Vec::new()).await;
 
     assert_eq!(
-        store.usage_insights(&over(END, START)),
+        store.usage_insights(&over(END, START)).await,
         Err(InsightsRefusal::Backwards)
     );
     assert_eq!(
-        store.usage_insights(&over(START, START)),
+        store.usage_insights(&over(START, START)).await,
         Ok(InsightsReport::default())
     );
     writer.shutdown().await.unwrap();
@@ -236,7 +239,7 @@ async fn the_sessions_the_metrics_read_counts_are_read_and_a_remotes_are_not() {
         "the Sidekick's tree lists the Remote's Session"
     );
 
-    let turns = read(&store, &over(START, END)).turns;
+    let turns = read(&store, &over(START, END)).await.turns;
 
     assert_eq!(
         (turns.completed, turns.failed, turns.interrupted),
@@ -263,7 +266,7 @@ async fn reading_insights_never_hydrates_a_deferred_session_and_moves_no_revisio
     let before = read_state(&store);
     assert!(before.0, "the history opens deferred");
 
-    let turns = read(&store, &over(START, END)).turns;
+    let turns = read(&store, &over(START, END)).await.turns;
 
     assert_eq!(turns.completed, 1);
     assert_eq!(read_state(&store), before, "no history was read in");
@@ -311,7 +314,7 @@ async fn turns_land_in_the_utc_quarter_hour_they_are_placed_in_earliest_first() 
     ];
     let (store, writer) = restore_deferred(directory.path(), vec![session]).await;
 
-    let report = read(&store, &over(QUARTER, QUARTER + 4 * QUARTER_HOUR_MS));
+    let report = read(&store, &over(QUARTER, QUARTER + 4 * QUARTER_HOUR_MS)).await;
 
     assert_eq!(
         report.quarter_hours,
@@ -344,7 +347,7 @@ async fn quarter_hour_costs_add_up_to_the_range_s_cost() {
     let (store, writer) = restore(directory.path(), vec![parent, brokered]).await;
     let (start, end) = (QUARTER, QUARTER + 4 * QUARTER_HOUR_MS);
 
-    let report = read(&store, &over(start, end));
+    let report = read(&store, &over(start, end)).await;
 
     assert_eq!(
         report.quarter_hours,
@@ -374,5 +377,262 @@ async fn quarter_hour_costs_add_up_to_the_range_s_cost() {
         (range.cost, range.is_cost_partial),
         "the quarter-hours add up to the Cost the metrics read gives the range"
     );
+    writer.shutdown().await.unwrap();
+}
+
+/// Records `activity` in `session`'s Transcript, as working the Turn it
+/// names recorded it.
+fn record(session: &mut PersistedSession, activity: Activity) {
+    session.snapshot.transcript.push(TranscriptItem::Activity {
+        activity_id: activity.id(),
+    });
+    session.snapshot.activities.push(activity);
+}
+
+fn command(turn_id: TurnId, status: ActivityStatus) -> Activity {
+    Activity::Command {
+        id: ActivityId::new(),
+        turn_id,
+        status,
+        command: "cargo nextest run".to_owned(),
+        cwd: None,
+        output: "a long output no tally reads".repeat(64),
+        output_truncated: false,
+        exit_status: None,
+    }
+}
+
+fn file_change(turn_id: TurnId, status: ActivityStatus) -> Activity {
+    Activity::FileChange {
+        id: ActivityId::new(),
+        turn_id,
+        status,
+        changes: Vec::new(),
+    }
+}
+
+fn tool_call(
+    turn_id: TurnId,
+    server: Option<&str>,
+    name: &str,
+    status: ActivityStatus,
+) -> Activity {
+    Activity::ToolCall {
+        id: ActivityId::new(),
+        turn_id,
+        status,
+        name: name.to_owned(),
+        server: server.map(str::to_owned),
+        input: String::new(),
+        input_truncated: false,
+        output: String::new(),
+        output_truncated: false,
+        omitted_parts: 0,
+    }
+}
+
+fn spawned(turn_id: TurnId, status: ActivityStatus, brokered: bool) -> Activity {
+    Activity::Subagent {
+        id: ActivityId::new(),
+        turn_id,
+        status,
+        name: "explorer".to_owned(),
+        description: "map the seams".to_owned(),
+        model: None,
+        session_id: crate::protocol::SessionId::new(),
+        brokered,
+        duration_ms: None,
+        delegated_at: None,
+    }
+}
+
+fn reasoned(turn_id: TurnId) -> Activity {
+    Activity::Reasoning {
+        id: ActivityId::new(),
+        turn_id,
+        status: ActivityStatus::Completed,
+        title: None,
+        content: "thinking".to_owned(),
+        content_truncated: false,
+        duration_ms: None,
+    }
+}
+
+fn named(server: Option<&str>, name: &str) -> InsightsTool {
+    InsightsTool::Named {
+        name: name.to_owned(),
+        server: server.map(str::to_owned),
+    }
+}
+
+fn uses(tool: InsightsTool, uses: u64, failed: u64) -> ToolUses {
+    ToolUses { tool, uses, failed }
+}
+
+#[tokio::test]
+async fn tools_are_tallied_from_the_stored_activities_of_the_interval_s_turns() {
+    use ActivityStatus::{Active, Completed, Failed, Interrupted};
+    let directory = tempfile::tempdir().unwrap();
+    let mut parent = persisted(directory.path(), None);
+    parent.snapshot.turns = vec![
+        took(START, 1),
+        took(END - 1, 1),
+        // Begun before the interval, and never placed in time at all.
+        took(START - 1, 1),
+        ended(TurnStatus::Completed, None, None),
+    ];
+    let [first, last, before, untimed] = [0, 1, 2, 3].map(|turn| parent.snapshot.turns[turn].id);
+    for activity in [
+        command(first, Completed),
+        command(first, Failed),
+        // Interrupted, or still running: a use, though not a failed one.
+        command(last, Interrupted),
+        command(last, Active),
+        file_change(first, Completed),
+        file_change(last, Failed),
+        tool_call(first, None, "Read", Completed),
+        // A Tool an MCP server hosts is told apart by its server, from one
+        // of the same name that none does as from one another hosts.
+        tool_call(first, Some("github"), "create_pr", Failed),
+        tool_call(last, Some("fs"), "Read", Completed),
+        spawned(first, Completed, false),
+        spawned(last, Failed, true),
+        // No Tool's use.
+        reasoned(first),
+        // Uses by Turns the interval does not hold.
+        command(before, Failed),
+        command(untimed, Failed),
+        tool_call(before, Some("github"), "create_pr", Completed),
+    ] {
+        record(&mut parent, activity);
+    }
+    // A Subagent's Tools are counted as its own Turns are.
+    let mut subagent = persisted(directory.path(), Some(parent.snapshot.session.id));
+    subagent.snapshot.turns = vec![took(START + 5, 1)];
+    let turn = subagent.snapshot.turns[0].id;
+    record(&mut subagent, tool_call(turn, None, "Read", Completed));
+    let (store, writer) = restore_deferred(directory.path(), vec![parent, subagent]).await;
+
+    let report = read(&store, &over(START, END)).await;
+
+    assert_eq!(
+        report.tools,
+        vec![
+            uses(InsightsTool::Command, 4, 1),
+            // As often used: the most failed first, and then as their
+            // kinds are ordered.
+            uses(InsightsTool::FileChange, 2, 1),
+            uses(InsightsTool::Subagent, 2, 1),
+            uses(named(None, "Read"), 2, 0),
+            uses(named(Some("github"), "create_pr"), 1, 1),
+            uses(named(Some("fs"), "Read"), 1, 0),
+        ]
+    );
+    writer.shutdown().await.unwrap();
+}
+
+/// A Session the read does not count used no Tool it reports: a Subagent
+/// whose parent is gone, which is in no tree Cost, and the Session a
+/// Sidekick began on a Remote, whose Activities storage here never holds.
+#[tokio::test]
+async fn tools_are_tallied_only_for_the_sessions_the_read_counts() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let sidekick_workspace = SidekickWorkspace::beside(data.path()).unwrap();
+    let mut sidekick = persisted(&sidekick_workspace.ensure().unwrap(), None);
+    sidekick.snapshot.turns = vec![took(START, 1)];
+    let turn = sidekick.snapshot.turns[0].id;
+    record(&mut sidekick, command(turn, ActivityStatus::Completed));
+    let sidekick_id = sidekick.snapshot.session.id;
+    let mut orphan = persisted(directory.path(), Some(crate::protocol::SessionId::new()));
+    orphan.snapshot.turns = vec![took(START, 1)];
+    let turn = orphan.snapshot.turns[0].id;
+    record(&mut orphan, command(turn, ActivityStatus::Failed));
+    record(&mut orphan, file_change(turn, ActivityStatus::Completed));
+    let (store, writer) = restore_deferred(directory.path(), vec![sidekick, orphan]).await;
+    let store = store.with_sidekicks(sidekick_workspace, Vec::new());
+    let remote_session = persisted(directory.path(), None);
+    let remote_id = remote_session.summary.session.id;
+    store.record_remote_sidekick_act(
+        sidekick_id,
+        STUDIO,
+        remote_id,
+        RemoteAct {
+            began: true,
+            resolved: true,
+            confirmed: true,
+            pairing: PAIRING.to_owned(),
+            beginning: None,
+            evidence: None,
+        },
+    );
+    store.remote_read(
+        STUDIO,
+        &Pairing {
+            fingerprint: PAIRING.to_owned(),
+            generation: 1,
+        },
+        vec![SessionListItem::Readable(Box::new(remote_session.summary))],
+        store.moment(),
+    );
+    assert_eq!(
+        store.remotes_listed_with(sidekick_id),
+        vec![STUDIO.to_owned()],
+        "the Sidekick's tree lists the Remote's Session"
+    );
+
+    let tools = read(&store, &over(START, END)).await.tools;
+
+    assert_eq!(tools, vec![uses(InsightsTool::Command, 1, 0)]);
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn tools_are_read_from_storage_without_hydrating_a_deferred_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut root = persisted(directory.path(), None);
+    root.snapshot.turns = vec![took(START, 1)];
+    let turn = root.snapshot.turns[0].id;
+    record(&mut root, command(turn, ActivityStatus::Failed));
+    let root_id = root.snapshot.session.id;
+    let (store, writer) = restore_deferred(directory.path(), vec![root]).await;
+    let read_state = |store: &SessionStore| {
+        let state = store.state.lock().unwrap();
+        (
+            state.is_deferred(root_id),
+            state.sessions[&root_id].snapshot.revision,
+            state.sessions[&root_id].snapshot.activities.len(),
+        )
+    };
+    let before = read_state(&store);
+    assert_eq!(
+        (before.0, before.2),
+        (true, 0),
+        "the history opens deferred"
+    );
+
+    let tools = read(&store, &over(START, END)).await.tools;
+
+    assert_eq!(tools, vec![uses(InsightsTool::Command, 1, 1)]);
+    assert_eq!(read_state(&store), before, "no history was read in");
+    writer.shutdown().await.unwrap();
+}
+
+/// A Session already open is read from storage too, so its Tools are
+/// counted as a deferred one's are, as of its latest save.
+#[tokio::test]
+async fn an_open_session_s_tools_are_read_from_storage_as_well() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut root = persisted(directory.path(), None);
+    root.snapshot.turns = vec![took(START, 1)];
+    let turn = root.snapshot.turns[0].id;
+    record(&mut root, file_change(turn, ActivityStatus::Completed));
+    let root_id = root.snapshot.session.id;
+    let (store, writer) = restore_deferred(directory.path(), vec![root]).await;
+    store.hydrate(root_id).await.unwrap();
+
+    let tools = read(&store, &over(START, END)).await.tools;
+
+    assert_eq!(tools, vec![uses(InsightsTool::FileChange, 1, 0)]);
     writer.shutdown().await.unwrap();
 }

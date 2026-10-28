@@ -7,17 +7,22 @@
 //! Each panel of the Insights tab reads one part of the report, which a
 //! [`InsightsFold`] adds up a part apiece from the Turns the span holds.
 //!
+//! The Tools those Turns used are Activities, which no Session holds in
+//! memory until its history is read (ADR 0022). Rather than read any in,
+//! the read asks storage for the few fields of each Activity it counts,
+//! and keeps those whose Turn the span holds (ADR 0056).
+//!
 //! The quarter-hours carry Cost as the metrics read's buckets do: every
 //! Cost Coverage contribution of the counted trees lands where the Turn
 //! carrying it does, so the quarter-hours of a span add up to the Cost the
 //! metrics read gives it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::protocol::{
     InsightsQuery, InsightsReport, QUARTER_HOUR_MS, QuarterHourTurns, SessionId,
-    TURN_DURATION_BIN_ENDS_MS, TURN_DURATION_BINS, Turn, TurnDurations, TurnInsights, TurnStatus,
-    Usage,
+    TURN_DURATION_BIN_ENDS_MS, TURN_DURATION_BINS, ToolUses, Turn, TurnDurations, TurnId,
+    TurnInsights, TurnStatus, Usage,
 };
 
 use super::{
@@ -33,13 +38,18 @@ use super::{
 pub(crate) enum InsightsRefusal {
     /// Its interval ends before it begins.
     Backwards,
+    /// Storage could not be read for the Tools the interval's Turns used.
+    Storage,
 }
 
 impl SessionStore {
     /// How the Sessions living here worked over `query`'s interval. A pure
     /// read, as the metrics read is: it moves no Session's revision, writes
-    /// nothing, and reads no history in.
-    pub(crate) fn usage_insights(
+    /// nothing, and reads no history in. The Tools the interval's Turns used
+    /// are read from the Activities storage holds, on a blocking task once
+    /// the lock is let go (ADR 0056), and placed in time by the Turns that
+    /// own them, which the copy taken under the lock holds.
+    pub(crate) async fn usage_insights(
         &self,
         query: &InsightsQuery,
     ) -> Result<InsightsReport, InsightsRefusal> {
@@ -47,11 +57,17 @@ impl SessionStore {
         if interval.end < interval.start {
             return Err(InsightsRefusal::Backwards);
         }
-        let copied = self
-            .state
-            .lock()
-            .expect("Session store lock is not poisoned")
-            .copied_sessions();
+        let (copied, repository) = {
+            let state = self
+                .state
+                .lock()
+                .expect("Session store lock is not poisoned");
+            let repository = state
+                .deferred
+                .as_ref()
+                .map(|deferred| deferred.repository.clone());
+            (state.copied_sessions(), repository)
+        };
         let forest = MeteredForest::index(copied);
         let roots = forest.cost_tree_heads();
         let mut fold = InsightsFold::default();
@@ -67,6 +83,18 @@ impl SessionStore {
                 fold.add_cost(&contribution);
             }
         }
+        // A store restored with no storage behind it holds every history in
+        // memory and none in storage, so it has no Tools to read.
+        if let Some(repository) = repository
+            && !fold.held_turns.is_empty()
+        {
+            let held = std::mem::take(&mut fold.held_turns);
+            let tools = repository.tool_uses(held).await.map_err(|error| {
+                tracing::warn!(%error, "reading the Tools Insights counts failed");
+                InsightsRefusal::Storage
+            })?;
+            fold.tools = tools;
+        }
         Ok(fold.into_report())
     }
 }
@@ -76,6 +104,11 @@ impl SessionStore {
 struct InsightsFold {
     turns: TurnTally,
     quarter_hours: QuarterHourTally,
+    /// The Turns the interval holds of each Session, whose Activities are
+    /// the Tool uses it counts.
+    held_turns: HashMap<SessionId, HashSet<TurnId>>,
+    /// How often each Tool was used, in no order yet.
+    tools: Vec<ToolUses>,
 }
 
 impl InsightsFold {
@@ -83,6 +116,10 @@ impl InsightsFold {
     fn add_turn(&mut self, session_id: SessionId, turn: &Turn, at: SessionTimestamp) {
         self.turns.add(turn);
         self.quarter_hours.add_turn(session_id, turn, at);
+        self.held_turns
+            .entry(session_id)
+            .or_default()
+            .insert(turn.id);
     }
 
     /// Adds a Cost contribution of the counted trees, where the interval
@@ -95,8 +132,21 @@ impl InsightsFold {
         InsightsReport {
             turns: self.turns.into_insights(),
             quarter_hours: self.quarter_hours.into_quarter_hours(),
+            tools: most_used_first(self.tools),
         }
     }
+}
+
+/// `tools` the most used first, those used as often the most failed first,
+/// and those alike in both as their Tools are ordered, so the order is the
+/// same at every read.
+fn most_used_first(mut tools: Vec<ToolUses>) -> Vec<ToolUses> {
+    tools.sort_unstable_by(|left, right| {
+        (right.uses, right.failed)
+            .cmp(&(left.uses, left.failed))
+            .then_with(|| left.tool.cmp(&right.tool))
+    });
+    tools
 }
 
 /// The interval's Turns by the UTC quarter-hour each is placed in, and

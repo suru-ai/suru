@@ -3,15 +3,17 @@
 //! and the reports cross the wire.
 
 use crate::session_integration::support::{read_session_until, working_turn};
+use std::time::Duration;
 use suru::{
     protocol::{
-        Cost, InsightsQuery, InsightsReport, QUARTER_HOUR_MS, RuntimeDescriptor, SessionError,
-        SessionErrorCode, SessionTimestamp, TURN_DURATION_BINS, TurnDurations, TurnInsights, Usage,
-        UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsKey,
-        UsageMetricsQuery, UsageMetricsReport,
+        Cost, InsightsQuery, InsightsReport, InsightsTool, QUARTER_HOUR_MS, RuntimeDescriptor,
+        SessionError, SessionErrorCode, SessionTimestamp, TURN_DURATION_BINS, ToolUses,
+        TurnDurations, TurnInsights, Usage, UsageMetricsAggregate, UsageMetricsBreakdown,
+        UsageMetricsInterval, UsageMetricsKey, UsageMetricsQuery, UsageMetricsReport,
     },
-    provider::{MeteredCost, ProviderEvent},
+    provider::{MeteredCost, ProviderActivityId, ProviderEvent, ProviderToolCallStatus},
 };
+use tokio::time::timeout;
 
 fn by_model(buckets: Vec<UsageMetricsInterval>) -> UsageMetricsQuery {
     UsageMetricsQuery {
@@ -187,10 +189,26 @@ async fn insights_are_read_over_the_api_and_a_backwards_interval_is_refused() {
     let state = tempfile::tempdir().unwrap();
     let fixture = working_turn(state.path(), "usage-insights-read").await;
     let descriptor = fixture.server.descriptor().clone();
-    fixture
-        .provider_session
-        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
-        .await;
+    let issue = ProviderActivityId::new("insights-issue");
+    for event in [
+        ProviderEvent::ToolCallStarted {
+            activity_id: issue.clone(),
+            name: "create_issue".to_owned(),
+            server: Some("github".to_owned()),
+            input: None,
+        },
+        ProviderEvent::ToolCallCompleted {
+            activity_id: issue,
+            status: ProviderToolCallStatus::Failed,
+            omitted_parts: 0,
+        },
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
     let snapshot = read_session_until(
         &fixture.client,
         &descriptor,
@@ -216,15 +234,38 @@ async fn insights_are_read_over_the_api_and_a_backwards_interval_is_refused() {
             .send()
     };
 
-    let response = ask(UsageMetricsInterval {
-        start: started_at,
-        end: SessionTimestamp(started_at.0 + 1),
+    // The Tools are read from storage, which the Turn's Settle saves to
+    // soon after, so the read is asked until the save has landed.
+    let report = timeout(Duration::from_secs(10), async {
+        loop {
+            let response = ask(UsageMetricsInterval {
+                start: started_at,
+                end: SessionTimestamp(started_at.0 + 1),
+            })
+            .await
+            .expect("send the Insights read");
+            assert!(response.status().is_success(), "{}", response.status());
+            let report = response.json::<InsightsReport>().await.unwrap();
+            if !report.tools.is_empty() {
+                return report;
+            }
+            tokio::task::yield_now().await;
+        }
     })
     .await
-    .expect("send the Insights read");
+    .expect("the Turn's Tool Call is saved");
 
-    assert!(response.status().is_success(), "{}", response.status());
-    let report = response.json::<InsightsReport>().await.unwrap();
+    assert_eq!(
+        report.tools,
+        vec![ToolUses {
+            tool: InsightsTool::Named {
+                name: "create_issue".to_owned(),
+                server: Some("github".to_owned()),
+            },
+            uses: 1,
+            failed: 1,
+        }]
+    );
     let mut bins = [0; TURN_DURATION_BINS];
     bins[0] = 1;
     assert_eq!(

@@ -88,6 +88,7 @@ fn worked() -> InsightsReport {
             interrupted: 31,
         },
         quarter_hours: worked_hours(),
+        tools: Vec::new(),
     }
 }
 
