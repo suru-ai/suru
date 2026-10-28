@@ -261,6 +261,7 @@ async fn default_selection(
     let models = usable_claude_models(executable, processes, availability, control_request_timeout)
         .await
         .map_err(|error| claude_error_context(CONTEXT, error))?
+        .0
         .models;
     models
         .iter()

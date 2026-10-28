@@ -150,7 +150,8 @@ pub enum ManualCompactionRefusal {
 /// The Provider runtimes a production server hosts, in the fixed built-in
 /// order a fresh Landing defaults from. This is the one place Suru names a
 /// concrete Provider. `data_dir` is where durable Provider-neutral caches —
-/// the models.dev rate table a Cost is estimated from — live between runs.
+/// the models.dev rate table a Codex Cost and any cache saving are estimated
+/// from — live between runs.
 pub fn built_in_runtimes(data_dir: &Path) -> Vec<Arc<dyn ProviderRuntime>> {
     runtimes(Some(Arc::new(PricingSource::new(data_dir))))
 }
@@ -159,15 +160,22 @@ pub fn built_in_runtimes(data_dir: &Path) -> Vec<Arc<dyn ProviderRuntime>> {
 /// runtimes what they are called. Nothing built this way runs a Turn, so
 /// nothing built this way needs somewhere to cache prices.
 fn runtimes(pricing: Option<Arc<PricingSource>>) -> Vec<Arc<dyn ProviderRuntime>> {
-    let codex = CodexRuntime::from_environment();
+    let (codex, claude) = (
+        CodexRuntime::from_environment(),
+        ClaudeRuntime::from_environment(),
+    );
+    let (codex, claude) = match pricing {
+        Some(pricing) => (
+            codex.with_pricing_source(pricing.clone()),
+            claude.with_pricing_source(pricing),
+        ),
+        None => (codex, claude),
+    };
     vec![
-        Arc::new(match pricing {
-            Some(pricing) => codex.with_pricing_source(pricing),
-            None => codex,
-        }),
+        Arc::new(codex),
         Arc::new(CopilotRuntime::from_environment()),
         // Appended last so the Landing default order the earlier Providers set is unchanged.
-        Arc::new(ClaudeRuntime::from_environment()),
+        Arc::new(claude),
     ]
 }
 

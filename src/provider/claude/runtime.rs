@@ -6,6 +6,7 @@
 //! from its first Turn until the Session shuts down (see [`super::session`]).
 
 use std::{
+    collections::HashMap,
     ffi::{OsStr, OsString},
     sync::{Arc, Mutex as StdMutex},
 };
@@ -21,12 +22,12 @@ use super::{
     session::{ClaudeTimings, start_claude_session},
     skills::ClaudeSkills,
     transport::{ClaudeConnection, ClaudeSettingSources, StreamJsonTransport},
-    wire::{ControlRequest, NativeModelList},
+    wire::{ControlRequest, NativeModel, NativeModelList},
 };
 use crate::{
+    pricing::{CacheRatesFuture, ModelsDevModel, PricingSource},
     protocol::{
-        AgentSelection, ClaudePermissionMode, EffectiveSettings, ModelDescriptor, ProviderId,
-        SkillCatalog,
+        AgentSelection, ClaudePermissionMode, EffectiveSettings, ModelId, ProviderId, SkillCatalog,
     },
     provider::{
         ManualCompaction, ProviderErrand, ProviderError, ProviderFuture, ProviderModelDiscovery,
@@ -36,6 +37,10 @@ use crate::{
 };
 
 const CLAUDE_PATH_ENV: &str = "SURU_CLAUDE_PATH";
+/// The models.dev catalog Claude's canonical Models are priced in.
+const MODELS_DEV_PROVIDER: &str = "anthropic";
+/// The suffix a 1M-context alias or Model carries, which models.dev's Model IDs never do.
+const ONE_MILLION_CONTEXT_SUFFIX: &str = "[1m]";
 const CLAUDE_EXECUTABLE_NAME: &str = "claude";
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// A user stopping a Turn is waiting on the answer, so an interrupt — and each of the task stops
@@ -54,6 +59,12 @@ pub struct ClaudeRuntime {
     context_request_timeout: Duration,
     skills: ClaudeSkills,
     permission_mode: Arc<StdMutex<ClaudePermissionMode>>,
+    /// The canonical Model each alias of the last listed catalog resolved to; absent until a
+    /// catalog has been listed.
+    resolved_models: Arc<StdMutex<Option<HashMap<String, String>>>>,
+    /// The models.dev rate table a cache saving is estimated from. Claude reports its own Cost,
+    /// so nothing else here reads it.
+    pricing: Option<Arc<PricingSource>>,
 }
 
 impl ClaudeRuntime {
@@ -68,7 +79,16 @@ impl ClaudeRuntime {
             context_request_timeout: Duration::from_secs(5),
             skills: ClaudeSkills::default(),
             permission_mode: Arc::new(StdMutex::new(ClaudePermissionMode::default())),
+            resolved_models: Arc::default(),
+            pricing: None,
         }
+    }
+
+    /// Hands this runtime the models.dev rate lookup a cache saving is estimated from;
+    /// injectable so tests point it at a fixture rather than the network.
+    pub fn with_pricing_source(mut self, pricing: Arc<PricingSource>) -> Self {
+        self.pricing = Some(pricing);
+        self
     }
 
     /// Bounds how long a verdict that Claude is usable stands before the CLI is probed again;
@@ -162,7 +182,43 @@ impl ProviderRuntime for ClaudeRuntime {
         let availability = self.availability.clone();
         let request_timeout = self.control_request_timeout;
         Box::pin(async move {
-            usable_claude_models(executable, processes, availability, request_timeout).await
+            let (discovery, resolved) =
+                usable_claude_models(executable, processes, availability, request_timeout).await?;
+            *self
+                .resolved_models
+                .lock()
+                .expect("Claude resolved Models lock is not poisoned") = Some(resolved);
+            Ok(discovery)
+        })
+    }
+
+    /// The models.dev `anthropic` rates of the canonical Model `model` ran: an alias of the last
+    /// listed catalog is read as the Model it resolved to then — today's, which may not be the
+    /// one an older Turn ran — and any other ID as itself, a 1M-context suffix set aside. The
+    /// cache-write rate models.dev lists is the five-minute one, and no long-context premium is
+    /// priced. None until a catalog has been listed, since nothing is launched only to answer.
+    fn cache_rates<'a>(&'a self, model: &'a ModelId) -> CacheRatesFuture<'a> {
+        let canonical = self
+            .resolved_models
+            .lock()
+            .expect("Claude resolved Models lock is not poisoned")
+            .as_ref()
+            .map(|resolved| {
+                let model = model.as_str();
+                let canonical = resolved.get(model).map_or(model, String::as_str);
+                canonical
+                    .strip_suffix(ONE_MILLION_CONTEXT_SUFFIX)
+                    .unwrap_or(canonical)
+                    .to_owned()
+            });
+        Box::pin(async move {
+            self.pricing
+                .as_ref()?
+                .cache_rates(&ModelsDevModel::new(
+                    MODELS_DEV_PROVIDER,
+                    ModelId::new(canonical?),
+                ))
+                .await
         })
     }
 
@@ -262,23 +318,30 @@ pub(super) async fn usable_claude_models(
     processes: ProcessRegistry,
     availability: ClaudeAvailability,
     request_timeout: Duration,
-) -> Result<ProviderModelDiscovery, ProviderError> {
+) -> Result<(ProviderModelDiscovery, HashMap<String, String>), ProviderError> {
     let warning = availability
         .verify(&executable, &processes, request_timeout)
         .await?;
     let models = discover_claude_models(executable, processes, request_timeout).await?;
-    let discovery = ProviderModelDiscovery::new(models);
-    Ok(match warning {
-        Some(warning) => discovery.with_warning(warning),
-        None => discovery,
-    })
+    let resolved = models
+        .iter()
+        .filter_map(|model| Some((model.value.clone(), model.resolved_model.clone()?)))
+        .collect();
+    let discovery = ProviderModelDiscovery::new(model_descriptors(models));
+    Ok((
+        match warning {
+            Some(warning) => discovery.with_warning(warning),
+            None => discovery,
+        },
+        resolved,
+    ))
 }
 
 async fn discover_claude_models(
     executable: OsString,
     processes: ProcessRegistry,
     request_timeout: Duration,
-) -> Result<Vec<ModelDescriptor>, ProviderError> {
+) -> Result<Vec<NativeModel>, ProviderError> {
     let ClaudeConnection { transport, process } = StreamJsonTransport::launch(
         &executable,
         std::iter::empty(),
@@ -301,5 +364,5 @@ async fn discover_claude_models(
     })?;
     transport.close().await;
     process.wait_until_stopped().await?;
-    Ok(model_descriptors(listed.models))
+    Ok(listed.models)
 }

@@ -388,3 +388,91 @@ async fn a_discovery_after_a_crashed_one_launches_a_fresh_process() {
 
     server.shutdown().await.expect("shut the server down");
 }
+
+/// A models.dev catalog pricing the fixture's canonical Models under
+/// `anthropic`: the first at every input rate, the second with no
+/// cache-write rate, and the third not at all.
+async fn anthropic_rates() -> (Arc<suru::pricing::PricingSource>, tempfile::TempDir) {
+    use axum::{Json, Router, routing::get};
+    use serde_json::json;
+
+    let app = Router::new().route(
+        "/api.json",
+        get(|| async {
+            Json(json!({
+                "anthropic": {
+                    "models": {
+                        "claude-fixture-1": {
+                            "cost": {
+                                "input": 5.0,
+                                "output": 25.0,
+                                "cache_read": 0.5,
+                                "cache_write": 6.25
+                            }
+                        },
+                        "claude-fixture-2": {
+                            "cost": { "input": 1.0, "output": 5.0, "cache_read": 0.1 }
+                        }
+                    }
+                }
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind pricing fixture");
+    let endpoint = format!("http://{}/api.json", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let cache = tempfile::tempdir().expect("create pricing cache directory");
+    let pricing = suru::pricing::PricingSource::new(cache.path()).with_source_endpoint(endpoint);
+    (Arc::new(pricing), cache)
+}
+
+#[tokio::test]
+async fn claude_prices_an_alias_at_the_models_dev_rates_of_the_model_it_resolves_to() {
+    use suru::{pricing::CacheRates, provider::ProviderRuntime};
+
+    let claude = ScriptedClaude::with_models(CLAUDE_MODELS);
+    let (pricing, _cache) = anthropic_rates().await;
+    let runtime = ClaudeRuntime::new(claude.executable()).with_pricing_source(pricing);
+    let priced = &runtime;
+    let rates_of =
+        move |model: &'static str| async move { priced.cache_rates(&ModelId::new(model)).await };
+
+    assert_eq!(
+        runtime.cache_rates(&ModelId::new("default")).await,
+        None,
+        "no alias resolves before a catalog is listed"
+    );
+    assert_eq!(claude.launches(), 0, "nothing is launched only to answer");
+
+    runtime.list_models().await.expect("discover Claude Models");
+
+    let first = Some(CacheRates {
+        input: 5.0,
+        cache_read: Some(0.5),
+        cache_write: Some(6.25),
+    });
+    assert_eq!(rates_of("default").await, first);
+    assert_eq!(
+        rates_of("fixture[1m]").await,
+        first,
+        "a 1M-context alias is priced as the Model it resolves to"
+    );
+    assert_eq!(
+        rates_of("claude-fixture-1[1m]").await,
+        first,
+        "a canonical Model is priced as itself, its context suffix set aside"
+    );
+    assert_eq!(
+        rates_of("middling").await,
+        Some(CacheRates {
+            input: 1.0,
+            cache_read: Some(0.1),
+            cache_write: None,
+        })
+    );
+    assert_eq!(rates_of("haiku").await, None, "models.dev prices it not");
+}

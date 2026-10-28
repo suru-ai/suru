@@ -613,13 +613,15 @@ pub(super) struct NativeModelList {
 }
 
 /// One row of the CLI's model picker. `value` is what a spawn's model flag accepts — an alias such
-/// as `sonnet` or `opus[1m]` — so it is the Model ID Suru presents; the row's canonical
-/// `resolvedModel` is not decoded because Suru presents rows verbatim rather than collapsing
-/// aliases.
+/// as `sonnet` or `opus[1m]` — so it is the Model ID Suru presents, rows verbatim rather than
+/// aliases collapsed. The row's canonical `resolvedModel` names the Model the alias runs today,
+/// which is only what a rate table is asked about.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct NativeModel {
     pub(super) value: String,
+    #[serde(default)]
+    pub(super) resolved_model: Option<String>,
     pub(super) display_name: String,
     pub(super) description: String,
     #[serde(default)]
