@@ -22,8 +22,8 @@
 //!
 //! What caching saved is no Cost and lands in none: it is worked out at
 //! every read from the rates each Turn's Provider prices its Model at today,
-//! asked once the lock is let go, and a Model priced at fewer than the three
-//! rates it needs is left out and the estimate marked partial.
+//! asked once the lock is let go, and a Model lacking the rate of a part of
+//! the cache its Turns used is left out and the estimate marked partial.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -417,19 +417,23 @@ impl CacheTally {
     }
 
     /// The figures, the saving worked out from the rates `rates` states
-    /// today for each Model, leaving out a Model it lacks a rate for.
+    /// today for each Model, leaving out a Model lacking a rate for a part
+    /// of the cache its Turns used.
     async fn priced(self, rates: &dyn CacheRateLookup) -> CacheInsights {
         let mut saving = EstimatedSaving {
             nano_usd: None,
             is_partial: self.is_unattributed,
         };
         for ((provider, model), used) in self.by_model {
-            let Some(model_rates) = rates.cache_rates(&provider, &model).await else {
+            let Some(usd) = rates
+                .cache_rates(&provider, &model)
+                .await
+                .and_then(|rates| rates.saving_usd(used.reads, used.writes))
+            else {
                 saving.is_partial = true;
                 continue;
             };
-            let nano_usd =
-                (model_rates.saving_usd(used.reads, used.writes) * NANO_USD_PER_USD).round() as i64;
+            let nano_usd = (usd * NANO_USD_PER_USD).round() as i64;
             saving.nano_usd = Some(saving.nano_usd.unwrap_or(0).saturating_add(nano_usd));
         }
         CacheInsights {

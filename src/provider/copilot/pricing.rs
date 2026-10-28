@@ -52,23 +52,16 @@ impl CopilotPricing {
             .loaded
     }
 
-    /// The rates Copilot's catalog prices `model`'s standard tier at, in USD
-    /// per million tokens; absent where it lists no price for fresh input,
-    /// cache reads, or cache writes, or no catalog has loaded yet.
+    /// The rates Copilot's catalog prices `model` at: see
+    /// [`PriceSchedule::cache_rates`]. Absent where it lists no price for
+    /// fresh input, or no catalog has loaded yet.
     pub(super) fn cache_rates(&self, model: &str) -> Option<CacheRates> {
-        let table = self
-            .table
+        self.table
             .lock()
-            .expect("Copilot pricing lock is not poisoned");
-        let schedule = table.models.get(model)?;
-        let usd_per_million =
-            |price: f64| price / schedule.batch_size as f64 * USD_PER_AI_CREDIT * 1_000_000.0;
-        let standard = &schedule.standard;
-        Some(CacheRates {
-            input: usd_per_million(standard.input?),
-            cache_read: usd_per_million(standard.cache_read?),
-            cache_write: usd_per_million(standard.cache_write?),
-        })
+            .expect("Copilot pricing lock is not poisoned")
+            .models
+            .get(model)?
+            .cache_rates()
     }
 
     pub(super) fn cost(
@@ -113,6 +106,30 @@ impl PriceSchedule {
         })
     }
 
+    /// The standard tier's input rates in USD per million tokens, as a cache
+    /// saving is estimated at: a saving is stated for no particular prompt
+    /// size, so the long-context tier is passed over, and the cache-write
+    /// price is the default five-minute one, the hour-long write price set
+    /// aside. Absent where the tier lists no fresh-input price.
+    fn cache_rates(&self) -> Option<CacheRates> {
+        let tier = &self.standard;
+        Some(CacheRates {
+            input: self.usd_per_million(tier.input?),
+            cache_read: tier.cache_read.map(|price| self.usd_per_million(price)),
+            cache_write: tier.cache_write.map(|price| self.usd_per_million(price)),
+        })
+    }
+
+    /// `credits` a batch of tokens in dollars a million tokens.
+    fn usd_per_million(&self, credits: f64) -> f64 {
+        self.usd(credits) * 1_000_000.0
+    }
+
+    /// `credits` a batch of tokens in dollars a token.
+    fn usd(&self, credits: f64) -> f64 {
+        credits / self.batch_size as f64 * USD_PER_AI_CREDIT
+    }
+
     fn cost(
         &self,
         max_prompt_tokens: Option<i64>,
@@ -128,7 +145,7 @@ impl PriceSchedule {
             + component(cache_read, tier.cache_read)?
             + component(cache_write, tier.cache_write_price(cache_ttl_seconds))?
             + component(output, tier.output)?;
-        Cost::from_usd(credits / self.batch_size as f64 * USD_PER_AI_CREDIT)
+        Cost::from_usd(self.usd(credits))
     }
 
     fn tier(&self, max_prompt_tokens: Option<i64>) -> &TierPrices {

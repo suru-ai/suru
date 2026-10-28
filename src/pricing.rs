@@ -54,24 +54,34 @@ impl EstimatedCost {
 }
 
 /// What a token of each part of a Model's input costs today, in USD per
-/// million tokens: the three rates a cache saving is estimated from. Only a
-/// Model priced at all three has any.
+/// million tokens: the rates a cache saving is estimated from. A catalog
+/// may list no rate for cache reads or cache writes — models.dev lists no
+/// cache-write rate for OpenAI's Models — and a saving then needs it only
+/// where the Model's Turns used that part, as a Cost needs a part's rate
+/// only where its Usage has tokens of that part.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CacheRates {
     pub input: f64,
-    pub cache_read: f64,
-    pub cache_write: f64,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
 }
 
 impl CacheRates {
     /// What reading `cache_read_tokens` from cache saved over sending them
     /// as fresh input, less what writing `cache_write_tokens` to it cost
     /// beyond sending those as fresh input, in USD. Negative where the
-    /// writes cost more than the reads saved.
-    pub fn saving_usd(self, cache_read_tokens: u64, cache_write_tokens: u64) -> f64 {
-        (cache_read_tokens as f64 * (self.input - self.cache_read)
-            - cache_write_tokens as f64 * (self.cache_write - self.input))
-            / USD_PER_MILLION_TOKENS
+    /// writes cost more than the reads saved; absent where tokens of a part
+    /// have no rate to price them at.
+    pub fn saving_usd(self, cache_read_tokens: u64, cache_write_tokens: u64) -> Option<f64> {
+        // What tokens of a part cost beyond fresh input, which a read saves
+        // rather than costs.
+        let beyond_input = |tokens: u64, rate: Option<f64>| match tokens {
+            0 => Some(0.0),
+            tokens => Some(tokens as f64 * (rate? - self.input)),
+        };
+        let read = beyond_input(cache_read_tokens, self.cache_read)?;
+        let written = beyond_input(cache_write_tokens, self.cache_write)?;
+        Some(-(read + written) / USD_PER_MILLION_TOKENS)
     }
 }
 
@@ -83,8 +93,8 @@ pub type CacheRatesFuture<'a> =
 /// a cache saving is estimated from them. A Server asks its Provider
 /// runtimes; a test injects a fixed table.
 pub trait CacheRateLookup: Send + Sync {
-    /// `model` of `provider`'s rates, absent where it is not priced at all
-    /// three. May wait on a bounded fetch.
+    /// `model` of `provider`'s rates, absent where its fresh input has no
+    /// rate. May wait on a bounded fetch.
     fn cache_rates<'a>(
         &'a self,
         provider: &'a ProviderId,
@@ -235,8 +245,8 @@ impl PricingSource {
     }
 
     /// The rates the catalog states today for `model`'s input, fresh, read
-    /// from cache, and written to it; absent where it lacks any of the
-    /// three. May fetch and wait, as [`Self::estimate`] does.
+    /// from cache, and written to it; absent where it does not price the
+    /// Model. May fetch and wait, as [`Self::estimate`] does.
     pub async fn cache_rates(&self, model: &ModelsDevModel) -> Option<CacheRates> {
         self.fetch_catalog().await?.cache_rates(model)
     }
@@ -346,8 +356,8 @@ impl RateCatalog {
             .get(model.model.as_str())?;
         Some(CacheRates {
             input: rates.input,
-            cache_read: rates.cache_read?,
-            cache_write: rates.cache_write?,
+            cache_read: rates.cache_read,
+            cache_write: rates.cache_write,
         })
     }
 
@@ -642,7 +652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_rates_are_the_current_catalog_s_and_absent_without_all_three() {
+    async fn cache_rates_are_the_current_catalog_s_each_part_absent_where_it_lists_none() {
         let app = Router::new().route(
             "/api.json",
             get(|| async {
@@ -669,23 +679,46 @@ mod tests {
         let (endpoint, server) = serve_fixture(app).await;
         let data_dir = tempfile::tempdir().expect("create data directory");
         let pricing = PricingSource::new(data_dir.path()).with_source_endpoint(endpoint);
+        let rates = |cache_read, cache_write| {
+            Some(CacheRates {
+                input: 2.0,
+                cache_read,
+                cache_write,
+            })
+        };
 
         assert_eq!(
             pricing.cache_rates(&openai_model("cached-model")).await,
-            Some(CacheRates {
-                input: 2.0,
-                cache_read: 0.5,
-                cache_write: 2.5,
-            })
+            rates(Some(0.5), Some(2.5))
         );
-        for unpriced in ["reads-only", "uncached", "unknown"] {
-            assert_eq!(
-                pricing.cache_rates(&openai_model(unpriced)).await,
-                None,
-                "{unpriced}"
-            );
-        }
+        assert_eq!(
+            pricing.cache_rates(&openai_model("reads-only")).await,
+            rates(Some(0.5), None),
+            "as models.dev lists OpenAI's Models: no cache-write rate"
+        );
+        assert_eq!(
+            pricing.cache_rates(&openai_model("uncached")).await,
+            rates(None, None)
+        );
+        assert_eq!(pricing.cache_rates(&openai_model("unknown")).await, None);
         server.abort();
+    }
+
+    #[test]
+    fn a_saving_needs_a_part_s_rate_only_where_tokens_of_that_part_were_used() {
+        let reads_only = CacheRates {
+            input: 2.0,
+            cache_read: Some(0.5),
+            cache_write: None,
+        };
+
+        assert_eq!(reads_only.saving_usd(1_000_000, 0), Some(1.5));
+        assert_eq!(reads_only.saving_usd(1_000_000, 1), None);
+        let priced = CacheRates {
+            cache_write: Some(2.5),
+            ..reads_only
+        };
+        assert_eq!(priced.saving_usd(1_000_000, 2_000_000), Some(1.5 - 1.0));
     }
 
     #[tokio::test]

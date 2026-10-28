@@ -191,14 +191,15 @@ async fn insights_are_read_over_the_api_and_a_backwards_interval_is_refused() {
     let state = tempfile::tempdir().unwrap();
     let fixture = working_turn(state.path(), "usage-insights-read").await;
     let descriptor = fixture.server.descriptor().clone();
-    // The Provider prices the Turn's Model today, and its Turn read 3M
-    // tokens from cache.
+    // The Provider prices the Turn's Model today, listing no cache-write
+    // rate, as models.dev lists none for OpenAI's Models; its Turn read 3M
+    // tokens from cache and wrote none.
     fixture.runtime.price_cache(
         ModelId::new("gpt-subagent"),
         CacheRates {
             input: 2.0,
-            cache_read: 0.2,
-            cache_write: 2.5,
+            cache_read: Some(0.2),
+            cache_write: None,
         },
     );
     let issue = ProviderActivityId::new("insights-issue");

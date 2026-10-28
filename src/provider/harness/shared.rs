@@ -156,9 +156,10 @@ impl<C: HarnessConnector> SharedHarness<C> {
     }
 
     /// The connection to the live harness process, where one is running and
-    /// has not crashed; never launches one.
-    pub(crate) async fn live(&self) -> Option<C::Connection> {
-        let state = self.state.lock().await;
+    /// has not crashed; never launches one, and never waits on one being
+    /// launched, which holds the state for as long as the launch takes.
+    pub(crate) fn live(&self) -> Option<C::Connection> {
+        let state = self.state.try_lock().ok()?;
         state
             .as_ref()
             .filter(|live| live.crash.borrow().is_none())

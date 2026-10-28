@@ -354,10 +354,10 @@ impl CacheInsights {
 pub struct EstimatedSaving {
     /// In billionths of a dollar; negative where writing the cache cost
     /// more than reading it saved. Absent where no Turn that read or wrote
-    /// the cache has a Model priced at all three rates.
+    /// the cache has a Model with the rates of the parts it used.
     pub nano_usd: Option<i64>,
     /// Whether a Turn that read or wrote the cache is left out, its Model
-    /// lacking a rate the estimate needs, so it says less than caching did.
+    /// lacking the rate of a part it used, so it says less than caching did.
     pub is_partial: bool,
 }
 

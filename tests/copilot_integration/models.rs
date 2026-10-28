@@ -563,7 +563,7 @@ async fn a_harness_that_dies_mid_discovery_fails_the_catalog_and_the_next_refres
 }
 
 #[tokio::test]
-async fn copilot_states_cache_rates_from_its_running_catalog_and_launches_nothing_to_answer() {
+async fn copilot_states_cache_rates_from_its_last_running_catalog_and_launches_nothing_to_answer() {
     use crate::copilot_integration::support::COPILOT_MODELS as PRICED_MODELS;
     use suru::{pricing::CacheRates, provider::ProviderRuntime};
 
@@ -589,17 +589,26 @@ async fn copilot_states_cache_rates_from_its_running_catalog_and_launches_nothin
         runtime.cache_rates(&model).await,
         Some(CacheRates {
             input: 20.0,
-            cache_read: 5.0,
-            cache_write: 25.0,
+            cache_read: Some(5.0),
+            cache_write: Some(25.0),
         })
     );
     assert_eq!(
         runtime
             .cache_rates(&ModelId::new("incomplete-cache-fixture"))
             .await,
-        None,
-        "a Model with no cache prices has no cache rates"
+        Some(CacheRates {
+            input: 20.0,
+            cache_read: None,
+            cache_write: None,
+        }),
+        "a Model listing no cache prices has its input rate alone"
     );
     runtime.shutdown().await.expect("shut Copilot down");
     copilot.wait_for_exit().await;
+    assert_eq!(
+        runtime.cache_rates(&model).await.map(|rates| rates.input),
+        Some(20.0),
+        "the last harness's prices still price once it has stopped"
+    );
 }

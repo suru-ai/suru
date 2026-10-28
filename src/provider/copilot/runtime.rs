@@ -13,6 +13,7 @@ use super::{
     catalog::model_descriptors,
     copilot_error_context, copilot_fix,
     errand::run_copilot_errand,
+    pricing::CopilotPricing,
     session::{INTERRUPT_REQUEST_TIMEOUT, start_copilot_session},
     skills::CopilotSkills,
     transport::CopilotConnector,
@@ -52,6 +53,10 @@ pub struct CopilotRuntime {
     skills: CopilotSkills,
     interrupt_request_timeout: Duration,
     permissions: Arc<StdMutex<CopilotPermissions>>,
+    /// The prices the last harness Suru saw running published, kept so a
+    /// cache saving can still be estimated at them while no harness runs or
+    /// one is being launched.
+    last_pricing: StdMutex<Option<CopilotPricing>>,
 }
 
 impl CopilotRuntime {
@@ -69,7 +74,27 @@ impl CopilotRuntime {
             skills: CopilotSkills::default(),
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
             permissions: Arc::new(StdMutex::new(CopilotPermissions::default())),
+            last_pricing: StdMutex::new(None),
         }
+    }
+
+    /// The prices of the running harness once it has loaded any,
+    /// remembered as the last seen, or else of the last harness seen
+    /// running with prices loaded.
+    fn pricing(&self) -> Option<CopilotPricing> {
+        let mut last = self
+            .last_pricing
+            .lock()
+            .expect("Copilot last pricing lock is not poisoned");
+        if let Some(pricing) = self
+            .harness
+            .live()
+            .map(|connection| connection.pricing())
+            .filter(CopilotPricing::is_loaded)
+        {
+            *last = Some(pricing);
+        }
+        last.clone()
     }
 
     /// Bounds how long an interrupt waits for Copilot to acknowledge it — and with it the other
@@ -134,6 +159,11 @@ impl ProviderRuntime for CopilotRuntime {
                 listed = handle.connection().list_models() => listed?,
             };
             let discovery = ProviderModelDiscovery::new(model_descriptors(listed));
+            *self
+                .last_pricing
+                .lock()
+                .expect("Copilot last pricing lock is not poisoned") =
+                Some(handle.connection().pricing());
             Ok(match handle.connection().compatibility_warning() {
                 Some(warning) => discovery.with_warning(warning),
                 None => discovery,
@@ -234,15 +264,12 @@ impl ProviderRuntime for CopilotRuntime {
     }
 
     /// The prices the running harness's catalog lists, which its Costs are
-    /// worked out from; none while no harness runs, since none is launched
-    /// only to answer.
+    /// worked out from, or the last harness's seen running; none until one
+    /// has run, since none is launched only to answer.
     fn cache_rates<'a>(&'a self, model: &'a ModelId) -> CacheRatesFuture<'a> {
-        Box::pin(async move {
-            self.harness
-                .live()
-                .await?
-                .pricing()
-                .cache_rates(model.as_str())
-        })
+        let rates = self
+            .pricing()
+            .and_then(|pricing| pricing.cache_rates(model.as_str()));
+        Box::pin(async move { rates })
     }
 }

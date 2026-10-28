@@ -58,13 +58,13 @@ struct RateTable(HashMap<(ProviderId, ModelId), CacheRates>);
 
 impl RateTable {
     /// This table, pricing `agent`'s Model at `input`, `cache_read`, and
-    /// `cache_write`.
+    /// `cache_write`, either absent where the catalog lists none.
     fn pricing(
         mut self,
         agent: Option<(&str, &str)>,
         input: f64,
-        cache_read: f64,
-        cache_write: f64,
+        cache_read: Option<f64>,
+        cache_write: Option<f64>,
     ) -> Self {
         let (provider, model) = agent.expect("a known Agent");
         self.0.insert(
@@ -1184,8 +1184,8 @@ async fn the_saving_is_what_cache_reads_saved_less_what_cache_writes_cost_beyond
     ];
     let (store, writer) = restore(directory.path(), vec![session]).await;
     let rates = RateTable::default()
-        .pricing(CODEX, 2.00, 0.20, 2.50)
-        .pricing(OPUS, 15.00, 1.50, 18.75);
+        .pricing(CODEX, 2.00, Some(0.20), Some(2.50))
+        .pricing(OPUS, 15.00, Some(1.50), Some(18.75));
 
     let cache = priced_at(&store, &over(START, END), &rates).await.cache;
 
@@ -1202,7 +1202,7 @@ async fn writing_the_cache_more_than_reading_it_saves_less_than_nothing() {
     let mut session = persisted(directory.path(), None);
     session.snapshot.turns = vec![cached(CODEX, START, 0, 0, 4_000_000)];
     let (store, writer) = restore(directory.path(), vec![session]).await;
-    let rates = RateTable::default().pricing(CODEX, 2.00, 0.20, 2.50);
+    let rates = RateTable::default().pricing(CODEX, 2.00, Some(0.20), Some(2.50));
 
     let cache = priced_at(&store, &over(START, END), &rates).await.cache;
 
@@ -1221,7 +1221,7 @@ async fn a_model_without_rates_is_left_out_of_the_saving_which_is_then_partial()
         cached(None, START + 2, 0, 5_000_000, 0),
     ];
     let (store, writer) = restore(directory.path(), vec![session]).await;
-    let rates = RateTable::default().pricing(CODEX, 2.00, 0.20, 2.50);
+    let rates = RateTable::default().pricing(CODEX, 2.00, Some(0.20), Some(2.50));
 
     let cache = priced_at(&store, &over(START, END), &rates).await.cache;
 
@@ -1274,7 +1274,7 @@ async fn the_saving_enters_no_cost_figure_of_the_insights_or_metrics_reports() {
         ..turn_scoped(CODEX, START, 0.50)
     }];
     let (store, writer) = restore(directory.path(), vec![session]).await;
-    let rates = RateTable::default().pricing(CODEX, 2.00, 0.20, 2.50);
+    let rates = RateTable::default().pricing(CODEX, 2.00, Some(0.20), Some(2.50));
     let query = over(START, END);
 
     let priced = priced_at(&store, &query, &rates).await;
@@ -1295,5 +1295,42 @@ async fn the_saving_enters_no_cost_figure_of_the_insights_or_metrics_reports() {
         (usd(0.50), None),
         "the metrics read's Cost is the Turn's alone"
     );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_model_lacking_a_rate_is_left_out_only_where_its_turns_used_that_part() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![
+        // Codex lists no cache-write rate, and wrote nothing: 1M read saves
+        // $1.80.
+        cached(CODEX, START, 0, 1_000_000, 0),
+        // Opus lists no cache-read rate, and its Turn read the cache: left
+        // out.
+        cached(OPUS, START + 1, 0, 1_000_000, 0),
+    ];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+    let rates = RateTable::default()
+        .pricing(CODEX, 2.00, Some(0.20), None)
+        .pricing(OPUS, 15.00, None, Some(18.75));
+
+    let cache = priced_at(&store, &over(START, END), &rates).await.cache;
+
+    assert_eq!(cache.saving, saved(Some(1.80), true));
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_model_lacking_the_cache_write_rate_is_left_out_where_its_turns_wrote_the_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![cached(CODEX, START, 0, 1_000_000, 1)];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+    let rates = RateTable::default().pricing(CODEX, 2.00, Some(0.20), None);
+
+    let cache = priced_at(&store, &over(START, END), &rates).await.cache;
+
+    assert_eq!(cache.saving, saved(None, true));
     writer.shutdown().await.unwrap();
 }
