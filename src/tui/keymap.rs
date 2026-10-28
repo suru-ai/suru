@@ -291,8 +291,9 @@ pub(super) struct MetricsKeys {
     pub(super) focused_row: Option<FocusedRow>,
     /// The Insights panel in focus.
     pub(super) panel: Option<InsightsPanel>,
-    /// Whether that panel has something selected within it.
-    pub(super) panel_selected: bool,
+    /// What that panel has selected within it, by its place among its
+    /// items.
+    pub(super) panel_item: Option<usize>,
 }
 
 /// The Usage Metrics view owns every key and click while it is open, since
@@ -477,7 +478,7 @@ fn command_for_overview_pointer(
 /// panel's, as [`command_for_insights_panel_key`] gives it.
 fn command_for_insights_key(key: KeyEvent, keys: MetricsKeys) -> Option<SemanticCommandId> {
     Some(match (key.code, key.modifiers) {
-        (KeyCode::Esc, KeyModifiers::NONE) if keys.panel_selected => {
+        (KeyCode::Esc, KeyModifiers::NONE) if keys.panel_item.is_some() => {
             SemanticCommandId::MetricsPanelSelectionClear
         }
         (KeyCode::Esc, KeyModifiers::NONE) if keys.panel.is_some() => {
@@ -492,44 +493,60 @@ fn command_for_insights_key(key: KeyEvent, keys: MetricsKeys) -> Option<Semantic
         (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
             SemanticCommandId::MetricsPanelFocusPrevious
         }
-        _ => return command_for_insights_panel_key(keys.panel?, key),
+        _ => return command_for_insights_panel_key(keys.panel?, keys.panel_item, key),
     })
 }
 
 /// A key the focused Insights panel acts on: the keys that move along its
 /// items the way they stand — on Turns, ←/→ along its sparkline's bins; on
 /// When you work, ←/→ an hour along the week and ↑/↓ a day, the same hour;
-/// on Tools, ↑/↓ a row, scrolling past either end of those in view.
+/// on Tools and Workspaces, ↑/↓ a row, scrolling past either end of those
+/// in view, and on Workspaces, Enter opens the row selected.
 fn command_for_insights_panel_key(
     panel: InsightsPanel,
+    selected: Option<usize>,
     key: KeyEvent,
 ) -> Option<SemanticCommandId> {
     match (panel, key.code, key.modifiers) {
+        (InsightsPanel::Workspaces, KeyCode::Enter, KeyModifiers::NONE) => {
+            selected.map(|item| SemanticCommandId::MetricsPanelItemOpen { panel, item })
+        }
         (InsightsPanel::Turns | InsightsPanel::WhenYouWork, KeyCode::Left, KeyModifiers::NONE) => {
             Some(SemanticCommandId::MetricsPanelItemPrevious)
         }
         (InsightsPanel::Turns | InsightsPanel::WhenYouWork, KeyCode::Right, KeyModifiers::NONE) => {
             Some(SemanticCommandId::MetricsPanelItemNext)
         }
-        (InsightsPanel::WhenYouWork | InsightsPanel::Tools, KeyCode::Up, KeyModifiers::NONE) => {
-            Some(SemanticCommandId::MetricsPanelItemUp)
-        }
-        (InsightsPanel::WhenYouWork | InsightsPanel::Tools, KeyCode::Down, KeyModifiers::NONE) => {
-            Some(SemanticCommandId::MetricsPanelItemDown)
-        }
+        (
+            InsightsPanel::WhenYouWork | InsightsPanel::Tools | InsightsPanel::Workspaces,
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        ) => Some(SemanticCommandId::MetricsPanelItemUp),
+        (
+            InsightsPanel::WhenYouWork | InsightsPanel::Tools | InsightsPanel::Workspaces,
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        ) => Some(SemanticCommandId::MetricsPanelItemDown),
         _ => None,
     }
 }
 
-/// Insights' own clicks and wheel: a click on what a panel lets a reader
-/// select selects it, focusing the panel, and one anywhere else on a panel
-/// focuses it; the wheel is the panel's under the pointer, whether or not it
+/// Insights' own clicks and wheel: a click on a Workspaces row opens it, a
+/// click on what another panel lets a reader select selects it, focusing
+/// the panel, and one anywhere else on a panel focuses it; the wheel is the panel's under the pointer, whether or not it
 /// is focused, as [`command_for_insights_panel_wheel`] gives it.
 fn command_for_insights_pointer(
     mouse: MouseEvent,
     target: InsightsTarget,
 ) -> Option<SemanticCommandId> {
     match (mouse.kind, target) {
+        (
+            MouseEventKind::Up(MouseButton::Left),
+            InsightsTarget::Item {
+                panel: panel @ InsightsPanel::Workspaces,
+                item,
+            },
+        ) => Some(SemanticCommandId::MetricsPanelItemOpen { panel, item }),
         (MouseEventKind::Up(MouseButton::Left), InsightsTarget::Item { panel, item }) => {
             Some(SemanticCommandId::MetricsPanelItemSelect { panel, item })
         }
@@ -562,13 +579,13 @@ fn command_for_insights_panel_wheel(
             | InsightsPanel::Delegation,
             _,
         ) => None,
-        (InsightsPanel::Tools, MouseEventKind::ScrollUp) => {
+        (InsightsPanel::Tools | InsightsPanel::Workspaces, MouseEventKind::ScrollUp) => {
             Some(SemanticCommandId::MetricsPanelScrollUp { panel })
         }
-        (InsightsPanel::Tools, MouseEventKind::ScrollDown) => {
+        (InsightsPanel::Tools | InsightsPanel::Workspaces, MouseEventKind::ScrollDown) => {
             Some(SemanticCommandId::MetricsPanelScrollDown { panel })
         }
-        (InsightsPanel::Tools, _) => None,
+        (InsightsPanel::Tools | InsightsPanel::Workspaces, _) => None,
     }
 }
 

@@ -15,10 +15,8 @@ use crate::{
 };
 
 use super::{
-    super::{
-        super::slots::truncate_to_width, calendar::MetricsRange, chart::MetricsMeasure, view::share,
-    },
-    view::render_spans,
+    super::{super::slots::truncate_to_width, calendar::MetricsRange, view::share},
+    view::{bar, render_spans, stated_cost},
 };
 
 /// The rows the panel draws inside its border: a role apiece, then the
@@ -38,10 +36,6 @@ const COST_WIDTH: usize = 10;
 /// What stands before a role's bar: its name, share, and Cost, and the gaps
 /// between them.
 const LEAD_WIDTH: usize = LABEL_WIDTH + 1 + SHARE_WIDTH + 2 + COST_WIDTH + 2;
-
-/// The glyphs a bar's last cell is drawn in, an eighth of a cell full to
-/// seven eighths.
-const EIGHTHS: [&str; 7] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉"];
 
 const NOTE: &str = "A Claude Session's native Subagents are in its Cost";
 
@@ -120,52 +114,7 @@ fn nano_usd(cost: RoleCost) -> u64 {
     cost.cost.map_or(0, Cost::nano_usd)
 }
 
-/// `cost` as the panel states it: its amount, `+` where it is partial; or,
-/// where it counts no amount, whether that is for want of work or of a
-/// price, never a zero nobody measured.
+/// `cost` as the panel states it: see [`stated_cost`].
 fn stated(cost: RoleCost) -> String {
-    match cost {
-        RoleCost {
-            cost: Some(cost),
-            is_cost_partial,
-        } => MetricsMeasure::Cost.figure(cost.nano_usd(), is_cost_partial),
-        RoleCost {
-            cost: None,
-            is_cost_partial: true,
-        } => "unpriced".to_owned(),
-        RoleCost {
-            cost: None,
-            is_cost_partial: false,
-        } => "—".to_owned(),
-    }
-}
-
-/// A bar as long, in eighths of `width` cells, as `part` is of `whole`, to
-/// the nearest eighth: any part at all at least an eighth long.
-fn bar(part: u64, whole: u64, width: usize) -> String {
-    if part == 0 || whole == 0 || width == 0 {
-        return String::new();
-    }
-    let span = u128::try_from(width).unwrap_or(u128::MAX).saturating_mul(8);
-    let eighths = (u128::from(part) * span + u128::from(whole) / 2) / u128::from(whole);
-    let eighths = usize::try_from(eighths.clamp(1, span)).unwrap_or(usize::MAX);
-    let mut bar = "█".repeat(eighths / 8);
-    if eighths % 8 > 0 {
-        bar.push_str(EIGHTHS[eighths % 8 - 1]);
-    }
-    bar
-}
-
-#[cfg(test)]
-mod tests {
-    use super::bar;
-
-    #[test]
-    fn a_bar_is_as_long_as_its_share_to_the_nearest_eighth_and_a_sliver_still_shows() {
-        assert_eq!(bar(1, 2, 4), "██");
-        assert_eq!(bar(3, 16, 4), "▊", "six of four cells' eighths");
-        assert_eq!(bar(1, 1_000, 4), "▏");
-        assert_eq!(bar(0, 1_000, 4), "");
-        assert_eq!(bar(1_000, 1_000, 4), "████");
-    }
+    stated_cost(cost.cost, cost.is_cost_partial)
 }

@@ -289,7 +289,7 @@ pub(in crate::tui) fn render(
                 }
                 return;
             }
-            let series = chart::series(report, measure, theme);
+            let series = chart::series(report, measure, theme, view.kept_apart());
             // Hiding a series changes only the chart: the legend's heading,
             // figures, and shares stay those of every series, hidden or not,
             // as the headline figures above it will.

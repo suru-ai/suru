@@ -184,12 +184,17 @@ pub(crate) const OTHER: &str = "Other";
 /// Other's Sessions are its keys' counts added: a Session that worked under
 /// two of them counts once for each, as it does under the keys shown, and
 /// the note that says so covers it.
+///
+/// A key `kept_apart` that would fold into Other stands as a series of its
+/// own in the last place kept, the key that stood there folding in its
+/// stead, so that it can be shown alone.
 pub(crate) fn series(
     report: &UsageMetricsReport,
     measure: MetricsMeasure,
     theme: &Theme,
+    kept_apart: Option<&UsageMetricsKey>,
 ) -> Vec<Series> {
-    let (ranked, folded) = ranked(report);
+    let (ranked, folded) = ranked(report, kept_apart);
     let values = |keys: &[RankedKey<'_>]| {
         report
             .buckets
@@ -244,8 +249,11 @@ pub(crate) fn series(
 
 /// Which series [`series`] makes of `report`, in the same order, without
 /// working out any figure.
-pub(crate) fn series_ids(report: &UsageMetricsReport) -> Vec<SeriesId> {
-    let (ranked, folded) = ranked(report);
+pub(crate) fn series_ids(
+    report: &UsageMetricsReport,
+    kept_apart: Option<&UsageMetricsKey>,
+) -> Vec<SeriesId> {
+    let (ranked, folded) = ranked(report, kept_apart);
     ranked
         .into_iter()
         .map(|(label, _)| SeriesId::Key(label.key.clone()))
@@ -254,11 +262,39 @@ pub(crate) fn series_ids(report: &UsageMetricsReport) -> Vec<SeriesId> {
 }
 
 /// A key and its figures over the range taken together.
-type RankedKey<'a> = (&'a UsageMetricsKeyLabel, UsageMetricsAggregate);
+pub(crate) type RankedKey<'a> = (&'a UsageMetricsKeyLabel, UsageMetricsAggregate);
 
 /// `report`'s keys in the order [`series`] stacks them, split into the
-/// largest few it keeps and the rest it folds into Other.
-fn ranked(report: &UsageMetricsReport) -> (Vec<RankedKey<'_>>, Vec<RankedKey<'_>>) {
+/// largest few it keeps and the rest it folds into Other, with the key
+/// `kept_apart` among those kept.
+fn ranked<'a>(
+    report: &'a UsageMetricsReport,
+    kept_apart: Option<&UsageMetricsKey>,
+) -> (Vec<RankedKey<'a>>, Vec<RankedKey<'a>>) {
+    let mut ranked = ranked_keys(report);
+    let mut folded = if ranked.len() > KEYED_SERIES {
+        ranked.split_off(KEYED_SERIES)
+    } else {
+        Vec::new()
+    };
+    if let Some(at) =
+        kept_apart.and_then(|key| folded.iter().position(|(label, _)| label.key == *key))
+    {
+        let apart = folded.remove(at);
+        // Keys fold only past a full set kept, so there is one to displace,
+        // and it is larger than every key folded.
+        if let Some(displaced) = ranked.pop() {
+            folded.insert(0, displaced);
+        }
+        ranked.push(apart);
+    }
+    (ranked, folded)
+}
+
+/// Every one of `report`'s keys, with its figures across the buckets, in
+/// the order [`series`] stacks them, before any is folded into Other: by
+/// Cost, then by tokens, then by Sessions, ties settled by label.
+pub(crate) fn ranked_keys(report: &UsageMetricsReport) -> Vec<RankedKey<'_>> {
     let mut ranked: Vec<RankedKey<'_>> = report
         .keys
         .iter()
@@ -277,12 +313,7 @@ fn ranked(report: &UsageMetricsReport) -> (Vec<RankedKey<'_>>, Vec<RankedKey<'_>
             .cmp(&rank(left_whole))
             .then_with(|| left.label.cmp(&right.label))
     });
-    let folded = if ranked.len() > KEYED_SERIES {
-        ranked.split_off(KEYED_SERIES)
-    } else {
-        Vec::new()
-    };
-    (ranked, folded)
+    ranked
 }
 
 /// `key`'s part of `bucket`, nothing where it did no work there.

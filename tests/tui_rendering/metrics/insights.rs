@@ -26,6 +26,8 @@ use suru::{
 };
 use uuid::Uuid;
 
+mod workspaces;
+
 fn ctrl(application: &mut Application, code: KeyCode) -> ApplicationTransition {
     application
         .handle_terminal_event(InputEvent::Key(KeyEvent::new(code, KeyModifiers::CONTROL)))
@@ -37,15 +39,38 @@ fn command_for_ctrl(application: &Application, code: KeyCode) -> Option<CommandI
         .command_for_terminal_input(InputEvent::Key(KeyEvent::new(code, KeyModifiers::CONTROL)))
 }
 
-fn expect_insights_read(transition: ApplicationTransition) -> (Outlook, Uuid, InsightsQuery) {
+/// The two reads showing Insights asks for together: its own, and the
+/// one-bucket Usage Metrics read its Workspaces panel fills from.
+struct InsightsReads {
+    origin: Outlook,
+    request_id: Uuid,
+    insights: InsightsQuery,
+    workspaces_request_id: Uuid,
+    workspaces: UsageMetricsQuery,
+}
+
+fn expect_insights_reads(transition: ApplicationTransition) -> InsightsReads {
     match transition {
         ApplicationTransition::ReadUsageInsights {
             origin,
             request_id,
             query,
-        } => (origin, request_id, query),
+            workspaces_request_id,
+            workspaces,
+        } => InsightsReads {
+            origin,
+            request_id,
+            insights: query,
+            workspaces_request_id,
+            workspaces,
+        },
         other => panic!("the tab reads the Outlook's Server's Insights, not {other:?}"),
     }
+}
+
+fn expect_insights_read(transition: ApplicationTransition) -> (Outlook, Uuid, InsightsQuery) {
+    let reads = expect_insights_reads(transition);
+    (reads.origin, reads.request_id, reads.insights)
 }
 
 fn expect_metrics_read(transition: ApplicationTransition) -> UsageMetricsQuery {
@@ -242,8 +267,14 @@ fn on_insights(insights: Result<InsightsReport, UsageMetricsReadRefusal>) -> App
     let mut application = reader_in(NEW_YORK, afternoon());
     let (_, request_id, query) = ask(&mut application);
     answer(&mut application, request_id, Ok(report(&query)));
-    let (_, request_id, _) = expect_insights_read(ctrl(&mut application, KeyCode::Right));
-    answer_insights(&mut application, request_id, insights);
+    let reads = expect_insights_reads(ctrl(&mut application, KeyCode::Right));
+    answer_insights(&mut application, reads.request_id, insights);
+    let workspaces = workspaces::spent(&reads.workspaces, &workspaces::MOCKUP);
+    answer(
+        &mut application,
+        reads.workspaces_request_id,
+        Ok(workspaces),
+    );
     application
 }
 

@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::protocol::{
     Outlook, SessionId, SessionReference, SessionTimestamp, UsageMetricsBreakdown,
-    UsageMetricsInterval, UsageMetricsQuery, UsageMetricsReport,
+    UsageMetricsInterval, UsageMetricsKey, UsageMetricsQuery, UsageMetricsReport,
 };
 
 use calendar::{MetricsRange, RangeBuckets};
@@ -171,6 +171,13 @@ pub(super) struct MetricsView {
     /// change of measure or a refresh. Only a new range or breakdown, whose
     /// series are others, lets them go.
     hidden: HashSet<SeriesId>,
+    /// A key the chart keeps as a series of its own even where it would
+    /// fold into Other, so that it can be shown alone: the Workspace an
+    /// Insights row opened. Only a new range or breakdown lets it go.
+    kept_apart: Option<UsageMetricsKey>,
+    /// The series to show alone once a report holding it lands, where it
+    /// was asked for before one had.
+    alone: Option<SeriesId>,
     /// The row of one of the view's lists the keyboard acts on.
     focused: Option<ListRow>,
     /// When the earliest timed Turn was, as the last report since opening
@@ -359,6 +366,8 @@ impl MetricsView {
         self.refusal = None;
         self.selected = None;
         self.hidden.clear();
+        self.kept_apart = None;
+        self.alone = None;
         self.focused = None;
         self.earliest = EarliestTurn::Unknown;
     }
@@ -444,6 +453,8 @@ impl MetricsView {
         self.refusal = None;
         self.selected = None;
         self.hidden.clear();
+        self.kept_apart = None;
+        self.alone = None;
         self.focused = None;
     }
 
@@ -501,7 +512,9 @@ impl MetricsView {
     /// it holds nothing to draw.
     fn series_ids(&self) -> Vec<SeriesId> {
         match &self.shown {
-            Some((_, _, report)) if !chart::holds_nothing(report) => chart::series_ids(report),
+            Some((_, _, report)) if !chart::holds_nothing(report) => {
+                chart::series_ids(report, self.kept_apart.as_ref())
+            }
             _ => Vec::new(),
         }
     }
@@ -635,6 +648,40 @@ impl MetricsView {
         };
     }
 
+    /// Shows `key`'s series alone, hiding every other, and focuses its row,
+    /// whatever was shown before: the way into a key from outside the
+    /// legend, by which key rather than where its row stands. The key is
+    /// kept apart from Other, as a series of its own in place of the
+    /// smallest key kept, so that a key that would fold away is shown alone
+    /// rather than among the keys folded with it. Before a report holding
+    /// series has landed, the key is shown alone once one does; a report
+    /// without the key shows every series.
+    pub(super) fn show_alone(&mut self, key: UsageMetricsKey) {
+        self.kept_apart = Some(key.clone());
+        self.alone = Some(SeriesId::Key(key));
+        self.show_awaited_alone();
+    }
+
+    /// Shows the series awaiting it alone, once the report shown has series.
+    fn show_awaited_alone(&mut self) {
+        let ids = self.series_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let Some(id) = self.alone.take() else {
+            return;
+        };
+        if ids.contains(&id) {
+            self.hidden = ids.into_iter().filter(|other| *other != id).collect();
+            self.focused = Some(ListRow::Series(id));
+        }
+    }
+
+    /// The key the chart keeps as a series of its own, where one is.
+    pub(super) fn kept_apart(&self) -> Option<&UsageMetricsKey> {
+        self.kept_apart.as_ref()
+    }
+
     /// Whether the chart leaves `series` out of its stacks.
     pub(super) fn is_hidden(&self, series: &SeriesId) -> bool {
         self.hidden.contains(series)
@@ -764,6 +811,7 @@ impl MetricsView {
                 .position(|bucket| bucket.interval.start == start)
                 .filter(|place| *place < selectable)
         });
+        self.show_awaited_alone();
         Receipt::Settled
     }
 

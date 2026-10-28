@@ -29,6 +29,7 @@ pub(super) mod heatmap;
 pub(super) mod tools;
 pub(super) mod turns;
 mod view;
+mod workspaces;
 
 use std::{cell::Cell, collections::HashMap};
 
@@ -36,7 +37,10 @@ use jiff::tz::TimeZone;
 use ratatui::layout::{Position, Rect};
 use uuid::Uuid;
 
-use crate::protocol::{InsightsQuery, InsightsReport, Outlook, SessionTimestamp};
+use crate::protocol::{
+    InsightsQuery, InsightsReport, Outlook, SessionTimestamp, UsageMetricsBreakdown,
+    UsageMetricsKey, UsageMetricsQuery, UsageMetricsReport,
+};
 
 use super::{
     UsageMetricsReadRefusal,
@@ -46,6 +50,7 @@ use heatmap::Heatmap;
 pub(in crate::tui) use tools::ToolsSort;
 
 pub(super) use view::render;
+use workspaces::WorkspaceRow;
 
 /// A panel of the Insights tab.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -67,13 +72,16 @@ pub enum InsightsPanel {
     /// How Cost divides between the user's own Sessions and the work
     /// delegated to Subagents, Sidekicks, and Subsessions.
     Delegation,
+    /// The Workspaces the range's work was done in, ranked by Cost, each
+    /// opening its trend on Overview.
+    Workspaces,
 }
 
 impl InsightsPanel {
     /// Every panel, in the order [`Self::GRID`] places them row by row
     /// across its two columns, which is the order focus moves among them.
-    pub(crate) const ALL: [Self; 7] = {
-        let mut all = [Self::WhenYouWork; 7];
+    pub(crate) const ALL: [Self; 8] = {
+        let mut all = [Self::WhenYouWork; 8];
         let mut placed = 0;
         let mut row = 0;
         while row < Self::GRID.len() {
@@ -102,7 +110,7 @@ impl InsightsPanel {
         [Some(Self::WhenYouWork), Some(Self::Tools)],
         [Some(Self::Turns), Some(Self::Compactions)],
         [Some(Self::Cache), Some(Self::Approvals)],
-        [None, Some(Self::Delegation)],
+        [Some(Self::Workspaces), Some(Self::Delegation)],
     ];
 
     pub(crate) fn place(self) -> usize {
@@ -121,16 +129,18 @@ impl InsightsPanel {
             Self::Cache => "Cache",
             Self::Approvals => "Approvals",
             Self::Delegation => "Delegation (Cost)",
+            Self::Workspaces => "Workspaces by Cost",
         }
     }
 
-    /// How many items `kept` gives the panel for a reader to select among,
-    /// in the order its keys move through them.
-    fn items(self, kept: &KeptReport) -> usize {
+    /// How many items `kept` and `workspaces` give the panel for a reader
+    /// to select among, in the order its keys move through them.
+    fn items(self, kept: &KeptReport, workspaces: &[WorkspaceRow]) -> usize {
         match self {
             Self::WhenYouWork => heatmap::items(&kept.heatmap),
             Self::Turns => turns::items(&kept.report.turns),
             Self::Tools => tools::items(&kept.report.tools),
+            Self::Workspaces => workspaces::items(workspaces),
             Self::Compactions | Self::Cache | Self::Approvals | Self::Delegation => 0,
         }
     }
@@ -140,7 +150,12 @@ impl InsightsPanel {
         match self {
             Self::WhenYouWork => heatmap::HOURS,
             Self::Turns => crate::protocol::TURN_DURATION_BINS,
-            Self::Tools | Self::Compactions | Self::Cache | Self::Approvals | Self::Delegation => 1,
+            Self::Tools
+            | Self::Workspaces
+            | Self::Compactions
+            | Self::Cache
+            | Self::Approvals
+            | Self::Delegation => 1,
         }
     }
 
@@ -155,6 +170,7 @@ impl InsightsPanel {
             | Self::Approvals
             | Self::Delegation => None,
             Self::Tools => Some(tools::SHOWN),
+            Self::Workspaces => Some(workspaces::SHOWN),
         }
     }
 }
@@ -266,6 +282,34 @@ impl InsightsTarget {
     }
 }
 
+/// The reads showing the tab asks for together: its own, and the
+/// one-bucket Usage Metrics read by Workspace over the same interval, which
+/// the Workspaces panel ranks — no read of its own, since the metrics read
+/// already answers it.
+pub(in crate::tui) struct InsightsAsk {
+    pub(in crate::tui) request_id: Uuid,
+    pub(in crate::tui) query: InsightsQuery,
+    pub(in crate::tui) workspaces_request_id: Uuid,
+    pub(in crate::tui) workspaces: UsageMetricsQuery,
+}
+
+/// What the Workspaces panel shows: its rows, which may be none, or what
+/// stands in for them while their read is on its way or where it was
+/// refused.
+pub(super) enum WorkspacesContent<'a> {
+    Reading,
+    Refused(&'a UsageMetricsReadRefusal),
+    Rows(&'a [WorkspaceRow]),
+}
+
+/// The Workspaces of a range kept from the one-bucket read, ranked as
+/// Overview ranks its keys, with the Outlook they were read from.
+#[derive(Clone, Debug)]
+struct KeptWorkspaces {
+    origin: Outlook,
+    rows: Vec<WorkspaceRow>,
+}
+
 /// What the tab shows beneath the range bar.
 pub(super) enum InsightsContent<'a> {
     Reading,
@@ -310,6 +354,13 @@ pub(in crate::tui) struct InsightsView {
     read: HashMap<MetricsRange, KeptReport>,
     /// Why the last read of a range, from an Outlook, gave no report.
     refused: Option<(Outlook, MetricsRange, UsageMetricsReadRefusal)>,
+    /// The one-bucket Workspace read awaited beside the insights read: its
+    /// request, the Outlook it asked, and the range it asked for.
+    asked_workspaces: Option<(Uuid, Outlook, MetricsRange)>,
+    /// The Workspaces last read of each range, kept as its report is.
+    workspaces: HashMap<MetricsRange, KeptWorkspaces>,
+    /// Why the last Workspace read of a range, from an Outlook, gave none.
+    workspaces_refused: Option<(Outlook, MetricsRange, UsageMetricsReadRefusal)>,
     focused: Option<InsightsPanel>,
     /// The item selected within the focused panel, by its place among the
     /// panel's items.
@@ -328,11 +379,29 @@ impl InsightsView {
         self.read.get(&range).filter(|kept| kept.origin == *origin)
     }
 
-    /// Whether `range` lacks a report from `origin` with none on its way, so
-    /// that showing it must read it. A range whose read was refused lacks
-    /// one, so showing it again reads it again.
+    /// The Workspaces kept for `range` from `origin`, where they are.
+    fn workspaces_of(&self, origin: &Outlook, range: MetricsRange) -> Option<&[WorkspaceRow]> {
+        self.workspaces
+            .get(&range)
+            .filter(|kept| kept.origin == *origin)
+            .map(|kept| kept.rows.as_slice())
+    }
+
+    /// Whether the Workspace read of `range` from `origin` is on its way.
+    fn reads_workspaces(&self, origin: &Outlook, range: MetricsRange) -> bool {
+        self.asked_workspaces
+            .as_ref()
+            .is_some_and(|(_, asked_of, asked)| asked_of == origin && *asked == range)
+    }
+
+    /// Whether `range` lacks a report, or its Workspaces, from `origin`
+    /// with neither on its way, so that showing it must read them. A range
+    /// whose read was refused lacks one, so showing it again reads it
+    /// again.
     pub(in crate::tui) fn lacks(&self, origin: &Outlook, range: MetricsRange) -> bool {
-        self.report(origin, range).is_none() && !self.is_reading(origin, range)
+        let lacking =
+            self.report(origin, range).is_none() || self.workspaces_of(origin, range).is_none();
+        lacking && !self.is_reading(origin, range) && !self.reads_workspaces(origin, range)
     }
 
     /// The query `origin` is asked for `range` at `now` in `zone`, which the
@@ -344,7 +413,7 @@ impl InsightsView {
         range: MetricsRange,
         now: SessionTimestamp,
         zone: &TimeZone,
-    ) -> Option<(Uuid, InsightsQuery)> {
+    ) -> Option<InsightsAsk> {
         let Some(interval) = calendar::span(range, now, zone) else {
             self.refuse(
                 origin,
@@ -356,9 +425,22 @@ impl InsightsView {
             return None;
         };
         let request_id = Uuid::new_v4();
-        self.asked = Some((request_id, origin, range, zone.clone()));
+        let workspaces_request_id = Uuid::new_v4();
+        self.asked = Some((request_id, origin.clone(), range, zone.clone()));
+        self.asked_workspaces = Some((workspaces_request_id, origin, range));
         self.refused = None;
-        Some((request_id, InsightsQuery { interval }))
+        self.workspaces_refused = None;
+        Some(InsightsAsk {
+            request_id,
+            query: InsightsQuery { interval },
+            workspaces_request_id,
+            workspaces: UsageMetricsQuery {
+                buckets: vec![interval],
+                breakdown: UsageMetricsBreakdown::Workspace,
+                comparison: None,
+                top_sessions: 0,
+            },
+        })
     }
 
     /// Lets go of every report kept but `range`'s, as a refresh of `range`
@@ -367,6 +449,7 @@ impl InsightsView {
     /// stays until the refresh replaces it.
     pub(in crate::tui) fn forget_all_but(&mut self, range: MetricsRange) {
         self.read.retain(|kept, _| *kept == range);
+        self.workspaces.retain(|kept, _| *kept == range);
     }
 
     /// Takes the Server's answer, unless the tab has since closed or asked
@@ -398,6 +481,36 @@ impl InsightsView {
         }
     }
 
+    /// Whether the tab awaits the Workspace read answering under
+    /// `request_id`, which answers as Overview's reads do.
+    pub(in crate::tui) fn awaits_workspaces(&self, request_id: Uuid) -> bool {
+        self.asked_workspaces
+            .as_ref()
+            .is_some_and(|(asked, _, _)| *asked == request_id)
+    }
+
+    /// Takes the Server's answer to the Workspace read, unless the tab has
+    /// since closed or asked again, keeping its Workspaces ranked under the
+    /// range it was asked for.
+    pub(in crate::tui) fn receive_workspaces(
+        &mut self,
+        request_id: Uuid,
+        result: Result<UsageMetricsReport, UsageMetricsReadRefusal>,
+    ) {
+        if !self.awaits_workspaces(request_id) {
+            return;
+        }
+        let (_, origin, range) = self.asked_workspaces.take().expect("the awaited read");
+        match result {
+            Ok(report) => {
+                let rows = workspaces::rows(&report);
+                self.workspaces
+                    .insert(range, KeptWorkspaces { origin, rows });
+            }
+            Err(refusal) => self.workspaces_refused = Some((origin, range, refusal)),
+        }
+    }
+
     /// Says why `range` has no fresh report from `origin`, giving up any
     /// read awaited. A report already kept for it stays, with the refusal
     /// beside it.
@@ -408,12 +521,14 @@ impl InsightsView {
         refusal: UsageMetricsReadRefusal,
     ) {
         self.asked = None;
+        self.asked_workspaces = None;
         self.refused = Some((origin, range, refusal));
     }
 
-    /// Lets go of the read awaited, as the view closes.
+    /// Lets go of the reads awaited, as the view closes.
     pub(in crate::tui) fn stop_awaiting(&mut self) {
         self.asked = None;
+        self.asked_workspaces = None;
     }
 
     /// Whether a read of `range` from `origin` is on its way.
@@ -432,6 +547,44 @@ impl InsightsView {
             .as_ref()
             .filter(|(refused_by, refused, _)| refused_by == origin && *refused == range)
             .map(|(_, _, refusal)| refusal)
+    }
+
+    /// What the Workspaces panel shows for `range`, read from `origin`.
+    pub(super) fn workspaces_content(
+        &self,
+        origin: &Outlook,
+        range: MetricsRange,
+    ) -> WorkspacesContent<'_> {
+        let refusal = self
+            .workspaces_refused
+            .as_ref()
+            .filter(|(refused_by, refused, _)| refused_by == origin && *refused == range)
+            .map(|(_, _, refusal)| refusal);
+        match (self.workspaces_of(origin, range), refusal) {
+            (Some(rows), _) => WorkspacesContent::Rows(rows),
+            (None, Some(refusal)) => WorkspacesContent::Refused(refusal),
+            (None, None) => WorkspacesContent::Reading,
+        }
+    }
+
+    /// The key of the `item`-th Workspace the Workspaces panel ranks for
+    /// `range` from `origin`, where it ranks that many.
+    pub(in crate::tui) fn workspace(
+        &self,
+        origin: &Outlook,
+        range: MetricsRange,
+        item: usize,
+    ) -> Option<UsageMetricsKey> {
+        let row = self.workspaces_of(origin, range)?.get(item)?;
+        Some(row.key.clone())
+    }
+
+    /// How many items `panel` offers for selection in what is shown for
+    /// `range` from `origin`: none before its report lands.
+    fn items(&self, origin: &Outlook, range: MetricsRange, panel: InsightsPanel) -> usize {
+        let workspaces = self.workspaces_of(origin, range).unwrap_or_default();
+        self.report(origin, range)
+            .map_or(0, |kept| panel.items(kept, workspaces))
     }
 
     /// What the tab shows for `range`, read from `origin`.
@@ -528,10 +681,10 @@ impl InsightsView {
         panel: InsightsPanel,
         to: RowScroll,
     ) {
-        let (Some(room), Some(kept)) = (panel.room(), self.report(origin, range)) else {
+        let Some(room) = panel.room() else {
             return;
         };
-        let rows = panel.items(kept).div_ceil(panel.across());
+        let rows = self.items(origin, range, panel).div_ceil(panel.across());
         let scrolled = self.scrolled(panel);
         let window = RowWindow::new(rows, room, scrolled);
         self.scrolled[panel.place()] = match to {
@@ -568,10 +721,7 @@ impl InsightsView {
         let Some(panel) = self.focused else {
             return;
         };
-        let Some(last) = self
-            .report(origin, range)
-            .and_then(|kept| panel.items(kept).checked_sub(1))
-        else {
+        let Some(last) = self.items(origin, range, panel).checked_sub(1) else {
             return;
         };
         let across = panel.across();
@@ -598,9 +748,7 @@ impl InsightsView {
         panel: InsightsPanel,
         item: usize,
     ) {
-        let items = self
-            .report(origin, range)
-            .map_or(0, |kept| panel.items(kept));
+        let items = self.items(origin, range, panel);
         if item < items {
             self.focus(panel);
             self.selected = Some(item);
@@ -674,14 +822,15 @@ mod tests {
     fn a_report_shows_only_for_the_outlook_it_was_read_from() {
         let mut view = InsightsView::default();
         let range = MetricsRange::ThirtyDays;
-        let (request_id, _) = view
+        let request_id = view
             .ask(
                 Outlook::Local,
                 range,
                 SessionTimestamp(1_800_000_000_000),
                 &jiff::tz::TimeZone::UTC,
             )
-            .expect("a placeable moment");
+            .expect("a placeable moment")
+            .request_id;
         view.receive(request_id, Ok(InsightsReport::default()));
         let studio = Outlook::Remote("studio".to_owned());
 

@@ -79,7 +79,7 @@ use super::{
         Receipt as MetricsReceipt, UsageMetricsReadRefusal,
         calendar::MetricsRange,
         chart::MetricsMeasure,
-        insights::{InsightsView, ItemMove, PanelMove, RowScroll},
+        insights::{InsightsPanel, InsightsView, ItemMove, PanelMove, RowScroll},
     },
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
@@ -5718,11 +5718,17 @@ pub enum ApplicationTransition {
         query: crate::protocol::UsageMetricsQuery,
     },
     /// Ask the Server `origin` names for its Insights, answering with
-    /// [`ApplicationEvent::UsageInsightsRead`] under the same request.
+    /// [`ApplicationEvent::UsageInsightsRead`] under the same request, and
+    /// beside them for its Usage Metrics in one bucket over the same
+    /// interval by Workspace, which the Workspaces panel ranks, answering
+    /// with [`ApplicationEvent::UsageMetricsRead`] under
+    /// `workspaces_request_id`.
     ReadUsageInsights {
         origin: Outlook,
         request_id: uuid::Uuid,
         query: crate::protocol::InsightsQuery,
+        workspaces_request_id: uuid::Uuid,
+        workspaces: crate::protocol::UsageMetricsQuery,
     },
     SubscribeSession(SessionReference),
     /// Report a root Session as Viewed without changing the main-view route.
@@ -6263,6 +6269,21 @@ impl Application {
             }
             ApplicationEvent::ContextBreakdownRead { request_id, result } => {
                 self.state.context_overlay.receive(request_id, result);
+                Ok(ApplicationTransition::Continue)
+            }
+            // The Insights tab's Workspace read answers as Overview's reads
+            // do, told apart by its request.
+            ApplicationEvent::UsageMetricsRead { request_id, result }
+                if self
+                    .state
+                    .metrics_view
+                    .insights()
+                    .awaits_workspaces(request_id) =>
+            {
+                self.state
+                    .metrics_view
+                    .insights_mut()
+                    .receive_workspaces(request_id, result);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::UsageMetricsRead { request_id, result } => {
@@ -9674,13 +9695,36 @@ impl Application {
         let range = self.state.metrics_view.range();
         let insights = self.state.metrics_view.insights_mut();
         match insights.ask(origin.clone(), range, now, &zone) {
-            Some((request_id, query)) => ApplicationTransition::ReadUsageInsights {
+            Some(asked) => ApplicationTransition::ReadUsageInsights {
                 origin,
-                request_id,
-                query,
+                request_id: asked.request_id,
+                query: asked.query,
+                workspaces_request_id: asked.workspaces_request_id,
+                workspaces: asked.workspaces,
             },
             None => ApplicationTransition::Continue,
         }
+    }
+
+    /// Opens the `item`-th Workspace the open Usage Metrics view's
+    /// Workspaces panel ranks on Overview, split by Workspace and showing
+    /// it alone, as its trend over the range: Overview reads the Workspace
+    /// breakdown where it shows another, and shows the Workspace alone once
+    /// that lands.
+    fn open_metrics_workspace(&mut self, item: usize) -> ApplicationTransition {
+        let view = &mut self.state.metrics_view;
+        let range = view.range();
+        let Some(key) = view
+            .is_open()
+            .then(|| view.insights().workspace(&self.state.outlook, range, item))
+            .flatten()
+        else {
+            return ApplicationTransition::Continue;
+        };
+        view.choose_tab(MetricsTab::Overview);
+        view.choose_breakdown(UsageMetricsBreakdown::Workspace);
+        view.show_alone(key);
+        self.read_metrics_tab_lacking()
     }
 
     /// Acts on the open Usage Metrics view's Insights, which reads nothing:
@@ -11779,6 +11823,16 @@ impl Application {
                 .act_on_metrics_insights(|insights, origin, range| {
                     insights.select_item(origin, range, panel, item)
                 })),
+            SemanticCommandId::MetricsPanelItemOpen { panel, item } => match panel {
+                InsightsPanel::Workspaces => Ok(self.open_metrics_workspace(item)),
+                InsightsPanel::WhenYouWork
+                | InsightsPanel::Turns
+                | InsightsPanel::Tools
+                | InsightsPanel::Compactions
+                | InsightsPanel::Cache
+                | InsightsPanel::Approvals
+                | InsightsPanel::Delegation => Ok(ApplicationTransition::Continue),
+            },
             SemanticCommandId::MetricsPanelScrollUp { panel } => {
                 Ok(self.act_on_metrics_insights(|insights, origin, range| {
                     insights.scroll(origin, range, panel, RowScroll::Up)
@@ -12936,7 +12990,7 @@ impl Application {
                         bucket_selected: view.selected_bucket().is_some(),
                         focused_row: view.focused_row(),
                         panel: view.insights().focused(),
-                        panel_selected: view.insights().selected_item().is_some(),
+                        panel_item: view.insights().selected_item(),
                     };
                     return command_for_metrics_view_event(event, keys, |position| {
                         view.target_at(position)

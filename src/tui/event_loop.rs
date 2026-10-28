@@ -1382,11 +1382,19 @@ impl RunLoop {
                 origin,
                 request_id,
                 query,
+                workspaces_request_id,
+                workspaces,
             } => {
                 spawn_usage_insights_read(
-                    self.client.session_commands_for(origin),
+                    self.client.session_commands_for(origin.clone()),
                     query,
                     request_id,
+                    self.channels.usage_metrics.clone(),
+                );
+                spawn_usage_metrics_read(
+                    self.client.session_commands_for(origin),
+                    workspaces,
+                    workspaces_request_id,
                     self.channels.usage_metrics.clone(),
                 );
             }

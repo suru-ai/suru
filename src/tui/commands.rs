@@ -219,6 +219,14 @@ pub enum SemanticCommandId {
         panel: InsightsPanel,
         item: usize,
     },
+    /// Opens one of an Insights panel's items by its place among them,
+    /// counted from the first: a Workspaces row opens Overview by Workspace
+    /// showing that Workspace alone. A panel whose items open nothing does
+    /// nothing.
+    MetricsPanelItemOpen {
+        panel: InsightsPanel,
+        item: usize,
+    },
     /// Scrolls an Insights panel's rows a row back toward its first,
     /// whether or not it is focused.
     MetricsPanelScrollUp {
@@ -827,6 +835,7 @@ impl SemanticCommandId {
                 InsightsPanel::Cache => "metrics.panel.cache",
                 InsightsPanel::Approvals => "metrics.panel.approvals",
                 InsightsPanel::Delegation => "metrics.panel.delegation",
+                InsightsPanel::Workspaces => "metrics.panel.workspaces",
             },
             Self::MetricsPanelFocusNext => "metrics.panel.next",
             Self::MetricsPanelFocusPrevious => "metrics.panel.previous",
@@ -837,6 +846,7 @@ impl SemanticCommandId {
             Self::MetricsPanelItemUp => "metrics.panel.item.up",
             Self::MetricsPanelItemDown => "metrics.panel.item.down",
             Self::MetricsPanelItemSelect { .. } => "metrics.panel.item.select",
+            Self::MetricsPanelItemOpen { .. } => "metrics.panel.item.open",
             Self::MetricsPanelScrollUp { .. } => "metrics.panel.scroll.up",
             Self::MetricsPanelScrollDown { .. } => "metrics.panel.scroll.down",
             Self::MetricsToolsSortToggle => "metrics.tools.sort",
@@ -2184,6 +2194,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     metrics_panel_descriptor(InsightsPanel::Cache, "Focus Cache Insights"),
     metrics_panel_descriptor(InsightsPanel::Approvals, "Focus Approvals Insights"),
     metrics_panel_descriptor(InsightsPanel::Delegation, "Focus Delegation Insights"),
+    metrics_panel_descriptor(InsightsPanel::Workspaces, "Focus Workspaces Insights"),
     SemanticCommandDescriptor {
         id: SemanticCommandId::MetricsPanelFocusNext,
         title: "Next Insights Panel",
@@ -2260,6 +2271,21 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Select Insights Item",
         reach: SemanticReach::Client,
         description: "Select one of an Insights panel's items by its place",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        // The panel and the item's place are invocation data, as for a
+        // selection. Opening a Workspace reaches the Client: what it reads
+        // is Overview's read, refused in the view where the Origin has
+        // stopped answering.
+        id: SemanticCommandId::MetricsPanelItemOpen {
+            panel: InsightsPanel::Workspaces,
+            item: 0,
+        },
+        title: "Open Insights Item",
+        reach: SemanticReach::Client,
+        description: "Open one of an Insights panel's items by its place: a Workspace's trend on Overview",
         slash: None,
         keybinding: None,
     },
@@ -3597,6 +3623,9 @@ pub(super) fn descriptor(id: SemanticCommandId) -> &'static SemanticCommandDescr
                     ) | (
                         SemanticCommandId::MetricsPanelItemSelect { .. },
                         SemanticCommandId::MetricsPanelItemSelect { .. }
+                    ) | (
+                        SemanticCommandId::MetricsPanelItemOpen { .. },
+                        SemanticCommandId::MetricsPanelItemOpen { .. }
                     ) | (
                         SemanticCommandId::MetricsPanelScrollUp { .. },
                         SemanticCommandId::MetricsPanelScrollUp { .. }
