@@ -872,14 +872,17 @@ async fn a_session_counts_in_every_bucket_it_worked_in_and_once_across_them_all(
         vec![(1, 1), (1, 0), (1, 1)]
     );
     assert_eq!(
-        sessions(&report.range.total),
+        sessions(&report.across_buckets.total),
         (2, 1),
         "across the buckets each Session counts once, though the buckets add to five"
     );
-    assert_eq!(sessions(&keyed(&report.range, &key(OPUS))), (2, 0));
-    assert_eq!(sessions(&keyed(&report.range, &key(CODEX))), (1, 1));
+    assert_eq!(sessions(&keyed(&report.across_buckets, &key(OPUS))), (2, 0));
     assert_eq!(
-        report.range.total.output_tokens,
+        sessions(&keyed(&report.across_buckets, &key(CODEX))),
+        (1, 1)
+    );
+    assert_eq!(
+        report.across_buckets.total.output_tokens,
         Some(6),
         "the range holds what its buckets do, and no more"
     );
@@ -904,11 +907,14 @@ async fn the_range_holds_the_cost_its_buckets_add_up_to() {
 
     let report = read(&store, &by_model(&[(10, 20), (20, 30)]));
 
-    assert_eq!(cost(&report.range.total), (usd(0.25), true, None));
+    assert_eq!(cost(&report.across_buckets.total), (usd(0.25), true, None));
     assert_eq!(
-        cost(&keyed(&report.range, &key(OPUS))),
+        cost(&keyed(&report.across_buckets, &key(OPUS))),
         (usd(0.25), false, None)
     );
-    assert_eq!(cost(&keyed(&report.range, &key(CODEX))), (None, true, None));
+    assert_eq!(
+        cost(&keyed(&report.across_buckets, &key(CODEX))),
+        (None, true, None)
+    );
     writer.shutdown().await.unwrap();
 }

@@ -76,6 +76,11 @@ pub struct UsageMetricsKeyLabel {
 pub struct UsageMetricsReport {
     /// One for each bucket asked for, in the order asked.
     pub buckets: Vec<UsageMetricsBucket>,
+    /// The buckets taken together, as though they were one: what a reader
+    /// shows for the whole span it asked about. Its Session counts count a
+    /// Session once however many buckets it has work in, which adding up
+    /// the buckets' counts cannot.
+    pub across_buckets: UsageMetricsBucket,
     /// The Turns no bucket can place, having neither begun nor Settled at a
     /// recorded moment: Turns stored before Suru recorded Turn timing.
     pub untimed: UsageMetricsBucket,
@@ -85,11 +90,6 @@ pub struct UsageMetricsReport {
     pub earliest_turn_at: Option<SessionTimestamp>,
     /// Every key a bucket breaks its figures down by, each with its label.
     pub keys: Vec<UsageMetricsKeyLabel>,
-    /// The buckets taken together, as though they were one: what a reader
-    /// shows for the whole span it asked about. Its Session counts count a
-    /// Session once however many buckets it has work in, which adding up
-    /// the buckets' counts cannot.
-    pub range: UsageMetricsBucket,
 }
 
 /// The figures of one bucket: its whole, and its part under each key a Turn

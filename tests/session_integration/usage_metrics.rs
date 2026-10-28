@@ -108,7 +108,7 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
     );
     assert_eq!(report.earliest_turn_at, Some(started_at));
     assert_eq!(
-        report.range.total, measured,
+        report.across_buckets.total, measured,
         "the buckets taken together hold the one Session's Turn"
     );
 

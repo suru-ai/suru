@@ -166,7 +166,7 @@ fn report(query: &UsageMetricsQuery) -> UsageMetricsReport {
                 label: "Claude Opus 5.5".to_owned(),
             },
         ],
-        range: UsageMetricsBucket {
+        across_buckets: UsageMetricsBucket {
             total: UsageMetricsAggregate {
                 sessions: 15,
                 ..UsageMetricsAggregate::default()
@@ -187,9 +187,9 @@ fn report(query: &UsageMetricsQuery) -> UsageMetricsReport {
     report
 }
 
-/// Sets `report`'s range to its buckets taken together, as the Server does,
+/// Sets `report`'s figures across its buckets to them taken together, as the Server does,
 /// in the figures that add up across buckets: Usage and Cost. Session counts
-/// do not, so the range keeps those it was given.
+/// do not, so it keeps those it was given.
 fn take_together(report: &mut UsageMetricsReport) {
     fn add(into: &mut UsageMetricsAggregate, part: &UsageMetricsAggregate) {
         let count = |held: Option<u64>, more: Option<u64>| match (held, more) {
@@ -214,14 +214,14 @@ fn take_together(report: &mut UsageMetricsReport) {
         subagent_sessions: aggregate.subagent_sessions,
         ..UsageMetricsAggregate::default()
     };
-    let mut total = counted(&report.range.total);
+    let mut total = counted(&report.across_buckets.total);
     let mut by_key: Vec<KeyedUsageMetrics> = report
         .keys
         .iter()
         .map(|label| KeyedUsageMetrics {
             key: label.key.clone(),
             aggregate: report
-                .range
+                .across_buckets
                 .by_key
                 .iter()
                 .find(|keyed| keyed.key == label.key)
@@ -237,7 +237,7 @@ fn take_together(report: &mut UsageMetricsReport) {
             }
         }
     }
-    report.range = UsageMetricsBucket { total, by_key };
+    report.across_buckets = UsageMetricsBucket { total, by_key };
 }
 
 /// Shows the Tokens measure, which reads nothing again.
@@ -496,7 +496,7 @@ fn a_range_without_usage_says_so() {
             untimed: UsageMetricsBucket::default(),
             earliest_turn_at: None,
             keys: Vec::new(),
-            range: UsageMetricsBucket::default(),
+            across_buckets: UsageMetricsBucket::default(),
         }),
     );
 
@@ -890,7 +890,7 @@ fn empty_report(
         untimed: UsageMetricsBucket::default(),
         earliest_turn_at: earliest,
         keys: Vec::new(),
-        range: UsageMetricsBucket::default(),
+        across_buckets: UsageMetricsBucket::default(),
     }
 }
 
@@ -1675,7 +1675,7 @@ fn sessions_that_each_used_one_model_carry_no_note() {
     let (_, request_id, query) = ask(&mut application);
     let mut report = report(&query);
     // Every Session used one Model alone: the Models add up to the total.
-    report.range.total.sessions = 19;
+    report.across_buckets.total.sessions = 19;
     answer(&mut application, request_id, Ok(report));
     press(&mut application, 's');
 
@@ -1706,7 +1706,7 @@ fn one_session_is_named_in_the_singular() {
         }],
     };
     report.buckets[29] = worked.clone();
-    report.range = worked;
+    report.across_buckets = worked;
     answer(&mut application, request_id, Ok(report));
     press(&mut application, 's');
 

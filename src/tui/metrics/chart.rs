@@ -137,8 +137,8 @@ pub(crate) struct Series {
 /// bottom and the rest above it in falling order, ties settled by label so
 /// the order never shifts between reads of the same figures. Each takes the
 /// colour of its place from the Theme's series palette, and its total from
-/// the report's range, where a Session counts once however many buckets it
-/// worked in.
+/// the report's figures across its buckets, where a Session counts once
+/// however many buckets it worked in.
 pub(crate) fn series(
     report: &UsageMetricsReport,
     measure: MetricsMeasure,
@@ -156,7 +156,7 @@ pub(crate) fn series(
                     .map(|keyed| keyed.aggregate)
                     .unwrap_or_default()
             };
-            let whole = part(&report.range);
+            let whole = part(&report.across_buckets);
             Series {
                 label: label.label.clone(),
                 color: Color::Reset,

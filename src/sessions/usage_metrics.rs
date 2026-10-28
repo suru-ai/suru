@@ -320,10 +320,7 @@ impl Tally {
 
     fn add_cost(&mut self, key: &UsageMetricsKey, contribution: &CostContribution) {
         add_contribution(&mut self.total.aggregate, contribution);
-        let keyed = match self.by_key.get_mut(key) {
-            Some(keyed) => keyed,
-            None => self.by_key.entry(key.clone()).or_default(),
-        };
+        let keyed = self.by_key.entry(key.clone()).or_default();
         add_contribution(&mut keyed.aggregate, contribution);
     }
 
@@ -364,7 +361,7 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, catalog: &ModelCatalog) -> 
         .collect::<Vec<_>>();
     let mut untimed = Tally::default();
     // Every bucket at once, where a Session working in several counts once.
-    let mut range = Tally::default();
+    let mut across_buckets = Tally::default();
     // The bucket a moment falls in, if any: the buckets run in order without
     // overlapping, so the one that can hold it is the first not over before it.
     let bucket_of = |placed_at: SessionTimestamp| {
@@ -390,7 +387,7 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, catalog: &ModelCatalog) -> 
         earliest_turn_at = Some(earliest_turn_at.map_or(placed_at, |held| held.min(placed_at)));
         if let Some(Some(index)) = place {
             buckets[index].add(&turn);
-            range.add(&turn);
+            across_buckets.add(&turn);
         }
     }
     for contribution in &metered.costs {
@@ -404,7 +401,7 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, catalog: &ModelCatalog) -> 
             None => untimed.add_cost(&key, contribution),
             Some(Some(index)) => {
                 buckets[index].add_cost(&key, contribution);
-                range.add_cost(&key, contribution);
+                across_buckets.add_cost(&key, contribution);
             }
             Some(None) => {}
         }
@@ -424,7 +421,7 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, catalog: &ModelCatalog) -> 
             .map(|tally| tally.into_bucket(&keys))
             .collect(),
         untimed: untimed.into_bucket(&keys),
-        range: range.into_bucket(&keys),
+        across_buckets: across_buckets.into_bucket(&keys),
         earliest_turn_at,
         keys: keys
             .into_iter()

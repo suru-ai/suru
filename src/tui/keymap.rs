@@ -279,8 +279,8 @@ pub(super) fn command_for_context_overlay_event(event: InputEvent) -> Option<Com
 /// The Usage Metrics view owns every key and click while it is open, since
 /// it covers the whole frame: Esc or a click on its ✕ closes it, `r` reads it
 /// again, `1`–`5` or a click in the range bar choose a range, `[`/`]` or the
-/// wheel over the chart step to the range before or after, `c`/`t` or a click
-/// on a measure choose what the chart plots and Tab the next, and Ctrl+C leaves
+/// wheel over the chart step to the range before or after, `c`/`t`/`s` or a
+/// click on a measure choose what the chart plots and Tab the next, and Ctrl+C leaves
 /// Suru, as it does from a composer with nothing in it — the view holds
 /// nothing a press could clear, and a draft it covers is the reader's to come
 /// back to.

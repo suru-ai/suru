@@ -126,7 +126,7 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 return;
             }
             let series = chart::series(report, measure, theme);
-            let whole = &report.range.total;
+            let whole = &report.across_buckets.total;
             let noted = overcounts(&series, measure, whole);
             let legend_rows =
                 u16::try_from(series.len() + 1 + usize::from(noted)).unwrap_or(u16::MAX);
