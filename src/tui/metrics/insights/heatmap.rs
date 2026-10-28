@@ -198,6 +198,7 @@ pub(super) fn render(
         InsightsPanel::WhenYouWork,
         Rect::new(grid_x, area.y + 1, width * hours, DAYS as u16),
         width,
+        0,
     );
     let y = area.y + 1 + DAYS as u16;
     match selected {

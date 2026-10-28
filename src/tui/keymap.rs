@@ -470,7 +470,8 @@ fn command_for_overview_pointer(
 }
 
 /// Insights' own keys: Tab and Shift+Tab move focus among its panels, the
-/// last turning round to the first, as a click on a panel focuses it; Esc
+/// last turning round to the first, as a click on a panel focuses it; `f`
+/// sorts the Tools panel by failures, or by uses again; Esc
 /// clears what the focused panel has selected, then leaves the panel, and
 /// with neither left closes the view; every other key is the focused
 /// panel's, as [`command_for_insights_panel_key`] gives it.
@@ -484,6 +485,9 @@ fn command_for_insights_key(key: KeyEvent, keys: MetricsKeys) -> Option<Semantic
         }
         (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::MetricsClose,
         (KeyCode::Tab, KeyModifiers::NONE) => SemanticCommandId::MetricsPanelFocusNext,
+        // The one panel that sorts is the Tools panel, so `f` sorts it
+        // whichever panel is focused, or none.
+        (KeyCode::Char('f'), KeyModifiers::NONE) => SemanticCommandId::MetricsToolsSortToggle,
         // Terminals send Shift+Tab as BackTab, with Shift or without.
         (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
             SemanticCommandId::MetricsPanelFocusPrevious
@@ -494,7 +498,8 @@ fn command_for_insights_key(key: KeyEvent, keys: MetricsKeys) -> Option<Semantic
 
 /// A key the focused Insights panel acts on: the keys that move along its
 /// items the way they stand — on Turns, ←/→ along its sparkline's bins; on
-/// When you work, ←/→ an hour along the week and ↑/↓ a day, the same hour.
+/// When you work, ←/→ an hour along the week and ↑/↓ a day, the same hour;
+/// on Tools, ↑/↓ a row, scrolling past either end of those in view.
 fn command_for_insights_panel_key(
     panel: InsightsPanel,
     key: KeyEvent,
@@ -506,10 +511,10 @@ fn command_for_insights_panel_key(
         (InsightsPanel::Turns | InsightsPanel::WhenYouWork, KeyCode::Right, KeyModifiers::NONE) => {
             Some(SemanticCommandId::MetricsPanelItemNext)
         }
-        (InsightsPanel::WhenYouWork, KeyCode::Up, KeyModifiers::NONE) => {
+        (InsightsPanel::WhenYouWork | InsightsPanel::Tools, KeyCode::Up, KeyModifiers::NONE) => {
             Some(SemanticCommandId::MetricsPanelItemUp)
         }
-        (InsightsPanel::WhenYouWork, KeyCode::Down, KeyModifiers::NONE) => {
+        (InsightsPanel::WhenYouWork | InsightsPanel::Tools, KeyCode::Down, KeyModifiers::NONE) => {
             Some(SemanticCommandId::MetricsPanelItemDown)
         }
         _ => None,
@@ -539,16 +544,23 @@ fn command_for_insights_pointer(
 }
 
 /// What the wheel does over an Insights panel, whether up or down by
-/// `_kind`: the seam a panel whose rows run past its border scrolls them
-/// through, as the Tools panel will. Over Turns and When you work, whose
-/// figures all stand in view, nothing; and never a step of the range, which
-/// the wheel over Overview's chart takes.
+/// `kind`: over the Tools panel, whose rows run past its border, it scrolls
+/// them a row; over Turns and When you work, whose figures all stand in
+/// view, nothing; and never a step of the range, which the wheel over
+/// Overview's chart takes.
 fn command_for_insights_panel_wheel(
     panel: InsightsPanel,
-    _kind: MouseEventKind,
+    kind: MouseEventKind,
 ) -> Option<SemanticCommandId> {
-    match panel {
-        InsightsPanel::WhenYouWork | InsightsPanel::Turns => None,
+    match (panel, kind) {
+        (InsightsPanel::WhenYouWork | InsightsPanel::Turns, _) => None,
+        (InsightsPanel::Tools, MouseEventKind::ScrollUp) => {
+            Some(SemanticCommandId::MetricsPanelScrollUp { panel })
+        }
+        (InsightsPanel::Tools, MouseEventKind::ScrollDown) => {
+            Some(SemanticCommandId::MetricsPanelScrollDown { panel })
+        }
+        (InsightsPanel::Tools, _) => None,
     }
 }
 

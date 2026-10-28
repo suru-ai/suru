@@ -14,7 +14,7 @@ use crate::theme::Theme;
 
 use super::{
     super::{UsageMetricsReadRefusal, calendar::MetricsRange},
-    InsightsContent, InsightsPanel, InsightsView, KeptReport, heatmap, turns,
+    InsightsContent, InsightsPanel, InsightsView, KeptReport, heatmap, tools, turns,
 };
 use crate::{protocol::Outlook, tui::slots::truncate_to_width};
 
@@ -86,6 +86,7 @@ fn height(panel: InsightsPanel) -> u16 {
     let rows = match panel {
         InsightsPanel::WhenYouWork => heatmap::ROWS,
         InsightsPanel::Turns => turns::ROWS,
+        InsightsPanel::Tools => tools::ROWS,
     };
     rows + 2
 }
@@ -135,6 +136,17 @@ fn render_panel(
                 buffer,
                 inner,
                 &kept.report.turns,
+                range,
+                selected,
+                view,
+                theme,
+            );
+        }
+        InsightsPanel::Tools => {
+            tools::render(
+                buffer,
+                inner,
+                &kept.report.tools,
                 range,
                 selected,
                 view,

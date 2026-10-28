@@ -13,10 +13,16 @@
 //! focused panel holds a selection, so Esc clears that, then leaves the
 //! panel, then closes the view.
 //!
+//! A panel with more rows than it has room for shows those it can, a
+//! [`RowWindow`] onto them, and folds the rest into a last "(N more)" row:
+//! the wheel scrolls it, and a selection moving past either end of the
+//! window scrolls it along.
+//!
 //! A report is kept with its quarter-hours folded into the week of the zone
 //! its range was cut in, once as it arrives rather than at every frame.
 
 pub(super) mod heatmap;
+pub(super) mod tools;
 pub(super) mod turns;
 mod view;
 
@@ -33,6 +39,7 @@ use super::{
     calendar::{self, MetricsRange},
 };
 use heatmap::Heatmap;
+pub(in crate::tui) use tools::ToolsSort;
 
 pub(super) use view::render;
 
@@ -43,12 +50,14 @@ pub enum InsightsPanel {
     WhenYouWork,
     /// How long Turns took to Settle, and how they ended.
     Turns,
+    /// How often each Tool was used, and how many of those uses failed.
+    Tools,
 }
 
 impl InsightsPanel {
     /// Every panel, in the order the grid lays them out, row by row across
     /// its two columns, and focus moves among them.
-    pub(crate) const ALL: [Self; 2] = [Self::WhenYouWork, Self::Turns];
+    pub(crate) const ALL: [Self; 3] = [Self::WhenYouWork, Self::Turns, Self::Tools];
 
     pub(crate) fn place(self) -> usize {
         Self::ALL
@@ -61,6 +70,7 @@ impl InsightsPanel {
         match self {
             Self::WhenYouWork => "When you work (Turns by hour)",
             Self::Turns => "Turns",
+            Self::Tools => "Tools used",
         }
     }
 
@@ -70,6 +80,7 @@ impl InsightsPanel {
         match self {
             Self::WhenYouWork => heatmap::items(&kept.heatmap),
             Self::Turns => turns::items(&kept.report.turns),
+            Self::Tools => tools::items(&kept.report.tools),
         }
     }
 
@@ -78,8 +89,84 @@ impl InsightsPanel {
         match self {
             Self::WhenYouWork => heatmap::HOURS,
             Self::Turns => crate::protocol::TURN_DURATION_BINS,
+            Self::Tools => 1,
         }
     }
+
+    /// How many lines the panel has for its rows of items, where it may
+    /// have more than fit, so that it scrolls; none where all stand in view.
+    fn room(self) -> Option<usize> {
+        match self {
+            Self::WhenYouWork | Self::Turns => None,
+            Self::Tools => Some(tools::SHOWN),
+        }
+    }
+}
+
+/// Which of a panel's rows stand in view, of more than its lines can hold:
+/// those from `first` on, and where any lie past them, a last line folding
+/// those away as "(N more)". Scrolled to the end, the last rows fill every
+/// line, with nothing left to fold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RowWindow {
+    pub(super) first: usize,
+    pub(super) shown: usize,
+    pub(super) folded: usize,
+}
+
+impl RowWindow {
+    /// The window onto `total` rows in `room` lines, scrolled `offset`
+    /// rows down, and no further than the last rows fill the lines.
+    pub(super) fn new(total: usize, room: usize, offset: usize) -> Self {
+        if total <= room {
+            return Self {
+                first: 0,
+                shown: total,
+                folded: 0,
+            };
+        }
+        let first = offset.min(total - room);
+        if first == total - room {
+            return Self {
+                first,
+                shown: room,
+                folded: 0,
+            };
+        }
+        let shown = room.saturating_sub(1);
+        Self {
+            first,
+            shown,
+            folded: total - first - shown,
+        }
+    }
+
+    /// How far down the window onto `total` rows in `room` lines,
+    /// scrolled `offset` rows down, is scrolled once it shows the row
+    /// `row`: as far as it was where it shows it already, and otherwise
+    /// only as far as brings it into view.
+    fn showing(total: usize, room: usize, offset: usize, row: usize) -> usize {
+        let window = Self::new(total, room, offset);
+        if row < window.first {
+            row
+        } else if row >= window.first + window.shown {
+            // The row stands last above the fold, or last of all.
+            (row + 2)
+                .saturating_sub(room)
+                .min(total.saturating_sub(room))
+        } else {
+            window.first
+        }
+    }
+}
+
+/// Which way a panel's rows scroll.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::tui) enum RowScroll {
+    /// A row back toward the first.
+    Up,
+    /// A row on toward the last.
+    Down,
 }
 
 /// Where a selection within a panel moves to.
@@ -145,12 +232,13 @@ struct Targets {
     /// Each panel's place in the grid, borders included, in
     /// [`InsightsPanel::ALL`] order.
     panels: [Option<Rect>; InsightsPanel::ALL.len()],
-    /// Where each panel drew the items a reader selects among, and how many
-    /// columns each takes, in the same order. They stand in rows a line
-    /// apiece, as many to a row as [`InsightsPanel::across`] says: the
-    /// Turns panel's bins a column apiece in one row, the heatmap's hours
-    /// two apiece in a row for each day.
-    items: [Option<(Rect, u16)>; InsightsPanel::ALL.len()],
+    /// Where each panel drew the items a reader selects among, how many
+    /// columns each takes, and the place of the first it drew, in the same
+    /// order. They stand in rows a line apiece, as many to a row as
+    /// [`InsightsPanel::across`] says: the Turns panel's bins a column
+    /// apiece in one row, the heatmap's hours two apiece in a row for each
+    /// day, and the Tools panel's Tools a row apiece from the first in view.
+    items: [Option<(Rect, u16, usize)>; InsightsPanel::ALL.len()],
 }
 
 /// The tab's state: the reports it read, kept by range, and the panel the
@@ -170,6 +258,11 @@ pub(in crate::tui) struct InsightsView {
     /// The item selected within the focused panel, by its place among the
     /// panel's items.
     selected: Option<usize>,
+    /// How many rows down each panel is scrolled, in
+    /// [`InsightsPanel::ALL`] order: always none for a panel whose rows all
+    /// stand in view.
+    scrolled: [usize; InsightsPanel::ALL.len()],
+    tools_sort: ToolsSort,
     targets: Cell<Targets>,
 }
 
@@ -343,6 +436,69 @@ impl InsightsView {
         self.selected = None;
     }
 
+    /// Lets go of what the view showed of the range before: the item
+    /// selected and how far each panel was scrolled stand for its figures.
+    pub(in crate::tui) fn leave_range(&mut self) {
+        self.selected = None;
+        self.scrolled = Default::default();
+    }
+
+    /// How far down `panel`'s rows are scrolled.
+    fn scrolled(&self, panel: InsightsPanel) -> usize {
+        self.scrolled[panel.place()]
+    }
+
+    pub(in crate::tui) fn tools_sort(&self) -> ToolsSort {
+        self.tools_sort
+    }
+
+    /// Sorts the Tools panel the other way, scrolled back to its first row
+    /// and letting go of a Tool selected, whose place the order changes.
+    pub(in crate::tui) fn toggle_tools_sort(&mut self) {
+        self.tools_sort = self.tools_sort.toggled();
+        self.scrolled[InsightsPanel::Tools.place()] = 0;
+        if self.focused == Some(InsightsPanel::Tools) {
+            self.selected = None;
+        }
+    }
+
+    /// Scrolls `panel`'s rows in the report shown for `range` from `origin`
+    /// a row `to`, stopping at either end, whether or not it is focused. A
+    /// panel whose rows all stand in view does not scroll.
+    pub(in crate::tui) fn scroll(
+        &mut self,
+        origin: &Outlook,
+        range: MetricsRange,
+        panel: InsightsPanel,
+        to: RowScroll,
+    ) {
+        let (Some(room), Some(kept)) = (panel.room(), self.report(origin, range)) else {
+            return;
+        };
+        let rows = panel.items(kept).div_ceil(panel.across());
+        let scrolled = self.scrolled(panel);
+        let window = RowWindow::new(rows, room, scrolled);
+        self.scrolled[panel.place()] = match to {
+            RowScroll::Up => window.first.saturating_sub(1),
+            RowScroll::Down => RowWindow::new(rows, room, window.first + 1).first,
+        };
+    }
+
+    /// Scrolls the focused panel just far enough to show the row of the
+    /// item selected in it, of `items`.
+    fn follow_selection(&mut self, items: usize) {
+        let (Some(panel), Some(item)) = (self.focused, self.selected) else {
+            return;
+        };
+        let Some(room) = panel.room() else {
+            return;
+        };
+        let across = panel.across();
+        let rows = items.div_ceil(across);
+        let place = panel.place();
+        self.scrolled[place] = RowWindow::showing(rows, room, self.scrolled[place], item / across);
+    }
+
     /// Moves the selection among the focused panel's items in the report
     /// shown for `range` from `origin`, stopping at the first and last.
     /// With no panel focused, or none of its items to select, it does
@@ -374,6 +530,7 @@ impl InsightsView {
             (ItemMove::Next | ItemMove::Down, None) => 0,
         };
         self.selected = Some(item.min(last));
+        self.follow_selection(last + 1);
     }
 
     /// Selects `panel`'s `item` in the report shown for `range` from
@@ -385,12 +542,13 @@ impl InsightsView {
         panel: InsightsPanel,
         item: usize,
     ) {
-        let held = self
+        let items = self
             .report(origin, range)
-            .is_some_and(|kept| item < panel.items(kept));
-        if held {
+            .map_or(0, |kept| panel.items(kept));
+        if item < items {
             self.focus(panel);
             self.selected = Some(item);
+            self.follow_selection(items);
         }
     }
 
@@ -404,9 +562,15 @@ impl InsightsView {
     }
 
     /// Records where `panel` drew its items, from the corner of `area`,
-    /// each `width` columns wide.
-    pub(super) fn record_item_targets(&self, panel: InsightsPanel, area: Rect, width: u16) {
-        self.update_targets(|targets| targets.items[panel.place()] = Some((area, width)));
+    /// each `width` columns wide, the first there the item at `first`.
+    pub(super) fn record_item_targets(
+        &self,
+        panel: InsightsPanel,
+        area: Rect,
+        width: u16,
+        first: usize,
+    ) {
+        self.update_targets(|targets| targets.items[panel.place()] = Some((area, width, first)));
     }
 
     fn update_targets(&self, update: impl FnOnce(&mut Targets)) {
@@ -422,11 +586,11 @@ impl InsightsView {
             targets.panels[panel.place()].is_some_and(|area| area.contains(position))
         })?;
         let item = targets.items[panel.place()]
-            .filter(|(area, _)| area.contains(position))
-            .map(|(area, width)| {
+            .filter(|(area, _, _)| area.contains(position))
+            .map(|(area, width, first)| {
                 let row = usize::from(position.y - area.y);
                 let column = usize::from((position.x - area.x) / width.max(1));
-                row * panel.across() + column
+                first + row * panel.across() + column
             });
         Some(match item {
             Some(item) => InsightsTarget::Item { panel, item },

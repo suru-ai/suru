@@ -79,7 +79,7 @@ use super::{
         Receipt as MetricsReceipt, UsageMetricsReadRefusal,
         calendar::MetricsRange,
         chart::MetricsMeasure,
-        insights::{InsightsView, ItemMove, PanelMove},
+        insights::{InsightsView, ItemMove, PanelMove, RowScroll},
     },
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
@@ -11779,6 +11779,18 @@ impl Application {
                 .act_on_metrics_insights(|insights, origin, range| {
                     insights.select_item(origin, range, panel, item)
                 })),
+            SemanticCommandId::MetricsPanelScrollUp { panel } => {
+                Ok(self.act_on_metrics_insights(|insights, origin, range| {
+                    insights.scroll(origin, range, panel, RowScroll::Up)
+                }))
+            }
+            SemanticCommandId::MetricsPanelScrollDown { panel } => Ok(self
+                .act_on_metrics_insights(|insights, origin, range| {
+                    insights.scroll(origin, range, panel, RowScroll::Down)
+                })),
+            SemanticCommandId::MetricsToolsSortToggle => {
+                Ok(self.act_on_metrics_insights(|insights, _, _| insights.toggle_tools_sort()))
+            }
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,
             // so on the Landing there is nothing to set aside and the view

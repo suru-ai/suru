@@ -14,8 +14,9 @@ use jiff::civil::date;
 use ratatui::{buffer::Buffer, style::Style};
 use suru::{
     protocol::{
-        Cost, InsightsQuery, InsightsReport, Outlook, QUARTER_HOUR_MS, QuarterHourTurns,
-        TurnDurations, TurnInsights, UsageMetricsInterval, UsageMetricsQuery,
+        Cost, InsightsQuery, InsightsReport, InsightsTool, Outlook, QUARTER_HOUR_MS,
+        QuarterHourTurns, ToolUses, TurnDurations, TurnInsights, UsageMetricsInterval,
+        UsageMetricsQuery,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, InsightsPanel, MetricsTab,
@@ -88,8 +89,34 @@ fn worked() -> InsightsReport {
             interrupted: 31,
         },
         quarter_hours: worked_hours(),
-        tools: Vec::new(),
+        tools: worked_tools(),
     }
+}
+
+fn tool(tool: InsightsTool, uses: u64, failed: u64) -> ToolUses {
+    ToolUses { tool, uses, failed }
+}
+
+fn named(server: Option<&str>, name: &str) -> InsightsTool {
+    InsightsTool::Named {
+        name: name.to_owned(),
+        server: server.map(str::to_owned),
+    }
+}
+
+/// The Tools the mockup's reader's Agents used, the most used first as the
+/// Server sends them: more than the panel has rows for.
+fn worked_tools() -> Vec<ToolUses> {
+    vec![
+        tool(InsightsTool::Command, 4_210, 212),
+        tool(InsightsTool::FileChange, 2_987, 9),
+        tool(named(None, "Read"), 2_544, 3),
+        tool(named(Some("github"), "create_pr"), 41, 2),
+        tool(InsightsTool::Subagent, 30, 5),
+        tool(named(None, "Grep"), 22, 0),
+        tool(named(Some("fs"), "write"), 9, 4),
+        tool(named(None, "WebFetch"), 3, 1),
+    ]
 }
 
 /// `turns` Turns of `tokens` tokens costing `usd`, placed in the quarter-hour
@@ -331,8 +358,8 @@ fn tab_or_a_click_focuses_a_panel_and_highlights_its_border() {
     assert_eq!(turns_border(&application), unfocused);
     key(&mut application, KeyCode::BackTab);
     assert_eq!(
-        turns_border(&application),
-        focused,
+        (tools_border(&application), turns_border(&application)),
+        (focused, unfocused),
         "from the first panel, focus moves round to the last"
     );
 
@@ -735,9 +762,218 @@ fn esc_clears_a_selected_cell_before_it_leaves_the_heatmap() {
     row(&screen(&application), "When you work");
 }
 
+/// The style of the Tools panel's top-left border corner.
+fn tools_border(application: &Application) -> Style {
+    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    let (x, y) = text_position(&buffer, "Tools used");
+    corner_left_of(&buffer, x, y)
+}
+
 /// The style of the When you work panel's top-left border corner.
 fn heatmap_border(application: &Application) -> Style {
     let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
     let (x, y) = text_position(&buffer, "When you work");
     corner_left_of(&buffer, x, y)
+}
+
+/// The Tools panel's lines beneath its title, the header first, each with
+/// its border and runs of spaces closed up.
+fn tools_panel(application: &Application) -> Vec<String> {
+    let rows = screen(application);
+    let title = rows
+        .iter()
+        .position(|row| row.contains("Tools used"))
+        .unwrap_or_else(|| panic!("no Tools panel in\n{}", rows.join("\n")));
+    let left = rows[title].find('╭').expect("the panel's corner");
+    rows[title + 1..]
+        .iter()
+        .take_while(|row| !row[left..].trim_start().starts_with('╰'))
+        .map(|row| {
+            row[left..]
+                .split('│')
+                .nth(1)
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+fn focus_tools(application: &mut Application) {
+    invoke(
+        application,
+        SemanticCommandId::MetricsPanelFocus(InsightsPanel::Tools),
+    );
+}
+
+#[test]
+fn the_tools_panel_lists_the_most_used_first_and_folds_the_rest_into_more() {
+    assert_eq!(
+        SemanticCommandId::MetricsPanelFocus(InsightsPanel::Tools).as_str(),
+        "metrics.panel.tools"
+    );
+    let application = on_insights(Ok(worked()));
+
+    assert_eq!(
+        tools_panel(&application),
+        vec![
+            "Tool uses ↓ failed",
+            "Command 4,210 212",
+            "File Change 2,987 9",
+            "Read 2,544 3",
+            "github · create_pr 41 2",
+            "(4 more)",
+        ]
+    );
+}
+
+#[test]
+fn f_sorts_the_tools_by_failures_and_again_by_uses() {
+    assert_eq!(
+        SemanticCommandId::MetricsToolsSortToggle.as_str(),
+        "metrics.tools.sort"
+    );
+    let mut application = on_insights(Ok(worked()));
+    let by_uses = tools_panel(&application);
+
+    assert_eq!(
+        press(&mut application, 'f'),
+        ApplicationTransition::Continue
+    );
+
+    assert_eq!(
+        tools_panel(&application),
+        vec![
+            "Tool uses failed ↓",
+            "Command 4,210 212",
+            "File Change 2,987 9",
+            "Subagent 30 5",
+            "fs · write 9 4",
+            "(4 more)",
+        ]
+    );
+    press(&mut application, 'f');
+    assert_eq!(tools_panel(&application), by_uses);
+}
+
+#[test]
+fn arrows_scroll_the_tools_into_the_rows_folded_away() {
+    let mut application = on_insights(Ok(worked()));
+    focus_tools(&mut application);
+    for _ in 0..4 {
+        key(&mut application, KeyCode::Down);
+    }
+
+    // The fourth row selected, the window has yet to move.
+    assert_eq!(tools_panel(&application)[5], "(4 more)");
+    key(&mut application, KeyCode::Down);
+    assert_eq!(
+        tools_panel(&application)[1..],
+        [
+            "File Change 2,987 9",
+            "Read 2,544 3",
+            "github · create_pr 41 2",
+            "Subagent 30 5",
+            "(3 more)",
+        ]
+    );
+    for _ in 0..10 {
+        key(&mut application, KeyCode::Down);
+    }
+    assert_eq!(
+        tools_panel(&application)[1..],
+        [
+            "github · create_pr 41 2",
+            "Subagent 30 5",
+            "Grep 22 0",
+            "fs · write 9 4",
+            "WebFetch 3 1",
+        ],
+        "the last row in view, nothing is folded"
+    );
+    for _ in 0..10 {
+        key(&mut application, KeyCode::Up);
+    }
+    assert_eq!(tools_panel(&application)[1], "Command 4,210 212");
+}
+
+#[test]
+fn the_wheel_over_the_tools_panel_scrolls_it_without_focusing_it() {
+    assert_eq!(
+        SemanticCommandId::MetricsPanelScrollDown {
+            panel: InsightsPanel::Tools
+        }
+        .as_str(),
+        "metrics.panel.scroll.down"
+    );
+    let mut application = on_insights(Ok(worked()));
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let over_tools = text_position(&buffer, "Read");
+
+    assert_eq!(
+        wheel(&mut application, MouseEventKind::ScrollDown, over_tools),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        tools_panel(&application)[1..],
+        [
+            "File Change 2,987 9",
+            "Read 2,544 3",
+            "github · create_pr 41 2",
+            "Subagent 30 5",
+            "(3 more)",
+        ]
+    );
+    for _ in 0..10 {
+        wheel(&mut application, MouseEventKind::ScrollDown, over_tools);
+    }
+    assert_eq!(tools_panel(&application)[5], "WebFetch 3 1");
+    for _ in 0..10 {
+        wheel(&mut application, MouseEventKind::ScrollUp, over_tools);
+    }
+    assert_eq!(
+        tools_panel(&application),
+        tools_panel(&on_insights(Ok(worked())))
+    );
+    let rows = screen(&application);
+    assert!(
+        row(&rows, "30 days").contains("▐30 days▌"),
+        "the range stays"
+    );
+}
+
+#[test]
+fn a_click_on_a_tool_selects_it_and_focuses_the_panel() {
+    let mut application = on_insights(Ok(worked()));
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let over_tools = text_position(&buffer, "Read");
+    wheel(&mut application, MouseEventKind::ScrollDown, over_tools);
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let subagent = text_position(&buffer, "Subagent");
+
+    press_at(&mut application, subagent);
+    // Down from the clicked row, the fifth, scrolls the sixth into view.
+    key(&mut application, KeyCode::Down);
+
+    assert_eq!(
+        tools_panel(&application)[1..],
+        [
+            "Read 2,544 3",
+            "github · create_pr 41 2",
+            "Subagent 30 5",
+            "Grep 22 0",
+            "(2 more)",
+        ]
+    );
+}
+
+#[test]
+fn a_range_whose_turns_used_no_tool_says_so_in_the_panel() {
+    let application = on_insights(Ok(InsightsReport::default()));
+
+    assert_eq!(
+        tools_panel(&application)[0],
+        "No Tools used in the last 30 days"
+    );
 }

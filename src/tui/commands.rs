@@ -219,6 +219,18 @@ pub enum SemanticCommandId {
         panel: InsightsPanel,
         item: usize,
     },
+    /// Scrolls an Insights panel's rows a row back toward its first,
+    /// whether or not it is focused.
+    MetricsPanelScrollUp {
+        panel: InsightsPanel,
+    },
+    /// Scrolls an Insights panel's rows a row on toward its last, whether
+    /// or not it is focused.
+    MetricsPanelScrollDown {
+        panel: InsightsPanel,
+    },
+    /// Sorts the Insights Tools panel by failures, or by uses again.
+    MetricsToolsSortToggle,
     /// Opens the Icon Picker over a Session, which the picker only does while
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
     /// menu item stays quiet rather than opening a picker no glyph could draw.
@@ -810,6 +822,7 @@ impl SemanticCommandId {
             Self::MetricsPanelFocus(panel) => match panel {
                 InsightsPanel::WhenYouWork => "metrics.panel.when-you-work",
                 InsightsPanel::Turns => "metrics.panel.turns",
+                InsightsPanel::Tools => "metrics.panel.tools",
             },
             Self::MetricsPanelFocusNext => "metrics.panel.next",
             Self::MetricsPanelFocusPrevious => "metrics.panel.previous",
@@ -820,6 +833,9 @@ impl SemanticCommandId {
             Self::MetricsPanelItemUp => "metrics.panel.item.up",
             Self::MetricsPanelItemDown => "metrics.panel.item.down",
             Self::MetricsPanelItemSelect { .. } => "metrics.panel.item.select",
+            Self::MetricsPanelScrollUp { .. } => "metrics.panel.scroll.up",
+            Self::MetricsPanelScrollDown { .. } => "metrics.panel.scroll.down",
+            Self::MetricsToolsSortToggle => "metrics.tools.sort",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::SessionRename => "session.rename",
@@ -2159,6 +2175,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     },
     metrics_panel_descriptor(InsightsPanel::WhenYouWork, "Focus When You Work Insights"),
     metrics_panel_descriptor(InsightsPanel::Turns, "Focus Turns Insights"),
+    metrics_panel_descriptor(InsightsPanel::Tools, "Focus Tools Insights"),
     SemanticCommandDescriptor {
         id: SemanticCommandId::MetricsPanelFocusNext,
         title: "Next Insights Panel",
@@ -2235,6 +2252,36 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Select Insights Item",
         reach: SemanticReach::Client,
         description: "Select one of an Insights panel's items by its place",
+        slash: None,
+        keybinding: None,
+    },
+    // Scrolling reads nothing: the report holds every row, and the panel is
+    // invocation data, as the wheel names the panel under the pointer.
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsPanelScrollUp {
+            panel: InsightsPanel::Tools,
+        },
+        title: "Scroll Insights Panel Up",
+        reach: SemanticReach::Client,
+        description: "Scroll an Insights panel's rows back toward its first",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsPanelScrollDown {
+            panel: InsightsPanel::Tools,
+        },
+        title: "Scroll Insights Panel Down",
+        reach: SemanticReach::Client,
+        description: "Scroll an Insights panel's rows on toward its last",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsToolsSortToggle,
+        title: "Sort Insights Tools",
+        reach: SemanticReach::Client,
+        description: "Sort the Insights Tools panel by failures, or by uses again",
         slash: None,
         keybinding: None,
     },
@@ -3542,6 +3589,12 @@ pub(super) fn descriptor(id: SemanticCommandId) -> &'static SemanticCommandDescr
                     ) | (
                         SemanticCommandId::MetricsPanelItemSelect { .. },
                         SemanticCommandId::MetricsPanelItemSelect { .. }
+                    ) | (
+                        SemanticCommandId::MetricsPanelScrollUp { .. },
+                        SemanticCommandId::MetricsPanelScrollUp { .. }
+                    ) | (
+                        SemanticCommandId::MetricsPanelScrollDown { .. },
+                        SemanticCommandId::MetricsPanelScrollDown { .. }
                     )
                 )
         })

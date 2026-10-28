@@ -414,8 +414,9 @@ impl MetricsView {
         self.range = range;
         self.forget_figures();
         // An item a panel selected stands for figures of the range before,
-        // and must not outlast them unseen for Esc to clear.
-        self.insights.clear_selection();
+        // and must not outlast them unseen for Esc to clear; how far a
+        // panel was scrolled stands for them too.
+        self.insights.leave_range();
         true
     }
 

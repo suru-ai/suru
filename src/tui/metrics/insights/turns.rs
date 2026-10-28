@@ -139,7 +139,7 @@ fn render_bins(
         let x = area.x + u16::try_from(bin).unwrap_or(0);
         buffer.set_string(x, y, glyph, style);
     }
-    view.record_item_targets(InsightsPanel::Turns, Rect::new(area.x, y, bins, 1), 1);
+    view.record_item_targets(InsightsPanel::Turns, Rect::new(area.x, y, bins, 1), 1, 0);
     let timed: u64 = durations.bins.iter().sum();
     let caption = match selected {
         Some(bin) => format!(
