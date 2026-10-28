@@ -5425,7 +5425,7 @@ pub enum ApplicationEvent {
         result: std::result::Result<crate::protocol::UsageMetricsReport, UsageMetricsReadRefusal>,
     },
     /// The Insights a Server reported, or why it reported none, in answer to
-    /// [`ApplicationTransition::ReadUsageInsights`].
+    /// [`ApplicationTransition::ReadUsageInsightsAndWorkspaces`].
     UsageInsightsRead {
         request_id: uuid::Uuid,
         result: std::result::Result<crate::protocol::InsightsReport, UsageMetricsReadRefusal>,
@@ -5723,7 +5723,7 @@ pub enum ApplicationTransition {
     /// interval by Workspace, which the Workspaces panel ranks, answering
     /// with [`ApplicationEvent::UsageMetricsRead`] under
     /// `workspaces_request_id`.
-    ReadUsageInsights {
+    ReadUsageInsightsAndWorkspaces {
         origin: Outlook,
         request_id: uuid::Uuid,
         query: crate::protocol::InsightsQuery,
@@ -9695,7 +9695,7 @@ impl Application {
         let range = self.state.metrics_view.range();
         let insights = self.state.metrics_view.insights_mut();
         match insights.ask(origin.clone(), range, now, &zone) {
-            Some(asked) => ApplicationTransition::ReadUsageInsights {
+            Some(asked) => ApplicationTransition::ReadUsageInsightsAndWorkspaces {
                 origin,
                 request_id: asked.request_id,
                 query: asked.query,

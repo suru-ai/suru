@@ -1378,7 +1378,7 @@ impl RunLoop {
                     self.channels.usage_metrics.clone(),
                 );
             }
-            ApplicationTransition::ReadUsageInsights {
+            ApplicationTransition::ReadUsageInsightsAndWorkspaces {
                 origin,
                 request_id,
                 query,
@@ -1936,7 +1936,7 @@ impl RunLoop {
             | ApplicationTransition::CompactSession { .. }
             | ApplicationTransition::ReadContextBreakdown { .. }
             | ApplicationTransition::ReadUsageMetrics { .. }
-            | ApplicationTransition::ReadUsageInsights { .. }
+            | ApplicationTransition::ReadUsageInsightsAndWorkspaces { .. }
             | ApplicationTransition::SubscribeSession(_)
             | ApplicationTransition::ViewSession(_)
             | ApplicationTransition::ViewAndAttachSession(_)

@@ -29,7 +29,7 @@ use super::{
         chart,
     },
     InsightsPanel, InsightsView, RowWindow, WorkspacesContent,
-    view::{bar, render_spans, stated_cost},
+    view::{bar, nothing, render_spans, stated_cost},
 };
 
 /// How many lines the panel has for its Workspaces, the fold among them.
@@ -110,8 +110,8 @@ pub(super) fn render(
             return;
         }
         WorkspacesContent::Rows([]) => {
-            let note = format!("No work {}", range.within());
-            buffer.set_string(area.x, area.y, truncate_to_width(&note, room), subdued);
+            let note = nothing(room, "No work", range);
+            buffer.set_string(area.x, area.y, note, subdued);
             return;
         }
         WorkspacesContent::Rows(rows) => rows,

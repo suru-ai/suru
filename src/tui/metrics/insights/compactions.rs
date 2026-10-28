@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     super::{super::usage::grouped_count, calendar::MetricsRange},
-    view::{fitting, render_fitting_spans},
+    view::{fitting, nothing, render_fitting_spans},
 };
 
 /// The rows the panel draws inside its border.
@@ -31,13 +31,7 @@ pub(super) fn render(
     let primary = theme.text.primary;
     let total = compactions.total();
     if total == 0 {
-        let note = fitting(
-            room,
-            [
-                format!("No Compactions {}", range.within()),
-                "No Compactions".to_owned(),
-            ],
-        );
+        let note = nothing(room, "No Compactions", range);
         buffer.set_string(area.x, area.y, note, subdued);
         return;
     }

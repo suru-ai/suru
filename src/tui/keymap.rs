@@ -533,8 +533,9 @@ fn command_for_insights_panel_key(
 
 /// Insights' own clicks and wheel: a click on a Workspaces row opens it, a
 /// click on what another panel lets a reader select selects it, focusing
-/// the panel, and one anywhere else on a panel focuses it; the wheel is the panel's under the pointer, whether or not it
-/// is focused, as [`command_for_insights_panel_wheel`] gives it.
+/// the panel, and one anywhere else on a panel focuses it; the wheel is the
+/// panel's under the pointer, whether or not it is focused, as
+/// [`command_for_insights_panel_wheel`] gives it.
 fn command_for_insights_pointer(
     mouse: MouseEvent,
     target: InsightsTarget,

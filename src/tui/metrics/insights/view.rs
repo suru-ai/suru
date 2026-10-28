@@ -24,7 +24,10 @@ use super::{
     Column, InsightsContent, InsightsPanel, InsightsView, KeptReport, Place, approvals, cache,
     compactions, delegation, heatmap, tools, turns, workspaces,
 };
-use crate::{protocol::Outlook, tui::slots::truncate_to_width};
+use crate::{
+    protocol::Outlook,
+    tui::{slots::truncate_to_width, usage::grouped_count},
+};
 
 /// Columns between two columns standing side by side.
 const COLUMN_GAP: u16 = 2;
@@ -32,6 +35,10 @@ const COLUMN_GAP: u16 = 2;
 /// The narrowest a column stands beside another in: room for the briefest
 /// figures of the small panels, inside their borders.
 const BESIDE_WIDTH: u16 = 28;
+
+/// How many of a panel's columns its border and the column of room either
+/// side of its figures take.
+const BORDERED: u16 = 4;
 
 /// What every panel is drawn from.
 struct Drawing<'a> {
@@ -96,7 +103,7 @@ fn render_place(
 ) -> Option<u16> {
     match place {
         Place::Panel(panel) => {
-            let height = height(panel);
+            let height = height(panel, area.width, drawing.kept);
             if area.y + height > area.bottom() {
                 return None;
             }
@@ -174,15 +181,16 @@ fn beside(width: u16, columns: &[Column]) -> Option<Vec<u16>> {
         .then_some(widths)
 }
 
-/// How many rows `panel` takes, its border included.
-fn height(panel: InsightsPanel) -> u16 {
+/// How many rows `panel` takes `width` columns wide, its border included.
+fn height(panel: InsightsPanel, width: u16, kept: &KeptReport) -> u16 {
+    let room = usize::from(width.saturating_sub(BORDERED));
     let rows = match panel {
         InsightsPanel::WhenYouWork => heatmap::ROWS,
         InsightsPanel::Turns => turns::ROWS,
         InsightsPanel::Tools => tools::ROWS,
         InsightsPanel::Compactions => compactions::ROWS,
         InsightsPanel::Cache => cache::ROWS,
-        InsightsPanel::Approvals => approvals::ROWS,
+        InsightsPanel::Approvals => approvals::rows(&kept.report.approvals, room),
         InsightsPanel::Delegation => delegation::ROWS,
         InsightsPanel::Workspaces => workspaces::ROWS,
     };
@@ -220,7 +228,7 @@ fn render_panel(buffer: &mut Buffer, area: Rect, panel: InsightsPanel, drawing: 
     let inner = Rect::new(
         inner.x + 1,
         inner.y,
-        inner.width.saturating_sub(2),
+        area.width.saturating_sub(BORDERED),
         inner.height,
     );
     let selected = view.selected_item().filter(|_| focused);
@@ -298,6 +306,40 @@ pub(super) fn fitting(room: usize, forms: impl IntoIterator<Item = String>) -> S
         briefest = form;
     }
     truncate_to_width(&briefest, room)
+}
+
+/// What a panel says where the range holds nothing for it: no `what`
+/// within the range, or, where that does not fit, no `what` at all.
+pub(super) fn nothing(room: usize, what: &str, range: MetricsRange) -> String {
+    fitting(
+        room,
+        [format!("{what} {}", range.within()), what.to_owned()],
+    )
+}
+
+/// Each of `tallies` — a glyph, a count, what the count is of, and the
+/// glyph's style — as spans, the counts in `figures`' style, two columns
+/// between one and the next, and each count named where `named`: how
+/// Turns ended, or how Approvals were decided.
+pub(super) fn tallies(
+    tallies: &[(&str, u64, &str, Style)],
+    named: bool,
+    figures: Style,
+) -> Vec<(String, Style)> {
+    tallies
+        .iter()
+        .enumerate()
+        .flat_map(|(place, (glyph, count, name, style))| {
+            let gap = if place == 0 { "" } else { "  " };
+            let count = grouped_count(*count);
+            let figure = if named {
+                format!("{count} {name}")
+            } else {
+                count
+            };
+            [(format!("{gap}{glyph} "), *style), (figure, figures)]
+        })
+        .collect()
 }
 
 /// Draws the fullest of `forms` — each spans in their own styles, given

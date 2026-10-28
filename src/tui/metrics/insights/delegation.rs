@@ -17,7 +17,7 @@ use crate::{
 
 use super::{
     super::{calendar::MetricsRange, view::share},
-    view::{bar, fitting, render_spans, stated_cost},
+    view::{bar, fitting, nothing, render_spans, stated_cost},
 };
 
 /// The rows the panel draws inside its border: a role apiece, then the
@@ -65,10 +65,7 @@ pub(super) fn render(
         } else {
             "No Cost"
         };
-        let note = fitting(
-            room,
-            [format!("{note} {}", range.within()), note.to_owned()],
-        );
+        let note = nothing(room, note, range);
         buffer.set_string(area.x, area.y, note, subdued);
         return;
     };
@@ -108,7 +105,7 @@ pub(super) fn render(
         let lead = if costed {
             format!(
                 "{label:<LABEL_WIDTH$} {share:>SHARE_WIDTH$}  {:>COST_WIDTH$}  ",
-                stated(cost),
+                stated_cost(cost.cost, cost.is_cost_partial),
             )
         } else {
             format!("{label:<LABEL_WIDTH$} {share:>SHARE_WIDTH$}  ")
@@ -144,9 +141,4 @@ fn share_of(cost: RoleCost, whole: RoleCost) -> String {
 /// What `cost` counts, in nano-dollars: nothing where it counts no amount.
 fn nano_usd(cost: RoleCost) -> u64 {
     cost.cost.map_or(0, Cost::nano_usd)
-}
-
-/// `cost` as the panel states it: see [`stated_cost`].
-fn stated(cost: RoleCost) -> String {
-    stated_cost(cost.cost, cost.is_cost_partial)
 }

@@ -135,12 +135,16 @@ impl InsightsPanel {
         },
     ]);
 
+    /// How many panels there are, every one of which [`Self::LAYOUT`]
+    /// places once.
+    pub(crate) const COUNT: usize = 8;
+
     /// Every panel, in the order [`Self::LAYOUT`] reads them — down each
     /// column, the left first, columns standing beside one another read
     /// before the place beneath them — which is the order focus moves
     /// among them.
-    pub(crate) const ALL: [Self; 8] = {
-        let mut all = [Self::WhenYouWork; 8];
+    pub(crate) const ALL: [Self; Self::COUNT] = {
+        let mut all = [Self::WhenYouWork; Self::COUNT];
         let placed = Self::gather(&Self::LAYOUT, &mut all, 0);
         assert!(placed == all.len(), "the layout places every panel");
         all
@@ -148,7 +152,7 @@ impl InsightsPanel {
 
     /// Places `place`'s panels in `all` in reading order from `placed` on,
     /// answering how many are placed then.
-    const fn gather(place: &Place, all: &mut [Self; 8], placed: usize) -> usize {
+    const fn gather(place: &Place, all: &mut [Self; Self::COUNT], placed: usize) -> usize {
         match place {
             Place::Panel(panel) => {
                 all[placed] = *panel;
@@ -360,14 +364,6 @@ pub(super) enum WorkspacesContent<'a> {
     Rows(&'a [WorkspaceRow]),
 }
 
-/// The Workspaces of a range kept from the one-bucket read, ranked as
-/// Overview ranks its keys, with the Outlook they were read from.
-#[derive(Clone, Debug)]
-struct KeptWorkspaces {
-    origin: Outlook,
-    rows: Vec<WorkspaceRow>,
-}
-
 /// What the tab shows beneath the range bar.
 pub(super) enum InsightsContent<'a> {
     Reading,
@@ -375,13 +371,128 @@ pub(super) enum InsightsContent<'a> {
     Report(&'a KeptReport),
 }
 
-/// A report kept for a range: the Outlook it was read from, and its
-/// quarter-hours folded into the week of the zone the range was cut in.
+/// A report kept for a range, its quarter-hours folded into the week of the
+/// zone the range was cut in.
 #[derive(Clone, Debug)]
 pub(super) struct KeptReport {
-    origin: Outlook,
     report: InsightsReport,
     heatmap: Heatmap,
+}
+
+/// One of the reads the tab makes of each range it shows: the read awaited,
+/// what the last answer for each range kept, with the Outlook it came from,
+/// and why the last read was refused. `C` is what the read awaited needs
+/// to keep its answer by: the zone its range was cut in, for the insights.
+#[derive(Clone, Debug)]
+struct RangeReads<T, C = ()> {
+    asked: Option<AskedRead<C>>,
+    /// The last answer kept for each range, so switching between tabs or
+    /// ranges reads nothing again. Only what was read from the Outlook the
+    /// view is turned toward is shown.
+    kept: HashMap<MetricsRange, (Outlook, T)>,
+    refused: Option<(Outlook, MetricsRange, UsageMetricsReadRefusal)>,
+}
+
+/// A read awaited: its request, the Outlook it asked, the range it asked
+/// for, and what its answer is kept by.
+#[derive(Clone, Debug)]
+struct AskedRead<C> {
+    request_id: Uuid,
+    origin: Outlook,
+    range: MetricsRange,
+    context: C,
+}
+
+impl<T, C> Default for RangeReads<T, C> {
+    fn default() -> Self {
+        Self {
+            asked: None,
+            kept: HashMap::new(),
+            refused: None,
+        }
+    }
+}
+
+impl<T, C> RangeReads<T, C> {
+    /// What is kept for `range` from `origin`, where anything is.
+    fn kept(&self, origin: &Outlook, range: MetricsRange) -> Option<&T> {
+        self.kept
+            .get(&range)
+            .filter(|(read_from, _)| read_from == origin)
+            .map(|(_, kept)| kept)
+    }
+
+    /// Whether the read of `range` from `origin` is on its way.
+    fn is_reading(&self, origin: &Outlook, range: MetricsRange) -> bool {
+        self.asked
+            .as_ref()
+            .is_some_and(|asked| asked.origin == *origin && asked.range == range)
+    }
+
+    /// Why the last read of `range` from `origin` was refused, where it was.
+    fn refusal(&self, origin: &Outlook, range: MetricsRange) -> Option<&UsageMetricsReadRefusal> {
+        self.refused
+            .as_ref()
+            .filter(|(refused_by, refused, _)| refused_by == origin && *refused == range)
+            .map(|(_, _, refusal)| refusal)
+    }
+
+    /// Awaits a read of `range` from `origin`, answering its request.
+    fn ask(&mut self, origin: Outlook, range: MetricsRange, context: C) -> Uuid {
+        let request_id = Uuid::new_v4();
+        self.asked = Some(AskedRead {
+            request_id,
+            origin,
+            range,
+            context,
+        });
+        self.refused = None;
+        request_id
+    }
+
+    /// Whether the read answering under `request_id` is awaited.
+    fn awaits(&self, request_id: Uuid) -> bool {
+        self.asked
+            .as_ref()
+            .is_some_and(|asked| asked.request_id == request_id)
+    }
+
+    /// Takes the answer under `request_id`, unless it is no longer awaited,
+    /// keeping what `keep` makes of it under the range it was asked for.
+    fn receive<A>(
+        &mut self,
+        request_id: Uuid,
+        result: Result<A, UsageMetricsReadRefusal>,
+        keep: impl FnOnce(A, C) -> T,
+    ) {
+        if !self.awaits(request_id) {
+            return;
+        }
+        let asked = self.asked.take().expect("the awaited read");
+        match result {
+            Ok(answer) => {
+                let kept = keep(answer, asked.context);
+                self.kept.insert(asked.range, (asked.origin, kept));
+            }
+            Err(refusal) => self.refuse(asked.origin, asked.range, refusal),
+        }
+    }
+
+    /// Says why `range` has nothing fresh from `origin`, giving up the read
+    /// awaited. What is already kept for it stays, the refusal beside it.
+    fn refuse(&mut self, origin: Outlook, range: MetricsRange, refusal: UsageMetricsReadRefusal) {
+        self.asked = None;
+        self.refused = Some((origin, range, refusal));
+    }
+
+    fn stop_awaiting(&mut self) {
+        self.asked = None;
+    }
+
+    /// Lets go of what is kept for every range but `range`.
+    fn forget_all_but(&mut self, range: MetricsRange) {
+        self.kept.retain(|kept, _| *kept == range);
+    }
 }
 
 /// Where the last frame drew each part of the tab a pointer can act on.
@@ -403,22 +514,11 @@ struct Targets {
 /// keys act on. What it read does not outlive the view's closing.
 #[derive(Clone, Debug, Default)]
 pub(in crate::tui) struct InsightsView {
-    /// The read it awaits: its request, the Outlook it asked, the range it
-    /// asked for, and the zone that range was cut in.
-    asked: Option<(Uuid, Outlook, MetricsRange, TimeZone)>,
-    /// The last report read of each range, so switching between tabs or
-    /// ranges reads nothing again. Only a report read from the Outlook the
-    /// view is turned toward is shown.
-    read: HashMap<MetricsRange, KeptReport>,
-    /// Why the last read of a range, from an Outlook, gave no report.
-    refused: Option<(Outlook, MetricsRange, UsageMetricsReadRefusal)>,
-    /// The one-bucket Workspace read awaited beside the insights read: its
-    /// request, the Outlook it asked, and the range it asked for.
-    asked_workspaces: Option<(Uuid, Outlook, MetricsRange)>,
-    /// The Workspaces last read of each range, kept as its report is.
-    workspaces: HashMap<MetricsRange, KeptWorkspaces>,
-    /// Why the last Workspace read of a range, from an Outlook, gave none.
-    workspaces_refused: Option<(Outlook, MetricsRange, UsageMetricsReadRefusal)>,
+    /// The insights read of each range, kept with the zone it was cut in.
+    reports: RangeReads<KeptReport, TimeZone>,
+    /// The one-bucket Workspace read made beside it, kept as the
+    /// Workspaces ranked as Overview ranks its keys.
+    workspaces: RangeReads<Vec<WorkspaceRow>>,
     focused: Option<InsightsPanel>,
     /// The item selected within the focused panel, by its place among the
     /// panel's items.
@@ -434,22 +534,12 @@ pub(in crate::tui) struct InsightsView {
 impl InsightsView {
     /// The report kept for `range` from `origin`, where one is.
     fn report(&self, origin: &Outlook, range: MetricsRange) -> Option<&KeptReport> {
-        self.read.get(&range).filter(|kept| kept.origin == *origin)
+        self.reports.kept(origin, range)
     }
 
     /// The Workspaces kept for `range` from `origin`, where they are.
     fn workspaces_of(&self, origin: &Outlook, range: MetricsRange) -> Option<&[WorkspaceRow]> {
-        self.workspaces
-            .get(&range)
-            .filter(|kept| kept.origin == *origin)
-            .map(|kept| kept.rows.as_slice())
-    }
-
-    /// Whether the Workspace read of `range` from `origin` is on its way.
-    fn reads_workspaces(&self, origin: &Outlook, range: MetricsRange) -> bool {
-        self.asked_workspaces
-            .as_ref()
-            .is_some_and(|(_, asked_of, asked)| asked_of == origin && *asked == range)
+        self.workspaces.kept(origin, range).map(Vec::as_slice)
     }
 
     /// Whether `range` lacks a report, or its Workspaces, from `origin`
@@ -459,7 +549,7 @@ impl InsightsView {
     pub(in crate::tui) fn lacks(&self, origin: &Outlook, range: MetricsRange) -> bool {
         let lacking =
             self.report(origin, range).is_none() || self.workspaces_of(origin, range).is_none();
-        lacking && !self.is_reading(origin, range) && !self.reads_workspaces(origin, range)
+        lacking && !self.is_reading(origin, range) && !self.workspaces.is_reading(origin, range)
     }
 
     /// The query `origin` is asked for `range` at `now` in `zone`, which the
@@ -482,12 +572,8 @@ impl InsightsView {
             );
             return None;
         };
-        let request_id = Uuid::new_v4();
-        let workspaces_request_id = Uuid::new_v4();
-        self.asked = Some((request_id, origin.clone(), range, zone.clone()));
-        self.asked_workspaces = Some((workspaces_request_id, origin, range));
-        self.refused = None;
-        self.workspaces_refused = None;
+        let request_id = self.reports.ask(origin.clone(), range, zone.clone());
+        let workspaces_request_id = self.workspaces.ask(origin, range, ());
         Some(InsightsAsk {
             request_id,
             query: InsightsQuery { interval },
@@ -506,45 +592,32 @@ impl InsightsView {
     /// nothing saying so, and are read again when next shown. `range`'s own
     /// stays until the refresh replaces it.
     pub(in crate::tui) fn forget_all_but(&mut self, range: MetricsRange) {
-        self.read.retain(|kept, _| *kept == range);
-        self.workspaces.retain(|kept, _| *kept == range);
+        self.reports.forget_all_but(range);
+        self.workspaces.forget_all_but(range);
     }
 
     /// Takes the Server's answer, unless the tab has since closed or asked
-    /// again, keeping a report under the range it was asked for.
+    /// again, keeping a report under the range it was asked for. A refusal
+    /// gives up the Workspace read beside it too, so that showing the range
+    /// again reads both again.
     pub(in crate::tui) fn receive(
         &mut self,
         request_id: Uuid,
         result: Result<InsightsReport, UsageMetricsReadRefusal>,
     ) {
-        if !self
-            .asked
-            .as_ref()
-            .is_some_and(|(asked, _, _, _)| *asked == request_id)
-        {
-            return;
+        if result.is_err() && self.reports.awaits(request_id) {
+            self.workspaces.stop_awaiting();
         }
-        let (_, origin, range, zone) = self.asked.take().expect("the awaited read");
-        match result {
-            Ok(report) => {
-                let heatmap = Heatmap::fold(&report.quarter_hours, &zone);
-                let kept = KeptReport {
-                    origin,
-                    report,
-                    heatmap,
-                };
-                self.read.insert(range, kept);
-            }
-            Err(refusal) => self.refuse(origin, range, refusal),
-        }
+        self.reports.receive(request_id, result, |report, zone| {
+            let heatmap = Heatmap::fold(&report.quarter_hours, &zone);
+            KeptReport { report, heatmap }
+        });
     }
 
     /// Whether the tab awaits the Workspace read answering under
     /// `request_id`, which answers as Overview's reads do.
     pub(in crate::tui) fn awaits_workspaces(&self, request_id: Uuid) -> bool {
-        self.asked_workspaces
-            .as_ref()
-            .is_some_and(|(asked, _, _)| *asked == request_id)
+        self.workspaces.awaits(request_id)
     }
 
     /// Takes the Server's answer to the Workspace read, unless the tab has
@@ -555,22 +628,12 @@ impl InsightsView {
         request_id: Uuid,
         result: Result<UsageMetricsReport, UsageMetricsReadRefusal>,
     ) {
-        if !self.awaits_workspaces(request_id) {
-            return;
-        }
-        let (_, origin, range) = self.asked_workspaces.take().expect("the awaited read");
-        match result {
-            Ok(report) => {
-                let rows = workspaces::rows(&report);
-                self.workspaces
-                    .insert(range, KeptWorkspaces { origin, rows });
-            }
-            Err(refusal) => self.workspaces_refused = Some((origin, range, refusal)),
-        }
+        self.workspaces
+            .receive(request_id, result, |report, ()| workspaces::rows(&report));
     }
 
-    /// Says why `range` has no fresh report from `origin`, giving up any
-    /// read awaited. A report already kept for it stays, with the refusal
+    /// Says why `range` has no fresh report from `origin`, giving up both
+    /// reads awaited. A report already kept for it stays, with the refusal
     /// beside it.
     pub(in crate::tui) fn refuse(
         &mut self,
@@ -578,33 +641,19 @@ impl InsightsView {
         range: MetricsRange,
         refusal: UsageMetricsReadRefusal,
     ) {
-        self.asked = None;
-        self.asked_workspaces = None;
-        self.refused = Some((origin, range, refusal));
+        self.reports.refuse(origin, range, refusal);
+        self.workspaces.stop_awaiting();
     }
 
     /// Lets go of the reads awaited, as the view closes.
     pub(in crate::tui) fn stop_awaiting(&mut self) {
-        self.asked = None;
-        self.asked_workspaces = None;
+        self.reports.stop_awaiting();
+        self.workspaces.stop_awaiting();
     }
 
     /// Whether a read of `range` from `origin` is on its way.
     pub(in crate::tui) fn is_reading(&self, origin: &Outlook, range: MetricsRange) -> bool {
-        self.asked
-            .as_ref()
-            .is_some_and(|(_, asked_of, asked, _)| asked_of == origin && *asked == range)
-    }
-
-    fn refusal_of(
-        &self,
-        origin: &Outlook,
-        range: MetricsRange,
-    ) -> Option<&UsageMetricsReadRefusal> {
-        self.refused
-            .as_ref()
-            .filter(|(refused_by, refused, _)| refused_by == origin && *refused == range)
-            .map(|(_, _, refusal)| refusal)
+        self.reports.is_reading(origin, range)
     }
 
     /// What the Workspaces panel shows for `range`, read from `origin`.
@@ -613,12 +662,10 @@ impl InsightsView {
         origin: &Outlook,
         range: MetricsRange,
     ) -> WorkspacesContent<'_> {
-        let refusal = self
-            .workspaces_refused
-            .as_ref()
-            .filter(|(refused_by, refused, _)| refused_by == origin && *refused == range)
-            .map(|(_, _, refusal)| refusal);
-        match (self.workspaces_of(origin, range), refusal) {
+        match (
+            self.workspaces_of(origin, range),
+            self.workspaces.refusal(origin, range),
+        ) {
             (Some(rows), _) => WorkspacesContent::Rows(rows),
             (None, Some(refusal)) => WorkspacesContent::Refused(refusal),
             (None, None) => WorkspacesContent::Reading,
@@ -647,7 +694,10 @@ impl InsightsView {
 
     /// What the tab shows for `range`, read from `origin`.
     pub(super) fn content(&self, origin: &Outlook, range: MetricsRange) -> InsightsContent<'_> {
-        match (self.report(origin, range), self.refusal_of(origin, range)) {
+        match (
+            self.report(origin, range),
+            self.reports.refusal(origin, range),
+        ) {
             (Some(report), _) => InsightsContent::Report(report),
             (None, Some(refusal)) => InsightsContent::Refused(refusal),
             (None, None) => InsightsContent::Reading,
@@ -662,7 +712,7 @@ impl InsightsView {
         range: MetricsRange,
     ) -> Option<&UsageMetricsReadRefusal> {
         self.report(origin, range)
-            .and_then(|_| self.refusal_of(origin, range))
+            .and_then(|_| self.reports.refusal(origin, range))
     }
 
     pub(in crate::tui) fn focused(&self) -> Option<InsightsPanel> {

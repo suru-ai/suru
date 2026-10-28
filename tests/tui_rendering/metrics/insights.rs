@@ -51,7 +51,7 @@ struct InsightsReads {
 
 fn expect_insights_reads(transition: ApplicationTransition) -> InsightsReads {
     match transition {
-        ApplicationTransition::ReadUsageInsights {
+        ApplicationTransition::ReadUsageInsightsAndWorkspaces {
             origin,
             request_id,
             query,
@@ -1484,10 +1484,39 @@ fn below_the_mockup_s_width_the_small_panels_stack_and_say_it_all_where_they_fit
         ]
     );
     assert_eq!(
-        lines(" Approvals ")[1..3],
+        lines(" Approvals "),
         [
+            "188 asked",
             "✓ 171 accepted ✗ 12 declined ⧗ 5 waiting or expired",
             "11 for the Session · 2 also interrupted the Turn",
-        ]
+        ],
+        "only the rows it fills"
+    );
+    assert_eq!(
+        lines(" Cache "),
+        ["71% of input from cache", "saved ≈ $1104.00 (est.)"]
+    );
+}
+
+#[test]
+fn a_wide_cache_panel_says_in_full_what_it_has_no_figure_for() {
+    let cache_lines =
+        |report: InsightsReport| panel_lines_at(&on_insights(Ok(report)), " Cache ", STACKED_WIDTH);
+    let mut unrated = worked();
+    unrated.cache.saving = EstimatedSaving {
+        nano_usd: None,
+        is_partial: true,
+    };
+    let mut uncached = worked();
+    uncached.cache.saving = EstimatedSaving::default();
+
+    assert_eq!(cache_lines(unrated)[1], "No rates to estimate a saving at");
+    assert_eq!(
+        cache_lines(uncached)[1],
+        "Nothing read from or written to cache"
+    );
+    assert_eq!(
+        cache_lines(InsightsReport::default())[0],
+        "No input in the last 30 days"
     );
 }

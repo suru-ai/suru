@@ -19,6 +19,7 @@ use super::{
         calendar::MetricsRange,
     },
     InsightsPanel, InsightsView, RowWindow,
+    view::nothing,
 };
 
 /// How many lines the panel has for its Tools, the fold among them.
@@ -99,8 +100,8 @@ pub(super) fn render(
     let room = usize::from(area.width);
     let subdued = theme.text.subdued;
     if tools.is_empty() {
-        let note = format!("No Tools used {}", range.within());
-        buffer.set_string(area.x, area.y, truncate_to_width(&note, room), subdued);
+        let note = nothing(room, "No Tools used", range);
+        buffer.set_string(area.x, area.y, note, subdued);
         return;
     }
     let label_width = room.saturating_sub(USES_WIDTH + 2 + FAILED_WIDTH + 1);

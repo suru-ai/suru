@@ -14,7 +14,7 @@ use super::{
         super::{slots::truncate_to_width, usage::compact_dollars},
         calendar::MetricsRange,
     },
-    view::fitting,
+    view::{fitting, nothing},
 };
 
 /// The rows the panel draws inside its border.
@@ -32,13 +32,7 @@ pub(super) fn render(
     let subdued = theme.text.subdued;
     let primary = theme.text.primary;
     let Some(share) = cache.read_share() else {
-        let note = fitting(
-            room,
-            [
-                format!("No input {}", range.within()),
-                "No input".to_owned(),
-            ],
-        );
+        let note = nothing(room, "No input", range);
         buffer.set_string(area.x, area.y, note, subdued);
         return;
     };

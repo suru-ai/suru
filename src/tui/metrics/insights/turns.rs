@@ -18,7 +18,7 @@ use super::{
         view::share,
     },
     InsightsPanel, InsightsView,
-    view::{fitting, render_fitting_spans},
+    view::{fitting, nothing, render_fitting_spans, tallies},
 };
 
 /// The rows the panel draws inside its border.
@@ -57,13 +57,7 @@ pub(super) fn render(
     let subdued = theme.text.subdued;
     let primary = theme.text.primary;
     if turns.completed + turns.failed + turns.interrupted == 0 {
-        let note = fitting(
-            room,
-            [
-                format!("No Turns {}", range.within()),
-                "No Turns".to_owned(),
-            ],
-        );
+        let note = nothing(room, "No Turns", range);
         buffer.set_string(area.x, area.y, note, subdued);
         return;
     }
@@ -100,23 +94,15 @@ pub(super) fn render(
             theme.feedback.warning,
         ),
     ];
-    let spans = |named: bool| {
-        ended
-            .iter()
-            .enumerate()
-            .flat_map(|(place, (glyph, count, name, style))| {
-                let gap = if place == 0 { "" } else { "  " };
-                let count = grouped_count(*count);
-                let figure = if named {
-                    format!("{count} {name}")
-                } else {
-                    count
-                };
-                [(format!("{gap}{glyph} "), *style), (figure, primary)]
-            })
-            .collect()
-    };
-    render_fitting_spans(buffer, area, area.y + 2, [spans(true), spans(false)]);
+    render_fitting_spans(
+        buffer,
+        area,
+        area.y + 2,
+        [
+            tallies(&ended, true, primary),
+            tallies(&ended, false, primary),
+        ],
+    );
 }
 
 /// `count` Turns, written whole.
