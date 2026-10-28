@@ -3140,3 +3140,27 @@ fn where_too_short_to_list_every_series_the_focus_stops_at_the_last_drawn() {
         ))
     );
 }
+
+#[test]
+fn where_too_short_to_list_any_series_nothing_can_be_focused() {
+    // Eight rows leave the legend its heading alone; six leave it nothing.
+    for short in [8, 6] {
+        let mut application = thirty_days_of_tokens();
+        let rows = rendered_application_rows_at(&application, WIDTH, short);
+        assert!(
+            !rows.iter().any(|row| row.contains("Claude Opus 5.5")),
+            "{rows:#?}"
+        );
+
+        key(&mut application, KeyCode::Down);
+        key(&mut application, KeyCode::Up);
+        assert_eq!(
+            application.command_for_terminal_input(InputEvent::Key(KeyEvent::new(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE
+            ))),
+            None,
+            "{short} rows"
+        );
+    }
+}

@@ -109,6 +109,11 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
         area.width.saturating_sub(INSET * 2),
         area.height.saturating_sub(6),
     );
+    if matches!(view.content(), MetricsContent::Report { .. }) {
+        // No legend rows drawn until the legend says otherwise, so a frame
+        // with no room for any leaves none to focus.
+        view.record_legend_targets(Rect::new(body.x, body.y, body.width, 0));
+    }
     if body.is_empty() {
         return;
     }
@@ -315,6 +320,10 @@ fn render_legend(
 ) {
     let buffer = frame.buffer_mut();
     let measure = view.measure();
+    let drawn = u16::try_from(series.len())
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(1));
+    view.record_legend_targets(Rect::new(area.x, area.y + 1, area.width, drawn));
     if area.height == 0 {
         return;
     }
@@ -395,12 +404,6 @@ fn render_legend(
         if bar > 0 && bar_x < area.right() {
             buffer.set_string(bar_x, y, "█".repeat(bar), swatch);
         }
-    }
-    let drawn = u16::try_from(series.len())
-        .unwrap_or(u16::MAX)
-        .min(area.height - 1);
-    if drawn > 0 {
-        view.record_legend_targets(Rect::new(area.x, area.y + 1, area.width, drawn));
     }
     let note_y = u16::try_from(series.len() + 1)
         .ok()

@@ -199,7 +199,8 @@ struct Targets {
     /// The bars the chart drew, each a column of it a pointer selects by.
     bars: Option<BarStrip>,
     /// The legend's series rows it drew, one series to a row, the first at
-    /// the top.
+    /// the top: none where a frame drew a report with no room for any, and
+    /// no rect at all before any frame has drawn one.
     legend: Option<Rect>,
 }
 
