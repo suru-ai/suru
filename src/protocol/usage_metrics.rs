@@ -24,6 +24,10 @@ pub struct UsageMetricsQuery {
     /// when the earliest Turn was.
     pub buckets: Vec<UsageMetricsInterval>,
     pub breakdown: UsageMetricsBreakdown,
+    /// A span to compare the buckets with, whose figures the report gives
+    /// taken together: the period before them, say. It stands apart from
+    /// the buckets and may overlap them.
+    pub comparison: Option<UsageMetricsInterval>,
 }
 
 /// A half-open span of time, from `start` up to but not including `end`.
@@ -97,6 +101,14 @@ pub struct UsageMetricsReport {
     /// The Turns no bucket can place, having neither begun nor Settled at a
     /// recorded moment: Turns stored before Suru recorded Turn timing.
     pub untimed: UsageMetricsBucket,
+    /// The buckets and the untimed Turns taken together, as though they were
+    /// one: what a reader asking for all of time shows for the whole of it.
+    /// A Session with both timed and untimed work counts once, which adding
+    /// `across_buckets` and `untimed` cannot.
+    pub across_buckets_and_untimed: UsageMetricsAggregate,
+    /// The figures of the query's comparison interval taken together, where
+    /// it asked for one.
+    pub comparison: Option<UsageMetricsAggregate>,
     /// The moment the earliest timed Turn on the Server is placed at, from
     /// which a reader asking for all of time can begin its buckets; absent
     /// where no Turn is timed.

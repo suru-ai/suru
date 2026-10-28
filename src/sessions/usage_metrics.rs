@@ -24,7 +24,9 @@
 //! Session apart from a Subagent — in its whole and once in each key it
 //! worked under, so its keys can count more Sessions than it does. Distinct
 //! counts do not add across buckets, so the report counts the buckets
-//! taken together on their own.
+//! taken together on their own, and the buckets and the untimed Turns
+//! together likewise. A comparison interval stands apart from the buckets:
+//! a Turn it holds counts there whether or not a bucket holds it too.
 
 use std::collections::{HashMap, HashSet};
 
@@ -45,7 +47,8 @@ use super::{
 pub(crate) enum UsageMetricsRefusal {
     /// It asks for more buckets than [`MAX_USAGE_METRICS_BUCKETS`].
     TooManyBuckets,
-    /// A bucket ends before it begins, or begins before the one ahead of it.
+    /// A bucket or the comparison interval ends before it begins, or a
+    /// bucket begins before the one ahead of it.
     OutOfOrder,
     /// A bucket begins before the one ahead of it ends.
     Overlapping,
@@ -54,12 +57,18 @@ pub(crate) enum UsageMetricsRefusal {
 impl UsageMetricsRefusal {
     /// Refuses a query whose buckets no report could answer one by one:
     /// too many of them, or any running out of order or overlapping
-    /// another, so no Turn could be placed in two.
+    /// another, so no Turn could be placed in two; or whose comparison
+    /// interval ends before it begins.
     fn of(query: &UsageMetricsQuery) -> Option<Self> {
         if query.buckets.len() > MAX_USAGE_METRICS_BUCKETS {
             return Some(Self::TooManyBuckets);
         }
-        if query.buckets.iter().any(|bucket| bucket.end < bucket.start) {
+        if query
+            .buckets
+            .iter()
+            .chain(&query.comparison)
+            .any(|bucket| bucket.end < bucket.start)
+        {
             return Some(Self::OutOfOrder);
         }
         query.buckets.windows(2).find_map(|pair| {
@@ -342,6 +351,15 @@ fn key_of(
     }
 }
 
+/// Where a Turn, and the Cost it carries, lands: in the bucket at an index,
+/// in none (`Some(None)`), or among the untimed (`None`); and whether in
+/// the comparison interval besides.
+#[derive(Clone, Default)]
+struct Place {
+    bucket: Option<Option<usize>>,
+    compared: bool,
+}
+
 /// One bucket's figures as they are added up.
 #[derive(Default)]
 struct Tally {
@@ -430,8 +448,18 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
         .map(|_| Tally::default())
         .collect::<Vec<_>>();
     let mut untimed = Tally::default();
-    // Every bucket at once, where a Session working in several counts once.
+    // Every bucket at once, where a Session working in several counts once,
+    // and those and the untimed Turns at once, likewise.
     let mut across_buckets = Tally::default();
+    let mut across_buckets_and_untimed = Part::default();
+    let mut comparison = query.comparison.map(|_| Part::default());
+    let compared = |placed_at: Option<SessionTimestamp>| {
+        placed_at.is_some_and(|placed_at| {
+            query
+                .comparison
+                .is_some_and(|comparison| comparison.contains(placed_at))
+        })
+    };
     // The bucket a moment falls in, if any: the buckets run in order without
     // overlapping, so the one that can hold it is the first not over before it.
     let bucket_of = |placed_at: SessionTimestamp| {
@@ -448,16 +476,27 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
     // Where each Turn landed, for the Cost it carries to land beside it.
     let mut placed = HashMap::with_capacity(metered.turns.len());
     for turn in metered.turns {
-        let place = turn.placed_at.map(bucket_of);
-        placed.insert((turn.session_id, turn.turn_id), (place, turn.key.clone()));
+        let place = Place {
+            bucket: turn.placed_at.map(bucket_of),
+            compared: compared(turn.placed_at),
+        };
+        if let Some(comparison) = comparison.as_mut().filter(|_| place.compared) {
+            comparison.add(&turn);
+        }
+        placed.insert(
+            (turn.session_id, turn.turn_id),
+            (place.clone(), turn.key.clone()),
+        );
         let Some(placed_at) = turn.placed_at else {
             untimed.add(&turn);
+            across_buckets_and_untimed.add(&turn);
             continue;
         };
         earliest_turn_at = Some(earliest_turn_at.map_or(placed_at, |held| held.min(placed_at)));
-        if let Some(Some(index)) = place {
+        if let Some(Some(index)) = place.bucket {
             buckets[index].add(&turn);
             across_buckets.add(&turn);
+            across_buckets_and_untimed.add(&turn);
         }
     }
     for contribution in &metered.costs {
@@ -466,15 +505,19 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
         let (place, key) = placed
             .get(&(contribution.session_id, contribution.turn_id))
             .cloned()
-            .unwrap_or((None, UsageMetricsKey::Unknown));
-        match place {
+            .unwrap_or((Place::default(), UsageMetricsKey::Unknown));
+        if let Some(comparison) = comparison.as_mut().filter(|_| place.compared) {
+            add_contribution(&mut comparison.aggregate, contribution);
+        }
+        match place.bucket {
             None => untimed.add_cost(&key, contribution),
             Some(Some(index)) => {
                 buckets[index].add_cost(&key, contribution);
                 across_buckets.add_cost(&key, contribution);
             }
-            Some(None) => {}
+            Some(None) => continue,
         }
+        add_contribution(&mut across_buckets_and_untimed.aggregate, contribution);
     }
 
     let mut keys = buckets
@@ -493,6 +536,8 @@ fn fold(query: &UsageMetricsQuery, metered: Metered, names: &KeyNames) -> UsageM
             .collect(),
         untimed: untimed.into_bucket(&keys),
         across_buckets: across_buckets.into_bucket(&keys),
+        across_buckets_and_untimed: across_buckets_and_untimed.aggregate,
+        comparison: comparison.map(|comparison| comparison.aggregate),
         earliest_turn_at,
         keys: keys
             .into_iter()

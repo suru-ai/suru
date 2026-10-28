@@ -1301,6 +1301,7 @@ fn all_time_metrics(
                     end: SessionTimestamp(u64::MAX),
                 }],
                 breakdown,
+                comparison: None,
             },
             &ModelCatalog {
                 providers: Vec::new(),
@@ -1405,6 +1406,11 @@ fn assert_all_time_metrics_by_add_up_to_root_tree_costs(
         )
     };
     let all_time = added(&[report.buckets[0].total, report.untimed.total]);
+    assert_eq!(
+        added(&[report.across_buckets_and_untimed]),
+        all_time,
+        "the buckets and the untimed Turns together hold what each does"
+    );
     let by_key = added(
         &report
             .buckets

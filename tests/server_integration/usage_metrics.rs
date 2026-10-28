@@ -34,6 +34,7 @@ async fn usage_metrics_are_read_from_the_server_the_outlook_names() {
             .usage_metrics(&UsageMetricsQuery {
                 buckets: vec![day],
                 breakdown: UsageMetricsBreakdown::Model,
+                comparison: None,
             })
             .await
             .unwrap_or_else(|error| panic!("{way}: {error:#}"));

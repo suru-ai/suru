@@ -150,6 +150,8 @@ fn report(query: &UsageMetricsQuery) -> UsageMetricsReport {
     let mut report = UsageMetricsReport {
         buckets,
         untimed: UsageMetricsBucket::default(),
+        across_buckets_and_untimed: UsageMetricsAggregate::default(),
+        comparison: None,
         earliest_turn_at: query.buckets.first().map(|bucket| bucket.start),
         // Listed smallest first, so the chart's order is its own.
         keys: vec![
@@ -187,9 +189,10 @@ fn report(query: &UsageMetricsQuery) -> UsageMetricsReport {
     report
 }
 
-/// Sets `report`'s figures across its buckets to them taken together, as the Server does,
-/// in the figures that add up across buckets: Usage and Cost. Session counts
-/// do not, so it keeps those it was given.
+/// Sets `report`'s figures across its buckets, and across them and its
+/// untimed Turns, which it holds none of, to the buckets taken together, as
+/// the Server does, in the figures that add up across buckets: Usage and
+/// Cost. Session counts do not, so it keeps those it was given.
 fn take_together(report: &mut UsageMetricsReport) {
     fn add(into: &mut UsageMetricsAggregate, part: &UsageMetricsAggregate) {
         let count = |held: Option<u64>, more: Option<u64>| match (held, more) {
@@ -237,6 +240,7 @@ fn take_together(report: &mut UsageMetricsReport) {
             }
         }
     }
+    report.across_buckets_and_untimed = total;
     report.across_buckets = UsageMetricsBucket { total, by_key };
 }
 
@@ -494,6 +498,8 @@ fn a_range_without_usage_says_so() {
         Ok(UsageMetricsReport {
             buckets: vec![UsageMetricsBucket::default(); query.buckets.len()],
             untimed: UsageMetricsBucket::default(),
+            across_buckets_and_untimed: UsageMetricsAggregate::default(),
+            comparison: None,
             earliest_turn_at: None,
             keys: Vec::new(),
             across_buckets: UsageMetricsBucket::default(),
@@ -888,6 +894,8 @@ fn empty_report(
     UsageMetricsReport {
         buckets: vec![UsageMetricsBucket::default(); query.buckets.len()],
         untimed: UsageMetricsBucket::default(),
+        across_buckets_and_untimed: UsageMetricsAggregate::default(),
+        comparison: None,
         earliest_turn_at: earliest,
         keys: Vec::new(),
         across_buckets: UsageMetricsBucket::default(),
@@ -1944,6 +1952,8 @@ fn many_workspaces(query: &UsageMetricsQuery, keys: u64) -> UsageMetricsReport {
             })
             .collect(),
         untimed: UsageMetricsBucket::default(),
+        across_buckets_and_untimed: UsageMetricsAggregate::default(),
+        comparison: None,
         earliest_turn_at: query.buckets.first().map(|bucket| bucket.start),
         // By identity, which says nothing of their size.
         keys: (0..keys)

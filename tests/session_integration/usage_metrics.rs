@@ -16,6 +16,7 @@ fn by_model(buckets: Vec<UsageMetricsInterval>) -> UsageMetricsQuery {
     UsageMetricsQuery {
         buckets,
         breakdown: UsageMetricsBreakdown::Model,
+        comparison: None,
     }
 }
 
@@ -66,19 +67,23 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
         .started_at
         .expect("a Turn begun now is timed");
 
+    let the_turn = UsageMetricsInterval {
+        start: started_at,
+        end: SessionTimestamp(started_at.0 + 1),
+    };
     let response = ask(
         &fixture.client,
         &descriptor,
-        &by_model(vec![
-            UsageMetricsInterval {
-                start: SessionTimestamp(0),
-                end: started_at,
-            },
-            UsageMetricsInterval {
-                start: started_at,
-                end: SessionTimestamp(started_at.0 + 1),
-            },
-        ]),
+        &UsageMetricsQuery {
+            comparison: Some(the_turn),
+            ..by_model(vec![
+                UsageMetricsInterval {
+                    start: SessionTimestamp(0),
+                    end: started_at,
+                },
+                the_turn,
+            ])
+        },
     )
     .await;
 
@@ -91,6 +96,7 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
         // The Turn is working still, past what its Cost says.
         is_cost_partial: true,
         sessions: 1,
+        turns: 1,
         ..UsageMetricsAggregate::default()
     };
     assert_eq!(report.buckets.len(), 2);
@@ -107,6 +113,12 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
         vec![&report.buckets[1].by_key[0].key]
     );
     assert_eq!(report.earliest_turn_at, Some(started_at));
+    assert_eq!(
+        report.comparison,
+        Some(measured),
+        "the comparison asked for"
+    );
+    assert_eq!(report.across_buckets_and_untimed, measured);
     assert_eq!(
         report.across_buckets.total, measured,
         "the buckets taken together hold the one Session's Turn"

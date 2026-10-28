@@ -510,6 +510,7 @@ impl MetricsView {
         let query = UsageMetricsQuery {
             buckets,
             breakdown: self.breakdown,
+            comparison: None,
         };
         self.asked = Some((request_id, asked));
         self.refusal = None;

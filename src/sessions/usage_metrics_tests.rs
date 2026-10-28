@@ -84,6 +84,7 @@ fn by_model(buckets: &[(u64, u64)]) -> UsageMetricsQuery {
             .map(|(start, end)| interval(*start, *end))
             .collect(),
         breakdown: UsageMetricsBreakdown::Model,
+        comparison: None,
     }
 }
 
@@ -1176,6 +1177,136 @@ async fn the_range_holds_the_cost_its_buckets_add_up_to() {
     assert_eq!(
         cost(&keyed(&report.across_buckets, &key(CODEX))),
         (None, true, None)
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_comparison_interval_holds_what_its_turns_consumed_apart_from_the_buckets() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut earlier = persisted(directory.path(), None);
+    earlier.snapshot.turns = vec![
+        turn_scoped(OPUS, 3, 0.10),
+        Turn {
+            status: TurnStatus::Interrupted,
+            ..metered(CODEX, Some(6), None, 10)
+        },
+        // Before the comparison begins.
+        metered(OPUS, Some(1), None, 1000),
+        metered(OPUS, None, None, 10_000),
+    ];
+    let mut later = persisted(directory.path(), None);
+    later.snapshot.turns = vec![
+        // Placed by its Settle, in the comparison too.
+        metered(OPUS, None, Some(9), 100),
+        metered(OPUS, Some(15), None, 100_000),
+    ];
+    let (store, writer) = restore(directory.path(), vec![earlier, later]).await;
+
+    let report = read(
+        &store,
+        &UsageMetricsQuery {
+            comparison: Some(interval(2, 10)),
+            ..by_model(&[(10, 20)])
+        },
+    );
+
+    assert_eq!(
+        report.comparison,
+        Some(UsageMetricsAggregate {
+            output_tokens: Some(111),
+            cost: usd(0.10),
+            is_cost_partial: true,
+            sessions: 2,
+            turns: 3,
+            interrupted_turns: 1,
+            ..Default::default()
+        })
+    );
+    assert_eq!(
+        report.across_buckets.total.output_tokens,
+        Some(100_000),
+        "the buckets hold none of the comparison's Turns"
+    );
+    assert_eq!(
+        read(&store, &by_model(&[(10, 20)])).comparison,
+        None,
+        "a query asking for no comparison is answered with none"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_comparison_interval_may_overlap_the_buckets_but_not_end_before_it_begins() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![metered(OPUS, Some(15), None, 1)];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+    let with_comparison = |start, end| UsageMetricsQuery {
+        comparison: Some(interval(start, end)),
+        ..by_model(&[(10, 20)])
+    };
+
+    let overlapping = read(&store, &with_comparison(12, 18));
+    assert_eq!(
+        overlapping
+            .comparison
+            .map(|comparison| comparison.output_tokens),
+        Some(Some(1))
+    );
+    assert_eq!(overlapping.buckets[0].total.output_tokens, Some(1));
+    assert_eq!(
+        store
+            .usage_metrics(
+                &with_comparison(10, 5),
+                &ModelCatalog {
+                    providers: Vec::new(),
+                },
+                &WorkspacePaths::default(),
+            )
+            .expect_err("the query is refused"),
+        UsageMetricsRefusal::OutOfOrder
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_buckets_and_the_untimed_turns_together_count_each_session_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut both = persisted(directory.path(), None);
+    both.snapshot.turns = vec![
+        turn_scoped(OPUS, 11, 0.10),
+        Turn {
+            status: TurnStatus::Failed,
+            ..metered(OPUS, None, None, 10)
+        },
+        // In no bucket, nor untimed: in neither figure.
+        metered(OPUS, Some(1), None, 1000),
+    ];
+    let both_id = both.snapshot.session.id;
+    let mut subagent = persisted(directory.path(), Some(both_id));
+    subagent.snapshot.turns = vec![metered(CODEX, None, None, 100)];
+    let mut untimed = persisted(directory.path(), None);
+    untimed.snapshot.turns = vec![metered(CODEX, None, None, 10_000)];
+    let (store, writer) = restore(directory.path(), vec![both, subagent, untimed]).await;
+
+    let report = read(&store, &by_model(&[(10, 20)]));
+
+    assert_eq!(sessions(&report.across_buckets.total), (1, 0));
+    assert_eq!(sessions(&report.untimed.total), (2, 1));
+    assert_eq!(
+        report.across_buckets_and_untimed,
+        UsageMetricsAggregate {
+            output_tokens: Some(10_111),
+            cost: usd(0.10),
+            is_cost_partial: true,
+            sessions: 2,
+            subagent_sessions: 1,
+            turns: 4,
+            failed_turns: 1,
+            ..Default::default()
+        },
+        "a Session with timed and untimed work counts once, not once in each"
     );
     writer.shutdown().await.unwrap();
 }
