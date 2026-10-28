@@ -50,6 +50,8 @@ mod relays;
 mod state_loss;
 #[path = "server_integration/stop_finality.rs"]
 mod stop_finality;
+#[path = "server_integration/usage_metrics.rs"]
+mod usage_metrics;
 
 use crate::support::connect_proxy;
 use crate::support::failing_provider as failing_provider_support;

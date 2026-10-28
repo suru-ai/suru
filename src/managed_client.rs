@@ -971,6 +971,16 @@ impl OutlookClient {
         self.commands.list_directory(request).await
     }
 
+    /// The Usage Metrics of every Session living on the Server this Outlook
+    /// names, in the buckets `query` cuts. A refused query carries its typed
+    /// [`crate::protocol::SessionError`].
+    pub async fn usage_metrics(
+        &self,
+        query: &crate::protocol::UsageMetricsQuery,
+    ) -> Result<crate::protocol::UsageMetricsReport> {
+        self.commands.usage_metrics(query).await
+    }
+
     /// The Sidekick Workspace of the Server this Client's own Outlook names,
     /// made there first if it is not there yet.
     pub async fn sidekick_workspace(&self) -> Result<crate::protocol::ResolvedWorkspace> {
@@ -1256,6 +1266,16 @@ impl SessionCommandClient {
             .await
             .context("send directory listing")?;
         decode_api_response(response, "Directory listing").await
+    }
+
+    /// The Usage Metrics of the Server this Outlook names. The query rides
+    /// the body, as the Server's route asks.
+    pub(crate) async fn usage_metrics(
+        &self,
+        query: &crate::protocol::UsageMetricsQuery,
+    ) -> Result<crate::protocol::UsageMetricsReport> {
+        self.post_session_command("/v1/usage-metrics", query, "Usage Metrics read")
+            .await
     }
 
     /// The Sidekick Workspace of the Server this Outlook names, which that
