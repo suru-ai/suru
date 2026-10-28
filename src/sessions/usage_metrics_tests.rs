@@ -25,7 +25,7 @@ use crate::{
 /// A Turn of `model` under `provider`, Settled as Completed, that began at
 /// `started_at`, Settled at `settled_at`, and reported `output` tokens, with
 /// no Cost.
-fn metered(
+pub(super) fn metered(
     agent: Option<(&str, &str)>,
     started_at: Option<u64>,
     settled_at: Option<u64>,
@@ -59,10 +59,10 @@ fn metered(
 
 /// The Remote a Sidekick here began a Session on, and the key of the
 /// Pairing it was begun through.
-const STUDIO: &str = "studio";
-const PAIRING: &str = "SHA256:studio";
+pub(super) const STUDIO: &str = "studio";
+pub(super) const PAIRING: &str = "SHA256:studio";
 
-const FABLE: Option<(&str, &str)> = Some(("claude", "claude-fable-5-1"));
+pub(super) const FABLE: Option<(&str, &str)> = Some(("claude", "claude-fable-5-1"));
 
 fn fable() -> UsageMetricsKey {
     UsageMetricsKey::Model {
@@ -138,7 +138,7 @@ fn only(key: UsageMetricsKey, tokens: u64) -> UsageMetricsBucket {
     }
 }
 
-async fn restore(
+pub(super) async fn restore(
     directory: &Path,
     records: Vec<PersistedSession>,
 ) -> (SessionStore, StorageWriter) {

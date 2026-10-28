@@ -1,11 +1,12 @@
-//! Usage Metrics asked of the Server over its HTTP API. What the read adds up
-//! is the Session store's to show; this shows the query and the report cross
-//! the wire.
+//! Usage Metrics and Insights asked of the Server over its HTTP API. What
+//! each read adds up is the Session store's to show; this shows the queries
+//! and the reports cross the wire.
 
 use crate::session_integration::support::{read_session_until, working_turn};
 use suru::{
     protocol::{
-        Cost, RuntimeDescriptor, SessionError, SessionErrorCode, SessionTimestamp, Usage,
+        Cost, InsightsQuery, InsightsReport, RuntimeDescriptor, SessionError, SessionErrorCode,
+        SessionTimestamp, TURN_DURATION_BINS, TurnDurations, TurnInsights, Usage,
         UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsKey,
         UsageMetricsQuery, UsageMetricsReport,
     },
@@ -175,6 +176,78 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
         &by_model(vec![overlapping, overlapping]),
     )
     .await;
+    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+    let refused = refused.json::<SessionError>().await.unwrap();
+    assert_eq!(refused.code, SessionErrorCode::InvalidUsageMetricsQuery);
+    fixture.server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn insights_are_read_over_the_api_and_a_backwards_interval_is_refused() {
+    let state = tempfile::tempdir().unwrap();
+    let fixture = working_turn(state.path(), "usage-insights-read").await;
+    let descriptor = fixture.server.descriptor().clone();
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    let snapshot = read_session_until(
+        &fixture.client,
+        &descriptor,
+        fixture.session_id,
+        "the Turn Settles",
+        |snapshot| {
+            snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.settled_at.is_some())
+        },
+    )
+    .await;
+    let turn = &snapshot.turns[0];
+    let started_at = turn.started_at.expect("a Turn begun now is timed");
+    let took = turn.settled_at.expect("a Settled Turn is timed").0 - started_at.0;
+    let ask = |interval: UsageMetricsInterval| {
+        fixture
+            .client
+            .post(format!("{}/v1/usage-metrics/insights", descriptor.base_url))
+            .bearer_auth(&descriptor.token)
+            .json(&InsightsQuery { interval })
+            .send()
+    };
+
+    let response = ask(UsageMetricsInterval {
+        start: started_at,
+        end: SessionTimestamp(started_at.0 + 1),
+    })
+    .await
+    .expect("send the Insights read");
+
+    assert!(response.status().is_success(), "{}", response.status());
+    let report = response.json::<InsightsReport>().await.unwrap();
+    let mut bins = [0; TURN_DURATION_BINS];
+    bins[0] = 1;
+    assert_eq!(
+        report.turns,
+        TurnInsights {
+            durations: Some(TurnDurations {
+                median_ms: took,
+                p90_ms: took,
+                longest_ms: took,
+                bins,
+            }),
+            completed: 1,
+            failed: 0,
+            interrupted: 0,
+        }
+    );
+
+    let refused = ask(UsageMetricsInterval {
+        start: SessionTimestamp(started_at.0 + 1),
+        end: started_at,
+    })
+    .await
+    .expect("send the backwards Insights read");
     assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
     let refused = refused.json::<SessionError>().await.unwrap();
     assert_eq!(refused.code, SessionErrorCode::InvalidUsageMetricsQuery);

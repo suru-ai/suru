@@ -238,3 +238,59 @@ impl UsageMetricsAggregate {
         )
     }
 }
+
+/// What a reader asks of a Server's Insights: how the Sessions living there
+/// worked over one span of time, rather than how much they consumed in each
+/// of many. The Server places each Turn in it as it places one in a bucket.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InsightsQuery {
+    /// Refused where it ends before it begins.
+    pub interval: UsageMetricsInterval,
+}
+
+/// A Server's answer to an [`InsightsQuery`], over the Turns its interval
+/// holds: those with a recorded moment to place them by, of the Sessions a
+/// [`UsageMetricsReport`] counts. Each part is one panel's figures.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InsightsReport {
+    pub turns: TurnInsights,
+}
+
+/// How long the interval's Turns took to Settle, and how they ended.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnInsights {
+    /// Over every Settled Turn that recorded when it began and when it
+    /// Settled; absent where none did. A Turn still working has no duration
+    /// yet, and one missing either moment has none to give.
+    pub durations: Option<TurnDurations>,
+    pub completed: u64,
+    pub failed: u64,
+    pub interrupted: u64,
+}
+
+/// How many fixed bins [`TurnDurations::bins`] counts Turns in.
+pub const TURN_DURATION_BINS: usize = 8;
+
+/// Where each of [`TurnDurations::bins`] but the last ends, in milliseconds:
+/// under 10s, 10–30s, 30s–1m, 1–2m, 2–5m, 5–15m, 15–30m, and the last bin
+/// holding 30m and over. A bin holds a duration from where the one before it
+/// ends up to but not including where it ends.
+pub const TURN_DURATION_BIN_ENDS_MS: [u64; TURN_DURATION_BINS - 1] =
+    [10_000, 30_000, 60_000, 120_000, 300_000, 900_000, 1_800_000];
+
+/// The durations of a set of Turns, each its settle time less its start
+/// time, in milliseconds. The median and p90 are nearest-rank: the duration
+/// at least half, or nine in ten, of the Turns took no longer than.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnDurations {
+    pub median_ms: u64,
+    pub p90_ms: u64,
+    pub longest_ms: u64,
+    /// How many of the Turns took a duration in each bin, as
+    /// [`TURN_DURATION_BIN_ENDS_MS`] cuts them.
+    pub bins: [u64; TURN_DURATION_BINS],
+}

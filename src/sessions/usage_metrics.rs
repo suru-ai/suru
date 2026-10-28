@@ -36,6 +36,10 @@
 //! of its own, listed and counted as one. Each is ranked once its Cost is
 //! added, the few asked for picked out without sorting the rest.
 
+mod insights;
+
+pub(crate) use insights::InsightsRefusal;
+
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -269,49 +273,72 @@ impl MeteredForest {
     /// listing shows, so neither its Usage nor its Cost is counted, and the
     /// two measures cover the same Sessions.
     fn metered(&self, breakdown: UsageMetricsBreakdown) -> Metered {
-        let roots: Vec<SessionId> = self
-            .sessions
-            .iter()
-            .filter(|(_, session)| self.heads_a_cost_tree(session))
-            .map(|(session_id, _)| *session_id)
-            .collect();
+        let roots = self.cost_tree_heads();
         let costs = roots
             .iter()
             .flat_map(|root| tree_contributions(self, *root))
             .collect();
-        let mut counted = HashSet::new();
         let mut turns = Vec::new();
-        for root in roots {
-            // A Subsession heads a tree of its own, owning its Cost.
-            let trees = std::iter::once(root).chain(self.subsessions_begun_by(root));
-            let owned = trees.flat_map(|head| {
-                self.subtree_of(head)
-                    .into_iter()
-                    .map(move |session_id| (head, session_id))
-            });
-            for (owner, session_id) in owned {
-                if !counted.insert(session_id) {
-                    continue;
-                }
-                let session = &self.sessions[&session_id];
-                turns.extend(session.turns.iter().map(|turn| MeteredTurn {
-                    session_id,
-                    turn_id: turn.id,
-                    is_subagent: session.parent.is_some(),
-                    owner,
-                    placed_at: turn.started_at.or(turn.settled_at),
-                    key: key_of(breakdown, session, turn),
-                    model: match key_of(UsageMetricsBreakdown::Model, session, turn) {
-                        UsageMetricsKey::Unknown => None,
-                        model => Some(model),
-                    },
-                    status: turn.status,
-                    usage: turn.usage.clone(),
-                }));
-            }
+        for CountedSession { owner, session_id } in self.counted_sessions(&roots) {
+            let session = &self.sessions[&session_id];
+            turns.extend(session.turns.iter().map(|turn| MeteredTurn {
+                session_id,
+                turn_id: turn.id,
+                is_subagent: session.parent.is_some(),
+                owner,
+                placed_at: placed_at(turn),
+                key: key_of(breakdown, session, turn),
+                model: match key_of(UsageMetricsBreakdown::Model, session, turn) {
+                    UsageMetricsKey::Unknown => None,
+                    model => Some(model),
+                },
+                status: turn.status,
+                usage: turn.usage.clone(),
+            }));
         }
         Metered { turns, costs }
     }
+
+    /// Every Session heading a tree whose Cost the Server's Cost adds up.
+    fn cost_tree_heads(&self) -> Vec<SessionId> {
+        self.sessions
+            .iter()
+            .filter(|(_, session)| self.heads_a_cost_tree(session))
+            .map(|(session_id, _)| *session_id)
+            .collect()
+    }
+
+    /// Every Session in a tree headed by one of `roots`, each once, beside
+    /// the top-level Session owning its Cost: every Session a read of Usage
+    /// Metrics or Insights counts. A Subsession heads a tree of its own,
+    /// owning its Cost, though its Sidekick's tree Cost carries it.
+    fn counted_sessions(&self, roots: &[SessionId]) -> Vec<CountedSession> {
+        let mut counted = HashSet::new();
+        let mut sessions = Vec::new();
+        for root in roots {
+            let trees = std::iter::once(*root).chain(self.subsessions_begun_by(*root));
+            for owner in trees {
+                for session_id in self.subtree_of(owner) {
+                    if counted.insert(session_id) {
+                        sessions.push(CountedSession { owner, session_id });
+                    }
+                }
+            }
+        }
+        sessions
+    }
+}
+
+/// A Session a read counts, and the top-level Session owning its Cost.
+struct CountedSession {
+    owner: SessionId,
+    session_id: SessionId,
+}
+
+/// The moment a Turn is placed at in time: when it began, otherwise when it
+/// Settled, and none where it recorded neither.
+fn placed_at(turn: &Turn) -> Option<SessionTimestamp> {
+    turn.started_at.or(turn.settled_at)
 }
 
 impl CostForest for MeteredForest {

@@ -981,6 +981,16 @@ impl OutlookClient {
         self.commands.usage_metrics(query).await
     }
 
+    /// The Insights of every Session living on the Server this Outlook
+    /// names, over `query`'s interval. A refused query carries its typed
+    /// [`crate::protocol::SessionError`].
+    pub async fn usage_insights(
+        &self,
+        query: &crate::protocol::InsightsQuery,
+    ) -> Result<crate::protocol::InsightsReport> {
+        self.commands.usage_insights(query).await
+    }
+
     /// The Sidekick Workspace of the Server this Client's own Outlook names,
     /// made there first if it is not there yet.
     pub async fn sidekick_workspace(&self) -> Result<crate::protocol::ResolvedWorkspace> {
@@ -1275,6 +1285,16 @@ impl SessionCommandClient {
         query: &crate::protocol::UsageMetricsQuery,
     ) -> Result<crate::protocol::UsageMetricsReport> {
         self.post_session_command("/v1/usage-metrics", query, "Usage Metrics read")
+            .await
+    }
+
+    /// The Insights of the Server this Outlook names, asked as its Usage
+    /// Metrics are.
+    pub(crate) async fn usage_insights(
+        &self,
+        query: &crate::protocol::InsightsQuery,
+    ) -> Result<crate::protocol::InsightsReport> {
+        self.post_session_command("/v1/usage-metrics/insights", query, "Insights read")
             .await
     }
 

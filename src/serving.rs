@@ -6912,13 +6912,15 @@ mod tests {
     }
 
     /// A Peer reads what a Client of this Server could, short of its
-    /// administration: a Remote's Usage Metrics are read through the
-    /// Pairing, by whichever way it was reached, as its Sessions are.
+    /// administration: a Remote's Usage Metrics and Insights are read
+    /// through the Pairing, by whichever way it was reached, as its Sessions
+    /// are.
     #[test]
     fn a_peer_reads_usage_metrics_as_it_reads_sessions() {
         for (method, path) in [
             (Method::GET, "/v1/sessions"),
             (Method::POST, "/v1/usage-metrics"),
+            (Method::POST, "/v1/usage-metrics/insights"),
         ] {
             assert!(
                 peer_route_class(&method, path) == PeerRouteClass::Api,

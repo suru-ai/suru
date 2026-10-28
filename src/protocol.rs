@@ -5333,7 +5333,8 @@ pub enum SessionErrorCode {
     /// The Provider was asked for a Context Breakdown and gave none.
     ContextBreakdownFailed,
     /// A Usage Metrics query asked for more buckets than one may, or for
-    /// buckets out of order or overlapping.
+    /// buckets out of order or overlapping; or an Insights query's interval
+    /// ends before it begins.
     InvalidUsageMetricsQuery,
     PromptConflict,
     PromptNotFound,

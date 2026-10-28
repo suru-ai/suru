@@ -36,7 +36,7 @@ use crate::errands::{DEFAULT_ERRAND_TIMEOUT, ErrandRunner};
 use crate::model_catalog::{CatalogMemory, ModelCatalogService};
 use crate::protocol::{
     AUTHOR_HEADER, Activity, AdmitPromptRequest, AgentSelection, Author, CloneWorkspaceRequest,
-    ClonedWorkspace, CompactSessionRequest, CreateSessionRequest, InterruptOutcome,
+    ClonedWorkspace, CompactSessionRequest, CreateSessionRequest, InsightsQuery, InterruptOutcome,
     IssueInviteRequest, LifecycleState, ListDirectoryRequest, ListenerState,
     MAX_USAGE_METRICS_BUCKETS, MAX_USAGE_METRICS_TOP_SESSIONS, MODEL_CATALOG_EVENT, Message,
     MessageId, MessageRole, MessageStatus, ModelCatalog, ONBOARDED_EVENT, PROMPT_ADMISSION_HEADER,
@@ -62,9 +62,9 @@ use crate::runtime::protect_current_user_file;
 use crate::serving::{ForgedAuthor, ServingController};
 use crate::sessions::{
     AgentSelectionMutationError, ApprovalPostureMutationError, CompactSessionError,
-    DeleteSessionError, Derivation, PromptMutationError, ProposalRefusal, SessionCatalogFeed,
-    SessionFeed, SessionStore, SetIconError, SetTitleError, SetWorkspaceDescriptionError,
-    SetWorkspaceIconError, StoreOutcome, UsageMetricsRefusal,
+    DeleteSessionError, Derivation, InsightsRefusal, PromptMutationError, ProposalRefusal,
+    SessionCatalogFeed, SessionFeed, SessionStore, SetIconError, SetTitleError,
+    SetWorkspaceDescriptionError, SetWorkspaceIconError, StoreOutcome, UsageMetricsRefusal,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
@@ -1963,6 +1963,7 @@ async fn start(
         )
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/usage-metrics", post(read_usage_metrics))
+        .route("/v1/usage-metrics/insights", post(read_usage_insights))
         .merge(
             Router::new()
                 .route(
@@ -3756,6 +3757,25 @@ async fn read_usage_metrics(State(state): State<AppState>, request: Request) -> 
                      Sessions"
                 ),
             },
+        ),
+    }
+}
+
+/// Insights of every Session living on this Server, on the same terms as
+/// its Usage Metrics: the query rides the body, and the read changes nothing
+/// and reads no history in.
+async fn read_usage_insights(State(state): State<AppState>, request: Request) -> Response {
+    let query =
+        match decode_session_command::<InsightsQuery>(&state, request, "Insights read").await {
+            Ok(query) => query,
+            Err(response) => return response,
+        };
+    match state.sessions.usage_insights(&query) {
+        Ok(report) => Json(report).into_response(),
+        Err(InsightsRefusal::Backwards) => session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidUsageMetricsQuery,
+            "An Insights query's interval ends before it begins".to_owned(),
         ),
     }
 }

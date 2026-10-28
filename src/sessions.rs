@@ -69,7 +69,9 @@ mod subagents;
 mod subsessions;
 mod title;
 mod usage_metrics;
-pub(crate) use usage_metrics::UsageMetricsRefusal;
+pub(crate) use usage_metrics::{InsightsRefusal, UsageMetricsRefusal};
+#[cfg(test)]
+mod usage_insights_tests;
 #[cfg(test)]
 mod usage_metrics_tests;
 mod viewed;
