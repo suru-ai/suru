@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::protocol::{Cost, CostBasis, ModelId, Usage};
+use crate::protocol::{Cost, CostBasis, ModelId, ProviderId, Usage};
 use crate::runtime::protect_current_user_file;
 
 const DEFAULT_SOURCE_ENDPOINT: &str = "https://models.dev/api.json";
@@ -51,6 +51,45 @@ impl EstimatedCost {
     pub const fn basis(self) -> CostBasis {
         CostBasis::Estimated
     }
+}
+
+/// What a token of each part of a Model's input costs today, in USD per
+/// million tokens: the three rates a cache saving is estimated from. Only a
+/// Model priced at all three has any.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CacheRates {
+    pub input: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+impl CacheRates {
+    /// What reading `cache_read_tokens` from cache saved over sending them
+    /// as fresh input, less what writing `cache_write_tokens` to it cost
+    /// beyond sending those as fresh input, in USD. Negative where the
+    /// writes cost more than the reads saved.
+    pub fn saving_usd(self, cache_read_tokens: u64, cache_write_tokens: u64) -> f64 {
+        (cache_read_tokens as f64 * (self.input - self.cache_read)
+            - cache_write_tokens as f64 * (self.cache_write - self.input))
+            / USD_PER_MILLION_TOKENS
+    }
+}
+
+/// The future a [`CacheRateLookup`] answers with.
+pub type CacheRatesFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<CacheRates>> + Send + 'a>>;
+
+/// Where the rates each Provider prices its Models at today are found, as
+/// a cache saving is estimated from them. A Server asks its Provider
+/// runtimes; a test injects a fixed table.
+pub trait CacheRateLookup: Send + Sync {
+    /// `model` of `provider`'s rates, absent where it is not priced at all
+    /// three. May wait on a bounded fetch.
+    fn cache_rates<'a>(
+        &'a self,
+        provider: &'a ProviderId,
+        model: &'a ModelId,
+    ) -> CacheRatesFuture<'a>;
 }
 
 /// Best-effort models.dev pricing behind one lookup interface. The source's
@@ -195,6 +234,13 @@ impl PricingSource {
         catalog.estimate(model, usage)
     }
 
+    /// The rates the catalog states today for `model`'s input, fresh, read
+    /// from cache, and written to it; absent where it lacks any of the
+    /// three. May fetch and wait, as [`Self::estimate`] does.
+    pub async fn cache_rates(&self, model: &ModelsDevModel) -> Option<CacheRates> {
+        self.fetch_catalog().await?.cache_rates(model)
+    }
+
     async fn fetch_catalog(&self) -> Option<RateCatalog> {
         let mut state = self.state.lock().await;
         if !state.cache_loaded {
@@ -291,6 +337,18 @@ impl RateCatalog {
             .get(model.model.as_str())?
             .price(usage)?;
         Some(EstimatedCost { cost })
+    }
+
+    fn cache_rates(&self, model: &ModelsDevModel) -> Option<CacheRates> {
+        let rates = self
+            .providers
+            .get(&model.provider)?
+            .get(model.model.as_str())?;
+        Some(CacheRates {
+            input: rates.input,
+            cache_read: rates.cache_read?,
+            cache_write: rates.cache_write?,
+        })
     }
 
     fn from_models_dev(source: &Value) -> Option<Self> {
@@ -580,6 +638,53 @@ mod tests {
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert!(data_dir.path().join("models-dev-pricing.json").is_file());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cache_rates_are_the_current_catalog_s_and_absent_without_all_three() {
+        let app = Router::new().route(
+            "/api.json",
+            get(|| async {
+                Json(json!({
+                    "openai": {
+                        "models": {
+                            "cached-model": {
+                                "cost": {
+                                    "input": 2.0,
+                                    "output": 4.0,
+                                    "cache_read": 0.5,
+                                    "cache_write": 2.5
+                                }
+                            },
+                            "reads-only": {
+                                "cost": { "input": 2.0, "output": 4.0, "cache_read": 0.5 }
+                            },
+                            "uncached": { "cost": { "input": 2.0, "output": 4.0 } }
+                        }
+                    }
+                }))
+            }),
+        );
+        let (endpoint, server) = serve_fixture(app).await;
+        let data_dir = tempfile::tempdir().expect("create data directory");
+        let pricing = PricingSource::new(data_dir.path()).with_source_endpoint(endpoint);
+
+        assert_eq!(
+            pricing.cache_rates(&openai_model("cached-model")).await,
+            Some(CacheRates {
+                input: 2.0,
+                cache_read: 0.5,
+                cache_write: 2.5,
+            })
+        );
+        for unpriced in ["reads-only", "uncached", "unknown"] {
+            assert_eq!(
+                pricing.cache_rates(&openai_model(unpriced)).await,
+                None,
+                "{unpriced}"
+            );
+        }
         server.abort();
     }
 

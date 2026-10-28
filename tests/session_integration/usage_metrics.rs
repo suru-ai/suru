@@ -5,12 +5,13 @@
 use crate::session_integration::support::{read_session_until, working_turn};
 use std::time::Duration;
 use suru::{
+    pricing::CacheRates,
     protocol::{
-        Cost, DelegationInsights, InsightsQuery, InsightsReport, InsightsTool, QUARTER_HOUR_MS,
-        RoleCost, RuntimeDescriptor, SessionError, SessionErrorCode, SessionTimestamp,
-        TURN_DURATION_BINS, ToolTally, TurnDurations, TurnInsights, Usage, UsageMetricsAggregate,
-        UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsKey, UsageMetricsQuery,
-        UsageMetricsReport,
+        CacheInsights, Cost, DelegationInsights, EstimatedSaving, InsightsQuery, InsightsReport,
+        InsightsTool, ModelId, QUARTER_HOUR_MS, RoleCost, RuntimeDescriptor, SessionError,
+        SessionErrorCode, SessionTimestamp, TURN_DURATION_BINS, ToolTally, TurnDurations,
+        TurnInsights, Usage, UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsInterval,
+        UsageMetricsKey, UsageMetricsQuery, UsageMetricsReport,
     },
     provider::{MeteredCost, ProviderActivityId, ProviderEvent, ProviderToolCallStatus},
 };
@@ -190,8 +191,27 @@ async fn insights_are_read_over_the_api_and_a_backwards_interval_is_refused() {
     let state = tempfile::tempdir().unwrap();
     let fixture = working_turn(state.path(), "usage-insights-read").await;
     let descriptor = fixture.server.descriptor().clone();
+    // The Provider prices the Turn's Model today, and its Turn read 3M
+    // tokens from cache.
+    fixture.runtime.price_cache(
+        ModelId::new("gpt-subagent"),
+        CacheRates {
+            input: 2.0,
+            cache_read: 0.2,
+            cache_write: 2.5,
+        },
+    );
     let issue = ProviderActivityId::new("insights-issue");
     for event in [
+        ProviderEvent::Usage {
+            usage: Usage {
+                fresh_input_tokens: Some(1_000_000),
+                cache_read_tokens: Some(3_000_000),
+                cache_write_tokens: Some(0),
+                ..Usage::default()
+            },
+            cost: None,
+        },
         ProviderEvent::ToolCallStarted {
             activity_id: issue.clone(),
             name: "create_issue".to_owned(),
@@ -305,6 +325,20 @@ async fn insights_are_read_over_the_api_and_a_backwards_interval_is_refused() {
             ..DelegationInsights::default()
         },
         "the user's own Session did the work, which nobody priced"
+    );
+    assert_eq!(
+        report.cache,
+        CacheInsights {
+            fresh_input_tokens: Some(1_000_000),
+            cache_read_tokens: Some(3_000_000),
+            cache_write_tokens: Some(0),
+            // 3M read at $0.20 rather than $2.00 a million.
+            saving: EstimatedSaving {
+                nano_usd: Some(5_400_000_000),
+                is_partial: false,
+            },
+        },
+        "estimated at the rates the hosting Provider states today"
     );
 
     let refused = ask(UsageMetricsInterval {

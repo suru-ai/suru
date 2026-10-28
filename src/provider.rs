@@ -13,12 +13,12 @@ use futures_util::Stream;
 use serde_json::Value;
 use tokio::sync::watch;
 
-use crate::pricing::{EstimatedCost, PricingSource};
+use crate::pricing::{CacheRateLookup, CacheRates, CacheRatesFuture, EstimatedCost, PricingSource};
 use crate::protocol::{
     AgentIdentity, AgentSelection, ApprovalPosture, Cost, CostBasis, CostCoverage,
-    EffectiveSettings, FileChange, ModelDescriptor, ModelOptionKind, ModelOptionRole, ProviderId,
-    ProviderUnavailability, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillId,
-    SkillInvocation, SkillPromptDelivery, TextSpan, Usage,
+    EffectiveSettings, FileChange, ModelDescriptor, ModelId, ModelOptionKind, ModelOptionRole,
+    ProviderId, ProviderUnavailability, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus,
+    SkillId, SkillInvocation, SkillPromptDelivery, TextSpan, Usage,
 };
 
 mod claude;
@@ -169,6 +169,34 @@ fn runtimes(pricing: Option<Arc<PricingSource>>) -> Vec<Arc<dyn ProviderRuntime>
         // Appended last so the Landing default order the earlier Providers set is unchanged.
         Arc::new(ClaudeRuntime::from_environment()),
     ]
+}
+
+/// The rates of every Provider a Server hosts, each Model's asked of the
+/// runtime of the Provider that ran it.
+#[derive(Clone)]
+pub(crate) struct HostedCacheRates(Arc<Vec<Arc<dyn ProviderRuntime>>>);
+
+impl HostedCacheRates {
+    pub(crate) fn new(runtimes: Arc<Vec<Arc<dyn ProviderRuntime>>>) -> Self {
+        Self(runtimes)
+    }
+}
+
+impl CacheRateLookup for HostedCacheRates {
+    fn cache_rates<'a>(
+        &'a self,
+        provider: &'a ProviderId,
+        model: &'a ModelId,
+    ) -> CacheRatesFuture<'a> {
+        match self
+            .0
+            .iter()
+            .find(|runtime| runtime.provider_id() == *provider)
+        {
+            Some(runtime) => runtime.cache_rates(model),
+            None => Box::pin(async { None::<CacheRates> }),
+        }
+    }
 }
 
 /// The built-in Providers as a client lists them, in that same fixed order.
@@ -1539,6 +1567,16 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     /// reuses it unchanged. It is not defaulted, so a new Provider has to decide
     /// how it runs Errands rather than silently running none.
     fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, Value>;
+
+    /// The rates this Provider prices `model` at today, from which Insights
+    /// estimates what caching saved; absent where it knows no rate table
+    /// that prices the Model's fresh input, cache reads, and cache writes
+    /// alike. Never launches anything only to answer, so a Provider whose
+    /// rates live in a harness not running now answers none.
+    fn cache_rates<'a>(&'a self, model: &'a ModelId) -> CacheRatesFuture<'a> {
+        let _ = model;
+        Box::pin(async { None })
+    }
 
     /// The Errand Selection this Provider declares: the Model its own Errands
     /// run at, chosen for cheapness and speed rather than capability, and the

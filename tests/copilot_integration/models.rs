@@ -561,3 +561,45 @@ async fn a_harness_that_dies_mid_discovery_fails_the_catalog_and_the_next_refres
 
     server.shutdown().await.expect("shut the server down");
 }
+
+#[tokio::test]
+async fn copilot_states_cache_rates_from_its_running_catalog_and_launches_nothing_to_answer() {
+    use crate::copilot_integration::support::COPILOT_MODELS as PRICED_MODELS;
+    use suru::{pricing::CacheRates, provider::ProviderRuntime};
+
+    let copilot = ScriptedCopilot::with_models(PRICED_MODELS);
+    let runtime = CopilotRuntime::new(copilot.executable());
+    let model = ModelId::new("claude-fixture");
+
+    assert_eq!(runtime.cache_rates(&model).await, None);
+    assert_eq!(
+        copilot.launches(),
+        0,
+        "no harness is launched only to answer"
+    );
+
+    runtime
+        .list_models()
+        .await
+        .expect("discover Copilot Models");
+
+    // Two, a half, and two and a half AI credits a thousand tokens, at a
+    // cent a credit: $20, $5, and $25 a million.
+    assert_eq!(
+        runtime.cache_rates(&model).await,
+        Some(CacheRates {
+            input: 20.0,
+            cache_read: 5.0,
+            cache_write: 25.0,
+        })
+    );
+    assert_eq!(
+        runtime
+            .cache_rates(&ModelId::new("incomplete-cache-fixture"))
+            .await,
+        None,
+        "a Model with no cache prices has no cache rates"
+    );
+    runtime.shutdown().await.expect("shut Copilot down");
+    copilot.wait_for_exit().await;
+}

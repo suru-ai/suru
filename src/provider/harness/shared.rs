@@ -155,6 +155,16 @@ impl<C: HarnessConnector> SharedHarness<C> {
         Ok(handle)
     }
 
+    /// The connection to the live harness process, where one is running and
+    /// has not crashed; never launches one.
+    pub(crate) async fn live(&self) -> Option<C::Connection> {
+        let state = self.state.lock().await;
+        state
+            .as_ref()
+            .filter(|live| live.crash.borrow().is_none())
+            .map(|live| live.connection.clone())
+    }
+
     async fn launch(&self) -> Result<LiveHarness<C::Connection>, ProviderError> {
         let (process, stdio) = spawn_harness_process(&self.spec).await?;
         let (crash, _) = watch::channel(None);

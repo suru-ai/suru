@@ -9,7 +9,10 @@ use std::{
 use github_copilot_sdk::rpc::Model;
 
 use super::catalog::{token_count, token_prices};
-use crate::protocol::{Cost, ModelPrice, ModelPriceTier, Usage};
+use crate::{
+    pricing::CacheRates,
+    protocol::{Cost, ModelPrice, ModelPriceTier, Usage},
+};
 
 /// Copilot documents each AI credit as one cent. Catalog prices are credits
 /// per token batch, so this is the final conversion into the dollar Cost Suru
@@ -47,6 +50,25 @@ impl CopilotPricing {
             .lock()
             .expect("Copilot pricing lock is not poisoned")
             .loaded
+    }
+
+    /// The rates Copilot's catalog prices `model`'s standard tier at, in USD
+    /// per million tokens; absent where it lists no price for fresh input,
+    /// cache reads, or cache writes, or no catalog has loaded yet.
+    pub(super) fn cache_rates(&self, model: &str) -> Option<CacheRates> {
+        let table = self
+            .table
+            .lock()
+            .expect("Copilot pricing lock is not poisoned");
+        let schedule = table.models.get(model)?;
+        let usd_per_million =
+            |price: f64| price / schedule.batch_size as f64 * USD_PER_AI_CREDIT * 1_000_000.0;
+        let standard = &schedule.standard;
+        Some(CacheRates {
+            input: usd_per_million(standard.input?),
+            cache_read: usd_per_million(standard.cache_read?),
+            cache_write: usd_per_million(standard.cache_write?),
+        })
     }
 
     pub(super) fn cost(

@@ -14,10 +14,10 @@ use jiff::civil::date;
 use ratatui::{buffer::Buffer, style::Style};
 use suru::{
     protocol::{
-        ApprovalInsights, CompactionCounts, CompactionInsights, Cost, DelegationInsights,
-        FreedShare, InsightsQuery, InsightsReport, InsightsTool, Outlook, QUARTER_HOUR_MS,
-        QuarterHourTurns, RoleCost, ToolTally, TurnDurations, TurnInsights, UsageMetricsInterval,
-        UsageMetricsQuery,
+        ApprovalInsights, CacheInsights, CompactionCounts, CompactionInsights, Cost,
+        DelegationInsights, FreedShare, InsightsQuery, InsightsReport, InsightsTool, Outlook,
+        QUARTER_HOUR_MS, QuarterHourTurns, RoleCost, ToolTally, TurnDurations, TurnInsights,
+        UsageMetricsInterval, UsageMetricsQuery,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, InsightsPanel, MetricsTab,
@@ -94,6 +94,7 @@ fn worked() -> InsightsReport {
         compactions: worked_compactions(),
         approvals: worked_approvals(),
         delegation: worked_delegation(),
+        cache: CacheInsights::default(),
     }
 }
 

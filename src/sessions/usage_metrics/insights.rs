@@ -19,16 +19,22 @@
 //! metrics read gives it. Delegation divides those same contributions by
 //! the role of the Session whose Turn carries each, so its roles add up to
 //! that Cost too.
+//!
+//! What caching saved is no Cost and lands in none: it is worked out at
+//! every read from the rates each Turn's Provider prices its Model at today,
+//! asked once the lock is let go, and a Model priced at fewer than the three
+//! rates it needs is left out and the estimate marked partial.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::protocol::{
-    DelegationInsights, InsightsQuery, InsightsReport, QUARTER_HOUR_MS, QuarterHourTurns, RoleCost,
-    SessionId, TURN_DURATION_BIN_ENDS_MS, TURN_DURATION_BINS, ToolTally, Turn, TurnDurations,
-    TurnId, TurnInsights, TurnStatus, Usage, WorkspaceId,
+    CacheInsights, DelegationInsights, EstimatedSaving, InsightsQuery, InsightsReport, ModelId,
+    ProviderId, QUARTER_HOUR_MS, QuarterHourTurns, RoleCost, SessionId, TURN_DURATION_BIN_ENDS_MS,
+    TURN_DURATION_BINS, ToolTally, Turn, TurnDurations, TurnId, TurnInsights, TurnStatus, Usage,
+    UsageMetricsAggregate, WorkspaceId,
 };
 
-use crate::{sidekick::SidekickWorkspace, storage::ActivityTallies};
+use crate::{pricing::CacheRateLookup, sidekick::SidekickWorkspace, storage::ActivityTallies};
 
 use super::{
     super::{
@@ -59,6 +65,7 @@ impl SessionStore {
     pub(crate) async fn usage_insights(
         &self,
         query: &InsightsQuery,
+        rates: &dyn CacheRateLookup,
     ) -> Result<InsightsReport, InsightsRefusal> {
         let interval = query.interval;
         if interval.end < interval.start {
@@ -111,7 +118,10 @@ impl SessionStore {
                 InsightsRefusal::Storage
             })?;
         }
-        Ok(fold.into_report())
+        // Priced once the lock is let go, since a lookup may wait on a
+        // fetch of the rate table.
+        let cache = std::mem::take(&mut fold.cache).priced(rates).await;
+        Ok(fold.into_report(cache))
     }
 }
 
@@ -121,6 +131,7 @@ struct InsightsFold {
     turns: TurnTally,
     quarter_hours: QuarterHourTally,
     delegation: DelegationTally,
+    cache: CacheTally,
     /// The Turns the interval holds of each Session, whose Activities it
     /// counts.
     held_turns: HashMap<SessionId, HashSet<TurnId>>,
@@ -141,6 +152,7 @@ impl InsightsFold {
         self.turns.add(turn);
         self.quarter_hours.add_turn(session_id, turn, at);
         self.delegation.add_turn(session_id, role, turn);
+        self.cache.add(turn);
         self.held_turns
             .entry(session_id)
             .or_default()
@@ -154,7 +166,7 @@ impl InsightsFold {
         self.delegation.add_cost(contribution);
     }
 
-    fn into_report(self) -> InsightsReport {
+    fn into_report(self, cache: CacheInsights) -> InsightsReport {
         InsightsReport {
             turns: self.turns.into_insights(),
             quarter_hours: self.quarter_hours.into_quarter_hours(),
@@ -162,6 +174,7 @@ impl InsightsFold {
             compactions: self.activities.compactions,
             approvals: self.activities.approvals,
             delegation: self.delegation.insights,
+            cache,
         }
     }
 }
@@ -356,3 +369,76 @@ fn durations_of(sorted: &[u64]) -> Option<TurnDurations> {
         bins,
     })
 }
+
+/// The interval's input, part by part, and how many tokens the Turns of
+/// each Model read from cache and wrote to it, for a saving to be worked
+/// out from that Model's rates once the lock is let go.
+#[derive(Default)]
+struct CacheTally {
+    input: UsageMetricsAggregate,
+    /// What the Turns of each Model read from cache and wrote to it. A
+    /// saving is linear in both, so a Model's Turns are priced together as
+    /// they would be one by one.
+    by_model: HashMap<(ProviderId, ModelId), CacheUse>,
+    /// Whether a Turn that read or wrote the cache ran on no Model the
+    /// store knows, so no rates can price it.
+    is_unattributed: bool,
+}
+
+/// How many tokens some Turns read from cache and wrote to it.
+#[derive(Clone, Copy, Default)]
+struct CacheUse {
+    reads: u64,
+    writes: u64,
+}
+
+impl CacheTally {
+    fn add(&mut self, turn: &Turn) {
+        let Some(usage) = &turn.usage else {
+            return;
+        };
+        self.input.add_usage(usage);
+        let reads = usage.cache_read_tokens.unwrap_or(0);
+        let writes = usage.cache_write_tokens.unwrap_or(0);
+        if reads == 0 && writes == 0 {
+            return;
+        }
+        let Some(agent) = &turn.agent else {
+            self.is_unattributed = true;
+            return;
+        };
+        let selection = &agent.selection;
+        let used = self
+            .by_model
+            .entry((selection.provider.clone(), selection.model.clone()))
+            .or_default();
+        used.reads = used.reads.saturating_add(reads);
+        used.writes = used.writes.saturating_add(writes);
+    }
+
+    /// The figures, the saving worked out from the rates `rates` states
+    /// today for each Model, leaving out a Model it lacks a rate for.
+    async fn priced(self, rates: &dyn CacheRateLookup) -> CacheInsights {
+        let mut saving = EstimatedSaving {
+            nano_usd: None,
+            is_partial: self.is_unattributed,
+        };
+        for ((provider, model), used) in self.by_model {
+            let Some(model_rates) = rates.cache_rates(&provider, &model).await else {
+                saving.is_partial = true;
+                continue;
+            };
+            let nano_usd =
+                (model_rates.saving_usd(used.reads, used.writes) * NANO_USD_PER_USD).round() as i64;
+            saving.nano_usd = Some(saving.nano_usd.unwrap_or(0).saturating_add(nano_usd));
+        }
+        CacheInsights {
+            fresh_input_tokens: self.input.fresh_input_tokens,
+            cache_read_tokens: self.input.cache_read_tokens,
+            cache_write_tokens: self.input.cache_write_tokens,
+            saving,
+        }
+    }
+}
+
+const NANO_USD_PER_USD: f64 = 1_000_000_000.0;

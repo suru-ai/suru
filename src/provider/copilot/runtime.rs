@@ -18,6 +18,7 @@ use super::{
     transport::CopilotConnector,
 };
 use crate::{
+    pricing::CacheRatesFuture,
     protocol::{
         AgentSelection, CopilotPermissions, EffectiveSettings, ModelId, ModelOptionChoiceId,
         ModelOptionId, ModelOptionSelection, ModelOptionValue, ProviderId, ProviderUnavailability,
@@ -230,5 +231,18 @@ impl ProviderRuntime for CopilotRuntime {
 
     fn shutdown(&self) -> ProviderFuture<'_, ()> {
         Box::pin(async move { self.harness.shutdown().await })
+    }
+
+    /// The prices the running harness's catalog lists, which its Costs are
+    /// worked out from; none while no harness runs, since none is launched
+    /// only to answer.
+    fn cache_rates<'a>(&'a self, model: &'a ModelId) -> CacheRatesFuture<'a> {
+        Box::pin(async move {
+            self.harness
+                .live()
+                .await?
+                .pricing()
+                .cache_rates(model.as_str())
+        })
     }
 }

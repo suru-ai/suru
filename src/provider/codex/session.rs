@@ -38,7 +38,7 @@ use super::{
     },
 };
 use crate::{
-    pricing::PricingSource,
+    pricing::{CacheRatesFuture, ModelsDevModel, PricingSource},
     protocol::{
         AgentId, AgentIdentity, AgentSelection, EffectiveSettings, ModelId, ModelOptionChoiceId,
         ModelOptionId, ModelOptionSelection, ModelOptionValue, ProviderId, ReasoningSummaryDetail,
@@ -273,6 +273,20 @@ impl ProviderRuntime for CodexRuntime {
     fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, serde_json::Value> {
         let executable = self.executable.clone();
         Box::pin(async move { super::errand::run(executable, errand).await })
+    }
+
+    /// The models.dev rates this runtime's Costs are estimated from, so a
+    /// saving is worked out at the rates a Cost would be today.
+    fn cache_rates<'a>(&'a self, model: &'a ModelId) -> CacheRatesFuture<'a> {
+        Box::pin(async move {
+            self.pricing
+                .as_ref()?
+                .cache_rates(&ModelsDevModel::new(
+                    super::MODELS_DEV_PROVIDER,
+                    model.clone(),
+                ))
+                .await
+        })
     }
 
     fn errand_selection(&self) -> Option<AgentSelection> {

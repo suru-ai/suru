@@ -237,6 +237,38 @@ impl UsageMetricsAggregate {
             self.reasoning_tokens,
         )
     }
+
+    /// The share of the Turns' input their cache reads served: see
+    /// [`cache_read_share`].
+    pub fn cache_read_share(&self) -> Option<u16> {
+        cache_read_share(
+            self.fresh_input_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+        )
+    }
+}
+
+/// The share of some input its cache reads served, in hundredths of a
+/// percent: cache reads ÷ (fresh input + cache reads + cache writes), where
+/// any input was recorded at all. Every surface that states the share reads
+/// it here, so they never disagree.
+pub fn cache_read_share(
+    fresh_input_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+) -> Option<u16> {
+    let reads = cache_read_tokens.unwrap_or(0);
+    let input = [fresh_input_tokens, cache_read_tokens, cache_write_tokens]
+        .into_iter()
+        .flatten()
+        .map(u128::from)
+        .sum::<u128>();
+    if input == 0 {
+        return None;
+    }
+    let basis_points = (u128::from(reads) * 10_000 + input / 2) / input;
+    u16::try_from(basis_points).ok()
 }
 
 /// What a reader asks of a Server's Insights: how the Sessions living there
@@ -282,6 +314,51 @@ pub struct InsightsReport {
     /// The interval's Cost, divided by the role of the Session doing the
     /// work.
     pub delegation: DelegationInsights,
+    /// How much of the interval's input its cache served, and what that
+    /// saved at today's rates.
+    pub cache: CacheInsights,
+}
+
+/// How much of the interval's input the Turns read from cache, and an
+/// estimate of what caching saved them.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheInsights {
+    /// The three parts of the Turns' input, each absent where no Turn
+    /// reported it, as a [`UsageMetricsAggregate`] keeps them.
+    pub fresh_input_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub saving: EstimatedSaving,
+}
+
+impl CacheInsights {
+    /// The share of the input cache reads served: see [`cache_read_share`].
+    pub fn read_share(&self) -> Option<u16> {
+        cache_read_share(
+            self.fresh_input_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+        )
+    }
+}
+
+/// What caching saved, worked out from the rates the pricing source states
+/// today for each Turn's Model: what its cache reads would have cost more as
+/// fresh input, less what its cache writes cost more than fresh input did.
+/// A what-if, never a Cost: it is worked out afresh at every read, never
+/// frozen or stored, and adds into no Cost figure (ADR 0016 governs Cost,
+/// not this).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EstimatedSaving {
+    /// In billionths of a dollar; negative where writing the cache cost
+    /// more than reading it saved. Absent where no Turn that read or wrote
+    /// the cache has a Model priced at all three rates.
+    pub nano_usd: Option<i64>,
+    /// Whether a Turn that read or wrote the cache is left out, its Model
+    /// lacking a rate the estimate needs, so it says less than caching did.
+    pub is_partial: bool,
 }
 
 /// The interval's Cost divided by the role of the Session whose Turn carries

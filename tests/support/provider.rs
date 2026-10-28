@@ -1,10 +1,14 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use futures_util::{StreamExt, stream};
 use serde_json::Value;
+use suru::pricing::{CacheRates, CacheRatesFuture};
 use suru::protocol::{
     AgentIdentity, AgentSelection, ContextBreakdown, ModelDescriptor, ModelId, ProviderId,
     ProviderUnavailability, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus,
@@ -79,6 +83,9 @@ pub struct ControlledProviderRuntime {
     /// On by default, like the Subagent stop; a test proves the refusal by
     /// withdrawing it.
     context_breakdown_offered: Arc<AtomicBool>,
+    /// The rates this Provider prices each Model at today, as a pricing
+    /// source would state them; none until a test prices one.
+    cache_rates: Arc<Mutex<HashMap<ModelId, CacheRates>>>,
     starts: mpsc::UnboundedSender<StartRequest>,
     errands: mpsc::UnboundedSender<ErrandRequest>,
     /// Where a session-shaped Errand's startup goes. It is kept apart from
@@ -322,6 +329,7 @@ impl ControlledProvider {
                 subagent_stop_offered: Arc::new(AtomicBool::new(true)),
                 manual_compaction: Arc::new(Mutex::new(ManualCompaction::WithInstructions)),
                 context_breakdown_offered: Arc::new(AtomicBool::new(true)),
+                cache_rates: Arc::default(),
                 starts: starts_tx,
                 errands: errands_tx,
                 errand_starts: errand_starts_tx,
@@ -386,6 +394,15 @@ impl ControlledProviderRuntime {
     pub fn withdraw_context_breakdown(&self) {
         self.context_breakdown_offered
             .store(false, Ordering::SeqCst);
+    }
+
+    /// Prices `model` at `rates` from here on, standing in for a Provider
+    /// whose pricing source states them.
+    pub fn price_cache(&self, model: ModelId, rates: CacheRates) {
+        self.cache_rates
+            .lock()
+            .expect("controlled Provider cache rates lock is not poisoned")
+            .insert(model, rates);
     }
 
     /// Declares how far this Provider compacts on request from here on,
@@ -1142,6 +1159,16 @@ impl ProviderRuntime for ControlledProviderRuntime {
 
     fn offers_context_breakdown(&self) -> bool {
         self.context_breakdown_offered.load(Ordering::SeqCst)
+    }
+
+    fn cache_rates<'a>(&'a self, model: &'a ModelId) -> CacheRatesFuture<'a> {
+        let rates = self
+            .cache_rates
+            .lock()
+            .expect("controlled Provider cache rates lock is not poisoned")
+            .get(model)
+            .copied();
+        Box::pin(async move { rates })
     }
 
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {

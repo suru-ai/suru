@@ -1398,6 +1398,9 @@ struct AppState {
     sidekick_workspace: crate::sidekick::SidekickWorkspace,
     /// How many outlines of its Session trees this Server has served.
     outlines_served: Arc<std::sync::atomic::AtomicU64>,
+    /// The rates its Providers price their Models at today, from which
+    /// Insights estimates what caching saved.
+    cache_rates: crate::provider::HostedCacheRates,
 }
 
 /// What every way of spawning a Server answers: a launch that, once polled,
@@ -1906,6 +1909,7 @@ async fn start(
         attachments: attachment_store,
         sidekick_workspace,
         outlines_served: Arc::default(),
+        cache_rates: crate::provider::HostedCacheRates::new(runtimes.clone()),
     };
     let outlines_served = state.outlines_served.clone();
     let app = Router::new()
@@ -3771,7 +3775,11 @@ async fn read_usage_insights(State(state): State<AppState>, request: Request) ->
             Ok(query) => query,
             Err(response) => return response,
         };
-    match state.sessions.usage_insights(&query).await {
+    match state
+        .sessions
+        .usage_insights(&query, &state.cache_rates)
+        .await
+    {
         Ok(report) => Json(report).into_response(),
         Err(InsightsRefusal::Backwards) => session_error_response(
             StatusCode::BAD_REQUEST,

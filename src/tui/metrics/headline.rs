@@ -246,37 +246,16 @@ fn columns(whole: &UsageMetricsAggregate, before: Option<&UsageMetricsAggregate>
             detail: ended,
         },
     ];
-    if let Some(share) = cache_share(whole) {
+    if let Some(share) = whole.cache_read_share() {
         columns.push(Column {
             figure: format!("{}% from cache", (share + 50) / 100),
             compared: before
-                .and_then(cache_share)
+                .and_then(UsageMetricsAggregate::cache_read_share)
                 .map(|earlier| points_change(share, earlier)),
             detail: None,
         });
     }
     columns
-}
-
-/// The share of `aggregate`'s input its cache reads served, in hundredths
-/// of a percent: cache reads ÷ (fresh input + cache reads + cache writes),
-/// where any input was recorded at all.
-fn cache_share(aggregate: &UsageMetricsAggregate) -> Option<u16> {
-    let reads = aggregate.cache_read_tokens.unwrap_or(0);
-    let input = [
-        aggregate.fresh_input_tokens,
-        aggregate.cache_read_tokens,
-        aggregate.cache_write_tokens,
-    ]
-    .into_iter()
-    .flatten()
-    .map(u128::from)
-    .sum::<u128>();
-    if input == 0 {
-        return None;
-    }
-    let basis_points = (u128::from(reads) * 10_000 + input / 2) / input;
-    u16::try_from(basis_points).ok()
 }
 
 /// How far a share of `now` hundredths of a percent rose or fell from one

@@ -9,14 +9,17 @@ use super::{
         restore, restore_deferred, running_total, turn_scoped, usd,
     },
 };
+use std::collections::HashMap;
+
 use crate::{
+    pricing::{CacheRateLookup, CacheRates, CacheRatesFuture},
     protocol::{
         Activity, ActivityId, ActivityStatus, Approval, ApprovalId, ApprovalInsights,
         ApprovalOutcome, ApprovalSubject, Author, CompactionCounts, CompactionTrigger, Cost,
-        Decision, DelegationInsights, FreedShare, InsightsQuery, InsightsReport, InsightsTool,
-        QUARTER_HOUR_MS, QuarterHourTurns, RoleCost, SessionId, SessionListItem, SessionTimestamp,
-        ToolTally, TranscriptItem, Turn, TurnDurations, TurnId, TurnInsights, TurnStatus,
-        UsageMetricsInterval, UsageTotal,
+        Decision, DelegationInsights, EstimatedSaving, FreedShare, InsightsQuery, InsightsReport,
+        InsightsTool, ModelId, ProviderId, QUARTER_HOUR_MS, QuarterHourTurns, RoleCost, SessionId,
+        SessionListItem, SessionTimestamp, ToolTally, TranscriptItem, Turn, TurnDurations, TurnId,
+        TurnInsights, TurnStatus, Usage, UsageMetricsInterval, UsageTotal,
     },
     sidekick::SidekickWorkspace,
     storage::PersistedSession,
@@ -33,10 +36,58 @@ fn over(start: u64, end: u64) -> InsightsQuery {
 }
 
 async fn read(store: &SessionStore, query: &InsightsQuery) -> InsightsReport {
+    priced_at(store, query, &RateTable::default()).await
+}
+
+/// [`read`], the pricing source stating `rates` today.
+async fn priced_at(
+    store: &SessionStore,
+    query: &InsightsQuery,
+    rates: &RateTable,
+) -> InsightsReport {
     store
-        .usage_insights(query)
+        .usage_insights(query, rates)
         .await
         .expect("a well-formed query is answered")
+}
+
+/// The rates a pricing source states today, fixed: in USD per million
+/// tokens of fresh input, cache reads, and cache writes, by Model.
+#[derive(Default)]
+struct RateTable(HashMap<(ProviderId, ModelId), CacheRates>);
+
+impl RateTable {
+    /// This table, pricing `agent`'s Model at `input`, `cache_read`, and
+    /// `cache_write`.
+    fn pricing(
+        mut self,
+        agent: Option<(&str, &str)>,
+        input: f64,
+        cache_read: f64,
+        cache_write: f64,
+    ) -> Self {
+        let (provider, model) = agent.expect("a known Agent");
+        self.0.insert(
+            (ProviderId::new(provider), ModelId::new(model)),
+            CacheRates {
+                input,
+                cache_read,
+                cache_write,
+            },
+        );
+        self
+    }
+}
+
+impl CacheRateLookup for RateTable {
+    fn cache_rates<'a>(
+        &'a self,
+        provider: &'a ProviderId,
+        model: &'a ModelId,
+    ) -> CacheRatesFuture<'a> {
+        let rates = self.0.get(&(provider.clone(), model.clone())).copied();
+        Box::pin(async move { rates })
+    }
 }
 
 /// A Turn that ended as `status`, begun at `started_at` and Settled at
@@ -159,11 +210,15 @@ async fn an_interval_that_runs_backwards_is_refused_and_an_empty_one_is_not() {
     let (store, writer) = restore(directory.path(), Vec::new()).await;
 
     assert_eq!(
-        store.usage_insights(&over(END, START)).await,
+        store
+            .usage_insights(&over(END, START), &RateTable::default())
+            .await,
         Err(InsightsRefusal::Backwards)
     );
     assert_eq!(
-        store.usage_insights(&over(START, START)).await,
+        store
+            .usage_insights(&over(START, START), &RateTable::default())
+            .await,
         Ok(InsightsReport::default())
     );
     writer.shutdown().await.unwrap();
@@ -1054,5 +1109,191 @@ async fn compactions_and_approvals_are_read_without_hydrating_a_deferred_session
         (counts(0, 0, 1, 0), 1, 1)
     );
     assert_eq!(read_state(&store), before, "no history was read in");
+    writer.shutdown().await.unwrap();
+}
+
+/// A Turn of `agent` begun at `started_at` whose input was `fresh` tokens
+/// sent fresh, `reads` read from cache, and `writes` written to it.
+fn cached(
+    agent: Option<(&str, &str)>,
+    started_at: u64,
+    fresh: u64,
+    reads: u64,
+    writes: u64,
+) -> Turn {
+    Turn {
+        usage: Some(Usage {
+            fresh_input_tokens: Some(fresh),
+            cache_read_tokens: Some(reads),
+            cache_write_tokens: Some(writes),
+            output_tokens: Some(1),
+            ..Usage::default()
+        }),
+        ..metered(agent, Some(started_at), Some(started_at + 1), 1)
+    }
+}
+
+#[tokio::test]
+async fn the_cache_read_share_is_reads_over_every_part_of_the_interval_s_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![
+        cached(CODEX, START, 1_000_000, 3_000_000, 0),
+        cached(OPUS, START + 1, 0, 1_000_000, 2_000_000),
+        // Before the interval: no part of its input.
+        cached(CODEX, START - 1, 9_000_000, 0, 0),
+    ];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+
+    let cache = read(&store, &over(START, END)).await.cache;
+
+    assert_eq!(
+        (
+            cache.fresh_input_tokens,
+            cache.cache_read_tokens,
+            cache.cache_write_tokens
+        ),
+        (Some(1_000_000), Some(4_000_000), Some(2_000_000))
+    );
+    // 4M of 7M: 57.14%.
+    assert_eq!(cache.read_share(), Some(5_714));
+    writer.shutdown().await.unwrap();
+}
+
+/// A saving of `usd`, partial where `partial` says.
+fn saved(usd: Option<f64>, partial: bool) -> EstimatedSaving {
+    EstimatedSaving {
+        nano_usd: usd.map(|usd| (usd * 1e9).round() as i64),
+        is_partial: partial,
+    }
+}
+
+#[tokio::test]
+async fn the_saving_is_what_cache_reads_saved_less_what_cache_writes_cost_beyond_fresh_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![
+        // 3M read at $0.20 rather than $2.00: $5.40 saved.
+        cached(CODEX, START, 1_000_000, 3_000_000, 0),
+        // 1M read saves $1.80; 2M written at $2.50 rather than $2.00 costs
+        // $1.00 more.
+        cached(CODEX, START + 1, 0, 1_000_000, 2_000_000),
+        // Another Model's rates: 1M read at $1.50 rather than $15.00 saves
+        // $13.50; 1M written at $18.75 costs $3.75 more.
+        cached(OPUS, START + 2, 0, 1_000_000, 1_000_000),
+    ];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+    let rates = RateTable::default()
+        .pricing(CODEX, 2.00, 0.20, 2.50)
+        .pricing(OPUS, 15.00, 1.50, 18.75);
+
+    let cache = priced_at(&store, &over(START, END), &rates).await.cache;
+
+    assert_eq!(
+        cache.saving,
+        saved(Some(5.40 + 1.80 - 1.00 + 13.50 - 3.75), false)
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn writing_the_cache_more_than_reading_it_saves_less_than_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![cached(CODEX, START, 0, 0, 4_000_000)];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+    let rates = RateTable::default().pricing(CODEX, 2.00, 0.20, 2.50);
+
+    let cache = priced_at(&store, &over(START, END), &rates).await.cache;
+
+    assert_eq!(cache.saving, saved(Some(-2.00), false));
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_model_without_rates_is_left_out_of_the_saving_which_is_then_partial() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![
+        cached(CODEX, START, 0, 1_000_000, 0),
+        // Neither the Model nor the Agent of these is priced.
+        cached(OPUS, START + 1, 0, 5_000_000, 0),
+        cached(None, START + 2, 0, 5_000_000, 0),
+    ];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+    let rates = RateTable::default().pricing(CODEX, 2.00, 0.20, 2.50);
+
+    let cache = priced_at(&store, &over(START, END), &rates).await.cache;
+
+    assert_eq!(cache.saving, saved(Some(1.80), true));
+    assert_eq!(
+        cache.cache_read_tokens,
+        Some(11_000_000),
+        "its tokens are still input"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn no_priced_model_leaves_the_saving_unknown() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![cached(OPUS, START, 0, 1_000_000, 0)];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+
+    let cache = read(&store, &over(START, END)).await.cache;
+
+    assert_eq!(cache.saving, saved(None, true));
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_model_that_used_no_cache_needs_no_rates() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![cached(OPUS, START, 1_000_000, 0, 0)];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+
+    let cache = read(&store, &over(START, END)).await.cache;
+
+    assert_eq!(
+        cache.saving,
+        saved(None, false),
+        "nothing read or written from cache, so nothing left out"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_saving_enters_no_cost_figure_of_the_insights_or_metrics_reports() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    // A Turn its Provider priced at $0.50, which read 3M tokens from cache.
+    session.snapshot.turns = vec![Turn {
+        usage: cached(CODEX, START, 1_000_000, 3_000_000, 0).usage,
+        ..turn_scoped(CODEX, START, 0.50)
+    }];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+    let rates = RateTable::default().pricing(CODEX, 2.00, 0.20, 2.50);
+    let query = over(START, END);
+
+    let priced = priced_at(&store, &query, &rates).await;
+    let unpriced = read(&store, &query).await;
+
+    assert_eq!(priced.cache.saving, saved(Some(5.40), false));
+    assert_eq!(
+        (&priced.quarter_hours, priced.delegation),
+        (&unpriced.quarter_hours, unpriced.delegation),
+        "the Cost figures are the same whatever the rates"
+    );
+    assert_eq!(priced.delegation.total(), role(usd(0.50), false));
+    let range = read_metrics(&store, &by_model(&[(START, END)]))
+        .across_buckets
+        .total;
+    assert_eq!(
+        (range.cost, range.estimated_cost),
+        (usd(0.50), None),
+        "the metrics read's Cost is the Turn's alone"
+    );
     writer.shutdown().await.unwrap();
 }
