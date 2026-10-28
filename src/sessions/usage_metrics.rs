@@ -797,14 +797,7 @@ fn labels(keys: &[UsageMetricsKey], names: &KeyNames) -> Vec<String> {
     keys.iter()
         .map(|key| match key {
             UsageMetricsKey::Model { .. } => models.remove(key).unwrap_or_default(),
-            UsageMetricsKey::Provider { provider } => catalog
-                .providers
-                .iter()
-                .find(|listed| listed.provider == *provider)
-                .map_or_else(
-                    || provider.as_str().to_owned(),
-                    |listed| listed.display_name.clone(),
-                ),
+            UsageMetricsKey::Provider { provider } => provider_label(catalog, provider),
             UsageMetricsKey::Workspace { workspace } => {
                 workspaces.remove(workspace).unwrap_or_default()
             }
@@ -813,19 +806,79 @@ fn labels(keys: &[UsageMetricsKey], names: &KeyNames) -> Vec<String> {
         .collect()
 }
 
-/// The label of each Model among `keys`, none reading like another: its
-/// name in the Model Catalog where it carries one, otherwise its id. Two
-/// read alike where their letters and digits match, whatever their case,
-/// once a Provider's own name is taken off the front of its Model's —
-/// `claude-opus-5-5` reads as `Opus 5.5` does. Where Models of several
-/// Providers read alike, each is named after its Provider, as
-/// `copilot · GPT-5.5`; where several of one Provider still do, each
-/// whose name is not its id has its id after it, as `Opus 5.5 (opus)`.
+/// A Provider's display name in the Model Catalog, otherwise its id: how
+/// the Provider breakdown names it, and how a Model's label names its
+/// Provider.
+fn provider_label(catalog: &ModelCatalog, provider: &ProviderId) -> String {
+    catalog
+        .providers
+        .iter()
+        .find(|listed| listed.provider == *provider)
+        .map_or_else(
+            || provider.as_str().to_owned(),
+            |listed| listed.display_name.clone(),
+        )
+}
+
+/// A Model a report names, and how its label reads.
+struct NamedModel<'a> {
+    key: &'a UsageMetricsKey,
+    provider: &'a ProviderId,
+    model: &'a ModelId,
+    /// Its name in the Model Catalog, otherwise its id.
+    label: String,
+    /// The ways its label reads: its letters and digits, lowercased, and
+    /// those again with any of the report's Providers' names taken off the
+    /// front where more follows.
+    readings: HashSet<String>,
+}
+
+impl NamedModel<'_> {
+    /// Whether it and `other` would read alike: whether any way one reads
+    /// is a way the other does. Each Model is read against every Provider
+    /// in the report, not its own alone, so the likeness runs both ways.
+    fn reads_like(&self, other: &Self) -> bool {
+        !self.readings.is_disjoint(&other.readings)
+    }
+}
+
+/// The label of each Model among `keys`: its name in the Model Catalog
+/// where it carries one, otherwise its id. Two read alike where their
+/// letters and digits match, whatever their case, either as written or with
+/// a Provider's name taken off the front — `claude-opus-5-5` reads as
+/// `Opus 5.5` does. A Model that reads like one of another Provider is named
+/// after its own Provider, as the Provider breakdown names it, as
+/// `Copilot · GPT-5.5`; one that reads like another of its own Provider has
+/// its id after it, as `Opus 5.5 (opus)`, unless its label is its id, which
+/// already tells it from the other's.
 fn model_labels(
     keys: &[UsageMetricsKey],
     catalog: &ModelCatalog,
 ) -> HashMap<UsageMetricsKey, String> {
-    let named: Vec<(&UsageMetricsKey, &ProviderId, &ModelId, String)> = keys
+    let letters = |text: &str| -> String {
+        text.chars()
+            .filter(|character| character.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let mut prefixes: Vec<String> = keys
+        .iter()
+        .filter_map(|key| match key {
+            UsageMetricsKey::Model { provider, .. } => Some(provider),
+            _ => None,
+        })
+        .flat_map(|provider| {
+            [
+                provider.as_str().to_owned(),
+                provider_label(catalog, provider),
+            ]
+        })
+        .map(|name| letters(&name))
+        .filter(|name| !name.is_empty())
+        .collect();
+    prefixes.sort();
+    prefixes.dedup();
+    let named: Vec<NamedModel<'_>> = keys
         .iter()
         .filter_map(|key| match key {
             UsageMetricsKey::Model { provider, model } => {
@@ -833,53 +886,44 @@ fn model_labels(
                     || model.as_str().to_owned(),
                     |descriptor| descriptor.display_name.clone(),
                 );
-                Some((key, provider, model, label))
+                let written = letters(&label);
+                let readings = prefixes
+                    .iter()
+                    .filter_map(|prefix| written.strip_prefix(prefix.as_str()))
+                    .filter(|rest| !rest.is_empty())
+                    .map(str::to_owned)
+                    .chain([written.clone()])
+                    .collect();
+                Some(NamedModel {
+                    key,
+                    provider,
+                    model,
+                    label,
+                    readings,
+                })
             }
             _ => None,
         })
         .collect();
-    let readings: Vec<String> = named
-        .iter()
-        .map(|(_, provider, _, label)| reading(provider, label))
-        .collect();
     named
         .iter()
-        .zip(&readings)
-        .map(|((key, provider, model, label), reading)| {
+        .map(|this| {
             let alike = || {
                 named
                     .iter()
-                    .zip(&readings)
-                    .filter(move |(_, other)| *other == reading)
-                    .map(|((_, other, _, _), _)| *other)
+                    .filter(|other| !std::ptr::eq(*other, this) && this.reads_like(other))
             };
-            let mut label = label.clone();
-            if alike().filter(|other| other == provider).count() > 1 && label != model.as_str() {
-                label = format!("{label} ({})", model.as_str());
+            let mut label = this.label.clone();
+            if alike().any(|other| other.provider == this.provider) && label != this.model.as_str()
+            {
+                label = format!("{label} ({})", this.model.as_str());
             }
-            if alike().any(|other| other != *provider) {
-                label = format!("{} · {label}", provider.as_str());
+            if alike().any(|other| other.provider != this.provider) {
+                label = format!("{} · {label}", provider_label(catalog, this.provider));
             }
-            ((*key).clone(), label)
+            (this.key.clone(), label)
         })
         .collect()
-}
-
-/// How a Model's `label` reads under `provider`, so two that would look
-/// alike to a reader compare equal: its letters and digits, lowercased,
-/// with the Provider's own name taken off the front where more follows.
-fn reading(provider: &ProviderId, label: &str) -> String {
-    let letters = |text: &str| -> String {
-        text.chars()
-            .filter(|character| character.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect()
-    };
-    let reading = letters(label);
-    match reading.strip_prefix(letters(provider.as_str()).as_str()) {
-        Some(rest) if !rest.is_empty() => rest.to_owned(),
-        _ => reading,
-    }
 }
 
 /// Relabels, by `refine`, every Workspace in `labels` whose label another

@@ -358,9 +358,10 @@ async fn a_model_under_two_providers_is_two_keys_and_a_turn_of_no_known_agent_is
             // Each named for its Provider, since they read alike.
             UsageMetricsKeyLabel {
                 key: model("codex"),
-                label: "codex · GPT-5.5".to_owned(),
+                label: "Codex · GPT-5.5".to_owned(),
             },
-            // The catalog names no such Model under Copilot: its id stands.
+            // The catalog names no such Model, nor Provider, under Copilot:
+            // the ids stand.
             UsageMetricsKeyLabel {
                 key: model("copilot"),
                 label: "copilot · gpt-5.5".to_owned(),
@@ -493,6 +494,82 @@ async fn models_that_would_read_alike_are_told_apart_in_the_keys_and_the_top_ses
             ("Pinned", Some("claude-opus-5-5")),
         ],
         "a top Session's Model as the keys name it"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn one_name_under_two_providers_is_told_apart_whichever_provider_s_name_it_begins_with() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![
+        metered(Some(("claude", "claude-opus-5-5")), Some(11), None, 1),
+        metered(Some(("copilot", "claude-opus-5-5")), Some(12), None, 1),
+        // Neither catalogued: their ids alike.
+        metered(Some(("claude", "claude-sonnet-5-5")), Some(13), None, 1),
+        metered(Some(("copilot", "claude-sonnet-5-5")), Some(14), None, 1),
+        // An id one Provider's name begins, reached through another.
+        metered(Some(("claude", "opus")), Some(15), None, 1),
+        metered(Some(("copilot", "claude-opus-4")), Some(16), None, 1),
+    ];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+    let catalog =
+        |provider: &str, display_name: &str, models: Vec<ModelDescriptor>| ProviderModelCatalog {
+            provider: ProviderId::new(provider),
+            display_name: display_name.to_owned(),
+            models,
+            status: ProviderCatalogStatus::Fresh,
+        };
+    let catalog = ModelCatalog {
+        providers: vec![
+            catalog(
+                "claude",
+                "Claude",
+                vec![
+                    listed("claude", "claude-opus-5-5", "Claude Opus 5.5"),
+                    listed("claude", "opus", "Opus 4"),
+                ],
+            ),
+            catalog(
+                "copilot",
+                "Copilot",
+                vec![listed("copilot", "claude-opus-5-5", "Claude Opus 5.5")],
+            ),
+        ],
+    };
+
+    let report = store
+        .usage_metrics(&by_model(&[(10, 20)]), &catalog, &WorkspacePaths::default())
+        .unwrap();
+
+    let model = |provider: &str, model: &str| UsageMetricsKey::Model {
+        provider: ProviderId::new(provider),
+        model: ModelId::new(model),
+    };
+    assert_eq!(
+        labels(&report),
+        vec![
+            (
+                model("claude", "claude-opus-5-5"),
+                "Claude · Claude Opus 5.5"
+            ),
+            (
+                model("claude", "claude-sonnet-5-5"),
+                "Claude · claude-sonnet-5-5"
+            ),
+            // Claude's own name taken off Copilot's id reads as Claude's alias.
+            (model("claude", "opus"), "Claude · Opus 4"),
+            (model("copilot", "claude-opus-4"), "Copilot · claude-opus-4"),
+            (
+                model("copilot", "claude-opus-5-5"),
+                "Copilot · Claude Opus 5.5"
+            ),
+            (
+                model("copilot", "claude-sonnet-5-5"),
+                "Copilot · claude-sonnet-5-5"
+            ),
+        ],
+        "each named after its Provider as the Provider breakdown names it"
     );
     writer.shutdown().await.unwrap();
 }
