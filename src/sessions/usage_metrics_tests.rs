@@ -87,23 +87,34 @@ fn by_model(buckets: &[(u64, u64)]) -> UsageMetricsQuery {
     }
 }
 
-/// `tokens` of output from Turns of one top-level Session that recorded no
-/// Cost, so their Cost is unknown.
+/// `tokens` of output from one Completed Turn of a top-level Session that
+/// recorded no Cost, so its Cost is unknown.
 fn output(tokens: u64) -> UsageMetricsAggregate {
     UsageMetricsAggregate {
         output_tokens: Some(tokens),
         is_cost_partial: true,
         sessions: 1,
+        turns: 1,
         ..Default::default()
     }
 }
 
+/// `tokens` of output from `turns` Completed Turns of one top-level Session
+/// that recorded no Cost.
+fn output_of(tokens: u64, turns: u64) -> UsageMetricsAggregate {
+    UsageMetricsAggregate {
+        turns,
+        ..output(tokens)
+    }
+}
+
 /// `bucket`, its whole and every key's part the work of `sessions` top-level
-/// Sessions and `subagents` Subagent Sessions.
+/// Sessions and `subagents` Subagent Sessions, a Turn each.
 fn worked_by(mut bucket: UsageMetricsBucket, sessions: u64, subagents: u64) -> UsageMetricsBucket {
     let counted = |aggregate: &mut UsageMetricsAggregate| {
         aggregate.sessions = sessions;
         aggregate.subagent_sessions = subagents;
+        aggregate.turns = sessions + subagents;
     };
     counted(&mut bucket.total);
     bucket
@@ -248,7 +259,8 @@ async fn a_part_no_turn_reported_stays_absent_and_failed_interrupted_and_active_
                 ..Default::default()
             },
         ),
-        // Working still: it counts with what it has recorded so far.
+        // Working when its process stopped, so the store restores it as
+        // Failed: it counts with what it had recorded by then.
         with(
             TurnStatus::Active,
             Usage {
@@ -278,6 +290,9 @@ async fn a_part_no_turn_reported_stays_absent_and_failed_interrupted_and_active_
         estimated_cost: None,
         sessions: 1,
         subagent_sessions: 0,
+        turns: 4,
+        failed_turns: 2,
+        interrupted_turns: 1,
     };
     assert_eq!(
         report.buckets,
@@ -361,7 +376,7 @@ async fn a_model_under_two_providers_is_two_keys_and_a_turn_of_no_known_agent_is
             },
             KeyedUsageMetrics {
                 key: model("copilot"),
-                aggregate: output(110),
+                aggregate: output_of(110, 2),
             },
             KeyedUsageMetrics {
                 key: UsageMetricsKey::Unknown,
@@ -369,7 +384,7 @@ async fn a_model_under_two_providers_is_two_keys_and_a_turn_of_no_known_agent_is
             },
         ]
     );
-    assert_eq!(report.buckets[0].total, output(1111));
+    assert_eq!(report.buckets[0].total, output_of(1111, 4));
     writer.shutdown().await.unwrap();
 }
 
@@ -448,11 +463,11 @@ async fn the_provider_breakdown_groups_every_model_under_its_provider_by_its_dis
         vec![
             (provider("claude"), output(1000)),
             (provider("codex"), output(1)),
-            (provider("copilot"), output(110)),
+            (provider("copilot"), output_of(110, 2)),
             (UsageMetricsKey::Unknown, output(10_000)),
         ]
     );
-    assert_eq!(report.buckets[0].total, output(11_111));
+    assert_eq!(report.buckets[0].total, output_of(11_111, 5));
     writer.shutdown().await.unwrap();
 }
 

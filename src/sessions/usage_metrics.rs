@@ -30,9 +30,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::protocol::{
     Cost, CostBasis, KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS, ModelCatalog, SessionId,
-    SessionTimestamp, Turn, TurnId, Usage, UsageMetricsAggregate, UsageMetricsBreakdown,
-    UsageMetricsBucket, UsageMetricsKey, UsageMetricsKeyLabel, UsageMetricsQuery,
-    UsageMetricsReport, Workspace, WorkspaceId, WorkspacePaths,
+    SessionTimestamp, Turn, TurnId, TurnStatus, Usage, UsageMetricsAggregate,
+    UsageMetricsBreakdown, UsageMetricsBucket, UsageMetricsKey, UsageMetricsKeyLabel,
+    UsageMetricsQuery, UsageMetricsReport, Workspace, WorkspaceId, WorkspacePaths,
 };
 
 use super::{
@@ -75,14 +75,15 @@ impl UsageMetricsRefusal {
 }
 
 /// What the read takes of one Turn: which it is, whether a Subagent ran it,
-/// where it is placed in time, the key it is broken down under, and its
-/// Usage.
+/// where it is placed in time, the key it is broken down under, how it
+/// ended, and its Usage.
 struct MeteredTurn {
     session_id: SessionId,
     turn_id: TurnId,
     is_subagent: bool,
     placed_at: Option<SessionTimestamp>,
     key: UsageMetricsKey,
+    status: TurnStatus,
     usage: Option<Usage>,
 }
 
@@ -261,6 +262,7 @@ impl MeteredForest {
                     is_subagent: session.parent.is_some(),
                     placed_at: turn.started_at.or(turn.settled_at),
                     key: key_of(breakdown, session, turn),
+                    status: turn.status,
                     usage: turn.usage.clone(),
                 }));
             }
@@ -359,6 +361,12 @@ impl Part {
     fn add(&mut self, turn: &MeteredTurn) {
         if let Some(usage) = &turn.usage {
             self.aggregate.add_usage(usage);
+        }
+        self.aggregate.turns += 1;
+        match turn.status {
+            TurnStatus::Failed => self.aggregate.failed_turns += 1,
+            TurnStatus::Interrupted => self.aggregate.interrupted_turns += 1,
+            TurnStatus::Active | TurnStatus::Completed => {}
         }
         if self.sessions.insert(turn.session_id) {
             let count = if turn.is_subagent {

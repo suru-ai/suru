@@ -124,8 +124,9 @@ pub struct KeyedUsageMetrics {
 
 /// What a set of Turns consumed together: the five parts of their Usage,
 /// each absent where no Turn among them reported it, as a Session's total
-/// keeps it, what their Cost Coverage contributions add up to, and how many
-/// Sessions they are the work of.
+/// keeps it, what their Cost Coverage contributions add up to, how many
+/// Sessions they are the work of, and how many Turns they are and how those
+/// ended.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageMetricsAggregate {
@@ -156,6 +157,13 @@ pub struct UsageMetricsAggregate {
     /// counted apart from `sessions` so a delegating conversation is still
     /// one Session.
     pub subagent_sessions: u64,
+    /// How many Turns there are among them, Settled or still working, each
+    /// counted once however it ended.
+    pub turns: u64,
+    /// How many of those Turns Failed.
+    pub failed_turns: u64,
+    /// How many of those Turns were Interrupted.
+    pub interrupted_turns: u64,
 }
 
 impl UsageMetricsAggregate {
