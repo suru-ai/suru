@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
 
-use super::text_layout::CursorTarget;
+use super::{metrics::calendar::MetricsRange, text_layout::CursorTarget};
 
 use crate::protocol::{
     ApprovalId, AttachmentId, Outlook, QuestionnaireId, SessionReference, TurnId, WorkspaceId,
@@ -109,6 +109,12 @@ pub enum SemanticCommandId {
     MetricsRefresh,
     /// Closes the Usage Metrics view, back to whatever it covered.
     MetricsClose,
+    /// Shows one range in the Usage Metrics view, reading it anew.
+    MetricsRangeSelect(MetricsRange),
+    /// Shows the range after the Usage Metrics view's in its range bar.
+    MetricsRangeNext,
+    /// Shows the range before the Usage Metrics view's in its range bar.
+    MetricsRangePrevious,
     /// Opens the Icon Picker over a Session, which the picker only does while
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
     /// menu item stays quiet rather than opening a picker no glyph could draw.
@@ -658,6 +664,15 @@ impl SemanticCommandId {
             Self::MetricsShow => "metrics.show",
             Self::MetricsRefresh => "metrics.refresh",
             Self::MetricsClose => "metrics.close",
+            Self::MetricsRangeSelect(range) => match range {
+                MetricsRange::Today => "metrics.range.today",
+                MetricsRange::SevenDays => "metrics.range.seven-days",
+                MetricsRange::ThirtyDays => "metrics.range.thirty-days",
+                MetricsRange::Year => "metrics.range.year",
+                MetricsRange::AllTime => "metrics.range.all-time",
+            },
+            Self::MetricsRangeNext => "metrics.range.next",
+            Self::MetricsRangePrevious => "metrics.range.previous",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::SessionRename => "session.rename",
@@ -899,6 +914,23 @@ const fn numeric_insert_descriptors() -> [SemanticCommandDescriptor; 10] {
 }
 
 const NUMERIC_INSERT_COMMANDS: [SemanticCommandDescriptor; 10] = numeric_insert_descriptors();
+
+/// Choosing a range only changes what the view shows, so it reaches the
+/// Client; the read it brings is refused in the view where the Origin has
+/// stopped answering.
+const fn metrics_range_descriptor(
+    range: MetricsRange,
+    title: &'static str,
+) -> SemanticCommandDescriptor {
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsRangeSelect(range),
+        title,
+        reach: SemanticReach::Client,
+        description: "Show one range in the Usage Metrics view",
+        slash: None,
+        keybinding: None,
+    }
+}
 
 const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
     SemanticCommandDescriptor {
@@ -1744,6 +1776,27 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Close Metrics",
         reach: SemanticReach::Client,
         description: "Close the Usage Metrics view",
+        slash: None,
+        keybinding: None,
+    },
+    metrics_range_descriptor(MetricsRange::Today, "Show Today's Metrics"),
+    metrics_range_descriptor(MetricsRange::SevenDays, "Show 7 Days of Metrics"),
+    metrics_range_descriptor(MetricsRange::ThirtyDays, "Show 30 Days of Metrics"),
+    metrics_range_descriptor(MetricsRange::Year, "Show a Year of Metrics"),
+    metrics_range_descriptor(MetricsRange::AllTime, "Show All Metrics"),
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsRangeNext,
+        title: "Next Metrics Range",
+        reach: SemanticReach::Client,
+        description: "Show the next, longer range in the Usage Metrics view",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsRangePrevious,
+        title: "Previous Metrics Range",
+        reach: SemanticReach::Client,
+        description: "Show the previous, shorter range in the Usage Metrics view",
         slash: None,
         keybinding: None,
     },

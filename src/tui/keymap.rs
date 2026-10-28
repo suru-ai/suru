@@ -13,6 +13,7 @@ use super::{
         descriptor,
     },
     connect_overlay::ConnectInputMode,
+    metrics::{MetricsTarget, calendar::MetricsRange},
     relay_overlay::RelayInputMode,
     settings_panel::PanelKeys,
     state::{CommandId, ScrollDirection},
@@ -277,28 +278,49 @@ pub(super) fn command_for_context_overlay_event(event: InputEvent) -> Option<Com
 
 /// The Usage Metrics view owns every key and click while it is open, since
 /// it covers the whole frame: Esc or a click on its ✕ closes it, `r` reads it
-/// again, and Ctrl+C leaves Suru, as it does from a composer with nothing in
-/// it — the view holds nothing a press could clear, and a draft it covers is
-/// the reader's to come back to.
+/// again, `1`–`5` or a click in the range bar choose a range, `[`/`]` or the
+/// wheel over the chart step to the range before or after, and Ctrl+C leaves
+/// Suru, as it does from a composer with nothing in it — the view holds
+/// nothing a press could clear, and a draft it covers is the reader's to come
+/// back to.
 pub(super) fn command_for_metrics_view_event(
     event: InputEvent,
-    close_target: impl Fn(Position) -> bool,
+    target_at: impl Fn(Position) -> Option<MetricsTarget>,
 ) -> Option<CommandId> {
     let command = match event {
         InputEvent::Key(key) if key.kind == KeyEventKind::Press => {
             match (key.code, key.modifiers) {
                 (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::MetricsClose,
                 (KeyCode::Char('r'), KeyModifiers::NONE) => SemanticCommandId::MetricsRefresh,
+                (KeyCode::Char('['), KeyModifiers::NONE) => SemanticCommandId::MetricsRangePrevious,
+                (KeyCode::Char(']'), KeyModifiers::NONE) => SemanticCommandId::MetricsRangeNext,
+                (KeyCode::Char(digit @ '1'..='5'), KeyModifiers::NONE) => {
+                    let place = usize::from(digit as u8 - b'1');
+                    SemanticCommandId::MetricsRangeSelect(MetricsRange::ALL[place])
+                }
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => SemanticCommandId::ApplicationExit,
                 _ => return None,
             }
         }
-        // A click arrives as the release that completes it.
-        InputEvent::Mouse(mouse)
-            if mouse.kind == MouseEventKind::Up(MouseButton::Left)
-                && close_target(Position::new(mouse.column, mouse.row)) =>
-        {
-            SemanticCommandId::MetricsClose
+        InputEvent::Mouse(mouse) => {
+            let target = target_at(Position::new(mouse.column, mouse.row));
+            match (mouse.kind, target?) {
+                // A click arrives as the release that completes it.
+                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Close) => {
+                    SemanticCommandId::MetricsClose
+                }
+                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Range(range)) => {
+                    SemanticCommandId::MetricsRangeSelect(range)
+                }
+                // Down the wheel to the longer ranges, as a map zooms out.
+                (MouseEventKind::ScrollDown, MetricsTarget::Chart) => {
+                    SemanticCommandId::MetricsRangeNext
+                }
+                (MouseEventKind::ScrollUp, MetricsTarget::Chart) => {
+                    SemanticCommandId::MetricsRangePrevious
+                }
+                _ => return None,
+            }
         }
         _ => return None,
     };

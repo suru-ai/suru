@@ -1,50 +1,128 @@
 //! The Usage Metrics calendar: where a range's buckets begin and end, cut at
 //! the reader's own local boundaries. The Server knows nothing of calendars
 //! or time zones, so the reader resolves them here, a pure function of the
-//! range, the moment now, and the zone, and asks for the intervals.
+//! range, the moment now, the zone, and — for All time — the earliest timed
+//! Turn, and asks for the intervals.
 
-use jiff::{Timestamp, ToSpan, Zoned, civil::DateTime, tz::TimeZone};
+use jiff::{
+    Span, Timestamp, ToSpan, Zoned,
+    civil::{Date, DateTime},
+    tz::TimeZone,
+};
 
-use crate::protocol::{SessionTimestamp, UsageMetricsInterval};
+use crate::protocol::{MAX_USAGE_METRICS_BUCKETS, SessionTimestamp, UsageMetricsInterval};
 
 /// The span of time a Usage Metrics view covers, ending with the present.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum MetricsRange {
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum MetricsRange {
+    /// Today's local hours, a bucket each.
+    Today,
+    /// Today and the 6 local days before it, a bucket each.
+    SevenDays,
     /// Today and the 29 local days before it, a bucket each.
     #[default]
     ThirtyDays,
+    /// This calendar month and the 11 before it, a bucket each.
+    Year,
+    /// Every calendar month since the earliest timed Turn's, gathered into
+    /// quarters past [`ALL_TIME_MONTHS`] months and into years past
+    /// [`ALL_TIME_QUARTERS`] quarters' worth of them.
+    AllTime,
 }
 
+/// The most months All time shows one bar each.
+pub(crate) const ALL_TIME_MONTHS: i64 = 36;
+/// The most months All time shows by the quarter, twelve years' worth.
+pub(crate) const ALL_TIME_QUARTERS: i64 = 12 * 12;
+
 impl MetricsRange {
-    /// How the range is named where it is shown.
+    /// Every range, in the order the range bar lists them and `1`–`5` and
+    /// `[`/`]` step through them.
+    pub const ALL: [Self; 5] = [
+        Self::Today,
+        Self::SevenDays,
+        Self::ThirtyDays,
+        Self::Year,
+        Self::AllTime,
+    ];
+
+    /// How the range bar names the range.
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::ThirtyDays => "Last 30 days",
+            Self::Today => "Today",
+            Self::SevenDays => "7 days",
+            Self::ThirtyDays => "30 days",
+            Self::Year => "Year",
+            Self::AllTime => "All time",
         }
     }
 
-    /// The unit one bucket of the range is.
-    pub(crate) fn unit(self) -> BucketUnit {
+    /// How a heading names the span the range covers.
+    pub(crate) fn title(self) -> &'static str {
         match self {
-            Self::ThirtyDays => BucketUnit::Day,
+            Self::Today => "Today",
+            Self::SevenDays => "Last 7 days",
+            Self::ThirtyDays => "Last 30 days",
+            Self::Year => "Last 12 months",
+            Self::AllTime => "All time",
         }
+    }
+
+    /// The range after this one in the range bar, or this one where it is
+    /// the last: the wheel stops at either end rather than spinning round.
+    pub(crate) fn next(self) -> Self {
+        let place = self.place();
+        Self::ALL[(place + 1).min(Self::ALL.len() - 1)]
+    }
+
+    /// The range before this one in the range bar, or this one where it is
+    /// the first.
+    pub(crate) fn previous(self) -> Self {
+        Self::ALL[self.place().saturating_sub(1)]
+    }
+
+    /// Where the range stands in the range bar, from nought.
+    pub(crate) fn place(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|range| *range == self)
+            .expect("every range is listed")
     }
 }
 
 /// What one bucket of a range is, which says how it is labelled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BucketUnit {
+    Hour,
     Day,
+    Month,
+    Quarter,
+    Year,
 }
 
 impl BucketUnit {
     /// The spans of buckets an x-axis may label every one of, shortest
-    /// first: a reader counts days by the week.
+    /// first, in the multiples a reader counts the unit in: hours by the
+    /// quarter- and half-day, days by the week, months by the quarter, half
+    /// year, and year, years by the decade.
     pub(crate) fn label_strides(self) -> &'static [u16] {
         match self {
+            Self::Hour => &[1, 2, 3, 6, 12],
             Self::Day => &[1, 7, 14, 28],
+            Self::Month => &[1, 3, 6, 12],
+            Self::Quarter => &[1, 2, 4],
+            Self::Year => &[1, 2, 5, 10],
         }
     }
+}
+
+/// A range as the reader's calendar cuts it: the unit of its buckets, and
+/// the buckets, earliest first and each beginning where the one before it
+/// ends.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RangeBuckets {
+    pub(crate) unit: BucketUnit,
+    pub(crate) buckets: Vec<CalendarBucket>,
 }
 
 /// One bucket as the reader's calendar cuts it: the interval asked of the
@@ -55,35 +133,148 @@ pub(crate) struct CalendarBucket {
     pub(crate) begins: DateTime,
 }
 
-/// The buckets `range` divides into at `now` in `zone`, earliest first and
-/// each beginning where the one before it ends. `None` where `now` lies
-/// beyond what the calendar can place.
+/// The buckets `range` divides into at `now` in `zone`. All time begins
+/// with the month of `earliest`, the earliest timed Turn, and is this month
+/// alone where no Turn is timed; no other range consults it. `None` where
+/// `now` lies beyond what the calendar can place.
 pub(crate) fn resolve(
     range: MetricsRange,
     now: SessionTimestamp,
     zone: &TimeZone,
-) -> Option<Vec<CalendarBucket>> {
-    let millis = i64::try_from(now.0).ok()?;
-    let now = Timestamp::from_millisecond(millis)
-        .ok()?
-        .to_zoned(zone.clone());
-    match range {
-        MetricsRange::ThirtyDays => days(&now, 30),
-    }
+    earliest: Option<SessionTimestamp>,
+) -> Option<RangeBuckets> {
+    let now = zoned(now, zone)?;
+    let today = now.date();
+    let this_month = today.first_of_month();
+    let (unit, buckets) = match range {
+        MetricsRange::Today => (BucketUnit::Hour, hours(&now)?),
+        MetricsRange::SevenDays => (BucketUnit::Day, days(today, 7, zone)?),
+        MetricsRange::ThirtyDays => (BucketUnit::Day, days(today, 30, zone)?),
+        MetricsRange::Year => (
+            BucketUnit::Month,
+            periods(this_month.checked_sub(11.months()).ok()?, 12, 1, zone)?,
+        ),
+        MetricsRange::AllTime => {
+            // A Turn the clock places after now begins no earlier month.
+            let earliest = match earliest {
+                Some(earliest) => zoned(earliest, zone)?.date().min(today),
+                None => today,
+            };
+            all_time(earliest, today, zone)?
+        }
+    };
+    Some(RangeBuckets { unit, buckets })
 }
 
-/// Today and the `count - 1` local days before it. A day is cut at its
-/// first moment rather than at midnight, which a transition can skip, so a
-/// 23- or 25-hour day is still one bucket.
-fn days(now: &Zoned, count: i64) -> Option<Vec<CalendarBucket>> {
-    let today = now.start_of_day().ok()?;
-    (0..count)
-        .rev()
-        .map(|back| {
-            let begins = today.checked_sub(back.days()).ok()?.start_of_day().ok()?;
-            let ends = begins.tomorrow().ok()?.start_of_day().ok()?;
-            bucket(&begins, &ends)
+/// From the month of `earliest` through the month of `today`: by the month
+/// up to [`ALL_TIME_MONTHS`] of them, then by the calendar quarter up to
+/// [`ALL_TIME_QUARTERS`] months, then by the calendar year — no more years
+/// than one query may ask for, the latest kept.
+fn all_time(
+    earliest: Date,
+    today: Date,
+    zone: &TimeZone,
+) -> Option<(BucketUnit, Vec<CalendarBucket>)> {
+    let months = i64::from(today.year() - earliest.year()) * 12
+        + i64::from(today.month() - earliest.month())
+        + 1;
+    if months <= ALL_TIME_MONTHS {
+        let buckets = periods(earliest.first_of_month(), months, 1, zone)?;
+        return Some((BucketUnit::Month, buckets));
+    }
+    if months <= ALL_TIME_QUARTERS {
+        let quarter = |date: Date| {
+            date.first_of_month()
+                .with()
+                .month((date.month() - 1) / 3 * 3 + 1)
+                .build()
+                .ok()
+        };
+        let first = quarter(earliest)?;
+        let last = quarter(today)?;
+        let count = i64::from(last.year() - first.year()) * 4
+            + i64::from(last.month() - first.month()) / 3
+            + 1;
+        return Some((BucketUnit::Quarter, periods(first, count, 3, zone)?));
+    }
+    let most = i16::try_from(MAX_USAGE_METRICS_BUCKETS).unwrap_or(i16::MAX);
+    let first = earliest.year().max(today.year() - (most - 1));
+    let count = i64::from(today.year() - first) + 1;
+    let first = today.first_of_year().with().year(first).build().ok()?;
+    Some((BucketUnit::Year, periods(first, count, 12, zone)?))
+}
+
+fn zoned(moment: SessionTimestamp, zone: &TimeZone) -> Option<Zoned> {
+    let millis = i64::try_from(moment.0).ok()?;
+    Some(
+        Timestamp::from_millisecond(millis)
+            .ok()?
+            .to_zoned(zone.clone()),
+    )
+}
+
+/// Today's local hours, from its first moment to tomorrow's: 23 or 25 of
+/// them on a day daylight saving shortens or lengthens.
+fn hours(now: &Zoned) -> Option<Vec<CalendarBucket>> {
+    let begins = now.start_of_day().ok()?;
+    let ends = begins.tomorrow().ok()?.start_of_day().ok()?;
+    let mut edges = vec![begins];
+    loop {
+        let last = edges.last()?;
+        if last.timestamp() >= ends.timestamp() {
+            break;
+        }
+        // An hour of elapsed time, so a repeated hour is a bucket of its own.
+        let next = last.checked_add(1.hour()).ok()?;
+        edges.push(if next.timestamp() < ends.timestamp() {
+            next
+        } else {
+            ends.clone()
+        });
+    }
+    between(&edges)
+}
+
+/// `today` and the `count - 1` local days before it.
+fn days(today: Date, count: i64, zone: &TimeZone) -> Option<Vec<CalendarBucket>> {
+    let first = today.checked_sub((count - 1).days()).ok()?;
+    edges(first, count, zone, |step| step.days())
+}
+
+/// `count` calendar periods of `months` months each, the first beginning on
+/// `first`.
+fn periods(first: Date, count: i64, months: i64, zone: &TimeZone) -> Option<Vec<CalendarBucket>> {
+    edges(first, count, zone, |step| (step * months).months())
+}
+
+/// `count` buckets, the `n`th beginning `step(n)` after `first`. Each is cut
+/// at its first day's first moment rather than at midnight, which a
+/// transition can skip, so a 23- or 25-hour day is still one bucket.
+fn edges(
+    first: Date,
+    count: i64,
+    zone: &TimeZone,
+    step: impl Fn(i64) -> Span,
+) -> Option<Vec<CalendarBucket>> {
+    let edges = (0..=count)
+        .map(|n| {
+            first
+                .checked_add(step(n))
+                .ok()?
+                .to_zoned(zone.clone())
+                .ok()?
+                .start_of_day()
+                .ok()
         })
+        .collect::<Option<Vec<Zoned>>>()?;
+    between(&edges)
+}
+
+/// The buckets between each edge and the next.
+fn between(edges: &[Zoned]) -> Option<Vec<CalendarBucket>> {
+    edges
+        .windows(2)
+        .map(|pair| bucket(&pair[0], &pair[1]))
         .collect()
 }
 
@@ -123,11 +314,291 @@ mod tests {
         (interval.end.0 - interval.start.0) / 3_600_000
     }
 
+    /// The buckets `range` divides into at `now` in the zone named, for a
+    /// range that does not consult the earliest Turn.
+    fn cut(range: MetricsRange, now: SessionTimestamp, zone_name: &str) -> Vec<CalendarBucket> {
+        resolve(range, now, &zone(zone_name), None)
+            .expect("a moment the calendar places")
+            .buckets
+    }
+
+    /// All time at `now` in UTC since a Turn at `earliest` there.
+    fn all_time_since(earliest: DateTime, now: DateTime) -> RangeBuckets {
+        resolve(
+            MetricsRange::AllTime,
+            at("UTC", now),
+            &zone("UTC"),
+            Some(at("UTC", earliest)),
+        )
+        .expect("moments the calendar places")
+    }
+
+    fn contiguous(buckets: &[CalendarBucket]) -> bool {
+        buckets
+            .windows(2)
+            .all(|pair| pair[0].interval.end == pair[1].interval.start)
+    }
+
+    fn hours_of_the_day(buckets: &[CalendarBucket]) -> Vec<i8> {
+        buckets.iter().map(|bucket| bucket.begins.hour()).collect()
+    }
+
+    #[test]
+    fn today_is_its_local_hours_from_midnight_to_midnight() {
+        let now = at("Asia/Tokyo", date(2026, 10, 28).at(14, 30, 0, 0));
+
+        let buckets = cut(MetricsRange::Today, now, "Asia/Tokyo");
+
+        assert_eq!(hours_of_the_day(&buckets), (0..24).collect::<Vec<_>>());
+        assert_eq!(
+            buckets[0].interval.start,
+            at("Asia/Tokyo", date(2026, 10, 28).at(0, 0, 0, 0))
+        );
+        assert_eq!(
+            buckets[23].interval.end,
+            at("Asia/Tokyo", date(2026, 10, 29).at(0, 0, 0, 0)),
+            "the hours still to come are buckets too"
+        );
+        assert!(buckets[14].interval.contains(now));
+        assert!(buckets.iter().all(|bucket| hours(bucket.interval) == 1));
+        assert!(contiguous(&buckets));
+    }
+
+    #[test]
+    fn today_has_twenty_three_hours_when_daylight_saving_begins() {
+        // New York springs forward at 02:00 on 8 March 2026, to 03:00.
+        let now = at("America/New_York", date(2026, 3, 8).at(12, 0, 0, 0));
+
+        let buckets = cut(MetricsRange::Today, now, "America/New_York");
+
+        assert_eq!(buckets.len(), 23);
+        let mut wall: Vec<i8> = (0..24).collect();
+        wall.retain(|hour| *hour != 2);
+        assert_eq!(hours_of_the_day(&buckets), wall, "02:00 never comes");
+        assert!(buckets.iter().all(|bucket| hours(bucket.interval) == 1));
+        assert!(contiguous(&buckets));
+        assert_eq!(
+            buckets[22].interval.end,
+            at("America/New_York", date(2026, 3, 9).at(0, 0, 0, 0))
+        );
+    }
+
+    #[test]
+    fn today_has_twenty_five_hours_when_daylight_saving_ends() {
+        // New York falls back at 02:00 on 1 November 2026, to 01:00 again.
+        let now = at("America/New_York", date(2026, 11, 1).at(12, 0, 0, 0));
+
+        let buckets = cut(MetricsRange::Today, now, "America/New_York");
+
+        assert_eq!(buckets.len(), 25);
+        let mut wall: Vec<i8> = (0..24).collect();
+        wall.insert(1, 1);
+        assert_eq!(
+            hours_of_the_day(&buckets),
+            wall,
+            "01:00 comes twice, a bucket each time"
+        );
+        assert!(buckets.iter().all(|bucket| hours(bucket.interval) == 1));
+        assert!(contiguous(&buckets));
+    }
+
+    #[test]
+    fn today_begins_at_its_first_moment_where_midnight_is_skipped() {
+        // Santiago springs forward at midnight on 6 September 2026.
+        let now = at("America/Santiago", date(2026, 9, 6).at(12, 0, 0, 0));
+
+        let buckets = cut(MetricsRange::Today, now, "America/Santiago");
+
+        assert_eq!(buckets.len(), 23);
+        assert_eq!(buckets[0].begins, date(2026, 9, 6).at(1, 0, 0, 0));
+        assert_eq!(hours_of_the_day(&buckets), (1..24).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn seven_days_are_today_and_the_six_local_days_before_it() {
+        let now = at("Europe/London", date(2026, 10, 28).at(9, 0, 0, 0));
+
+        let buckets = cut(MetricsRange::SevenDays, now, "Europe/London");
+
+        let days: Vec<Date> = buckets.iter().map(|bucket| bucket.begins.date()).collect();
+        assert_eq!(
+            days,
+            (22..=28).map(|day| date(2026, 10, day)).collect::<Vec<_>>()
+        );
+        // London falls back on the 25th.
+        assert_eq!(hours(buckets[3].interval), 25);
+        assert!(buckets[6].interval.contains(now));
+        assert!(contiguous(&buckets));
+    }
+
+    #[test]
+    fn a_year_is_this_month_and_the_eleven_before_it() {
+        let now = at("Europe/London", date(2026, 10, 28).at(9, 0, 0, 0));
+
+        let buckets = cut(MetricsRange::Year, now, "Europe/London");
+
+        let months: Vec<Date> = buckets.iter().map(|bucket| bucket.begins.date()).collect();
+        let mut expected = vec![date(2025, 11, 1), date(2025, 12, 1)];
+        expected.extend((1..=10).map(|month| date(2026, month, 1)));
+        assert_eq!(months, expected);
+        assert!(buckets.iter().all(|bucket| bucket.begins.hour() == 0));
+        assert!(buckets[11].interval.contains(now));
+        assert!(contiguous(&buckets));
+        let hours_in = |month: i8| {
+            hours(
+                buckets
+                    .iter()
+                    .find(|bucket| bucket.begins.date() == date(2026, month, 1))
+                    .unwrap()
+                    .interval,
+            )
+        };
+        assert_eq!(hours_in(2), 28 * 24, "February 2026 is no leap month");
+        assert_eq!(hours_in(3), 31 * 24 - 1, "London springs forward in March");
+        assert_eq!(hours_in(10), 31 * 24 + 1, "and falls back in October");
+        assert_eq!(hours_in(4), 30 * 24);
+    }
+
+    #[test]
+    fn a_leap_year_s_february_is_twenty_nine_days() {
+        let now = at("Asia/Kolkata", date(2028, 3, 1).at(0, 0, 0, 0));
+
+        let buckets = cut(MetricsRange::Year, now, "Asia/Kolkata");
+
+        assert_eq!(buckets[0].begins.date(), date(2027, 4, 1));
+        let february = &buckets[10];
+        assert_eq!(february.begins.date(), date(2028, 2, 1));
+        assert_eq!(hours(february.interval), 29 * 24);
+        assert_eq!(
+            buckets[11].interval.start,
+            at("Asia/Kolkata", date(2028, 3, 1).at(0, 0, 0, 0)),
+            "March begins at the moment now, its first"
+        );
+        assert!(buckets[11].interval.contains(now));
+    }
+
+    #[test]
+    fn all_time_is_monthly_from_the_earliest_turn_s_month_up_to_three_years() {
+        let now = date(2026, 10, 28).at(9, 0, 0, 0);
+
+        let cut = all_time_since(date(2023, 11, 30).at(23, 0, 0, 0), now);
+
+        assert_eq!(cut.unit, BucketUnit::Month);
+        assert_eq!(cut.buckets.len(), 36);
+        assert_eq!(cut.buckets[0].begins, date(2023, 11, 1).at(0, 0, 0, 0));
+        assert_eq!(cut.buckets[35].begins, date(2026, 10, 1).at(0, 0, 0, 0));
+        assert!(contiguous(&cut.buckets));
+    }
+
+    #[test]
+    fn all_time_past_three_years_is_by_the_calendar_quarter() {
+        let now = date(2026, 10, 28).at(9, 0, 0, 0);
+
+        let cut = all_time_since(date(2023, 10, 31).at(0, 0, 0, 0), now);
+
+        assert_eq!(cut.unit, BucketUnit::Quarter, "37 months");
+        assert_eq!(cut.buckets.len(), 13);
+        assert_eq!(cut.buckets[0].begins.date(), date(2023, 10, 1));
+        assert_eq!(cut.buckets[1].begins.date(), date(2024, 1, 1));
+        assert_eq!(cut.buckets[12].begins.date(), date(2026, 10, 1));
+        assert_eq!(
+            cut.buckets[12].interval.end,
+            at("UTC", date(2027, 1, 1).at(0, 0, 0, 0))
+        );
+        assert!(contiguous(&cut.buckets));
+
+        // A quarter begins on the first of its first month, wherever in it
+        // the earliest Turn fell.
+        let cut = all_time_since(date(2014, 11, 15).at(0, 0, 0, 0), now);
+        assert_eq!(cut.unit, BucketUnit::Quarter, "twelve years exactly");
+        assert_eq!(cut.buckets.len(), 49);
+        assert_eq!(cut.buckets[0].begins.date(), date(2014, 10, 1));
+    }
+
+    #[test]
+    fn all_time_past_twelve_years_is_by_the_calendar_year() {
+        let now = date(2026, 10, 28).at(9, 0, 0, 0);
+
+        let cut = all_time_since(date(2014, 10, 31).at(0, 0, 0, 0), now);
+
+        assert_eq!(cut.unit, BucketUnit::Year, "145 months");
+        let years: Vec<Date> = cut
+            .buckets
+            .iter()
+            .map(|bucket| bucket.begins.date())
+            .collect();
+        assert_eq!(
+            years,
+            (2014..=2026)
+                .map(|year| date(year, 1, 1))
+                .collect::<Vec<_>>()
+        );
+        assert!(contiguous(&cut.buckets));
+    }
+
+    #[test]
+    fn all_time_never_asks_for_more_buckets_than_a_query_may_hold() {
+        let cut = all_time_since(
+            date(1970, 1, 1).at(0, 0, 0, 0),
+            date(9000, 6, 1).at(0, 0, 0, 0),
+        );
+
+        assert_eq!(cut.unit, BucketUnit::Year);
+        assert_eq!(cut.buckets.len(), MAX_USAGE_METRICS_BUCKETS);
+        assert_eq!(cut.buckets.last().unwrap().begins.date(), date(9000, 1, 1));
+    }
+
+    #[test]
+    fn all_time_without_a_timed_turn_is_this_month_alone() {
+        let now = at("UTC", date(2026, 10, 28).at(9, 0, 0, 0));
+        let only_this_month = |earliest| {
+            let cut = resolve(MetricsRange::AllTime, now, &zone("UTC"), earliest).unwrap();
+            assert_eq!(cut.unit, BucketUnit::Month);
+            cut.buckets
+                .iter()
+                .map(|bucket| bucket.begins.date())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(only_this_month(None), vec![date(2026, 10, 1)]);
+        assert_eq!(
+            only_this_month(Some(at("UTC", date(2027, 2, 1).at(0, 0, 0, 0)))),
+            vec![date(2026, 10, 1)],
+            "a Turn the clock places later begins no later month"
+        );
+    }
+
+    #[test]
+    fn all_time_begins_with_the_month_the_earliest_turn_was_in_where_the_reader_is() {
+        // 02:00 UTC on 1 October is still 30 September in New York.
+        let earliest = at("UTC", date(2026, 10, 1).at(2, 0, 0, 0));
+        let now = at("UTC", date(2026, 10, 28).at(9, 0, 0, 0));
+        let first = |zone_name: &str| {
+            resolve(MetricsRange::AllTime, now, &zone(zone_name), Some(earliest))
+                .unwrap()
+                .buckets[0]
+                .begins
+                .date()
+        };
+
+        assert_eq!(first("America/New_York"), date(2026, 9, 1));
+        assert_eq!(first("Europe/London"), date(2026, 10, 1));
+    }
+
+    #[test]
+    fn ranges_step_in_the_range_bar_s_order_and_stop_at_either_end() {
+        assert_eq!(MetricsRange::Today.previous(), MetricsRange::Today);
+        assert_eq!(MetricsRange::Today.next(), MetricsRange::SevenDays);
+        assert_eq!(MetricsRange::ThirtyDays.next(), MetricsRange::Year);
+        assert_eq!(MetricsRange::Year.previous(), MetricsRange::ThirtyDays);
+        assert_eq!(MetricsRange::AllTime.next(), MetricsRange::AllTime);
+    }
+
     #[test]
     fn thirty_days_are_today_and_the_twenty_nine_local_days_before_it() {
         let now = at("Asia/Kolkata", date(2026, 10, 28).at(0, 30, 0, 0));
 
-        let buckets = resolve(MetricsRange::ThirtyDays, now, &zone("Asia/Kolkata")).unwrap();
+        let buckets = cut(MetricsRange::ThirtyDays, now, "Asia/Kolkata");
 
         assert_eq!(buckets.len(), 30);
         assert_eq!(buckets[0].begins, date(2026, 9, 29).at(0, 0, 0, 0));
@@ -141,12 +612,7 @@ mod tests {
             );
         }
         assert!(buckets[29].interval.contains(now));
-        assert!(
-            buckets
-                .windows(2)
-                .all(|pair| pair[0].interval.end == pair[1].interval.start),
-            "each day ends where the next begins"
-        );
+        assert!(contiguous(&buckets), "each day ends where the next begins");
     }
 
     #[test]
@@ -154,8 +620,8 @@ mod tests {
         // 03:00 UTC on 28 October is still the 27th in New York.
         let now = at("UTC", date(2026, 10, 28).at(3, 0, 0, 0));
 
-        let new_york = resolve(MetricsRange::ThirtyDays, now, &zone("America/New_York")).unwrap();
-        let kolkata = resolve(MetricsRange::ThirtyDays, now, &zone("Asia/Kolkata")).unwrap();
+        let new_york = cut(MetricsRange::ThirtyDays, now, "America/New_York");
+        let kolkata = cut(MetricsRange::ThirtyDays, now, "Asia/Kolkata");
 
         assert_eq!(new_york[29].begins.date(), date(2026, 10, 27));
         assert_eq!(kolkata[29].begins.date(), date(2026, 10, 28));
@@ -169,7 +635,7 @@ mod tests {
     fn a_day_daylight_saving_shortens_or_lengthens_is_still_one_bucket() {
         let now = at("America/New_York", date(2026, 11, 20).at(12, 0, 0, 0));
 
-        let buckets = resolve(MetricsRange::ThirtyDays, now, &zone("America/New_York")).unwrap();
+        let buckets = cut(MetricsRange::ThirtyDays, now, "America/New_York");
 
         let ends = buckets
             .iter()
@@ -184,7 +650,7 @@ mod tests {
         );
 
         let now = at("America/New_York", date(2026, 3, 20).at(12, 0, 0, 0));
-        let buckets = resolve(MetricsRange::ThirtyDays, now, &zone("America/New_York")).unwrap();
+        let buckets = cut(MetricsRange::ThirtyDays, now, "America/New_York");
         let begins = buckets
             .iter()
             .find(|bucket| bucket.begins.date() == date(2026, 3, 8))
@@ -198,7 +664,7 @@ mod tests {
         // 00:00 and begins at 01:00.
         let now = at("America/Santiago", date(2026, 9, 20).at(12, 0, 0, 0));
 
-        let buckets = resolve(MetricsRange::ThirtyDays, now, &zone("America/Santiago")).unwrap();
+        let buckets = cut(MetricsRange::ThirtyDays, now, "America/Santiago");
 
         let skipped = buckets
             .iter()
@@ -206,10 +672,6 @@ mod tests {
             .expect("6 September is in range");
         assert_eq!(skipped.begins, date(2026, 9, 6).at(1, 0, 0, 0));
         assert_eq!(hours(skipped.interval), 23);
-        assert!(
-            buckets
-                .windows(2)
-                .all(|pair| pair[0].interval.end == pair[1].interval.start)
-        );
+        assert!(contiguous(&buckets));
     }
 }

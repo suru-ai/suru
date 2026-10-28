@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     super::usage::compact_count,
-    calendar::{BucketUnit, CalendarBucket},
+    calendar::{BucketUnit, CalendarBucket, RangeBuckets},
 };
 
 /// What the y-axis measures.
@@ -168,34 +168,62 @@ pub(crate) fn nice_axis(max: u64, ticks: u64) -> Axis {
     }
 }
 
-/// How a bucket is named under its bar.
+/// How a bucket is named under its bar: an hour by the clock, a day by its
+/// date, a month, a quarter, or a year by the calendar's names for them.
 pub(crate) fn bucket_label(bucket: &CalendarBucket, unit: BucketUnit) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
+    let begins = bucket.begins;
+    let month = MONTHS[usize::try_from(begins.month() - 1).unwrap_or(0)];
     match unit {
-        BucketUnit::Day => {
-            let date = bucket.begins.date();
-            let month = MONTHS[usize::try_from(date.month() - 1).unwrap_or(0)];
-            format!("{} {month}", date.day())
-        }
+        BucketUnit::Hour => format!("{:02}:00", begins.hour()),
+        BucketUnit::Day => format!("{} {month}", begins.day()),
+        BucketUnit::Month => format!("{month} {}", begins.year()),
+        BucketUnit::Quarter => format!("Q{} {}", (begins.month() - 1) / 3 + 1, begins.year()),
+        BucketUnit::Year => begins.year().to_string(),
+    }
+}
+
+/// The bucket a thinned x-axis counts its strides from. Days count back from
+/// today, so the present is always named; the calendar's other units count
+/// from the turn of whatever holds them — hours from midnight, months from
+/// January, quarters from the first, years from the decade — so a label
+/// every third month names the quarters' first months wherever the range
+/// begins. Every stride of those units divides the next unit up, so the
+/// bucket counted from need not lie in range.
+fn label_anchor(range: &RangeBuckets) -> usize {
+    let Some(first) = range.buckets.first().map(|bucket| bucket.begins) else {
+        return 0;
+    };
+    let index = |into: i64, modulus: i64| usize::try_from(into.rem_euclid(modulus)).unwrap_or(0);
+    match range.unit {
+        BucketUnit::Hour => index(-i64::from(first.hour()), 24),
+        BucketUnit::Day => range.buckets.len() - 1,
+        BucketUnit::Month => index(1 - i64::from(first.month()), 12),
+        BucketUnit::Quarter => index(-i64::from((first.month() - 1) / 3), 4),
+        BucketUnit::Year => index(-i64::from(first.year()), 10),
     }
 }
 
 /// The labels shown along an x-axis whose bars stand `slot` columns apart,
 /// each as its bucket's index and the column it begins at, counted from the
-/// first bar. Every `stride`-th bucket is labelled, counting back from the
-/// last so the present is always named, the stride the shortest of `strides`
-/// — the spans a reader counts the unit in, such as a week of days — that
-/// leaves a column between labels. The last label moves left as far as it must to
-/// end within `width`; any other stands under its own bar or not at all, so
-/// one that would still run into its right-hand neighbour is dropped.
+/// first bar. Every `stride`-th bucket is labelled, counting from `anchor`
+/// either way, the stride the shortest of `strides` — the spans a reader
+/// counts the unit in, such as a week of days — that leaves a column between
+/// labels. The rightmost label moves left as far as it must to end within
+/// `width`; any other stands under its own bar or not at all, so one that
+/// would still run into its right-hand neighbour is dropped.
 pub(crate) fn thinned_labels(
     labels: &[String],
     strides: &[u16],
+    anchor: usize,
     slot: u16,
     width: u16,
 ) -> Vec<(usize, u16)> {
+    let Some(last) = labels.len().checked_sub(1) else {
+        return Vec::new();
+    };
     let widest = labels.iter().map(|label| label.width()).max().unwrap_or(0);
     // Counted in `usize`, so no range's stride or width can overflow.
     let needed = widest + 1;
@@ -206,9 +234,11 @@ pub(crate) fn thinned_labels(
         .find(|stride| stride.saturating_mul(slot) >= needed)
         .unwrap_or_else(|| needed.div_ceil(slot))
         .max(1);
+    // The last bucket a stride from `anchor` labels.
+    let rightmost = last - (last % stride + stride - anchor % stride) % stride;
     let mut placed: Vec<(usize, u16)> = Vec::new();
     let width = usize::from(width);
-    for index in (0..labels.len()).rev().step_by(stride) {
+    for index in (0..=rightmost).rev().step_by(stride) {
         let label_width = labels[index].width();
         let under_bar = index.saturating_mul(slot);
         let at = match placed.last() {
@@ -238,12 +268,12 @@ const LOWER_EIGHTHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆',
 pub(crate) fn render_chart(
     buffer: &mut Buffer,
     area: Rect,
-    buckets: &[CalendarBucket],
-    unit: BucketUnit,
+    range: &RangeBuckets,
     series: &[Series],
     measure: MetricsMeasure,
     theme: &Theme,
 ) {
+    let buckets = &range.buckets;
     // The x-axis and the labels beneath it take the last two rows.
     let plot_rows = area.height.saturating_sub(2);
     if plot_rows == 0 || buckets.is_empty() {
@@ -340,12 +370,13 @@ pub(crate) fn render_chart(
 
     let labels: Vec<String> = buckets
         .iter()
-        .map(|bucket| bucket_label(bucket, unit))
+        .map(|bucket| bucket_label(bucket, range.unit))
         .collect();
     let first_bar = slot - bar_width;
     for (index, at) in thinned_labels(
         &labels,
-        unit.label_strides(),
+        range.unit.label_strides(),
+        label_anchor(range),
         slot,
         plot_width.saturating_sub(first_bar),
     ) {
@@ -401,7 +432,7 @@ mod tests {
     fn labels_are_thinned_so_none_runs_into_the_next() {
         let labels: Vec<String> = (1..=30).map(|day| format!("{day} Oct")).collect();
 
-        let placed = thinned_labels(&labels, BucketUnit::Day.label_strides(), 3, 90);
+        let placed = thinned_labels(&labels, BucketUnit::Day.label_strides(), 29, 3, 90);
 
         assert_eq!(
             placed.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
@@ -420,16 +451,96 @@ mod tests {
     fn no_slot_or_stride_is_too_wide_to_count() {
         let labels: Vec<String> = (0..600).map(|day| format!("{day} Oct")).collect();
 
-        let placed = thinned_labels(&labels, &[u16::MAX], u16::MAX, u16::MAX);
+        let placed = thinned_labels(&labels, &[u16::MAX], 599, u16::MAX, u16::MAX);
 
         assert_eq!(placed.first(), Some(&(599, u16::MAX - 7)));
+    }
+
+    /// The labels a range's x-axis keeps with its bars `slot` columns apart.
+    fn kept_labels(range: &RangeBuckets, slot: u16) -> Vec<String> {
+        let labels: Vec<String> = range
+            .buckets
+            .iter()
+            .map(|bucket| bucket_label(bucket, range.unit))
+            .collect();
+        let width = slot * u16::try_from(labels.len()).unwrap();
+        thinned_labels(
+            &labels,
+            range.unit.label_strides(),
+            label_anchor(range),
+            slot,
+            width,
+        )
+        .into_iter()
+        .map(|(index, _)| labels[index].clone())
+        .collect()
+    }
+
+    fn all_time_since(earliest: jiff::civil::DateTime) -> RangeBuckets {
+        use crate::protocol::SessionTimestamp;
+        use jiff::{civil::date, tz::TimeZone};
+        let moment = |wall: jiff::civil::DateTime| {
+            SessionTimestamp(
+                wall.to_zoned(TimeZone::UTC)
+                    .unwrap()
+                    .timestamp()
+                    .as_millisecond() as u64,
+            )
+        };
+        super::super::calendar::resolve(
+            super::super::calendar::MetricsRange::AllTime,
+            moment(date(2026, 10, 28).at(9, 0, 0, 0)),
+            &TimeZone::UTC,
+            Some(moment(earliest)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn calendar_labels_count_from_the_turn_of_what_holds_them() {
+        use jiff::civil::date;
+
+        // Thirty months three columns apart: a label every third month,
+        // on the months that begin the quarters.
+        let months = all_time_since(date(2024, 5, 9).at(0, 0, 0, 0));
+        assert_eq!(months.unit, BucketUnit::Month);
+        let kept = kept_labels(&months, 3);
+        assert_eq!(kept.first().map(String::as_str), Some("Jul 2024"));
+        assert_eq!(kept.last().map(String::as_str), Some("Oct 2026"));
+        assert!(
+            kept.iter().all(|label| ["Jan", "Apr", "Jul", "Oct"]
+                .iter()
+                .any(|month| label.starts_with(month))),
+            "{kept:?}"
+        );
+
+        // Every other quarter, on the year's first and third.
+        let quarters = all_time_since(date(2016, 2, 1).at(0, 0, 0, 0));
+        assert_eq!(quarters.unit, BucketUnit::Quarter);
+        let kept = kept_labels(&quarters, 4);
+        assert!(
+            kept.iter()
+                .all(|label| label.starts_with("Q1") || label.starts_with("Q3")),
+            "{kept:?}"
+        );
+
+        // Years two columns apart, by the half decade.
+        let years = all_time_since(date(1971, 3, 1).at(0, 0, 0, 0));
+        assert_eq!(years.unit, BucketUnit::Year);
+        let kept = kept_labels(&years, 2);
+        assert_eq!(kept.first().map(String::as_str), Some("1975"));
+        assert!(
+            kept.iter()
+                .all(|label| label.parse::<i32>().unwrap() % 5 == 0),
+            "{kept:?}"
+        );
     }
 
     #[test]
     fn a_label_at_the_right_edge_moves_left_rather_than_running_off() {
         let labels: Vec<String> = ["1 Oct", "2 Oct", "3 Oct"].map(str::to_owned).into();
 
-        let placed = thinned_labels(&labels, BucketUnit::Day.label_strides(), 6, 15);
+        let placed = thinned_labels(&labels, BucketUnit::Day.label_strides(), 2, 6, 15);
 
         assert_eq!(placed, vec![(0, 0), (2, 10)]);
     }

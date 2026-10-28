@@ -1,7 +1,7 @@
 //! Draws the Usage Metrics view over the whole frame: a title bar with its
-//! close control, then the chart and its legend, or what stands in for them
-//! while a read is on its way, when it was refused, or when the range holds
-//! no Usage.
+//! close control, the range bar, then the chart and its legend, or what
+//! stands in for them while a read is on its way, when it was refused, or
+//! when the range holds no Usage.
 
 use ratatui::{
     Frame,
@@ -15,6 +15,7 @@ use crate::theme::Theme;
 use super::{
     super::slots::truncate_to_width,
     MetricsContent, MetricsView, UsageMetricsReadRefusal,
+    calendar::MetricsRange,
     chart::{self, Series},
 };
 
@@ -27,10 +28,15 @@ const INSET: u16 = 2;
 const LEGEND_BAR: u16 = 24;
 /// Labels in the legend are cut to this many columns.
 const LEGEND_LABEL: usize = 32;
+/// Columns between the range bar and what follows it on its row.
+const CONTROL_GAP: u16 = 4;
+/// Columns between one range's place in the range bar and the next's.
+const RANGE_GAP: u16 = 1;
 
 pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &Theme) {
     let area = frame.area();
     let buffer = frame.buffer_mut();
+    view.forget_targets();
     let subdued = theme.text.subdued;
     let primary = theme.text.primary;
 
@@ -52,18 +58,21 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
 
     let range = view.range();
     let measure = view.measure();
-    let mut subtitle = format!("{} by Model · {}", measure.label(), range.label());
+    let controls_y = area.y + 3;
+    let bar_end = render_range_bar(buffer, area.x + INSET - 1, controls_y, view, theme);
+    let mut subtitle = format!("{} by Model", measure.label());
     if view.is_reading() && matches!(view.content(), MetricsContent::Report { .. }) {
         subtitle.push_str(" · Refreshing…");
     }
+    let subtitle_x = bar_end + CONTROL_GAP;
     let subtitle_width = u16::try_from(subtitle.width()).unwrap_or(u16::MAX);
-    buffer.set_string(area.x + INSET, area.y + 3, &subtitle, subdued);
+    buffer.set_string(subtitle_x, controls_y, &subtitle, subdued);
     // Figures that could not be read again stay, saying why beside them.
     if let Some(refusal) = view.stale_because() {
-        let x = area.x + INSET + subtitle_width;
+        let x = subtitle_x + subtitle_width;
         let room = usize::from(area.right().saturating_sub(x + INSET));
         let note = truncate_to_width(&format!(" · {}", stale_note(refusal)), room);
-        buffer.set_string(x, area.y + 3, note, theme.feedback.error);
+        buffer.set_string(x, controls_y, note, theme.feedback.error);
     }
 
     let body = Rect::new(
@@ -75,6 +84,9 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
     if body.is_empty() {
         return;
     }
+    // The wheel steps ranges over where the chart stands, drawn or not, so a
+    // range with nothing to draw can still be stepped past.
+    view.record_chart_target(body);
     match view.content() {
         MetricsContent::Reading => {
             buffer.set_string(body.x, body.y, "Reading Usage Metrics…", subdued);
@@ -97,25 +109,14 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
             let series = chart::series(report, measure, theme);
             let total: u64 = series.iter().map(|series| series.total).sum();
             if total == 0 {
-                buffer.set_string(
-                    body.x,
-                    body.y,
-                    format!("No Usage in the {}.", range.label().to_lowercase()),
-                    subdued,
-                );
+                buffer.set_string(body.x, body.y, no_usage(range), subdued);
                 return;
             }
             let legend_rows = u16::try_from(series.len() + 1).unwrap_or(u16::MAX);
             let chart_rows = body.height.saturating_sub(legend_rows + 1).min(24);
-            chart::render_chart(
-                buffer,
-                Rect::new(body.x, body.y, body.width, chart_rows),
-                buckets,
-                range.unit(),
-                &series,
-                measure,
-                theme,
-            );
+            let chart_area = Rect::new(body.x, body.y, body.width, chart_rows);
+            view.record_chart_target(chart_area);
+            chart::render_chart(buffer, chart_area, buckets, &series, measure, theme);
             let legend = Rect::new(
                 body.x,
                 body.y + chart_rows + 1,
@@ -124,6 +125,51 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
             );
             render_legend(frame, legend, &series, total, view, theme);
         }
+    }
+}
+
+/// Every range from `x` along row `y`, each a label with a column either side
+/// that a pointer can choose it by, the chosen one drawn as a filled tab in
+/// those columns, so no label moves as the choice does. Answers the column
+/// after the last.
+fn render_range_bar(
+    buffer: &mut ratatui::buffer::Buffer,
+    mut x: u16,
+    y: u16,
+    view: &MetricsView,
+    theme: &Theme,
+) -> u16 {
+    let accent = theme.accent.primary;
+    for range in MetricsRange::ALL {
+        let label = range.label();
+        let label_width = u16::try_from(label.width()).unwrap_or(u16::MAX);
+        if range == view.range() {
+            buffer.set_string(x, y, "▐", accent);
+            buffer.set_string(
+                x + 1,
+                y,
+                label,
+                accent.add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            );
+            buffer.set_string(x + 1 + label_width, y, "▌", accent);
+        } else {
+            buffer.set_string(x + 1, y, label, theme.text.subdued);
+        }
+        let width = label_width + 2;
+        view.record_range_target(range, Rect::new(x, y, width, 1));
+        x += width + RANGE_GAP;
+    }
+    x - RANGE_GAP
+}
+
+/// What the view says of a range that holds no Usage.
+fn no_usage(range: MetricsRange) -> &'static str {
+    match range {
+        MetricsRange::Today => "No Usage today.",
+        MetricsRange::SevenDays => "No Usage in the last 7 days.",
+        MetricsRange::ThirtyDays => "No Usage in the last 30 days.",
+        MetricsRange::Year => "No Usage in the last 12 months.",
+        MetricsRange::AllTime => "No Usage yet.",
     }
 }
 
@@ -146,7 +192,7 @@ fn render_legend(
     buffer.set_string(
         area.x,
         area.y,
-        format!("{} · {}", view.range().label(), measure.total(total)),
+        format!("{} · {}", view.range().title(), measure.total(total)),
         theme.text.primary.add_modifier(Modifier::BOLD),
     );
     let label_width = series

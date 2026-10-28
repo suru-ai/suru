@@ -21,8 +21,8 @@ use suru::{
         UsageMetricsReport,
     },
     tui::{
-        Application, ApplicationEvent, ApplicationTransition, SemanticCommandId,
-        UsageMetricsReadRefusal,
+        Application, ApplicationEvent, ApplicationTransition, CommandId, MetricsRange,
+        SemanticCommandId, UsageMetricsReadRefusal,
     },
 };
 use uuid::Uuid;
@@ -246,7 +246,11 @@ fn a_report_draws_stacked_bars_over_a_nice_axis_with_a_legend() {
     let shown = rows.join("\n");
     eprintln!("{shown}");
     assert!(rows[0].trim_end().ends_with("esc ✕"), "{shown}");
-    row(&rows, "Tokens by Model · Last 30 days");
+    let controls = row(&rows, "Tokens by Model");
+    assert!(
+        controls.starts_with("  Today   7 days  ▐30 days▌  Year   All time"),
+        "the range bar, thirty days chosen: {controls:?}"
+    );
 
     // The busiest day holds 6.25M, so the axis climbs in steps of 1M to 7M.
     for tick in ["1M", "2M", "7M"] {
@@ -456,7 +460,7 @@ fn a_refused_refresh_keeps_the_figures_and_says_why_beside_them() {
 
     let rows = screen(&application);
     row(&rows, "Claude Opus 5.5");
-    let subtitle = row(&rows, "Tokens by Model · Last 30 days");
+    let subtitle = row(&rows, "Tokens by Model");
     assert!(
         subtitle.contains("could not refresh: connection refused"),
         "{subtitle}"
@@ -731,4 +735,494 @@ fn a_selection_left_beneath_the_view_takes_neither_esc_nor_ctrl_c_from_it() {
         ApplicationTransition::Exit,
         "Ctrl+C leaves rather than copies"
     );
+}
+
+/// The local moment each bucket of `query` begins at in New York.
+fn new_york_starts(query: &UsageMetricsQuery) -> Vec<jiff::civil::DateTime> {
+    query
+        .buckets
+        .iter()
+        .map(|bucket| {
+            jiff::Timestamp::from_millisecond(bucket.start.0 as i64)
+                .unwrap()
+                .to_zoned(zone(NEW_YORK))
+                .datetime()
+        })
+        .collect()
+}
+
+fn contiguous(query: &UsageMetricsQuery) -> bool {
+    query
+        .buckets
+        .windows(2)
+        .all(|pair| pair[0].end == pair[1].start)
+}
+
+fn press(application: &mut Application, character: char) -> ApplicationTransition {
+    key(application, KeyCode::Char(character))
+}
+
+fn wheel(
+    application: &mut Application,
+    kind: MouseEventKind,
+    (column, row): (u16, u16),
+) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("turn the wheel")
+}
+
+/// A report of `query`'s buckets with nothing in them, naming `earliest` as
+/// the earliest timed Turn.
+fn empty_report(
+    query: &UsageMetricsQuery,
+    earliest: Option<SessionTimestamp>,
+) -> UsageMetricsReport {
+    UsageMetricsReport {
+        buckets: vec![UsageMetricsBucket::default(); query.buckets.len()],
+        untimed: UsageMetricsBucket::default(),
+        earliest_turn_at: earliest,
+        keys: Vec::new(),
+    }
+}
+
+#[test]
+fn each_range_key_reads_that_range_in_the_reader_s_calendar() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(report(&query)));
+
+    let (_, _, today) = expect_read(press(&mut application, '1'));
+    assert_eq!(
+        new_york_starts(&today),
+        (0..24)
+            .map(|hour| date(2026, 10, 28).at(hour, 0, 0, 0))
+            .collect::<Vec<_>>(),
+        "today's hours, those still to come included"
+    );
+    assert!(contiguous(&today));
+    assert_eq!(
+        today.buckets.last().unwrap().end,
+        in_new_york(date(2026, 10, 29).at(0, 0, 0, 0))
+    );
+
+    let (_, _, week) = expect_read(press(&mut application, '2'));
+    assert_eq!(
+        new_york_starts(&week),
+        (22..=28)
+            .map(|day| date(2026, 10, day).at(0, 0, 0, 0))
+            .collect::<Vec<_>>()
+    );
+
+    let (_, _, month) = expect_read(press(&mut application, '3'));
+    assert_eq!(month, query, "thirty days, as the view opened on");
+
+    let (_, _, year) = expect_read(press(&mut application, '4'));
+    let mut months = vec![date(2025, 11, 1), date(2025, 12, 1)];
+    months.extend((1..=10).map(|month| date(2026, month, 1)));
+    assert_eq!(
+        new_york_starts(&year),
+        months
+            .into_iter()
+            .map(|first| first.at(0, 0, 0, 0))
+            .collect::<Vec<_>>(),
+        "this month and the eleven before it, each from its first midnight"
+    );
+    assert!(contiguous(&year));
+    assert_eq!(
+        year.buckets[3].end.0 - year.buckets[3].start.0,
+        28 * 24 * 3_600_000,
+        "February 2026"
+    );
+
+    assert_eq!(
+        press(&mut application, '4'),
+        ApplicationTransition::Continue,
+        "the range already shown is not read again"
+    );
+}
+
+#[test]
+fn today_has_as_many_hours_as_daylight_saving_leaves_it() {
+    let hours_on = |day: jiff::civil::Date| {
+        let mut application = reader_in(NEW_YORK, in_new_york(day.at(12, 0, 0, 0)));
+        ask(&mut application);
+        let (_, _, today) = expect_read(press(&mut application, '1'));
+        assert!(contiguous(&today));
+        assert!(
+            today
+                .buckets
+                .iter()
+                .all(|hour| hour.end.0 - hour.start.0 == 3_600_000)
+        );
+        today.buckets.len()
+    };
+
+    assert_eq!(hours_on(date(2026, 3, 8)), 23, "New York springs forward");
+    assert_eq!(hours_on(date(2026, 11, 1)), 25, "and falls back");
+    assert_eq!(hours_on(date(2026, 11, 2)), 24);
+}
+
+#[test]
+fn all_time_with_no_report_yet_first_reads_when_the_earliest_turn_was() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, thirty_days, _) = ask(&mut application);
+
+    // Chosen before any report has landed, so nothing says where it begins.
+    let (_, probe, first) = expect_read(press(&mut application, '5'));
+    assert!(
+        first.buckets.is_empty(),
+        "the first read asks only when the earliest Turn was"
+    );
+    let earliest = in_new_york(date(2025, 6, 14).at(9, 0, 0, 0));
+
+    // The thirty days asked for before are no longer wanted.
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::UsageMetricsRead {
+                request_id: thirty_days,
+                result: Ok(empty_report(&first, Some(earliest))),
+            })
+            .expect("deliver a straggler"),
+        ApplicationTransition::Continue
+    );
+    row(&screen(&application), "Reading Usage Metrics…");
+
+    let transition = application
+        .handle_event(ApplicationEvent::UsageMetricsRead {
+            request_id: probe,
+            result: Ok(empty_report(&first, Some(earliest))),
+        })
+        .expect("deliver the earliest Turn");
+    let (origin, request_id, all_time) = expect_read(transition);
+    assert_eq!(origin, Outlook::Local);
+    let mut months: Vec<jiff::civil::DateTime> = (6..=12)
+        .map(|month| date(2025, month, 1).at(0, 0, 0, 0))
+        .collect();
+    months.extend((1..=10).map(|month| date(2026, month, 1).at(0, 0, 0, 0)));
+    assert_eq!(
+        new_york_starts(&all_time),
+        months,
+        "every month from the earliest Turn's to this one"
+    );
+    assert!(contiguous(&all_time));
+    row(&screen(&application), "Reading Usage Metrics…");
+
+    answer(&mut application, request_id, Ok(report(&all_time)));
+    let rows = screen(&application);
+    row(&rows, "▐All time▌");
+    row(&rows, "All time · ");
+    let axis = row(&rows, "Oct 2026");
+    assert!(axis.contains("Jan 2026"), "{axis}");
+}
+
+#[test]
+fn all_time_begins_where_the_last_report_said_without_asking_again() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    let earliest = in_new_york(date(2026, 8, 3).at(9, 0, 0, 0));
+    answer(
+        &mut application,
+        request_id,
+        Ok(empty_report(&query, Some(earliest))),
+    );
+
+    let (_, _, all_time) = expect_read(press(&mut application, '5'));
+
+    assert_eq!(
+        new_york_starts(&all_time),
+        [8, 9, 10].map(|month| date(2026, month, 1).at(0, 0, 0, 0))
+    );
+}
+
+#[test]
+fn all_time_reads_again_when_its_report_names_an_earlier_turn() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(
+        &mut application,
+        request_id,
+        Ok(empty_report(
+            &query,
+            Some(in_new_york(date(2026, 8, 3).at(9, 0, 0, 0))),
+        )),
+    );
+    let (_, request_id, all_time) = expect_read(press(&mut application, '5'));
+
+    // A Turn from before the buckets asked for, such as one restored since.
+    let earlier = in_new_york(date(2026, 5, 20).at(9, 0, 0, 0));
+    let transition = application
+        .handle_event(ApplicationEvent::UsageMetricsRead {
+            request_id,
+            result: Ok(empty_report(&all_time, Some(earlier))),
+        })
+        .expect("deliver the report");
+
+    let (_, request_id, again) = expect_read(transition);
+    assert_eq!(new_york_starts(&again)[0], date(2026, 5, 1).at(0, 0, 0, 0));
+    let landed = application
+        .handle_event(ApplicationEvent::UsageMetricsRead {
+            request_id,
+            result: Ok(empty_report(&again, Some(earlier))),
+        })
+        .expect("deliver the report");
+    assert_eq!(landed, ApplicationTransition::Continue);
+    row(&screen(&application), "No Usage yet.");
+}
+
+#[test]
+fn all_time_without_a_timed_turn_says_so_after_one_read() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    ask(&mut application);
+    let (_, probe, first) = expect_read(press(&mut application, '5'));
+
+    let transition = application
+        .handle_event(ApplicationEvent::UsageMetricsRead {
+            request_id: probe,
+            result: Ok(empty_report(&first, None)),
+        })
+        .expect("deliver the report");
+
+    assert_eq!(transition, ApplicationTransition::Continue);
+    row(&screen(&application), "No Usage yet.");
+}
+
+#[test]
+fn the_range_outlives_the_view_and_all_time_learns_its_beginning_anew_on_opening() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(
+        &mut application,
+        request_id,
+        Ok(empty_report(
+            &query,
+            Some(in_new_york(date(2026, 8, 3).at(9, 0, 0, 0))),
+        )),
+    );
+    let (_, request_id, all_time) = expect_read(press(&mut application, '5'));
+    answer(&mut application, request_id, Ok(report(&all_time)));
+    key(&mut application, KeyCode::Esc);
+
+    let (_, _, reopened) = ask(&mut application);
+
+    assert!(
+        reopened.buckets.is_empty(),
+        "All time still, read from its earliest Turn again"
+    );
+    row(&screen(&application), "▐All time▌");
+}
+
+#[test]
+fn brackets_clicks_and_the_wheel_choose_ranges_as_the_keys_do() {
+    assert_eq!(
+        [
+            SemanticCommandId::MetricsRangeSelect(MetricsRange::Today),
+            SemanticCommandId::MetricsRangeSelect(MetricsRange::SevenDays),
+            SemanticCommandId::MetricsRangeSelect(MetricsRange::ThirtyDays),
+            SemanticCommandId::MetricsRangeSelect(MetricsRange::Year),
+            SemanticCommandId::MetricsRangeSelect(MetricsRange::AllTime),
+            SemanticCommandId::MetricsRangeNext,
+            SemanticCommandId::MetricsRangePrevious,
+        ]
+        .map(SemanticCommandId::as_str),
+        [
+            "metrics.range.today",
+            "metrics.range.seven-days",
+            "metrics.range.thirty-days",
+            "metrics.range.year",
+            "metrics.range.all-time",
+            "metrics.range.next",
+            "metrics.range.previous",
+        ]
+    );
+    // Each way of asking for a range, from a view showing thirty days.
+    let read_by = |act: &dyn Fn(&mut Application) -> ApplicationTransition| {
+        let mut application = reader_in(NEW_YORK, afternoon());
+        let (_, request_id, query) = ask(&mut application);
+        answer(&mut application, request_id, Ok(report(&query)));
+        rendered_application_buffer(&application, WIDTH, HEIGHT);
+        let (_, _, query) = expect_read(act(&mut application));
+        let rows = screen(&application);
+        (query.buckets, row(&rows, "Tokens by Model").to_owned())
+    };
+    let semantic = |command| move |application: &mut Application| invoke(application, command);
+    let chart = |application: &Application| {
+        let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+        let (x, y) = text_position(&buffer, "└");
+        (x + 10, y - 3)
+    };
+    let range_label = |label: &'static str| {
+        move |application: &mut Application| {
+            let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+            press_at(application, text_position(&buffer, label))
+        }
+    };
+
+    let year = read_by(&semantic(SemanticCommandId::MetricsRangeSelect(
+        MetricsRange::Year,
+    )));
+    assert!(year.1.contains("▐Year▌"), "{}", year.1);
+    assert_eq!(read_by(&|application| press(application, '4')), year);
+    assert_eq!(read_by(&|application| press(application, ']')), year);
+    assert_eq!(
+        read_by(&semantic(SemanticCommandId::MetricsRangeNext)),
+        year
+    );
+    assert_eq!(read_by(&range_label("Year")), year);
+    assert_eq!(
+        read_by(&|application| {
+            let at = chart(application);
+            wheel(application, MouseEventKind::ScrollDown, at)
+        }),
+        year,
+        "down the wheel to the longer range"
+    );
+
+    let week = read_by(&semantic(SemanticCommandId::MetricsRangeSelect(
+        MetricsRange::SevenDays,
+    )));
+    assert!(week.1.contains("▐7 days▌"), "{}", week.1);
+    assert_eq!(read_by(&|application| press(application, '2')), week);
+    assert_eq!(read_by(&|application| press(application, '[')), week);
+    assert_eq!(read_by(&range_label("7 days")), week);
+    assert_eq!(
+        read_by(&|application| {
+            let at = chart(application);
+            wheel(application, MouseEventKind::ScrollUp, at)
+        }),
+        week
+    );
+
+    // The keys and the wheel name the very commands the invocations do.
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(report(&query)));
+    let at = chart(&application);
+    let command_for = |event| application.command_for_terminal_input(event);
+    let wheel_event = |kind| {
+        InputEvent::Mouse(MouseEvent {
+            kind,
+            column: at.0,
+            row: at.1,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    let key_event =
+        |character| InputEvent::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    let semantic_command = |command| Some(CommandId::InvokeSemantic(command));
+    assert_eq!(
+        command_for(wheel_event(MouseEventKind::ScrollDown)),
+        semantic_command(SemanticCommandId::MetricsRangeNext)
+    );
+    assert_eq!(
+        command_for(key_event(']')),
+        semantic_command(SemanticCommandId::MetricsRangeNext)
+    );
+    assert_eq!(
+        command_for(wheel_event(MouseEventKind::ScrollUp)),
+        semantic_command(SemanticCommandId::MetricsRangePrevious)
+    );
+    assert_eq!(
+        command_for(key_event('[')),
+        semantic_command(SemanticCommandId::MetricsRangePrevious)
+    );
+    // Over the title bar the wheel steps nothing.
+    let title = InputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 3,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(command_for(title), None);
+}
+
+#[test]
+fn stepping_stops_at_either_end_of_the_range_bar() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    ask(&mut application);
+    expect_read(press(&mut application, '1'));
+    assert_eq!(
+        press(&mut application, '['),
+        ApplicationTransition::Continue
+    );
+    expect_read(press(&mut application, '5'));
+    assert_eq!(
+        press(&mut application, ']'),
+        ApplicationTransition::Continue
+    );
+    assert_eq!(
+        invoke(&mut application, SemanticCommandId::MetricsRangeNext),
+        ApplicationTransition::Continue
+    );
+}
+
+#[test]
+fn a_range_chosen_with_the_view_closed_changes_nothing() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+
+    assert_eq!(
+        invoke(
+            &mut application,
+            SemanticCommandId::MetricsRangeSelect(MetricsRange::Year)
+        ),
+        ApplicationTransition::Continue
+    );
+    let (_, _, query) = ask(&mut application);
+    assert_eq!(query.buckets.len(), 30, "still thirty days");
+}
+
+#[test]
+fn today_is_labelled_by_the_hour_and_a_year_by_the_month() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    ask(&mut application);
+    let (_, request_id, today) = expect_read(press(&mut application, '1'));
+    answer(&mut application, request_id, Ok(report(&today)));
+    let rows = screen(&application);
+    eprintln!("{}", rows.join("\n"));
+    let hours = row(&rows, "00:00");
+    let labels: Vec<&str> = hours.split_whitespace().collect();
+    assert_eq!(
+        labels,
+        (0..12)
+            .map(|hour| format!("{:02}:00", hour * 2))
+            .collect::<Vec<_>>(),
+        "every other hour from midnight: {hours}"
+    );
+    row(&rows, "Today · ");
+    row(&rows, "▐Today▌");
+
+    let (_, request_id, year) = expect_read(press(&mut application, '4'));
+    answer(&mut application, request_id, Ok(report(&year)));
+    let rows = screen(&application);
+    eprintln!("{}", rows.join("\n"));
+    let months = row(&rows, "Nov 2025");
+    let labels: Vec<&str> = months.split_whitespace().collect();
+    assert_eq!(labels.len(), 24, "every month named: {months}");
+    assert_eq!(labels.last(), Some(&"2026"));
+    assert!(months.contains("Oct 2026"));
+    row(&rows, "Last 12 months · ");
+}
+
+#[test]
+fn a_range_chosen_while_the_remote_is_unreachable_is_refused_in_the_view() {
+    let mut application = application_looking_at_studio()
+        .with_session_clock(afternoon)
+        .with_time_zone(zone(NEW_YORK));
+    ask(&mut application);
+    studio_stops_answering(&mut application, 1, std::time::Duration::from_secs(5));
+    grace_elapses(&mut application, Outlook::Remote("studio".to_owned()));
+
+    assert_eq!(
+        press(&mut application, '2'),
+        ApplicationTransition::Continue
+    );
+
+    let rows = screen(&application);
+    row(&rows, "▐7 days▌");
+    row(&rows, "studio is unreachable");
 }

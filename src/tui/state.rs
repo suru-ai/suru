@@ -6225,8 +6225,11 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::UsageMetricsRead { request_id, result } => {
-                self.state.metrics_view.receive(request_id, result);
-                Ok(ApplicationTransition::Continue)
+                Ok(if self.state.metrics_view.receive(request_id, result) {
+                    self.read_usage_metrics()
+                } else {
+                    ApplicationTransition::Continue
+                })
             }
             // Only the re-check the flow awaits answers for the rows, and what
             // it read reaches the Local catalog as a push would, unless the
@@ -9562,11 +9565,17 @@ impl Application {
     /// Asks the Server the Outlook is turned toward for the Usage Metrics
     /// view's buckets, cut by the reader's calendar now.
     fn read_usage_metrics(&mut self) -> ApplicationTransition {
+        // A range chosen while the Origin has stopped answering is still
+        // chosen, and its read refused in the view.
+        let origin = self.state.outlook.clone();
+        if self.refuse_if_unreachable(&origin) {
+            return ApplicationTransition::Continue;
+        }
         let now = self.state.session_now();
         let zone = self.state.local_zone.now();
         match self.state.metrics_view.ask(now, &zone) {
             Some((request_id, query)) => ApplicationTransition::ReadUsageMetrics {
-                origin: self.state.outlook.clone(),
+                origin,
                 request_id,
                 query,
             },
@@ -11402,6 +11411,21 @@ impl Application {
                 self.state.metrics_view.close();
                 Ok(ApplicationTransition::Continue)
             }
+            command @ (SemanticCommandId::MetricsRangeSelect(_)
+            | SemanticCommandId::MetricsRangeNext
+            | SemanticCommandId::MetricsRangePrevious) => {
+                let view = &mut self.state.metrics_view;
+                let range = match command {
+                    SemanticCommandId::MetricsRangeSelect(range) => range,
+                    SemanticCommandId::MetricsRangeNext => view.range().next(),
+                    _ => view.range().previous(),
+                };
+                Ok(if view.is_open() && view.choose_range(range) {
+                    self.read_usage_metrics()
+                } else {
+                    ApplicationTransition::Continue
+                })
+            }
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,
             // so on the Landing there is nothing to set aside and the view
@@ -12539,7 +12563,7 @@ impl Application {
                 SelectionSurface::Context => return command_for_context_overlay_event(event),
                 SelectionSurface::Metrics => {
                     return command_for_metrics_view_event(event, |position| {
-                        self.state.metrics_view.close_target_contains(position)
+                        self.state.metrics_view.target_at(position)
                     });
                 }
                 SelectionSurface::Themes => return command_for_theme_picker_event(event),
