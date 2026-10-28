@@ -28,7 +28,7 @@ use crate::protocol::{
     TurnId, TurnInsights, TurnStatus, Usage, WorkspaceId,
 };
 
-use crate::storage::ActivityTallies;
+use crate::{sidekick::SidekickWorkspace, storage::ActivityTallies};
 
 use super::{
     super::{
@@ -81,9 +81,7 @@ impl SessionStore {
         };
         // Read once the lock is let go, since naming the Sidekick
         // Workspace reads the filesystem.
-        let sidekick_workspace = sidekick_workspace
-            .as_ref()
-            .map(|workspace| WorkspaceId::directory(&workspace.directory()));
+        let sidekick_workspace = sidekick_workspace.as_ref().map(SidekickWorkspace::id);
         let forest = MeteredForest::index(copied);
         let roots = forest.cost_tree_heads();
         let mut fold = InsightsFold::default();
@@ -142,7 +140,7 @@ impl InsightsFold {
     ) {
         self.turns.add(turn);
         self.quarter_hours.add_turn(session_id, turn, at);
-        self.delegation.roles.place(session_id, turn.id, role);
+        self.delegation.add_turn(session_id, role, turn);
         self.held_turns
             .entry(session_id)
             .or_default()
@@ -251,10 +249,10 @@ impl SessionRole {
             } else {
                 Self::NativeSubagent
             }
-        } else if session.is_subsession {
-            Self::Subsession
         } else if sidekick_workspace == Some(&session.workspace) {
             Self::Sidekick
+        } else if session.is_subsession() {
+            Self::Subsession
         } else {
             Self::Own
         }
@@ -270,6 +268,12 @@ struct DelegationTally {
 }
 
 impl DelegationTally {
+    /// Records the role of the Session owning a Turn the interval holds,
+    /// for the Cost that Turn carries to land under it.
+    fn add_turn(&mut self, session_id: SessionId, role: SessionRole, turn: &Turn) {
+        self.roles.place(session_id, turn.id, role);
+    }
+
     fn add_cost(&mut self, contribution: &CostContribution) {
         let Some(role) = self.roles.of(contribution) else {
             return;

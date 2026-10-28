@@ -91,7 +91,10 @@ impl InsightsPanel {
     /// row, keeping to the neighbours the Insights mockup gives the panels
     /// built so far: the empty place beside Approvals is the Cache panel's,
     /// yet to be, and Delegation stands in the right-hand column, as it
-    /// stands beneath Tools in the mockup.
+    /// stands beneath Tools in the mockup. The place beside Delegation is
+    /// empty only because the grid is interim: the mockup's three-column
+    /// layout (#579) puts the small panels side by side beneath When you
+    /// work, and Delegation beneath Tools.
     pub(super) const GRID: [[Option<Self>; 2]; 4] = [
         [Some(Self::WhenYouWork), Some(Self::Tools)],
         [Some(Self::Turns), Some(Self::Compactions)],

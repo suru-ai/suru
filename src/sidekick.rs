@@ -177,7 +177,13 @@ impl SidekickWorkspace {
 
     /// Whether the Workspace `id` names is the Sidekick Workspace.
     pub(crate) fn is_named_by(&self, id: &WorkspaceId) -> bool {
-        *id == WorkspaceId::directory(&self.directory())
+        *id == self.id()
+    }
+
+    /// The Sidekick Workspace's id, named by its directory as every
+    /// Workspace's is. Reads the filesystem, as [`Self::directory`] does.
+    pub(crate) fn id(&self) -> WorkspaceId {
+        WorkspaceId::directory(&self.directory())
     }
 
     /// Whether `session`'s Agent is a Sidekick: a top-level Session of the

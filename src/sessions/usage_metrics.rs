@@ -46,11 +46,11 @@ use std::{
 };
 
 use crate::protocol::{
-    Cost, CostBasis, KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS, MAX_USAGE_METRICS_TOP_SESSIONS,
-    ModelCatalog, ModelId, ProviderId, SessionId, SessionTimestamp, Turn, TurnId, TurnStatus,
-    Usage, UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsBucket, UsageMetricsKey,
-    UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport, UsageMetricsSession, Workspace,
-    WorkspaceId, WorkspacePaths,
+    Author, Cost, CostBasis, KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS,
+    MAX_USAGE_METRICS_TOP_SESSIONS, ModelCatalog, ModelId, ProviderId, SessionId, SessionTimestamp,
+    Turn, TurnId, TurnStatus, Usage, UsageMetricsAggregate, UsageMetricsBreakdown,
+    UsageMetricsBucket, UsageMetricsKey, UsageMetricsKeyLabel, UsageMetricsQuery,
+    UsageMetricsReport, UsageMetricsSession, Workspace, WorkspaceId, WorkspacePaths,
 };
 
 use super::{
@@ -177,11 +177,22 @@ struct CopiedSession {
     parent: Option<SessionId>,
     workspace: WorkspaceId,
     is_brokered_subagent: bool,
-    /// The Sidekick's Session that began it, where one did.
-    sidekick: Option<SessionId>,
-    /// Whether a Sidekick began it, this Server's or a Peer's: a Subsession.
-    is_subsession: bool,
+    /// The Sidekick that began it, this Server's or a Peer's, where one did:
+    /// a Subsession.
+    begun_by: Option<Author>,
     turns: Vec<Turn>,
+}
+
+impl CopiedSession {
+    /// The Sidekick's Session here that began it, where one did.
+    fn sidekick(&self) -> Option<SessionId> {
+        self.begun_by.as_ref().and_then(Author::sidekick_session)
+    }
+
+    /// Whether a Sidekick began it, this Server's or a Peer's.
+    fn is_subsession(&self) -> bool {
+        self.begun_by.is_some()
+    }
 }
 
 impl SessionStoreState {
@@ -197,8 +208,7 @@ impl SessionStoreState {
                     parent: record.snapshot.session.parent,
                     workspace: record.snapshot.session.workspace.id.clone(),
                     is_brokered_subagent: record.is_brokered_subagent(),
-                    sidekick: record.summary.session.sidekick(),
-                    is_subsession: record.summary.session.begun_by.is_some(),
+                    begun_by: record.summary.session.begun_by.clone(),
                     turns: record.snapshot.turns.clone(),
                 };
                 (*session_id, copied)
@@ -246,7 +256,7 @@ impl MeteredForest {
             if let Some(parent) = session.parent {
                 children.entry(parent).or_default().push(*session_id);
             }
-            if let Some(sidekick) = session.sidekick {
+            if let Some(sidekick) = session.sidekick() {
                 subsessions.entry(sidekick).or_default().push(*session_id);
             }
         }
@@ -265,7 +275,7 @@ impl MeteredForest {
     fn heads_a_cost_tree(&self, session: &CopiedSession) -> bool {
         session.parent.is_none()
             && session
-                .sidekick
+                .sidekick()
                 .is_none_or(|sidekick| !self.sessions.contains_key(&sidekick))
     }
 

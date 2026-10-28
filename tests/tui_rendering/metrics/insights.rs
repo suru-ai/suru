@@ -1216,9 +1216,9 @@ fn the_delegation_panel_divides_cost_by_role_with_brokered_subagents_beside_thei
     assert_eq!(
         delegation_panel(&application),
         vec![
-            "own Sessions 71% $293.13 ███████████████▋",
-            "Subagents 22% $90.83 ████▉ brokered 9%",
-            "Sidekicks 6% $24.77 █▍",
+            "own Sessions 71% $293.13 ██████████████▉",
+            "Subagents 22% $90.83 ████▋ brokered 9%",
+            "Sidekicks 6% $24.77 █▎",
             "Subsessions 1% $4.13 ▎",
             "A Claude Session's native Subagents are in its Cost",
         ]
@@ -1238,12 +1238,12 @@ fn a_role_whose_cost_is_partial_says_so_with_a_plus() {
 
     let lines = delegation_panel(&application);
     assert_eq!(
-        lines[1], "Subagents 24% $90.83+ █████▎ brokered 10%",
-        "partial where its brokered part is"
+        lines[1], "Subagents 24%+ $90.83+ █████ brokered 10%+",
+        "partial where its brokered part is, and its shares of a partial whole"
     );
     assert_eq!(lines[2], "Sidekicks 0% —", "no work, so no Cost to state");
     assert_eq!(
-        lines[3], "Subsessions 0% unpriced",
+        lines[3], "Subsessions 0%+ unpriced",
         "work, none of it priced, is never a zero"
     );
 }
