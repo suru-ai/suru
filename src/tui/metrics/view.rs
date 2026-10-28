@@ -18,7 +18,7 @@ use crate::{
 use super::{
     super::slots::truncate_to_width,
     BREAKDOWNS, MetricsContent, MetricsView, OfferedBreakdown, UsageMetricsReadRefusal,
-    calendar::MetricsRange,
+    calendar::{BucketUnit, CalendarBucket, MetricsRange},
     chart::{self, MetricsMeasure, Series},
 };
 
@@ -139,21 +139,46 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
                 return;
             }
             let series = chart::series(report, measure, theme);
-            let whole = &report.across_buckets.total;
-            let noted = overcounts(&series, measure, whole);
+            let across = range_legend(&series, measure, view, &report.across_buckets.total);
+            let selected = view.selected_bucket().and_then(|index| {
+                let bucket = buckets.buckets.get(index)?;
+                let figures = &report.buckets.get(index)?.total;
+                Some(bucket_legend(
+                    &series,
+                    measure,
+                    index,
+                    buckets.unit,
+                    bucket,
+                    figures,
+                ))
+            });
+            // Room is kept for a note either legend needs, so selecting a
+            // bar never moves the chart.
+            let noted = across.noted || selected.as_ref().is_some_and(|legend| legend.noted);
             let legend_rows =
                 u16::try_from(series.len() + 1 + usize::from(noted)).unwrap_or(u16::MAX);
             let chart_rows = body.height.saturating_sub(legend_rows + 1).min(24);
             let chart_area = Rect::new(body.x, body.y, body.width, chart_rows);
             view.record_chart_target(chart_area);
-            chart::render_chart(buffer, chart_area, buckets, &series, measure, theme);
+            if let Some(bars) = chart::render_chart(
+                buffer,
+                chart_area,
+                buckets,
+                &series,
+                measure,
+                view.selected_bucket(),
+                theme,
+            ) {
+                view.record_bar_targets(bars);
+            }
             let legend = Rect::new(
                 body.x,
                 body.y + chart_rows + 1,
                 body.width,
                 body.height.saturating_sub(chart_rows + 1),
             );
-            render_legend(frame, legend, &series, whole, noted, view, theme);
+            let shown = selected.unwrap_or(across);
+            render_legend(frame, legend, &series, &shown, view, theme);
         }
     }
 }
@@ -192,17 +217,93 @@ fn render_tabs<const N: usize>(
     x - TAB_GAP
 }
 
-/// A heading naming the range's whole, then one row per series in the
-/// chart's order — ranked by Cost whatever the measure, Other last — each
-/// its colour, label, figure, share, and a bar proportional to the largest
-/// series in the measure shown. Where the series count more than the
-/// whole, `noted`, a note under them says why.
+/// What the legend reads: the range's figures, or, where a bar is selected,
+/// that bucket's in their place, so the legend is the bar's tooltip.
+struct Legend {
+    heading: String,
+    /// Each series' figure, and whether it says less than was consumed, in
+    /// the series' order.
+    figures: Vec<(u64, bool)>,
+    /// The whole each figure's share is of.
+    whole: u64,
+    /// Whether the figures count more than the whole, as Sessions under
+    /// several keys do, so a note must say why.
+    noted: bool,
+}
+
+/// The legend of the range taken together, headed by its name and whole.
+fn range_legend(
+    series: &[Series],
+    measure: MetricsMeasure,
+    view: &MetricsView,
+    whole: &UsageMetricsAggregate,
+) -> Legend {
+    let total = measure.value(whole);
+    let figures: Vec<(u64, bool)> = series
+        .iter()
+        .map(|series| (series.total, series.is_partial))
+        .collect();
+    Legend {
+        heading: format!(
+            "{} · {}",
+            view.range().title(),
+            measure.total(total, measure.is_partial(whole))
+        ),
+        noted: overcounts(&figures, measure, total),
+        figures,
+        whole: total,
+    }
+}
+
+/// The legend of the `index`-th bucket alone, headed by its local date or
+/// hour, its whole, and the distinct Sessions that worked in it — never the
+/// series' Sessions added, which count a Session once under each key.
+fn bucket_legend(
+    series: &[Series],
+    measure: MetricsMeasure,
+    index: usize,
+    unit: BucketUnit,
+    bucket: &CalendarBucket,
+    whole: &UsageMetricsAggregate,
+) -> Legend {
+    let total = measure.value(whole);
+    let figures: Vec<(u64, bool)> = series
+        .iter()
+        .map(|series| {
+            (
+                series.values.get(index).copied().unwrap_or(0),
+                series.partials.get(index).copied().unwrap_or(false),
+            )
+        })
+        .collect();
+    let mut heading = format!(
+        "{} · {}",
+        chart::bucket_heading(bucket, unit),
+        measure.total(total, measure.is_partial(whole))
+    );
+    // The Sessions measure's whole already counts them.
+    if measure != MetricsMeasure::Sessions {
+        heading.push_str(" · ");
+        heading.push_str(&MetricsMeasure::Sessions.total(whole.sessions, false));
+    }
+    Legend {
+        heading,
+        noted: overcounts(&figures, measure, total),
+        figures,
+        whole: total,
+    }
+}
+
+/// The legend's heading, then one row per series in the chart's order —
+/// ranked by Cost over the range whatever the measure or bucket, Other last —
+/// each its colour, label, figure, share of the legend's whole, and a bar
+/// proportional to the largest figure shown. Where the figures count more
+/// than the whole, a note under them says why.
 fn render_legend(
     frame: &mut Frame<'_>,
     area: Rect,
     series: &[Series],
-    whole: &UsageMetricsAggregate,
-    noted: bool,
+    legend: &Legend,
     view: &MetricsView,
     theme: &Theme,
 ) {
@@ -211,15 +312,11 @@ fn render_legend(
     if area.height == 0 {
         return;
     }
-    let total = measure.value(whole);
+    let total = legend.whole;
     buffer.set_string(
         area.x,
         area.y,
-        format!(
-            "{} · {}",
-            view.range().title(),
-            measure.total(total, measure.is_partial(whole))
-        ),
+        &legend.heading,
         theme.text.primary.add_modifier(Modifier::BOLD),
     );
     let label_width = series
@@ -228,16 +325,18 @@ fn render_legend(
         .max()
         .unwrap_or(0)
         .min(LEGEND_LABEL);
-    let values: Vec<String> = series
+    let values: Vec<String> = legend
+        .figures
         .iter()
-        .map(|series| measure.figure(series.total, series.is_partial))
+        .map(|(figure, is_partial)| measure.figure(*figure, *is_partial))
         .collect();
     let value_width = values.iter().map(|value| value.width()).max().unwrap_or(0);
     // Series stand in the same order whatever the measure, so the largest
     // in this one need not be the first.
-    let largest = series
+    let largest = legend
+        .figures
         .iter()
-        .map(|series| series.total)
+        .map(|(figure, _)| *figure)
         .max()
         .unwrap_or(0)
         .max(1);
@@ -245,7 +344,9 @@ fn render_legend(
     let bar_room = usize::from(area.width)
         .saturating_sub(fixed)
         .min(usize::from(LEGEND_BAR));
-    for (row, (series, value)) in series.iter().zip(&values).enumerate() {
+    for (row, ((series, value), (figure, _))) in
+        series.iter().zip(&values).zip(&legend.figures).enumerate()
+    {
         let Some(y) = u16::try_from(row + 1)
             .ok()
             .map(|row| area.y + row)
@@ -261,13 +362,12 @@ fn render_legend(
         let padding = " ".repeat(label_width.saturating_sub(label.width()));
         let text = format!(
             "{label}{padding}  {value:>value_width$}  {share:>4}",
-            share = share(series.total, total),
+            share = share(*figure, total),
         );
         buffer.set_string(area.x + 2, y, &text, theme.text.primary);
-        let bar =
-            usize::try_from(u128::from(series.total) * bar_room as u128 / u128::from(largest))
-                .unwrap_or(0);
-        let bar = if series.total > 0 { bar.max(1) } else { 0 };
+        let bar = usize::try_from(u128::from(*figure) * bar_room as u128 / u128::from(largest))
+            .unwrap_or(0);
+        let bar = if *figure > 0 { bar.max(1) } else { 0 };
         let bar_x = area.x + u16::try_from(fixed).unwrap_or(u16::MAX);
         if bar > 0 && bar_x < area.right() {
             buffer.set_string(bar_x, y, "█".repeat(bar), swatch);
@@ -277,7 +377,9 @@ fn render_legend(
         .ok()
         .map(|row| area.y.saturating_add(row))
         .filter(|y| *y < area.bottom());
-    if noted && let Some(y) = note_y {
+    if legend.noted
+        && let Some(y) = note_y
+    {
         let note = overlap_note(view.breakdown());
         let note = truncate_to_width(&note, usize::from(area.width));
         buffer.set_string(area.x, y, note, theme.text.subdued);
@@ -293,15 +395,15 @@ fn overlap_note(breakdown: UsageMetricsBreakdown) -> String {
     )
 }
 
-/// Whether `series` count more than `whole` does, as a measure that does not
-/// add up can: a Session that worked under several keys counts once under
-/// each and once in the whole.
-fn overcounts(series: &[Series], measure: MetricsMeasure, whole: &UsageMetricsAggregate) -> bool {
-    let counted = series
+/// Whether `figures` count more than `whole` does, as a measure that does
+/// not add up can: a Session that worked under several keys counts once
+/// under each and once in the whole.
+fn overcounts(figures: &[(u64, bool)], measure: MetricsMeasure, whole: u64) -> bool {
+    let counted = figures
         .iter()
-        .map(|series| series.total)
+        .map(|(figure, _)| *figure)
         .fold(0, u64::saturating_add);
-    !measure.adds_up() && counted > measure.value(whole)
+    !measure.adds_up() && counted > whole
 }
 
 /// What the view says of figures a refresh could not replace.

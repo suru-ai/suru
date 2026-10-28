@@ -19,6 +19,7 @@ use crate::{
 
 use super::{
     super::usage::{compact_cost, compact_count},
+    BarStrip,
     calendar::{BucketUnit, CalendarBucket, RangeBuckets},
 };
 
@@ -128,6 +129,9 @@ pub(crate) struct Series {
     pub(crate) color: Color,
     /// The series' figure in each bucket, in the order of the buckets.
     pub(crate) values: Vec<u64>,
+    /// Whether each of those figures says less than the key's Turns in that
+    /// bucket consumed.
+    pub(crate) partials: Vec<bool>,
     /// The series' figure over the buckets taken together, which for a
     /// measure that does not add up is not its values added.
     pub(crate) total: u64,
@@ -208,6 +212,16 @@ pub(crate) fn series(
             })
             .collect()
     };
+    let partials = |keys: &[(&UsageMetricsKeyLabel, UsageMetricsAggregate)]| {
+        report
+            .buckets
+            .iter()
+            .map(|bucket| {
+                keys.iter()
+                    .any(|(label, _)| measure.is_partial(&part(bucket, &label.key)))
+            })
+            .collect()
+    };
     let palette = palette(theme);
     let mut series: Vec<Series> = ranked
         .iter()
@@ -216,6 +230,7 @@ pub(crate) fn series(
             label: keyed.0.label.clone(),
             color: palette[place % palette.len()],
             values: values(std::slice::from_ref(keyed)),
+            partials: partials(std::slice::from_ref(keyed)),
             total: measure.value(&keyed.1),
             is_partial: measure.is_partial(&keyed.1),
         })
@@ -225,6 +240,7 @@ pub(crate) fn series(
             label: OTHER.to_owned(),
             color: other_color(theme),
             values: values(&folded),
+            partials: partials(&folded),
             total: folded
                 .iter()
                 .map(|(_, whole)| measure.value(whole))
@@ -328,12 +344,38 @@ pub(crate) fn nice_axis(max: u64, ticks: u64) -> Axis {
     }
 }
 
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// How a selected bucket is named over its figures in the legend: as under
+/// its bar, with an hour's or a day's weekday and date before it, so the
+/// reader knows which day it was without counting along the axis.
+pub(crate) fn bucket_heading(bucket: &CalendarBucket, unit: BucketUnit) -> String {
+    let begins = bucket.begins;
+    let weekday = match begins.weekday() {
+        jiff::civil::Weekday::Monday => "Mon",
+        jiff::civil::Weekday::Tuesday => "Tue",
+        jiff::civil::Weekday::Wednesday => "Wed",
+        jiff::civil::Weekday::Thursday => "Thu",
+        jiff::civil::Weekday::Friday => "Fri",
+        jiff::civil::Weekday::Saturday => "Sat",
+        jiff::civil::Weekday::Sunday => "Sun",
+    };
+    match unit {
+        BucketUnit::Hour => format!(
+            "{weekday} {} {}",
+            bucket_label(bucket, BucketUnit::Day),
+            bucket_label(bucket, unit)
+        ),
+        BucketUnit::Day => format!("{weekday} {}", bucket_label(bucket, unit)),
+        BucketUnit::Month | BucketUnit::Quarter | BucketUnit::Year => bucket_label(bucket, unit),
+    }
+}
+
 /// How a bucket is named under its bar: an hour by the clock, a day by its
 /// date, a month, a quarter, or a year by the calendar's names for them.
 pub(crate) fn bucket_label(bucket: &CalendarBucket, unit: BucketUnit) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
     let begins = bucket.begins;
     let month = MONTHS[usize::try_from(begins.month() - 1).unwrap_or(0)];
     match unit {
@@ -425,23 +467,26 @@ pub(crate) fn thinned_labels(
 const LOWER_EIGHTHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 /// Draws `series` stacked over `buckets` into `area`: the y-axis and its tick
-/// labels down the left, a bar per bucket, the x-axis beneath them, and the
-/// thinned bucket labels under that. Each segment boundary falling inside a
-/// cell is drawn with an eighth block in the lower segment's colour over the
-/// upper segment's, so a segment's height reads to an eighth of a row.
+/// labels down the left, a bar per bucket, the x-axis beneath them, a mark
+/// under the `selected` bar, and the thinned bucket labels under that. Each
+/// segment boundary falling inside a cell is drawn with an eighth block in
+/// the lower segment's colour over the upper segment's, so a segment's
+/// height reads to an eighth of a row. Answers where it drew the bars.
 pub(crate) fn render_chart(
     buffer: &mut Buffer,
     area: Rect,
     range: &RangeBuckets,
     series: &[Series],
     measure: MetricsMeasure,
+    selected: Option<usize>,
     theme: &Theme,
-) {
+) -> Option<BarStrip> {
     let buckets = &range.buckets;
-    // The x-axis and the labels beneath it take the last two rows.
-    let plot_rows = area.height.saturating_sub(2);
+    // The x-axis, the selection's mark, and the labels beneath them take
+    // the last three rows.
+    let plot_rows = area.height.saturating_sub(FOOT_ROWS);
     if plot_rows == 0 || buckets.is_empty() {
-        return;
+        return None;
     }
     let totals: Vec<u64> = (0..buckets.len())
         .map(|index| series.iter().map(|series| series.values[index]).sum())
@@ -472,7 +517,7 @@ pub(crate) fn render_chart(
     let axis_x = area.x + label_width + 1;
     let plot_x = axis_x + 1;
     let plot_width = area.right().saturating_sub(plot_x);
-    let top = area.y + (area.height - 2 - plot_rows);
+    let top = area.y + (area.height - FOOT_ROWS - plot_rows);
     let axis_y = top + plot_rows;
     let subdued = theme.text.subdued;
     let border = theme.border.subdued;
@@ -501,6 +546,7 @@ pub(crate) fn render_chart(
     }
     let bar_width = if slot >= 2 { slot - 1 } else { 1 };
     let eighths = u128::from(plot_rows) * 8;
+    let mut drawn = 0;
     for (index, _) in buckets.iter().enumerate() {
         let bar_x = plot_x
             + u16::try_from(index)
@@ -509,6 +555,11 @@ pub(crate) fn render_chart(
         let bar_x = bar_x + (slot - bar_width);
         if bar_x + bar_width > area.right() {
             break;
+        }
+        drawn = index + 1;
+        if selected == Some(index) {
+            let mark = "▔".repeat(usize::from(bar_width));
+            buffer.set_string(bar_x, axis_y + 1, mark, theme.accent.primary);
         }
         // Where each segment ends, in eighths of a row from the foot.
         let mut boundaries = Vec::with_capacity(series.len());
@@ -550,9 +601,23 @@ pub(crate) fn render_chart(
         slot,
         plot_width.saturating_sub(first_bar),
     ) {
-        buffer.set_string(plot_x + first_bar + at, axis_y + 1, &labels[index], subdued);
+        buffer.set_string(plot_x + first_bar + at, axis_y + 2, &labels[index], subdued);
     }
+    (drawn > 0).then(|| BarStrip {
+        area: Rect::new(
+            plot_x,
+            area.y,
+            slot.saturating_mul(u16::try_from(drawn).unwrap_or(u16::MAX)),
+            area.height,
+        ),
+        slot,
+        count: drawn,
+    })
 }
+
+/// Rows the chart keeps under its bars: the x-axis, the selection's mark,
+/// and the bucket labels.
+const FOOT_ROWS: u16 = 3;
 
 /// The segment holding eighth `eighth` from the foot, if any reaches it.
 fn segment_at(boundaries: &[(u32, Color)], eighth: u32) -> Option<usize> {

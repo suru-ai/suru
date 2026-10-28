@@ -75,8 +75,8 @@ use super::{
         command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
     },
     metrics::{
-        MetricsView, OfferedBreakdown, Receipt as MetricsReceipt, UsageMetricsReadRefusal,
-        calendar::MetricsRange, chart::MetricsMeasure,
+        BucketMove, MetricsView, OfferedBreakdown, Receipt as MetricsReceipt,
+        UsageMetricsReadRefusal, calendar::MetricsRange, chart::MetricsMeasure,
     },
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
@@ -9598,6 +9598,16 @@ impl Application {
         }
     }
 
+    /// Moves the open Usage Metrics view's bucket selection, which reads
+    /// nothing: the report shown holds every bucket's figures.
+    fn move_metrics_selection(&mut self, to: BucketMove) -> ApplicationTransition {
+        let view = &mut self.state.metrics_view;
+        if view.is_open() {
+            view.move_selection(to);
+        }
+        ApplicationTransition::Continue
+    }
+
     /// Asks the Server the Outlook is turned toward for the Usage Metrics
     /// view's buckets, cut by the reader's calendar now.
     fn read_usage_metrics(&mut self) -> ApplicationTransition {
@@ -10550,6 +10560,30 @@ impl Application {
                     })
             }
             SemanticCommandId::PointerDrag => {
+                // The Usage Metrics view covers the whole frame and holds no
+                // text to select, so a drag over it is its own, through the
+                // same table as its clicks. The drag still marks the press as
+                // dragged, so letting go is not a click where it ends.
+                if self.state.metrics_view.is_open() {
+                    let SemanticSubject::ScreenPosition(position) = invocation.subject else {
+                        return Ok(ApplicationTransition::Continue);
+                    };
+                    if let Some(press) = &mut self.state.left_press {
+                        press.pointer = position;
+                        press.dragged |= position != press.position;
+                    }
+                    let event = InputEvent::Mouse(MouseEvent {
+                        kind: MouseEventKind::Drag(MouseButton::Left),
+                        column: position.x,
+                        row: position.y,
+                        modifiers: KeyModifiers::NONE,
+                    });
+                    return self
+                        .command_for_input_mode(event)
+                        .map_or(Ok(ApplicationTransition::Continue), |command| {
+                            self.handle_command(command)
+                        });
+                }
                 if self.state.sidebar.column().edge_is_held() {
                     let SemanticSubject::ScreenPosition(position) = &invocation.subject else {
                         return Ok(ApplicationTransition::Continue);
@@ -11471,6 +11505,25 @@ impl Application {
             SemanticCommandId::MetricsBreakdownNext => {
                 let breakdown = self.state.metrics_view.breakdown().next();
                 Ok(self.choose_metrics_breakdown(breakdown))
+            }
+            SemanticCommandId::MetricsBucketPrevious => {
+                Ok(self.move_metrics_selection(BucketMove::Previous))
+            }
+            SemanticCommandId::MetricsBucketNext => {
+                Ok(self.move_metrics_selection(BucketMove::Next))
+            }
+            SemanticCommandId::MetricsBucketFirst => {
+                Ok(self.move_metrics_selection(BucketMove::First))
+            }
+            SemanticCommandId::MetricsBucketLast => {
+                Ok(self.move_metrics_selection(BucketMove::Last))
+            }
+            SemanticCommandId::MetricsBucketSelect { bucket } => {
+                Ok(self.move_metrics_selection(BucketMove::To(bucket)))
+            }
+            SemanticCommandId::MetricsBucketClear => {
+                self.state.metrics_view.clear_selection();
+                Ok(ApplicationTransition::Continue)
             }
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,
@@ -12608,9 +12661,12 @@ impl Application {
                 }
                 SelectionSurface::Context => return command_for_context_overlay_event(event),
                 SelectionSurface::Metrics => {
-                    return command_for_metrics_view_event(event, |position| {
-                        self.state.metrics_view.target_at(position)
-                    });
+                    let view = &self.state.metrics_view;
+                    return command_for_metrics_view_event(
+                        event,
+                        view.selected_bucket().is_some(),
+                        |position| view.target_at(position),
+                    );
                 }
                 SelectionSurface::Themes => return command_for_theme_picker_event(event),
                 SelectionSurface::Models => return command_for_model_picker_event(event),

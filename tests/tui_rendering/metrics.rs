@@ -2102,3 +2102,461 @@ fn an_answer_awaited_before_a_choice_the_origin_could_not_read_never_lands() {
         assert!(shown.contains("studio is unreachable"), "{choose}: {shown}");
     }
 }
+
+/// A view showing thirty days of [`report`] in Tokens, drawn once so its
+/// bars can be pointed at.
+fn thirty_days_of_tokens() -> Application {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(report(&query)));
+    show_tokens(&mut application);
+    rendered_application_buffer(&application, WIDTH, HEIGHT);
+    application
+}
+
+/// Where the bar of the `day`-th bucket stands, counted from the first:
+/// thirty bars share 112 columns, three apiece, a column of gap before
+/// two of bar. Answers its first column and a row inside the chart.
+fn bar_at(application: &Application, day: u16) -> (u16, u16) {
+    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    let (axis_x, axis_y) = text_position(&buffer, "└");
+    (axis_x + 1 + day * 3 + 1, axis_y - 3)
+}
+
+/// The legend's heading: the row above its first series.
+fn legend_heading(application: &Application) -> String {
+    let rows = screen(application);
+    let first = rendered_row(&rows, "Claude Opus 5.5");
+    rows[first - 1].trim().to_owned()
+}
+
+fn drag_to(application: &mut Application, (column, row): (u16, u16)) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("drag the pointer")
+}
+
+fn release_at(application: &mut Application, (column, row): (u16, u16)) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("release the pointer")
+}
+
+#[test]
+fn arrows_home_and_end_move_a_selection_that_stops_at_either_end() {
+    assert_eq!(
+        [
+            SemanticCommandId::MetricsBucketPrevious,
+            SemanticCommandId::MetricsBucketNext,
+            SemanticCommandId::MetricsBucketFirst,
+            SemanticCommandId::MetricsBucketLast,
+            SemanticCommandId::MetricsBucketSelect { bucket: 3 },
+            SemanticCommandId::MetricsBucketClear,
+        ]
+        .map(SemanticCommandId::as_str),
+        [
+            "metrics.bucket.previous",
+            "metrics.bucket.next",
+            "metrics.bucket.first",
+            "metrics.bucket.last",
+            "metrics.bucket.select",
+            "metrics.bucket.clear",
+        ]
+    );
+    let mut application = thirty_days_of_tokens();
+    let command_for = |application: &Application, code| {
+        application
+            .command_for_terminal_input(InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    };
+    for (code, command) in [
+        (KeyCode::Left, SemanticCommandId::MetricsBucketPrevious),
+        (KeyCode::Right, SemanticCommandId::MetricsBucketNext),
+        (KeyCode::Home, SemanticCommandId::MetricsBucketFirst),
+        (KeyCode::End, SemanticCommandId::MetricsBucketLast),
+    ] {
+        assert_eq!(
+            command_for(&application, code),
+            Some(CommandId::InvokeSemantic(command))
+        );
+    }
+    assert!(legend_heading(&application).starts_with("Last 30 days"));
+
+    // ← enters from the right, at today, and stops at it going right.
+    assert_eq!(
+        key(&mut application, KeyCode::Left),
+        ApplicationTransition::Continue
+    );
+    assert!(
+        legend_heading(&application).starts_with("Wed 28 Oct ·"),
+        "{}",
+        legend_heading(&application)
+    );
+    key(&mut application, KeyCode::Right);
+    assert!(legend_heading(&application).starts_with("Wed 28 Oct ·"));
+    key(&mut application, KeyCode::Left);
+    assert!(legend_heading(&application).starts_with("Tue 27 Oct ·"));
+
+    // Home and End jump to either end, and the selection stops there.
+    key(&mut application, KeyCode::Home);
+    assert!(legend_heading(&application).starts_with("Tue 29 Sep ·"));
+    key(&mut application, KeyCode::Left);
+    assert!(legend_heading(&application).starts_with("Tue 29 Sep ·"));
+    key(&mut application, KeyCode::Right);
+    assert!(legend_heading(&application).starts_with("Wed 30 Sep ·"));
+    key(&mut application, KeyCode::End);
+    assert!(legend_heading(&application).starts_with("Wed 28 Oct ·"));
+
+    // → enters from the left, at the first bucket.
+    let mut application = thirty_days_of_tokens();
+    key(&mut application, KeyCode::Right);
+    assert!(legend_heading(&application).starts_with("Tue 29 Sep ·"));
+
+    // The commands do as their keys do.
+    let mut by_key = thirty_days_of_tokens();
+    let mut by_command = thirty_days_of_tokens();
+    for (code, command) in [
+        (KeyCode::End, SemanticCommandId::MetricsBucketLast),
+        (KeyCode::Left, SemanticCommandId::MetricsBucketPrevious),
+        (KeyCode::Left, SemanticCommandId::MetricsBucketPrevious),
+        (KeyCode::Home, SemanticCommandId::MetricsBucketFirst),
+        (KeyCode::Right, SemanticCommandId::MetricsBucketNext),
+    ] {
+        key(&mut by_key, code);
+        invoke(&mut by_command, command);
+        assert_eq!(screen(&by_key), screen(&by_command));
+    }
+    invoke(
+        &mut by_command,
+        SemanticCommandId::MetricsBucketSelect { bucket: 14 },
+    );
+    assert!(legend_heading(&by_command).starts_with("Tue 13 Oct ·"));
+    invoke(
+        &mut by_command,
+        SemanticCommandId::MetricsBucketSelect { bucket: 99 },
+    );
+    assert!(
+        legend_heading(&by_command).starts_with("Wed 28 Oct ·"),
+        "a bucket past the last selects the last"
+    );
+}
+
+#[test]
+fn a_selected_bar_reads_its_own_figures_in_the_legend() {
+    let mut application = thirty_days_of_tokens();
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsBucketSelect { bucket: 14 },
+    );
+
+    // The fifteenth day: Opus 5M, Codex 1M, Copilot 250K, by three Sessions.
+    let rows = screen(&application);
+    let shown = rows.join("\n");
+    eprintln!("{shown}");
+    assert_eq!(
+        legend_heading(&application),
+        "Tue 13 Oct · 6.25M tokens · 3 Sessions"
+    );
+    assert!(!shown.contains("Last 30 days"), "{shown}");
+    for (label, figures) in [
+        ("Claude Opus 5.5", ["5M ", "80%"]),
+        ("GPT-5.5 Codex", ["1M ", "16%"]),
+        ("copilot · GPT-5.5", ["250K", "4%"]),
+    ] {
+        let line = row(&rows, label);
+        for figure in figures {
+            assert!(line.contains(figure), "{figure} in {line:?}");
+        }
+    }
+
+    // The selection outlives a change of measure, its figures in the new one.
+    press(&mut application, 'c');
+    assert_eq!(
+        legend_heading(&application),
+        "Tue 13 Oct · $0.00 · 3 Sessions"
+    );
+
+    // Sessions count the bucket's distinct total, which the Models overcount.
+    press(&mut application, 's');
+    let rows = screen(&application);
+    assert_eq!(legend_heading(&application), "Tue 13 Oct · 3 Sessions");
+    for (label, sessions) in [
+        ("Claude Opus 5.5", "2 "),
+        ("GPT-5.5 Codex", "1 "),
+        ("copilot · GPT-5.5", "1 "),
+    ] {
+        let line = row(&rows, label);
+        assert!(line.contains(sessions), "{sessions} in {line:?}");
+    }
+    row(
+        &rows,
+        "A Session that used several Models counts once for each",
+    );
+
+    // Clearing it restores the range's figures.
+    show_tokens(&mut application);
+    invoke(&mut application, SemanticCommandId::MetricsBucketClear);
+    assert_eq!(legend_heading(&application), "Last 30 days · 109M tokens");
+    row(&screen(&application), "90M");
+}
+
+#[test]
+fn a_selected_bar_s_cost_is_partial_where_its_own_work_is() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(priced_report(&query)));
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsBucketSelect { bucket: 14 },
+    );
+
+    let rows = screen(&application);
+    assert_eq!(
+        legend_heading(&application),
+        "Tue 13 Oct · $7.00+ · 3 Sessions"
+    );
+    for (label, figures) in [
+        ("Claude Opus 5.5", ["$5.00 ", "71%"]),
+        ("GPT-5.5 Codex", ["$2.00 ", "29%"]),
+        ("copilot · GPT-5.5", ["$0.00+", "0%"]),
+    ] {
+        let line = row(&rows, label);
+        for figure in figures {
+            assert!(line.contains(figure), "{figure} in {line:?}");
+        }
+    }
+
+    // The second day has no Copilot, so its Cost is all it says.
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsBucketSelect { bucket: 1 },
+    );
+    assert_eq!(
+        legend_heading(&application),
+        "Wed 30 Sep · $3.00 · 2 Sessions"
+    );
+}
+
+#[test]
+fn the_selected_bar_is_marked_under_the_axis() {
+    let mut application = thirty_days_of_tokens();
+    let marks = |application: &Application| {
+        let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+        let (_, axis_y) = text_position(&buffer, "└");
+        (0..WIDTH)
+            .filter(|x| buffer[(*x, axis_y + 1)].symbol() == "▔")
+            .collect::<Vec<_>>()
+    };
+    assert!(marks(&application).is_empty());
+
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsBucketSelect { bucket: 14 },
+    );
+    let (column, _) = bar_at(&application, 14);
+    assert_eq!(marks(&application), vec![column, column + 1]);
+    eprintln!("{}", screen(&application).join("\n"));
+}
+
+#[test]
+fn esc_clears_the_selection_and_then_closes() {
+    assert_eq!(SemanticCommandId::MetricsClose.as_str(), "metrics.close");
+    let mut application = thirty_days_of_tokens();
+    let esc = InputEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(
+        application.command_for_terminal_input(esc.clone()),
+        Some(CommandId::InvokeSemantic(SemanticCommandId::MetricsClose))
+    );
+    key(&mut application, KeyCode::End);
+    assert_eq!(
+        application.command_for_terminal_input(esc),
+        Some(CommandId::InvokeSemantic(
+            SemanticCommandId::MetricsBucketClear
+        ))
+    );
+
+    key(&mut application, KeyCode::Esc);
+    assert!(
+        screen(&application)[0].starts_with(" Metrics"),
+        "still open"
+    );
+    assert!(legend_heading(&application).starts_with("Last 30 days"));
+    key(&mut application, KeyCode::Esc);
+    assert!(!screen(&application)[0].starts_with(" Metrics"), "closed");
+}
+
+#[test]
+fn a_click_selects_a_bar_and_one_on_empty_chart_space_clears_it() {
+    let mut application = thirty_days_of_tokens();
+    let bar = bar_at(&application, 14);
+    press_at(&mut application, bar);
+    assert!(legend_heading(&application).starts_with("Tue 13 Oct ·"));
+
+    // The gap before a bar, and the space above a short one, are still its.
+    let (column, _) = bar_at(&application, 0);
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let (_, top) = text_position(&buffer, "7M ┤");
+    press_at(&mut application, (column - 1, top));
+    assert!(legend_heading(&application).starts_with("Tue 29 Sep ·"));
+
+    let mut by_command = thirty_days_of_tokens();
+    invoke(
+        &mut by_command,
+        SemanticCommandId::MetricsBucketSelect { bucket: 0 },
+    );
+    assert_eq!(screen(&application), screen(&by_command));
+
+    // Beside the axis, among its ticks, nothing stands to select.
+    let (left, _) = top_left_of_chart(&application);
+    press_at(&mut application, (left, top));
+    assert!(legend_heading(&application).starts_with("Last 30 days"));
+
+    // Wheeling over a bar still steps the range.
+    let bar = bar_at(&application, 14);
+    expect_read(wheel(&mut application, MouseEventKind::ScrollDown, bar));
+}
+
+/// The chart's first column and its first row.
+fn top_left_of_chart(application: &Application) -> (u16, u16) {
+    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    let (x, y) = text_position(&buffer, "7M ┤");
+    (x, y)
+}
+
+#[test]
+fn dragging_across_the_bars_moves_the_selection_with_the_pointer() {
+    let mut application = thirty_days_of_tokens();
+    let start = bar_at(&application, 3);
+    let command_for = |application: &Application, kind, (column, row): (u16, u16)| {
+        application.command_for_terminal_input(InputEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+    };
+    // The press and the drag go the way every pointer's do.
+    assert_eq!(
+        command_for(&application, MouseEventKind::Down(MouseButton::Left), start),
+        Some(CommandId::PressAt {
+            position: ratatui::layout::Position::new(start.0, start.1)
+        })
+    );
+
+    press_at_only(&mut application, start);
+    {
+        let at = bar_at(&application, 5);
+        drag_to(&mut application, at);
+    }
+    assert!(
+        legend_heading(&application).starts_with("Sun 4 Oct ·"),
+        "{}",
+        legend_heading(&application)
+    );
+    {
+        let at = bar_at(&application, 14);
+        drag_to(&mut application, at);
+    }
+    assert!(legend_heading(&application).starts_with("Tue 13 Oct ·"));
+
+    // Past either end of the bars the selection stays at that end.
+    let (left, row) = top_left_of_chart(&application);
+    drag_to(&mut application, (left, row + 2));
+    assert!(legend_heading(&application).starts_with("Tue 29 Sep ·"));
+    drag_to(&mut application, (WIDTH - 1, row + 2));
+    assert!(legend_heading(&application).starts_with("Wed 28 Oct ·"));
+
+    // Letting go where the drag ends keeps what it chose, rather than
+    // clicking there.
+    let end = bar_at(&application, 20);
+    drag_to(&mut application, end);
+    release_at(&mut application, end);
+    assert!(legend_heading(&application).starts_with("Mon 19 Oct ·"));
+    let mut by_command = thirty_days_of_tokens();
+    invoke(
+        &mut by_command,
+        SemanticCommandId::MetricsBucketSelect { bucket: 20 },
+    );
+    assert_eq!(screen(&application), screen(&by_command));
+
+    // A drag that ends where it began still keeps it.
+    let back = bar_at(&application, 20);
+    press_at_only(&mut application, back);
+    {
+        let at = bar_at(&application, 21);
+        drag_to(&mut application, at);
+    }
+    drag_to(&mut application, back);
+    release_at(&mut application, back);
+    assert!(legend_heading(&application).starts_with("Mon 19 Oct ·"));
+}
+
+fn press_at_only(application: &mut Application, (column, row): (u16, u16)) {
+    application
+        .handle_terminal_event(InputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("press the pointer");
+}
+
+#[test]
+fn choosing_a_range_or_breakdown_clears_the_selection_and_a_refresh_keeps_it() {
+    let mut application = thirty_days_of_tokens();
+    key(&mut application, KeyCode::End);
+    let (_, request_id, query) = expect_read(press(&mut application, 'r'));
+    answer(&mut application, request_id, Ok(report(&query)));
+    assert!(legend_heading(&application).starts_with("Wed 28 Oct ·"));
+
+    let (_, request_id, query) = expect_read(press(&mut application, '2'));
+    answer(&mut application, request_id, Ok(report(&query)));
+    assert!(
+        legend_heading(&application).starts_with("Last 7 days"),
+        "{}",
+        legend_heading(&application)
+    );
+
+    key(&mut application, KeyCode::End);
+    let (_, request_id, query) = expect_read(press(&mut application, 'b'));
+    let mut answered = report(&query);
+    answered.keys = vec![UsageMetricsKeyLabel {
+        key: opus(),
+        label: "Claude Opus 5.5".to_owned(),
+    }];
+    answer(&mut application, request_id, Ok(answered));
+    assert!(legend_heading(&application).starts_with("Last 7 days"));
+}
+
+#[test]
+fn with_nothing_to_draw_there_is_no_bar_to_select() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    ask(&mut application);
+    let esc = InputEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    key(&mut application, KeyCode::End);
+    assert_eq!(
+        application.command_for_terminal_input(esc.clone()),
+        Some(CommandId::InvokeSemantic(SemanticCommandId::MetricsClose)),
+        "nothing read yet, so nothing selected"
+    );
+
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(empty_report(&query, None)));
+    key(&mut application, KeyCode::End);
+    assert_eq!(
+        application.command_for_terminal_input(esc),
+        Some(CommandId::InvokeSemantic(SemanticCommandId::MetricsClose)),
+        "an empty range has no bars"
+    );
+}

@@ -131,6 +131,24 @@ pub enum SemanticCommandId {
     /// Splits the Usage Metrics view's bars by the breakdown after its own,
     /// the last turning back to the first.
     MetricsBreakdownNext,
+    /// Selects the bucket before the Usage Metrics view's selected one, or
+    /// the last where none is, stopping at the first.
+    MetricsBucketPrevious,
+    /// Selects the bucket after the Usage Metrics view's selected one, or
+    /// the first where none is, stopping at the last.
+    MetricsBucketNext,
+    /// Selects the Usage Metrics view's first bucket.
+    MetricsBucketFirst,
+    /// Selects the Usage Metrics view's last bucket.
+    MetricsBucketLast,
+    /// Selects one of the Usage Metrics view's buckets by its place among
+    /// them, counted from the first; a place past the last selects the last.
+    MetricsBucketSelect {
+        bucket: usize,
+    },
+    /// Clears the Usage Metrics view's bucket selection, so its legend reads
+    /// the range again.
+    MetricsBucketClear,
     /// Opens the Icon Picker over a Session, which the picker only does while
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
     /// menu item stays quiet rather than opening a picker no glyph could draw.
@@ -701,6 +719,12 @@ impl SemanticCommandId {
                 UsageMetricsBreakdown::Workspace => "metrics.breakdown.workspace",
             },
             Self::MetricsBreakdownNext => "metrics.breakdown.next",
+            Self::MetricsBucketPrevious => "metrics.bucket.previous",
+            Self::MetricsBucketNext => "metrics.bucket.next",
+            Self::MetricsBucketFirst => "metrics.bucket.first",
+            Self::MetricsBucketLast => "metrics.bucket.last",
+            Self::MetricsBucketSelect { .. } => "metrics.bucket.select",
+            Self::MetricsBucketClear => "metrics.bucket.clear",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::SessionRename => "session.rename",
@@ -1883,6 +1907,57 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Next Metrics Breakdown",
         reach: SemanticReach::Client,
         description: "Split the Usage Metrics view's bars by the next breakdown",
+        slash: None,
+        keybinding: None,
+    },
+    // Selecting a bucket reads nothing: the report holds every bucket's
+    // figures, which the legend shows in place of the range's.
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsBucketPrevious,
+        title: "Previous Metrics Bucket",
+        reach: SemanticReach::Client,
+        description: "Select the bucket before the Usage Metrics view's selected one",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsBucketNext,
+        title: "Next Metrics Bucket",
+        reach: SemanticReach::Client,
+        description: "Select the bucket after the Usage Metrics view's selected one",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsBucketFirst,
+        title: "First Metrics Bucket",
+        reach: SemanticReach::Client,
+        description: "Select the Usage Metrics view's first bucket",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsBucketLast,
+        title: "Last Metrics Bucket",
+        reach: SemanticReach::Client,
+        description: "Select the Usage Metrics view's last bucket",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        // The bucket's place is invocation data, as a Sidebar width is.
+        id: SemanticCommandId::MetricsBucketSelect { bucket: 0 },
+        title: "Select Metrics Bucket",
+        reach: SemanticReach::Client,
+        description: "Select one of the Usage Metrics view's buckets by its place",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsBucketClear,
+        title: "Clear Metrics Bucket",
+        reach: SemanticReach::Client,
+        description: "Clear the Usage Metrics view's bucket selection",
         slash: None,
         keybinding: None,
     },
@@ -3169,6 +3244,9 @@ pub(super) fn descriptor(id: SemanticCommandId) -> &'static SemanticCommandDescr
                     ) | (
                         SemanticCommandId::AsideWidthSet { .. },
                         SemanticCommandId::AsideWidthSet { .. }
+                    ) | (
+                        SemanticCommandId::MetricsBucketSelect { .. },
+                        SemanticCommandId::MetricsBucketSelect { .. }
                     )
                 )
         })

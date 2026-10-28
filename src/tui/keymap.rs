@@ -277,7 +277,10 @@ pub(super) fn command_for_context_overlay_event(event: InputEvent) -> Option<Com
 }
 
 /// The Usage Metrics view owns every key and click while it is open, since
-/// it covers the whole frame: Esc or a click on its ✕ closes it, `r` reads it
+/// it covers the whole frame: ←/→ move a bucket selection and Home/End take
+/// it to either end, as a click on a bar or a drag across them does; Esc
+/// clears that selection, as a click on the chart away from its bars does,
+/// and with nothing selected Esc or a click on its ✕ closes it, `r` reads it
 /// again, `1`–`5` or a click in the range bar choose a range, `[`/`]` or the
 /// wheel over the chart step to the range before or after, `c`/`t`/`s` or a
 /// click on a measure choose what the chart plots and Tab the next, `b` splits
@@ -287,12 +290,20 @@ pub(super) fn command_for_context_overlay_event(event: InputEvent) -> Option<Com
 /// back to.
 pub(super) fn command_for_metrics_view_event(
     event: InputEvent,
+    bucket_selected: bool,
     target_at: impl Fn(Position) -> Option<MetricsTarget>,
 ) -> Option<CommandId> {
     let command = match event {
         InputEvent::Key(key) if key.kind == KeyEventKind::Press => {
             match (key.code, key.modifiers) {
+                (KeyCode::Esc, KeyModifiers::NONE) if bucket_selected => {
+                    SemanticCommandId::MetricsBucketClear
+                }
                 (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::MetricsClose,
+                (KeyCode::Left, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketPrevious,
+                (KeyCode::Right, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketNext,
+                (KeyCode::Home, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketFirst,
+                (KeyCode::End, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketLast,
                 (KeyCode::Char('r'), KeyModifiers::NONE) => SemanticCommandId::MetricsRefresh,
                 (KeyCode::Char('['), KeyModifiers::NONE) => SemanticCommandId::MetricsRangePrevious,
                 (KeyCode::Char(']'), KeyModifiers::NONE) => SemanticCommandId::MetricsRangeNext,
@@ -331,11 +342,27 @@ pub(super) fn command_for_metrics_view_event(
                 (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Breakdown(breakdown)) => {
                     SemanticCommandId::MetricsBreakdownSelect(breakdown)
                 }
-                // Down the wheel to the longer ranges, as a map zooms out.
-                (MouseEventKind::ScrollDown, MetricsTarget::Chart) => {
-                    SemanticCommandId::MetricsRangeNext
+                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Bar(bucket)) => {
+                    SemanticCommandId::MetricsBucketSelect { bucket }
                 }
-                (MouseEventKind::ScrollUp, MetricsTarget::Chart) => {
+                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Chart { .. }) => {
+                    SemanticCommandId::MetricsBucketClear
+                }
+                // A drag scrubs: the selection follows the pointer along the
+                // bars, staying at the end it passed beyond either.
+                (
+                    MouseEventKind::Drag(MouseButton::Left),
+                    MetricsTarget::Bar(bucket)
+                    | MetricsTarget::Chart {
+                        toward: Some(bucket),
+                    },
+                ) => SemanticCommandId::MetricsBucketSelect { bucket },
+                // Down the wheel to the longer ranges, as a map zooms out.
+                (
+                    MouseEventKind::ScrollDown,
+                    MetricsTarget::Bar(_) | MetricsTarget::Chart { .. },
+                ) => SemanticCommandId::MetricsRangeNext,
+                (MouseEventKind::ScrollUp, MetricsTarget::Bar(_) | MetricsTarget::Chart { .. }) => {
                     SemanticCommandId::MetricsRangePrevious
                 }
                 _ => return None,

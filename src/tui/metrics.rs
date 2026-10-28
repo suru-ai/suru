@@ -104,6 +104,9 @@ pub(super) struct MetricsView {
     shown: Option<(RangeBuckets, UsageMetricsReport)>,
     /// Why the last read gave no report.
     refusal: Option<UsageMetricsReadRefusal>,
+    /// The bucket whose figures the legend shows in place of the range's,
+    /// by its place among the shown report's buckets.
+    selected: Option<usize>,
     /// When the earliest timed Turn was, as the last report since opening
     /// said, from which All time begins.
     earliest: EarliestTurn,
@@ -159,6 +162,27 @@ struct Targets {
     breakdowns: [Option<Rect>; BREAKDOWNS.len()],
     /// The chart, or where it stands while there is none to draw.
     chart: Option<Rect>,
+    /// The bars the chart drew, each a column of it a pointer selects by.
+    bars: Option<BarStrip>,
+}
+
+/// Where the last frame drew the chart's bars: `count` slots `slot` columns
+/// wide side by side across `area`, from its left edge, each a bar and the
+/// gap before it, over every row of the chart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BarStrip {
+    pub(super) area: Rect,
+    pub(super) slot: u16,
+    pub(super) count: usize,
+}
+
+impl BarStrip {
+    /// The bucket whose slot holds column `x`, the first or the last for a
+    /// column before or past them all.
+    fn nearest(self, x: u16) -> usize {
+        let offset = usize::from(x.saturating_sub(self.area.x) / self.slot.max(1));
+        offset.min(self.count.saturating_sub(1))
+    }
 }
 
 /// A part of the view a pointer can act on.
@@ -168,7 +192,27 @@ pub(super) enum MetricsTarget {
     Range(MetricsRange),
     Measure(MetricsMeasure),
     Breakdown(UsageMetricsBreakdown),
-    Chart,
+    /// A bucket's bar, by its place among them, or the space above or
+    /// before it in its slot.
+    Bar(usize),
+    /// The chart away from any bar, `toward` the bar a drag across it
+    /// reaches for: the nearest along its row, where any is drawn.
+    Chart {
+        toward: Option<usize>,
+    },
+}
+
+/// Where a bucket selection moves to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BucketMove {
+    /// The bucket before, or the last where none is selected.
+    Previous,
+    /// The bucket after, or the first where none is selected.
+    Next,
+    First,
+    Last,
+    /// The bucket at that place, or the last for a place past it.
+    To(usize),
 }
 
 /// What the view shows beneath its title bar.
@@ -192,6 +236,7 @@ impl MetricsView {
         self.asked = None;
         self.shown = None;
         self.refusal = None;
+        self.selected = None;
         self.earliest = EarliestTurn::Unknown;
     }
 
@@ -234,6 +279,40 @@ impl MetricsView {
         self.asked = None;
         self.shown = None;
         self.refusal = None;
+        self.selected = None;
+    }
+
+    /// How many buckets a selection can move among: those of the report
+    /// shown, where its chart draws them.
+    fn selectable(&self) -> usize {
+        match &self.shown {
+            Some((buckets, report)) if !chart::holds_nothing(report) => buckets.buckets.len(),
+            _ => 0,
+        }
+    }
+
+    /// The bucket the legend reads, where one is selected.
+    pub(super) fn selected_bucket(&self) -> Option<usize> {
+        self.selected
+    }
+
+    /// Moves the bucket selection, which stops at the first and last
+    /// bucket. With no bars drawn there is nothing to select.
+    pub(super) fn move_selection(&mut self, to: BucketMove) {
+        let Some(last) = self.selectable().checked_sub(1) else {
+            return;
+        };
+        self.selected = Some(match (to, self.selected) {
+            (BucketMove::Previous, Some(selected)) => selected.saturating_sub(1),
+            (BucketMove::Next, Some(selected)) => (selected + 1).min(last),
+            (BucketMove::Previous | BucketMove::Last, _) => last,
+            (BucketMove::Next | BucketMove::First, _) => 0,
+            (BucketMove::To(bucket), _) => bucket.min(last),
+        });
+    }
+
+    pub(super) fn clear_selection(&mut self) {
+        self.selected = None;
     }
 
     pub(super) fn breakdown(&self) -> UsageMetricsBreakdown {
@@ -334,6 +413,11 @@ impl MetricsView {
         }
         self.shown = Some((buckets, report));
         self.refusal = None;
+        // A refresh keeps the bucket chosen, where the new report still has it.
+        let last = self.selectable().checked_sub(1);
+        self.selected = self
+            .selected
+            .and_then(|selected| last.map(|last| selected.min(last)));
         Receipt::Settled
     }
 
@@ -401,6 +485,10 @@ impl MetricsView {
         self.update_targets(|targets| targets.chart = Some(area));
     }
 
+    pub(super) fn record_bar_targets(&self, bars: BarStrip) {
+        self.update_targets(|targets| targets.bars = Some(bars));
+    }
+
     fn update_targets(&self, update: impl FnOnce(&mut Targets)) {
         let mut targets = self.targets.get();
         update(&mut targets);
@@ -432,6 +520,21 @@ impl MetricsView {
         {
             return Some(MetricsTarget::Breakdown(breakdown));
         }
-        on(targets.chart).then_some(MetricsTarget::Chart)
+        // Beside the bars, out to the frame's edges, the chart reaches for
+        // the nearest of them, so a drag past either end stays at that end.
+        if let Some(bars) = targets
+            .bars
+            .filter(|bars| (bars.area.top()..bars.area.bottom()).contains(&position.y))
+        {
+            let nearest = bars.nearest(position.x);
+            return Some(if bars.area.contains(position) {
+                MetricsTarget::Bar(nearest)
+            } else {
+                MetricsTarget::Chart {
+                    toward: Some(nearest),
+                }
+            });
+        }
+        on(targets.chart).then_some(MetricsTarget::Chart { toward: None })
     }
 }
