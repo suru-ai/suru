@@ -2500,6 +2500,33 @@ fn dragging_across_the_bars_moves_the_selection_with_the_pointer() {
     assert!(legend_heading(&application).starts_with("Mon 19 Oct ·"));
 }
 
+#[test]
+fn a_drag_that_returns_to_empty_space_and_lets_go_there_is_not_a_click() {
+    let mut application = thirty_days_of_tokens();
+    // Beside the axis, among its ticks: a click there clears the selection.
+    let (left, row) = top_left_of_chart(&application);
+    let beside = (left, row + 2);
+    key(&mut application, KeyCode::End);
+    press_at(&mut application, beside);
+    assert!(legend_heading(&application).starts_with("Last 30 days"));
+
+    // Pressed there, dragged onto the bars and back, then let go where it
+    // was pressed: the drag chose, and letting go is no click.
+    press_at_only(&mut application, beside);
+    {
+        let at = bar_at(&application, 5);
+        drag_to(&mut application, at);
+    }
+    assert!(legend_heading(&application).starts_with("Sun 4 Oct ·"));
+    drag_to(&mut application, beside);
+    release_at(&mut application, beside);
+    assert!(
+        legend_heading(&application).starts_with("Tue 29 Sep ·"),
+        "{}",
+        legend_heading(&application)
+    );
+}
+
 fn press_at_only(application: &mut Application, (column, row): (u16, u16)) {
     application
         .handle_terminal_event(InputEvent::Mouse(MouseEvent {
@@ -2559,4 +2586,77 @@ fn with_nothing_to_draw_there_is_no_bar_to_select() {
         Some(CommandId::InvokeSemantic(SemanticCommandId::MetricsClose)),
         "an empty range has no bars"
     );
+}
+
+#[test]
+fn a_refresh_keeps_the_selected_day_where_the_new_range_still_holds_it() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    let now = Arc::new(AtomicU64::new(afternoon().0));
+    let clock = Arc::clone(&now);
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path())
+        .with_session_clock(move || SessionTimestamp(clock.load(Ordering::SeqCst)))
+        .with_time_zone(zone(NEW_YORK));
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(report(&query)));
+    rendered_application_buffer(&application, WIDTH, HEIGHT);
+    key(&mut application, KeyCode::End);
+    assert!(legend_heading(&application).starts_with("Wed 28 Oct ·"));
+
+    // A day on, the 28th is no longer the last bucket, and is still chosen.
+    let a_day = 24 * 60 * 60 * 1_000;
+    now.fetch_add(a_day, Ordering::SeqCst);
+    let (_, request_id, query) = expect_read(press(&mut application, 'r'));
+    answer(&mut application, request_id, Ok(report(&query)));
+    assert!(
+        legend_heading(&application).starts_with("Wed 28 Oct ·"),
+        "{}",
+        legend_heading(&application)
+    );
+
+    // The range's first day, once a refresh has left it behind, is let go.
+    key(&mut application, KeyCode::Home);
+    assert!(legend_heading(&application).starts_with("Wed 30 Sep ·"));
+    now.fetch_add(a_day, Ordering::SeqCst);
+    let (_, request_id, query) = expect_read(press(&mut application, 'r'));
+    answer(&mut application, request_id, Ok(report(&query)));
+    assert!(legend_heading(&application).starts_with("Last 30 days"));
+}
+
+#[test]
+fn where_too_narrow_to_draw_every_bar_the_selection_stops_at_the_last_drawn() {
+    const NARROW: u16 = 30;
+    let mut application = thirty_days_of_tokens();
+    let marks = |application: &Application| {
+        let buffer = rendered_application_buffer(application, NARROW, HEIGHT);
+        let (axis_x, axis_y) = text_position(&buffer, "└");
+        let bars = (0..NARROW)
+            .filter(|x| buffer[(*x, axis_y - 1)].symbol() != " " && *x > axis_x)
+            .count();
+        let marked: Vec<u16> = (0..NARROW)
+            .filter(|x| buffer[(*x, axis_y + 1)].symbol() == "▔")
+            .map(|x| x - axis_x - 1)
+            .collect();
+        (bars, marked)
+    };
+    // One column apiece, and room for fewer than thirty.
+    let (drawn, _) = marks(&application);
+    assert!(drawn < 30, "{drawn} bars");
+
+    key(&mut application, KeyCode::End);
+    let last = u16::try_from(drawn - 1).unwrap();
+    assert_eq!(marks(&application).1, vec![last]);
+    key(&mut application, KeyCode::Right);
+    assert_eq!(marks(&application).1, vec![last]);
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsBucketSelect { bucket: 29 },
+    );
+    assert_eq!(marks(&application).1, vec![last]);
+    key(&mut application, KeyCode::Home);
+    key(&mut application, KeyCode::Right);
+    assert_eq!(marks(&application).1, vec![1]);
 }

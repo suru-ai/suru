@@ -283,12 +283,18 @@ impl MetricsView {
     }
 
     /// How many buckets a selection can move among: those of the report
-    /// shown, where its chart draws them.
+    /// shown that its chart draws, so a selection always has its bar and
+    /// mark. A frame too narrow for every bar draws the first few; before
+    /// any frame has drawn the report's bars, all of them count.
     fn selectable(&self) -> usize {
-        match &self.shown {
+        let buckets = match &self.shown {
             Some((buckets, report)) if !chart::holds_nothing(report) => buckets.buckets.len(),
-            _ => 0,
-        }
+            _ => return 0,
+        };
+        self.targets
+            .get()
+            .bars
+            .map_or(buckets, |bars| bars.count.min(buckets))
     }
 
     /// The bucket the legend reads, where one is selected.
@@ -411,13 +417,25 @@ impl MetricsView {
         if self.range == MetricsRange::AllTime && learned && uncovered {
             return Receipt::ReadAgain;
         }
+        // A refresh keeps the bucket chosen by when it begins, which a later
+        // clock may have moved along the range or out of it altogether.
+        let chosen = self
+            .selected
+            .zip(self.shown.as_ref())
+            .and_then(|(selected, (shown, _))| shown.buckets.get(selected))
+            .map(|bucket| bucket.interval.start);
         self.shown = Some((buckets, report));
         self.refusal = None;
-        // A refresh keeps the bucket chosen, where the new report still has it.
-        let last = self.selectable().checked_sub(1);
-        self.selected = self
-            .selected
-            .and_then(|selected| last.map(|last| selected.min(last)));
+        let selectable = self.selectable();
+        self.selected = chosen.and_then(|start| {
+            self.shown
+                .as_ref()?
+                .0
+                .buckets
+                .iter()
+                .position(|bucket| bucket.interval.start == start)
+                .filter(|place| *place < selectable)
+        });
         Receipt::Settled
     }
 
