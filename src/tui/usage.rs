@@ -45,7 +45,13 @@ pub(super) fn grouped_count(value: u64) -> String {
 }
 
 pub(super) fn compact_cost(cost: Cost) -> String {
-    format!("${:.2}", cost.as_usd())
+    compact_dollars(cost.nano_usd())
+}
+
+/// `nano_usd` billionths of a dollar, written as every dollar figure is —
+/// a Cost's, and an estimate that is none.
+pub(super) fn compact_dollars(nano_usd: u64) -> String {
+    format!("${:.2}", nano_usd as f64 / 1_000_000_000.0)
 }
 
 fn trim_fractional_zeros(mut value: String) -> String {

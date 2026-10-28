@@ -5,12 +5,12 @@
 use ratatui::{buffer::Buffer, layout::Rect};
 
 use crate::{
-    protocol::{CacheInsights, Cost, EstimatedSaving},
+    protocol::{CacheInsights, EstimatedSaving},
     theme::Theme,
 };
 
 use super::super::{
-    super::{slots::truncate_to_width, usage::compact_cost},
+    super::{slots::truncate_to_width, usage::compact_dollars},
     calendar::MetricsRange,
 };
 
@@ -49,8 +49,7 @@ pub(super) fn render(
 /// than reading it saved; none where no Model's rates could estimate it.
 fn saved(saving: EstimatedSaving) -> Option<String> {
     let nano_usd = saving.nano_usd?;
-    // Written as a dollar figure is, though it is no Cost.
-    let amount = compact_cost(Cost::from_nano_usd(nano_usd.unsigned_abs()));
+    let amount = compact_dollars(nano_usd.unsigned_abs());
     let sign = if nano_usd < 0 { "−" } else { "" };
     let partial = if saving.is_partial { "+" } else { "" };
     Some(format!("saved ≈ {sign}{amount}{partial} (est.)"))
