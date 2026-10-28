@@ -13,7 +13,12 @@ use super::{
         descriptor,
     },
     connect_overlay::ConnectInputMode,
-    metrics::{FocusedRow, MetricsTarget, calendar::MetricsRange, chart::MetricsMeasure},
+    metrics::{
+        FocusedRow, MetricsTab, MetricsTarget,
+        calendar::MetricsRange,
+        chart::MetricsMeasure,
+        insights::{InsightsPanel, InsightsTarget},
+    },
     relay_overlay::RelayInputMode,
     settings_panel::PanelKeys,
     state::{CommandId, ScrollDirection},
@@ -276,62 +281,40 @@ pub(super) fn command_for_context_overlay_event(event: InputEvent) -> Option<Com
     Some(CommandId::InvokeSemantic(command))
 }
 
+/// What the Usage Metrics view's keys act on, beside the key itself.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MetricsKeys {
+    pub(super) tab: MetricsTab,
+    /// Whether Overview has a bucket selected.
+    pub(super) bucket_selected: bool,
+    /// The row of Overview's lists in focus.
+    pub(super) focused_row: Option<FocusedRow>,
+    /// The Insights panel in focus.
+    pub(super) panel: Option<InsightsPanel>,
+    /// Whether that panel has something selected within it.
+    pub(super) panel_selected: bool,
+}
+
 /// The Usage Metrics view owns every key and click while it is open, since
-/// it covers the whole frame: ←/→ move a bucket selection and Home/End take
-/// it to either end, as a click on a bar or a drag across them does; ↑/↓
-/// focus a row of its lists, on which Space hides or shows a legend row's
-/// series and Shift+Space or `o` shows it alone, as a click on the row or a
-/// modified one does, and Enter opens a listed Session, as a click on its
-/// row does; Esc clears the bucket selection, as a click on the
-/// chart away from its bars does, then the focus, and with neither left Esc
-/// or a click on its ✕ closes it — the selection first, since it changes
-/// what the legend reads, where a focus only marks a row — `r` reads it
-/// again, `1`–`5` or a click in the range bar choose a range, `[`/`]` or the
-/// wheel over the chart step to the range before or after, `c`/`t`/`s` or a
-/// click on a measure choose what the chart plots and Tab the next, `b` splits
-/// the bars by the next breakdown and a click on one by that, and Ctrl+C leaves
+/// it covers the whole frame. On either tab, Ctrl+←/→ or a click in the tab
+/// bar switch tab, `r` reads the tab showing again, `1`–`5` or a click in
+/// the range bar choose the range both tabs share, `[`/`]` step to the
+/// range before or after, a click on its ✕ closes it, and Ctrl+C leaves
 /// Suru, as it does from a composer with nothing in it — the view holds
-/// nothing a press could clear, and a draft it covers is the reader's to come
-/// back to.
+/// nothing a press could clear, and a draft it covers is the reader's to
+/// come back to. Everything else is the tab's own: see
+/// [`command_for_overview_key`], [`command_for_overview_pointer`],
+/// [`command_for_insights_key`], and [`command_for_insights_pointer`].
 pub(super) fn command_for_metrics_view_event(
     event: InputEvent,
-    bucket_selected: bool,
-    focused: Option<FocusedRow>,
+    keys: MetricsKeys,
     target_at: impl Fn(Position) -> Option<MetricsTarget>,
 ) -> Option<CommandId> {
     let command = match event {
         InputEvent::Key(key) if key.kind == KeyEventKind::Press => {
             match (key.code, key.modifiers) {
-                (KeyCode::Esc, KeyModifiers::NONE) if bucket_selected => {
-                    SemanticCommandId::MetricsBucketClear
-                }
-                (KeyCode::Esc, KeyModifiers::NONE) if focused.is_some() => {
-                    SemanticCommandId::MetricsFocusClear
-                }
-                (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::MetricsClose,
-                (KeyCode::Left, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketPrevious,
-                (KeyCode::Right, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketNext,
-                (KeyCode::Up, KeyModifiers::NONE) => SemanticCommandId::MetricsFocusPrevious,
-                (KeyCode::Down, KeyModifiers::NONE) => SemanticCommandId::MetricsFocusNext,
-                (KeyCode::Char(' '), KeyModifiers::NONE) => match focused? {
-                    FocusedRow::Series(series) => SemanticCommandId::MetricsSeriesToggle { series },
-                    FocusedRow::Session(_) => return None,
-                },
-                (KeyCode::Enter, KeyModifiers::NONE) => match focused? {
-                    FocusedRow::Session(session) => {
-                        SemanticCommandId::MetricsSessionOpen { session }
-                    }
-                    FocusedRow::Series(_) => return None,
-                },
-                // Most terminals send Shift+Space as Space alone, so `o`, for
-                // "only", does the same wherever Shift+Space cannot.
-                (KeyCode::Char(' '), KeyModifiers::SHIFT)
-                | (KeyCode::Char('o'), KeyModifiers::NONE) => match focused? {
-                    FocusedRow::Series(series) => SemanticCommandId::MetricsSeriesSolo { series },
-                    FocusedRow::Session(_) => return None,
-                },
-                (KeyCode::Home, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketFirst,
-                (KeyCode::End, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketLast,
+                (KeyCode::Left, KeyModifiers::CONTROL) => SemanticCommandId::MetricsTabPrevious,
+                (KeyCode::Right, KeyModifiers::CONTROL) => SemanticCommandId::MetricsTabNext,
                 (KeyCode::Char('r'), KeyModifiers::NONE) => SemanticCommandId::MetricsRefresh,
                 (KeyCode::Char('['), KeyModifiers::NONE) => SemanticCommandId::MetricsRangePrevious,
                 (KeyCode::Char(']'), KeyModifiers::NONE) => SemanticCommandId::MetricsRangeNext,
@@ -339,82 +322,217 @@ pub(super) fn command_for_metrics_view_event(
                     let place = usize::try_from(digit.to_digit(10)?).ok()? - 1;
                     SemanticCommandId::MetricsRangeSelect(MetricsRange::ALL[place])
                 }
-                (KeyCode::Char('c'), KeyModifiers::NONE) => {
-                    SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Cost)
-                }
-                (KeyCode::Char('t'), KeyModifiers::NONE) => {
-                    SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Tokens)
-                }
-                (KeyCode::Char('s'), KeyModifiers::NONE) => {
-                    SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Sessions)
-                }
-                (KeyCode::Tab, KeyModifiers::NONE) => SemanticCommandId::MetricsMeasureNext,
-                (KeyCode::Char('b'), KeyModifiers::NONE) => SemanticCommandId::MetricsBreakdownNext,
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => SemanticCommandId::ApplicationExit,
-                _ => return None,
+                _ => match keys.tab {
+                    MetricsTab::Overview => command_for_overview_key(key, keys)?,
+                    MetricsTab::Insights => command_for_insights_key(key, keys)?,
+                },
             }
         }
         InputEvent::Mouse(mouse) => {
-            let target = target_at(Position::new(mouse.column, mouse.row));
-            match (mouse.kind, target?) {
-                // A click arrives as the release that completes it.
-                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Close) => {
-                    SemanticCommandId::MetricsClose
-                }
-                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Range(range)) => {
+            let target = target_at(Position::new(mouse.column, mouse.row))?;
+            // A click arrives as the release that completes it.
+            let click = mouse.kind == MouseEventKind::Up(MouseButton::Left);
+            match target {
+                MetricsTarget::Close if click => SemanticCommandId::MetricsClose,
+                MetricsTarget::Tab(tab) if click => SemanticCommandId::MetricsTabSelect(tab),
+                MetricsTarget::Range(range) if click => {
                     SemanticCommandId::MetricsRangeSelect(range)
                 }
-                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Measure(measure)) => {
-                    SemanticCommandId::MetricsMeasureSelect(measure)
-                }
-                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Breakdown(breakdown)) => {
-                    SemanticCommandId::MetricsBreakdownSelect(breakdown)
-                }
-                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Bar(bucket)) => {
-                    SemanticCommandId::MetricsBucketSelect { bucket }
-                }
-                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Chart { .. }) => {
-                    SemanticCommandId::MetricsBucketClear
-                }
-                // Any modifier will do, since terminals keep some for their
-                // own: many take a Shift-click to select text, and macOS
-                // Terminal makes a Ctrl-click a right one.
-                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Series(series))
-                    if mouse.modifiers.intersects(
-                        KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT,
-                    ) =>
-                {
-                    SemanticCommandId::MetricsSeriesSolo { series }
-                }
-                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Series(series)) => {
-                    SemanticCommandId::MetricsSeriesToggle { series }
-                }
-                (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Session(session)) => {
-                    SemanticCommandId::MetricsSessionOpen { session }
-                }
-                // A drag scrubs: the selection follows the pointer along the
-                // bars, staying at the end it passed beyond either.
-                (
-                    MouseEventKind::Drag(MouseButton::Left),
-                    MetricsTarget::Bar(bucket)
-                    | MetricsTarget::Chart {
-                        toward: Some(bucket),
-                    },
-                ) => SemanticCommandId::MetricsBucketSelect { bucket },
-                // Down the wheel to the longer ranges, as a map zooms out.
-                (
-                    MouseEventKind::ScrollDown,
-                    MetricsTarget::Bar(_) | MetricsTarget::Chart { .. },
-                ) => SemanticCommandId::MetricsRangeNext,
-                (MouseEventKind::ScrollUp, MetricsTarget::Bar(_) | MetricsTarget::Chart { .. }) => {
-                    SemanticCommandId::MetricsRangePrevious
-                }
-                _ => return None,
+                MetricsTarget::Insights(target) => command_for_insights_pointer(mouse, target)?,
+                target => command_for_overview_pointer(mouse, target)?,
             }
         }
         _ => return None,
     };
     Some(CommandId::InvokeSemantic(command))
+}
+
+/// Overview's own keys: ←/→ move a bucket selection and Home/End take it to
+/// either end, as a click on a bar or a drag across them does; ↑/↓ focus a
+/// row of its lists, on which Space hides or shows a legend row's series and
+/// Shift+Space or `o` shows it alone, as a click on the row or a modified
+/// one does, and Enter opens a listed Session, as a click on its row does;
+/// Esc clears the bucket selection, as a click on the chart away from its
+/// bars does, then the focus, and with neither left closes the view — the
+/// selection first, since it changes what the legend reads, where a focus
+/// only marks a row — `c`/`t`/`s` or a click on a measure choose what the
+/// chart plots and Tab the next, and `b` splits the bars by the next
+/// breakdown and a click on one by that.
+fn command_for_overview_key(key: KeyEvent, keys: MetricsKeys) -> Option<SemanticCommandId> {
+    let focused = keys.focused_row;
+    Some(match (key.code, key.modifiers) {
+        (KeyCode::Esc, KeyModifiers::NONE) if keys.bucket_selected => {
+            SemanticCommandId::MetricsBucketClear
+        }
+        (KeyCode::Esc, KeyModifiers::NONE) if focused.is_some() => {
+            SemanticCommandId::MetricsFocusClear
+        }
+        (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::MetricsClose,
+        (KeyCode::Left, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketPrevious,
+        (KeyCode::Right, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketNext,
+        (KeyCode::Up, KeyModifiers::NONE) => SemanticCommandId::MetricsFocusPrevious,
+        (KeyCode::Down, KeyModifiers::NONE) => SemanticCommandId::MetricsFocusNext,
+        (KeyCode::Char(' '), KeyModifiers::NONE) => match focused? {
+            FocusedRow::Series(series) => SemanticCommandId::MetricsSeriesToggle { series },
+            FocusedRow::Session(_) => return None,
+        },
+        (KeyCode::Enter, KeyModifiers::NONE) => match focused? {
+            FocusedRow::Session(session) => SemanticCommandId::MetricsSessionOpen { session },
+            FocusedRow::Series(_) => return None,
+        },
+        // Most terminals send Shift+Space as Space alone, so `o`, for
+        // "only", does the same wherever Shift+Space cannot.
+        (KeyCode::Char(' '), KeyModifiers::SHIFT) | (KeyCode::Char('o'), KeyModifiers::NONE) => {
+            match focused? {
+                FocusedRow::Series(series) => SemanticCommandId::MetricsSeriesSolo { series },
+                FocusedRow::Session(_) => return None,
+            }
+        }
+        (KeyCode::Home, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketFirst,
+        (KeyCode::End, KeyModifiers::NONE) => SemanticCommandId::MetricsBucketLast,
+        (KeyCode::Char('c'), KeyModifiers::NONE) => {
+            SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Cost)
+        }
+        (KeyCode::Char('t'), KeyModifiers::NONE) => {
+            SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Tokens)
+        }
+        (KeyCode::Char('s'), KeyModifiers::NONE) => {
+            SemanticCommandId::MetricsMeasureSelect(MetricsMeasure::Sessions)
+        }
+        (KeyCode::Tab, KeyModifiers::NONE) => SemanticCommandId::MetricsMeasureNext,
+        (KeyCode::Char('b'), KeyModifiers::NONE) => SemanticCommandId::MetricsBreakdownNext,
+        _ => return None,
+    })
+}
+
+/// Overview's own clicks, drags, and wheel, over the measures, breakdowns,
+/// chart, legend, and Sessions it drew.
+fn command_for_overview_pointer(
+    mouse: MouseEvent,
+    target: MetricsTarget,
+) -> Option<SemanticCommandId> {
+    Some(match (mouse.kind, target) {
+        (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Measure(measure)) => {
+            SemanticCommandId::MetricsMeasureSelect(measure)
+        }
+        (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Breakdown(breakdown)) => {
+            SemanticCommandId::MetricsBreakdownSelect(breakdown)
+        }
+        (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Bar(bucket)) => {
+            SemanticCommandId::MetricsBucketSelect { bucket }
+        }
+        (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Chart { .. }) => {
+            SemanticCommandId::MetricsBucketClear
+        }
+        // Any modifier will do, since terminals keep some for their
+        // own: many take a Shift-click to select text, and macOS
+        // Terminal makes a Ctrl-click a right one.
+        (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Series(series))
+            if mouse
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            SemanticCommandId::MetricsSeriesSolo { series }
+        }
+        (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Series(series)) => {
+            SemanticCommandId::MetricsSeriesToggle { series }
+        }
+        (MouseEventKind::Up(MouseButton::Left), MetricsTarget::Session(session)) => {
+            SemanticCommandId::MetricsSessionOpen { session }
+        }
+        // A drag scrubs: the selection follows the pointer along the
+        // bars, staying at the end it passed beyond either.
+        (
+            MouseEventKind::Drag(MouseButton::Left),
+            MetricsTarget::Bar(bucket)
+            | MetricsTarget::Chart {
+                toward: Some(bucket),
+            },
+        ) => SemanticCommandId::MetricsBucketSelect { bucket },
+        // Down the wheel to the longer ranges, as a map zooms out.
+        (MouseEventKind::ScrollDown, MetricsTarget::Bar(_) | MetricsTarget::Chart { .. }) => {
+            SemanticCommandId::MetricsRangeNext
+        }
+        (MouseEventKind::ScrollUp, MetricsTarget::Bar(_) | MetricsTarget::Chart { .. }) => {
+            SemanticCommandId::MetricsRangePrevious
+        }
+        _ => return None,
+    })
+}
+
+/// Insights' own keys: Tab and Shift+Tab move focus among its panels, the
+/// last turning round to the first, as a click on a panel focuses it; Esc
+/// clears what the focused panel has selected, then leaves the panel, and
+/// with neither left closes the view; every other key is the focused
+/// panel's, as [`command_for_insights_panel_key`] gives it.
+fn command_for_insights_key(key: KeyEvent, keys: MetricsKeys) -> Option<SemanticCommandId> {
+    Some(match (key.code, key.modifiers) {
+        (KeyCode::Esc, KeyModifiers::NONE) if keys.panel_selected => {
+            SemanticCommandId::MetricsPanelSelectionClear
+        }
+        (KeyCode::Esc, KeyModifiers::NONE) if keys.panel.is_some() => {
+            SemanticCommandId::MetricsPanelFocusClear
+        }
+        (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::MetricsClose,
+        (KeyCode::Tab, KeyModifiers::NONE) => SemanticCommandId::MetricsPanelFocusNext,
+        // Terminals send Shift+Tab as BackTab, with Shift or without.
+        (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
+            SemanticCommandId::MetricsPanelFocusPrevious
+        }
+        _ => return command_for_insights_panel_key(keys.panel?, key),
+    })
+}
+
+/// A key the focused Insights panel acts on: on Turns, ←/→ move the bin
+/// selection along its sparkline.
+fn command_for_insights_panel_key(
+    panel: InsightsPanel,
+    key: KeyEvent,
+) -> Option<SemanticCommandId> {
+    match (panel, key.code, key.modifiers) {
+        (InsightsPanel::Turns, KeyCode::Left, KeyModifiers::NONE) => {
+            Some(SemanticCommandId::MetricsTurnsBinPrevious)
+        }
+        (InsightsPanel::Turns, KeyCode::Right, KeyModifiers::NONE) => {
+            Some(SemanticCommandId::MetricsTurnsBinNext)
+        }
+        _ => None,
+    }
+}
+
+/// Insights' own clicks and wheel: a click on what a panel lets a reader
+/// select selects it, focusing the panel, and one anywhere else on a panel
+/// focuses it; the wheel is the panel's under the pointer, whether or not it
+/// is focused, as [`command_for_insights_panel_wheel`] gives it.
+fn command_for_insights_pointer(
+    mouse: MouseEvent,
+    target: InsightsTarget,
+) -> Option<SemanticCommandId> {
+    match (mouse.kind, target) {
+        (MouseEventKind::Up(MouseButton::Left), InsightsTarget::TurnsBin(bin)) => {
+            Some(SemanticCommandId::MetricsTurnsBinSelect { bin })
+        }
+        (MouseEventKind::Up(MouseButton::Left), InsightsTarget::Panel(panel)) => {
+            Some(SemanticCommandId::MetricsPanelFocus(panel))
+        }
+        (MouseEventKind::ScrollUp | MouseEventKind::ScrollDown, target) => {
+            command_for_insights_panel_wheel(target.panel(), mouse.kind)
+        }
+        _ => None,
+    }
+}
+
+/// What the wheel does over an Insights panel: nothing over Turns, whose
+/// figures all stand in view, and never a step of the range, which the
+/// wheel over Overview's chart takes.
+fn command_for_insights_panel_wheel(
+    panel: InsightsPanel,
+    _kind: MouseEventKind,
+) -> Option<SemanticCommandId> {
+    match panel {
+        InsightsPanel::Turns => None,
+    }
 }
 
 /// The Serve overlay owns the keys while it is visible. Its picker of the

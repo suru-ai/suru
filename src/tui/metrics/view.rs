@@ -1,5 +1,6 @@
 //! Draws the Usage Metrics view over the whole frame: a title bar with its
-//! close control, the range bar and the measures beside it, then the range's
+//! close control, the tab bar, then on Overview the range bar and the
+//! measures beside it, then the range's
 //! headline figures, the chart, and its legend — with the Usage mix strip
 //! under it for Tokens — and the Sessions that cost the most beneath them,
 //! or what stands in for them while a read is on its way, when it was
@@ -24,8 +25,8 @@ use crate::{
 
 use super::{
     super::slots::truncate_to_width,
-    BREAKDOWNS, BarStrip, FocusedRow, LEGEND_SERIES, MetricsContent, MetricsView, OfferedBreakdown,
-    UsageMetricsReadRefusal,
+    BREAKDOWNS, BarStrip, FocusedRow, LEGEND_SERIES, MetricsContent, MetricsTab, MetricsView,
+    OfferedBreakdown, UsageMetricsReadRefusal,
     calendar::{MetricsRange, RangeBuckets},
     chart::{self, MetricsMeasure, Series},
     headline::{self, HEADLINE_ROWS},
@@ -69,7 +70,7 @@ const FLOWED_GAP: usize = 2;
 /// The fewest rows a legend whose series flow along a line is drawn in: its
 /// heading and one line of them.
 const FLOWED_LEGEND_FLOOR: u16 = 2;
-/// The rows above the headline: the title bar, its rule, a blank row, the
+/// The rows above the headline: the title bar, its rule, the tab bar, the
 /// controls, and the row under them that says what became of a read.
 const HEAD_ROWS: u16 = 5;
 /// The narrowest frame the view is drawn in: the controls row stands whole
@@ -117,6 +118,18 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
         buffer.set_string(x, area.y + 1, "─", theme.border.subdued);
     }
 
+    render_tabs(
+        buffer,
+        area.x + INSET - 1,
+        area.y + 2,
+        MetricsTab::ALL.map(|tab| (tab.label(), tab == view.tab())),
+        |place, at| view.record_tab_target(MetricsTab::ALL[place], at),
+        theme,
+    );
+    if view.tab() == MetricsTab::Insights {
+        render_insights(buffer, area, view, theme);
+        return;
+    }
     let range = view.range();
     let measure = view.measure();
     let breakdown = view.breakdown();
@@ -383,6 +396,46 @@ pub(in crate::tui) fn render(frame: &mut Frame<'_>, view: &MetricsView, theme: &
 /// What the view draws in a frame smaller than it can be drawn in: a request
 /// for a larger terminal, centred, saying how large and how to leave, and
 /// nothing a pointer or a key could act on.
+/// The Insights tab beneath the tab bar: the range bar alone, the row under
+/// it saying what became of a read, and the panels.
+fn render_insights(buffer: &mut Buffer, area: Rect, view: &MetricsView, theme: &Theme) {
+    let range = view.range();
+    let controls_y = area.y + 3;
+    render_tabs(
+        buffer,
+        area.x + INSET - 1,
+        controls_y,
+        MetricsRange::ALL.map(|chosen| (chosen.label(), chosen == range)),
+        |place, at| view.record_range_target(MetricsRange::ALL[place], at),
+        theme,
+    );
+    let insights = view.insights();
+    let room = usize::from(area.width.saturating_sub(INSET * 2));
+    if let Some(refusal) = insights.stale_because(range) {
+        let note = truncate_to_width(&stale_note(refusal), room);
+        buffer.set_string(area.x + INSET, controls_y + 1, note, theme.feedback.error);
+    } else if insights.is_reading(range)
+        && matches!(
+            insights.content(range),
+            super::insights::InsightsContent::Report(_)
+        )
+    {
+        buffer.set_string(
+            area.x + INSET,
+            controls_y + 1,
+            "Refreshing…",
+            theme.text.subdued,
+        );
+    }
+    let body = Rect::new(
+        area.x + INSET,
+        area.y + HEAD_ROWS,
+        area.width.saturating_sub(INSET * 2),
+        area.height.saturating_sub(HEAD_ROWS + 1),
+    );
+    super::insights::render(buffer, body, insights, range, theme);
+}
+
 fn render_too_small(buffer: &mut Buffer, area: Rect, view: &MetricsView, theme: &Theme) {
     view.record_bar_targets(no_bars(area));
     view.record_legend_targets([None; LEGEND_SERIES]);

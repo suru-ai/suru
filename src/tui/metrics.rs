@@ -2,10 +2,15 @@
 //! Outlook is turned toward consumed over a span of time, read on request
 //! and drawn over the whole frame. Nothing in it updates live; a refresh
 //! reads again.
+//!
+//! It has two tabs sharing one range: Overview, which charts what was
+//! consumed, and Insights, whose panels say how the work went. Each reads
+//! its own report when it is shown and lacks one.
 
 pub(crate) mod calendar;
 pub(crate) mod chart;
 mod headline;
+pub(crate) mod insights;
 mod mix;
 mod view;
 
@@ -22,6 +27,7 @@ use crate::protocol::{
 
 use calendar::{MetricsRange, RangeBuckets};
 use chart::{MetricsMeasure, SeriesId};
+use insights::{InsightsTarget, InsightsView};
 
 pub(super) use view::render;
 
@@ -81,6 +87,45 @@ impl OfferedBreakdown for UsageMetricsBreakdown {
     }
 }
 
+/// A tab of the view, beneath its title bar and above the range bar.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum MetricsTab {
+    /// The chart of what was consumed, where the view opens.
+    #[default]
+    Overview,
+    /// Panels saying how the work went.
+    Insights,
+}
+
+impl MetricsTab {
+    /// Every tab, in the order the tab bar lists them.
+    pub const ALL: [Self; 2] = [Self::Overview, Self::Insights];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Insights => "Insights",
+        }
+    }
+
+    pub(crate) fn place(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|tab| *tab == self)
+            .expect("every tab is listed")
+    }
+
+    /// The tab after this one, or this one where it is the last.
+    pub(crate) fn next(self) -> Self {
+        Self::ALL[(self.place() + 1).min(Self::ALL.len() - 1)]
+    }
+
+    /// The tab before this one, or this one where it is the first.
+    pub(crate) fn previous(self) -> Self {
+        Self::ALL[self.place().saturating_sub(1)]
+    }
+}
+
 /// Why the view has no fresh figures to show.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UsageMetricsReadRefusal {
@@ -104,6 +149,8 @@ impl UsageMetricsReadRefusal {
 #[derive(Clone, Debug, Default)]
 pub(super) struct MetricsView {
     open: bool,
+    tab: MetricsTab,
+    /// The range both tabs show.
     range: MetricsRange,
     measure: MetricsMeasure,
     breakdown: UsageMetricsBreakdown,
@@ -131,6 +178,8 @@ pub(super) struct MetricsView {
     earliest: EarliestTurn,
     /// Where the last frame drew what a pointer can act on.
     targets: Cell<Targets>,
+    /// The Insights tab's reports and focus.
+    insights: InsightsView,
 }
 
 /// A row of one of the view's lists, by what it shows rather than where it
@@ -205,6 +254,8 @@ pub(super) enum Receipt {
 #[derive(Clone, Copy, Debug, Default)]
 struct Targets {
     close: Option<Rect>,
+    /// Each tab's place in the tab bar, in [`MetricsTab::ALL`] order.
+    tabs: [Option<Rect>; MetricsTab::ALL.len()],
     /// Each range's place in the range bar, in [`MetricsRange::ALL`] order.
     ranges: [Option<Rect>; MetricsRange::ALL.len()],
     /// Each measure's place beside it, in [`MetricsMeasure::ALL`] order.
@@ -248,6 +299,7 @@ impl BarStrip {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MetricsTarget {
     Close,
+    Tab(MetricsTab),
     Range(MetricsRange),
     Measure(MetricsMeasure),
     Breakdown(UsageMetricsBreakdown),
@@ -263,6 +315,8 @@ pub(super) enum MetricsTarget {
     Series(usize),
     /// A row of the Sessions that cost the most, by its place among them.
     Session(usize),
+    /// Something the Insights tab drew.
+    Insights(InsightsTarget),
 }
 
 /// Where a bucket selection moves to.
@@ -293,9 +347,12 @@ impl MetricsView {
         self.open
     }
 
-    /// Opens the view with nothing yet read, keeping the choices it had.
+    /// Opens the view on Overview with nothing yet read, keeping the
+    /// choices it had.
     pub(super) fn open(&mut self) {
         self.open = true;
+        self.tab = MetricsTab::Overview;
+        self.insights = InsightsView::default();
         self.asked = None;
         self.shown = None;
         self.unopened = None;
@@ -309,7 +366,41 @@ impl MetricsView {
     pub(super) fn close(&mut self) {
         self.open = false;
         self.asked = None;
-        self.targets.set(Targets::default());
+        self.insights.stop_awaiting();
+        self.forget_targets();
+    }
+
+    pub(super) fn tab(&self) -> MetricsTab {
+        self.tab
+    }
+
+    /// Shows `tab`, answering whether that changed it.
+    pub(super) fn choose_tab(&mut self, tab: MetricsTab) -> bool {
+        let changed = self.tab != tab;
+        self.tab = tab;
+        changed
+    }
+
+    /// Whether the Overview has no report to show, nor one on its way, nor
+    /// a refusal to show in its place, so showing it must read.
+    pub(super) fn overview_lacks_report(&self) -> bool {
+        self.shown.is_none() && self.asked.is_none() && self.refusal.is_none()
+    }
+
+    pub(super) fn insights(&self) -> &InsightsView {
+        &self.insights
+    }
+
+    pub(super) fn insights_mut(&mut self) -> &mut InsightsView {
+        &mut self.insights
+    }
+
+    /// Says why the tab showing has no fresh figures.
+    pub(super) fn refuse_showing(&mut self, refusal: UsageMetricsReadRefusal) {
+        match self.tab {
+            MetricsTab::Overview => self.refuse(refusal),
+            MetricsTab::Insights => self.insights.refuse(self.range, refusal),
+        }
     }
 
     /// Chooses the range the view shows, answering whether that changed it,
@@ -713,10 +804,15 @@ impl MetricsView {
     /// Forgets where the last frame drew anything, before the next draws.
     pub(super) fn forget_targets(&self) {
         self.targets.set(Targets::default());
+        self.insights.forget_targets();
     }
 
     pub(super) fn record_close_target(&self, area: Rect) {
         self.update_targets(|targets| targets.close = Some(area));
+    }
+
+    pub(super) fn record_tab_target(&self, tab: MetricsTab, area: Rect) {
+        self.update_targets(|targets| targets.tabs[tab.place()] = Some(area));
     }
 
     pub(super) fn record_range_target(&self, range: MetricsRange, area: Rect) {
@@ -760,11 +856,23 @@ impl MetricsView {
         if on(targets.close) {
             return Some(MetricsTarget::Close);
         }
+        if let Some(tab) = MetricsTab::ALL
+            .into_iter()
+            .find(|tab| on(targets.tabs[tab.place()]))
+        {
+            return Some(MetricsTarget::Tab(tab));
+        }
         if let Some(range) = MetricsRange::ALL
             .into_iter()
             .find(|range| on(targets.ranges[range.place()]))
         {
             return Some(MetricsTarget::Range(range));
+        }
+        if self.tab == MetricsTab::Insights {
+            return self
+                .insights
+                .target_at(position)
+                .map(MetricsTarget::Insights);
         }
         if let Some(measure) = MetricsMeasure::ALL
             .into_iter()

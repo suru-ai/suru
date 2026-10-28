@@ -179,6 +179,10 @@ _Avoid_: Cost source, cost type
 What the Sessions living on one Server consumed over a span of time, divided into time buckets and broken down by Model, Provider, or Workspace. It is read on request and never stored. The reader cuts the buckets at its own local boundaries and asks for them as spans of time, so the Server keeps no calendar, and a remote Server's Usage Metrics are read in the reader's days. Only the Sessions that live on that Server count, so one it merely reads from another Server is never counted twice. A span's figures are compared with the period of its own length before it, cut in the reader's calendar as far as the span has run, and all of time with nothing. Its most expensive Sessions are the top-level Sessions whose work cost the most in the span — not over their lifetimes — a Subagent's Cost counted toward the Session it works for, and a Subsession's apart from the Sidekick that began it, since each is a Session the reader opens on its own.
 _Avoid_: Usage stats, analytics, spend, token count
 
+**Insights**:
+How the Sessions living on one Server worked over one span of time, beside how much they consumed: how long their Turns took to Settle and how they ended. It counts the Sessions Usage Metrics counts and places each Turn in time by the same rule, leaving out a Turn with no recorded moment to place it by; a Turn still working has no duration yet. Like Usage Metrics it is read on request and never stored, and the Usage Metrics view shows it on its own tab, over the range its Overview tab shows.
+_Avoid_: Stats, analytics, Usage Metrics (for the figures of how work went)
+
 **Prompt**:
 Input submitted for delivery to an agent: the user's own, or a Sidekick's sent on the user's behalf. A delivered Prompt becomes either the user Message that begins a Turn or a later user Message that steers its active Turn. A Prompt a Sidekick sent says so as a typed property naming the Sidekick's Session, and its Message is drawn apart from one the user wrote and leads back to that Session, so a reader always knows which words were theirs.
 _Avoid_: Request, draft, message

@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
 
 use super::{
-    metrics::{calendar::MetricsRange, chart::MetricsMeasure},
+    metrics::{MetricsTab, calendar::MetricsRange, chart::MetricsMeasure, insights::InsightsPanel},
     text_layout::CursorTarget,
 };
 
@@ -178,6 +178,37 @@ pub enum SemanticCommandId {
     /// view.
     MetricsSessionOpen {
         session: usize,
+    },
+    /// Shows one tab of the Usage Metrics view, reading it where it has no
+    /// figures for the range.
+    MetricsTabSelect(MetricsTab),
+    /// Shows the Usage Metrics view's tab after the one showing.
+    MetricsTabNext,
+    /// Shows the Usage Metrics view's tab before the one showing.
+    MetricsTabPrevious,
+    /// Focuses one of the Insights tab's panels.
+    MetricsPanelFocus(InsightsPanel),
+    /// Focuses the Insights panel after the focused one, the last turning
+    /// round to the first, or the first where none is focused.
+    MetricsPanelFocusNext,
+    /// Focuses the Insights panel before the focused one, the first turning
+    /// round to the last, or the last where none is focused.
+    MetricsPanelFocusPrevious,
+    /// Leaves the focused Insights panel, and what it had selected.
+    MetricsPanelFocusClear,
+    /// Clears what the focused Insights panel has selected, keeping its
+    /// focus.
+    MetricsPanelSelectionClear,
+    /// Selects the Turns panel's duration bin before its selected one, or
+    /// the last where none is, focusing the panel.
+    MetricsTurnsBinPrevious,
+    /// Selects the Turns panel's duration bin after its selected one, or the
+    /// first where none is, focusing the panel.
+    MetricsTurnsBinNext,
+    /// Selects one of the Turns panel's duration bins by its place among
+    /// them, counted from the shortest, focusing the panel.
+    MetricsTurnsBinSelect {
+        bin: usize,
     },
     /// Opens the Icon Picker over a Session, which the picker only does while
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
@@ -761,6 +792,22 @@ impl SemanticCommandId {
             Self::MetricsFocusNext => "metrics.focus.next",
             Self::MetricsFocusClear => "metrics.focus.clear",
             Self::MetricsSessionOpen { .. } => "metrics.session.open",
+            Self::MetricsTabSelect(tab) => match tab {
+                MetricsTab::Overview => "metrics.tab.overview",
+                MetricsTab::Insights => "metrics.tab.insights",
+            },
+            Self::MetricsTabNext => "metrics.tab.next",
+            Self::MetricsTabPrevious => "metrics.tab.previous",
+            Self::MetricsPanelFocus(panel) => match panel {
+                InsightsPanel::Turns => "metrics.panel.turns",
+            },
+            Self::MetricsPanelFocusNext => "metrics.panel.next",
+            Self::MetricsPanelFocusPrevious => "metrics.panel.previous",
+            Self::MetricsPanelFocusClear => "metrics.panel.clear",
+            Self::MetricsPanelSelectionClear => "metrics.panel.selection.clear",
+            Self::MetricsTurnsBinPrevious => "metrics.turns.bin.previous",
+            Self::MetricsTurnsBinNext => "metrics.turns.bin.next",
+            Self::MetricsTurnsBinSelect { .. } => "metrics.turns.bin.select",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::SessionRename => "session.rename",
@@ -1048,6 +1095,36 @@ const fn metrics_breakdown_descriptor(
         title,
         reach: SemanticReach::Client,
         description: "Split the Usage Metrics view's bars by one breakdown",
+        slash: None,
+        keybinding: None,
+    }
+}
+
+/// Switching tab changes only what the view shows, so it reaches the
+/// Client, as choosing a range does; the read it brings is refused in the
+/// view where the Origin has stopped answering.
+const fn metrics_tab_descriptor(tab: MetricsTab, title: &'static str) -> SemanticCommandDescriptor {
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsTabSelect(tab),
+        title,
+        reach: SemanticReach::Client,
+        description: "Show one tab of the Usage Metrics view",
+        slash: None,
+        keybinding: None,
+    }
+}
+
+/// Focusing a panel reads nothing: the report shown holds every panel's
+/// figures.
+const fn metrics_panel_descriptor(
+    panel: InsightsPanel,
+    title: &'static str,
+) -> SemanticCommandDescriptor {
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsPanelFocus(panel),
+        title,
+        reach: SemanticReach::Client,
+        description: "Focus one of the Usage Metrics view's Insights panels",
         slash: None,
         keybinding: None,
     }
@@ -2047,6 +2124,83 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Open Metrics Session",
         reach: SemanticReach::Client,
         description: "Open one of the Sessions the Usage Metrics view lists as costing the most",
+        slash: None,
+        keybinding: None,
+    },
+    metrics_tab_descriptor(MetricsTab::Overview, "Show Metrics Overview"),
+    metrics_tab_descriptor(MetricsTab::Insights, "Show Metrics Insights"),
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsTabNext,
+        title: "Next Metrics Tab",
+        reach: SemanticReach::Client,
+        description: "Show the Usage Metrics view's next tab",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsTabPrevious,
+        title: "Previous Metrics Tab",
+        reach: SemanticReach::Client,
+        description: "Show the Usage Metrics view's previous tab",
+        slash: None,
+        keybinding: None,
+    },
+    metrics_panel_descriptor(InsightsPanel::Turns, "Focus Turns Insights"),
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsPanelFocusNext,
+        title: "Next Insights Panel",
+        reach: SemanticReach::Client,
+        description: "Focus the Insights panel after the focused one",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsPanelFocusPrevious,
+        title: "Previous Insights Panel",
+        reach: SemanticReach::Client,
+        description: "Focus the Insights panel before the focused one",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsPanelFocusClear,
+        title: "Leave Insights Panel",
+        reach: SemanticReach::Client,
+        description: "Leave the focused Insights panel",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsPanelSelectionClear,
+        title: "Clear Insights Selection",
+        reach: SemanticReach::Client,
+        description: "Clear what the focused Insights panel has selected",
+        slash: None,
+        keybinding: None,
+    },
+    // Selecting a bin reads nothing: the report holds every bin's count.
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsTurnsBinPrevious,
+        title: "Previous Turn Duration Bin",
+        reach: SemanticReach::Client,
+        description: "Select the Turns panel's duration bin before its selected one",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::MetricsTurnsBinNext,
+        title: "Next Turn Duration Bin",
+        reach: SemanticReach::Client,
+        description: "Select the Turns panel's duration bin after its selected one",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        // The bin's place is invocation data, as a bucket's is.
+        id: SemanticCommandId::MetricsTurnsBinSelect { bin: 0 },
+        title: "Select Turn Duration Bin",
+        reach: SemanticReach::Client,
+        description: "Select one of the Turns panel's duration bins by its place",
         slash: None,
         keybinding: None,
     },
@@ -3351,6 +3505,9 @@ pub(super) fn descriptor(id: SemanticCommandId) -> &'static SemanticCommandDescr
                     ) | (
                         SemanticCommandId::MetricsSessionOpen { .. },
                         SemanticCommandId::MetricsSessionOpen { .. }
+                    ) | (
+                        SemanticCommandId::MetricsTurnsBinSelect { .. },
+                        SemanticCommandId::MetricsTurnsBinSelect { .. }
                     )
                 )
         })

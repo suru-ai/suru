@@ -115,6 +115,18 @@ impl MetricsRange {
         }
     }
 
+    /// How a note that the range holds none of something ends: "No Turns
+    /// in the last 7 days", or "No Turns yet" for All time.
+    pub(crate) fn within(self) -> &'static str {
+        match self {
+            Self::Today => "today",
+            Self::SevenDays => "in the last 7 days",
+            Self::ThirtyDays => "in the last 30 days",
+            Self::Year => "in the last 12 months",
+            Self::AllTime => "yet",
+        }
+    }
+
     /// The range after this one in the range bar, or this one where it is
     /// the last: the wheel stops at either end rather than spinning round.
     pub(crate) fn next(self) -> Self {
@@ -213,6 +225,27 @@ pub(crate) struct CalendarBucket {
 /// up to this time of day, 30 days with the 30 local days before as far
 /// into the last of them, and Year with the 12 months before as far into
 /// the twelfth, a day past the end of a shorter month taken as its last.
+/// The one interval `range` spans at `now` in `zone`, from its first
+/// bucket's start to its last's end, as the Insights tab reads it: All time
+/// from the first moment a Turn can be placed at, so it needs no earliest
+/// Turn to begin from. `None` where `now` lies beyond what the calendar can
+/// place.
+pub(crate) fn span(
+    range: MetricsRange,
+    now: SessionTimestamp,
+    zone: &TimeZone,
+) -> Option<UsageMetricsInterval> {
+    let cut = resolve(range, now, zone, None)?;
+    let start = match range {
+        MetricsRange::AllTime => SessionTimestamp(0),
+        _ => cut.buckets.first()?.interval.start,
+    };
+    Some(UsageMetricsInterval {
+        start,
+        end: cut.buckets.last()?.interval.end,
+    })
+}
+
 pub(crate) fn resolve(
     range: MetricsRange,
     now: SessionTimestamp,

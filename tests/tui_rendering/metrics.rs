@@ -27,6 +27,8 @@ use suru::{
 };
 use uuid::Uuid;
 
+mod insights;
+
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 48;
 const NEW_YORK: &str = "America/New_York";

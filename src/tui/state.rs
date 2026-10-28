@@ -58,7 +58,7 @@ use super::{
     },
     icon_picker::{IconPicker, IconPickerTarget},
     keymap::{
-        command_for_approval_posture_picker_event, command_for_aside_event,
+        MetricsKeys, command_for_approval_posture_picker_event, command_for_aside_event,
         command_for_completion_event, command_for_connect_overlay_event,
         command_for_context_overlay_event, command_for_directory_browser_event,
         command_for_icon_picker_event, command_for_interrupt_confirmation_event,
@@ -75,8 +75,11 @@ use super::{
         command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
     },
     metrics::{
-        BucketMove, FocusMove, MetricsView, OfferedBreakdown, Receipt as MetricsReceipt,
-        UsageMetricsReadRefusal, calendar::MetricsRange, chart::MetricsMeasure,
+        BucketMove, FocusMove, MetricsTab, MetricsView, OfferedBreakdown,
+        Receipt as MetricsReceipt, UsageMetricsReadRefusal,
+        calendar::MetricsRange,
+        chart::MetricsMeasure,
+        insights::{ItemMove, PanelMove},
     },
     model_options::{ModelOptions, ModelOptionsOwner, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerPurpose},
@@ -5421,6 +5424,12 @@ pub enum ApplicationEvent {
         request_id: uuid::Uuid,
         result: std::result::Result<crate::protocol::UsageMetricsReport, UsageMetricsReadRefusal>,
     },
+    /// The Insights a Server reported, or why it reported none, in answer to
+    /// [`ApplicationTransition::ReadUsageInsights`].
+    UsageInsightsRead {
+        request_id: uuid::Uuid,
+        result: std::result::Result<crate::protocol::InsightsReport, UsageMetricsReadRefusal>,
+    },
     /// The Client's own Server's answer to Onboarding's re-check `recheck`:
     /// the Model Catalog as every Provider was read anew, or why it was not.
     ProvidersRechecked {
@@ -5707,6 +5716,13 @@ pub enum ApplicationTransition {
         origin: Outlook,
         request_id: uuid::Uuid,
         query: crate::protocol::UsageMetricsQuery,
+    },
+    /// Ask the Server `origin` names for its Insights, answering with
+    /// [`ApplicationEvent::UsageInsightsRead`] under the same request.
+    ReadUsageInsights {
+        origin: Outlook,
+        request_id: uuid::Uuid,
+        query: crate::protocol::InsightsQuery,
     },
     SubscribeSession(SessionReference),
     /// Report a root Session as Viewed without changing the main-view route.
@@ -6254,6 +6270,13 @@ impl Application {
                     MetricsReceipt::ReadAgain => self.read_usage_metrics(),
                     MetricsReceipt::Settled => ApplicationTransition::Continue,
                 })
+            }
+            ApplicationEvent::UsageInsightsRead { request_id, result } => {
+                self.state
+                    .metrics_view
+                    .insights_mut()
+                    .receive(request_id, result);
+                Ok(ApplicationTransition::Continue)
             }
             // Only the re-check the flow awaits answers for the rows, and what
             // it read reaches the Local catalog as a push would, unless the
@@ -7749,7 +7772,7 @@ impl Application {
         if self.state.metrics_view.is_open() {
             self.state
                 .metrics_view
-                .refuse(UsageMetricsReadRefusal::Failed(refusal));
+                .refuse_showing(UsageMetricsReadRefusal::Failed(refusal));
             return true;
         }
         self.state.submission_error = Some(refusal);
@@ -9586,10 +9609,80 @@ impl Application {
     fn choose_metrics_range(&mut self, range: MetricsRange) -> ApplicationTransition {
         let view = &mut self.state.metrics_view;
         if view.is_open() && view.choose_range(range) {
-            self.read_usage_metrics()
+            self.read_metrics_tab_lacking()
         } else {
             ApplicationTransition::Continue
         }
+    }
+
+    /// Shows `tab` in the open Usage Metrics view, reading it where it has
+    /// no figures for the range: each tab keeps what it read, so switching
+    /// back and forth reads nothing again.
+    fn choose_metrics_tab(&mut self, tab: MetricsTab) -> ApplicationTransition {
+        let view = &mut self.state.metrics_view;
+        if view.is_open() && view.choose_tab(tab) {
+            self.read_metrics_tab_lacking()
+        } else {
+            ApplicationTransition::Continue
+        }
+    }
+
+    /// Reads the tab of the open Usage Metrics view showing, where it has
+    /// no figures for the range and none are on their way.
+    fn read_metrics_tab_lacking(&mut self) -> ApplicationTransition {
+        let view = &self.state.metrics_view;
+        let lacking = match view.tab() {
+            MetricsTab::Overview => view.overview_lacks_report(),
+            MetricsTab::Insights => view.insights().lacks(&self.state.outlook, view.range()),
+        };
+        if lacking {
+            self.read_metrics_tab()
+        } else {
+            ApplicationTransition::Continue
+        }
+    }
+
+    /// Reads the tab of the open Usage Metrics view showing again.
+    fn read_metrics_tab(&mut self) -> ApplicationTransition {
+        match self.state.metrics_view.tab() {
+            MetricsTab::Overview => self.read_usage_metrics(),
+            MetricsTab::Insights => self.read_usage_insights(),
+        }
+    }
+
+    /// Asks the Server the Outlook is turned toward for the Insights of the
+    /// Usage Metrics view's range, cut by the reader's calendar now.
+    fn read_usage_insights(&mut self) -> ApplicationTransition {
+        let origin = self.state.outlook.clone();
+        if self.refuse_if_unreachable(&origin) {
+            return ApplicationTransition::Continue;
+        }
+        let now = self.state.session_now();
+        let zone = self.state.local_zone.now();
+        let range = self.state.metrics_view.range();
+        let insights = self.state.metrics_view.insights_mut();
+        match insights.ask(origin.clone(), range, now, &zone) {
+            Some((request_id, query)) => ApplicationTransition::ReadUsageInsights {
+                origin,
+                request_id,
+                query,
+            },
+            None => ApplicationTransition::Continue,
+        }
+    }
+
+    /// Acts on the open Usage Metrics view's Insights, which reads nothing:
+    /// the report shown holds every panel's figures.
+    fn act_on_metrics_insights(
+        &mut self,
+        act: impl FnOnce(&mut super::metrics::insights::InsightsView, MetricsRange),
+    ) -> ApplicationTransition {
+        let view = &mut self.state.metrics_view;
+        if view.is_open() {
+            let range = view.range();
+            act(view.insights_mut(), range);
+        }
+        ApplicationTransition::Continue
     }
 
     /// Splits the open Usage Metrics view's bars by `breakdown`, reading
@@ -9600,7 +9693,7 @@ impl Application {
     ) -> ApplicationTransition {
         let view = &mut self.state.metrics_view;
         if view.is_open() && view.choose_breakdown(breakdown) {
-            self.read_usage_metrics()
+            self.read_metrics_tab_lacking()
         } else {
             ApplicationTransition::Continue
         }
@@ -11544,7 +11637,7 @@ impl Application {
                 Ok(self.read_usage_metrics())
             }
             SemanticCommandId::MetricsRefresh => Ok(if self.state.metrics_view.is_open() {
-                self.read_usage_metrics()
+                self.read_metrics_tab()
             } else {
                 ApplicationTransition::Continue
             }),
@@ -11622,6 +11715,44 @@ impl Application {
             }
             SemanticCommandId::MetricsSessionOpen { session } => {
                 Ok(self.open_metrics_session(session))
+            }
+            SemanticCommandId::MetricsTabSelect(tab) => Ok(self.choose_metrics_tab(tab)),
+            SemanticCommandId::MetricsTabNext => {
+                let tab = self.state.metrics_view.tab().next();
+                Ok(self.choose_metrics_tab(tab))
+            }
+            SemanticCommandId::MetricsTabPrevious => {
+                let tab = self.state.metrics_view.tab().previous();
+                Ok(self.choose_metrics_tab(tab))
+            }
+            SemanticCommandId::MetricsPanelFocus(panel) => {
+                Ok(self.act_on_metrics_insights(|insights, _| insights.focus(panel)))
+            }
+            SemanticCommandId::MetricsPanelFocusNext => Ok(
+                self.act_on_metrics_insights(|insights, _| insights.move_focus(PanelMove::Next))
+            ),
+            SemanticCommandId::MetricsPanelFocusPrevious => Ok(self
+                .act_on_metrics_insights(|insights, _| insights.move_focus(PanelMove::Previous))),
+            SemanticCommandId::MetricsPanelFocusClear => {
+                Ok(self.act_on_metrics_insights(|insights, _| insights.clear_focus()))
+            }
+            SemanticCommandId::MetricsPanelSelectionClear => {
+                Ok(self.act_on_metrics_insights(|insights, _| insights.clear_selection()))
+            }
+            SemanticCommandId::MetricsTurnsBinPrevious => {
+                Ok(self.act_on_metrics_insights(|insights, range| {
+                    insights.move_turns_bin(range, ItemMove::Previous)
+                }))
+            }
+            SemanticCommandId::MetricsTurnsBinNext => {
+                Ok(self.act_on_metrics_insights(|insights, range| {
+                    insights.move_turns_bin(range, ItemMove::Next)
+                }))
+            }
+            SemanticCommandId::MetricsTurnsBinSelect { bin } => {
+                Ok(self.act_on_metrics_insights(|insights, range| {
+                    insights.move_turns_bin(range, ItemMove::To(bin))
+                }))
             }
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,
@@ -12763,12 +12894,16 @@ impl Application {
                 SelectionSurface::Context => return command_for_context_overlay_event(event),
                 SelectionSurface::Metrics => {
                     let view = &self.state.metrics_view;
-                    return command_for_metrics_view_event(
-                        event,
-                        view.selected_bucket().is_some(),
-                        view.focused_row(),
-                        |position| view.target_at(position),
-                    );
+                    let keys = MetricsKeys {
+                        tab: view.tab(),
+                        bucket_selected: view.selected_bucket().is_some(),
+                        focused_row: view.focused_row(),
+                        panel: view.insights().focused(),
+                        panel_selected: view.insights().selection().is_some(),
+                    };
+                    return command_for_metrics_view_event(event, keys, |position| {
+                        view.target_at(position)
+                    });
                 }
                 SelectionSurface::Themes => return command_for_theme_picker_event(event),
                 SelectionSurface::Models => return command_for_model_picker_event(event),

@@ -71,7 +71,10 @@ pub use context_overlay::ContextBreakdownRefusal;
 pub use directory_browser::DirectoryListingId;
 pub use event_loop::run;
 pub use keymap::command_for_terminal_event;
-pub use metrics::{UsageMetricsReadRefusal, calendar::MetricsRange, chart::MetricsMeasure};
+pub use metrics::{
+    MetricsTab, UsageMetricsReadRefusal, calendar::MetricsRange, chart::MetricsMeasure,
+    insights::InsightsPanel,
+};
 pub use relay_overlay::{RelayLoginFollow, RelayRequest};
 pub use serve_overlay::ServeRequest;
 pub use state::{

@@ -1378,6 +1378,18 @@ impl RunLoop {
                     self.channels.usage_metrics.clone(),
                 );
             }
+            ApplicationTransition::ReadUsageInsights {
+                origin,
+                request_id,
+                query,
+            } => {
+                spawn_usage_insights_read(
+                    self.client.session_commands_for(origin),
+                    query,
+                    request_id,
+                    self.channels.usage_metrics.clone(),
+                );
+            }
             ApplicationTransition::DeleteSession(session) => {
                 let session_id = session.session_id;
                 self.spawn_operation(session, SessionOperation::DeleteSession { session_id });
@@ -1916,6 +1928,7 @@ impl RunLoop {
             | ApplicationTransition::CompactSession { .. }
             | ApplicationTransition::ReadContextBreakdown { .. }
             | ApplicationTransition::ReadUsageMetrics { .. }
+            | ApplicationTransition::ReadUsageInsights { .. }
             | ApplicationTransition::SubscribeSession(_)
             | ApplicationTransition::ViewSession(_)
             | ApplicationTransition::ViewAndAttachSession(_)
@@ -3457,15 +3470,39 @@ fn spawn_usage_metrics_read(
     answers: UnboundedSender<ApplicationEvent>,
 ) {
     tokio::spawn(async move {
-        let result = commands.usage_metrics(&query).await.map_err(|error| {
-            use crate::tui::UsageMetricsReadRefusal;
-            match error.downcast_ref::<crate::protocol::SessionError>() {
-                Some(refusal) => UsageMetricsReadRefusal::Refused(refusal.message.clone()),
-                None => UsageMetricsReadRefusal::Failed(format!("{error:#}")),
-            }
-        });
+        let result = commands
+            .usage_metrics(&query)
+            .await
+            .map_err(|error| usage_metrics_refusal(&error));
         let _ = answers.send(ApplicationEvent::UsageMetricsRead { request_id, result });
     });
+}
+
+/// Asks the Server `commands` names for its Insights, on the terms its
+/// Usage Metrics are asked for, answering on the same channel.
+fn spawn_usage_insights_read(
+    commands: SessionCommandClient,
+    query: crate::protocol::InsightsQuery,
+    request_id: uuid::Uuid,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let result = commands
+            .usage_insights(&query)
+            .await
+            .map_err(|error| usage_metrics_refusal(&error));
+        let _ = answers.send(ApplicationEvent::UsageInsightsRead { request_id, result });
+    });
+}
+
+/// Why a Server gave no Usage Metrics or Insights: in its own words where
+/// it refused, and a plain account where it could not be asked at all.
+fn usage_metrics_refusal(error: &anyhow::Error) -> crate::tui::UsageMetricsReadRefusal {
+    use crate::tui::UsageMetricsReadRefusal;
+    match error.downcast_ref::<crate::protocol::SessionError>() {
+        Some(refusal) => UsageMetricsReadRefusal::Refused(refusal.message.clone()),
+        None => UsageMetricsReadRefusal::Failed(format!("{error:#}")),
+    }
 }
 
 /// Why the server gave no Context Breakdown: a Provider that attributes
