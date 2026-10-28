@@ -21,6 +21,8 @@
 //! A report is kept with its quarter-hours folded into the week of the zone
 //! its range was cut in, once as it arrives rather than at every frame.
 
+mod approvals;
+mod compactions;
 pub(super) mod heatmap;
 pub(super) mod tools;
 pub(super) mod turns;
@@ -52,12 +54,33 @@ pub enum InsightsPanel {
     Turns,
     /// How often each Tool was used, and how many of those uses failed.
     Tools,
+    /// How many Compactions there were, of each trigger and how many
+    /// failed, and how much of the context they freed.
+    Compactions,
+    /// How many Approvals were asked, and how each was decided.
+    Approvals,
 }
 
 impl InsightsPanel {
     /// Every panel, in the order the grid lays them out, row by row across
-    /// its two columns, and focus moves among them.
-    pub(crate) const ALL: [Self; 3] = [Self::WhenYouWork, Self::Turns, Self::Tools];
+    /// its two columns as [`Self::GRID`] places them, and focus moves among
+    /// them.
+    pub(crate) const ALL: [Self; 5] = [
+        Self::WhenYouWork,
+        Self::Tools,
+        Self::Turns,
+        Self::Compactions,
+        Self::Approvals,
+    ];
+
+    /// Where each panel stands in the grid, row by row across its two
+    /// columns, as the Insights mockup lays them out: the left column's
+    /// last place is the Cache panel's, which is yet to be.
+    pub(super) const GRID: [[Option<Self>; 2]; 3] = [
+        [Some(Self::WhenYouWork), Some(Self::Tools)],
+        [Some(Self::Turns), Some(Self::Compactions)],
+        [None, Some(Self::Approvals)],
+    ];
 
     pub(crate) fn place(self) -> usize {
         Self::ALL
@@ -71,6 +94,8 @@ impl InsightsPanel {
             Self::WhenYouWork => "When you work (Turns by hour)",
             Self::Turns => "Turns",
             Self::Tools => "Tools used",
+            Self::Compactions => "Compactions",
+            Self::Approvals => "Approvals",
         }
     }
 
@@ -81,6 +106,7 @@ impl InsightsPanel {
             Self::WhenYouWork => heatmap::items(&kept.heatmap),
             Self::Turns => turns::items(&kept.report.turns),
             Self::Tools => tools::items(&kept.report.tools),
+            Self::Compactions | Self::Approvals => 0,
         }
     }
 
@@ -89,7 +115,7 @@ impl InsightsPanel {
         match self {
             Self::WhenYouWork => heatmap::HOURS,
             Self::Turns => crate::protocol::TURN_DURATION_BINS,
-            Self::Tools => 1,
+            Self::Tools | Self::Compactions | Self::Approvals => 1,
         }
     }
 
@@ -97,7 +123,7 @@ impl InsightsPanel {
     /// have more than fit, so that it scrolls; none where all stand in view.
     fn room(self) -> Option<usize> {
         match self {
-            Self::WhenYouWork | Self::Turns => None,
+            Self::WhenYouWork | Self::Turns | Self::Compactions | Self::Approvals => None,
             Self::Tools => Some(tools::SHOWN),
         }
     }
@@ -601,8 +627,21 @@ impl InsightsView {
 
 #[cfg(test)]
 mod tests {
-    use super::{InsightsContent, InsightsView, MetricsRange, Outlook};
+    use super::{InsightsContent, InsightsPanel, InsightsView, MetricsRange, Outlook};
     use crate::protocol::{InsightsReport, SessionTimestamp};
+
+    /// Focus moves through the panels in the order a reader reads the grid.
+    #[test]
+    fn the_grid_places_every_panel_once_in_their_order() {
+        let placed = InsightsPanel::GRID
+            .iter()
+            .flatten()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+
+        assert_eq!(placed, InsightsPanel::ALL);
+    }
 
     /// A report read from one Server is never shown for another, which
     /// lacks one of its own until it is read.

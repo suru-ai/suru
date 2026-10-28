@@ -545,15 +545,20 @@ fn command_for_insights_pointer(
 
 /// What the wheel does over an Insights panel, whether up or down by
 /// `kind`: over the Tools panel, whose rows run past its border, it scrolls
-/// them a row; over Turns and When you work, whose figures all stand in
-/// view, nothing; and never a step of the range, which the wheel over
+/// them a row; over the others, whose figures all stand in view, nothing; and never a step of the range, which the wheel over
 /// Overview's chart takes.
 fn command_for_insights_panel_wheel(
     panel: InsightsPanel,
     kind: MouseEventKind,
 ) -> Option<SemanticCommandId> {
     match (panel, kind) {
-        (InsightsPanel::WhenYouWork | InsightsPanel::Turns, _) => None,
+        (
+            InsightsPanel::WhenYouWork
+            | InsightsPanel::Turns
+            | InsightsPanel::Compactions
+            | InsightsPanel::Approvals,
+            _,
+        ) => None,
         (InsightsPanel::Tools, MouseEventKind::ScrollUp) => {
             Some(SemanticCommandId::MetricsPanelScrollUp { panel })
         }

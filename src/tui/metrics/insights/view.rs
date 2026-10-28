@@ -6,15 +6,17 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::Modifier,
+    style::{Modifier, Style},
     widgets::{Block, BorderType, Widget},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
 
 use super::{
     super::{UsageMetricsReadRefusal, calendar::MetricsRange},
-    InsightsContent, InsightsPanel, InsightsView, KeptReport, heatmap, tools, turns,
+    InsightsContent, InsightsPanel, InsightsView, KeptReport, approvals, compactions, heatmap,
+    tools, turns,
 };
 use crate::{protocol::Outlook, tui::slots::truncate_to_width};
 
@@ -55,8 +57,9 @@ pub(in crate::tui) fn render(
     }
 }
 
-/// The panels row by row across two columns, each row as tall as its
-/// tallest panel, and none drawn past the foot of `body`.
+/// The panels row by row across two columns where [`InsightsPanel::GRID`]
+/// places them, each row as tall as its tallest panel, and none drawn past
+/// the foot of `body`.
 fn render_grid(
     buffer: &mut Buffer,
     body: Rect,
@@ -67,15 +70,19 @@ fn render_grid(
 ) {
     let column_width = body.width.saturating_sub(COLUMN_GAP) / 2;
     let mut y = body.y;
-    for row in InsightsPanel::ALL.chunks(2) {
-        let tallest = row.iter().map(|panel| height(*panel)).max().unwrap_or(0);
+    for row in InsightsPanel::GRID {
+        let tallest = row.iter().flatten().map(|panel| height(*panel)).max();
+        let tallest = tallest.unwrap_or(0);
         if y + tallest > body.bottom() {
             break;
         }
         for (column, panel) in (0u16..).zip(row) {
+            let Some(panel) = panel else {
+                continue;
+            };
             let x = body.x + column * (column_width + COLUMN_GAP);
-            let area = Rect::new(x, y, column_width, height(*panel));
-            render_panel(buffer, area, *panel, view, kept, range, theme);
+            let area = Rect::new(x, y, column_width, height(panel));
+            render_panel(buffer, area, panel, view, kept, range, theme);
         }
         y += tallest + 1;
     }
@@ -87,6 +94,8 @@ fn height(panel: InsightsPanel) -> u16 {
         InsightsPanel::WhenYouWork => heatmap::ROWS,
         InsightsPanel::Turns => turns::ROWS,
         InsightsPanel::Tools => tools::ROWS,
+        InsightsPanel::Compactions => compactions::ROWS,
+        InsightsPanel::Approvals => approvals::ROWS,
     };
     rows + 2
 }
@@ -153,5 +162,28 @@ fn render_panel(
                 theme,
             );
         }
+        InsightsPanel::Compactions => {
+            compactions::render(buffer, inner, &kept.report.compactions, range, theme);
+        }
+        InsightsPanel::Approvals => {
+            approvals::render(buffer, inner, &kept.report.approvals, range, theme);
+        }
+    }
+}
+
+/// Draws `spans` one after another along the row `y` of `area`, each in its
+/// own style, cutting short whatever runs past its right edge.
+pub(super) fn render_spans(
+    buffer: &mut Buffer,
+    area: Rect,
+    y: u16,
+    spans: impl IntoIterator<Item = (String, Style)>,
+) {
+    let mut x = area.x;
+    for (text, style) in spans {
+        let left = usize::from(area.right().saturating_sub(x));
+        let text = truncate_to_width(&text, left);
+        buffer.set_string(x, y, &text, style);
+        x += u16::try_from(text.width()).unwrap_or(u16::MAX);
     }
 }

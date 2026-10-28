@@ -350,9 +350,7 @@ fn ctrl_arrows_and_clicks_on_the_tab_bar_switch_tabs_alike() {
 
 /// The style of the Turns panel's top-left border corner.
 fn turns_border(application: &Application) -> Style {
-    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
-    let (x, y) = text_position(&buffer, " Turns ");
-    corner_left_of(&buffer, x, y)
+    border(application, " Turns ")
 }
 
 fn corner_left_of(buffer: &Buffer, x: u16, y: u16) -> Style {
@@ -379,13 +377,16 @@ fn tab_or_a_click_focuses_a_panel_and_highlights_its_border() {
     );
     let mut application = on_insights(Ok(worked()));
     let unfocused = turns_border(&application);
+    let heatmap_unfocused = heatmap_border(&application);
 
     assert_eq!(press_tab(&mut application), ApplicationTransition::Continue);
-    assert_eq!(
-        turns_border(&application),
-        unfocused,
+    assert_ne!(
+        heatmap_border(&application),
+        heatmap_unfocused,
         "focus begins at the first panel"
     );
+    assert_eq!(turns_border(&application), unfocused);
+    press_tab(&mut application);
     press_tab(&mut application);
     let focused = turns_border(&application);
     assert_ne!(focused, unfocused, "the focused panel's border stands out");
@@ -393,10 +394,17 @@ fn tab_or_a_click_focuses_a_panel_and_highlights_its_border() {
         key(&mut application, KeyCode::BackTab),
         ApplicationTransition::Continue
     );
-    assert_eq!(turns_border(&application), unfocused);
-    key(&mut application, KeyCode::BackTab);
     assert_eq!(
         (tools_border(&application), turns_border(&application)),
+        (focused, unfocused)
+    );
+    key(&mut application, KeyCode::BackTab);
+    key(&mut application, KeyCode::BackTab);
+    assert_eq!(
+        (
+            border(&application, " Approvals "),
+            heatmap_border(&application)
+        ),
         (focused, unfocused),
         "from the first panel, focus moves round to the last"
     );
@@ -412,12 +420,25 @@ fn press_tab(application: &mut Application) -> ApplicationTransition {
     key(application, KeyCode::Tab)
 }
 
+/// Tabs through When you work and Tools to the Turns panel.
+fn tab_to_turns(application: &mut Application) {
+    for _ in 0..3 {
+        press_tab(application);
+    }
+}
+
+/// The style of the top-left border corner of the panel titled `title`.
+fn border(application: &Application, title: &str) -> Style {
+    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    let (x, y) = text_position(&buffer, title);
+    corner_left_of(&buffer, x, y)
+}
+
 #[test]
 fn esc_clears_the_selection_then_leaves_the_panel_then_closes_the_view() {
     let mut application = on_insights(Ok(worked()));
     let unfocused = turns_border(&application);
-    press_tab(&mut application);
-    press_tab(&mut application);
+    tab_to_turns(&mut application);
     let focused = turns_border(&application);
     key(&mut application, KeyCode::Right);
     key(&mut application, KeyCode::Right);
@@ -578,8 +599,7 @@ fn g_and_i_switch_tabs_where_the_system_takes_ctrl_arrows() {
 #[test]
 fn a_new_range_lets_go_of_the_selection_its_figures_were_made_for() {
     let mut application = on_insights(Ok(worked()));
-    press_tab(&mut application);
-    press_tab(&mut application);
+    tab_to_turns(&mut application);
     key(&mut application, KeyCode::Right);
     let focused = turns_border(&application);
 
@@ -802,40 +822,43 @@ fn esc_clears_a_selected_cell_before_it_leaves_the_heatmap() {
 
 /// The style of the Tools panel's top-left border corner.
 fn tools_border(application: &Application) -> Style {
-    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
-    let (x, y) = text_position(&buffer, "Tools used");
-    corner_left_of(&buffer, x, y)
+    border(application, "Tools used")
 }
 
 /// The style of the When you work panel's top-left border corner.
 fn heatmap_border(application: &Application) -> Style {
-    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
-    let (x, y) = text_position(&buffer, "When you work");
-    corner_left_of(&buffer, x, y)
+    border(application, "When you work")
 }
 
-/// The Tools panel's lines beneath its title, the header first, each with
-/// its border and runs of spaces closed up.
-fn tools_panel(application: &Application) -> Vec<String> {
-    let rows = screen(application);
-    let title = rows
-        .iter()
-        .position(|row| row.contains("Tools used"))
-        .unwrap_or_else(|| panic!("no Tools panel in\n{}", rows.join("\n")));
-    let left = rows[title].find('╭').expect("the panel's corner");
-    rows[title + 1..]
-        .iter()
-        .take_while(|row| !row[left..].trim_start().starts_with('╰'))
+/// The lines of the panel titled `title` beneath its title, inside its
+/// border, each with runs of spaces closed up.
+fn panel_lines(application: &Application, title: &str) -> Vec<String> {
+    let buffer = rendered_application_buffer(application, WIDTH, HEIGHT);
+    let (x, y) = text_position(&buffer, title);
+    let symbol = |column: u16, row: u16| buffer[(column, row)].symbol().to_owned();
+    let left = (0..x)
+        .rev()
+        .find(|column| symbol(*column, y) == "╭")
+        .unwrap_or_else(|| panic!("no corner left of {title:?}"));
+    let right = (x..buffer.area.width)
+        .find(|column| symbol(*column, y) == "╮")
+        .unwrap_or_else(|| panic!("no corner right of {title:?}"));
+    (y + 1..buffer.area.height)
+        .take_while(|row| symbol(left, *row) != "╰")
         .map(|row| {
-            row[left..]
-                .split('│')
-                .nth(1)
-                .unwrap_or_default()
+            (left + 1..right)
+                .map(|column| symbol(column, row))
+                .collect::<String>()
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ")
         })
         .collect()
+}
+
+/// The Tools panel's lines beneath its title, the header first.
+fn tools_panel(application: &Application) -> Vec<String> {
+    panel_lines(application, "Tools used")
 }
 
 fn focus_tools(application: &mut Application) {
@@ -1013,5 +1036,124 @@ fn a_range_whose_turns_used_no_tool_says_so_in_the_panel() {
     assert_eq!(
         tools_panel(&application)[0],
         "No Tools used in the last 30 days"
+    );
+}
+
+/// Where the title of the panel titled `title` stands.
+fn title_at(application: &Application, title: &str) -> (u16, u16) {
+    text_position(
+        &rendered_application_buffer(application, WIDTH, HEIGHT),
+        title,
+    )
+}
+
+#[test]
+fn panels_stand_as_the_mockup_lays_them_out() {
+    let application = on_insights(Ok(worked()));
+    let heatmap = title_at(&application, "When you work");
+    let tools = title_at(&application, "Tools used");
+    let turns = title_at(&application, " Turns ");
+    let compactions = title_at(&application, " Compactions ");
+    let approvals = title_at(&application, " Approvals ");
+
+    assert_eq!(tools.1, heatmap.1, "Tools stand beside When you work");
+    assert!(tools.0 > heatmap.0);
+    assert_eq!(compactions.1, turns.1, "Compactions stand beside Turns");
+    assert!(turns.1 > heatmap.1 && compactions.0 > turns.0);
+    assert_eq!(
+        approvals.0, compactions.0,
+        "Approvals stand beneath Compactions"
+    );
+    assert!(approvals.1 > compactions.1);
+}
+
+#[test]
+fn the_compactions_panel_states_how_many_how_many_were_manual_and_failed_and_what_they_freed() {
+    assert_eq!(
+        SemanticCommandId::MetricsPanelFocus(InsightsPanel::Compactions).as_str(),
+        "metrics.panel.compactions"
+    );
+    let application = on_insights(Ok(worked()));
+
+    assert_eq!(
+        panel_lines(&application, " Compactions "),
+        vec![
+            "27 Compactions · 6 manual · ✗ 1 failed",
+            "frees 61% of context on average",
+        ]
+    );
+}
+
+#[test]
+fn compactions_that_could_not_say_what_they_freed_leave_it_unstated() {
+    let mut report = worked();
+    report.compactions = CompactionInsights {
+        manual: CompactionCounts {
+            interrupted: 1,
+            ..CompactionCounts::default()
+        },
+        ..CompactionInsights::default()
+    };
+    let application = on_insights(Ok(report));
+
+    assert_eq!(
+        panel_lines(&application, " Compactions "),
+        vec![
+            "1 Compaction · 1 manual · ✗ 0 failed",
+            "No Compaction recorded what it freed",
+        ]
+    );
+}
+
+#[test]
+fn compactions_that_left_more_context_than_they_found_say_so() {
+    let mut report = worked();
+    report.compactions.freed = Some(FreedShare {
+        compactions: 2,
+        average_millionths: -50_000,
+    });
+    let application = on_insights(Ok(report));
+
+    assert_eq!(
+        panel_lines(&application, " Compactions ")[1],
+        "leaves 5% more context on average"
+    );
+}
+
+#[test]
+fn a_range_with_no_compactions_says_so_in_the_panel() {
+    let application = on_insights(Ok(InsightsReport::default()));
+
+    assert_eq!(
+        panel_lines(&application, " Compactions ")[0],
+        "No Compactions in the last 30 days"
+    );
+}
+
+#[test]
+fn the_approvals_panel_states_how_many_were_asked_and_how_each_was_decided() {
+    assert_eq!(
+        SemanticCommandId::MetricsPanelFocus(InsightsPanel::Approvals).as_str(),
+        "metrics.panel.approvals"
+    );
+    let application = on_insights(Ok(worked()));
+
+    assert_eq!(
+        panel_lines(&application, " Approvals "),
+        vec![
+            "188 asked",
+            "✓ 171 accepted ✗ 12 declined ⏱ 5 waiting or expired",
+            "11 for the Session · 2 also interrupted the Turn",
+        ]
+    );
+}
+
+#[test]
+fn a_range_with_no_approvals_says_so_in_the_panel() {
+    let application = on_insights(Ok(InsightsReport::default()));
+
+    assert_eq!(
+        panel_lines(&application, " Approvals ")[0],
+        "No Approvals asked in the last 30 days"
     );
 }

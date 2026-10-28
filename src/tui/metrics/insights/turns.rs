@@ -4,7 +4,6 @@
 //! Failed, and were Interrupted.
 
 use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
-use unicode_width::UnicodeWidthStr;
 
 use crate::{
     protocol::{TURN_DURATION_BINS, TurnDurations, TurnInsights},
@@ -18,6 +17,7 @@ use super::{
         view::share,
     },
     InsightsPanel, InsightsView,
+    view::render_spans,
 };
 
 /// The rows the panel draws inside its border.
@@ -86,19 +86,17 @@ pub(super) fn render(
             theme.feedback.warning,
         ),
     ];
-    let mut x = area.x;
-    let y = area.y + 2;
-    for (place, (glyph, count, name, style)) in ended.into_iter().enumerate() {
-        let gap = if place == 0 { "" } else { "  " };
-        let figure = format!("{gap}{glyph} ");
-        let words = format!("{} {name}", grouped_count(count));
-        for (text, style) in [(figure, style), (words, primary)] {
-            let left = usize::from(area.right().saturating_sub(x));
-            let text = truncate_to_width(&text, left);
-            buffer.set_string(x, y, &text, style);
-            x += u16::try_from(text.width()).unwrap_or(u16::MAX);
-        }
-    }
+    let spans = ended
+        .into_iter()
+        .enumerate()
+        .flat_map(|(place, (glyph, count, name, style))| {
+            let gap = if place == 0 { "" } else { "  " };
+            [
+                (format!("{gap}{glyph} "), style),
+                (format!("{} {name}", grouped_count(count)), primary),
+            ]
+        });
+    render_spans(buffer, area, area.y + 2, spans);
 }
 
 /// `count` Turns, written whole.
