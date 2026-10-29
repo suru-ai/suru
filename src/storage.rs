@@ -31,6 +31,7 @@ mod activity_rows;
 mod attachment_table;
 mod clone_staging_table;
 mod errand_table;
+pub(crate) use errand_table::ErrandReading;
 mod memory_table;
 mod rows;
 mod unsaved;

@@ -1,6 +1,6 @@
 //! Usage Metrics: what the Sessions living on one Server, and the Errands it
-//! ran, consumed over a span of time, divided into time buckets the reader chooses and broken down by
-//! a key. The Server knows nothing of calendars or time zones: a reader asks
+//! ran, consumed over a span of time, divided into time buckets the reader
+//! chooses and broken down by a key. The Server knows nothing of calendars or time zones: a reader asks
 //! for the buckets as intervals of Session timestamps, cut where its own
 //! calendar falls, and is answered with the figures each one holds. A report
 //! is read on request and never stored.

@@ -807,6 +807,13 @@ fn render_legend(
     for (row, ((series, value), figure)) in
         series.iter().zip(&values).zip(&legend.figures).enumerate()
     {
+        // A figure that measured nothing, for want of any work, is no share
+        // of the whole, as Errands are none of its Sessions.
+        let share = if figure.is_measured || figure.is_partial {
+            share(figure.value, total)
+        } else {
+            String::new()
+        };
         let figure = &figure.value;
         let Some(y) = u16::try_from(row + 1)
             .ok()
@@ -841,10 +848,7 @@ fn render_legend(
         // wide glyph in one label leaves the figures beside every row aligned.
         let label = truncate_to_width(&series.label, label_width);
         let padding = " ".repeat(label_width.saturating_sub(label.width()));
-        let text = format!(
-            "{label}{padding}  {value:>value_width$}  {share:>4}",
-            share = share(*figure, total),
-        );
+        let text = format!("{label}{padding}  {value:>value_width$}  {share:>4}",);
         buffer.set_string(area.x + 2, y, &text, text_style);
         let bar = usize::try_from(u128::from(*figure) * bar_room as u128 / u128::from(largest))
             .unwrap_or(0);

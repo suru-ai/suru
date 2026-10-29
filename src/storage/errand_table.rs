@@ -159,22 +159,35 @@ impl StorageRepository {
             .map_err(|error| StorageError::WriteErrand(error.to_string()))
     }
 
-    /// Every Errand recorded as beginning within `began` — from its start,
-    /// up to but not including its end — earliest first, read on a blocking
-    /// task through the index on when each began.
+    /// The Errands a read counts, read on one blocking task over one
+    /// connection through the index on when each began: every Errand
+    /// recorded as beginning within `began`, where given — from its start, up
+    /// to but not including its end — earliest first, and when the earliest
+    /// of all of them began.
     ///
     /// A row this Suru cannot read is logged and left out rather than failing
     /// the read. The schema version only guards the table's shape: a later
     /// Suru that adds a purpose or outcome writes it without a migration, so
     /// after a downgrade this Suru can meet a spelling it does not know, and a
     /// figure missing one Errand is better than no figures at all.
-    pub(crate) async fn errand_records(
+    pub(crate) async fn errand_reading(
         &self,
-        began: Range<SessionTimestamp>,
-    ) -> Result<Vec<ErrandRecord>, StorageError> {
+        began: Option<Range<SessionTimestamp>>,
+    ) -> Result<ErrandReading, StorageError> {
         let path = self.database_path.clone();
         on_blocking_task("reading Errand records", move || {
             let mut connection = connect(&path)?;
+            let earliest_began = errands::table
+                .select(diesel::dsl::min(errands::began_at))
+                .first::<Option<i64>>(&mut connection)
+                .map_err(|error| StorageError::Read(error.to_string()))?
+                .map(timestamp);
+            let Some(began) = began else {
+                return Ok(ErrandReading {
+                    records: Vec::new(),
+                    earliest_began,
+                });
+            };
             let rows = errands::table
                 .filter(errands::began_at.ge(stamp_column(began.start)))
                 .filter(errands::began_at.lt(stamp_column(began.end)))
@@ -182,7 +195,7 @@ impl StorageRepository {
                 .select(ErrandRow::as_select())
                 .load::<ErrandRow>(&mut connection)
                 .map_err(|error| StorageError::Read(error.to_string()))?;
-            Ok(rows
+            let records = rows
                 .into_iter()
                 .filter_map(|row| {
                     let id = row.id;
@@ -192,27 +205,23 @@ impl StorageRepository {
                         })
                         .ok()
                 })
-                .collect())
+                .collect();
+            Ok(ErrandReading {
+                records,
+                earliest_began,
+            })
         })
         .await
     }
+}
 
-    /// When the earliest Errand recorded began, read on a blocking task
-    /// through the index on when each began; none where none is recorded.
-    pub(crate) async fn earliest_errand_began(
-        &self,
-    ) -> Result<Option<SessionTimestamp>, StorageError> {
-        let path = self.database_path.clone();
-        on_blocking_task("reading when the earliest Errand began", move || {
-            let mut connection = connect(&path)?;
-            let earliest = errands::table
-                .select(diesel::dsl::min(errands::began_at))
-                .first::<Option<i64>>(&mut connection)
-                .map_err(|error| StorageError::Read(error.to_string()))?;
-            Ok(earliest.map(timestamp))
-        })
-        .await
-    }
+/// What [`StorageRepository::errand_reading`] read: the Errands that began
+/// within the span it was asked for, earliest first, and when the earliest
+/// of every Errand recorded began, none where none is.
+#[derive(Debug, Default)]
+pub(crate) struct ErrandReading {
+    pub(crate) records: Vec<ErrandRecord>,
+    pub(crate) earliest_began: Option<SessionTimestamp>,
 }
 
 #[cfg(test)]
@@ -271,7 +280,14 @@ mod tests {
         };
         {
             let repository = StorageRepository::open(data.path()).await.unwrap();
-            assert_eq!(repository.earliest_errand_began().await.unwrap(), None);
+            assert_eq!(
+                repository
+                    .errand_reading(None)
+                    .await
+                    .unwrap()
+                    .earliest_began,
+                None
+            );
             for written in [
                 record(3_000, ErrandPurpose::WorkspaceDescription),
                 record(999, ErrandPurpose::SessionTitle),
@@ -286,9 +302,10 @@ mod tests {
 
         assert_eq!(
             repository
-                .errand_records(at(1_000)..at(3_000))
+                .errand_reading(Some(at(1_000)..at(3_000)))
                 .await
-                .unwrap(),
+                .unwrap()
+                .records,
             vec![
                 record(1_000, ErrandPurpose::SessionTitle),
                 estimated,
@@ -297,13 +314,18 @@ mod tests {
         );
         assert_eq!(
             repository
-                .errand_records(at(3_001)..at(u64::MAX))
+                .errand_reading(Some(at(3_001)..at(u64::MAX)))
                 .await
-                .unwrap(),
+                .unwrap()
+                .records,
             Vec::new()
         );
         assert_eq!(
-            repository.earliest_errand_began().await.unwrap(),
+            repository
+                .errand_reading(None)
+                .await
+                .unwrap()
+                .earliest_began,
             Some(at(999))
         );
     }
@@ -324,9 +346,10 @@ mod tests {
 
         assert_eq!(
             repository
-                .errand_records(at(0)..at(u64::MAX))
+                .errand_reading(Some(at(0)..at(u64::MAX)))
                 .await
-                .unwrap(),
+                .unwrap()
+                .records,
             vec![record(1_000, ErrandPurpose::SessionTitle)]
         );
     }

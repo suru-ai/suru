@@ -70,7 +70,7 @@ use super::{
 use crate::{
     errands::ErrandRecord,
     provider::ErrandCost,
-    storage::{StorageError, StorageRepository},
+    storage::{ErrandReading, StorageError, StorageRepository},
 };
 
 /// Why a Usage Metrics query is refused.
@@ -189,11 +189,11 @@ impl SessionStore {
         // Only a store restored without storage, as some tests restore one,
         // lacks a repository; it has recorded no Errand to count.
         let errands = match repository {
-            Some(repository) => Errands::read(&repository, query).await.map_err(|error| {
+            Some(repository) => read_errands(&repository, query).await.map_err(|error| {
                 tracing::warn!(%error, "reading the Errands Usage Metrics counts failed");
                 UsageMetricsRefusal::Storage
             })?,
-            None => Errands::default(),
+            None => ErrandReading::default(),
         };
         let forest = MeteredForest::index(copied);
         let metered = forest.metered(query.breakdown);
@@ -206,39 +206,23 @@ impl SessionStore {
     }
 }
 
-/// What the read takes of the Errands storage records: those that began
-/// where a bucket or the comparison interval may hold them, and when the
-/// earliest of them all began.
-#[derive(Default)]
-struct Errands {
-    records: Vec<ErrandRecord>,
-    earliest_began: Option<SessionTimestamp>,
-}
-
-impl Errands {
-    /// Reads the Errands that began from the start of `query`'s first
-    /// bucket or its comparison interval, whichever is earlier, up to the
-    /// end of whichever ends later: every one a bucket or the comparison
-    /// can hold, in one pass.
-    async fn read(
-        repository: &StorageRepository,
-        query: &UsageMetricsQuery,
-    ) -> Result<Self, StorageError> {
-        let intervals = || query.buckets.iter().chain(&query.comparison);
-        let span = intervals()
-            .map(|interval| interval.start)
-            .min()
-            .zip(intervals().map(|interval| interval.end).max())
-            .filter(|(start, end)| start < end);
-        let records = match span {
-            Some((start, end)) => repository.errand_records(start..end).await?,
-            None => Vec::new(),
-        };
-        Ok(Self {
-            records,
-            earliest_began: repository.earliest_errand_began().await?,
-        })
-    }
+/// The Errands a read of `query` counts, read from `repository` in one
+/// pass: those that began from the start of its first bucket or its
+/// comparison interval, whichever is earlier, up to the end of whichever
+/// ends later — every one a bucket or the comparison can hold, none where
+/// it asks for neither — and when the earliest of them all began.
+async fn read_errands(
+    repository: &StorageRepository,
+    query: &UsageMetricsQuery,
+) -> Result<ErrandReading, StorageError> {
+    let intervals = || query.buckets.iter().chain(&query.comparison);
+    let span = intervals()
+        .map(|interval| interval.start)
+        .min()
+        .zip(intervals().map(|interval| interval.end).max())
+        .filter(|(start, end)| start < end)
+        .map(|(start, end)| start..end);
+    repository.errand_reading(span).await
 }
 
 /// What the read copies of one Session under the store lock: its Title, its
@@ -555,9 +539,9 @@ impl Tally {
     /// Adds `errand` to the whole and to the reserved Errands key, whatever
     /// the breakdown.
     fn add_errand(&mut self, errand: &ErrandRecord) {
-        add_errand(&mut self.total.aggregate, errand);
+        add_errand_to(&mut self.total.aggregate, errand);
         let errands = self.by_key.entry(UsageMetricsKey::Errands).or_default();
-        add_errand(&mut errands.aggregate, errand);
+        add_errand_to(&mut errands.aggregate, errand);
     }
 
     fn add(&mut self, turn: &MeteredTurn) {
@@ -687,7 +671,7 @@ fn add_contribution(aggregate: &mut UsageMetricsAggregate, contribution: &CostCo
 /// one whose Cost or Usage is unknown marks the Cost partial: a figure
 /// holding it says less than it cost. It is neither a Session nor a Turn,
 /// so it adds to neither count.
-fn add_errand(aggregate: &mut UsageMetricsAggregate, errand: &ErrandRecord) {
+fn add_errand_to(aggregate: &mut UsageMetricsAggregate, errand: &ErrandRecord) {
     if let Some(usage) = &errand.usage {
         aggregate.add_usage(usage);
     }
@@ -765,7 +749,7 @@ struct Placed {
 fn fold(
     query: &UsageMetricsQuery,
     metered: Metered,
-    errands: Errands,
+    errands: ErrandReading,
     forest: &MeteredForest,
     names: &KeyNames,
 ) -> UsageMetricsReport {
@@ -885,14 +869,14 @@ fn fold(
     // untimed, since every Errand records when it began.
     for errand in &errands.records {
         if let Some(comparison) = comparison.as_mut().filter(|_| compared(Some(errand.began))) {
-            add_errand(&mut comparison.aggregate, errand);
+            add_errand_to(&mut comparison.aggregate, errand);
         }
         let Landing::Bucket(index) = landing(Some(errand.began)) else {
             continue;
         };
         buckets[index].add_errand(errand);
         across_buckets.add_errand(errand);
-        add_errand(&mut across_buckets_and_untimed.aggregate, errand);
+        add_errand_to(&mut across_buckets_and_untimed.aggregate, errand);
     }
 
     let mut keys = buckets
@@ -974,12 +958,12 @@ fn key_order(key: &UsageMetricsKey) -> (u8, &str, &str) {
 
 /// What the reserved [`UsageMetricsKey::Errands`] is labelled, whatever the
 /// breakdown.
-const ERRANDS: &str = "Errands";
+const ERRANDS_LABEL: &str = "Errands";
 
 /// The name a reader is shown for each of `keys`, in their order: a Model's
 /// as [`model_labels`] tells them apart, a Provider's display name in the
 /// Model Catalog, otherwise its id; a Workspace's as [`workspace_labels`]
-/// tells them apart; and Errands as [`ERRANDS`].
+/// tells them apart; and Errands as [`ERRANDS_LABEL`].
 fn labels(keys: &[UsageMetricsKey], names: &KeyNames) -> Vec<String> {
     let catalog = names.catalog;
     let mut models = model_labels(keys, catalog);
@@ -992,7 +976,7 @@ fn labels(keys: &[UsageMetricsKey], names: &KeyNames) -> Vec<String> {
                 workspaces.remove(workspace).unwrap_or_default()
             }
             UsageMetricsKey::Unknown => "Unknown".to_owned(),
-            UsageMetricsKey::Errands => ERRANDS.to_owned(),
+            UsageMetricsKey::Errands => ERRANDS_LABEL.to_owned(),
         })
         .collect()
 }

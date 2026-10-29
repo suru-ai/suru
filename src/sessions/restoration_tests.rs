@@ -1447,8 +1447,8 @@ fn lend_repository(
     lent
 }
 
-/// An Errand of `purpose`'s that began at `began`, with whatever Usage and
-/// Cost it knows.
+/// A Session Title Errand that began at `began`, reporting `usage` tokens of
+/// output where it knew its Usage, and costing `cost` where it knew that.
 fn errand(began: u64, usage: Option<u64>, cost: Option<ErrandCost>) -> ErrandRecord {
     ErrandRecord {
         purpose: ErrandPurpose::SessionTitle,

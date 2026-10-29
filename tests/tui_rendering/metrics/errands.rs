@@ -7,7 +7,7 @@ use super::{
     legend_row_at, legend_row_dimmed, many_workspaces, press, press_at, priced_report, reader_in,
     rendered_row, report, row, screen, show_tokens, take_together,
 };
-use crate::tui_rendering::support::{rendered_application_buffer, text_position};
+use crate::tui_rendering::support::{invoke, rendered_application_buffer, text_position};
 use crossterm::event::KeyModifiers;
 use ratatui::style::Color;
 use suru::{
@@ -15,7 +15,7 @@ use suru::{
         Cost, CountedCost, KeyedUsageMetrics, UsageMetricsAggregate, UsageMetricsKey,
         UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport,
     },
-    tui::Application,
+    tui::{Application, SemanticCommandId},
 };
 
 /// `report` with Suru's Errands beside its keys, as the Server adds them:
@@ -168,6 +168,45 @@ fn under_the_sessions_measure_the_errands_row_reads_a_dash() {
     let errands = row(&rows, "Errands");
     assert!(errands.contains("—"), "{errands:?}");
     assert!(!errands.contains(" 0 "), "{errands:?}");
+    assert!(
+        !errands.contains('%'),
+        "a figure that measured nothing is no share of the whole: {errands:?}"
+    );
+}
+
+#[test]
+fn a_selected_bar_s_legend_reads_that_day_s_errands() {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    let mut answered = with_errands(report(&query), 100_000, 0, 0);
+    // The fifteenth day's Errands used 500K rather than 100K.
+    let busiest = &mut answered.buckets[14];
+    let more = 400_000;
+    busiest.total.fresh_input_tokens = busiest.total.fresh_input_tokens.map(|held| held + more);
+    for keyed in &mut busiest.by_key {
+        if keyed.key == UsageMetricsKey::Errands {
+            keyed.aggregate.fresh_input_tokens = Some(500_000);
+        }
+    }
+    take_together(&mut answered);
+    answer(&mut application, request_id, Ok(answered));
+    show_tokens(&mut application);
+    assert!(row(&screen(&application), "Errands").contains("3.4M"));
+
+    invoke(
+        &mut application,
+        SemanticCommandId::MetricsBucketSelect { bucket: 14 },
+    );
+
+    // Opus 5M, Codex 1M, Copilot 250K and the Errands' 500K, by the three
+    // Sessions alone.
+    let rows = screen(&application);
+    row(&rows, "Tue 13 Oct · 6.75M tokens · 3 Sessions · 30 Turns");
+    let errands = row(&rows, "Errands");
+    assert!(
+        errands.contains("500K") && errands.contains("7%"),
+        "{errands:?}"
+    );
 }
 
 #[test]
