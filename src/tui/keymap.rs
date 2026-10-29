@@ -481,7 +481,7 @@ fn command_for_overview_pointer(
 fn command_for_insights_key(key: KeyEvent, keys: MetricsKeys) -> Option<SemanticCommandId> {
     Some(match (key.code, key.modifiers) {
         (KeyCode::Esc, KeyModifiers::NONE) if keys.panel_item.is_some() => {
-            SemanticCommandId::MetricsPanelSelectionClear
+            SemanticCommandId::MetricsPanelItemClear
         }
         (KeyCode::Esc, KeyModifiers::NONE) if keys.panel.is_some() => {
             SemanticCommandId::MetricsPanelFocusClear

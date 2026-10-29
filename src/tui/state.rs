@@ -11815,7 +11815,7 @@ impl Application {
             SemanticCommandId::MetricsPanelFocusClear => {
                 Ok(self.act_on_metrics_insights(|insights, _, _| insights.clear_focus()))
             }
-            SemanticCommandId::MetricsPanelSelectionClear => {
+            SemanticCommandId::MetricsPanelItemClear => {
                 Ok(self.act_on_metrics_insights(|insights, _, _| insights.clear_selection()))
             }
             SemanticCommandId::MetricsPanelItemPrevious => {

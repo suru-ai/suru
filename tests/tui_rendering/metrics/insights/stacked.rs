@@ -106,11 +106,11 @@ fn at_80_columns_every_panel_stacks_in_one_column_with_nothing_overlapping() {
 fn page_down_and_page_up_scroll_the_column_until_every_panel_has_been_shown() {
     assert_eq!(
         SemanticCommandId::MetricsInsightsPageDown.as_str(),
-        "metrics.insights.page-down"
+        "metrics.insights.page.down"
     );
     assert_eq!(
         SemanticCommandId::MetricsInsightsPageUp.as_str(),
-        "metrics.insights.page-up"
+        "metrics.insights.page.up"
     );
     let mut application = on_insights(Ok(worked()));
     assert!(!shows(&application, NARROW, SHORT, " Delegation "));

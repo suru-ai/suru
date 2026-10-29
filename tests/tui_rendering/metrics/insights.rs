@@ -435,7 +435,7 @@ fn corner_left_of(buffer: &Buffer, x: u16, y: u16) -> Style {
 fn tab_or_a_click_focuses_a_panel_and_highlights_its_border() {
     assert_eq!(
         SemanticCommandId::MetricsPanelFocus(InsightsPanel::Turns).as_str(),
-        "metrics.panel.turns"
+        "metrics.panel.focus.turns"
     );
     assert_eq!(
         SemanticCommandId::MetricsPanelItemSelect {
@@ -743,7 +743,7 @@ fn cell_position(application: &Application, day: &str, hour: u16) -> (u16, u16) 
 fn when_you_work_shades_each_local_hour_of_the_week_by_its_share_of_the_busiest() {
     assert_eq!(
         SemanticCommandId::MetricsPanelFocus(InsightsPanel::WhenYouWork).as_str(),
-        "metrics.panel.when-you-work"
+        "metrics.panel.focus.when-you-work"
     );
     let application = on_insights(Ok(worked()));
 
@@ -940,7 +940,7 @@ fn focus_tools(application: &mut Application) {
 fn the_tools_panel_lists_the_most_used_first_and_folds_the_rest_into_more() {
     assert_eq!(
         SemanticCommandId::MetricsPanelFocus(InsightsPanel::Tools).as_str(),
-        "metrics.panel.tools"
+        "metrics.panel.focus.tools"
     );
     let application = on_insights(Ok(worked()));
 
@@ -961,7 +961,7 @@ fn the_tools_panel_lists_the_most_used_first_and_folds_the_rest_into_more() {
 fn f_sorts_the_tools_by_failures_and_again_by_uses() {
     assert_eq!(
         SemanticCommandId::MetricsToolsSortToggle.as_str(),
-        "metrics.tools.sort"
+        "metrics.tools.sort.toggle"
     );
     let mut application = on_insights(Ok(worked()));
     let by_uses = tools_panel(&application);
@@ -1202,7 +1202,7 @@ fn tab_moves_focus_through_the_panels_in_the_order_they_are_read() {
 fn the_compactions_panel_states_how_many_how_many_were_manual_and_failed_and_what_they_freed() {
     assert_eq!(
         SemanticCommandId::MetricsPanelFocus(InsightsPanel::Compactions).as_str(),
-        "metrics.panel.compactions"
+        "metrics.panel.focus.compactions"
     );
     let application = on_insights(Ok(worked()));
 
@@ -1274,7 +1274,7 @@ fn a_range_with_no_compactions_says_so_in_the_panel() {
 fn the_approvals_panel_states_how_many_were_asked_and_how_each_was_decided() {
     assert_eq!(
         SemanticCommandId::MetricsPanelFocus(InsightsPanel::Approvals).as_str(),
-        "metrics.panel.approvals"
+        "metrics.panel.focus.approvals"
     );
     let application = on_insights(Ok(worked()));
 
@@ -1307,7 +1307,7 @@ fn delegation_panel(application: &Application) -> Vec<String> {
 fn the_delegation_panel_divides_cost_by_role_with_brokered_subagents_beside_theirs() {
     assert_eq!(
         SemanticCommandId::MetricsPanelFocus(InsightsPanel::Delegation).as_str(),
-        "metrics.panel.delegation"
+        "metrics.panel.focus.delegation"
     );
     let application = on_insights(Ok(worked()));
 
@@ -1372,7 +1372,7 @@ fn cache_panel(application: &Application) -> Vec<String> {
 fn the_cache_panel_states_the_share_read_from_cache_and_the_estimated_saving() {
     assert_eq!(
         SemanticCommandId::MetricsPanelFocus(InsightsPanel::Cache).as_str(),
-        "metrics.panel.cache"
+        "metrics.panel.focus.cache"
     );
     let application = on_insights(Ok(worked()));
 
