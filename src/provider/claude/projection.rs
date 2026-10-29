@@ -112,7 +112,7 @@ use crate::provider::{
     AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
     ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus,
     ProviderSubagentId, ProviderSubagentStatus, ProviderToolCallStatus, ProviderWatchId,
-    ProviderWatchOutcome, ReportedTurnMetering, ToolCallInput,
+    ProviderWatchOutcome, ReportedMetering, ToolCallInput,
 };
 
 /// The tool whose executions are Command Activity. Claude sends the command itself as the tool's
@@ -870,7 +870,7 @@ pub(super) struct ClaudeProjection {
     latest_reported_costs: HashMap<String, Cost>,
     seen_results: HashSet<String>,
     reasoning_blocks: u64,
-    turn_metering: Option<ReportedTurnMetering>,
+    turn_metering: Option<ReportedMetering>,
     /// The completion of a compaction whose summary the CLI has still to write, held back until
     /// it does so the Compaction settles with it.
     awaited_summary: Option<AwaitedSummary>,
@@ -2799,7 +2799,7 @@ impl ClaudeProjection {
             if let Some(metering) = self.turn_metering.as_mut() {
                 metering.add_usage_with_cumulative_cost(usage, reported_cost);
             } else {
-                self.turn_metering = Some(ReportedTurnMetering::new(usage, reported_cost));
+                self.turn_metering = Some(ReportedMetering::new(usage, reported_cost));
             }
             let metering = self
                 .turn_metering

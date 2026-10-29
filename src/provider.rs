@@ -1459,24 +1459,40 @@ impl From<EstimatedCost> for MeteredCost {
     }
 }
 
-/// The cumulative Usage and Provider-reported Cost for one active Turn. A
-/// field stays known only while every contributing Provider report states a
+/// The cumulative Usage and Provider-reported Cost of the work one reading
+/// covers: an active Turn, or an Errand. A field stays known only while every contributing Provider report states a
 /// valid value; overflow and omission degrade that field to absence rather
 /// than manufacturing a number.
-pub(super) struct ReportedTurnMetering {
+pub(super) struct ReportedMetering {
     usage: Usage,
     reported_cost: Option<Cost>,
     cost_complete: bool,
     native_meter_overflowed: bool,
 }
 
-impl ReportedTurnMetering {
+impl ReportedMetering {
     pub(super) fn new(usage: Usage, reported_cost: Option<Cost>) -> Self {
         Self {
             usage,
             reported_cost,
             cost_complete: reported_cost.is_some(),
             native_meter_overflowed: false,
+        }
+    }
+
+    /// Adds one report to the reading `slot` holds, starting it with that
+    /// report where there is none yet, and answers the reading.
+    pub(super) fn accumulate(
+        slot: &mut Option<Self>,
+        usage: Usage,
+        reported_cost: Option<Cost>,
+    ) -> &Self {
+        match slot {
+            Some(metering) => {
+                metering.add(usage, reported_cost);
+                metering
+            }
+            None => slot.insert(Self::new(usage, reported_cost)),
         }
     }
 
@@ -1558,13 +1574,10 @@ impl ReportedTurnMetering {
     /// whole or not at all, so one that some contributing report left
     /// unpriced is absent rather than understated.
     pub(super) fn into_errand_consumption(self) -> ErrandConsumption {
+        let cost = self.complete_cost().map(ErrandCost::reported);
         ErrandConsumption {
             usage: Some(self.usage),
-            cost: self
-                .cost_complete
-                .then_some(self.reported_cost)
-                .flatten()
-                .map(ErrandCost::reported),
+            cost,
         }
     }
 
@@ -1572,11 +1585,15 @@ impl ReportedTurnMetering {
         ProviderEvent::Usage {
             usage: self.usage.clone(),
             cost: self
-                .cost_complete
-                .then_some(self.reported_cost)
-                .flatten()
+                .complete_cost()
                 .map(|cost| MeteredCost::reported_subtree(cost, reporting_lifetime)),
         }
+    }
+
+    /// The Cost every contributing report priced, or nothing where any left
+    /// it unpriced.
+    fn complete_cost(&self) -> Option<Cost> {
+        self.cost_complete.then_some(self.reported_cost).flatten()
     }
 }
 

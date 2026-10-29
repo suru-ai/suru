@@ -41,8 +41,8 @@ use super::{
     transport::CopilotConnection,
 };
 use crate::provider::{
-    ErrandAnswer, ErrandConsumption, ErrandFailed, ProviderErrand, ProviderError,
-    ReportedTurnMetering, harness::SharedHarnessHandle,
+    ErrandAnswer, ErrandConsumption, ErrandFailed, ProviderErrand, ProviderError, ReportedMetering,
+    harness::SharedHarnessHandle,
 };
 
 /// What a failure running an Errand is reported under: the work Suru asked for rather than the
@@ -101,7 +101,7 @@ pub(super) async fn run_copilot_errand(
 struct ErrandMetering {
     events: EventSubscription,
     pricing: CopilotPricing,
-    reading: Option<ReportedTurnMetering>,
+    reading: Option<ReportedMetering>,
     lost: bool,
     closed: bool,
 }
@@ -130,8 +130,10 @@ impl ErrandMetering {
     }
 
     /// What the Session reported consuming, once the events already delivered are taken in. The
-    /// SDK queues every event up to the one that ends a wait before the wait answers, so nothing
-    /// the Errand's call reported is still to come. A Session that reported none leaves it unknown.
+    /// SDK delivers events in order and queues every one up to the one that ends a wait before the
+    /// wait answers, so this relies on the Copilot CLI reporting each call's `assistant.usage`
+    /// before the `session.idle` that settles it: a report arriving after the idle is missed. A
+    /// Session that reported none leaves it unknown.
     fn consumption(mut self) -> ErrandConsumption {
         while !self.closed {
             match self.events.next().now_or_never() {
@@ -161,10 +163,7 @@ impl ErrandMetering {
             self.lost = true;
             return;
         };
-        match self.reading.as_mut() {
-            Some(reading) => reading.add(usage, cost),
-            None => self.reading = Some(ReportedTurnMetering::new(usage, cost)),
-        }
+        ReportedMetering::accumulate(&mut self.reading, usage, cost);
     }
 }
 

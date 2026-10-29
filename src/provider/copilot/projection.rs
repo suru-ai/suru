@@ -156,7 +156,7 @@ use crate::provider::{
     AttributedProviderEvent, ContextFillReport, ProviderActivityId, ProviderCommandStatus,
     ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
     ProviderFileChangeStatus, ProviderSubagentId, ProviderSubagentStatus, ProviderToolCallStatus,
-    ProviderWatchId, ProviderWatchOutcome, ReportedTurnMetering, concise_remote_message,
+    ProviderWatchId, ProviderWatchOutcome, ReportedMetering, concise_remote_message,
     exclusive_count, first_line,
     harness::SharedHarnessHandle,
     reasoning::{ReasoningSegment, ReasoningSummarySplitter},
@@ -560,7 +560,7 @@ struct ConversationStreams {
     /// The cumulative reading for this conversation's one Suru Turn. Copilot
     /// emits one usage event per model call and gives it no Turn identity, so
     /// this state lives exactly as long as the surrounding Turn streams do.
-    metering: Option<ReportedTurnMetering>,
+    metering: Option<ReportedMetering>,
 }
 
 /// The agent Message Copilot is still streaming, and the text it has carried so far — against
@@ -1739,18 +1739,7 @@ fn metered(
     usage: Usage,
     reported_cost: Option<Cost>,
 ) -> ProviderEvent {
-    match streams.metering.as_mut() {
-        Some(metering) => {
-            metering.add(usage, reported_cost);
-            metering.event()
-        }
-        None => {
-            let metering = ReportedTurnMetering::new(usage, reported_cost);
-            let event = metering.event();
-            streams.metering = Some(metering);
-            event
-        }
-    }
+    ReportedMetering::accumulate(&mut streams.metering, usage, reported_cost).event()
 }
 
 fn reported_cache_ttl(event: &SessionEvent) -> Option<i64> {
