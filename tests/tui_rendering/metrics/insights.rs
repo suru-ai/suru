@@ -1378,7 +1378,7 @@ fn the_cache_panel_states_the_share_read_from_cache_and_the_estimated_saving() {
 
     assert_eq!(
         cache_panel(&application),
-        vec!["71% of input from cache", "saved ≈ $1104.00 (est.)"]
+        vec!["71% of input from cache", "saved ≈ $1,104.00 (est.)"]
     );
 }
 
@@ -1388,7 +1388,7 @@ fn a_saving_some_model_had_no_rates_for_says_so_with_a_plus() {
     report.cache.saving.is_partial = true;
     let application = on_insights(Ok(report));
 
-    assert_eq!(cache_panel(&application)[1], "saved ≈ $1104.00+ (est.)");
+    assert_eq!(cache_panel(&application)[1], "saved ≈ $1,104.00+ (est.)");
 }
 
 #[test]
@@ -1492,7 +1492,7 @@ fn below_the_mockup_s_width_the_small_panels_stack_and_say_it_all_where_they_fit
     );
     assert_eq!(
         lines(" Cache "),
-        ["71% of input from cache", "saved ≈ $1104.00 (est.)"]
+        ["71% of input from cache", "saved ≈ $1,104.00 (est.)"]
     );
 }
 

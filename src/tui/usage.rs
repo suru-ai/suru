@@ -49,9 +49,15 @@ pub(super) fn compact_cost(cost: Cost) -> String {
 }
 
 /// `nano_usd` billionths of a dollar, written as every dollar figure is —
-/// a Cost's, and an estimate that is none.
+/// a Cost's, and an estimate that is none — to the cent, its whole dollars'
+/// thousands grouped as [`grouped_count`] groups a count's: `$1,104.00`.
 pub(super) fn compact_dollars(nano_usd: u64) -> String {
-    format!("${:.2}", Cost::from_nano_usd(nano_usd).as_usd())
+    let cents = format!("{:.2}", Cost::from_nano_usd(nano_usd).as_usd());
+    let (dollars, cents) = cents.split_once('.').unwrap_or((&cents, "00"));
+    let dollars = dollars
+        .parse()
+        .map_or_else(|_| dollars.to_owned(), grouped_count);
+    format!("${dollars}.{cents}")
 }
 
 fn trim_fractional_zeros(mut value: String) -> String {
@@ -74,6 +80,18 @@ mod tests {
     #[test]
     fn cost_always_has_two_decimal_places() {
         for (usd, expected) in [(0.001, "$0.00"), (1.2, "$1.20"), (10.0, "$10.00")] {
+            assert_eq!(compact_cost(Cost::from_usd(usd).unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn dollars_group_their_thousands_as_counts_do() {
+        for (usd, expected) in [
+            (999.99, "$999.99"),
+            (1_104.0, "$1,104.00"),
+            (1_234_567.891, "$1,234,567.89"),
+            (999_999.999, "$1,000,000.00"),
+        ] {
             assert_eq!(compact_cost(Cost::from_usd(usd).unwrap()), expected);
         }
     }
