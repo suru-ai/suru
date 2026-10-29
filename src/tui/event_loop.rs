@@ -1712,6 +1712,10 @@ impl RunLoop {
                     self.application.current_workspace_request(),
                     &self.channels.workspaces,
                 );
+                // The Usage Metrics view, open over the turn, reads anew
+                // from the Server the Outlook now names.
+                let read = self.application.take_metrics_read_after_turn();
+                let _ = self.dispatch_transition(read);
             }
             ApplicationTransition::TurnOutlookAndViewAndAttach {
                 session,

@@ -515,6 +515,26 @@ impl<T, C> RangeReads<T, C> {
     fn forget_all_but(&mut self, range: MetricsRange) {
         self.kept.retain(|kept, _| *kept == range);
     }
+
+    /// Lets go of everything kept, awaited, or refused that is not of
+    /// `outlook`'s Server.
+    fn keep_only(&mut self, outlook: &Outlook) {
+        self.kept.retain(|_, (origin, _)| origin == outlook);
+        if self
+            .asked
+            .as_ref()
+            .is_some_and(|asked| asked.origin != *outlook)
+        {
+            self.asked = None;
+        }
+        if self
+            .refused
+            .as_ref()
+            .is_some_and(|(origin, _, _)| origin != outlook)
+        {
+            self.refused = None;
+        }
+    }
 }
 
 /// Where the last frame drew each part of the tab a pointer can act on.
@@ -706,6 +726,13 @@ impl InsightsView {
     pub(in crate::tui) fn forget_all_but(&mut self, range: MetricsRange) {
         self.reports.forget_all_but(range);
         self.workspaces.forget_all_but(range);
+    }
+
+    /// Lets go of everything read from, or asked of, any Server but the one
+    /// `outlook` names, as the Outlook turns toward it.
+    pub(in crate::tui) fn keep_only(&mut self, outlook: &Outlook) {
+        self.reports.keep_only(outlook);
+        self.workspaces.keep_only(outlook);
     }
 
     /// Takes the Server's answer, unless the tab has since closed or asked

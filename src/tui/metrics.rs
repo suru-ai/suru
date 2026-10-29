@@ -157,10 +157,8 @@ pub(super) struct MetricsView {
     /// The read the view awaits, the Outlook it asked, and what it asked for.
     asked: Option<(Uuid, Outlook, Asked)>,
     /// The last report read, with the Outlook it was read from and the
-    /// buckets it answers.
+    /// buckets it answers: shown only while the Outlook names that Server.
     shown: Option<(Outlook, RangeBuckets, UsageMetricsReport)>,
-    /// Why the last Session the view was asked to open was not opened.
-    unopened: Option<String>,
     /// Why the last read gave no report.
     refusal: Option<MetricsReadRefusal>,
     /// The bucket whose figures the legend shows in place of the range's,
@@ -362,7 +360,6 @@ impl MetricsView {
         self.insights = InsightsView::default();
         self.asked = None;
         self.shown = None;
-        self.unopened = None;
         self.refusal = None;
         self.selected = None;
         self.hidden.clear();
@@ -370,6 +367,26 @@ impl MetricsView {
         self.alone = None;
         self.focused = None;
         self.earliest = EarliestTurn::Unknown;
+    }
+
+    /// Lets go of every figure, and every read awaited, that is not of the
+    /// Server `outlook` names, on both tabs, as the Outlook turns toward it:
+    /// the tabs describe one Server, and figures of the one turned from must
+    /// not stand under the other's name. When All time begins is that
+    /// Server's to say again.
+    pub(super) fn turn_toward(&mut self, outlook: &Outlook) {
+        let elsewhere = self
+            .shown
+            .as_ref()
+            .map(|(origin, _, _)| origin)
+            .into_iter()
+            .chain(self.asked.as_ref().map(|(_, origin, _)| origin))
+            .any(|origin| origin != outlook);
+        if elsewhere {
+            self.forget_figures();
+            self.earliest = EarliestTurn::Unknown;
+        }
+        self.insights.keep_only(outlook);
     }
 
     pub(super) fn close(&mut self) {
@@ -390,11 +407,19 @@ impl MetricsView {
         changed
     }
 
-    /// Whether the Overview has no report to show nor one on its way, so
-    /// showing it must read: a read that was refused is read again, as
-    /// Insights reads a refused range again.
-    pub(super) fn overview_lacks_report(&self) -> bool {
-        self.shown.is_none() && self.asked.is_none()
+    /// Whether the Overview has no report from `outlook` to show nor one
+    /// on its way, so showing it must read: a read that was refused is read
+    /// again, as Insights reads a refused range again.
+    pub(super) fn overview_lacks_report(&self, outlook: &Outlook) -> bool {
+        let shown = self
+            .shown
+            .as_ref()
+            .is_some_and(|(origin, _, _)| origin == outlook);
+        let asked = self
+            .asked
+            .as_ref()
+            .is_some_and(|(_, origin, _)| origin == outlook);
+        !shown && !asked
     }
 
     pub(super) fn insights(&self) -> &InsightsView {
@@ -449,7 +474,6 @@ impl MetricsView {
     fn forget_figures(&mut self) {
         self.asked = None;
         self.shown = None;
-        self.unopened = None;
         self.refusal = None;
         self.selected = None;
         self.hidden.clear();
@@ -597,23 +621,13 @@ impl MetricsView {
     }
 
     /// The `place`-th of the Sessions the view lists as costing the most,
-    /// on the Server the report naming it was read from, where it lists
-    /// that many.
+    /// on the Server the report naming it was read from — the one the
+    /// Outlook names, since the view lets go of any other's report as the
+    /// Outlook turns — where it lists that many.
     pub(super) fn top_session(&self, place: usize) -> Option<SessionReference> {
         let (origin, _, _) = self.shown.as_ref()?;
         let session_id = *self.top_session_ids().get(place)?;
         Some(SessionReference::new(origin.clone(), session_id))
-    }
-
-    /// Says why a listed Session was not opened, above the figures.
-    pub(super) fn refuse_opening(&mut self, reason: String) {
-        self.unopened = Some(reason);
-    }
-
-    /// Why the last Session the view was asked to open was not opened,
-    /// until it reads again.
-    pub(super) fn unopened_because(&self) -> Option<&str> {
-        self.unopened.as_deref()
     }
 
     /// Hides the `place`-th series in the legend from the chart, or shows it
@@ -746,7 +760,6 @@ impl MetricsView {
         };
         self.asked = Some((request_id, origin, asked));
         self.refusal = None;
-        self.unopened = None;
         (request_id, query)
     }
 
@@ -846,8 +859,14 @@ impl MetricsView {
         self.asked.is_some()
     }
 
-    pub(super) fn content(&self) -> MetricsContent<'_> {
-        match (&self.shown, &self.refusal) {
+    /// What the Overview shows of the Server `outlook` names: never a
+    /// report read from another.
+    pub(super) fn content(&self, outlook: &Outlook) -> MetricsContent<'_> {
+        let shown = self
+            .shown
+            .as_ref()
+            .filter(|(origin, _, _)| origin == outlook);
+        match (shown, &self.refusal) {
             (Some((_, buckets, report)), _) => MetricsContent::Report { buckets, report },
             (None, Some(refusal)) => MetricsContent::Refused(refusal),
             (None, None) => MetricsContent::Reading,

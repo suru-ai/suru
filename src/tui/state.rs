@@ -1437,6 +1437,9 @@ impl TuiState {
         self.outlook_landing_selections
             .insert(self.outlook.clone(), self.landing_agent_selection.clone());
         self.outlook = outlook.clone();
+        // The Usage Metrics view stays open over the turn, reading anew what
+        // it showed of the Server turned from.
+        self.metrics_view.turn_toward(&outlook);
         self.pending_workspace_resolutions.clear();
         self.worktree_picker.close();
         self.workspace = self
@@ -9656,7 +9659,7 @@ impl Application {
     fn read_metrics_tab_lacking(&mut self) -> ApplicationTransition {
         let view = &self.state.metrics_view;
         let lacking = match view.tab() {
-            MetricsTab::Overview => view.overview_lacks_report(),
+            MetricsTab::Overview => view.overview_lacks_report(&self.state.outlook),
             MetricsTab::Insights => view.insights().lacks(&self.state.outlook, view.range()),
         };
         if lacking {
@@ -9805,24 +9808,14 @@ impl Application {
 
     /// Opens the `place`-th of the Sessions the open Usage Metrics view lists
     /// as costing the most, closing the view, as a Sidebar row opens one: it
-    /// lives on the Server the report naming it was read from, so the route
-    /// moves now and the attach follows it. Should the Outlook have turned
-    /// from that Server since, the view says so and opens nothing rather
-    /// than ask another Server for it. The Session already open is only
-    /// uncovered.
+    /// lives on the Server the report naming it was read from, the one the
+    /// Outlook names, so the route moves now and the attach follows it. The
+    /// Session already open is only uncovered.
     fn open_metrics_session(&mut self, place: usize) -> ApplicationTransition {
         let view = &mut self.state.metrics_view;
         let Some(session) = view.is_open().then(|| view.top_session(place)).flatten() else {
             return ApplicationTransition::Continue;
         };
-        if session.origin != self.state.outlook {
-            let read_from = session.origin.remote_name().unwrap_or("this machine");
-            view.refuse_opening(format!(
-                "Not opened: the Session is on {read_from}, which the Outlook has turned \
-                 from since — press r to read again"
-            ));
-            return ApplicationTransition::Continue;
-        }
         view.close();
         if self.state.settled_open_session() == Some(&session) {
             return ApplicationTransition::Continue;
@@ -12854,6 +12847,17 @@ impl Application {
             })
             .chain(resumed)
             .collect()
+    }
+
+    /// The read the open Usage Metrics view needs once the Outlook has
+    /// turned beneath it: its showing tab's, from the Server the Outlook now
+    /// names, where it holds none from there nor awaits one.
+    pub fn take_metrics_read_after_turn(&mut self) -> ApplicationTransition {
+        if self.state.metrics_view.is_open() {
+            self.read_metrics_tab_lacking()
+        } else {
+            ApplicationTransition::Continue
+        }
     }
 
     /// Drains listing work queued by the independent Session surfaces. The

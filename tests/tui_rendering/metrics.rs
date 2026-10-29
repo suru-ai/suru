@@ -3851,15 +3851,10 @@ fn where_too_short_to_list_every_session_the_list_and_its_focus_stop_at_the_last
     );
 }
 
-#[test]
-fn a_session_read_from_a_server_the_outlook_has_turned_from_is_not_opened() {
-    let (mut application, _) = thirty_days_of_top_sessions(
-        application_looking_at_studio()
-            .with_session_clock(afternoon)
-            .with_time_zone(zone(NEW_YORK)),
-    );
-    // Removing the Remote turns the Outlook home beneath the view.
-    application
+/// Removes the Remote `studio`, which turns an Outlook turned toward it
+/// home beneath the view, answering the read the view then needs.
+pub(super) fn remove_studio(application: &mut Application) -> ApplicationTransition {
+    let turned = application
         .handle_event(ApplicationEvent::RemoteRemoved {
             name: "studio".to_owned(),
             result: Ok(suru::protocol::RemoteRemoval {
@@ -3868,23 +3863,39 @@ fn a_session_read_from_a_server_the_outlook_has_turned_from_is_not_opened() {
             }),
         })
         .expect("remove the Remote");
-    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
-    let (x, y) = text_position(&buffer, "Fix Windows path fixtures");
-
-    assert_eq!(
-        press_at(&mut application, (x, y)),
-        ApplicationTransition::Continue,
-        "nothing is asked of this machine for studio's Session"
+    assert!(
+        matches!(
+            turned,
+            ApplicationTransition::TurnOutlook {
+                outlook: Outlook::Local,
+                ..
+            }
+        ),
+        "{turned:?}"
     );
+    application.take_metrics_read_after_turn()
+}
+
+#[test]
+fn turning_the_outlook_beneath_the_overview_reads_the_server_it_now_names() {
+    let (mut application, _) = thirty_days_of_top_sessions(
+        application_looking_at_studio()
+            .with_session_clock(afternoon)
+            .with_time_zone(zone(NEW_YORK)),
+    );
+
+    let (origin, request_id, query) = expect_read(remove_studio(&mut application));
+
+    assert_eq!(origin, Outlook::Local);
     let rows = screen(&application);
     assert!(rows[0].starts_with(" Metrics"), "the view stays open");
-    row(&rows, "Not opened: the Session is on studio");
-
-    // Reading again lets the note go.
-    let (origin, request_id, query) = expect_read(press(&mut application, 'r'));
-    assert_eq!(origin, Outlook::Local);
+    row(&rows, "Reading Usage Metrics…");
+    assert!(
+        !rows.join("\n").contains("Fix Windows path fixtures"),
+        "studio's figures are never shown as this machine's: {rows:#?}"
+    );
     answer(&mut application, request_id, Ok(with_top_sessions(&query)));
-    assert!(!screen(&application).join("\n").contains("Not opened"));
+    row(&screen(&application), "Fix Windows path fixtures");
 }
 
 /// The narrowest frame the view draws itself in.

@@ -187,16 +187,11 @@ pub(in crate::tui) fn render(
     // controls, where it has the whole width to say it in.
     let status_y = controls_y + 1;
     let room = usize::from(area.width.saturating_sub(INSET * 2));
-    if let Some(reason) = view.unopened_because() {
-        // A listed Session that could not be opened says why where the
-        // reader looks for what became of their press.
-        let note = truncate_to_width(reason, room);
-        buffer.set_string(area.x + INSET, status_y, note, theme.feedback.error);
-    } else if let Some(refusal) = view.stale_because() {
+    if let Some(refusal) = view.stale_because() {
         // Figures that could not be read again stay, saying why above them.
         let note = truncate_to_width(&stale_note(refusal), room);
         buffer.set_string(area.x + INSET, status_y, note, theme.feedback.error);
-    } else if view.is_reading() && matches!(view.content(), MetricsContent::Report { .. }) {
+    } else if view.is_reading() && matches!(view.content(outlook), MetricsContent::Report { .. }) {
         buffer.set_string(area.x + INSET, status_y, "Refreshing…", subdued);
     }
 
@@ -210,7 +205,7 @@ pub(in crate::tui) fn render(
     // draws, the hidden series among them: All time's count every Turn,
     // untimed ones too, where the chart can place only the timed.
     let mut headed = None;
-    if let MetricsContent::Report { report, .. } = view.content() {
+    if let MetricsContent::Report { report, .. } = view.content(outlook) {
         let whole = if range == MetricsRange::AllTime {
             &report.across_buckets_and_untimed
         } else {
@@ -231,7 +226,7 @@ pub(in crate::tui) fn render(
             headed = Some(whole);
         }
     }
-    if matches!(view.content(), MetricsContent::Report { .. }) {
+    if matches!(view.content(outlook), MetricsContent::Report { .. }) {
         // No legend or Session rows drawn until they say otherwise, so a
         // frame with no room for any leaves none to focus.
         view.record_legend_targets([None; LEGEND_SERIES]);
@@ -243,7 +238,7 @@ pub(in crate::tui) fn render(
     // The wheel steps ranges over where the chart stands, drawn or not, so a
     // range with nothing to draw can still be stepped past.
     view.record_chart_target(body);
-    match view.content() {
+    match view.content(outlook) {
         MetricsContent::Reading => {
             buffer.set_string(body.x, body.y, "Reading Usage Metrics…", subdued);
         }

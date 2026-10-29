@@ -2,8 +2,8 @@
 //! Outlook's Server worked over the range the Overview tab shares with it.
 
 use super::{
-    HEIGHT, NEW_YORK, WIDTH, afternoon, answer, ask, in_new_york, press, press_at, reader_in,
-    report, row, screen, wheel, zone,
+    HEIGHT, NEW_YORK, WIDTH, afternoon, answer, ask, expect_read, in_new_york, press, press_at,
+    reader_in, remove_studio, report, row, screen, wheel, zone,
 };
 use crate::tui_rendering::support::{
     application_looking_at_studio, grace_elapses, invoke, key, rendered_application_buffer,
@@ -639,6 +639,42 @@ fn insights_asked_of_a_remote_that_stopped_answering_are_refused_in_the_tab() {
     let rows = screen(&application);
     row(&rows, "studio is unreachable");
     assert!(row(&rows, "7 days").contains("▐7 days▌"), "{rows:#?}");
+}
+
+/// Answers both reads showing the tab asked for: `insights`, and the
+/// mockup's Workspaces beside them.
+fn answer_reads(application: &mut Application, reads: &InsightsReads, insights: InsightsReport) {
+    answer_insights(application, reads.request_id, Ok(insights));
+    let workspaces = workspaces::spent(&reads.workspaces, &workspaces::MOCKUP);
+    answer(application, reads.workspaces_request_id, Ok(workspaces));
+}
+
+#[test]
+fn turning_the_outlook_beneath_insights_reads_both_tabs_from_the_server_it_now_names() {
+    let mut application = application_looking_at_studio()
+        .with_session_clock(afternoon)
+        .with_time_zone(zone(NEW_YORK));
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(report(&query)));
+    let reads = expect_insights_reads(ctrl(&mut application, KeyCode::Right));
+    answer_reads(&mut application, &reads, worked());
+
+    let reads = expect_insights_reads(remove_studio(&mut application));
+
+    assert_eq!(reads.origin, Outlook::Local);
+    let rows = screen(&application);
+    row(&rows, "Reading Insights…");
+    assert!(
+        !rows.iter().any(|row| row.contains("median 48s")),
+        "{rows:#?}"
+    );
+    answer_reads(&mut application, &reads, worked());
+    let (origin, _, _) = expect_read(ctrl(&mut application, KeyCode::Left));
+    assert_eq!(
+        origin,
+        Outlook::Local,
+        "studio's Overview went with the Outlook, so this machine's is read"
+    );
 }
 
 #[test]
