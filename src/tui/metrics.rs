@@ -422,6 +422,14 @@ impl MetricsView {
         !shown && !asked
     }
 
+    /// Lets go of the Overview's report, as a refresh of Insights does: it
+    /// would otherwise show older figures than Insights beside nothing
+    /// saying so, and is read again when next shown.
+    pub(super) fn forget_overview_report(&mut self) {
+        self.shown = None;
+        self.selected = None;
+    }
+
     pub(super) fn insights(&self) -> &InsightsView {
         &self.insights
     }

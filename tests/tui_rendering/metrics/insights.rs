@@ -678,6 +678,20 @@ fn turning_the_outlook_beneath_insights_reads_both_tabs_from_the_server_it_now_n
 }
 
 #[test]
+fn a_refresh_lets_go_of_the_other_tab_s_figures_so_the_tabs_never_disagree() {
+    let mut application = on_insights(Ok(worked()));
+
+    let reads = expect_insights_reads(press(&mut application, 'r'));
+    answer_reads(&mut application, &reads, worked());
+    let (_, request_id, query) = expect_read(ctrl(&mut application, KeyCode::Left));
+    answer(&mut application, request_id, Ok(report(&query)));
+
+    let (_, request_id, query) = expect_read(press(&mut application, 'r'));
+    answer(&mut application, request_id, Ok(report(&query)));
+    expect_insights_reads(ctrl(&mut application, KeyCode::Right));
+}
+
+#[test]
 fn g_and_i_switch_tabs_where_the_system_takes_ctrl_arrows() {
     let mut application = reader_in(NEW_YORK, afternoon());
     let (_, request_id, query) = ask(&mut application);

@@ -728,6 +728,14 @@ impl InsightsView {
         self.workspaces.forget_all_but(range);
     }
 
+    /// Lets go of every report kept, as a refresh of Overview does: each
+    /// would otherwise show older figures than it beside nothing saying so,
+    /// and is read again when next shown.
+    pub(in crate::tui) fn forget_all(&mut self) {
+        self.reports.kept.clear();
+        self.workspaces.kept.clear();
+    }
+
     /// Lets go of everything read from, or asked of, any Server but the one
     /// `outlook` names, as the Outlook turns toward it.
     pub(in crate::tui) fn keep_only(&mut self, outlook: &Outlook) {

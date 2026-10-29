@@ -9670,13 +9670,19 @@ impl Application {
     }
 
     /// Reads the tab of the open Usage Metrics view showing again, as `r`
-    /// does. Insights lets go of every other range's report first, which
-    /// would otherwise show older figures beside nothing saying so.
+    /// does, letting go first of every figure the other tab keeps, and of
+    /// Insights' other ranges, which would otherwise show older figures
+    /// than the refresh beside nothing saying so: each is read again when
+    /// next shown.
     fn refresh_metrics_tab(&mut self) -> ApplicationTransition {
         let view = &mut self.state.metrics_view;
-        if view.tab() == MetricsTab::Insights {
-            let range = view.range();
-            view.insights_mut().forget_all_but(range);
+        match view.tab() {
+            MetricsTab::Overview => view.insights_mut().forget_all(),
+            MetricsTab::Insights => {
+                let range = view.range();
+                view.insights_mut().forget_all_but(range);
+                view.forget_overview_report();
+            }
         }
         self.read_metrics_tab()
     }
