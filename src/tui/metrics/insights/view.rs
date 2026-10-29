@@ -28,7 +28,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{protocol::CountedCost, theme::Theme};
 
 use super::{
-    super::{UsageMetricsReadRefusal, calendar::MetricsRange, chart::MetricsMeasure},
+    super::{MetricsReadRefusal, calendar::MetricsRange, chart::MetricsMeasure},
     Column, InsightsContent, InsightsPanel, InsightsView, KeptReport, Place, approvals, cache,
     compactions, delegation, heatmap, tools, turns, workspaces,
 };
@@ -73,8 +73,8 @@ pub(in crate::tui) fn render(
         }
         InsightsContent::Refused(refusal) => {
             let heading = match refusal {
-                UsageMetricsReadRefusal::Refused(_) => "The Server refused the Insights read",
-                UsageMetricsReadRefusal::Failed(_) => "Insights could not be read",
+                MetricsReadRefusal::Refused(_) => "The Server refused the Insights read",
+                MetricsReadRefusal::Failed(_) => "Insights could not be read",
             };
             buffer.set_string(
                 body.x,

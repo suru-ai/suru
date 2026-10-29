@@ -23,7 +23,7 @@ use suru::{
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, MetricsMeasure,
-        MetricsRange, SemanticCommandId, UsageMetricsReadRefusal,
+        MetricsRange, MetricsReadRefusal, SemanticCommandId,
     },
 };
 use uuid::Uuid;
@@ -78,7 +78,7 @@ fn expect_read(transition: ApplicationTransition) -> (Outlook, Uuid, UsageMetric
 fn answer(
     application: &mut Application,
     request_id: Uuid,
-    result: Result<UsageMetricsReport, UsageMetricsReadRefusal>,
+    result: Result<UsageMetricsReport, MetricsReadRefusal>,
 ) {
     application
         .handle_event(ApplicationEvent::UsageMetricsRead { request_id, result })
@@ -532,7 +532,7 @@ fn a_refused_read_shows_its_reason() {
     answer(
         &mut application,
         request_id,
-        Err(UsageMetricsReadRefusal::Refused(
+        Err(MetricsReadRefusal::Refused(
             "A Usage Metrics query's buckets overlap".to_owned(),
         )),
     );
@@ -549,7 +549,7 @@ fn a_read_that_never_reached_a_server_says_so() {
     answer(
         &mut application,
         request_id,
-        Err(UsageMetricsReadRefusal::Failed(
+        Err(MetricsReadRefusal::Failed(
             "send Usage Metrics read command: connection refused".to_owned(),
         )),
     );
@@ -569,9 +569,7 @@ fn a_refused_refresh_keeps_the_figures_and_says_why_above_them() {
     answer(
         &mut application,
         second,
-        Err(UsageMetricsReadRefusal::Failed(
-            "connection refused".to_owned(),
-        )),
+        Err(MetricsReadRefusal::Failed("connection refused".to_owned())),
     );
 
     let rows = screen(&application);
@@ -771,7 +769,7 @@ fn r_reads_again_and_only_the_newest_answer_lands() {
     answer(
         &mut application,
         first,
-        Err(UsageMetricsReadRefusal::Failed("too late".to_owned())),
+        Err(MetricsReadRefusal::Failed("too late".to_owned())),
     );
     assert!(!screen(&application).join("\n").contains("too late"));
 

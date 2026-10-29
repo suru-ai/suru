@@ -24,7 +24,7 @@ use crate::{
 use super::{
     super::{
         super::{slots::truncate_to_width, usage::grouped_count},
-        UsageMetricsReadRefusal,
+        MetricsReadRefusal,
         calendar::MetricsRange,
         chart,
     },
@@ -94,8 +94,8 @@ pub(super) fn render(
         }
         WorkspacesContent::Refused(refusal) => {
             let heading = match refusal {
-                UsageMetricsReadRefusal::Refused(_) => "The Server refused the Workspace read",
-                UsageMetricsReadRefusal::Failed(_) => "Workspaces could not be read",
+                MetricsReadRefusal::Refused(_) => "The Server refused the Workspace read",
+                MetricsReadRefusal::Failed(_) => "Workspaces could not be read",
             };
             let style = theme.feedback.error;
             buffer.set_string(area.x, area.y, truncate_to_width(heading, room), style);

@@ -75,8 +75,8 @@ use super::{
         command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
     },
     metrics::{
-        BucketMove, FocusMove, MetricsTab, MetricsView, OfferedBreakdown,
-        Receipt as MetricsReceipt, UsageMetricsReadRefusal,
+        BucketMove, FocusMove, MetricsReadRefusal, MetricsTab, MetricsView, OfferedBreakdown,
+        Receipt as MetricsReceipt,
         calendar::MetricsRange,
         chart::MetricsMeasure,
         insights::{InsightsPanel, InsightsView, ItemMove, PanelMove, RowScroll},
@@ -5425,13 +5425,13 @@ pub enum ApplicationEvent {
     /// answer to [`ApplicationTransition::ReadUsageMetrics`].
     UsageMetricsRead {
         request_id: uuid::Uuid,
-        result: std::result::Result<crate::protocol::UsageMetricsReport, UsageMetricsReadRefusal>,
+        result: std::result::Result<crate::protocol::UsageMetricsReport, MetricsReadRefusal>,
     },
     /// The Insights a Server reported, or why it reported none, in answer to
-    /// [`ApplicationTransition::ReadUsageInsightsAndWorkspaces`].
-    UsageInsightsRead {
+    /// [`ApplicationTransition::ReadInsightsAndWorkspaces`].
+    InsightsRead {
         request_id: uuid::Uuid,
-        result: std::result::Result<crate::protocol::InsightsReport, UsageMetricsReadRefusal>,
+        result: std::result::Result<crate::protocol::InsightsReport, MetricsReadRefusal>,
     },
     /// The Client's own Server's answer to Onboarding's re-check `recheck`:
     /// the Model Catalog as every Provider was read anew, or why it was not.
@@ -5721,12 +5721,12 @@ pub enum ApplicationTransition {
         query: crate::protocol::UsageMetricsQuery,
     },
     /// Ask the Server `origin` names for its Insights, answering with
-    /// [`ApplicationEvent::UsageInsightsRead`] under the same request, and
+    /// [`ApplicationEvent::InsightsRead`] under the same request, and
     /// beside them for its Usage Metrics in one bucket over the same
     /// interval by Workspace, which the Workspaces panel ranks, answering
     /// with [`ApplicationEvent::UsageMetricsRead`] under
     /// `workspaces_request_id`.
-    ReadUsageInsightsAndWorkspaces {
+    ReadInsightsAndWorkspaces {
         origin: Outlook,
         request_id: uuid::Uuid,
         query: crate::protocol::InsightsQuery,
@@ -6295,7 +6295,7 @@ impl Application {
                     MetricsReceipt::Settled => ApplicationTransition::Continue,
                 })
             }
-            ApplicationEvent::UsageInsightsRead { request_id, result } => {
+            ApplicationEvent::InsightsRead { request_id, result } => {
                 self.state
                     .metrics_view
                     .insights_mut()
@@ -7796,7 +7796,7 @@ impl Application {
         if self.state.metrics_view.is_open() {
             self.state
                 .metrics_view
-                .refuse_showing(origin.clone(), UsageMetricsReadRefusal::Failed(refusal));
+                .refuse_showing(origin.clone(), MetricsReadRefusal::Failed(refusal));
             return true;
         }
         self.state.submission_error = Some(refusal);
@@ -9682,13 +9682,13 @@ impl Application {
     fn read_metrics_tab(&mut self) -> ApplicationTransition {
         match self.state.metrics_view.tab() {
             MetricsTab::Overview => self.read_usage_metrics(),
-            MetricsTab::Insights => self.read_usage_insights(),
+            MetricsTab::Insights => self.read_insights(),
         }
     }
 
     /// Asks the Server the Outlook is turned toward for the Insights of the
     /// Usage Metrics view's range, cut by the reader's calendar now.
-    fn read_usage_insights(&mut self) -> ApplicationTransition {
+    fn read_insights(&mut self) -> ApplicationTransition {
         let origin = self.state.outlook.clone();
         if self.refuse_if_unreachable(&origin) {
             return ApplicationTransition::Continue;
@@ -9698,7 +9698,7 @@ impl Application {
         let range = self.state.metrics_view.range();
         let insights = self.state.metrics_view.insights_mut();
         match insights.ask(origin.clone(), range, now, &zone) {
-            Some(asked) => ApplicationTransition::ReadUsageInsightsAndWorkspaces {
+            Some(asked) => ApplicationTransition::ReadInsightsAndWorkspaces {
                 origin,
                 request_id: asked.request_id,
                 query: asked.query,

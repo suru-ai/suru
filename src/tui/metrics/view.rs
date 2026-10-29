@@ -27,8 +27,8 @@ use crate::{
 
 use super::{
     super::slots::truncate_to_width,
-    BREAKDOWNS, BarStrip, FocusedRow, LEGEND_SERIES, MetricsContent, MetricsTab, MetricsView,
-    OfferedBreakdown, UsageMetricsReadRefusal,
+    BREAKDOWNS, BarStrip, FocusedRow, LEGEND_SERIES, MetricsContent, MetricsReadRefusal,
+    MetricsTab, MetricsView, OfferedBreakdown,
     calendar::{MetricsRange, RangeBuckets},
     chart::{self, MetricsMeasure, Series},
     headline::{self, HEADLINE_ROWS},
@@ -249,8 +249,8 @@ pub(in crate::tui) fn render(
         }
         MetricsContent::Refused(refusal) => {
             let heading = match refusal {
-                UsageMetricsReadRefusal::Refused(_) => "The Server refused the Usage Metrics read",
-                UsageMetricsReadRefusal::Failed(_) => "Usage Metrics could not be read",
+                MetricsReadRefusal::Refused(_) => "The Server refused the Usage Metrics read",
+                MetricsReadRefusal::Failed(_) => "Usage Metrics could not be read",
             };
             buffer.set_string(
                 body.x,
@@ -1041,10 +1041,10 @@ fn overcounts(figures: &[(u64, bool)], measure: MetricsMeasure, whole: u64) -> b
 }
 
 /// What the view says of figures a refresh could not replace.
-fn stale_note(refusal: &UsageMetricsReadRefusal) -> String {
+fn stale_note(refusal: &MetricsReadRefusal) -> String {
     match refusal {
-        UsageMetricsReadRefusal::Refused(reason) => format!("Not refreshed: {reason}"),
-        UsageMetricsReadRefusal::Failed(reason) => format!("Could not refresh: {reason}"),
+        MetricsReadRefusal::Refused(reason) => format!("Not refreshed: {reason}"),
+        MetricsReadRefusal::Failed(reason) => format!("Could not refresh: {reason}"),
     }
 }
 

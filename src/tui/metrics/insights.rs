@@ -50,7 +50,7 @@ use crate::protocol::{
 };
 
 use super::{
-    UsageMetricsReadRefusal,
+    MetricsReadRefusal,
     calendar::{self, MetricsRange},
 };
 use heatmap::Heatmap;
@@ -382,14 +382,14 @@ pub(in crate::tui) struct InsightsAsk {
 /// refused.
 pub(super) enum WorkspacesContent<'a> {
     Reading,
-    Refused(&'a UsageMetricsReadRefusal),
+    Refused(&'a MetricsReadRefusal),
     Rows(&'a [WorkspaceRow]),
 }
 
 /// What the tab shows beneath the range bar.
 pub(super) enum InsightsContent<'a> {
     Reading,
-    Refused(&'a UsageMetricsReadRefusal),
+    Refused(&'a MetricsReadRefusal),
     Report(&'a KeptReport),
 }
 
@@ -412,7 +412,7 @@ struct RangeReads<T, C = ()> {
     /// ranges reads nothing again. Only what was read from the Outlook the
     /// view is turned toward is shown.
     kept: HashMap<MetricsRange, (Outlook, T)>,
-    refused: Option<(Outlook, MetricsRange, UsageMetricsReadRefusal)>,
+    refused: Option<(Outlook, MetricsRange, MetricsReadRefusal)>,
 }
 
 /// A read awaited: its request, the Outlook it asked, the range it asked
@@ -452,7 +452,7 @@ impl<T, C> RangeReads<T, C> {
     }
 
     /// Why the last read of `range` from `origin` was refused, where it was.
-    fn refusal(&self, origin: &Outlook, range: MetricsRange) -> Option<&UsageMetricsReadRefusal> {
+    fn refusal(&self, origin: &Outlook, range: MetricsRange) -> Option<&MetricsReadRefusal> {
         self.refused
             .as_ref()
             .filter(|(refused_by, refused, _)| refused_by == origin && *refused == range)
@@ -484,7 +484,7 @@ impl<T, C> RangeReads<T, C> {
     fn receive<A>(
         &mut self,
         request_id: Uuid,
-        result: Result<A, UsageMetricsReadRefusal>,
+        result: Result<A, MetricsReadRefusal>,
         keep: impl FnOnce(A, C) -> T,
     ) {
         if !self.awaits(request_id) {
@@ -502,7 +502,7 @@ impl<T, C> RangeReads<T, C> {
 
     /// Says why `range` has nothing fresh from `origin`, giving up the read
     /// awaited. What is already kept for it stays, the refusal beside it.
-    fn refuse(&mut self, origin: Outlook, range: MetricsRange, refusal: UsageMetricsReadRefusal) {
+    fn refuse(&mut self, origin: Outlook, range: MetricsRange, refusal: MetricsReadRefusal) {
         self.asked = None;
         self.refused = Some((origin, range, refusal));
     }
@@ -678,7 +678,7 @@ impl InsightsView {
             self.refuse(
                 origin,
                 range,
-                UsageMetricsReadRefusal::Failed(
+                MetricsReadRefusal::Failed(
                     "The clock reads a moment the calendar cannot place".to_owned(),
                 ),
             );
@@ -715,7 +715,7 @@ impl InsightsView {
     pub(in crate::tui) fn receive(
         &mut self,
         request_id: Uuid,
-        result: Result<InsightsReport, UsageMetricsReadRefusal>,
+        result: Result<InsightsReport, MetricsReadRefusal>,
     ) {
         if result.is_err() && self.reports.awaits(request_id) {
             self.workspaces.stop_awaiting();
@@ -738,7 +738,7 @@ impl InsightsView {
     pub(in crate::tui) fn receive_workspaces(
         &mut self,
         request_id: Uuid,
-        result: Result<UsageMetricsReport, UsageMetricsReadRefusal>,
+        result: Result<UsageMetricsReport, MetricsReadRefusal>,
     ) {
         self.workspaces
             .receive(request_id, result, |report, ()| workspaces::rows(&report));
@@ -751,7 +751,7 @@ impl InsightsView {
         &mut self,
         origin: Outlook,
         range: MetricsRange,
-        refusal: UsageMetricsReadRefusal,
+        refusal: MetricsReadRefusal,
     ) {
         self.reports.refuse(origin, range, refusal);
         self.workspaces.stop_awaiting();
@@ -822,7 +822,7 @@ impl InsightsView {
         &self,
         origin: &Outlook,
         range: MetricsRange,
-    ) -> Option<&UsageMetricsReadRefusal> {
+    ) -> Option<&MetricsReadRefusal> {
         self.report(origin, range)
             .and_then(|_| self.reports.refusal(origin, range))
     }

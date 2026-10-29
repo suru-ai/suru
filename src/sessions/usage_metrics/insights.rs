@@ -52,7 +52,7 @@ use super::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InsightsRefusal {
     /// Its interval ends before it begins.
-    Backwards,
+    OutOfOrder,
     /// Storage could not be read for the Activities of the interval's Turns.
     Storage,
 }
@@ -65,14 +65,14 @@ impl SessionStore {
     /// storage holds, on a blocking task once
     /// the lock is let go (ADR 0056), and placed in time by the Turns that
     /// own them, which the copy taken under the lock holds.
-    pub(crate) async fn usage_insights(
+    pub(crate) async fn insights(
         &self,
         query: &InsightsQuery,
         rates: &dyn CacheRateLookup,
     ) -> Result<InsightsReport, InsightsRefusal> {
         let interval = query.interval;
         if interval.end < interval.start {
-            return Err(InsightsRefusal::Backwards);
+            return Err(InsightsRefusal::OutOfOrder);
         }
         let (copied, repository, sidekick_workspace) = {
             let state = self

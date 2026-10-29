@@ -1967,7 +1967,7 @@ async fn start(
         )
         .route("/v1/sessions", get(list_sessions).post(create_session))
         .route("/v1/usage-metrics", post(read_usage_metrics))
-        .route("/v1/usage-metrics/insights", post(read_usage_insights))
+        .route("/v1/usage-metrics/insights", post(read_insights))
         .merge(
             Router::new()
                 .route(
@@ -3769,19 +3769,15 @@ async fn read_usage_metrics(State(state): State<AppState>, request: Request) -> 
 /// its Usage Metrics: the query rides the body, and the read changes nothing
 /// and reads no history in. The Tools it counts are read from storage, and
 /// a failure to read them is the Server's.
-async fn read_usage_insights(State(state): State<AppState>, request: Request) -> Response {
+async fn read_insights(State(state): State<AppState>, request: Request) -> Response {
     let query =
         match decode_session_command::<InsightsQuery>(&state, request, "Insights read").await {
             Ok(query) => query,
             Err(response) => return response,
         };
-    match state
-        .sessions
-        .usage_insights(&query, &state.cache_rates)
-        .await
-    {
+    match state.sessions.insights(&query, &state.cache_rates).await {
         Ok(report) => Json(report).into_response(),
-        Err(InsightsRefusal::Backwards) => session_error_response(
+        Err(InsightsRefusal::OutOfOrder) => session_error_response(
             StatusCode::BAD_REQUEST,
             SessionErrorCode::InvalidUsageMetricsQuery,
             "An Insights query's interval ends before it begins".to_owned(),

@@ -20,8 +20,8 @@ use suru::{
         TurnInsights, UsageMetricsInterval, UsageMetricsQuery,
     },
     tui::{
-        Application, ApplicationEvent, ApplicationTransition, CommandId, InsightsPanel, MetricsTab,
-        SemanticCommandId, UsageMetricsReadRefusal,
+        Application, ApplicationEvent, ApplicationTransition, CommandId, InsightsPanel,
+        MetricsReadRefusal, MetricsTab, SemanticCommandId,
     },
 };
 use uuid::Uuid;
@@ -52,7 +52,7 @@ struct InsightsReads {
 
 fn expect_insights_reads(transition: ApplicationTransition) -> InsightsReads {
     match transition {
-        ApplicationTransition::ReadUsageInsightsAndWorkspaces {
+        ApplicationTransition::ReadInsightsAndWorkspaces {
             origin,
             request_id,
             query,
@@ -84,10 +84,10 @@ fn expect_metrics_read(transition: ApplicationTransition) -> UsageMetricsQuery {
 fn answer_insights(
     application: &mut Application,
     request_id: Uuid,
-    result: Result<InsightsReport, UsageMetricsReadRefusal>,
+    result: Result<InsightsReport, MetricsReadRefusal>,
 ) {
     application
-        .handle_event(ApplicationEvent::UsageInsightsRead { request_id, result })
+        .handle_event(ApplicationEvent::InsightsRead { request_id, result })
         .expect("deliver the Insights");
 }
 
@@ -265,7 +265,7 @@ fn worked_hours() -> Vec<QuarterHourTurns> {
 
 /// The view opened on 30 days, its Overview answered, then Insights shown,
 /// asked, and answered with `insights`.
-fn on_insights(insights: Result<InsightsReport, UsageMetricsReadRefusal>) -> Application {
+fn on_insights(insights: Result<InsightsReport, MetricsReadRefusal>) -> Application {
     let mut application = reader_in(NEW_YORK, afternoon());
     let (_, request_id, query) = ask(&mut application);
     answer(&mut application, request_id, Ok(report(&query)));
@@ -605,7 +605,7 @@ fn turns_that_ended_without_both_moments_are_counted_but_give_no_durations() {
 
 #[test]
 fn a_refused_read_shows_its_reason_in_place_of_the_panels() {
-    let application = on_insights(Err(UsageMetricsReadRefusal::Refused(
+    let application = on_insights(Err(MetricsReadRefusal::Refused(
         "An Insights query's interval ends before it begins".to_owned(),
     )));
 
@@ -712,17 +712,13 @@ fn a_tab_whose_read_was_refused_reads_again_when_shown_again() {
     answer(
         &mut application,
         request_id,
-        Err(UsageMetricsReadRefusal::Failed(
-            "the line dropped".to_owned(),
-        )),
+        Err(MetricsReadRefusal::Failed("the line dropped".to_owned())),
     );
     let (_, request_id, _) = expect_insights_read(ctrl(&mut application, KeyCode::Right));
     answer_insights(
         &mut application,
         request_id,
-        Err(UsageMetricsReadRefusal::Failed(
-            "the line dropped".to_owned(),
-        )),
+        Err(MetricsReadRefusal::Failed("the line dropped".to_owned())),
     );
 
     expect_metrics_read(ctrl(&mut application, KeyCode::Left));

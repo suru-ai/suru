@@ -46,7 +46,7 @@ async fn priced_at(
     rates: &RateTable,
 ) -> InsightsReport {
     store
-        .usage_insights(query, rates)
+        .insights(query, rates)
         .await
         .expect("a well-formed query is answered")
 }
@@ -211,13 +211,13 @@ async fn an_interval_that_runs_backwards_is_refused_and_an_empty_one_is_not() {
 
     assert_eq!(
         store
-            .usage_insights(&over(END, START), &RateTable::default())
+            .insights(&over(END, START), &RateTable::default())
             .await,
-        Err(InsightsRefusal::Backwards)
+        Err(InsightsRefusal::OutOfOrder)
     );
     assert_eq!(
         store
-            .usage_insights(&over(START, START), &RateTable::default())
+            .insights(&over(START, START), &RateTable::default())
             .await,
         Ok(InsightsReport::default())
     );

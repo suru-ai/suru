@@ -128,7 +128,7 @@ impl MetricsTab {
 
 /// Why the view has no fresh figures to show.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum UsageMetricsReadRefusal {
+pub enum MetricsReadRefusal {
     /// The Server answered, and refused the read, in its own words.
     Refused(String),
     /// The read never reached a Server that could answer it, for the reason
@@ -136,7 +136,7 @@ pub enum UsageMetricsReadRefusal {
     Failed(String),
 }
 
-impl UsageMetricsReadRefusal {
+impl MetricsReadRefusal {
     pub(super) fn reason(&self) -> &str {
         match self {
             Self::Refused(reason) | Self::Failed(reason) => reason,
@@ -162,7 +162,7 @@ pub(super) struct MetricsView {
     /// Why the last Session the view was asked to open was not opened.
     unopened: Option<String>,
     /// Why the last read gave no report.
-    refusal: Option<UsageMetricsReadRefusal>,
+    refusal: Option<MetricsReadRefusal>,
     /// The bucket whose figures the legend shows in place of the range's,
     /// by its place among the shown report's buckets.
     selected: Option<usize>,
@@ -342,7 +342,7 @@ pub(super) enum BucketMove {
 /// What the view shows beneath its title bar.
 pub(super) enum MetricsContent<'a> {
     Reading,
-    Refused(&'a UsageMetricsReadRefusal),
+    Refused(&'a MetricsReadRefusal),
     Report {
         buckets: &'a RangeBuckets,
         report: &'a UsageMetricsReport,
@@ -406,7 +406,7 @@ impl MetricsView {
     }
 
     /// Says why the tab showing has no fresh figures from `origin`.
-    pub(super) fn refuse_showing(&mut self, origin: Outlook, refusal: UsageMetricsReadRefusal) {
+    pub(super) fn refuse_showing(&mut self, origin: Outlook, refusal: MetricsReadRefusal) {
         match self.tab {
             MetricsTab::Overview => self.refuse(refusal),
             MetricsTab::Insights => self.insights.refuse(origin, self.range, refusal),
@@ -716,7 +716,7 @@ impl MetricsView {
             EarliestTurn::Unknown | EarliestTurn::Untimed => None,
         };
         let Some(buckets) = calendar::resolve(self.range, now, zone, earliest) else {
-            self.refuse(UsageMetricsReadRefusal::Failed(
+            self.refuse(MetricsReadRefusal::Failed(
                 "The clock reads a moment the calendar cannot place".to_owned(),
             ));
             return None;
@@ -757,7 +757,7 @@ impl MetricsView {
     pub(super) fn receive(
         &mut self,
         request_id: Uuid,
-        result: Result<UsageMetricsReport, UsageMetricsReadRefusal>,
+        result: Result<UsageMetricsReport, MetricsReadRefusal>,
     ) -> Receipt {
         if !self
             .asked
@@ -817,13 +817,13 @@ impl MetricsView {
 
     /// Says why the view has no fresh figures, giving up any read it
     /// awaits. A report already shown stays, with the refusal beside it.
-    pub(super) fn refuse(&mut self, refusal: UsageMetricsReadRefusal) {
+    pub(super) fn refuse(&mut self, refusal: MetricsReadRefusal) {
         self.asked = None;
         self.refusal = Some(refusal);
     }
 
     /// Why the figures shown could not be read again, where they could not.
-    pub(super) fn stale_because(&self) -> Option<&UsageMetricsReadRefusal> {
+    pub(super) fn stale_because(&self) -> Option<&MetricsReadRefusal> {
         self.shown.as_ref().and(self.refusal.as_ref())
     }
 

@@ -17,8 +17,7 @@ use suru::{
         UsageMetricsReport, WorkspaceId,
     },
     tui::{
-        Application, ApplicationTransition, InsightsPanel, SemanticCommandId,
-        UsageMetricsReadRefusal,
+        Application, ApplicationTransition, InsightsPanel, MetricsReadRefusal, SemanticCommandId,
     },
 };
 
@@ -116,7 +115,7 @@ pub(super) const MOCKUP: [(&str, f64, bool); 8] = [
 /// answered: the insights with the mockup's, and the Workspaces by what
 /// `workspaces` makes of the query.
 fn on_workspaces(
-    workspaces: impl FnOnce(&UsageMetricsQuery) -> Result<UsageMetricsReport, UsageMetricsReadRefusal>,
+    workspaces: impl FnOnce(&UsageMetricsQuery) -> Result<UsageMetricsReport, MetricsReadRefusal>,
 ) -> Application {
     let mut application = reader_in(NEW_YORK, afternoon());
     let (_, request_id, query) = ask(&mut application);
@@ -195,7 +194,7 @@ fn the_panel_says_while_its_workspaces_are_read_and_why_they_could_not_be() {
     answer(
         &mut application,
         reads.workspaces_request_id,
-        Err(UsageMetricsReadRefusal::Refused(
+        Err(MetricsReadRefusal::Refused(
             "metrics are switched off".to_owned(),
         )),
     );
