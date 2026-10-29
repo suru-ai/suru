@@ -1,5 +1,7 @@
 # Run Suru's own Provider work as Errands
 
+_Amended by ADR-0057: Suru now keeps a record of each Errand's Usage and Cost beside its answer; an Errand still belongs to no Session, appears in no Transcript, and is never a Turn._
+
 Work Suru does for itself rather than for the user — deriving a Session's Title and Emoji today, compaction and summarization later — runs as an Errand: one Prompt to a Provider, one reply shaped by a schema the Errand supplies, carrying no Tools and belonging to no Session. A Provider fulfils an Errand through its harness's own one-shot mode where it has one (`codex exec --ephemeral`, `claude -p`), and otherwise by starting a Provider-side session and discarding it. The alternative — running Errands through the ordinary Session machinery behind an "ephemeral" flag — was rejected because it turns "this leaves no trace" into a rule five modules have to keep rather than a property of the seam, and because it hands a call that writes six words the whole apparatus of Tools and Resume State it must never use.
 
 ## Consequences
