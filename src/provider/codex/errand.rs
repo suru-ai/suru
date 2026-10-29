@@ -23,7 +23,7 @@ use serde_json::Value;
 use super::{
     REASONING_EFFORT_OPTION_ID, codex_error, codex_error_context,
     projection::has_billable_usage,
-    wire::{ExecTokenBreakdown, NativeServiceTierOverride, lower_turn_options},
+    wire::{NativeServiceTierOverride, NativeTokenBreakdown, lower_turn_options},
 };
 use crate::{
     pricing::{ModelsDevModel, PricingSource},
@@ -111,15 +111,19 @@ pub(super) async fn run(
         .await
         .map_err(|error| codex_error_context(ERRAND_FAILED, error))?;
     let events = ExecEvents::read(&finished.stdout);
-    let consumption = consumption(events.usage, pricing.as_deref(), model).await;
+    let consumption = consumption(events.usage, pricing.as_deref(), model);
     if !finished.status.success() {
-        // Codex says why in its event stream, or on its stderr where it failed
-        // before it had one, and the Log is the only place an Errand failure
-        // is ever reported — so what it said is carried through rather than
-        // reduced to an exit status nobody can act on.
+        // The Log is the only place an Errand failure is ever reported, so
+        // whatever Codex said of it is carried through rather than reduced to
+        // an exit status nobody can act on: the Turn's own failure where there
+        // was one, else its stderr, where it fails before any Turn begins, and
+        // only then the last error its stream reported, which may have been
+        // one it went on to retry.
+        let stderr = Some(finished.stderr.trim().to_owned()).filter(|said| !said.is_empty());
         let said = events
-            .failure
-            .or_else(|| Some(finished.stderr.trim().to_owned()).filter(|said| !said.is_empty()))
+            .turn_failure
+            .or(stderr)
+            .or(events.last_error)
             .unwrap_or_else(|| format!("Codex exited with {}", finished.status));
         return Err(ErrandFailed::measured(
             codex_error(format!("{ERRAND_FAILED}: {said}")),
@@ -134,21 +138,25 @@ pub(super) async fn run(
 
 /// What the run consumed, and its Cost where the rate table prices `model`.
 /// Codex states tokens and never dollars, so the Cost is always Estimated.
-async fn consumption(
+///
+/// Only rates already in hand are read, as a Codex Turn reads them: the
+/// answer is in by now, and asking models.dev could hold it past the Errand's
+/// deadline, losing the answer and its Usage for the sake of a Cost. A table
+/// no fetch has filled, or one overdue for a refresh, leaves the Cost absent.
+fn consumption(
     usage: Option<Usage>,
     pricing: Option<&PricingSource>,
     model: ModelId,
 ) -> ErrandConsumption {
-    let cost = match (&usage, pricing) {
-        (Some(usage), Some(pricing)) => pricing
-            .estimate(
+    let cost = pricing
+        .zip(usage.as_ref())
+        .and_then(|(pricing, usage)| {
+            pricing.estimate_cached(
                 &ModelsDevModel::new(super::MODELS_DEV_PROVIDER, model),
                 usage,
             )
-            .await
-            .map(ErrandCost::from),
-        _ => None,
-    };
+        })
+        .map(ErrandCost::from);
     ErrandConsumption { usage, cost }
 }
 
@@ -159,7 +167,7 @@ async fn consumption(
 #[serde(tag = "type")]
 enum ExecEvent {
     #[serde(rename = "turn.completed")]
-    TurnCompleted { usage: ExecTokenBreakdown },
+    TurnCompleted { usage: NativeTokenBreakdown },
     #[serde(rename = "turn.failed")]
     TurnFailed { error: ExecError },
     #[serde(rename = "error")]
@@ -181,9 +189,12 @@ struct ExecEvents {
     /// usage when it never received a reading, and that is a figure nobody
     /// measured rather than an Errand that consumed nothing.
     usage: Option<Usage>,
-    /// Why the run failed: the Turn's own failure, else the last error the
-    /// stream reported.
-    failure: Option<String>,
+    /// Why the Turn failed, where it said.
+    turn_failure: Option<String>,
+    /// The last error the stream reported. Codex reports transient errors it
+    /// goes on to retry this way too, without saying which they were, so one
+    /// may not be why the run failed.
+    last_error: Option<String>,
 }
 
 impl ExecEvents {
@@ -192,22 +203,22 @@ impl ExecEvents {
     /// measurement lost rather than a failed Errand, so it is passed over.
     fn read(stdout: &str) -> Self {
         let mut events = Self::default();
-        let mut turn_failure = None;
-        let mut stream_error = None;
         for event in stdout
             .lines()
             .filter_map(|line| serde_json::from_str::<ExecEvent>(line).ok())
         {
             match event {
                 ExecEvent::TurnCompleted { usage } => {
-                    events.usage = Some(usage.into_usage()).filter(has_billable_usage);
+                    // The total is the thread's since it opened, and a one-shot
+                    // run's thread is its own, so the whole of it is the run's.
+                    events.usage =
+                        Some(usage.into_cumulative().into_usage()).filter(has_billable_usage);
                 }
-                ExecEvent::TurnFailed { error } => turn_failure = Some(error.message),
-                ExecEvent::Error(error) => stream_error = Some(error.message),
+                ExecEvent::TurnFailed { error } => events.turn_failure = Some(error.message),
+                ExecEvent::Error(error) => events.last_error = Some(error.message),
                 ExecEvent::Other => {}
             }
         }
-        events.failure = turn_failure.or(stream_error);
         events
     }
 }

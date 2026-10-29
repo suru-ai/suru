@@ -15,10 +15,12 @@ use crate::codex_integration::{
     support::{ScriptedCodex, assert_process_exited},
     usage::priced_lookup,
 };
+use axum::{Json, Router, routing::get};
 use serde_json::json;
 use std::sync::Arc;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
+    pricing::PricingSource,
     protocol::{
         AgentSelection, Cost, CostBasis, CreateSessionRequest, InitialPrompt, ModelId, PromptId,
         ProviderId, SessionId, SessionTitleChanged, SkillCatalogRequest, SkillCatalogStatus,
@@ -30,7 +32,10 @@ use suru::{
     },
     server::{self, ServerConfig, ServerTimings},
 };
-use tokio::time::Duration;
+use tokio::{
+    net::TcpListener,
+    time::{Duration, timeout},
+};
 
 /// The first Prompt every Session here is started with, and so the Title each
 /// one carries until an Errand replaces it.
@@ -531,8 +536,16 @@ fn exec_printing(events: &str, answer: Option<&str>, status: u8) -> String {
 /// Runs one Errand at `model` straight through Codex's runtime, against the
 /// fixture rate table, with `codex exec` answering as `body` says.
 async fn run_errand(model: &str, body: &str) -> Result<ErrandAnswer, ErrandFailed> {
-    let codex = scripted_codex(CATALOG_WITH_ERRAND_MODEL, body);
     let (pricing, _pricing_cache) = priced_lookup().await;
+    run_errand_with_pricing(model, body, pricing).await
+}
+
+async fn run_errand_with_pricing(
+    model: &str,
+    body: &str,
+    pricing: Arc<PricingSource>,
+) -> Result<ErrandAnswer, ErrandFailed> {
+    let codex = scripted_codex(CATALOG_WITH_ERRAND_MODEL, body);
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     CodexRuntime::new(codex.executable())
         .with_pricing_source(pricing)
@@ -730,4 +743,107 @@ async fn a_codex_errand_failing_before_its_turn_completes_is_unmeasured() {
         failed.to_string().contains("not signed in"),
         "stderr is carried through where no event says why: {failed}"
     );
+}
+
+/// A rate table whose source answers `served` fetches with the fixture's
+/// rates and then hangs every later fetch for far longer than any Errand
+/// waits, so a lookup that went to the network would be seen waiting.
+async fn rates_that_stall_after(served: usize) -> (Arc<PricingSource>, tempfile::TempDir) {
+    let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/api.json",
+        get(move || {
+            let fetches = fetches.clone();
+            async move {
+                if fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < served {
+                    return Json(json!({"openai":{"models":{"priced-fixture":{"cost":{
+                        "input":2,"output":4,"cache_read":0.5,"cache_write":0.25
+                    }}}}}));
+                }
+                std::future::pending::<Json<serde_json::Value>>().await
+            }
+        }),
+    );
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind pricing fixture");
+    let endpoint = format!("http://{}/api.json", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let cache = tempfile::tempdir().expect("create pricing cache directory");
+    let pricing = PricingSource::new(cache.path())
+        .with_source_endpoint(endpoint)
+        .with_refresh_interval(Duration::from_millis(20))
+        .with_fetch_timeout(Duration::from_secs(60));
+    (Arc::new(pricing), cache)
+}
+
+/// An Errand that has its answer never waits on the rate table: one no fetch
+/// has filled, or one overdue for a refresh, leaves the Cost absent rather
+/// than holding the answer — and the Usage with it — past the Errand's
+/// deadline while models.dev is asked.
+#[tokio::test]
+async fn a_cold_or_stale_rate_table_leaves_a_codex_errands_cost_absent_without_waiting() {
+    for served in [0, 1] {
+        let (pricing, _cache) = rates_that_stall_after(served).await;
+        if served > 0 {
+            pricing.prime().await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let answer = timeout(
+            Duration::from_secs(5),
+            run_errand_with_pricing(
+                PRICED_MODEL,
+                &exec_printing(ANSWERED_EVENTS, Some(r#"{"title":"Unpriced today"}"#), 0),
+                pricing,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("a table served {served} times holds up the Errand"))
+        .expect("the Errand answers");
+
+        assert_eq!(
+            answer.consumption,
+            ErrandConsumption {
+                usage: Some(answered_usage()),
+                cost: None,
+            },
+            "a table served {served} times prices nothing"
+        );
+    }
+}
+
+/// Codex reports transient errors it goes on to retry as `error` events, so
+/// one is the least of what says why a run failed: the Turn's own failure
+/// comes first, then stderr, and the last such error only where neither said.
+#[tokio::test]
+async fn a_failed_codex_errand_is_explained_by_its_turn_then_stderr_then_its_last_error() {
+    let retried = r#"{"type":"error","message":"Reconnecting... 1/5"}"#;
+    let cases = [
+        (
+            format!(
+                "{retried}\n{}",
+                r#"{"type":"turn.failed","error":{"message":"usage limit reached"}}"#
+            ),
+            "  printf '%s\\n' 'a warning' >&2\n",
+            "usage limit reached",
+        ),
+        (
+            retried.to_owned(),
+            "  printf '%s\\n' 'not signed in' >&2\n",
+            "not signed in",
+        ),
+        (retried.to_owned(), "", "Reconnecting... 1/5"),
+    ];
+    for (events, stderr, reason) in cases {
+        let body = format!("{stderr}{}", exec_printing(&events, None, 1));
+        let failed = run_errand(PRICED_MODEL, &body)
+            .await
+            .expect_err("a failed run is no answer");
+        assert!(
+            failed.to_string().contains(reason),
+            "{events:?} with stderr {stderr:?} is explained by {reason:?}: {failed}"
+        );
+    }
 }

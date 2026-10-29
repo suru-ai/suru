@@ -1364,21 +1364,23 @@ pub(super) struct NativeThreadTokenUsage {
 /// One Codex token breakdown as the wire states it. Every count is optional so
 /// a build that omits one leaves the part absent rather than reading as zero,
 /// and the cached and cache-write counts are subsets of `input_tokens` just as
-/// the reasoning count is a subset of `output_tokens`.
+/// the reasoning count is a subset of `output_tokens`. The app-server spells
+/// it in camelCase; `codex exec --json` states the same breakdown on its
+/// `turn.completed` event in snake_case, which the aliases read.
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct NativeTokenBreakdown {
-    #[serde(default)]
+    #[serde(default, alias = "total_tokens")]
     total_tokens: Option<i64>,
-    #[serde(default)]
+    #[serde(default, alias = "input_tokens")]
     input_tokens: Option<i64>,
-    #[serde(default)]
+    #[serde(default, alias = "cached_input_tokens")]
     cached_input_tokens: Option<i64>,
-    #[serde(default)]
+    #[serde(default, alias = "cache_write_input_tokens")]
     cache_write_input_tokens: Option<i64>,
-    #[serde(default)]
+    #[serde(default, alias = "output_tokens")]
     output_tokens: Option<i64>,
-    #[serde(default)]
+    #[serde(default, alias = "reasoning_output_tokens")]
     reasoning_output_tokens: Option<i64>,
 }
 
@@ -1403,7 +1405,7 @@ impl NativeTokenBreakdown {
     /// Reasoning leaves `output_tokens` — so no consumer downstream ever
     /// subtracts, and a figure that cannot be represented degrades to absence
     /// rather than to a wrong number.
-    fn into_cumulative(self) -> NativeCumulativeUsage {
+    pub(super) fn into_cumulative(self) -> NativeCumulativeUsage {
         NativeCumulativeUsage {
             fresh_input_tokens: exclusive_count(
                 self.input_tokens,
@@ -1414,41 +1416,6 @@ impl NativeTokenBreakdown {
             output_tokens: exclusive_count(self.output_tokens, [self.reasoning_output_tokens]),
             reasoning_tokens: reported_count(self.reasoning_output_tokens),
         }
-    }
-}
-
-/// The same breakdown as `codex exec --json` spells it on a `turn.completed`
-/// event: snake_case, and stating the thread's running total as the
-/// app-server's `total` does. Every count is optional for the same reason.
-#[derive(Deserialize)]
-pub(super) struct ExecTokenBreakdown {
-    #[serde(default)]
-    input_tokens: Option<i64>,
-    #[serde(default)]
-    cached_input_tokens: Option<i64>,
-    #[serde(default)]
-    cache_write_input_tokens: Option<i64>,
-    #[serde(default)]
-    output_tokens: Option<i64>,
-    #[serde(default)]
-    reasoning_output_tokens: Option<i64>,
-}
-
-impl ExecTokenBreakdown {
-    /// What the run consumed, in the parts a Codex Turn's Usage is made of.
-    /// The total is the thread's since it opened, and a one-shot run's thread
-    /// is its own, so the whole of it is the run's.
-    pub(super) fn into_usage(self) -> Usage {
-        NativeTokenBreakdown {
-            total_tokens: None,
-            input_tokens: self.input_tokens,
-            cached_input_tokens: self.cached_input_tokens,
-            cache_write_input_tokens: self.cache_write_input_tokens,
-            output_tokens: self.output_tokens,
-            reasoning_output_tokens: self.reasoning_output_tokens,
-        }
-        .into_cumulative()
-        .since(NativeCumulativeUsage::default())
     }
 }
 
@@ -1476,6 +1443,12 @@ impl NativeCumulativeUsage {
             output_tokens: furthest_count(self.output_tokens, other.output_tokens),
             reasoning_tokens: furthest_count(self.reasoning_tokens, other.reasoning_tokens),
         }
+    }
+
+    /// What was consumed since the thread opened: the whole of this total,
+    /// for a thread whose every Turn is the caller's own.
+    pub(super) fn into_usage(self) -> Usage {
+        self.since(Self::default())
     }
 
     /// What was consumed between `baseline` and this reading.
