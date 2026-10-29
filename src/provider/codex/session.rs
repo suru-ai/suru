@@ -273,7 +273,8 @@ impl ProviderRuntime for CodexRuntime {
     /// driven over, which persists nothing and is never resumed.
     fn run_errand(&self, errand: ProviderErrand) -> ErrandFuture<'_> {
         let executable = self.executable.clone();
-        Box::pin(async move { super::errand::run(executable, errand).await })
+        let pricing = self.pricing.clone();
+        Box::pin(async move { super::errand::run(executable, pricing, errand).await })
     }
 
     /// The models.dev rates this runtime's Costs are estimated from, so a

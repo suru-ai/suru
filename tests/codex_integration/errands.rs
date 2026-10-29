@@ -13,15 +13,21 @@ use crate::codex_integration::{
         assert_no_title_reaches, next_derived_title, next_skill_catalog, receive_initial_state,
     },
     support::{ScriptedCodex, assert_process_exited},
+    usage::priced_lookup,
 };
+use serde_json::json;
 use std::sync::Arc;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        CreateSessionRequest, InitialPrompt, PromptId, ProviderId, SessionId, SessionTitleChanged,
-        SkillCatalogRequest, SkillCatalogStatus, SkillInvocation, TextSpan,
+        AgentSelection, Cost, CostBasis, CreateSessionRequest, InitialPrompt, ModelId, PromptId,
+        ProviderId, SessionId, SessionTitleChanged, SkillCatalogRequest, SkillCatalogStatus,
+        SkillInvocation, TextSpan, Usage,
     },
-    provider::CodexRuntime,
+    provider::{
+        CodexRuntime, ErrandAnswer, ErrandConsumption, ErrandFailed, ProviderErrand,
+        ProviderRuntime,
+    },
     server::{self, ServerConfig, ServerTimings},
 };
 use tokio::time::Duration;
@@ -238,6 +244,7 @@ async fn codex_derives_a_title_through_its_own_one_shot_mode() {
             ERRAND_MODEL,
             "--config",
             "model_reasoning_effort=\"low\"",
+            "--json",
             "--output-schema",
             "<file>",
             "--output-last-message",
@@ -484,4 +491,243 @@ async fn a_codex_errand_that_never_answers_leaves_the_prompt_derived_title_stand
     .await;
 
     server.shutdown().await.expect("shut down server");
+}
+
+/// The Model the fixture rate table prices, and one it does not.
+const PRICED_MODEL: &str = "priced-fixture";
+const UNPRICED_MODEL: &str = "unpriced-fixture";
+
+/// What `codex exec --json` prints for one Errand, shaped as the Codex
+/// reference's own JSONL event processor and SDK tests show it: the thread, its
+/// one Turn, the structured final message, and the Turn's completion carrying
+/// the thread's usage — cached and cache-write input inside `input_tokens`,
+/// Reasoning inside `output_tokens`.
+const ANSWERED_EVENTS: &str = r#"{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"title\":\"Fix reasoning group flicker\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":3,"cache_write_input_tokens":4,"output_tokens":29,"reasoning_output_tokens":7}}"#;
+
+/// What those events' usage is in Suru's own disjoint parts.
+fn answered_usage() -> Usage {
+    Usage {
+        fresh_input_tokens: Some(3),
+        cache_read_tokens: Some(3),
+        cache_write_tokens: Some(4),
+        output_tokens: Some(22),
+        reasoning_tokens: Some(7),
+        native_meter: None,
+    }
+}
+
+/// The body of a `codex exec` run that prints `events` on stdout, writes
+/// `answer` as its final message where it was asked to, and exits `status`.
+fn exec_printing(events: &str, answer: Option<&str>, status: u8) -> String {
+    let answer = answer
+        .map(|answer| format!("  printf '%s' '{answer}' > \"$answer\"\n"))
+        .unwrap_or_default();
+    format!("  cat <<'EVENTS'\n{events}\nEVENTS\n{answer}  exit {status}")
+}
+
+/// Runs one Errand at `model` straight through Codex's runtime, against the
+/// fixture rate table, with `codex exec` answering as `body` says.
+async fn run_errand(model: &str, body: &str) -> Result<ErrandAnswer, ErrandFailed> {
+    let codex = scripted_codex(CATALOG_WITH_ERRAND_MODEL, body);
+    let (pricing, _pricing_cache) = priced_lookup().await;
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    CodexRuntime::new(codex.executable())
+        .with_pricing_source(pricing)
+        .run_errand(ProviderErrand {
+            prompt: "Title this Session".to_owned(),
+            schema: json!({"type": "object"}),
+            selection: AgentSelection {
+                provider: ProviderId::new("codex"),
+                model: ModelId::new(model),
+                options: Vec::new(),
+            },
+            execution_directory: workspace.path().to_owned(),
+        })
+        .await
+}
+
+/// An Errand answers with what its final message said and with what its Turn
+/// consumed, priced from the rate table Codex Turns are: Codex states tokens and
+/// never dollars, so the Cost is an estimate.
+#[tokio::test]
+async fn a_codex_errand_answers_with_its_usage_and_an_estimated_cost() {
+    let answer = run_errand(
+        PRICED_MODEL,
+        &exec_printing(
+            ANSWERED_EVENTS,
+            Some(r#"{"title":"Fix reasoning group flicker"}"#),
+            0,
+        ),
+    )
+    .await
+    .expect("the Errand answers");
+
+    assert_eq!(
+        answer.reply,
+        json!({"title": "Fix reasoning group flicker"})
+    );
+    assert_eq!(answer.consumption.usage, Some(answered_usage()));
+    let cost = answer.consumption.cost.expect("a priced Model has a Cost");
+    // 3 fresh at $2, 3 cache reads at $0.50, 4 cache writes at $0.25, and 22
+    // output plus 7 Reasoning at $4, per million tokens.
+    assert_eq!(Some(cost.cost()), Cost::from_usd(0.000_124_5));
+    assert_eq!(cost.basis(), CostBasis::Estimated);
+}
+
+/// The reply is the output file's, not the event stream's: a final message
+/// the events disagree with does not replace what Codex wrote as its answer.
+#[tokio::test]
+async fn a_codex_errand_answers_from_its_output_file_rather_than_its_events() {
+    let answer = run_errand(
+        PRICED_MODEL,
+        &exec_printing(ANSWERED_EVENTS, Some(r#"{"title":"From the file"}"#), 0),
+    )
+    .await
+    .expect("the Errand answers");
+
+    assert_eq!(answer.reply, json!({"title": "From the file"}));
+}
+
+/// A Model the rate table does not price still says what it consumed; it is
+/// only the Cost that is left unknown.
+#[tokio::test]
+async fn a_codex_errand_at_an_unpriced_model_carries_usage_without_a_cost() {
+    let answer = run_errand(
+        UNPRICED_MODEL,
+        &exec_printing(ANSWERED_EVENTS, Some(r#"{"title":"Unpriced"}"#), 0),
+    )
+    .await
+    .expect("the Errand answers");
+
+    assert_eq!(
+        answer.consumption,
+        ErrandConsumption {
+            usage: Some(answered_usage()),
+            cost: None,
+        }
+    );
+}
+
+/// What Codex printed about its consumption is a measurement, not the answer:
+/// none at all, a line that is not JSON, or a completion whose usage is not a
+/// usage leaves the Usage unknown and the Errand answered.
+#[tokio::test]
+async fn a_codex_errand_without_a_readable_usage_event_answers_unmeasured() {
+    for events in [
+        "",
+        r#"{"type":"thread.started","thread_id":"t"}
+{"type":"turn.started"}"#,
+        r#"{"type":"turn.completed","usage":"#,
+        r#"{"type":"turn.completed","usage":"plenty"}"#,
+        r#"{"type":"turn.completed"}"#,
+    ] {
+        let answer = run_errand(
+            PRICED_MODEL,
+            &exec_printing(events, Some(r#"{"title":"Still answered"}"#), 0),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{events:?} still answers: {error}"));
+
+        assert_eq!(
+            answer.reply,
+            json!({"title": "Still answered"}),
+            "{events:?}"
+        );
+        assert_eq!(
+            answer.consumption,
+            ErrandConsumption::default(),
+            "{events:?} says nothing of what the Errand consumed"
+        );
+    }
+}
+
+/// Codex states a zeroed usage when it never received a reading, which is a
+/// figure nobody measured rather than an Errand that consumed nothing.
+#[tokio::test]
+async fn a_codex_errand_whose_usage_is_all_zero_answers_unmeasured() {
+    let answer = run_errand(
+        PRICED_MODEL,
+        &exec_printing(
+            r#"{"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}"#,
+            Some(r#"{"title":"Unmetered"}"#),
+            0,
+        ),
+    )
+    .await
+    .expect("the Errand answers");
+
+    assert_eq!(answer.consumption, ErrandConsumption::default());
+}
+
+/// A run that completed its Turn but left no answer behind still consumed
+/// what its usage event says, and the failure keeps it.
+#[tokio::test]
+async fn a_codex_errand_that_answers_nothing_keeps_the_usage_it_printed() {
+    let failed = run_errand(PRICED_MODEL, &exec_printing(ANSWERED_EVENTS, None, 0))
+        .await
+        .expect_err("no answer file is no answer");
+
+    assert_eq!(failed.consumption.usage, Some(answered_usage()));
+    assert_eq!(
+        failed.consumption.cost.map(|cost| cost.basis()),
+        Some(CostBasis::Estimated)
+    );
+}
+
+/// A run that exits badly after printing its usage keeps that usage too, and
+/// says why it failed in the words Codex's own event stream used.
+#[tokio::test]
+async fn a_failed_codex_errand_keeps_its_usage_and_says_why_it_failed() {
+    let events = format!(
+        "{ANSWERED_EVENTS}\n{}",
+        r#"{"type":"turn.failed","error":{"message":"stream disconnected before completion"}}"#
+    );
+    let failed = run_errand(PRICED_MODEL, &exec_printing(&events, None, 1))
+        .await
+        .expect_err("a failed run is no answer");
+
+    assert_eq!(failed.consumption.usage, Some(answered_usage()));
+    assert!(
+        failed
+            .to_string()
+            .contains("stream disconnected before completion"),
+        "the event stream's own reason is carried through: {failed}"
+    );
+}
+
+/// A run that failed before any Turn completed says why without measuring
+/// anything, whether Codex said so in an event or only on its stderr.
+#[tokio::test]
+async fn a_codex_errand_failing_before_its_turn_completes_is_unmeasured() {
+    let failed = run_errand(
+        PRICED_MODEL,
+        &exec_printing(
+            r#"{"type":"thread.started","thread_id":"t"}
+{"type":"error","message":"unexpected status 401 Unauthorized"}
+{"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized"}}"#,
+            None,
+            1,
+        ),
+    )
+    .await
+    .expect_err("a failed run is no answer");
+    assert_eq!(*failed.consumption, ErrandConsumption::default());
+    assert!(
+        failed.to_string().contains("401 Unauthorized"),
+        "the event stream's reason is carried through: {failed}"
+    );
+
+    let failed = run_errand(
+        PRICED_MODEL,
+        "  printf '%s\\n' 'not signed in' >&2\n  exit 3",
+    )
+    .await
+    .expect_err("a failed run is no answer");
+    assert!(
+        failed.to_string().contains("not signed in"),
+        "stderr is carried through where no event says why: {failed}"
+    );
 }

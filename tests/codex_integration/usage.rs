@@ -291,7 +291,7 @@ fn first_turn_usage() -> Usage {
 /// A models.dev catalog serving one priced Model, and the Suru rate lookup
 /// pointed at it. Tests asserting exact Costs begin with warm rates; cold and
 /// refreshing rates have separate fixtures. Each cache has its own directory.
-async fn priced_lookup() -> (Arc<PricingSource>, tempfile::TempDir) {
+pub(super) async fn priced_lookup() -> (Arc<PricingSource>, tempfile::TempDir) {
     let app = Router::new().route(
         "/api.json",
         get(|| async {

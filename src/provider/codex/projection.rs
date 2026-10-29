@@ -1492,7 +1492,7 @@ fn estimate_cost(
     event
 }
 
-fn has_billable_usage(usage: &Usage) -> bool {
+pub(super) fn has_billable_usage(usage: &Usage) -> bool {
     [
         usage.fresh_input_tokens,
         usage.cache_read_tokens,

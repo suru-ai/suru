@@ -15,21 +15,24 @@
 //! starts in the Session's own Workspace, so that Workspace's agent instructions
 //! inform the answer and no repository check refuses the run.
 
-use std::{ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
     REASONING_EFFORT_OPTION_ID, codex_error, codex_error_context,
-    wire::{NativeServiceTierOverride, lower_turn_options},
+    projection::has_billable_usage,
+    wire::{ExecTokenBreakdown, NativeServiceTierOverride, lower_turn_options},
 };
 use crate::{
+    pricing::{ModelsDevModel, PricingSource},
     protocol::{
         AgentSelection, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
-        ModelOptionValue, ProviderId, ProviderUnavailability,
+        ModelOptionValue, ProviderId, ProviderUnavailability, Usage,
     },
     provider::{
-        ErrandAnswer, ErrandFailed, ProviderErrand, ProviderError,
+        ErrandAnswer, ErrandConsumption, ErrandCost, ErrandFailed, ProviderErrand, ProviderError,
         harness::{HarnessSpec, run_harness_to_completion},
     },
 };
@@ -86,12 +89,15 @@ pub(super) fn declared_errand_selection() -> AgentSelection {
 /// Codex rather than binding it, so whoever asked for the Errand still checks
 /// the shape it came back in.
 ///
-/// Codex is not yet asked what the run consumed, so the answer carries no
-/// Usage and no Cost.
+/// Beside it is what the run consumed, read from the events Codex printed, and
+/// its Cost estimated from `pricing` as a Codex Turn's is. A run that failed
+/// after its Turn completed keeps both: the Model was paid for either way.
 pub(super) async fn run(
     executable: OsString,
+    pricing: Option<Arc<PricingSource>>,
     errand: ProviderErrand,
 ) -> Result<ErrandAnswer, ErrandFailed> {
+    let model = errand.selection.model.clone();
     let files = ErrandFiles::new(&errand.schema)?;
     let spec = HarnessSpec {
         executable,
@@ -104,18 +110,106 @@ pub(super) async fn run(
     let finished = run_harness_to_completion(&spec, errand.prompt)
         .await
         .map_err(|error| codex_error_context(ERRAND_FAILED, error))?;
+    let events = ExecEvents::read(&finished.stdout);
+    let consumption = consumption(events.usage, pricing.as_deref(), model).await;
     if !finished.status.success() {
-        // Codex says why on its stderr, and the Log is the only place an Errand
-        // failure is ever reported — so what it said is carried through rather
-        // than reduced to an exit status nobody can act on.
-        let said = [finished.stderr.trim(), finished.stdout.trim()]
-            .into_iter()
-            .find(|output| !output.is_empty())
-            .map(str::to_owned)
+        // Codex says why in its event stream, or on its stderr where it failed
+        // before it had one, and the Log is the only place an Errand failure
+        // is ever reported — so what it said is carried through rather than
+        // reduced to an exit status nobody can act on.
+        let said = events
+            .failure
+            .or_else(|| Some(finished.stderr.trim().to_owned()).filter(|said| !said.is_empty()))
             .unwrap_or_else(|| format!("Codex exited with {}", finished.status));
-        return Err(codex_error(format!("{ERRAND_FAILED}: {said}")).into());
+        return Err(ErrandFailed::measured(
+            codex_error(format!("{ERRAND_FAILED}: {said}")),
+            consumption,
+        ));
     }
-    Ok(files.answer().map(ErrandAnswer::unmeasured)?)
+    match files.answer() {
+        Ok(reply) => Ok(ErrandAnswer { reply, consumption }),
+        Err(error) => Err(ErrandFailed::measured(error, consumption)),
+    }
+}
+
+/// What the run consumed, and its Cost where the rate table prices `model`.
+/// Codex states tokens and never dollars, so the Cost is always Estimated.
+async fn consumption(
+    usage: Option<Usage>,
+    pricing: Option<&PricingSource>,
+    model: ModelId,
+) -> ErrandConsumption {
+    let cost = match (&usage, pricing) {
+        (Some(usage), Some(pricing)) => pricing
+            .estimate(
+                &ModelsDevModel::new(super::MODELS_DEV_PROVIDER, model),
+                usage,
+            )
+            .await
+            .map(ErrandCost::from),
+        _ => None,
+    };
+    ErrandConsumption { usage, cost }
+}
+
+/// One line of what `codex exec --json` prints, as far as an Errand cares:
+/// the Turn's completion with its usage, and the reasons a run failed. Every
+/// other event is passed over.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum ExecEvent {
+    #[serde(rename = "turn.completed")]
+    TurnCompleted { usage: ExecTokenBreakdown },
+    #[serde(rename = "turn.failed")]
+    TurnFailed { error: ExecError },
+    #[serde(rename = "error")]
+    Error(ExecError),
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct ExecError {
+    message: String,
+}
+
+/// What a run's event stream said about it.
+#[derive(Default)]
+struct ExecEvents {
+    /// The last completed Turn's usage. Absent where Codex printed none that
+    /// could be read, or one that measured nothing: Codex states a zeroed
+    /// usage when it never received a reading, and that is a figure nobody
+    /// measured rather than an Errand that consumed nothing.
+    usage: Option<Usage>,
+    /// Why the run failed: the Turn's own failure, else the last error the
+    /// stream reported.
+    failure: Option<String>,
+}
+
+impl ExecEvents {
+    /// Reads `stdout` a line at a time. A line that is not an event Codex
+    /// documents — not JSON, or an event not shaped as its kind says — is a
+    /// measurement lost rather than a failed Errand, so it is passed over.
+    fn read(stdout: &str) -> Self {
+        let mut events = Self::default();
+        let mut turn_failure = None;
+        let mut stream_error = None;
+        for event in stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<ExecEvent>(line).ok())
+        {
+            match event {
+                ExecEvent::TurnCompleted { usage } => {
+                    events.usage = Some(usage.into_usage()).filter(has_billable_usage);
+                }
+                ExecEvent::TurnFailed { error } => turn_failure = Some(error.message),
+                ExecEvent::Error(error) => stream_error = Some(error.message),
+                ExecEvent::Other => {}
+            }
+        }
+        events.failure = turn_failure.or(stream_error);
+        events
+    }
 }
 
 /// The two files one `codex exec` run is pointed at: the schema going in, and
@@ -208,6 +302,10 @@ fn arguments(errand: &ProviderErrand, files: &ErrandFiles) -> Result<Vec<OsStrin
         arguments.push(format!("{SERVICE_TIER_CONFIG_KEY}=\"{service_tier}\"").into());
     }
     arguments.extend([
+        // Events on stdout as JSONL, so the run says what it consumed. The
+        // answer is still the file below, which Codex writes only once its
+        // final message is whole.
+        "--json".into(),
         "--output-schema".into(),
         files.schema_path().into_os_string(),
         "--output-last-message".into(),
