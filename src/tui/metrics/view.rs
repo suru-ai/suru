@@ -848,7 +848,7 @@ fn render_legend(
         // wide glyph in one label leaves the figures beside every row aligned.
         let label = truncate_to_width(&series.label, label_width);
         let padding = " ".repeat(label_width.saturating_sub(label.width()));
-        let text = format!("{label}{padding}  {value:>value_width$}  {share:>4}",);
+        let text = format!("{label}{padding}  {value:>value_width$}  {share:>4}");
         buffer.set_string(area.x + 2, y, &text, text_style);
         let bar = usize::try_from(u128::from(*figure) * bar_room as u128 / u128::from(largest))
             .unwrap_or(0);

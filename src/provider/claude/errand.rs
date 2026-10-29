@@ -120,7 +120,9 @@ fn arguments(errand: &ProviderErrand) -> Result<Vec<OsString>, ProviderError> {
 ///
 /// The result's `usage` is the Errand's Usage, and its `total_cost_usd` a Cost Claude reported:
 /// print mode persists no conversation, so the running total it keeps is this run's alone. A
-/// result is printed for a failure as for an answer, so a failure carries both as well.
+/// result is printed for a failure as for an answer, so a failure carries both as well. A `usage`
+/// of all zeroes is kept as stated: Claude prints one only for a run that measured spending
+/// nothing, unlike Codex's zeroed usage, which says no reading was ever received.
 fn errand_answer(printed: &str) -> Result<ErrandAnswer, ErrandFailed> {
     let printed = printed.trim();
     if printed.is_empty() {

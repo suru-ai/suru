@@ -98,6 +98,8 @@ pub(super) async fn run_copilot_errand(
 /// whichever agent made it, by the same reading and pricing a Copilot Turn's are. A report that
 /// went unread — one Suru could not decode, or one the subscription fell too far behind to deliver
 /// — leaves the whole consumption unknown, since a sum missing a call is a figure nobody measured.
+/// A report of zero tokens is added in as stated: each `assistant.usage` is a reading the CLI took
+/// of one call, unlike Codex's zeroed usage, which says no reading was ever received.
 struct ErrandMetering {
     events: EventSubscription,
     pricing: CopilotPricing,
