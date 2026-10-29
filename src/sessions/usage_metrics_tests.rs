@@ -4,7 +4,9 @@
 use std::{collections::HashMap, path::Path};
 
 use super::{Pairing, RemoteAct, SessionStore, UsageMetricsRefusal, restoration_tests::persisted};
-use crate::protocol::{MAX_USAGE_METRICS_TOP_SESSIONS, SessionId, UsageMetricsSession};
+use crate::protocol::{
+    CostTotal, CountedCost, MAX_USAGE_METRICS_TOP_SESSIONS, SessionId, UsageMetricsSession,
+};
 use crate::{
     protocol::{
         AgentId, AgentIdentity, AgentSelection, Author, Cost, CostBasis, CostCoverage, CostDetails,
@@ -95,7 +97,10 @@ pub(super) fn by_model(buckets: &[(u64, u64)]) -> UsageMetricsQuery {
 fn output(tokens: u64) -> UsageMetricsAggregate {
     UsageMetricsAggregate {
         output_tokens: Some(tokens),
-        is_cost_partial: true,
+        cost: CountedCost {
+            amount: None,
+            is_partial: true,
+        },
         sessions: 1,
         turns: 1,
         ..Default::default()
@@ -307,8 +312,10 @@ async fn a_part_no_turn_reported_stays_absent_and_failed_interrupted_and_active_
         cache_write_tokens: None,
         output_tokens: Some(7),
         reasoning_tokens: Some(3),
-        cost: None,
-        is_cost_partial: true,
+        cost: CountedCost {
+            amount: None,
+            is_partial: true,
+        },
         estimated_cost: None,
         sessions: 1,
         subagent_sessions: 0,
@@ -1067,8 +1074,8 @@ pub(super) fn running_total(
 /// is partial, and its Estimated portion.
 fn cost(aggregate: &UsageMetricsAggregate) -> (Option<Cost>, bool, Option<Cost>) {
     (
-        aggregate.cost,
-        aggregate.is_cost_partial,
+        aggregate.cost.amount,
+        aggregate.cost.is_partial,
         aggregate.estimated_cost,
     )
 }
@@ -1454,8 +1461,10 @@ async fn the_comparison_interval_holds_what_its_turns_consumed_apart_from_the_bu
         report.comparison,
         Some(UsageMetricsAggregate {
             output_tokens: Some(111),
-            cost: usd(0.10),
-            is_cost_partial: true,
+            cost: CountedCost {
+                amount: usd(0.10),
+                is_partial: true
+            },
             sessions: 2,
             turns: 3,
             interrupted_turns: 1,
@@ -1537,8 +1546,10 @@ async fn the_buckets_and_the_untimed_turns_together_count_each_session_once() {
         report.across_buckets_and_untimed,
         UsageMetricsAggregate {
             output_tokens: Some(10_111),
-            cost: usd(0.10),
-            is_cost_partial: true,
+            cost: CountedCost {
+                amount: usd(0.10),
+                is_partial: true
+            },
             sessions: 2,
             subagent_sessions: 1,
             turns: 4,
@@ -1566,8 +1577,8 @@ fn ranked(report: &UsageMetricsReport) -> Vec<(SessionId, Option<Cost>, bool)> {
         .map(|session| {
             (
                 session.session_id,
-                Some(session.cost),
-                session.is_cost_partial,
+                Some(session.cost.cost),
+                session.cost.is_partial,
             )
         })
         .collect()
@@ -1621,8 +1632,10 @@ async fn the_top_sessions_are_ordered_by_their_cost_in_range_not_their_lifetime_
             workspace: name,
             // The catalog names no Model: its id stands.
             model: Some("gpt-5.5-codex".to_owned()),
-            cost: Cost::from_usd(0.50).unwrap(),
-            is_cost_partial: false,
+            cost: CostTotal {
+                cost: Cost::from_usd(0.50).unwrap(),
+                is_partial: false,
+            },
         }
     );
     assert_eq!(

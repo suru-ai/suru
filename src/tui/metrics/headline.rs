@@ -27,7 +27,7 @@ const NARROWEST_GAP: usize = 2;
 /// Whether `aggregate` holds anything a headline could state: Usage, a
 /// Cost, work whose Cost is unknown, or Turns at all.
 pub(super) fn holds_anything(aggregate: &UsageMetricsAggregate) -> bool {
-    holds_usage(aggregate) || aggregate.is_cost_partial || aggregate.turns > 0
+    holds_usage(aggregate) || aggregate.cost.is_partial || aggregate.turns > 0
 }
 
 /// Whether `aggregate` holds any Usage or Cost: a period that held none is
@@ -40,7 +40,7 @@ pub(super) fn holds_usage(aggregate: &UsageMetricsAggregate) -> bool {
         aggregate.output_tokens,
         aggregate.reasoning_tokens,
     ];
-    parts.into_iter().flatten().any(|part| part > 0) || aggregate.cost.is_some()
+    parts.into_iter().flatten().any(|part| part > 0) || aggregate.cost.amount.is_some()
 }
 
 /// One column of the headline: a figure, how it compares with the period
@@ -226,7 +226,7 @@ fn columns(whole: &UsageMetricsAggregate, before: Option<&UsageMetricsAggregate>
 
     let mut columns = vec![
         Column {
-            figure: MetricsMeasure::Cost.total(cost(whole), whole.is_cost_partial),
+            figure: MetricsMeasure::Cost.total(cost(whole), whole.cost.is_partial),
             compared: change(cost),
             detail: estimated,
         },

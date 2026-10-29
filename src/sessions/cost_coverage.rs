@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 
 use crate::protocol::{
-    Cost, CostBasis, CostCoverage, CostRecord, CostTotal, SessionId, SessionTimestamp, Turn,
-    TurnId, TurnStatus,
+    Cost, CostBasis, CostCoverage, CostRecord, CostTotal, CountedCost, SessionId, SessionTimestamp,
+    Turn, TurnId, TurnStatus,
 };
 
 use super::SessionStoreState;
@@ -28,19 +28,27 @@ pub(crate) struct CostContribution {
     pub(crate) turn_id: TurnId,
     /// What the Turn adds and who computed it, or absent where it adds no
     /// known amount but its work leaves the total partial.
-    pub(crate) amount: Option<CountedCost>,
+    pub(crate) amount: Option<CountedAmount>,
     pub(crate) is_partial: bool,
 }
 
 /// An amount a Turn contributes to a Cost, with the Cost Basis of the frozen
 /// Cost it was counted from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CountedCost {
+pub(crate) struct CountedAmount {
     pub(crate) cost: Cost,
     pub(crate) basis: CostBasis,
 }
 
 impl CostContribution {
+    /// What the contribution adds to any Cost counting it.
+    pub(crate) fn counted(&self) -> CountedCost {
+        CountedCost {
+            amount: self.amount.map(|amount| amount.cost),
+            is_partial: self.is_partial,
+        }
+    }
+
     /// Work of this Turn whose Cost no counted amount accounts for: it adds
     /// nothing, and leaves the total partial.
     fn unaccounted(session_id: SessionId, turn_id: TurnId) -> Self {
@@ -67,15 +75,11 @@ enum Coverage {
 /// counts a known amount, never a zero nobody measured, and partial where
 /// any of them is.
 pub(crate) fn sum_contributions(contributions: &[CostContribution]) -> Option<CostTotal> {
-    let mut total = None;
-    let mut is_partial = false;
-    for contribution in contributions {
-        if let Some(amount) = contribution.amount {
-            total = Some(add_cost(total, amount.cost));
-        }
-        is_partial |= contribution.is_partial;
-    }
-    total.map(|cost| CostTotal { cost, is_partial })
+    contributions
+        .iter()
+        .map(CostContribution::counted)
+        .sum::<CountedCost>()
+        .total()
 }
 
 impl SessionStoreState {
@@ -259,7 +263,7 @@ fn contributions_of(forest: &impl CostForest, sessions: &[SessionId]) -> Vec<Cos
                     CostContribution {
                         session_id: increment.report.owner,
                         turn_id: increment.report.turn_id,
-                        amount: Some(CountedCost {
+                        amount: Some(CountedAmount {
                             cost: increment.cost,
                             basis: increment.report.record.basis,
                         }),
@@ -278,7 +282,7 @@ fn contributions_of(forest: &impl CostForest, sessions: &[SessionId]) -> Vec<Cos
         let counted = CostContribution {
             session_id: record.owner,
             turn_id: record.turn_id,
-            amount: Some(CountedCost {
+            amount: Some(CountedAmount {
                 cost: record.record.cost,
                 basis: record.record.basis,
             }),
@@ -533,10 +537,6 @@ pub(super) fn work_exceeds_coverage(
     coverage_end: SessionTimestamp,
 ) -> bool {
     last_output_at.is_some_and(|output| output > coverage_end) || active && !is_report_carrier
-}
-
-pub(super) fn add_cost(total: Option<Cost>, cost: Cost) -> Cost {
-    total.map_or(cost, |total| total.saturating_add(cost))
 }
 
 /// Two tree Costs stated as one: their sum, partial where either is.

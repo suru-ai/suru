@@ -63,7 +63,7 @@ impl MetricsMeasure {
 
     pub(crate) fn value(self, aggregate: &UsageMetricsAggregate) -> u64 {
         match self {
-            Self::Cost => aggregate.cost.map_or(0, Cost::nano_usd),
+            Self::Cost => aggregate.cost.amount.map_or(0, Cost::nano_usd),
             Self::Tokens => aggregate.blended_tokens().unwrap_or(0),
             Self::Sessions => aggregate.sessions,
         }
@@ -72,7 +72,7 @@ impl MetricsMeasure {
     /// Whether `aggregate`'s figure says less than its Turns consumed.
     pub(crate) fn is_partial(self, aggregate: &UsageMetricsAggregate) -> bool {
         match self {
-            Self::Cost => aggregate.is_cost_partial,
+            Self::Cost => aggregate.cost.is_partial,
             Self::Tokens | Self::Sessions => false,
         }
     }

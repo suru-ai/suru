@@ -14,10 +14,10 @@ use jiff::civil::date;
 use ratatui::{buffer::Buffer, style::Style};
 use suru::{
     protocol::{
-        ApprovalInsights, CacheInsights, CompactionCounts, CompactionInsights, Cost,
+        ApprovalInsights, CacheInsights, CompactionCounts, CompactionInsights, Cost, CountedCost,
         DelegationInsights, EstimatedSaving, FreedShare, InsightsQuery, InsightsReport,
-        InsightsTool, Outlook, QUARTER_HOUR_MS, QuarterHourTurns, RoleCost, ToolTally,
-        TurnDurations, TurnInsights, UsageMetricsInterval, UsageMetricsQuery,
+        InsightsTool, Outlook, QUARTER_HOUR_MS, QuarterHourTurns, ToolTally, TurnDurations,
+        TurnInsights, UsageMetricsInterval, UsageMetricsQuery,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, InsightsPanel, MetricsTab,
@@ -139,10 +139,10 @@ fn worked_cache() -> CacheInsights {
 }
 
 /// What `usd` dollars cost a role, partial where `partial` says.
-fn role(usd: f64, partial: bool) -> RoleCost {
-    RoleCost {
-        cost: Cost::from_usd(usd),
-        is_cost_partial: partial,
+fn role(usd: f64, partial: bool) -> CountedCost {
+    CountedCost {
+        amount: Cost::from_usd(usd),
+        is_partial: partial,
     }
 }
 
@@ -236,8 +236,10 @@ fn new_york_quarter(
         start,
         turns,
         tokens: Some(tokens),
-        cost: Cost::from_usd(usd),
-        is_cost_partial: false,
+        cost: CountedCost {
+            amount: Cost::from_usd(usd),
+            is_partial: false,
+        },
     }
 }
 
@@ -255,10 +257,9 @@ fn worked_hours() -> Vec<QuarterHourTurns> {
         new_york_quarter(27, 17, 15, 10, 300_000, 1.00),
         new_york_quarter(27, 18, 0, 1, 30_000, 0.10),
     ];
-    hours.push(QuarterHourTurns {
-        is_cost_partial: true,
-        ..new_york_quarter(21, 23, 45, 1, 500, 0.05)
-    });
+    let mut partial = new_york_quarter(21, 23, 45, 1, 500, 0.05);
+    partial.cost.is_partial = true;
+    hours.push(partial);
     hours
 }
 
@@ -1329,12 +1330,12 @@ fn the_delegation_panel_divides_cost_by_role_with_brokered_subagents_beside_thei
 #[test]
 fn a_role_whose_cost_is_partial_says_so_with_a_plus() {
     let mut report = worked();
-    report.delegation.brokered_subagents.is_cost_partial = true;
-    report.delegation.subsessions = RoleCost {
-        cost: None,
-        is_cost_partial: true,
+    report.delegation.brokered_subagents.is_partial = true;
+    report.delegation.subsessions = CountedCost {
+        amount: None,
+        is_partial: true,
     };
-    report.delegation.sidekicks = RoleCost::default();
+    report.delegation.sidekicks = CountedCost::default();
     let application = on_insights(Ok(report));
 
     // Wide enough for every Cost beside the bars and the brokered share.
@@ -1359,7 +1360,7 @@ fn a_range_with_no_cost_says_so_in_the_delegation_panel() {
     );
 
     let mut report = InsightsReport::default();
-    report.delegation.own_sessions.is_cost_partial = true;
+    report.delegation.own_sessions.is_partial = true;
     let application = on_insights(Ok(report));
     assert_eq!(
         delegation_panel(&application)[0],
@@ -1428,7 +1429,7 @@ fn a_range_with_no_input_says_so_in_the_cache_panel() {
 #[test]
 fn delegation_leaves_its_costs_out_where_they_would_crowd_the_brokered_share() {
     let mut report = worked();
-    report.delegation.brokered_subagents.is_cost_partial = true;
+    report.delegation.brokered_subagents.is_partial = true;
     let application = on_insights(Ok(report));
 
     assert_eq!(

@@ -582,7 +582,7 @@ fn render_top_sessions(
     let costs: Vec<String> = sessions
         .iter()
         .map(|session| {
-            MetricsMeasure::Cost.figure(session.cost.nano_usd(), session.is_cost_partial)
+            MetricsMeasure::Cost.figure(session.cost.cost.nano_usd(), session.cost.is_partial)
         })
         .collect();
     let widest = |width: &dyn Fn(&UsageMetricsSession) -> usize, most: usize| {

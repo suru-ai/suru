@@ -11,7 +11,7 @@ use ratatui::{buffer::Buffer, layout::Rect};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    protocol::{Cost, DelegationInsights, RoleCost},
+    protocol::{Cost, CountedCost, DelegationInsights},
     theme::Theme,
 };
 
@@ -59,8 +59,8 @@ pub(super) fn render(
     let subdued = theme.text.subdued;
     let primary = theme.text.primary;
     let total = delegation.total();
-    let Some(whole) = total.cost.map(Cost::nano_usd) else {
-        let note = if total.is_cost_partial {
+    let Some(whole) = total.amount.map(Cost::nano_usd) else {
+        let note = if total.is_partial {
             "No work priced"
         } else {
             "No Cost"
@@ -69,9 +69,9 @@ pub(super) fn render(
         buffer.set_string(area.x, area.y, note, subdued);
         return;
     };
-    let subagents = delegation
-        .native_subagents
-        .with(delegation.brokered_subagents);
+    let subagents = [delegation.native_subagents, delegation.brokered_subagents]
+        .into_iter()
+        .sum();
     let roles = [
         ("own Sessions", delegation.own_sessions, None),
         ("Subagents", subagents, Some(delegation.brokered_subagents)),
@@ -82,7 +82,7 @@ pub(super) fn render(
     // work was brokered.
     let roles = roles.map(|(label, cost, brokered)| {
         let brokered = brokered
-            .filter(|brokered| brokered.cost.is_some() || brokered.is_cost_partial)
+            .filter(|brokered| brokered.counts_work())
             .map(|brokered| format!("  brokered {}", share_of(brokered, total)))
             .unwrap_or_default();
         (label, cost, brokered)
@@ -105,7 +105,7 @@ pub(super) fn render(
         let lead = if costed {
             format!(
                 "{label:<LABEL_WIDTH$} {share:>SHARE_WIDTH$}  {:>COST_WIDTH$}  ",
-                stated_cost(cost.cost, cost.is_cost_partial),
+                stated_cost(cost),
             )
         } else {
             format!("{label:<LABEL_WIDTH$} {share:>SHARE_WIDTH$}  ")
@@ -128,10 +128,9 @@ pub(super) fn render(
 /// `cost`'s share of `whole`, `+` where the whole is partial and `cost`
 /// counts work at all: a role that did none has no share however much of
 /// the whole went unpriced.
-fn share_of(cost: RoleCost, whole: RoleCost) -> String {
+fn share_of(cost: CountedCost, whole: CountedCost) -> String {
     let stated = share(nano_usd(cost), nano_usd(whole));
-    let did_work = cost.cost.is_some() || cost.is_cost_partial;
-    if whole.is_cost_partial && did_work {
+    if whole.is_partial && cost.counts_work() {
         stated + "+"
     } else {
         stated
@@ -139,6 +138,6 @@ fn share_of(cost: RoleCost, whole: RoleCost) -> String {
 }
 
 /// What `cost` counts, in nano-dollars: nothing where it counts no amount.
-fn nano_usd(cost: RoleCost) -> u64 {
-    cost.cost.map_or(0, Cost::nano_usd)
+fn nano_usd(cost: CountedCost) -> u64 {
+    cost.amount.map_or(0, Cost::nano_usd)
 }

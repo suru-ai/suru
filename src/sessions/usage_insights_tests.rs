@@ -16,10 +16,10 @@ use crate::{
     protocol::{
         Activity, ActivityId, ActivityStatus, Approval, ApprovalId, ApprovalInsights,
         ApprovalOutcome, ApprovalSubject, Author, CompactionCounts, CompactionTrigger, Cost,
-        Decision, DelegationInsights, EstimatedSaving, FreedShare, InsightsQuery, InsightsReport,
-        InsightsTool, ModelId, ProviderId, QUARTER_HOUR_MS, QuarterHourTurns, RoleCost, SessionId,
-        SessionListItem, SessionTimestamp, ToolTally, TranscriptItem, Turn, TurnDurations, TurnId,
-        TurnInsights, TurnStatus, Usage, UsageMetricsInterval, UsageTotal,
+        CountedCost, Decision, DelegationInsights, EstimatedSaving, FreedShare, InsightsQuery,
+        InsightsReport, InsightsTool, ModelId, ProviderId, QUARTER_HOUR_MS, QuarterHourTurns,
+        SessionId, SessionListItem, SessionTimestamp, ToolTally, TranscriptItem, Turn,
+        TurnDurations, TurnId, TurnInsights, TurnStatus, Usage, UsageMetricsInterval, UsageTotal,
     },
     sidekick::SidekickWorkspace,
     storage::PersistedSession,
@@ -347,8 +347,7 @@ fn quarter(
         start: SessionTimestamp(QUARTER + place * QUARTER_HOUR_MS),
         turns,
         tokens: Some(tokens),
-        cost,
-        is_cost_partial: partial,
+        cost: role(cost, partial),
     }
 }
 
@@ -420,29 +419,18 @@ async fn quarter_hour_costs_add_up_to_the_range_s_cost() {
     let added = report
         .quarter_hours
         .iter()
-        .filter_map(|quarter| quarter.cost)
-        .fold(None, |total: Option<Cost>, cost| {
-            Some(Cost::from_nano_usd(
-                total.map_or(0, Cost::nano_usd) + cost.nano_usd(),
-            ))
-        });
+        .map(|quarter| quarter.cost)
+        .sum::<CountedCost>();
     assert_eq!(
-        (
-            added,
-            report.quarter_hours.iter().any(|q| q.is_cost_partial)
-        ),
-        (range.cost, range.is_cost_partial),
+        added, range.cost,
         "the quarter-hours add up to the Cost the metrics read gives the range"
     );
     writer.shutdown().await.unwrap();
 }
 
-/// What the Sessions of one role cost.
-fn role(cost: Option<Cost>, partial: bool) -> RoleCost {
-    RoleCost {
-        cost,
-        is_cost_partial: partial,
-    }
+/// What some work cost: the Sessions of one role, or a quarter-hour's Turns.
+fn role(amount: Option<Cost>, is_partial: bool) -> CountedCost {
+    CountedCost { amount, is_partial }
 }
 
 /// `session`, begun by the Sidekick's Session `sidekick`: a Subsession.
@@ -525,7 +513,7 @@ async fn delegation_divides_the_range_s_cost_by_the_role_of_the_session_carrying
         .total;
     assert_eq!(
         delegation.total(),
-        role(range.cost, range.is_cost_partial),
+        range.cost,
         "the roles add up to the Cost the metrics read gives the range"
     );
     writer.shutdown().await.unwrap();
@@ -1310,7 +1298,7 @@ async fn the_saving_enters_no_cost_figure_of_the_insights_or_metrics_reports() {
         .across_buckets
         .total;
     assert_eq!(
-        (range.cost, range.estimated_cost),
+        (range.cost.amount, range.estimated_cost),
         (usd(0.50), None),
         "the metrics read's Cost is the Turn's alone"
     );

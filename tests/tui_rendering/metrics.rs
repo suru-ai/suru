@@ -15,10 +15,11 @@ use ratatui::style::Color;
 use suru::{
     managed_client::{ManagedEvent, RecoveryStatus},
     protocol::{
-        Cost, EffectiveSettings, KeyedUsageMetrics, ModelId, Outlook, ProviderId, SessionId,
-        SessionReference, SessionTimestamp, SidebarVisibility, UsageMetricsAggregate,
-        UsageMetricsBreakdown, UsageMetricsBucket, UsageMetricsInterval, UsageMetricsKey,
-        UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport, UsageMetricsSession,
+        Cost, CostTotal, CountedCost, EffectiveSettings, KeyedUsageMetrics, ModelId, Outlook,
+        ProviderId, SessionId, SessionReference, SessionTimestamp, SidebarVisibility,
+        UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsBucket, UsageMetricsInterval,
+        UsageMetricsKey, UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport,
+        UsageMetricsSession,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, MetricsMeasure,
@@ -212,9 +213,9 @@ fn take_together(report: &mut UsageMetricsReport) {
         into.cache_write_tokens = count(into.cache_write_tokens, part.cache_write_tokens);
         into.output_tokens = count(into.output_tokens, part.output_tokens);
         into.reasoning_tokens = count(into.reasoning_tokens, part.reasoning_tokens);
-        into.cost = cost(into.cost, part.cost);
+        into.cost.amount = cost(into.cost.amount, part.cost.amount);
+        into.cost.is_partial |= part.cost.is_partial;
         into.estimated_cost = cost(into.estimated_cost, part.estimated_cost);
-        into.is_cost_partial |= part.is_cost_partial;
     }
     let counted = |aggregate: &UsageMetricsAggregate| UsageMetricsAggregate {
         sessions: aggregate.sessions,
@@ -1404,24 +1405,29 @@ fn priced_report(query: &UsageMetricsQuery) -> UsageMetricsReport {
     let mut report = report(query);
     for bucket in &mut report.buckets {
         let mut total = UsageMetricsAggregate {
-            cost: None,
+            cost: CountedCost::default(),
             ..bucket.total
         };
         for keyed in &mut bucket.by_key {
             let tokens = keyed.aggregate.fresh_input_tokens.unwrap_or(0);
             let aggregate = &mut keyed.aggregate;
             if keyed.key == opus() {
-                aggregate.cost = Some(Cost::from_nano_usd(tokens * 1_000));
+                aggregate.cost.amount = Some(Cost::from_nano_usd(tokens * 1_000));
             } else if keyed.key == codex() {
-                aggregate.cost = Some(Cost::from_nano_usd(tokens * 2_000));
-                aggregate.estimated_cost = aggregate.cost;
+                aggregate.cost.amount = Some(Cost::from_nano_usd(tokens * 2_000));
+                aggregate.estimated_cost = aggregate.cost.amount;
             } else {
-                aggregate.is_cost_partial = tokens > 0;
+                aggregate.cost.is_partial = tokens > 0;
             }
-            if let Some(cost) = aggregate.cost {
-                total.cost = Some(total.cost.map_or(cost, |held| held.saturating_add(cost)));
+            if let Some(cost) = aggregate.cost.amount {
+                total.cost.amount = Some(
+                    total
+                        .cost
+                        .amount
+                        .map_or(cost, |held| held.saturating_add(cost)),
+                );
             }
-            total.is_cost_partial |= aggregate.is_cost_partial;
+            total.cost.is_partial |= aggregate.cost.is_partial;
         }
         bucket.total = total;
     }
@@ -1478,7 +1484,10 @@ fn work_with_no_known_cost_is_not_shown_as_no_usage() {
         label: "copilot · GPT-5.5".to_owned(),
     }];
     let unpriced = UsageMetricsAggregate {
-        is_cost_partial: true,
+        cost: CountedCost {
+            amount: None,
+            is_partial: true,
+        },
         ..tokens(1_000)
     };
     report.buckets[29] = UsageMetricsBucket {
@@ -2088,7 +2097,7 @@ fn each_series_keeps_its_colour_whatever_the_measure() {
     for bucket in &mut report.buckets {
         for keyed in &mut bucket.by_key {
             if keyed.key == copilot() {
-                keyed.aggregate.cost = Some(Cost::from_nano_usd(100_000_000_000));
+                keyed.aggregate.cost.amount = Some(Cost::from_nano_usd(100_000_000_000));
             }
         }
     }
@@ -3111,6 +3120,14 @@ fn usd(usd: f64) -> Option<Cost> {
     Some(Cost::from_usd(usd).expect("a dollar figure"))
 }
 
+/// A Cost of `usd`, wholly priced.
+fn priced(usd: f64) -> CountedCost {
+    CountedCost {
+        amount: self::usd(usd),
+        is_partial: false,
+    }
+}
+
 /// [`report`] of `query`, its range taken together as thirty days of a
 /// busy Server might be, and the period before it as `comparison` says.
 fn headlined(
@@ -3124,8 +3141,10 @@ fn headlined(
         cache_write_tokens: Some(9_000_000),
         output_tokens: Some(5_000_000),
         reasoning_tokens: Some(2_000_000),
-        cost: usd(412.86),
-        is_cost_partial: true,
+        cost: CountedCost {
+            amount: usd(412.86),
+            is_partial: true,
+        },
         estimated_cost: usd(37.10),
         sessions: 96,
         subagent_sessions: 12,
@@ -3147,7 +3166,7 @@ fn the_month_before() -> UsageMetricsAggregate {
         cache_read_tokens: Some(60_000_000),
         cache_write_tokens: Some(15_000_000),
         output_tokens: Some(5_000_000),
-        cost: usd(349.88),
+        cost: priced(349.88),
         sessions: 92,
         turns: 1_070,
         ..UsageMetricsAggregate::default()
@@ -3238,7 +3257,10 @@ fn the_comparison_is_left_out_where_the_period_before_had_no_usage() {
             Some(UsageMetricsAggregate {
                 sessions: 3,
                 turns: 4,
-                is_cost_partial: true,
+                cost: CountedCost {
+                    amount: None,
+                    is_partial: true,
+                },
                 ..UsageMetricsAggregate::default()
             }),
         ),
@@ -3302,13 +3324,16 @@ fn all_time_headline_figures_count_untimed_turns_and_no_other_range_s_do() {
         // A Session with timed and untimed work counts once in the whole,
         // which adding the two cannot say.
         report.untimed.total = UsageMetricsAggregate {
-            cost: usd(10.0),
+            cost: priced(10.0),
             sessions: 3,
             turns: 16,
             ..UsageMetricsAggregate::default()
         };
         report.across_buckets_and_untimed = UsageMetricsAggregate {
-            cost: usd(422.86),
+            cost: CountedCost {
+                amount: usd(422.86),
+                ..report.across_buckets.total.cost
+            },
             sessions: 98,
             turns: 1_300,
             ..report.across_buckets.total
@@ -3344,7 +3369,7 @@ fn all_time_with_no_timed_turn_still_heads_the_view_with_its_untimed_figures() {
     let (_, probe, first) = expect_read(press(&mut application, '5'));
     let untimed = UsageMetricsAggregate {
         output_tokens: Some(4_000),
-        cost: usd(5.0),
+        cost: priced(5.0),
         sessions: 2,
         turns: 7,
         failed_turns: 1,
@@ -3550,8 +3575,10 @@ fn top_session(title: &str, usd: f64, model: Option<&str>, workspace: &str) -> U
         title: title.to_owned(),
         workspace: workspace.to_owned(),
         model: model.map(str::to_owned),
-        cost: Cost::from_usd(usd).unwrap(),
-        is_cost_partial: false,
+        cost: CostTotal {
+            cost: Cost::from_usd(usd).unwrap(),
+            is_partial: false,
+        },
     }
 }
 
@@ -3559,16 +3586,15 @@ fn top_session(title: &str, usd: f64, model: Option<&str>, workspace: &str) -> U
 /// the first of them partly unpriced.
 fn with_top_sessions(query: &UsageMetricsQuery) -> UsageMetricsReport {
     let mut report = priced_report(query);
+    let mut unpriced = top_session(
+        "Introduce relay pairing",
+        28.40,
+        Some("Claude Opus 5.5"),
+        "suru",
+    );
+    unpriced.cost.is_partial = true;
     report.top_sessions = vec![
-        UsageMetricsSession {
-            is_cost_partial: true,
-            ..top_session(
-                "Introduce relay pairing",
-                28.40,
-                Some("Claude Opus 5.5"),
-                "suru",
-            )
-        },
+        unpriced,
         top_session(
             "Fix Windows path fixtures",
             19.12,

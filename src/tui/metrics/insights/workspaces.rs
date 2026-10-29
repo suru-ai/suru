@@ -17,7 +17,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    protocol::{Cost, UsageMetricsAggregate, UsageMetricsKey, UsageMetricsReport},
+    protocol::{Cost, CountedCost, UsageMetricsAggregate, UsageMetricsKey, UsageMetricsReport},
     theme::Theme,
 };
 
@@ -69,15 +69,9 @@ pub(super) fn items(rows: &[WorkspaceRow]) -> usize {
     rows.len()
 }
 
-/// What `rows` cost together, in nano-dollars, and whether any of that is
-/// partial.
-fn cost_of(rows: &[WorkspaceRow]) -> (Option<Cost>, bool) {
-    let cost = rows
-        .iter()
-        .filter_map(|row| row.aggregate.cost)
-        .reduce(Cost::saturating_add);
-    let partial = rows.iter().any(|row| row.aggregate.is_cost_partial);
-    (cost, partial)
+/// What `rows` cost together.
+fn cost_of(rows: &[WorkspaceRow]) -> CountedCost {
+    rows.iter().map(|row| row.aggregate.cost).sum()
 }
 
 /// Draws the panel's rows in `area`, inside its border, scrolled as `view`
@@ -119,16 +113,12 @@ pub(super) fn render(
     let bar_width = room.saturating_sub(COST_WIDTH + 2) / 2;
     let label_width = room.saturating_sub(COST_WIDTH + 2 + bar_width + 1);
     // The first row costs the most, so every bar is drawn beside its.
-    let largest = rows[0].aggregate.cost.map_or(0, Cost::nano_usd);
-    let mut line = |y: u16, label: &str, (cost, partial): (Option<Cost>, bool), style: Style| {
+    let largest = rows[0].aggregate.cost.amount.map_or(0, Cost::nano_usd);
+    let mut line = |y: u16, label: &str, cost: CountedCost, style: Style| {
         let label = truncate_to_width(label, label_width);
         let pad = label_width.saturating_sub(label.width());
-        let lead = format!(
-            "{label}{:pad$} {:>COST_WIDTH$}  ",
-            "",
-            stated_cost(cost, partial),
-        );
-        let part = cost.map_or(0, Cost::nano_usd);
+        let lead = format!("{label}{:pad$} {:>COST_WIDTH$}  ", "", stated_cost(cost),);
+        let part = cost.amount.map_or(0, Cost::nano_usd);
         render_spans(
             buffer,
             area,
@@ -152,8 +142,7 @@ pub(super) fn render(
         } else {
             theme.text.primary
         };
-        let cost = (row.aggregate.cost, row.aggregate.is_cost_partial);
-        line(y, &row.label, cost, style);
+        line(y, &row.label, row.aggregate.cost, style);
     }
     if window.folded > 0 {
         let y = area.y + u16::try_from(window.shown).unwrap_or(u16::MAX);

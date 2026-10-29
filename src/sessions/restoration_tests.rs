@@ -4,7 +4,7 @@ use std::{cell::Cell, collections::HashMap, path::Path};
 
 use super::{
     SessionStore,
-    cost_coverage::{CostContribution, CountedCost, sum_contributions},
+    cost_coverage::{CostContribution, CountedAmount, sum_contributions},
 };
 use crate::{
     protocol::{
@@ -830,7 +830,7 @@ async fn malformed_relationships_do_not_promote_children_into_listed_roots() {
     assert!(store.subscribe(root_id).is_some());
     let all_time = all_time_metrics(&store, UsageMetricsBreakdown::Model).buckets[0].total;
     assert_eq!(
-        (all_time.cost, all_time.output_tokens),
+        (all_time.cost.amount, all_time.output_tokens),
         (Cost::from_usd(0.01), Some(1)),
         "only the listed root's Turn counts"
     );
@@ -1256,7 +1256,7 @@ fn counted(session_id: SessionId, turn: &Turn, usd: f64, is_partial: bool) -> Co
     CostContribution {
         session_id,
         turn_id: turn.id,
-        amount: Some(CountedCost {
+        amount: Some(CountedAmount {
             cost: Cost::from_usd(usd).unwrap(),
             basis: CostBasis::Reported,
         }),
@@ -1364,7 +1364,7 @@ async fn reading_usage_metrics_over_a_wide_forest_walks_each_tree_once() {
     }
     let report = all_time_metrics(&store, UsageMetricsBreakdown::Model);
     assert_eq!(
-        report.buckets[0].total.cost,
+        report.buckets[0].total.cost.amount,
         Cost::from_usd(128.0 * 0.12 + 0.65),
         "every tree once: each root's report and its brokered Subagent, and \
          the Sidekick with its Subsessions"
@@ -1402,9 +1402,9 @@ fn assert_all_time_metrics_by_add_up_to_root_tree_costs(
         (
             aggregates
                 .iter()
-                .filter_map(|aggregate| aggregate.cost)
+                .filter_map(|aggregate| aggregate.cost.amount)
                 .reduce(Cost::saturating_add),
-            aggregates.iter().any(|aggregate| aggregate.is_cost_partial),
+            aggregates.iter().any(|aggregate| aggregate.cost.is_partial),
         )
     };
     let all_time = added(&[report.buckets[0].total, report.untimed.total]);
@@ -1618,7 +1618,7 @@ async fn a_contribution_carries_its_cost_basis() {
     let id = session.snapshot.session.id;
     let (store, writer) = restore(workspace.path(), vec![session]).await;
     let mut estimated_counted = counted(id, &estimated, 0.03, false);
-    estimated_counted.amount = estimated_counted.amount.map(|amount| CountedCost {
+    estimated_counted.amount = estimated_counted.amount.map(|amount| CountedAmount {
         basis: CostBasis::Estimated,
         ..amount
     });

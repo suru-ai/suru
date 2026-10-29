@@ -28,8 +28,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::protocol::{
-    CacheInsights, DelegationInsights, EstimatedSaving, InsightsQuery, InsightsReport, ModelId,
-    ProviderId, QUARTER_HOUR_MS, QuarterHourTurns, RoleCost, SessionId, TURN_DURATION_BIN_ENDS_MS,
+    CacheInsights, CountedCost, DelegationInsights, EstimatedSaving, InsightsQuery, InsightsReport,
+    ModelId, ProviderId, QUARTER_HOUR_MS, QuarterHourTurns, SessionId, TURN_DURATION_BIN_ENDS_MS,
     TURN_DURATION_BINS, ToolTally, Turn, TurnDurations, TurnId, TurnInsights, TurnStatus, Usage,
     UsageMetricsAggregate, WorkspaceId, signed_nano_usd,
 };
@@ -41,8 +41,7 @@ use super::{
         SessionStore,
         cost_coverage::{CostContribution, tree_contributions},
     },
-    CopiedSession, CountedSession, MeteredForest, SessionTimestamp, TurnPlaces, add_counted,
-    placed_at,
+    CopiedSession, CountedSession, MeteredForest, SessionTimestamp, TurnPlaces, placed_at,
 };
 
 /// Why an Insights query is refused.
@@ -208,8 +207,7 @@ impl QuarterHourTally {
             start: SessionTimestamp(place * QUARTER_HOUR_MS),
             turns: 0,
             tokens: None,
-            cost: None,
-            is_cost_partial: false,
+            cost: CountedCost::default(),
         });
         quarter.turns += 1;
         if let Some(tokens) = turn.usage.as_ref().and_then(Usage::blended_tokens) {
@@ -226,11 +224,7 @@ impl QuarterHourTally {
         else {
             return;
         };
-        add_counted(
-            &mut quarter.cost,
-            &mut quarter.is_cost_partial,
-            contribution,
-        );
+        quarter.cost.add(contribution.counted());
     }
 
     fn into_quarter_hours(self) -> Vec<QuarterHourTurns> {
@@ -292,17 +286,14 @@ impl DelegationTally {
             return;
         };
         let insights = &mut self.insights;
-        let RoleCost {
-            cost,
-            is_cost_partial,
-        } = match role {
+        let cost = match role {
             SessionRole::Own => &mut insights.own_sessions,
             SessionRole::NativeSubagent => &mut insights.native_subagents,
             SessionRole::BrokeredSubagent => &mut insights.brokered_subagents,
             SessionRole::Sidekick => &mut insights.sidekicks,
             SessionRole::Subsession => &mut insights.subsessions,
         };
-        add_counted(cost, is_cost_partial, contribution);
+        cost.add(contribution.counted());
     }
 }
 

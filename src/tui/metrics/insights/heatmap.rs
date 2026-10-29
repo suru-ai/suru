@@ -18,7 +18,7 @@ use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    protocol::{Cost, QuarterHourTurns},
+    protocol::{Cost, CountedCost, QuarterHourTurns},
     theme::Theme,
 };
 
@@ -58,9 +58,7 @@ pub(super) struct HourCell {
     pub(super) turns: u64,
     /// Absent where none of them reported tokens.
     pub(super) tokens: Option<u64>,
-    /// Absent where none of them contributes a known amount.
-    pub(super) cost: Option<Cost>,
-    pub(super) is_cost_partial: bool,
+    pub(super) cost: CountedCost,
 }
 
 impl HourCell {
@@ -69,10 +67,7 @@ impl HourCell {
         if let Some(tokens) = quarter.tokens {
             self.tokens = Some(self.tokens.unwrap_or(0).saturating_add(tokens));
         }
-        if let Some(cost) = quarter.cost {
-            self.cost = Some(self.cost.map_or(cost, |held| held.saturating_add(cost)));
-        }
-        self.is_cost_partial |= quarter.is_cost_partial;
+        self.cost.add(quarter.cost);
     }
 }
 
@@ -244,9 +239,9 @@ fn named_cell(heatmap: &Heatmap, day: usize, hour: usize) -> String {
     if let Some(tokens) = cell.tokens {
         parts.push(MetricsMeasure::Tokens.total(tokens, false));
     }
-    if cell.cost.is_some() || cell.is_cost_partial {
-        let cost = cell.cost.map_or(0, Cost::nano_usd);
-        parts.push(MetricsMeasure::Cost.total(cost, cell.is_cost_partial));
+    if cell.cost.counts_work() {
+        let cost = cell.cost.amount.map_or(0, Cost::nano_usd);
+        parts.push(MetricsMeasure::Cost.total(cost, cell.cost.is_partial));
     }
     parts.join(" · ")
 }
@@ -281,7 +276,7 @@ mod tests {
     use jiff::{civil::DateTime, civil::date, tz::TimeZone};
 
     use super::{Heatmap, HourCell};
-    use crate::protocol::{Cost, QUARTER_HOUR_MS, QuarterHourTurns, SessionTimestamp};
+    use crate::protocol::{Cost, CountedCost, QUARTER_HOUR_MS, QuarterHourTurns, SessionTimestamp};
 
     const MONDAY: usize = 0;
     const TUESDAY: usize = 1;
@@ -301,8 +296,10 @@ mod tests {
             start: SessionTimestamp(start),
             turns: 1,
             tokens: Some(tokens),
-            cost: Some(Cost::from_nano_usd(nano_usd)),
-            is_cost_partial: false,
+            cost: CountedCost {
+                amount: Some(Cost::from_nano_usd(nano_usd)),
+                is_partial: false,
+            },
         }
     }
 
@@ -342,8 +339,10 @@ mod tests {
             HourCell {
                 turns: 2,
                 tokens: Some(6),
-                cost: Some(Cost::from_nano_usd(6)),
-                is_cost_partial: false,
+                cost: CountedCost {
+                    amount: Some(Cost::from_nano_usd(6)),
+                    is_partial: false,
+                },
             }
         );
     }
@@ -452,8 +451,10 @@ mod tests {
             start: SessionTimestamp(priced.start.0 + QUARTER_HOUR_MS),
             turns: 2,
             tokens: None,
-            cost: None,
-            is_cost_partial: true,
+            cost: CountedCost {
+                amount: None,
+                is_partial: true,
+            },
         };
 
         let heatmap = Heatmap::fold(&[priced, unpriced], &utc);
@@ -463,8 +464,10 @@ mod tests {
             HourCell {
                 turns: 3,
                 tokens: Some(10),
-                cost: Some(Cost::from_nano_usd(5)),
-                is_cost_partial: true,
+                cost: CountedCost {
+                    amount: Some(Cost::from_nano_usd(5)),
+                    is_partial: true,
+                },
             }
         );
         assert_eq!(heatmap.busiest(), 3);

@@ -12,8 +12,9 @@ use crate::tui_rendering::{
 use crossterm::event::KeyCode;
 use suru::{
     protocol::{
-        Cost, KeyedUsageMetrics, UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsBucket,
-        UsageMetricsKey, UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport, WorkspaceId,
+        Cost, CountedCost, KeyedUsageMetrics, UsageMetricsAggregate, UsageMetricsBreakdown,
+        UsageMetricsBucket, UsageMetricsKey, UsageMetricsKeyLabel, UsageMetricsQuery,
+        UsageMetricsReport, WorkspaceId,
     },
     tui::{
         Application, ApplicationTransition, InsightsPanel, SemanticCommandId,
@@ -60,8 +61,10 @@ pub(super) fn spent(query: &UsageMetricsQuery, spent: &[(&str, f64, bool)]) -> U
         .map(|(label, usd, partial)| KeyedUsageMetrics {
             key: workspace(label),
             aggregate: UsageMetricsAggregate {
-                cost: Cost::from_usd(*usd),
-                is_cost_partial: *partial,
+                cost: CountedCost {
+                    amount: Cost::from_usd(*usd),
+                    is_partial: *partial,
+                },
                 sessions: 1,
                 turns: 1,
                 ..UsageMetricsAggregate::default()
@@ -69,8 +72,10 @@ pub(super) fn spent(query: &UsageMetricsQuery, spent: &[(&str, f64, bool)]) -> U
         })
         .collect();
     let total = UsageMetricsAggregate {
-        cost: Cost::from_usd(spent.iter().map(|(_, usd, _)| usd).sum()),
-        is_cost_partial: spent.iter().any(|(_, _, partial)| *partial),
+        cost: CountedCost {
+            amount: Cost::from_usd(spent.iter().map(|(_, usd, _)| usd).sum()),
+            is_partial: spent.iter().any(|(_, _, partial)| *partial),
+        },
         sessions: spent.len() as u64,
         turns: spent.len() as u64,
         ..UsageMetricsAggregate::default()

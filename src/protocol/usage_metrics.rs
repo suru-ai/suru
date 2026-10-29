@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{Cost, ModelId, ProviderId, SessionId, SessionTimestamp, WorkspaceId};
+use super::{Cost, CostTotal, ModelId, ProviderId, SessionId, SessionTimestamp, WorkspaceId};
 
 /// The most buckets one query may ask for: enough for every hour of a day,
 /// every day of a year, or every month of decades, and few enough that a
@@ -146,10 +146,10 @@ pub struct UsageMetricsSession {
     /// most under, or used the most tokens of where none cost more than
     /// another; absent where no Turn there knows its Agent.
     pub model: Option<String>,
-    pub cost: Cost,
-    /// Whether work of the Session across the buckets has a Cost no counted
-    /// amount accounts for, so `cost` says less than it cost.
-    pub is_cost_partial: bool,
+    /// Always a known amount: only a Session whose work has one is named.
+    /// Partial where work of the Session across the buckets has a Cost no
+    /// counted amount accounts for.
+    pub cost: CostTotal,
 }
 
 /// The figures of one bucket: its whole, and its part under each key a Turn
@@ -184,15 +184,10 @@ pub struct UsageMetricsAggregate {
     pub reasoning_tokens: Option<u64>,
     /// The Cost the Turns contribute once every overlap is removed (ADR
     /// 0054), a running total's increments placed on the Turns that carried
-    /// them; absent where none contributes a known amount, never a zero
-    /// nobody measured.
-    pub cost: Option<Cost>,
-    /// Whether work among the Turns has a Cost no counted amount accounts
-    /// for, so `cost` says less than they cost. It holds where `cost` is
-    /// absent too: unpriced work is still work.
-    pub is_cost_partial: bool,
-    /// The part of `cost` Suru estimated rather than the Provider reported;
-    /// absent where no contribution was Estimated.
+    /// them.
+    pub cost: CountedCost,
+    /// The part of `cost`'s amount Suru estimated rather than the Provider
+    /// reported; absent where no contribution was Estimated.
     pub estimated_cost: Option<Cost>,
     /// How many distinct top-level Sessions — those without a parent, a
     /// Sidekick's Subsessions among them — ran at least one of the Turns.
@@ -246,6 +241,64 @@ impl UsageMetricsAggregate {
             self.cache_read_tokens,
             self.cache_write_tokens,
         )
+    }
+}
+
+/// A Cost as Cost Coverage contributions add up to it: the amount they
+/// count, and whether work among them has a Cost no counted amount accounts
+/// for, so the amount says less than it cost. Every figure a read gives that
+/// adds contributions up is one, and adds them by [`Self::add`] alone.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CountedCost {
+    /// Absent where nothing counted contributes a known amount, never a
+    /// zero nobody measured.
+    pub amount: Option<Cost>,
+    /// It holds where `amount` is absent too: unpriced work is still work.
+    pub is_partial: bool,
+}
+
+impl CountedCost {
+    /// Adds `other` in: the amounts' sum, absent only where both are, and
+    /// partial where either is.
+    pub fn add(&mut self, other: Self) {
+        self.amount = match (self.amount, other.amount) {
+            (Some(amount), Some(other)) => Some(amount.saturating_add(other)),
+            (amount, other) => amount.or(other),
+        };
+        self.is_partial |= other.is_partial;
+    }
+
+    /// Whether it counts any work: an amount, or work no amount accounts
+    /// for.
+    pub fn counts_work(self) -> bool {
+        self.amount.is_some() || self.is_partial
+    }
+
+    /// The Cost stated as a known total, where it counts an amount.
+    pub fn total(self) -> Option<CostTotal> {
+        self.amount.map(|cost| CostTotal {
+            cost,
+            is_partial: self.is_partial,
+        })
+    }
+}
+
+impl From<CostTotal> for CountedCost {
+    fn from(total: CostTotal) -> Self {
+        Self {
+            amount: Some(total.cost),
+            is_partial: total.is_partial,
+        }
+    }
+}
+
+impl std::iter::Sum for CountedCost {
+    fn sum<I: Iterator<Item = Self>>(costs: I) -> Self {
+        costs.fold(Self::default(), |mut sum, cost| {
+            sum.add(cost);
+            sum
+        })
     }
 }
 
@@ -372,21 +425,21 @@ pub struct EstimatedSaving {
 #[serde(deny_unknown_fields)]
 pub struct DelegationInsights {
     /// Top-level Sessions that are neither a Sidekick's nor Subsessions.
-    pub own_sessions: RoleCost,
+    pub own_sessions: CountedCost,
     /// Subagents a Provider spawned of its own accord.
-    pub native_subagents: RoleCost,
+    pub native_subagents: CountedCost,
     /// Subagents spawned through the Broker, metered apart from the
     /// Session that spawned them.
-    pub brokered_subagents: RoleCost,
+    pub brokered_subagents: CountedCost,
     /// The top-level Sessions of the Sidekick Workspace.
-    pub sidekicks: RoleCost,
+    pub sidekicks: CountedCost,
     /// Sessions a Sidekick began.
-    pub subsessions: RoleCost,
+    pub subsessions: CountedCost,
 }
 
 impl DelegationInsights {
     /// The Cost every role adds up to: the interval's.
-    pub fn total(&self) -> RoleCost {
+    pub fn total(&self) -> CountedCost {
         [
             self.own_sessions,
             self.native_subagents,
@@ -395,33 +448,7 @@ impl DelegationInsights {
             self.subsessions,
         ]
         .into_iter()
-        .fold(RoleCost::default(), RoleCost::with)
-    }
-}
-
-/// The Cost of the work Sessions of one role did.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RoleCost {
-    /// Absent where none of their work contributes a known amount.
-    pub cost: Option<Cost>,
-    /// Whether some of their work has a Cost no counted amount accounts
-    /// for.
-    pub is_cost_partial: bool,
-}
-
-impl RoleCost {
-    /// This Cost and `other` stated as one: their sum, partial where either
-    /// is.
-    pub fn with(self, other: Self) -> Self {
-        let cost = match (self.cost, other.cost) {
-            (Some(cost), Some(other)) => Some(cost.saturating_add(other)),
-            (cost, other) => cost.or(other),
-        };
-        Self {
-            cost,
-            is_cost_partial: self.is_cost_partial || other.is_cost_partial,
-        }
+        .sum()
     }
 }
 
@@ -550,11 +577,8 @@ pub struct QuarterHourTurns {
     pub tokens: Option<u64>,
     /// The Cost their Cost Coverage contributions add up to, overlaps
     /// removed as a [`UsageMetricsAggregate`]'s are, so the quarter-hours of
-    /// an interval add up to its Cost; absent where none contributes a
-    /// known amount.
-    pub cost: Option<Cost>,
-    /// Whether work among them has a Cost no counted amount accounts for.
-    pub is_cost_partial: bool,
+    /// an interval add up to its Cost.
+    pub cost: CountedCost,
 }
 
 /// How long the interval's Turns took to Settle, and how they ended.

@@ -46,7 +46,7 @@ use std::{
 };
 
 use crate::protocol::{
-    Author, Cost, CostBasis, KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS,
+    Author, Cost, CostBasis, CountedCost, KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS,
     MAX_USAGE_METRICS_TOP_SESSIONS, ModelCatalog, ModelId, ProviderId, SessionId, SessionTimestamp,
     Turn, TurnId, TurnStatus, Usage, UsageMetricsAggregate, UsageMetricsBreakdown,
     UsageMetricsBucket, UsageMetricsKey, UsageMetricsKeyLabel, UsageMetricsQuery,
@@ -55,7 +55,7 @@ use crate::protocol::{
 
 use super::{
     SessionStore, SessionStoreState,
-    cost_coverage::{CostContribution, CostForest, add_cost, tree_contributions},
+    cost_coverage::{CostContribution, CostForest, tree_contributions},
 };
 
 /// Why a Usage Metrics query is refused.
@@ -518,15 +518,14 @@ impl Tally {
 /// which the Model it ran most is named.
 #[derive(Default)]
 struct OwnedCost {
-    cost: Option<Cost>,
-    is_partial: bool,
+    cost: CountedCost,
     models: HashMap<UsageMetricsKey, ModelShare>,
 }
 
 /// One Model's part of a Session's work across the buckets.
 #[derive(Clone, Copy, Default)]
 struct ModelShare {
-    cost: Option<Cost>,
+    cost: CountedCost,
     tokens: u64,
 }
 
@@ -541,14 +540,10 @@ impl OwnedCost {
     }
 
     fn add_cost(&mut self, model: Option<&UsageMetricsKey>, contribution: &CostContribution) {
-        self.is_partial |= contribution.is_partial;
-        let Some(amount) = contribution.amount else {
-            return;
-        };
-        self.cost = Some(add_cost(self.cost, amount.cost));
+        self.cost.add(contribution.counted());
         if let Some(model) = model {
             let share = self.models.entry(model.clone()).or_default();
-            share.cost = Some(add_cost(share.cost, amount.cost));
+            share.cost.add(contribution.counted());
         }
     }
 
@@ -556,7 +551,8 @@ impl OwnedCost {
     /// where none cost more than another, the first in a report's order
     /// among any still alike.
     fn main_model(&self) -> Option<&UsageMetricsKey> {
-        let weight = |share: &ModelShare| (share.cost.map_or(0, Cost::nano_usd), share.tokens);
+        let weight =
+            |share: &ModelShare| (share.cost.amount.map_or(0, Cost::nano_usd), share.tokens);
         self.models
             .iter()
             .max_by(|(left_key, left), (right_key, right)| {
@@ -587,7 +583,7 @@ fn top_owners(owned: &HashMap<SessionId, OwnedCost>, limit: usize) -> Vec<Sessio
     }
     let mut priced: Vec<(SessionId, Cost)> = owned
         .iter()
-        .filter_map(|(owner, owned)| Some((*owner, owned.cost?)))
+        .filter_map(|(owner, owned)| Some((*owner, owned.cost.amount?)))
         .collect();
     if priced.len() > limit {
         priced.select_nth_unstable_by(limit - 1, dearest_first);
@@ -600,27 +596,16 @@ fn top_owners(owned: &HashMap<SessionId, OwnedCost>, limit: usize) -> Vec<Sessio
 /// Adds what one Turn contributes to a Cost: its amount, and its Estimated
 /// portion, where it counts one, and its partial mark.
 fn add_contribution(aggregate: &mut UsageMetricsAggregate, contribution: &CostContribution) {
-    add_counted(
-        &mut aggregate.cost,
-        &mut aggregate.is_cost_partial,
-        contribution,
-    );
+    aggregate.cost.add(contribution.counted());
     if let Some(amount) = contribution
         .amount
         .filter(|amount| amount.basis == CostBasis::Estimated)
     {
-        aggregate.estimated_cost = Some(add_cost(aggregate.estimated_cost, amount.cost));
+        aggregate.estimated_cost =
+            Some(aggregate.estimated_cost.map_or(amount.cost, |estimated| {
+                estimated.saturating_add(amount.cost)
+            }));
     }
-}
-
-/// Adds what one Turn contributes to `cost`, where it counts an amount, and
-/// its partial mark to `is_partial`: how every figure a read gives adds a
-/// contribution up.
-fn add_counted(cost: &mut Option<Cost>, is_partial: &mut bool, contribution: &CostContribution) {
-    if let Some(amount) = contribution.amount {
-        *cost = Some(add_cost(*cost, amount.cost));
-    }
-    *is_partial |= contribution.is_partial;
 }
 
 /// Where each Turn a read counts landed, so each Cost Coverage contribution
@@ -832,8 +817,7 @@ fn fold(
                         .cloned()
                         .expect("every top Session's Model is named")
                 }),
-                cost: owned.cost.expect("a top Session has a known Cost"),
-                is_cost_partial: owned.is_partial,
+                cost: owned.cost.total().expect("a top Session has a known Cost"),
             }
         })
         .collect();

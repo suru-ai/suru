@@ -25,7 +25,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::{protocol::Cost, theme::Theme};
+use crate::{protocol::CountedCost, theme::Theme};
 
 use super::{
     super::{UsageMetricsReadRefusal, calendar::MetricsRange, chart::MetricsMeasure},
@@ -431,8 +431,8 @@ pub(super) fn bar(part: u64, whole: u64, width: usize) -> String {
 /// A Cost as a panel states it: its amount, `+` where it is partial; or,
 /// where it counts no amount, whether that is for want of work or of a
 /// price, never a zero nobody measured.
-pub(super) fn stated_cost(cost: Option<Cost>, is_partial: bool) -> String {
-    match (cost, is_partial) {
+pub(super) fn stated_cost(cost: CountedCost) -> String {
+    match (cost.amount, cost.is_partial) {
         (Some(cost), is_partial) => MetricsMeasure::Cost.figure(cost.nano_usd(), is_partial),
         (None, true) => "unpriced".to_owned(),
         (None, false) => "—".to_owned(),

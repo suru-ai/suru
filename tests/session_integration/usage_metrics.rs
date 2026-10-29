@@ -7,11 +7,11 @@ use std::time::Duration;
 use suru::{
     pricing::CacheRates,
     protocol::{
-        CacheInsights, Cost, DelegationInsights, EstimatedSaving, InsightsQuery, InsightsReport,
-        InsightsTool, ModelId, QUARTER_HOUR_MS, RoleCost, RuntimeDescriptor, SessionError,
-        SessionErrorCode, SessionTimestamp, TURN_DURATION_BINS, ToolTally, TurnDurations,
-        TurnInsights, Usage, UsageMetricsAggregate, UsageMetricsBreakdown, UsageMetricsInterval,
-        UsageMetricsKey, UsageMetricsQuery, UsageMetricsReport,
+        CacheInsights, Cost, CostTotal, CountedCost, DelegationInsights, EstimatedSaving,
+        InsightsQuery, InsightsReport, InsightsTool, ModelId, QUARTER_HOUR_MS, RuntimeDescriptor,
+        SessionError, SessionErrorCode, SessionTimestamp, TURN_DURATION_BINS, ToolTally,
+        TurnDurations, TurnInsights, Usage, UsageMetricsAggregate, UsageMetricsBreakdown,
+        UsageMetricsInterval, UsageMetricsKey, UsageMetricsQuery, UsageMetricsReport,
     },
     provider::{MeteredCost, ProviderActivityId, ProviderEvent, ProviderToolCallStatus},
 };
@@ -99,9 +99,11 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
     let measured = UsageMetricsAggregate {
         fresh_input_tokens: Some(4_000),
         output_tokens: Some(1_000),
-        cost: Cost::from_usd(0.25),
         // The Turn is working still, past what its Cost says.
-        is_cost_partial: true,
+        cost: CountedCost {
+            amount: Cost::from_usd(0.25),
+            is_partial: true,
+        },
         sessions: 1,
         turns: 1,
         ..UsageMetricsAggregate::default()
@@ -134,9 +136,15 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
         report
             .top_sessions
             .iter()
-            .map(|session| (session.session_id, session.cost, session.is_cost_partial))
+            .map(|session| (session.session_id, session.cost))
             .collect::<Vec<_>>(),
-        vec![(fixture.session_id, Cost::from_usd(0.25).unwrap(), true)],
+        vec![(
+            fixture.session_id,
+            CostTotal {
+                cost: Cost::from_usd(0.25).unwrap(),
+                is_partial: true,
+            }
+        )],
         "the one Session that cost anything, its Turn working still"
     );
 
@@ -319,9 +327,9 @@ async fn insights_are_read_over_the_api_and_a_backwards_interval_is_refused() {
     assert_eq!(
         report.delegation,
         DelegationInsights {
-            own_sessions: RoleCost {
-                cost: None,
-                is_cost_partial: true,
+            own_sessions: CountedCost {
+                amount: None,
+                is_partial: true,
             },
             ..DelegationInsights::default()
         },
