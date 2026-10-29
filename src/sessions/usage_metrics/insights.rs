@@ -31,7 +31,7 @@ use crate::protocol::{
     CacheInsights, DelegationInsights, EstimatedSaving, InsightsQuery, InsightsReport, ModelId,
     ProviderId, QUARTER_HOUR_MS, QuarterHourTurns, RoleCost, SessionId, TURN_DURATION_BIN_ENDS_MS,
     TURN_DURATION_BINS, ToolTally, Turn, TurnDurations, TurnId, TurnInsights, TurnStatus, Usage,
-    UsageMetricsAggregate, WorkspaceId,
+    UsageMetricsAggregate, WorkspaceId, signed_nano_usd,
 };
 
 use crate::{pricing::CacheRateLookup, sidekick::SidekickWorkspace, storage::ActivityTallies};
@@ -418,22 +418,22 @@ impl CacheTally {
 
     /// The figures, the saving worked out from the rates `rates` states
     /// today for each Model, leaving out a Model lacking a rate for a part
-    /// of the cache its Turns used.
+    /// of the cache its Turns used, or whose rates price no finite saving.
     async fn priced(self, rates: &dyn CacheRateLookup) -> CacheInsights {
         let mut saving = EstimatedSaving {
             nano_usd: None,
             is_partial: self.is_unattributed,
         };
         for ((provider, model), used) in self.by_model {
-            let Some(usd) = rates
+            let Some(nano_usd) = rates
                 .cache_rates(&provider, &model)
                 .await
                 .and_then(|rates| rates.saving_usd(used.reads, used.writes))
+                .and_then(signed_nano_usd)
             else {
                 saving.is_partial = true;
                 continue;
             };
-            let nano_usd = (usd * NANO_USD_PER_USD).round() as i64;
             saving.nano_usd = Some(saving.nano_usd.unwrap_or(0).saturating_add(nano_usd));
         }
         CacheInsights {
@@ -444,5 +444,3 @@ impl CacheTally {
         }
     }
 }
-
-const NANO_USD_PER_USD: f64 = 1_000_000_000.0;

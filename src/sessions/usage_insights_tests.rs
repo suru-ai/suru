@@ -1235,6 +1235,25 @@ async fn a_model_without_rates_is_left_out_of_the_saving_which_is_then_partial()
 }
 
 #[tokio::test]
+async fn a_rate_that_prices_no_finite_saving_is_left_out_which_is_then_partial() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![
+        cached(CODEX, START, 0, 1_000_000, 0),
+        cached(OPUS, START + 1, 0, 1_000_000, 0),
+    ];
+    let (store, writer) = restore(directory.path(), vec![session]).await;
+    let rates = RateTable::default()
+        .pricing(CODEX, 2.00, Some(0.20), Some(2.50))
+        .pricing(OPUS, f64::INFINITY, Some(1.50), None);
+
+    let cache = priced_at(&store, &over(START, END), &rates).await.cache;
+
+    assert_eq!(cache.saving, saved(Some(1.80), true));
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn no_priced_model_leaves_the_saving_unknown() {
     let directory = tempfile::tempdir().unwrap();
     let mut session = persisted(directory.path(), None);

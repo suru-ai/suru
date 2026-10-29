@@ -357,7 +357,8 @@ pub struct EstimatedSaving {
     /// the cache has a Model with the rates of the parts it used.
     pub nano_usd: Option<i64>,
     /// Whether a Turn that read or wrote the cache is left out, its Model
-    /// lacking the rate of a part it used, so it says less than caching did.
+    /// lacking the rate of a part it used, or its rates pricing no finite
+    /// saving, so it says less than caching did.
     pub is_partial: bool,
 }
 

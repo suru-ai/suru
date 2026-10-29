@@ -4203,6 +4203,19 @@ impl Cost {
     }
 }
 
+/// A dollar figure that may run negative — an estimate, never a Cost, such
+/// as what caching saved — in billionths of one USD, rounded as a Cost is.
+/// Absent where `usd` is not finite or lies beyond what an `i64` of
+/// billionths holds, so an estimate worked out from a rate gone wrong never
+/// reads as a figure.
+pub fn signed_nano_usd(usd: f64) -> Option<i64> {
+    let nano_usd = (usd * Cost::NANO_USD_PER_USD).round();
+    // `i64::MAX as f64` rounds up past `i64::MAX`, so it bounds from above
+    // exclusively.
+    (nano_usd.is_finite() && nano_usd >= i64::MIN as f64 && nano_usd < i64::MAX as f64)
+        .then_some(nano_usd as i64)
+}
+
 impl Serialize for Cost {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
