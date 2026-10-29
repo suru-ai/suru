@@ -15,12 +15,12 @@ use suru::protocol::{
     SkillDescriptor, SkillId, SkillPromptDelivery,
 };
 use suru::provider::{
-    AttributedProviderEvent, ErrandAnswer, ErrandConsumption, ErrandFuture, ManualCompaction,
-    ProviderCompactionInput, ProviderDecisionDelivery, ProviderErrand, ProviderError,
-    ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFuture, ProviderInput,
-    ProviderInterruption, ProviderModelDiscovery, ProviderPrompt, ProviderRuntime, ProviderSession,
-    ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
-    ProviderTurnInput, ProviderWatchId, Report, SubagentReport,
+    AttributedProviderEvent, ErrandAnswer, ErrandConsumption, ErrandFailed, ErrandFuture,
+    ManualCompaction, ProviderCompactionInput, ProviderDecisionDelivery, ProviderErrand,
+    ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFuture,
+    ProviderInput, ProviderInterruption, ProviderModelDiscovery, ProviderPrompt, ProviderRuntime,
+    ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
+    ProviderSubagentId, ProviderTurnInput, ProviderWatchId, Report, SubagentReport,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -109,7 +109,7 @@ pub struct StartRequest {
 /// because nothing else about a request that is never answered is observable.
 pub struct ErrandRequest {
     errand: ProviderErrand,
-    response: oneshot::Sender<Result<ErrandAnswer, ProviderError>>,
+    response: oneshot::Sender<Result<ErrandAnswer, ErrandFailed>>,
 }
 
 /// Holding a gated delivery exposes arbitration while Provider acknowledgement waits.
@@ -562,8 +562,17 @@ impl ErrandRequest {
     }
 
     pub fn fail(self, message: impl Into<String>) {
+        self.fail_consuming(message, ErrandConsumption::default());
+    }
+
+    /// Fails with `message`, saying the attempt still consumed `consumption`,
+    /// as a call that reached the Model before failing may have.
+    pub fn fail_consuming(self, message: impl Into<String>, consumption: ErrandConsumption) {
         self.response
-            .send(Err(ProviderError::new(message)))
+            .send(Err(ErrandFailed::measured(
+                ProviderError::new(message),
+                consumption,
+            )))
             .unwrap_or_else(|_| panic!("Provider Errand response remains connected"));
     }
 }
@@ -1284,9 +1293,9 @@ impl ProviderRuntime for ControlledProviderRuntime {
                     response: response_tx,
                 })
                 .map_err(|_| ProviderError::new("test Provider controller disconnected"))?;
-            Ok(response_rx
+            response_rx
                 .await
-                .map_err(|_| ProviderError::new("test Provider Errand was abandoned"))??)
+                .map_err(|_| ProviderError::new("test Provider Errand was abandoned"))?
         })
     }
 
@@ -1383,7 +1392,10 @@ async fn run_errand_through_a_session(
     }
     session.shutdown().await?;
     serde_json::from_str(&reply)
-        .map(ErrandAnswer::unmeasured)
+        .map(|reply| ErrandAnswer {
+            reply,
+            consumption: ErrandConsumption::default(),
+        })
         .map_err(|error| ProviderError::new(format!("Errand reply is not JSON: {error}")))
 }
 

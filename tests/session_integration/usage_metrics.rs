@@ -6,7 +6,7 @@ use crate::session_integration::{
     provider_support::ControlledProvider,
     support::{hosted_model, hosted_selection, read_session_until, working_turn},
 };
-use crate::support::PROGRESS_DEADLINE;
+use crate::support::{PROGRESS_DEADLINE, provider::ErrandRequest};
 use std::time::Duration;
 use suru::{
     pricing::CacheRates,
@@ -376,6 +376,32 @@ async fn insights_are_read_over_the_api_and_a_backwards_interval_is_refused() {
 /// once the storage writer has landed its record.
 #[tokio::test]
 async fn an_errand_s_usage_and_cost_are_read_over_the_api_under_the_errands_key() {
+    errand_is_read_over_the_api("usage-metrics-errands", |errand, consumption| {
+        errand.succeed_consuming(
+            serde_json::json!({ "title": "Errands on the wire", "icon": "md-bug" }),
+            consumption,
+        )
+    })
+    .await;
+}
+
+/// A failed Errand that reached its Model is recorded with the Usage and Cost
+/// its failure states, and read back as an answered one's would be.
+#[tokio::test]
+async fn a_failed_errand_s_stated_usage_and_cost_are_read_over_the_api() {
+    errand_is_read_over_the_api("usage-metrics-failed-errands", |errand, consumption| {
+        errand.fail_consuming("the reply fell outside its schema", consumption)
+    })
+    .await;
+}
+
+/// Runs a Session whose Title Errand `settle` ends, stating it consumed 12
+/// fresh input and 56 output tokens at a Reported Cost, and shows the
+/// Usage Metrics and Insights reads count exactly that under Errands.
+async fn errand_is_read_over_the_api(
+    server_name: &str,
+    settle: impl FnOnce(ErrandRequest, ErrandConsumption),
+) {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let (runtime, mut provider) = ControlledProvider::with_provider(
@@ -383,7 +409,7 @@ async fn an_errand_s_usage_and_cost_are_read_over_the_api_under_the_errands_key(
         vec![hosted_model("controlled", "controlled-default")],
     );
     let server = server::spawn_with_provider(
-        ServerConfig::new(state.path(), "usage-metrics-errands").expect("configure server"),
+        ServerConfig::new(state.path(), server_name).expect("configure server"),
         runtime,
     )
     .await
@@ -413,20 +439,19 @@ async fn an_errand_s_usage_and_cost_are_read_over_the_api_under_the_errands_key(
         .error_for_status()
         .expect("Session creation succeeds");
     let cost = Cost::from_usd(0.004).unwrap();
-    timeout(PROGRESS_DEADLINE, provider.next_errand())
-        .await
-        .expect("the Title Errand reaches the Provider")
-        .succeed_consuming(
-            serde_json::json!({ "title": "Errands on the wire", "icon": "md-bug" }),
-            ErrandConsumption {
-                usage: Some(Usage {
-                    fresh_input_tokens: Some(12),
-                    output_tokens: Some(56),
-                    ..Usage::default()
-                }),
-                cost: Some(ErrandCost::reported(cost)),
-            },
-        );
+    settle(
+        timeout(PROGRESS_DEADLINE, provider.next_errand())
+            .await
+            .expect("the Title Errand reaches the Provider"),
+        ErrandConsumption {
+            usage: Some(Usage {
+                fresh_input_tokens: Some(12),
+                output_tokens: Some(56),
+                ..Usage::default()
+            }),
+            cost: Some(ErrandCost::reported(cost)),
+        },
+    );
 
     let all_of_time = by_model(vec![UsageMetricsInterval {
         start: SessionTimestamp(0),
