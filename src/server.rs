@@ -228,6 +228,12 @@ pub struct ServerTimings {
     /// its wait ends takes it down along with everything it started, so a
     /// Provider that ignores being asked to stop never outlives the Server.
     pub provider_stop_timeout: Duration,
+    /// How long a Session whose Provider runs a process of its own for each
+    /// Session — Claude's and Codex's — may wait idle, with nothing owed on
+    /// it, before that process is stopped, so idle Sessions hold no processes
+    /// or pipes however many there are. Its conversation resumes from its
+    /// stored Resume State at its next Turn.
+    pub provider_idle_shutdown: Duration,
     /// How long a newly issued Invite remains redeemable.
     pub invite_ttl: Duration,
     /// How long removing a Remote waits for that Remote to acknowledge the
@@ -389,6 +395,7 @@ impl Default for ServerTimings {
             shutdown_cutoff_margin: CUTOFF_MARGIN,
             errand_timeout: DEFAULT_ERRAND_TIMEOUT,
             provider_stop_timeout: crate::provider::PROVIDER_STOP_TIMEOUT,
+            provider_idle_shutdown: crate::provider::PROVIDER_IDLE_SHUTDOWN,
             invite_ttl: Duration::from_secs(10 * 60),
             remote_withdrawal_timeout: Duration::from_secs(5),
             remote_reach_timeout: Duration::from_secs(10),
@@ -517,6 +524,14 @@ impl ServerTimings {
     /// out the default.
     pub fn with_provider_stop_timeout(mut self, timeout: Duration) -> Self {
         self.provider_stop_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long an idle Session keeps a Provider process of its own;
+    /// injectable so tests see it let go of, and the conversation resumed,
+    /// without waiting out the default.
+    pub fn with_provider_idle_shutdown(mut self, idle: Duration) -> Self {
+        self.provider_idle_shutdown = idle;
         self
     }
 
@@ -1791,6 +1806,7 @@ async fn start(
         source_control.clone(),
         timings.checkout_skill_timeout,
         timings.provider_stop_timeout,
+        timings.provider_idle_shutdown,
         broker_access.clone(),
         attachment_store.clone(),
     );

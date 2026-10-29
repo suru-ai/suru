@@ -176,6 +176,11 @@ impl ProviderRuntime for ClaudeRuntime {
         true
     }
 
+    // Every Session runs a `claude` process of its own.
+    fn launches_a_process_per_session(&self) -> bool {
+        true
+    }
+
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();

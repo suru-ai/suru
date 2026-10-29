@@ -2,15 +2,16 @@
 //!
 //! The provider-session identifier Suru mints persists as the Session's Resume State, and every
 //! child after the first asks the CLI to resume the conversation filed under it: the child a
-//! replacement server spawns after a restart, and the child an Agent Selection change respawns —
+//! replacement server spawns after a restart, the child the next Turn spawns once an idle
+//! Session's own was stopped, and the child an Agent Selection change respawns —
 //! the Model and its Options being spawn-time flags, a change between Turns is a new process on
 //! the same conversation. A resume the CLI cannot honor fails the Turn rather than quietly opening
 //! an empty conversation under the same identifier.
 
 use crate::claude_integration::support::{
     CLAUDE_MODELS, ScriptedClaude, agent_messages, connect, conversation_arms,
-    conversation_fixture, discovery_arms, flag_value, hosting, rejecting_resume_preamble,
-    settled_session,
+    conversation_fixture, discovery_arms, flag_value, hosting, hosting_with_timings,
+    rejecting_resume_preamble, settled_session,
 };
 use suru::{
     managed_client::ManagedClient,
@@ -21,7 +22,7 @@ use suru::{
         ModelOptionValue, PromptDelivery, PromptId, ProviderId, SessionId, SessionSnapshot,
         SettingMutation, TurnId, TurnStatus, UpdateAgentSelectionRequest,
     },
-    server::RunningServer,
+    server::{RunningServer, ServerTimings},
 };
 
 /// One agent Message streamed and the terminal result that Settles the Turn — enough for a Turn to
@@ -68,12 +69,22 @@ impl DurableSession {
     /// Opens a Session on `claude` under `channel` and runs its first Turn to completion.
     /// `channel` is the client channel, so each test needs its own.
     async fn start(claude: &ScriptedClaude, channel: &'static str) -> Self {
+        Self::start_with(claude, channel, ServerTimings::default()).await
+    }
+
+    /// [`Self::start`] on a server run to `timings`.
+    async fn start_with(
+        claude: &ScriptedClaude,
+        channel: &'static str,
+        timings: ServerTimings,
+    ) -> Self {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let workspace = tempfile::tempdir().expect("create valid Workspace");
         let execution_directory = workspace.path().join("packages/nested agent directory");
         std::fs::create_dir_all(&execution_directory).unwrap();
         let execution_directory = suru::paths::canonical(execution_directory).unwrap();
-        let (server, client) = hosting(claude, channel, state_dir.path()).await;
+        let (server, client) =
+            hosting_with_timings(claude, channel, state_dir.path(), timings).await;
         let created = client
             .create_session(CreateSessionRequest {
                 session_id: None,
@@ -248,6 +259,38 @@ async fn a_session_reopened_after_a_restart_resumes_the_conversation_it_opened()
     }
 
     restored.shutdown().await;
+}
+
+/// A Session left idle has its child stopped, holding no process or pipes while it waits, and the
+/// child its next Turn spawns resumes the conversation the first one opened.
+#[tokio::test]
+async fn an_idle_sessions_child_is_stopped_and_its_next_turn_resumes_the_conversation() {
+    let claude = conversation_fixture(STREAMED_MESSAGE);
+    let idle = DurableSession::start_with(
+        &claude,
+        "claude-idle-resume",
+        ServerTimings::default().with_provider_idle_shutdown(std::time::Duration::from_millis(50)),
+    )
+    .await;
+    claude.wait_for_exits(claude.launches()).await;
+    assert_eq!(
+        conversation_launches(&claude).len(),
+        1,
+        "nothing respawns the stopped child before the next Turn"
+    );
+
+    let settled = idle.continue_with("Carry on where we stopped", 1).await;
+
+    assert_eq!(
+        settled.turns[1].status,
+        TurnStatus::Completed,
+        "the Turn after the idle stop runs on the resumed conversation: {:?}",
+        settled.activities
+    );
+    assert_eq!(agent_messages(&settled).len(), 2);
+    assert_second_child_resumed_the_first(&claude, "the idle stop");
+
+    idle.shutdown().await;
 }
 
 #[tokio::test]

@@ -194,6 +194,11 @@ impl ProviderRuntime for CodexRuntime {
         ManualCompaction::Supported
     }
 
+    // Every Session runs an app-server process of its own.
+    fn launches_a_process_per_session(&self) -> bool {
+        true
+    }
+
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();

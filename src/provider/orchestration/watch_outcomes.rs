@@ -125,4 +125,9 @@ impl HeldWatchOutcomes {
     pub(super) fn drop_all(&mut self) {
         self.held.clear();
     }
+
+    /// Whether no outcome waits for a Turn.
+    pub(super) fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
 }

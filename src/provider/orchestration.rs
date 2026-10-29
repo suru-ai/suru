@@ -124,6 +124,11 @@ const COMPACTION_OVERTAKEN_MESSAGE: &str = "Compaction not started: the Agent be
 /// on one when that wait ends takes it down along with everything it started.
 pub(crate) const PROVIDER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a Session whose Provider runs a process for each Session waits
+/// idle, with nothing owed on it, before that process is let go of; see
+/// [`ProviderRuntime::launches_a_process_per_session`].
+pub(crate) const PROVIDER_IDLE_SHUTDOWN: Duration = Duration::from_secs(10 * 60);
+
 /// Checkout guards taken while admitting a Prompt, held until that Prompt's
 /// preparation inherits them or the Prompt leaves the queue.
 type CheckoutGuards = Arc<Mutex<HashMap<(SessionId, PromptId), tokio::sync::OwnedMutexGuard<()>>>>;
@@ -151,6 +156,9 @@ pub(crate) struct ProviderOrchestrator {
     /// How long a Provider Session, and then a Provider runtime, is waited on to stop; see
     /// [`PROVIDER_STOP_TIMEOUT`].
     stop_timeout: Duration,
+    /// How long an idle Session's own Provider process is kept; see
+    /// [`PROVIDER_IDLE_SHUTDOWN`].
+    idle_shutdown: Duration,
     /// Mints the Broker token each Provider start is handed.
     broker: BrokerAccess,
     /// Where the bytes of a delivered Prompt's Attachments are read from.
@@ -437,7 +445,8 @@ pub(crate) enum ContextBreakdownError {
     SessionNotFound,
     /// The Session's Provider attributes no context.
     Unsupported,
-    /// No Provider runs for the Session: none has started since Suru did.
+    /// No Provider runs for the Session: none has started since Suru did,
+    /// or the one that ran was stopped for waiting idle.
     NotRunning,
     /// The Session is a native Subagent's, whose conversation rides an
     /// ancestor's Provider, which can only describe its own.
@@ -462,6 +471,9 @@ struct ProviderSessionContext {
     connected_incarnations: Arc<Mutex<HashMap<SessionId, u64>>>,
     checkout_skill_timeout: Duration,
     stop_timeout: Duration,
+    /// How long the actor's Provider connection waits idle before it is let
+    /// go of, where its runtime launches a process for each Session.
+    idle_shutdown: Duration,
     runtime: Arc<dyn ProviderRuntime>,
     sessions: SessionStore,
     skill_catalog: SkillCatalogService,
@@ -1499,6 +1511,8 @@ impl SubagentRoutes {
 enum ActorInput {
     Command(Option<ProviderCommand>),
     Event(Option<Result<AttributedProviderEvent, super::ProviderError>>),
+    /// The connection has waited idle for as long as its process is kept.
+    Idle,
 }
 
 enum ProviderEventProjection {
@@ -1526,6 +1540,7 @@ impl ProviderOrchestrator {
         source_control: crate::source_control::SourceControlService,
         checkout_skill_timeout: Duration,
         stop_timeout: Duration,
+        idle_shutdown: Duration,
         broker: BrokerAccess,
         attachments: AttachmentStore,
     ) -> Self {
@@ -1552,6 +1567,7 @@ impl ProviderOrchestrator {
             source_control,
             checkout_skill_timeout,
             stop_timeout,
+            idle_shutdown,
             checkout_guards: Default::default(),
             connected_incarnations: Default::default(),
             broker,
@@ -1849,6 +1865,7 @@ impl ProviderOrchestrator {
                 connected_incarnations: self.connected_incarnations.clone(),
                 checkout_skill_timeout: self.checkout_skill_timeout,
                 stop_timeout: self.stop_timeout,
+                idle_shutdown: self.idle_shutdown,
                 runtime,
                 sessions,
                 skill_catalog: self.skill_catalog.clone(),
@@ -2663,6 +2680,7 @@ async fn run_provider_session(
         connected_incarnations,
         checkout_skill_timeout,
         stop_timeout,
+        idle_shutdown,
         runtime,
         sessions,
         skill_catalog,
@@ -2706,6 +2724,9 @@ async fn run_provider_session(
     // request queued here is stale by the time it is read, and asks nothing.
     let mut withdrawn_compactions: HashSet<TurnId> = HashSet::new();
     let provider_id = runtime.provider_id();
+    // A Provider process launched for this Session alone is let go of once
+    // the Session has waited idle long enough; a shared one stays.
+    let rests_when_idle = runtime.launches_a_process_per_session();
     let connector = ProviderConnector {
         runtime: &runtime,
         source_control: &source_control,
@@ -2752,6 +2773,9 @@ async fn run_provider_session(
                         }))
                     }
                     command = commands.recv() => ActorInput::Command(command),
+                    // Restarted with every input, so it elapses only once
+                    // nothing has reached the actor for that long.
+                    () = tokio::time::sleep(idle_shutdown), if rests_when_idle => ActorInput::Idle,
                 }
             } else if let Some(prompt_id) = pending_turn_starts
                 .pop_front()
@@ -3012,6 +3036,30 @@ async fn run_provider_session(
                         &updates,
                         session_id,
                     );
+                    continue;
+                }
+                // Nothing the actor holds would die with the connection, and
+                // nothing owed on it needs the process running to be told:
+                // the process is let go of, and the next Turn opens a fresh
+                // one that resumes the conversation from its stored Resume
+                // State, as after a restart. Anything still owed keeps it for
+                // another wait.
+                ActorInput::Idle => {
+                    if pending_prompt.is_none()
+                        && pending_delegations.is_empty()
+                        && !reports_owed
+                        && !subagents.owes_continuation()
+                        && subagents.watch_outcomes.is_empty()
+                        && sessions.provider_may_rest(session_id)
+                        && let Some(idle) = provider.take()
+                    {
+                        connected_incarnations.lock().unwrap().remove(&session_id);
+                        let _ = timeout(stop_timeout, idle.session.shutdown()).await;
+                        tracing::info!(
+                            %session_id,
+                            "Stopped an idle Session's Provider process; its next Turn resumes it"
+                        );
+                    }
                     continue;
                 }
             };
@@ -3669,6 +3717,8 @@ async fn run_provider_session(
         };
         match input {
             ActorInput::Command(None) => break,
+            // Only an actor with no Turn active waits idle.
+            ActorInput::Idle => continue,
             ActorInput::Command(Some(ProviderCommand::StartPrompt { prompt_id })) => {
                 let current = active
                     .as_mut()
@@ -7771,6 +7821,8 @@ running 1 test",
     /// held until the test lets it finish.
     struct HandRuntime {
         starts: mpsc::UnboundedSender<HandStart>,
+        /// Whether it declares a process of its own for each Session.
+        per_session_process: bool,
     }
 
     struct HandStart {
@@ -7789,6 +7841,10 @@ running 1 test",
 
         fn display_name(&self) -> &str {
             "By Hand"
+        }
+
+        fn launches_a_process_per_session(&self) -> bool {
+            self.per_session_process
         }
 
         fn list_models(&self) -> ProviderFuture<'_, crate::provider::ProviderModelDiscovery> {
@@ -7902,13 +7958,18 @@ running 1 test",
         .unwrap_or_else(|_| panic!("{what}"))
     }
 
-    /// An actor released for its tree going unused may still be on its way
-    /// out when work arrives for its Session. The replacement waits for it,
-    /// and what the replacement holds — the Worktree guard handed to its
-    /// Prompt, its connection, its Watches — outlives the released actor's
-    /// cleanup.
-    #[tokio::test]
-    async fn a_replacement_actor_keeps_what_it_holds_from_the_released_one_it_waits_for() {
+    /// An orchestrator over one [`HandRuntime`], and what the test drives it
+    /// through.
+    struct HandFixture {
+        _data_dir: tempfile::TempDir,
+        workspace: tempfile::TempDir,
+        sessions: SessionStore,
+        started: mpsc::UnboundedReceiver<HandStart>,
+        stop: watch::Sender<bool>,
+        providers: ProviderOrchestrator,
+    }
+
+    async fn hand_fixture(per_session_process: bool, idle_shutdown: Duration) -> HandFixture {
         let data_dir = tempfile::tempdir().expect("create isolated data directory");
         let workspace = tempfile::tempdir().expect("create valid Workspace");
         let repository = StorageRepository::open(data_dir.path())
@@ -7917,8 +7978,11 @@ running 1 test",
         let (_writer, storage) = StorageWriter::spawn(repository.clone());
         let sessions =
             SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
-        let (starts, mut started) = mpsc::unbounded_channel();
-        let runtimes: Vec<Arc<dyn ProviderRuntime>> = vec![Arc::new(HandRuntime { starts })];
+        let (starts, started) = mpsc::unbounded_channel();
+        let runtimes: Vec<Arc<dyn ProviderRuntime>> = vec![Arc::new(HandRuntime {
+            starts,
+            per_session_process,
+        })];
         let (_settings, settings) = watch::channel(SettingsSnapshot::default());
         let (stop, shutdown) = watch::channel(false);
         let providers = ProviderOrchestrator::new(
@@ -7933,6 +7997,7 @@ running 1 test",
             )),
             Duration::from_secs(5),
             PROVIDER_STOP_TIMEOUT,
+            idle_shutdown,
             BrokerAccess::new(
                 "http://127.0.0.1:1/broker".to_owned(),
                 settings,
@@ -7942,6 +8007,187 @@ running 1 test",
             ),
             AttachmentStore::new(repository),
         );
+        HandFixture {
+            _data_dir: data_dir,
+            workspace,
+            sessions,
+            started,
+            stop,
+            providers,
+        }
+    }
+
+    /// Runs `session_id`'s scheduled Prompt over the start it asks for, to
+    /// its end, answering with what feeds the connection events.
+    async fn run_to_idle(
+        fixture: &mut HandFixture,
+        session_id: SessionId,
+        shutdown: Option<oneshot::Receiver<()>>,
+    ) -> mpsc::UnboundedSender<Result<crate::provider::AttributedProviderEvent, ProviderError>>
+    {
+        let events = answer(
+            within("the Provider starts", fixture.started.recv())
+                .await
+                .expect("the Provider start"),
+            shutdown,
+        );
+        let sessions = &fixture.sessions;
+        waited("the Turn runs", || {
+            sessions
+                .snapshot(session_id)
+                .filter(|snapshot| {
+                    snapshot
+                        .turns
+                        .last()
+                        .is_some_and(|turn| turn.status == TurnStatus::Active)
+                })
+                .map(drop)
+        })
+        .await;
+        events
+            .send(Ok(ProviderEvent::TurnCompleted.into()))
+            .expect("the actor reads its events");
+        waited("the Turn settles", || {
+            sessions
+                .snapshot(session_id)
+                .filter(|snapshot| snapshot.session.working_since.is_none())
+                .map(drop)
+        })
+        .await;
+        events
+    }
+
+    fn queue_prompt(sessions: &SessionStore, session_id: SessionId, text: &str) -> PromptId {
+        let prompt = PromptId::new();
+        sessions
+            .admit(
+                session_id,
+                crate::protocol::AdmitPromptRequest {
+                    delivery: crate::protocol::PromptDelivery::Queue,
+                    prompt: InitialPrompt {
+                        id: prompt,
+                        text: text.to_owned(),
+                        skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
+                    },
+                },
+                Vec::new(),
+                None,
+            )
+            .expect("admit the Prompt");
+        prompt
+    }
+
+    /// A Session whose Provider runs a process for it alone lets that
+    /// process go once it has waited idle, and its next Turn starts a fresh
+    /// one; a Watch still standing keeps it, as does a Provider whose process
+    /// every Session shares.
+    #[tokio::test]
+    async fn an_idle_sessions_own_provider_process_is_let_go_of_and_resumed_at_its_next_turn() {
+        let idle = Duration::from_millis(20);
+        let mut fixture = hand_fixture(true, idle).await;
+        let created = create_session(&fixture.sessions, fixture.workspace.path(), "First");
+        let session_id = created.session.id;
+        fixture
+            .providers
+            .schedule_prompt(session_id, created.prompts[0].id)
+            .expect("schedule the first Prompt");
+        let first = run_to_idle(&mut fixture, session_id, None).await;
+
+        // A Watch the Agent left running keeps the process it runs in.
+        first
+            .send(Ok(ProviderEvent::WatchStarted {
+                watch_id: crate::provider::ProviderWatchId::new("build"),
+                description: "the build".to_owned(),
+            }
+            .into()))
+            .expect("the actor reads its events");
+        let sessions = &fixture.sessions;
+        waited("the Watch stands", || {
+            (!sessions.live_watches(session_id).is_empty()).then_some(())
+        })
+        .await;
+        tokio::time::sleep(idle * 10).await;
+        assert!(
+            !first.is_closed(),
+            "a Session with a Watch standing keeps its process"
+        );
+
+        // Once the Watch has settled, nothing is owed, and the process goes.
+        first
+            .send(Ok(ProviderEvent::WatchSettled {
+                watch_id: crate::provider::ProviderWatchId::new("build"),
+                outcome: crate::provider::ProviderWatchOutcome::Completed,
+                summary: None,
+                woke_agent: false,
+            }
+            .into()))
+            .expect("the actor reads its events");
+        waited("the idle process is let go of", || {
+            first.is_closed().then_some(())
+        })
+        .await;
+        assert_eq!(fixture.providers.connected_incarnation(session_id), None);
+        assert!(
+            fixture.providers.has_session_actor(session_id),
+            "the actor stays, only its process goes"
+        );
+
+        // The next Turn starts a fresh process, resuming the conversation.
+        let second = queue_prompt(&fixture.sessions, session_id, "Second");
+        fixture
+            .providers
+            .schedule_prompt(session_id, second)
+            .expect("schedule the second Prompt");
+        let _second = run_to_idle(&mut fixture, session_id, None).await;
+        assert_eq!(
+            fixture.sessions.snapshot(session_id).unwrap().turns.len(),
+            2,
+            "the second Prompt ran a Turn of its own"
+        );
+
+        fixture.stop.send_replace(true);
+        within("the orchestrator stops", fixture.providers.shutdown()).await;
+    }
+
+    #[tokio::test]
+    async fn a_shared_provider_process_stays_connected_however_long_a_session_waits() {
+        let idle = Duration::from_millis(20);
+        let mut fixture = hand_fixture(false, idle).await;
+        let created = create_session(&fixture.sessions, fixture.workspace.path(), "First");
+        let session_id = created.session.id;
+        fixture
+            .providers
+            .schedule_prompt(session_id, created.prompts[0].id)
+            .expect("schedule the first Prompt");
+        let first = run_to_idle(&mut fixture, session_id, None).await;
+        tokio::time::sleep(idle * 10).await;
+        assert!(!first.is_closed(), "the connection stays");
+        assert!(
+            fixture
+                .providers
+                .connected_incarnation(session_id)
+                .is_some()
+        );
+        fixture.stop.send_replace(true);
+        within("the orchestrator stops", fixture.providers.shutdown()).await;
+    }
+
+    /// An actor released for its tree going unused may still be on its way
+    /// out when work arrives for its Session. The replacement waits for it,
+    /// and what the replacement holds — the Worktree guard handed to its
+    /// Prompt, its connection, its Watches — outlives the released actor's
+    /// cleanup.
+    #[tokio::test]
+    async fn a_replacement_actor_keeps_what_it_holds_from_the_released_one_it_waits_for() {
+        let HandFixture {
+            _data_dir,
+            workspace,
+            sessions,
+            mut started,
+            stop,
+            providers,
+        } = hand_fixture(false, PROVIDER_IDLE_SHUTDOWN).await;
 
         // The first actor runs a Turn to its end, and is left idle.
         let created = create_session(&sessions, workspace.path(), "First");

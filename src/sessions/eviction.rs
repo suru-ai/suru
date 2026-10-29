@@ -11,8 +11,10 @@
 //! what storage holds, and what this process knew of it beyond its history
 //! stays on the record that remains (see `SessionRecord::keep_runtime_of`).
 //!
-//! A Provider actor outlives the Turns it runs, idle and connected, until
-//! something stops it, and a Session whose history waits in storage has none
+//! A Provider actor outlives the Turns it runs, idle — connected, unless its
+//! Provider's process for the Session alone was stopped for waiting idle with
+//! nothing owed on it (ADR 0058) — until something stops it, and a Session
+//! whose history waits in storage has none
 //! (ADR 0022): it could take no word the actor sent, and could tell it no
 //! posture. So a tree's actors are stopped before it is evicted, as a
 //! restart stops them, and the conversation resumes from its stored Resume
@@ -197,6 +199,30 @@ impl SessionStore {
     }
 }
 
+impl SessionStore {
+    /// Whether the Provider process the actor `owner` owns may be let go of
+    /// while it waits for the next Turn: nothing runs or is owed on that
+    /// actor — in `owner`, or in any native Subagent riding it — that the
+    /// process would act on or answer, or that needs it running to be told.
+    /// A reader following the Sessions holds nothing here: what they read
+    /// stays as it is, and the conversation resumes from its stored Resume
+    /// State at the next Turn, as it does after a restart.
+    pub(crate) fn provider_may_rest(&self, owner: SessionId) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let riding = state.actor_subtree(owner);
+        !state.owes_reports_to_sidekicks_of(&riding)
+            && !riding.iter().any(|session_id| {
+                state
+                    .sessions
+                    .get(session_id)
+                    .is_none_or(|record| state.holds_work(*session_id, record))
+            })
+    }
+}
+
 impl SessionStoreState {
     /// Every held tree nothing holds whose Sessions have all gone unused
     /// for `idle` at `now`, each its top-level Session first. Where `mark`
@@ -266,69 +292,79 @@ impl SessionStoreState {
         {
             return true;
         }
-        let members = tree.iter().copied().collect::<HashSet<_>>();
-        // Reports owed to a Sidekick of this tree are told to it as it is
-        // held, by Sessions here or elsewhere, or by a Remote.
-        if self.sessions.values().any(|record| {
-            record
-                .sidekick_work
-                .iter()
-                .any(|work| members.contains(&work.sidekick))
-        }) || tree
-            .iter()
-            .any(|session_id| self.remote_reports.owes_sidekick(*session_id))
-        {
+        if self.owes_reports_to_sidekicks_of(tree) {
             return true;
         }
         tree.iter().any(|session_id| {
             let Some(record) = self.sessions.get(session_id) else {
                 return true;
             };
-            let snapshot = &record.snapshot;
-            let session = &snapshot.session;
             self.is_deferred(*session_id)
                 // A subscriber reads its updates.
                 || record.updates.receiver_count() > 0
-                // Work runs, or is owed, somewhere in its subtree.
-                || session.working_since.is_some()
-                || session.monitoring_since.is_some()
-                || session.status != SessionStatus::Idle
-                || snapshot.turns.iter().any(|turn| !turn.status.is_terminal())
-                || snapshot
-                    .prompts
-                    .iter()
-                    .any(|prompt| prompt.status == PromptStatus::Pending)
-                || snapshot.activities.iter().any(|activity| {
-                    matches!(
-                        activity,
-                        Activity::Subagent {
-                            status: ActivityStatus::Active,
-                            ..
-                        }
-                    ) || recovery_moves(activity)
-                })
-                || !snapshot.watches.is_empty()
-                || !record.watches.is_empty()
-                || snapshot.waiting_on_subagents.is_some()
-                || !record.subagent_waits.is_empty()
-                || !record.held_reports.is_empty()
-                || !record.sidekick_work.is_empty()
-                || !record.steer_targets.is_empty()
-                || !record.turn_start_admissions.is_empty()
-                || record.selection_retry_prompt.is_some()
-                || self.resumable_preparations.contains(session_id)
-                // Interventions stand open, here or reported from below.
-                || !snapshot.pending_approvals.is_empty()
-                || !snapshot.submitting_approvals.is_empty()
-                || !snapshot.subagent_interventions.is_empty()
-                // A posture is still being applied to its Provider.
-                || session.approval_posture.as_ref().is_some_and(|posture| {
-                    posture.application == crate::protocol::ApprovalPostureApplication::Applying
-                })
-                // Its Provider may still owe output a Continuation answers.
-                || (record.owns_provider_actor()
-                    && self.owes_continuation_to_brokered_subagents(*session_id))
+                || self.holds_work(*session_id, record)
         })
+    }
+
+    /// Whether Reports are owed to a Sidekick among `members`, to be told to
+    /// it by Sessions here or elsewhere, or by a Remote.
+    fn owes_reports_to_sidekicks_of(&self, members: &[SessionId]) -> bool {
+        let members = members.iter().copied().collect::<HashSet<_>>();
+        self.sessions.values().any(|record| {
+            record
+                .sidekick_work
+                .iter()
+                .any(|work| members.contains(&work.sidekick))
+        }) || members
+            .iter()
+            .any(|session_id| self.remote_reports.owes_sidekick(*session_id))
+    }
+
+    /// Whether work runs in `session_id`, whose record is `record`, or is
+    /// owed there: anything its Provider may yet act on or answer, or that
+    /// still waits on it, whoever reads the Session meanwhile.
+    fn holds_work(&self, session_id: SessionId, record: &super::SessionRecord) -> bool {
+        let snapshot = &record.snapshot;
+        let session = &snapshot.session;
+        // Work runs, or is owed, somewhere in its subtree.
+        session.working_since.is_some()
+            || session.monitoring_since.is_some()
+            || session.status != SessionStatus::Idle
+            || snapshot.turns.iter().any(|turn| !turn.status.is_terminal())
+            || snapshot
+                .prompts
+                .iter()
+                .any(|prompt| prompt.status == PromptStatus::Pending)
+            || snapshot.activities.iter().any(|activity| {
+                matches!(
+                    activity,
+                    Activity::Subagent {
+                        status: ActivityStatus::Active,
+                        ..
+                    }
+                ) || recovery_moves(activity)
+            })
+            || !snapshot.watches.is_empty()
+            || !record.watches.is_empty()
+            || snapshot.waiting_on_subagents.is_some()
+            || !record.subagent_waits.is_empty()
+            || !record.held_reports.is_empty()
+            || !record.sidekick_work.is_empty()
+            || !record.steer_targets.is_empty()
+            || !record.turn_start_admissions.is_empty()
+            || record.selection_retry_prompt.is_some()
+            || self.resumable_preparations.contains(&session_id)
+            // Interventions stand open, here or reported from below.
+            || !snapshot.pending_approvals.is_empty()
+            || !snapshot.submitting_approvals.is_empty()
+            || !snapshot.subagent_interventions.is_empty()
+            // A posture is still being applied to its Provider.
+            || session.approval_posture.as_ref().is_some_and(|posture| {
+                posture.application == crate::protocol::ApprovalPostureApplication::Applying
+            })
+            // Its Provider may still owe output a Continuation answers.
+            || (record.owns_provider_actor()
+                && self.owes_continuation_to_brokered_subagents(session_id))
     }
 
     /// Drops the histories of `tree`, whose saves have all landed, leaving

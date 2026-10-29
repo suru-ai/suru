@@ -39,8 +39,8 @@ pub use codex::CodexRuntime;
 pub use copilot::CopilotRuntime;
 pub(crate) use orchestration::{
     BrokeredDelivery, BrokeredSendRefusal, BrokeredSpawnRefusal, BrokeredStop,
-    BrokeredSubagentRequest, ContextBreakdownError, PROVIDER_STOP_TIMEOUT, ProviderOrchestrator,
-    ProviderUpdateGate,
+    BrokeredSubagentRequest, ContextBreakdownError, PROVIDER_IDLE_SHUTDOWN, PROVIDER_STOP_TIMEOUT,
+    ProviderOrchestrator, ProviderUpdateGate,
 };
 pub use report::{
     FinalMessage, Report, SettledMessage, SidekickIntervention, SidekickOriginLoss,
@@ -1760,6 +1760,18 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     /// context. Defaulted to `false`, matching the refusal
     /// [`ProviderSession::context_breakdown`] defaults to.
     fn offers_context_breakdown(&self) -> bool {
+        false
+    }
+
+    /// Whether this Provider runs a process of its own for each Session,
+    /// rather than one every Session shares. A Session whose Provider does
+    /// has that process let go of once it has waited idle for the Server's
+    /// `provider_idle_shutdown` with nothing owed on it, and its conversation
+    /// resumes from its stored Resume State at its next Turn, so idle
+    /// Sessions hold no processes, nor the pipes to them, however many there
+    /// are. A process every Session shares costs nothing more for each idle
+    /// Session, and is kept. Defaulted to `false`, keeping every connection.
+    fn launches_a_process_per_session(&self) -> bool {
         false
     }
 

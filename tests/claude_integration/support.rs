@@ -792,15 +792,41 @@ pub async fn hosting(
     hosting_runtime(ClaudeRuntime::new(claude.executable()), name, state_dir).await
 }
 
+/// The same server run to `timings`, for a test injecting the Server's own.
+pub async fn hosting_with_timings(
+    claude: &ScriptedClaude,
+    name: &'static str,
+    state_dir: &std::path::Path,
+    timings: server::ServerTimings,
+) -> (RunningServer, ManagedClient) {
+    hosting_runtime_with_timings(
+        ClaudeRuntime::new(claude.executable()),
+        name,
+        state_dir,
+        timings,
+    )
+    .await
+}
+
 /// The same server over a runtime the caller has already tuned, for a test injecting timings.
 pub async fn hosting_runtime(
     runtime: ClaudeRuntime,
     name: &'static str,
     state_dir: &std::path::Path,
 ) -> (RunningServer, ManagedClient) {
-    let server = server::spawn_with_provider(
+    hosting_runtime_with_timings(runtime, name, state_dir, server::ServerTimings::default()).await
+}
+
+async fn hosting_runtime_with_timings(
+    runtime: ClaudeRuntime,
+    name: &'static str,
+    state_dir: &std::path::Path,
+    timings: server::ServerTimings,
+) -> (RunningServer, ManagedClient) {
+    let server = server::spawn_with_provider_and_timings(
         ServerConfig::new(state_dir, name).expect("configure server"),
         std::sync::Arc::new(runtime),
+        timings,
     )
     .await
     .expect("spawn server");
