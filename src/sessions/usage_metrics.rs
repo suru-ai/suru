@@ -426,22 +426,20 @@ fn key_of(
 
 /// Where a Turn, and the Cost it carries, lands among the buckets, and
 /// whether in the comparison interval besides.
-#[derive(Clone, Default)]
+#[derive(Clone, Copy)]
 struct Place {
     bucket: Landing,
     compared: bool,
 }
 
 /// Where among the buckets a Turn lands.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 enum Landing {
     /// In the bucket at this index.
     Bucket(usize),
     /// At a moment no bucket holds.
     Outside,
-    /// At no recorded moment: among the untimed. A Cost of a Turn the store
-    /// does not hold, with nothing to place it by, lands here too.
-    #[default]
+    /// At no recorded moment: among the untimed.
     Untimed,
 }
 
@@ -612,6 +610,14 @@ fn add_contribution(aggregate: &mut UsageMetricsAggregate, contribution: &CostCo
 /// is filed beside the Turn carrying it: the one rule by which the metrics
 /// read's buckets and the Insights read's quarter-hours place Cost, so the
 /// two add up alike.
+///
+/// A contribution is always of a Turn the read counts, since both walk the
+/// same trees: [`MeteredForest::counted_sessions`] reaches exactly the
+/// Sessions [`tree_contributions`] reads from the same heads. A read files
+/// a contribution where it placed the Turn carrying it, and drops one whose
+/// Turn it did not place: Insights places only the Turns its interval
+/// holds, and the metrics read places every Turn it counts, so it drops
+/// none and asserts as much.
 struct TurnPlaces<P> {
     places: HashMap<(SessionId, TurnId), P>,
 }
@@ -644,25 +650,11 @@ impl<P> TurnPlaces<P> {
 
 /// Where a Turn landed, the key it counts under, and the top-level Session
 /// and Model its Cost is owned by, for the Cost it carries to land beside it.
-#[derive(Clone)]
 struct Placed {
     place: Place,
     key: UsageMetricsKey,
-    owner: Option<SessionId>,
+    owner: SessionId,
     model: Option<UsageMetricsKey>,
-}
-
-impl Default for Placed {
-    /// Where the Cost of a Turn the store does not hold lands: among the
-    /// untimed, under Unknown, owned by no Session.
-    fn default() -> Self {
-        Self {
-            place: Place::default(),
-            key: UsageMetricsKey::Unknown,
-            owner: None,
-            model: None,
-        }
-    }
 }
 
 fn fold(
@@ -725,9 +717,9 @@ fn fold(
             turn.session_id,
             turn.turn_id,
             Placed {
-                place: place.clone(),
+                place,
                 key: turn.key.clone(),
-                owner: Some(turn.owner),
+                owner: turn.owner,
                 model: turn.model.clone(),
             },
         );
@@ -746,29 +738,29 @@ fn fold(
         across_buckets_and_untimed.add(&turn);
     }
     for contribution in &metered.costs {
-        // Every contribution is of a Turn the store holds; one that were not
-        // would still count, among the untimed.
-        let Placed {
+        let Some(Placed {
             place,
             key,
             owner,
             model,
-        } = placed.of(contribution).cloned().unwrap_or_default();
+        }) = placed.of(contribution)
+        else {
+            debug_assert!(false, "every contribution is of a Turn the read counts");
+            continue;
+        };
         if let Some(comparison) = comparison.as_mut().filter(|_| place.compared) {
             add_contribution(&mut comparison.aggregate, contribution);
         }
         match place.bucket {
             Landing::Bucket(index) => {
-                buckets[index].add_cost(&key, contribution);
-                across_buckets.add_cost(&key, contribution);
-                if let Some(owner) = owner {
-                    owned
-                        .entry(owner)
-                        .or_default()
-                        .add_cost(model.as_ref(), contribution);
-                }
+                buckets[index].add_cost(key, contribution);
+                across_buckets.add_cost(key, contribution);
+                owned
+                    .entry(*owner)
+                    .or_default()
+                    .add_cost(model.as_ref(), contribution);
             }
-            Landing::Untimed => untimed.add_cost(&key, contribution),
+            Landing::Untimed => untimed.add_cost(key, contribution),
             Landing::Outside => continue,
         }
         add_contribution(&mut across_buckets_and_untimed.aggregate, contribution);
