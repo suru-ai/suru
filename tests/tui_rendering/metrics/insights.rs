@@ -691,6 +691,52 @@ fn a_refresh_lets_go_of_the_other_tab_s_figures_so_the_tabs_never_disagree() {
     expect_insights_reads(ctrl(&mut application, KeyCode::Right));
 }
 
+/// What Insights says of All time where Turns stored before Suru timed
+/// them lie outside it.
+const UNTIMED_NOTE: &str = "Turns recorded before Suru timed Turns are not included";
+
+/// [`on_insights`] of All time, its Workspace read saying `untimed_turns`
+/// Turns are untimed, and the 30 days before it read alike.
+fn all_time_with_untimed(untimed_turns: u64) -> (Application, Vec<String>) {
+    let mut application = reader_in(NEW_YORK, afternoon());
+    let (_, request_id, query) = ask(&mut application);
+    answer(&mut application, request_id, Ok(report(&query)));
+    let mut thirty_days = Vec::new();
+    for key in [None, Some('5')] {
+        let reads = expect_insights_reads(match key {
+            None => ctrl(&mut application, KeyCode::Right),
+            Some(key) => press(&mut application, key),
+        });
+        answer_insights(&mut application, reads.request_id, Ok(worked()));
+        let mut workspaces = workspaces::spent(&reads.workspaces, &workspaces::MOCKUP);
+        workspaces.untimed.total.turns = untimed_turns;
+        answer(
+            &mut application,
+            reads.workspaces_request_id,
+            Ok(workspaces),
+        );
+        if key.is_none() {
+            thirty_days = screen(&application);
+        }
+    }
+    (application, thirty_days)
+}
+
+#[test]
+fn all_time_says_turns_from_before_suru_timed_them_are_not_included() {
+    let (application, thirty_days) = all_time_with_untimed(3);
+
+    row(&screen(&application), UNTIMED_NOTE);
+    assert!(
+        !thirty_days.join("\n").contains(UNTIMED_NOTE),
+        "only All time reaches back that far: {thirty_days:#?}"
+    );
+
+    let (application, _) = all_time_with_untimed(0);
+    let rows = screen(&application);
+    assert!(!rows.join("\n").contains(UNTIMED_NOTE), "{rows:#?}");
+}
+
 #[test]
 fn g_and_i_switch_tabs_where_the_system_takes_ctrl_arrows() {
     let mut application = reader_in(NEW_YORK, afternoon());

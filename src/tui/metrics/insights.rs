@@ -401,6 +401,15 @@ pub(super) struct KeptReport {
     heatmap: Heatmap,
 }
 
+/// What the Workspace read kept for a range: its Workspaces, ranked, and
+/// whether the Server holds Turns no range can place, having no recorded
+/// moment, which therefore lie outside even All time.
+#[derive(Clone, Debug)]
+struct KeptWorkspaces {
+    rows: Vec<WorkspaceRow>,
+    holds_untimed: bool,
+}
+
 /// One of the reads the tab makes of each range it shows: the read awaited,
 /// what the last answer for each range kept, with the Outlook it came from,
 /// and why the last read was refused. `C` is what the read awaited needs
@@ -645,7 +654,7 @@ pub(in crate::tui) struct InsightsView {
     reports: RangeReads<KeptReport, TimeZone>,
     /// The one-bucket Workspace read made beside it, kept as the
     /// Workspaces ranked as Overview ranks its keys.
-    workspaces: RangeReads<Vec<WorkspaceRow>>,
+    workspaces: RangeReads<KeptWorkspaces>,
     focused: Option<InsightsPanel>,
     /// The item selected within the focused panel, by its place among the
     /// panel's items.
@@ -671,7 +680,9 @@ impl InsightsView {
 
     /// The Workspaces kept for `range` from `origin`, where they are.
     fn workspaces_of(&self, origin: &Outlook, range: MetricsRange) -> Option<&[WorkspaceRow]> {
-        self.workspaces.kept(origin, range).map(Vec::as_slice)
+        self.workspaces
+            .kept(origin, range)
+            .map(|kept| kept.rows.as_slice())
     }
 
     /// Whether `range` lacks a report, or its Workspaces, from `origin`
@@ -776,7 +787,22 @@ impl InsightsView {
         result: Result<UsageMetricsReport, MetricsReadRefusal>,
     ) {
         self.workspaces
-            .receive(request_id, result, |report, ()| workspaces::rows(&report));
+            .receive(request_id, result, |report, ()| KeptWorkspaces {
+                rows: workspaces::rows(&report),
+                holds_untimed: report.untimed.total.turns > 0,
+            });
+    }
+
+    /// Whether what is shown for `range` from `origin` leaves out Turns
+    /// stored before Suru timed Turns, which only All time, reaching back
+    /// to the first moment a Turn can be placed at, would otherwise hold:
+    /// as its Workspace read says.
+    pub(in crate::tui) fn leaves_out_untimed(&self, origin: &Outlook, range: MetricsRange) -> bool {
+        range == MetricsRange::AllTime
+            && self
+                .workspaces
+                .kept(origin, range)
+                .is_some_and(|kept| kept.holds_untimed)
     }
 
     /// Says why `range` has no fresh report from `origin`, giving up both

@@ -397,8 +397,13 @@ pub(in crate::tui) fn render(
     }
 }
 
+/// What Insights says of All time where Turns stored before Suru timed them
+/// lie outside it.
+const UNTIMED_NOTE: &str = "Turns recorded before Suru timed Turns are not included";
+
 /// The Insights tab beneath the tab bar: the range bar alone, the row under
-/// it saying what became of a read, and the panels.
+/// it saying what became of a read — or of All time, what it leaves out —
+/// and the panels.
 fn render_insights(
     buffer: &mut Buffer,
     area: Rect,
@@ -433,6 +438,11 @@ fn render_insights(
             "Refreshing…",
             theme.text.subdued,
         );
+    } else if insights.leaves_out_untimed(outlook, range) {
+        // Overview counts them in All time's headline; the panels, which
+        // place every Turn in time, cannot.
+        let note = truncate_to_width(UNTIMED_NOTE, room);
+        buffer.set_string(area.x + INSET, controls_y + 1, note, theme.text.subdued);
     }
     let body = Rect::new(
         area.x + INSET,
