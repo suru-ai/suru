@@ -664,16 +664,6 @@ pub struct ErrandAnswer {
     pub consumption: ErrandConsumption,
 }
 
-impl ErrandAnswer {
-    /// An answer whose Provider cannot say what giving it consumed.
-    pub fn unmeasured(reply: Value) -> Self {
-        Self {
-            reply,
-            consumption: ErrandConsumption::default(),
-        }
-    }
-}
-
 /// Why a Provider gave an Errand no answer, and what the attempt consumed
 /// where the Provider can still tell: a call that failed after reaching the
 /// Model may have spent tokens all the same. Any [`ProviderError`] converts
