@@ -38,8 +38,15 @@ impl GitSourceControl {
         }
         let common = crate::paths::canonical(&repository.metadata_directory)
             .map_err(|_| "Repository metadata is missing or unreadable")?;
+        // Git that cannot be run says nothing of the checkout, and is
+        // reported as what it is rather than as a checkout gone foreign.
         if RepositoryId::from_metadata("git", &common) != repository.id
-            || self.common(&common).await.as_ref() != Some(&common)
+            || self
+                .common(&common)
+                .await
+                .map_err(|e| unchecked(&e))?
+                .as_ref()
+                != Some(&common)
         {
             return Err("Repository metadata no longer identifies the known Repository".to_owned());
         }
@@ -77,7 +84,10 @@ impl GitSourceControl {
         }
         if checkout.root.exists() {
             if std::fs::symlink_metadata(&checkout.root).is_ok_and(|m| m.file_type().is_symlink())
-                || self.valid_root(&checkout.root, &common).await.as_ref() != Some(&checkout.root)
+                || !self
+                    .is_root(&checkout.root, &common)
+                    .await
+                    .map_err(|e| unchecked(&e))?
             {
                 return Err("The original Worktree path is occupied by unrelated contents; nothing was overwritten".to_owned());
             }
@@ -100,7 +110,7 @@ impl GitSourceControl {
                         &common,
                         &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
                     )
-                    .await
+                    .await?
                     .ok_or("The retained recovery branch was deleted or has no usable commit")?;
                     (name.clone(), false)
                 }
@@ -109,7 +119,7 @@ impl GitSourceControl {
                         &common,
                         &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
                     )
-                    .await
+                    .await?
                     .ok_or("The retained detached commit is unavailable")?;
                     (commit.clone(), true)
                 }
@@ -166,7 +176,8 @@ impl GitSourceControl {
                 &checkout.root,
                 &["symbolic-ref", "--quiet", "--short", "HEAD"],
             )
-            .await;
+            .await
+            .map_err(|e| unchecked(&e))?;
         let expected = match &checkout.recovery_revision {
             Some(CheckoutRevision::Branch { name, .. }) => branch.as_ref() == Some(name),
             Some(CheckoutRevision::Detached { commit }) => {
@@ -174,6 +185,7 @@ impl GitSourceControl {
                     && self
                         .text(&checkout.root, &["rev-parse", "--verify", "HEAD^{commit}"])
                         .await
+                        .map_err(|e| unchecked(&e))?
                         .as_ref()
                         == Some(commit)
             }
@@ -205,8 +217,14 @@ impl GitSourceControl {
                 .await?;
         }
         let reading = self.observe_checkout(checkout, true).await;
-        if !matches!(reading.availability, SourceControlAvailability::Available) {
-            return Err("Recovered Worktree remains unavailable".to_owned());
+        match &reading.availability {
+            SourceControlAvailability::Available => {}
+            SourceControlAvailability::Unavailable { reason } => {
+                return Err(format!("Recovered Worktree remains unavailable: {reason}"));
+            }
+            SourceControlAvailability::NotDetected => {
+                return Err("Recovered Worktree remains unavailable".to_owned());
+            }
         }
         // Keep proof through the last await: cancellation must leave the next
         // caller able to report recreation and invalidate every warm actor.

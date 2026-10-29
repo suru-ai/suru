@@ -677,16 +677,11 @@ impl SourceControlService {
                     .to_owned(),
             );
         }
-        let exact = self.adapter.discover(&path).await;
-        if exact.workspace.id != session.workspace.id
-            || exact
-                .checkout
-                .as_ref()
-                .is_none_or(|actual| actual.id != checkout.id)
-        {
-            return Err("The exact Execution Directory now belongs to a different Repository or checkout; execution was not redirected".to_owned());
-        }
-        let association = exact.checkout.expect("validated checkout identity");
+        let association = exact_checkout(
+            self.adapter.discover(&path).await,
+            &session.workspace.id,
+            &checkout.id,
+        )?;
         let reading = CheckoutSummary {
             revision: association.recovery_revision.clone(),
             association,
@@ -1292,6 +1287,31 @@ pub(crate) struct ExecutionLease {
     pub(crate) recreated: bool,
 }
 
+/// The checkout `exact`, a discovery of a Session's exact Execution
+/// Directory, reads there, where it is still `checkout` of `workspace`. A
+/// directory its source control could not read at all is refused as unread,
+/// never as one that now belongs elsewhere: nothing was learned of it.
+fn exact_checkout(
+    exact: ResolvedWorkspace,
+    workspace: &crate::protocol::WorkspaceId,
+    checkout: &crate::protocol::CheckoutId,
+) -> Result<crate::protocol::CheckoutAssociation, String> {
+    use crate::protocol::SourceControlAvailability;
+    match exact.checkout {
+        Some(actual) if exact.workspace.id == *workspace && actual.id == *checkout => Ok(actual),
+        _ => match &exact.workspace.source_control {
+            SourceControlAvailability::Unavailable { reason }
+                if exact.workspace.repository.is_none() =>
+            {
+                Err(format!(
+                    "The exact Execution Directory could not be read: {reason}; the checkout was not checked, so retry once it can be read"
+                ))
+            }
+            _ => Err("The exact Execution Directory now belongs to a different Repository or checkout; execution was not redirected".to_owned()),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1533,6 +1553,42 @@ mod tests {
             expected.insert(selected.clone(), 1);
             assert_eq!(adapter.take_readings(), expected, "{case}");
         }
+    }
+
+    /// A Session's exact Execution Directory that Git could not be run to
+    /// read is refused for that, and never as one that moved elsewhere.
+    #[tokio::test]
+    async fn an_execution_directory_git_cannot_read_is_not_called_another_checkout() {
+        use crate::protocol::{CheckoutId, RepositoryId};
+        let scratch = tempfile::tempdir().expect("create a scratch directory");
+        let directory = crate::paths::canonical(scratch.path()).expect("canonical scratch path");
+        let repository = RepositoryId::from_metadata("git", &directory.join(".git"));
+        let checkout = CheckoutId::from_root(&repository, &directory);
+        let workspace = repository.workspace_id();
+
+        let unrunnable = GitSourceControl::new(scratch.path().join("no-git-here"));
+        let unread = exact_checkout(unrunnable.discover(&directory).await, &workspace, &checkout)
+            .expect_err("nothing was read to accept");
+        assert!(
+            unread.contains("Git is not installed or cannot be found")
+                && unread.contains("the checkout was not checked"),
+            "the refusal says Git could not run: {unread}"
+        );
+        assert!(
+            !unread.contains("different Repository"),
+            "an unread directory is not called another checkout: {unread}"
+        );
+
+        let elsewhere = exact_checkout(
+            ResolvedWorkspace::directory(directory),
+            &workspace,
+            &checkout,
+        )
+        .expect_err("a directory in no Repository is not the checkout");
+        assert!(
+            elsewhere.contains("different Repository or checkout"),
+            "a directory read as outside the checkout still says so: {elsewhere}"
+        );
     }
 
     #[tokio::test]

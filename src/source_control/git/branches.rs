@@ -61,12 +61,14 @@ impl GitSourceControl {
     ) -> Result<BranchRename, String> {
         let root = &created.checkout.root;
         let metadata = &created.repository.metadata_directory;
-        if self.valid_root(root, metadata).await.as_ref() != Some(root) {
+        if !self.is_root(root, metadata).await? {
             return Err(
                 "The Worktree is missing or no longer belongs to its Repository".to_owned(),
             );
         }
-        let head = self.text(root, &["symbolic-ref", "--quiet", "HEAD"]).await;
+        let head = self
+            .text(root, &["symbolic-ref", "--quiet", "HEAD"])
+            .await?;
         if head.as_deref() != Some(format!("refs/heads/{}", created.branch).as_str()) {
             return Err("The Worktree is no longer on the branch Suru created for it".to_owned());
         }

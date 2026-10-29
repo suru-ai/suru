@@ -251,6 +251,8 @@ impl GitSourceControl {
                 ],
             )
             .await
+            .ok()
+            .flatten()
             .unwrap_or_default();
         let configured = |key: &str| {
             configured

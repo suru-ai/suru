@@ -1018,7 +1018,7 @@ mod tests {
             assert!(read.is_some(), "{} was not read from disk", root.display());
             assert_eq!(
                 read,
-                self.adapter.git_revision(root).await,
+                self.adapter.git_revision(root).await.expect("Git runs"),
                 "{}",
                 root.display()
             );
@@ -1031,8 +1031,11 @@ mod tests {
             root: &Path,
         ) -> Option<CheckoutRevision> {
             assert_eq!(on_disk.revision(root), None, "{}", root.display());
-            let read = self.adapter.read_revision(root).await;
-            assert_eq!(read, self.adapter.git_revision(root).await);
+            let read = self.adapter.read_revision(root).await.expect("Git runs");
+            assert_eq!(
+                read,
+                self.adapter.git_revision(root).await.expect("Git runs")
+            );
             read
         }
         /// The root the disk confirms `path` as a Worktree of the Repository
@@ -1047,7 +1050,10 @@ mod tests {
             );
             assert_eq!(
                 read,
-                self.adapter.valid_root(path, common).await,
+                self.adapter
+                    .valid_root(path, common)
+                    .await
+                    .expect("Git runs"),
                 "{}",
                 path.display()
             );
@@ -1066,7 +1072,10 @@ mod tests {
                 "{}",
                 path.display()
             );
-            self.adapter.valid_root(path, common).await
+            self.adapter
+                .valid_root(path, common)
+                .await
+                .expect("Git runs")
         }
         async fn git_listing(&self, common: &Path) -> Option<Vec<Entry>> {
             let output = self
@@ -1691,7 +1700,11 @@ mod tests {
                 ("[core]\n\tfilemode = false\n", true),
             ] {
                 std::fs::write(own, contents).unwrap();
-                let passed = fixture.adapter.valid_root(elsewhere, &common).await;
+                let passed = fixture
+                    .adapter
+                    .valid_root(elsewhere, &common)
+                    .await
+                    .expect("Git runs");
                 assert_eq!(
                     passed.as_ref(),
                     Some(elsewhere),

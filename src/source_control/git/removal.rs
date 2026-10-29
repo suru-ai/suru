@@ -51,7 +51,7 @@ impl GitSourceControl {
                 repository,
                 &["config", "--get", &format!("branch.{name}.suru-base")],
             )
-            .await
+            .await?
         {
             Some(base) => base,
             None => return Ok(CheckoutBranchOutcome::Retained),
@@ -65,7 +65,7 @@ impl GitSourceControl {
                     &format!("branch.{name}.suru-base-branch"),
                 ],
             )
-            .await
+            .await?
         {
             Some(branch) => branch,
             None => return Ok(CheckoutBranchOutcome::Retained),
@@ -92,7 +92,7 @@ impl GitSourceControl {
                     repository,
                     &["for-each-ref", "--format=%(refname)", "refs/remotes"],
                 )
-                .await
+                .await?
                 .unwrap_or_default();
             let mut merged = false;
             for reference in refs.lines() {
@@ -202,9 +202,9 @@ impl GitSourceControl {
         let common = crate::paths::canonical(&repository.metadata_directory)
             .map_err(|_| "Repository metadata is unavailable")?;
         if RepositoryId::from_metadata("git", &common) != repository.id
-            || self.common(&common).await.as_ref() != Some(&common)
+            || self.common(&common).await?.as_ref() != Some(&common)
             || std::fs::symlink_metadata(&checkout.root).is_ok_and(|m| m.file_type().is_symlink())
-            || self.valid_root(&checkout.root, &common).await.as_ref() != Some(&checkout.root)
+            || !self.is_root(&checkout.root, &common).await?
         {
             return Err("The selected Worktree is missing or its Repository identity changed; nothing was removed".into());
         }
@@ -222,7 +222,11 @@ impl GitSourceControl {
         // the inspection and still blocks unattended removal.
         let reading = self.observe_checkout(checkout, true).await;
         if reading.availability != SourceControlAvailability::Available {
-            return Err("The selected Worktree cannot be read safely for removal".into());
+            let mut refusal = "The selected Worktree cannot be read safely for removal".to_owned();
+            if let SourceControlAvailability::Unavailable { reason } = &reading.availability {
+                refusal = format!("{refusal}: {reason}");
+            }
+            return Err(refusal);
         }
         // Listing every ignored file and walking submodules can outlast an observation poll's
         // deadline in a large Worktree, and this reading gates a removal the user asked for.

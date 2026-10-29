@@ -50,7 +50,7 @@ impl GitSourceControl {
                     "refs/suru/preparations",
                 ],
             )
-            .await
+            .await?
             .unwrap_or_default();
         for reference in references.lines() {
             let message = self
@@ -58,7 +58,7 @@ impl GitSourceControl {
                     &target.repository.metadata_directory,
                     &["reflog", "show", "--format=%gs", "-1", reference],
                 )
-                .await;
+                .await?;
             if message.as_deref() == Some(lock) {
                 return Ok(true);
             }
@@ -122,7 +122,7 @@ impl GitSourceControl {
         let claim = format!("refs/suru/preparations/{}", plan.id.0.simple());
         let branch_ref = format!("refs/heads/{branch}");
         let expected = token(plan);
-        if let Some(commit) = self.text(root, &["rev-parse", "--verify", &claim]).await {
+        if let Some(commit) = self.text(root, &["rev-parse", "--verify", &claim]).await? {
             if commit != *source_commit {
                 return Err(
                     "Preparation ownership ref conflicts with its recorded source commit".into(),
@@ -130,14 +130,14 @@ impl GitSourceControl {
             }
             let claim_message = self
                 .text(root, &["reflog", "show", "--format=%gs", "-1", &claim])
-                .await;
+                .await?;
             if claim_message.as_deref() != Some(expected.as_str()) {
                 return Err("Preparation ownership ref has conflicting provenance".into());
             }
             if !plan.checkout_created {
                 let tip = self
                     .text(root, &["rev-parse", "--verify", &branch_ref])
-                    .await;
+                    .await?;
                 if tip.is_none() && self.owned_registration(plan)?.is_none() {
                     let input = format!(
                         "start\nverify {claim} {source_commit}\ncreate {branch_ref} {source_commit}\nprepare\ncommit\n"
@@ -158,7 +158,7 @@ impl GitSourceControl {
                 }
                 let creation = self
                     .text(root, &["reflog", "show", "--format=%gs", "-1", &branch_ref])
-                    .await;
+                    .await?;
                 if tip.as_ref() != Some(source_commit)
                     || creation.as_deref() != Some(expected.as_str())
                 {

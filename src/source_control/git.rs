@@ -39,6 +39,13 @@ impl From<Unrun> for String {
     }
 }
 
+/// What a reading of a checkout says where Git could not be run to read it,
+/// as `reason` says: that nothing about the checkout was learned, so it is no
+/// sign the checkout is damaged or gone, and trying again may read it.
+fn unchecked(reason: &str) -> String {
+    format!("{reason}; the checkout was not checked, so retry once Git can run")
+}
+
 /// A Git command's arguments as the Log shows them: each as given, but for
 /// the credential a Repository URL among them carries.
 struct Shown<'a>(&'a [&'a str]);
@@ -134,42 +141,58 @@ impl GitSourceControl {
         let revision = if self.still_validated(checkout) {
             self.read_revision(&checkout.root).await
         } else {
-            None
+            Ok(None)
         };
         let revision = match revision {
-            Some(revision) => revision,
+            Ok(Some(revision)) => Ok(Some(revision)),
             // A read that fails after validation is re-validated in full so a
             // replaced or unreadable root is reported for what it now is.
-            None => match self.validate_root(checkout).await {
-                Some(revision) => revision,
-                None => return reading,
-            },
+            _ => self.validate_root(checkout).await,
         };
-        reading.revision = Some(revision);
-        reading.availability = SourceControlAvailability::Available;
+        match revision {
+            Ok(Some(revision)) => {
+                reading.revision = Some(revision);
+                reading.availability = SourceControlAvailability::Available;
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                reading.availability = SourceControlAvailability::Unavailable {
+                    reason: unchecked(&reason),
+                }
+            }
+        }
         reading
     }
     /// Confirm with Git that the root is this checkout's Worktree, remembering
-    /// it for later polls, and read its revision.
-    async fn validate_root(&self, checkout: &CheckoutAssociation) -> Option<CheckoutRevision> {
+    /// it for later polls, and read its revision. Nothing where Git says the
+    /// root is not this Worktree or has no readable revision, and an error
+    /// where Git could not be run to say.
+    async fn validate_root(
+        &self,
+        checkout: &CheckoutAssociation,
+    ) -> Result<Option<CheckoutRevision>, String> {
         self.validated_roots.lock().unwrap().remove(&checkout.id);
         // Fingerprint before Git confirms the identity: a root replaced in
         // between then mismatches its own marker and is validated again.
         let marker = git_marker(&checkout.root);
-        let common = self.common(&checkout.root).await?;
+        let Some(common) = self.common(&checkout.root).await? else {
+            return Ok(None);
+        };
         if RepositoryId::from_metadata("git", &common) != checkout.repository
-            || self.valid_root(&checkout.root, &common).await.as_ref() != Some(&checkout.root)
+            || !self.is_root(&checkout.root, &common).await?
         {
-            return None;
+            return Ok(None);
         }
-        let revision = self.read_revision(&checkout.root).await?;
+        let Some(revision) = self.read_revision(&checkout.root).await? else {
+            return Ok(None);
+        };
         if let Some(marker) = marker {
             self.validated_roots
                 .lock()
                 .unwrap()
                 .insert(checkout.id.clone(), ValidatedRoot { common, marker });
         }
-        Some(revision)
+        Ok(Some(revision))
     }
     /// Whether a Worktree still looks like the one Git validated for this
     /// checkout, judged without spawning Git: its metadata directory survives,
@@ -190,68 +213,60 @@ impl GitSourceControl {
         validated.remove(&checkout.id);
         false
     }
-    /// The branch and commit of a validated root. `None` means Git could not
-    /// read them; an unborn branch or a detached HEAD is still a revision.
-    /// Read from the metadata on disk where it can be, sparing two spawns on
-    /// every observation poll, and from Git wherever it cannot.
-    async fn read_revision(&self, root: &Path) -> Option<CheckoutRevision> {
+    /// The branch and commit of a validated root. Nothing means Git could not
+    /// read them, and an error that Git could not be run to; an unborn branch
+    /// or a detached HEAD is still a revision. Read from the metadata on disk
+    /// where it can be, sparing two spawns on every observation poll, and
+    /// from Git wherever it cannot.
+    async fn read_revision(&self, root: &Path) -> Result<Option<CheckoutRevision>, String> {
         if let Some(revision) = self.on_disk.revision(root) {
-            return Some(revision);
+            return Ok(Some(revision));
         }
         self.git_revision(root).await
     }
-    async fn git_revision(&self, root: &Path) -> Option<CheckoutRevision> {
-        let Ok(branch_output) = self
+    async fn git_revision(&self, root: &Path) -> Result<Option<CheckoutRevision>, String> {
+        let branch_output = self
             .command(root, &["symbolic-ref", "--quiet", "HEAD"])
-            .await
-        else {
-            return None;
-        };
+            .await?;
         let branch = if branch_output.status.success() {
             let Ok(name) = String::from_utf8(branch_output.stdout) else {
-                return None;
+                return Ok(None);
             };
             Some(name.trim_end_matches(['\r', '\n']).to_owned())
         } else if branch_output.status.code() == Some(1) {
             None // Detached HEAD is the documented quiet symbolic-ref miss.
         } else {
-            return None;
+            return Ok(None);
         };
-        let Ok(commit_output) = self
+        let commit_output = self
             .command(root, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
-            .await
-        else {
-            return None;
-        };
+            .await?;
         let commit = if commit_output.status.success() {
             let Ok(commit) = String::from_utf8(commit_output.stdout) else {
-                return None;
+                return Ok(None);
             };
             Some(commit.trim_end_matches(['\r', '\n']).to_owned())
         } else if let Some(branch) = &branch {
             // Only a genuinely absent branch ref is unborn. A failed commit
             // read from an existing ref must not erase retained recovery facts.
-            let Ok(reference) = self
+            let reference = self
                 .command(root, &["show-ref", "--verify", "--quiet", branch])
-                .await
-            else {
-                return None;
-            };
+                .await?;
             if reference.status.code() != Some(1) {
-                return None;
+                return Ok(None);
             }
             None
         } else {
-            return None;
+            return Ok(None);
         };
-        match (branch, commit) {
+        Ok(match (branch, commit) {
             (Some(name), commit) => Some(CheckoutRevision::Branch {
                 name: name.strip_prefix("refs/heads/").unwrap_or(&name).to_owned(),
                 commit,
             }),
             (None, Some(commit)) => Some(CheckoutRevision::Detached { commit }),
             (None, None) => None,
-        }
+        })
     }
 
     pub fn new(executable: impl Into<PathBuf>) -> Self {
@@ -444,18 +459,16 @@ impl GitSourceControl {
     async fn validate_prepared(&self, plan: &PreparedCheckout) -> Result<(), String> {
         if std::fs::symlink_metadata(&plan.destination.path)
             .is_ok_and(|m| m.file_type().is_symlink())
-            || self
-                .valid_root(&plan.destination.path, &plan.repository.metadata_directory)
-                .await
-                .as_ref()
-                != Some(&plan.destination.path)
+            || !self
+                .is_root(&plan.destination.path, &plan.repository.metadata_directory)
+                .await?
         {
             return Err("The prepared destination is occupied by unrelated contents; it was not overwritten".to_owned());
         }
         let CheckoutPreparationPlan::Git { branch: name, .. } = &plan.plan;
         if self
             .text(&plan.destination.path, &["symbolic-ref", "--short", "HEAD"])
-            .await
+            .await?
             .as_ref()
             != Some(name)
         {
@@ -467,46 +480,63 @@ impl GitSourceControl {
                 &plan.destination.path,
                 &["rev-parse", "--verify", "HEAD^{commit}"],
             )
-            .await
+            .await?
             .ok_or("Prepared checkout HEAD is unavailable; its branch may have been deleted")?;
         if !plan.checkout_created && &commit != source_commit {
             return Err("The destination does not contain the captured source commit; it was not overwritten".into());
         }
         Ok(())
     }
-    async fn text(&self, directory: &Path, args: &[&str]) -> Option<String> {
-        self.command(directory, args)
-            .await
-            .ok()
+    /// What Git printed for `args` in `directory`, as one line. Nothing
+    /// where Git ran and refused, and an error where Git could not be run at
+    /// all — not started, or stopped at its deadline — which says nothing of
+    /// the directory, so no caller may read it as a fact about the checkout.
+    async fn text(&self, directory: &Path, args: &[&str]) -> Result<Option<String>, String> {
+        let output = self.command(directory, args).await?;
+        Ok(Some(output)
             .filter(|output| output.status.success())
             .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|text| text.trim_end_matches(['\r', '\n']).to_owned())
+            .map(|text| text.trim_end_matches(['\r', '\n']).to_owned()))
     }
-    async fn common(&self, directory: &Path) -> Option<PathBuf> {
+    /// The shared metadata directory of the Repository `directory` is in, or
+    /// nothing where it is in none; an error where Git could not be run.
+    async fn common(&self, directory: &Path) -> Result<Option<PathBuf>, String> {
         let path = self
             .text(
                 directory,
                 &["rev-parse", "--path-format=absolute", "--git-common-dir"],
             )
             .await?;
-        crate::paths::canonical(path).ok()
+        Ok(path.and_then(|path| crate::paths::canonical(path).ok()))
     }
     /// [`Self::valid_root`] for a Worktree discovery lists, answered from
     /// disk wherever the disk confirms it outright.
-    async fn listed_root(&self, path: &Path, common: &Path) -> Option<PathBuf> {
+    async fn listed_root(&self, path: &Path, common: &Path) -> Result<Option<PathBuf>, String> {
         match self.on_disk.worktree_root(path, common) {
-            Some(root) => Some(root),
+            Some(root) => Ok(Some(root)),
             None => self.valid_root(path, common).await,
         }
     }
-    async fn valid_root(&self, path: &Path, common: &Path) -> Option<PathBuf> {
-        let root = self.text(path, &["rev-parse", "--show-toplevel"]).await?;
-        let root = crate::paths::canonical(root).ok()?;
-        let path = crate::paths::canonical(path).ok()?;
-        if root != path || self.common(&root).await.as_deref() != Some(common) {
-            return None;
+    /// `path`, where Git confirms it is the root of a Worktree whose shared
+    /// metadata is `common`; nothing where Git says it is not, and an error
+    /// where Git could not be run to say.
+    async fn valid_root(&self, path: &Path, common: &Path) -> Result<Option<PathBuf>, String> {
+        let Some(root) = self.text(path, &["rev-parse", "--show-toplevel"]).await? else {
+            return Ok(None);
+        };
+        let (Ok(root), Ok(path)) = (crate::paths::canonical(root), crate::paths::canonical(path))
+        else {
+            return Ok(None);
+        };
+        if root != path || self.common(&root).await?.as_deref() != Some(common) {
+            return Ok(None);
         }
-        Some(root)
+        Ok(Some(root))
+    }
+    /// Whether Git confirms `root` as the root of a Worktree of `common`;
+    /// an error where Git could not be run to say.
+    async fn is_root(&self, root: &Path, common: &Path) -> Result<bool, String> {
+        Ok(self.valid_root(root, common).await?.as_deref() == Some(root))
     }
 }
 
@@ -546,7 +576,7 @@ impl SourceControl for GitSourceControl {
             .as_ref()
             .map(|d| d.path.as_path())
             .unwrap_or(root);
-        if self.common(source_path).await.as_ref() != Some(&repository.metadata_directory) {
+        if self.common(source_path).await?.as_ref() != Some(&repository.metadata_directory) {
             return Err("The source checkout no longer belongs to this Repository".to_owned());
         }
         let ownership_ref = format!("refs/suru/preparations/{}", id.0.simple());
@@ -555,7 +585,7 @@ impl SourceControl for GitSourceControl {
                 &repository.metadata_directory,
                 &["rev-parse", "--verify", &ownership_ref],
             )
-            .await
+            .await?
             .is_some()
         {
             return Err(
@@ -568,21 +598,21 @@ impl SourceControl for GitSourceControl {
         // several branches may legitimately share it.
         let source_reference = self
             .text(source_path, &["symbolic-ref", "--quiet", "HEAD"])
-            .await;
+            .await?;
         let source_branch = source_reference
             .as_deref()
             .and_then(|reference| reference.strip_prefix("refs/heads/"))
             .map(str::to_owned);
         let commit = self
             .text(source_path, &["rev-parse", "--verify", "HEAD^{commit}"])
-            .await
+            .await?
             .ok_or("A usable local source commit is required; this Repository may be unborn")?;
         let confirmed_reference = self
             .text(source_path, &["symbolic-ref", "--quiet", "HEAD"])
-            .await;
+            .await?;
         let confirmed_commit = self
             .text(source_path, &["rev-parse", "--verify", "HEAD^{commit}"])
-            .await;
+            .await?;
         if confirmed_reference != source_reference || confirmed_commit.as_deref() != Some(&commit) {
             return Err("The source checkout changed while its Worktree was being planned; retry preparation".into());
         }
@@ -758,14 +788,14 @@ impl SourceControl for GitSourceControl {
         }
         let commit = self
             .text(repository, &["rev-parse", "--verify", &reference])
-            .await
+            .await?
             .ok_or("Preparation ownership ref could not be read")?;
         let provenance = self
             .text(
                 repository,
                 &["reflog", "show", "--format=%gs", "-1", &reference],
             )
-            .await;
+            .await?;
         if &commit != source_commit
             || provenance.as_deref() != Some(preparation::token(plan).as_str())
         {
@@ -784,7 +814,7 @@ impl SourceControl for GitSourceControl {
         } else if branch_status.success() && retire_branch {
             let tip = self
                 .text(repository, &["rev-parse", "--verify", &branch_ref])
-                .await
+                .await?
                 .ok_or("Prepared branch could not be read")?;
             if self.branch_outcome(repository, branch, &tip).await?
                 == CheckoutBranchOutcome::Deleted
@@ -818,7 +848,7 @@ impl SourceControl for GitSourceControl {
                 return Err("The main checkout location is unknown".to_owned());
             }
         };
-        if self.common(root).await.as_ref() != Some(&plan.repository.metadata_directory) {
+        if self.common(root).await?.as_ref() != Some(&plan.repository.metadata_directory) {
             return Err("Repository metadata is unavailable or has changed".to_owned());
         }
         let destination = &plan.destination.path;
@@ -1049,15 +1079,28 @@ impl SourceControl for GitSourceControl {
             Some(layout) => layout,
             // A line break within a path leaves the lines indistinct, so each
             // is read by a command of its own.
-            None => [
-                self.text(
-                    &path,
-                    &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                )
-                .await,
-                self.text(&path, &["rev-parse", "--absolute-git-dir"]).await,
-                self.text(&path, &["rev-parse", "--show-toplevel"]).await,
-            ],
+            None => {
+                let layout = async {
+                    Ok::<_, String>([
+                        self.text(
+                            &path,
+                            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                        )
+                        .await?,
+                        self.text(&path, &["rev-parse", "--absolute-git-dir"])
+                            .await?,
+                        self.text(&path, &["rev-parse", "--show-toplevel"]).await?,
+                    ])
+                };
+                match layout.await {
+                    Ok(layout) => layout,
+                    Err(reason) => {
+                        resolved.workspace.source_control =
+                            SourceControlAvailability::Unavailable { reason };
+                        return resolved;
+                    }
+                }
+            }
         };
         let common = match common.and_then(|common| crate::paths::canonical(common).ok()) {
             Some(path) => path,
@@ -1076,15 +1119,24 @@ impl SourceControl for GitSourceControl {
         // reading, so Git is asked at the shared metadata, beside the listing,
         // unless the Repository's own configuration already says it is not.
         let bare = async {
-            !self.on_disk.configured_not_bare(&common)
-                && self
-                    .text(&common, &["rev-parse", "--is-bare-repository"])
-                    .await
-                    .as_deref()
-                    == Some("true")
+            if self.on_disk.configured_not_bare(&common) {
+                return Ok(false);
+            }
+            let bare = self
+                .text(&common, &["rev-parse", "--is-bare-repository"])
+                .await?;
+            Ok::<_, String>(bare.as_deref() == Some("true"))
         };
         let listing = self.command(&path, &["worktree", "list", "--porcelain", "-z"]);
         let (bare, listing) = tokio::join!(bare, listing);
+        let bare = match bare {
+            Ok(bare) => bare,
+            Err(reason) => {
+                resolved.workspace.source_control =
+                    SourceControlAvailability::Unavailable { reason };
+                return resolved;
+            }
+        };
         let mut location = if bare {
             RepositoryLocation::Bare {
                 root: common.clone(),
@@ -1110,12 +1162,15 @@ impl SourceControl for GitSourceControl {
                 let main_root = match (bare, entries.first()) {
                     (false, Some(first)) if !first.bare => match &location {
                         RepositoryLocation::Main { root } => Some(root.clone()),
-                        _ => self
-                            .listed_root(&first.root, &common)
-                            .await
-                            .inspect(|root| {
+                        _ => match self.listed_root(&first.root, &common).await {
+                            Ok(root) => root.inspect(|root| {
                                 location = RepositoryLocation::Main { root: root.clone() };
                             }),
+                            Err(reason) => {
+                                availability = SourceControlAvailability::Unavailable { reason };
+                                None
+                            }
+                        },
                     },
                     _ => None,
                 };
@@ -1131,7 +1186,8 @@ impl SourceControl for GitSourceControl {
                     .collect::<Vec<_>>()
                     .await;
                 for ((entry, mut association), root) in listed.into_iter().zip(roots) {
-                    let valid = root.is_some() && !recovery_in_progress(&association.root);
+                    let valid =
+                        matches!(root, Ok(Some(_))) && !recovery_in_progress(&association.root);
                     // Discovery is already a successful reading. Preserve it
                     // before any Client starts live observation, but never
                     // promote stale Git listing data for an unavailable root.
@@ -1140,12 +1196,14 @@ impl SourceControl for GitSourceControl {
                     checkouts.push(CheckoutSummary {
                         association,
                         revision: entry.revision,
-                        availability: if valid {
-                            SourceControlAvailability::Available
-                        } else {
-                            SourceControlAvailability::Unavailable {
+                        availability: match root {
+                            _ if valid => SourceControlAvailability::Available,
+                            Err(reason) => SourceControlAvailability::Unavailable {
+                                reason: unchecked(&reason),
+                            },
+                            Ok(_) => SourceControlAvailability::Unavailable {
                                 reason: "Worktree is missing or unreadable".to_owned(),
-                            }
+                            },
                         },
                     });
                 }

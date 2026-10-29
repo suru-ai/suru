@@ -921,6 +921,63 @@ async fn validated_linked_worktree_replaced_by_another_repository_is_unavailable
         Some(CheckoutRevision::Branch { name, .. }) if name == "topic-again"));
 }
 
+/// Git that cannot be run — not found, or unable to start for want of file
+/// descriptors — says nothing of a checkout. Reading or recovering an intact
+/// Worktree then reports that Git could not run, never that the Worktree
+/// went missing, was replaced, or that its path holds unrelated contents.
+#[tokio::test]
+async fn git_that_cannot_run_never_reports_an_intact_worktree_as_foreign() {
+    let (_temporary, root) = root();
+    let main = root.join("main");
+    init(&main);
+    commit(&main);
+    let linked_root = root.join("linked");
+    linked(&main, &linked_root, "topic");
+    let discovered = GitSourceControl::default().discover(&linked_root).await;
+    let repository = discovered.workspace.repository.clone().unwrap();
+    let mut checkout = discovered.checkout.unwrap();
+    checkout.recovery_revision = Some(CheckoutRevision::Branch {
+        name: "topic".to_owned(),
+        commit: None,
+    });
+
+    let unrunnable = GitSourceControl::new(root.join("no-git-here"));
+    let SourceControlAvailability::Unavailable { reason } =
+        unrunnable.observe(&checkout).await.availability
+    else {
+        panic!("a checkout Git could not read is not available");
+    };
+    assert!(
+        reason.contains("Git is not installed or cannot be found")
+            && reason.contains("the checkout was not checked"),
+        "the reading says Git could not run: {reason}"
+    );
+
+    let refused = unrunnable
+        .recover_checkout(&repository, &checkout)
+        .await
+        .expect_err("nothing can be recovered without Git");
+    assert!(
+        refused.contains("Git is not installed or cannot be found")
+            && refused.contains("the checkout was not checked"),
+        "the refusal says Git could not run: {refused}"
+    );
+    for misleading in [
+        "unrelated contents",
+        "no longer identifies",
+        "not the known linked Worktree",
+    ] {
+        assert!(
+            !refused.contains(misleading),
+            "an intact Worktree is not called foreign: {refused}"
+        );
+    }
+    assert!(
+        linked_root.join(".git").is_file(),
+        "the Worktree is left as it was"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn validated_worktree_moved_behind_a_symlink_at_its_root_is_unavailable() {
