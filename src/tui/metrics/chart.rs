@@ -471,7 +471,7 @@ fn other_color(theme: &Theme) -> Color {
 /// the canvas's, the accent the first key takes, nor [`other_color`] — which
 /// [`palette`] then leaves out, so the Errands keep one colour wherever they
 /// rank and read as no key.
-fn errands_color(theme: &Theme) -> Color {
+pub(super) fn errands_color(theme: &Theme) -> Color {
     let ansi = theme.ansi;
     let other = other_color(theme);
     [ansi.bright.magenta, ansi.normal.magenta, ansi.bright.white]

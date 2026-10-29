@@ -3,6 +3,10 @@
 //! many Turns each cell holds of the busiest's, a cell of which a reader
 //! can select to read its Turns, tokens, and Cost.
 //!
+//! The panel is about the user's own work, so it holds Turns alone: Suru's
+//! Errands are no Turns, and the cells' Costs add up to the range's Session
+//! Cost — its Cost less the Errands' that Delegation states beside it.
+//!
 //! A cell takes one of five looks: a dot where it holds no Turn, otherwise
 //! one of four shades, each its own glyph, so they read apart on a Theme of
 //! few colours or none.

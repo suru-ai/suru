@@ -1,6 +1,6 @@
 //! The Cache panel: the share of the range's input read from cache, and an
 //! estimate of what caching saved at today's rates — labelled as one, and
-//! never a Cost.
+//! never a Cost. Both count the Errands' input beside the Turns'.
 
 use ratatui::{buffer::Buffer, layout::Rect};
 

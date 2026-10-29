@@ -1,9 +1,11 @@
 //! The Delegation panel: how the range's Cost divides between the user's
 //! own Sessions, their Subagents — the brokered share of those beside them
-//! — Sidekicks, and Subsessions, each role's share of the whole with a bar
-//! and its Cost, `+` where that Cost is partial — and on every share of
-//! work where the whole is, since a share of a partial whole is no more
-//! certain than its amount. Beneath them, a note that a
+//! — Sidekicks, Subsessions, and Suru's own Errands, each row's share of the
+//! whole with a bar and its Cost, `+` where that Cost is partial — and on
+//! every share of work where the whole is, since a share of a partial whole
+//! is no more certain than its amount. The Errands' bar takes the colour
+//! reserved for them, as their series does on Overview. Beneath them, a
+//! note that a
 //! Claude Session's native Subagents are inside its own Cost, since Claude
 //! reports a whole tree's Cost on the Session it runs them in.
 
@@ -16,13 +18,13 @@ use crate::{
 };
 
 use super::{
-    super::{calendar::MetricsRange, view::share},
+    super::{calendar::MetricsRange, chart, view::share},
     view::{bar, fitting, nothing, render_spans, stated_cost},
 };
 
-/// The rows the panel draws inside its border: a role apiece, then the
-/// note.
-pub(super) const ROWS: u16 = 5;
+/// The rows the panel draws inside its border: a role apiece, the Errands,
+/// then the note.
+pub(super) const ROWS: u16 = 6;
 
 /// How wide the roles' names stand, wide enough for the longest.
 const LABEL_WIDTH: usize = 12;
@@ -72,20 +74,28 @@ pub(super) fn render(
     let subagents = [delegation.native_subagents, delegation.brokered_subagents]
         .into_iter()
         .sum();
+    let accent = theme.accent.primary;
+    let errands = accent.fg(chart::errands_color(theme));
     let roles = [
-        ("own Sessions", delegation.own_sessions, None),
-        ("Subagents", subagents, Some(delegation.brokered_subagents)),
-        ("Sidekicks", delegation.sidekicks, None),
-        ("Subsessions", delegation.subsessions, None),
+        ("own Sessions", delegation.own_sessions, None, accent),
+        (
+            "Subagents",
+            subagents,
+            Some(delegation.brokered_subagents),
+            accent,
+        ),
+        ("Sidekicks", delegation.sidekicks, None, accent),
+        ("Subsessions", delegation.subsessions, None, accent),
+        ("Errands", delegation.errands, None, errands),
     ];
     // The brokered share stands beside its Subagents wherever any of their
     // work was brokered.
-    let roles = roles.map(|(label, cost, brokered)| {
+    let roles = roles.map(|(label, cost, brokered, style)| {
         let brokered = brokered
             .filter(|brokered| brokered.counts_work())
             .map(|brokered| format!("  brokered {}", share_of(brokered, total)))
             .unwrap_or_default();
-        (label, cost, brokered)
+        (label, cost, brokered, style)
     });
     // Each role's Cost stands beside its share where every bar and the
     // brokered share after its own still fit, and is left out where they
@@ -93,14 +103,14 @@ pub(super) fn render(
     // share are the panel's point.
     let fits = |lead: usize| {
         let bar_width = room.saturating_sub(lead);
-        roles.iter().all(|(_, cost, brokered)| {
+        roles.iter().all(|(_, cost, brokered, _)| {
             bar(nano_usd(*cost), whole, bar_width).width() + brokered.width() <= bar_width
         })
     };
     let costed = fits(LEAD_WIDTH);
     let lead_width = if costed { LEAD_WIDTH } else { BRIEF_LEAD_WIDTH };
     let bar_width = room.saturating_sub(lead_width);
-    for (y, (label, cost, brokered)) in (area.y..).zip(roles) {
+    for (y, (label, cost, brokered, style)) in (area.y..).zip(roles) {
         let share = share_of(cost, total);
         let lead = if costed {
             format!(
@@ -116,13 +126,13 @@ pub(super) fn render(
             y,
             [
                 (lead, primary),
-                (bar(nano_usd(cost), whole, bar_width), theme.accent.primary),
+                (bar(nano_usd(cost), whole, bar_width), style),
                 (brokered, subdued),
             ],
         );
     }
     let note = fitting(room, NOTE.map(str::to_owned));
-    buffer.set_string(area.x, area.y + 4, note, subdued);
+    buffer.set_string(area.x, area.y + ROWS - 1, note, subdued);
 }
 
 /// `cost`'s share of `whole`, `+` where the whole is partial and `cost`

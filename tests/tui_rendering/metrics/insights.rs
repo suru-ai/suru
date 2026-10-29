@@ -146,8 +146,9 @@ fn role(usd: f64, partial: bool) -> CountedCost {
     }
 }
 
-/// The mockup's $412.86 divided: 71% the user's own Sessions', 22% their
-/// Subagents', 9% of it brokered, 6% Sidekicks', and 1% Subsessions'.
+/// The mockup's $413.27 divided: 71% the user's own Sessions', 22% their
+/// Subagents', 9% of it brokered, 6% Sidekicks', 1% Subsessions', and under
+/// 1% Suru's own Errands'.
 fn worked_delegation() -> DelegationInsights {
     DelegationInsights {
         own_sessions: role(293.13, false),
@@ -155,7 +156,7 @@ fn worked_delegation() -> DelegationInsights {
         brokered_subagents: role(37.16, false),
         sidekicks: role(24.77, false),
         subsessions: role(4.13, false),
-        errands: CountedCost::default(),
+        errands: role(0.41, false),
     }
 }
 
@@ -1411,13 +1412,39 @@ fn the_delegation_panel_divides_cost_by_role_with_brokered_subagents_beside_thei
     assert_eq!(
         delegation_panel(&application),
         vec![
-            "own Sessions 71% $293.13 ████████████▏",
+            "own Sessions 71% $293.13 ████████████",
             "Subagents 22% $90.83 ███▊ brokered 9%",
             "Sidekicks 6% $24.77 █",
             "Subsessions 1% $4.13 ▏",
+            "Errands <1% $0.41 ▏",
             "A Claude Session's Subagents are in its Cost",
         ]
     );
+}
+
+#[test]
+fn the_delegation_panel_s_errands_row_states_suru_s_own_cost_in_the_errands_colour() {
+    let mut report = worked();
+    report.delegation.errands = role(41.33, true);
+    let application = on_insights(Ok(report));
+
+    let lines = panel_lines_at(&application, "Delegation (Cost)", 140);
+    assert_eq!(lines[4], "Errands 9%+ $41.33+ ██▌");
+    let buffer = rendered_application_buffer(&application, 140, HEIGHT);
+    let bar = |label: &str| {
+        let (x, y) = text_position(&buffer, label);
+        let x = (x..buffer.area.right())
+            .find(|x| buffer[(*x, y)].symbol() == "█")
+            .expect("the row has a bar");
+        buffer[(x, y)].fg
+    };
+    let errands = bar("Errands");
+    assert_ne!(
+        errands,
+        bar("own Sessions"),
+        "the Errands bar takes the colour reserved for them, as on Overview"
+    );
+    assert_eq!(bar("Sidekicks"), bar("own Sessions"));
 }
 
 #[test]
