@@ -2882,7 +2882,7 @@ fn send_message_description(input: &Value) -> Option<String> {
 /// A result's usage in Suru's disjoint parts. The CLI counts thinking inside its output tokens, so
 /// the thinking it breaks out is taken back out of the output; a breakdown it does not give leaves
 /// the thinking unknown and the output as stated.
-fn result_usage(usage: &ResultUsage) -> Usage {
+pub(super) fn result_usage(usage: &ResultUsage) -> Usage {
     let output = reported_token_count(usage.output_tokens);
     let reasoning = usage
         .output_tokens_details

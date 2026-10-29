@@ -1748,6 +1748,7 @@ async fn start(
         LandingAgentSelectionStore::new(persisted_landing_agent_selection, storage.clone());
     let onboarded =
         OnboardedStore::new(persisted_onboarded, storage.clone(), timings.clock.clone());
+    let errand_ledger = Arc::new(storage.clone());
     let model_catalog = ModelCatalogService::new(
         runtimes.iter().cloned(),
         settings.subscribe(),
@@ -1802,14 +1803,18 @@ async fn start(
         provider_shutdown_rx.clone(),
     );
     // Errands are abandoned on the same signal that stops Provider work, so a
-    // shutting-down server never waits on one and never resumes one.
+    // shutting-down server never waits on one and never resumes one. Each one
+    // that reaches a Provider is recorded through the storage writer, timed
+    // by the Server's clock (ADR 0057).
     let derivation = Derivation::new(
         ErrandRunner::new(
             runtimes.clone(),
             provider_shutdown_rx.clone(),
             settings.subscribe(),
+            errand_ledger,
         )
-        .with_timeout(timings.errand_timeout),
+        .with_timeout(timings.errand_timeout)
+        .with_clock(timings.clock.clone()),
         model_catalog.clone(),
         sessions.clone(),
         settings.subscribe(),

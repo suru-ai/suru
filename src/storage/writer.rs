@@ -36,6 +36,7 @@ use std::{
 };
 
 use crate::{
+    errands::{ErrandLedger, ErrandRecord},
     model_catalog::RememberedProviderCatalog,
     protocol::{
         AgentSelection, SessionChange, SessionId, SessionStatus, SessionTimestamp, SessionUpdate,
@@ -132,6 +133,8 @@ enum WriterCommand {
     SaveLandingAgentSelection(AgentSelection),
     /// That this Server was onboarded, at the moment it was.
     SaveOnboarded(SessionTimestamp),
+    /// An Errand that reached a Provider, as it ended (ADR 0057).
+    RecordErrand(Box<ErrandRecord>),
     SaveModelCatalog(RememberedProviderCatalog),
     /// A derived Icon filling a Workspace's absent one. Each Icon and
     /// Description write carries the provenance of the Registry entry it
@@ -398,6 +401,13 @@ impl Writer {
             WriterCommand::SaveOnboarded(at) => {
                 if let Err(error) = repository.save_onboarded(at) {
                     tracing::warn!("could not save that this Server has been onboarded: {error}");
+                }
+            }
+            // An Errand's record never holds up its answer, so one that fails
+            // to persist is logged and its Usage and Cost go uncounted.
+            WriterCommand::RecordErrand(record) => {
+                if let Err(error) = repository.record_errand(&record) {
+                    tracing::warn!("could not record an Errand: {error}");
                 }
             }
             // A remembered catalog is a nicety the next process starts from;
@@ -1059,6 +1069,16 @@ pub(crate) fn is_turn_boundary(update: &SessionUpdate) -> bool {
         SessionChange::SessionStatusChanged { status } => *status == SessionStatus::Idle,
         _ => false,
     })
+}
+
+/// The storage writer keeps the Errand records the runner takes, landing each
+/// on its own thread so the runner never waits on SQLite.
+impl ErrandLedger for StorageSink {
+    fn record(&self, record: ErrandRecord) -> Result<(), StorageError> {
+        self.commands
+            .send(WriterCommand::RecordErrand(Box::new(record)))
+            .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))
+    }
 }
 
 #[cfg(test)]

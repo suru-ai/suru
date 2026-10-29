@@ -15,12 +15,12 @@ use suru::protocol::{
     SkillDescriptor, SkillId, SkillPromptDelivery,
 };
 use suru::provider::{
-    AttributedProviderEvent, ManualCompaction, ProviderCompactionInput, ProviderDecisionDelivery,
-    ProviderErrand, ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
-    ProviderFuture, ProviderInput, ProviderInterruption, ProviderModelDiscovery, ProviderPrompt,
-    ProviderRuntime, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
-    ProviderSteerInput, ProviderSubagentId, ProviderTurnInput, ProviderWatchId, Report,
-    SubagentReport,
+    AttributedProviderEvent, ErrandAnswer, ManualCompaction, ProviderCompactionInput,
+    ProviderDecisionDelivery, ProviderErrand, ProviderError, ProviderEvent,
+    ProviderEventAttribution, ProviderEventStream, ProviderFuture, ProviderInput,
+    ProviderInterruption, ProviderModelDiscovery, ProviderPrompt, ProviderRuntime, ProviderSession,
+    ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
+    ProviderTurnInput, ProviderWatchId, Report, SubagentReport,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -109,7 +109,7 @@ pub struct StartRequest {
 /// because nothing else about a request that is never answered is observable.
 pub struct ErrandRequest {
     errand: ProviderErrand,
-    response: oneshot::Sender<Result<Value, ProviderError>>,
+    response: oneshot::Sender<Result<ErrandAnswer, ProviderError>>,
 }
 
 /// Holding a gated delivery exposes arbitration while Provider acknowledgement waits.
@@ -552,7 +552,7 @@ impl ErrandRequest {
 
     pub fn succeed(self, reply: Value) {
         self.response
-            .send(Ok(reply))
+            .send(Ok(ErrandAnswer::unmeasured(reply)))
             .unwrap_or_else(|_| panic!("Provider Errand response remains connected"));
     }
 
@@ -1259,7 +1259,7 @@ impl ProviderRuntime for ControlledProviderRuntime {
             .clone()
     }
 
-    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, Value> {
+    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, ErrandAnswer> {
         if *self
             .session_shaped_errands
             .lock()
@@ -1346,7 +1346,7 @@ fn dispatch_start(
 async fn run_errand_through_a_session(
     starts: mpsc::UnboundedSender<StartRequest>,
     errand: ProviderErrand,
-) -> Result<Value, ProviderError> {
+) -> Result<ErrandAnswer, ProviderError> {
     let connection = dispatch_start(
         starts,
         ProviderSessionRequest {
@@ -1376,6 +1376,7 @@ async fn run_errand_through_a_session(
     }
     session.shutdown().await?;
     serde_json::from_str(&reply)
+        .map(ErrandAnswer::unmeasured)
         .map_err(|error| ProviderError::new(format!("Errand reply is not JSON: {error}")))
 }
 

@@ -23,13 +23,11 @@
 
 use std::ffi::OsString;
 
-use serde_json::Value;
-
-use super::{claude_error, claude_error_context, wire::ResultMessage};
+use super::{claude_error, claude_error_context, projection::result_usage, wire::ResultMessage};
 use crate::{
-    protocol::ProviderUnavailability,
+    protocol::{Cost, CostBasis, ProviderUnavailability},
     provider::{
-        ProviderErrand, ProviderError,
+        ErrandAnswer, ErrandCost, ProviderErrand, ProviderError,
         harness::{HarnessSpec, run_harness_to_completion},
     },
 };
@@ -59,12 +57,13 @@ const CLAUDE_PRINT_MODE_ARGS: [&str; 9] = [
 ];
 
 /// Runs one Errand as a single print-mode invocation and answers with the JSON the CLI shaped to
-/// the Errand's schema. The reply is handed back unvalidated: the schema constrains the CLI rather
-/// than binding it, so whoever asked for the Errand still checks the shape it came back in.
+/// the Errand's schema, beside the Usage and Cost its result states. The reply is handed back
+/// unvalidated: the schema constrains the CLI rather than binding it, so whoever asked for the
+/// Errand still checks the shape it came back in.
 pub(super) async fn run_claude_errand(
     executable: OsString,
     errand: ProviderErrand,
-) -> Result<Value, ProviderError> {
+) -> Result<ErrandAnswer, ProviderError> {
     let spec = HarnessSpec {
         executable,
         args: arguments(&errand)?,
@@ -116,7 +115,10 @@ fn arguments(errand: &ProviderErrand) -> Result<Vec<OsString>, ProviderError> {
 ///
 /// A result the CLI could not shape to the schema is a failure rather than a partial answer: the
 /// caller asked for one shape, and the prose the CLI would otherwise fall back to is not it.
-fn errand_answer(printed: &str) -> Result<Value, ProviderError> {
+///
+/// The result's `usage` is the Errand's Usage, and its `total_cost_usd` a Cost Claude reported:
+/// print mode persists no conversation, so the running total it keeps is this run's alone.
+fn errand_answer(printed: &str) -> Result<ErrandAnswer, ProviderError> {
     let printed = printed.trim();
     if printed.is_empty() {
         return Err(claude_error(
@@ -135,8 +137,19 @@ fn errand_answer(printed: &str) -> Result<Value, ProviderError> {
             "Errand", &result,
         )));
     }
-    result.structured_output.ok_or_else(|| {
+    let reply = result.structured_output.ok_or_else(|| {
         claude_error("the Claude Code CLI answered an Errand outside the schema it was given")
+    })?;
+    Ok(ErrandAnswer {
+        reply,
+        usage: result.usage.as_ref().map(result_usage),
+        cost: result
+            .total_cost_usd
+            .and_then(Cost::from_usd)
+            .map(|cost| ErrandCost {
+                cost,
+                basis: CostBasis::Reported,
+            }),
     })
 }
 
@@ -145,6 +158,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::protocol::Usage;
 
     /// What the launch must never carry: an Errand carries no Tools, so there is nothing for it to
     /// be permitted to do, and a call the user never asked for is the last one that should run with
@@ -194,9 +208,84 @@ mod tests {
         })
         .to_string();
         assert_eq!(
-            errand_answer(&printed).expect("a schema-shaped answer is an answer"),
+            errand_answer(&printed)
+                .expect("a schema-shaped answer is an answer")
+                .reply,
             json!({ "title": "Fix the flicker", "icon": "md-bug" })
         );
+    }
+
+    /// Print mode's result says what the run consumed and what it cost. The conversation is never
+    /// persisted, so its running total is this Errand's alone: a Cost Claude reported.
+    #[test]
+    fn an_answer_carries_the_usage_and_reported_cost_its_result_states() {
+        let printed = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "duration_ms": 2873,
+            "duration_api_ms": 2741,
+            "num_turns": 1,
+            "result": "{\"title\":\"Fix the flicker\"}",
+            "stop_reason": null,
+            "session_id": "5f0b3c1e-8a52-4a3f-9d5e-0b6c2a1f7e44",
+            "total_cost_usd": 0.0041235,
+            "usage": {
+                "input_tokens": 12,
+                "cache_creation_input_tokens": 1830,
+                "cache_read_input_tokens": 14211,
+                "output_tokens": 96,
+                "output_tokens_details": { "thinking_tokens": 40 },
+                "server_tool_use": { "web_search_requests": 0, "web_fetch_requests": 0 },
+                "service_tier": "standard"
+            },
+            "modelUsage": {
+                "claude-haiku-4-5-20251001": {
+                    "inputTokens": 12,
+                    "outputTokens": 96,
+                    "costUSD": 0.0041235
+                }
+            },
+            "permission_denials": [],
+            "structured_output": { "title": "Fix the flicker" },
+            "uuid": "0d7f4c8e-2b1a-4e6f-a3c9-5d8b7e6f1a20"
+        })
+        .to_string();
+        let answer = errand_answer(&printed).expect("a schema-shaped answer is an answer");
+        assert_eq!(answer.reply, json!({ "title": "Fix the flicker" }));
+        assert_eq!(
+            answer.usage,
+            Some(Usage {
+                fresh_input_tokens: Some(12),
+                cache_read_tokens: Some(14211),
+                cache_write_tokens: Some(1830),
+                output_tokens: Some(56),
+                reasoning_tokens: Some(40),
+                native_meter: None,
+            })
+        );
+        assert_eq!(
+            answer.cost,
+            Some(ErrandCost {
+                cost: Cost::from_usd(0.0041235).expect("a representable Cost"),
+                basis: CostBasis::Reported,
+            })
+        );
+    }
+
+    /// A CLI whose result states neither leaves both unknown rather than zero.
+    #[test]
+    fn an_answer_whose_result_states_no_usage_carries_none() {
+        let printed = json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "structured_output": { "title": "Fix the flicker" },
+        })
+        .to_string();
+        let answer = errand_answer(&printed).expect("a schema-shaped answer is an answer");
+        assert_eq!(answer.usage, None);
+        assert_eq!(answer.cost, None);
     }
 
     #[test]

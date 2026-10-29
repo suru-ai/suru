@@ -30,6 +30,7 @@ use crate::{
 mod activity_rows;
 mod attachment_table;
 mod clone_staging_table;
+mod errand_table;
 mod memory_table;
 mod rows;
 mod unsaved;
@@ -49,7 +50,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20261014000000";
+const CURRENT_SCHEMA_VERSION: &str = "20261029000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -472,6 +473,7 @@ pub(crate) enum StorageError {
     WriteAttachment(String),
     WriteSidekickAct(String),
     WriteMemory(String),
+    WriteErrand(String),
     BlockingTask {
         operation: &'static str,
         message: String,
@@ -536,6 +538,7 @@ impl fmt::Display for StorageError {
                 write!(formatter, "save a Sidekick's act on a Session: {message}")
             }
             Self::WriteMemory(message) => write!(formatter, "save a Memory: {message}"),
+            Self::WriteErrand(message) => write!(formatter, "record an Errand: {message}"),
             Self::BlockingTask { operation, message } => write!(
                 formatter,
                 "Session repository {operation} task failed: {message}"

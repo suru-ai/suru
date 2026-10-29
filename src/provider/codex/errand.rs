@@ -29,7 +29,7 @@ use crate::{
         ModelOptionValue, ProviderId, ProviderUnavailability,
     },
     provider::{
-        ProviderErrand, ProviderError,
+        ErrandAnswer, ProviderErrand, ProviderError,
         harness::{HarnessSpec, run_harness_to_completion},
     },
 };
@@ -85,10 +85,13 @@ pub(super) fn declared_errand_selection() -> AgentSelection {
 /// Codex wrote. The reply is handed back unvalidated: the schema constrains
 /// Codex rather than binding it, so whoever asked for the Errand still checks
 /// the shape it came back in.
+///
+/// Codex is not yet asked what the run consumed, so the answer carries no
+/// Usage and no Cost.
 pub(super) async fn run(
     executable: OsString,
     errand: ProviderErrand,
-) -> Result<Value, ProviderError> {
+) -> Result<ErrandAnswer, ProviderError> {
     let files = ErrandFiles::new(&errand.schema)?;
     let spec = HarnessSpec {
         executable,
@@ -112,7 +115,7 @@ pub(super) async fn run(
             .unwrap_or_else(|| format!("Codex exited with {}", finished.status));
         return Err(codex_error(format!("{ERRAND_FAILED}: {said}")));
     }
-    files.answer()
+    files.answer().map(ErrandAnswer::unmeasured)
 }
 
 /// The two files one `codex exec` run is pointed at: the schema going in, and

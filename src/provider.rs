@@ -646,6 +646,36 @@ pub struct ProviderErrand {
     pub execution_directory: PathBuf,
 }
 
+/// What a Provider answers an Errand with: the reply it gave, and what
+/// giving it consumed where the Provider can tell — its Usage, and its Cost
+/// where it knows one. A Provider that cannot tell answers with neither, which
+/// is never the same as having consumed nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ErrandAnswer {
+    /// The JSON the Provider replied, unvalidated against the Errand's schema.
+    pub reply: Value,
+    pub usage: Option<Usage>,
+    pub cost: Option<ErrandCost>,
+}
+
+impl ErrandAnswer {
+    /// An answer whose Provider cannot say what giving it consumed.
+    pub fn unmeasured(reply: Value) -> Self {
+        Self {
+            reply,
+            usage: None,
+            cost: None,
+        }
+    }
+}
+
+/// An Errand's Cost and who computed it, fixed when the Errand ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ErrandCost {
+    pub cost: Cost,
+    pub basis: CostBasis,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderResumeState(Value);
 
@@ -1565,7 +1595,8 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     ) -> ProviderFuture<'_, ProviderSessionConnection>;
 
     /// Runs one Errand: delivers its Prompt, asks for its shape, and answers
-    /// with the JSON the Provider replied. How that happens is the runtime's
+    /// with the JSON the Provider replied, beside the Usage and Cost giving it
+    /// consumed where the Provider can tell (ADR 0057). How that happens is the runtime's
     /// own business — a native one-shot mode where the harness offers one, and
     /// otherwise a Provider-side session it starts and discards (ADR 0011) —
     /// and the caller never learns which path ran.
@@ -1574,7 +1605,7 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     /// in this shape" capability, so a later compaction or summarization Errand
     /// reuses it unchanged. It is not defaulted, so a new Provider has to decide
     /// how it runs Errands rather than silently running none.
-    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, Value>;
+    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, ErrandAnswer>;
 
     /// The rates this Provider prices `model` at today, from which Insights
     /// estimates what caching saved; absent where it knows no rate table
@@ -1966,10 +1997,10 @@ mod tests {
     #[cfg(windows)]
     use super::executable_shadowed_by_windows_app_alias;
     use super::{
-        AgentSelection, MAX_REMOTE_ERROR_CHARS, ManualCompaction, ManualCompactionRefusal,
-        ProviderErrand, ProviderFuture, ProviderId, ProviderModelDiscovery, ProviderRuntime,
-        ProviderSessionConnection, ProviderSessionRequest, built_in_providers,
-        concise_remote_message, resolve_executable, runtimes,
+        AgentSelection, ErrandAnswer, MAX_REMOTE_ERROR_CHARS, ManualCompaction,
+        ManualCompactionRefusal, ProviderErrand, ProviderFuture, ProviderId,
+        ProviderModelDiscovery, ProviderRuntime, ProviderSessionConnection, ProviderSessionRequest,
+        built_in_providers, concise_remote_message, resolve_executable, runtimes,
     };
     use crate::{protocol::EffectiveSettings, settings::provider_enablement};
 
@@ -2097,7 +2128,7 @@ mod tests {
                 unimplemented!("no Session is started")
             }
 
-            fn run_errand(&self, _errand: ProviderErrand) -> ProviderFuture<'_, serde_json::Value> {
+            fn run_errand(&self, _errand: ProviderErrand) -> ProviderFuture<'_, ErrandAnswer> {
                 unimplemented!("no Errand is run")
             }
 

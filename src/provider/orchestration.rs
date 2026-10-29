@@ -7808,7 +7808,10 @@ running 1 test",
             })
         }
 
-        fn run_errand(&self, _errand: ProviderErrand) -> ProviderFuture<'_, serde_json::Value> {
+        fn run_errand(
+            &self,
+            _errand: ProviderErrand,
+        ) -> ProviderFuture<'_, crate::provider::ErrandAnswer> {
             Box::pin(async { Err(ProviderError::new("no Errand is run")) })
         }
 

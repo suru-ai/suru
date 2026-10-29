@@ -85,7 +85,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use crate::{
-    errands::ErrandRunner,
+    errands::{ErrandPurpose, ErrandRunner},
     icon_catalog,
     model_catalog::ModelCatalogService,
     protocol::{
@@ -288,7 +288,8 @@ impl Derivation {
                 selection: selection.clone(),
                 execution_directory: execution_directory.clone(),
             };
-            let proposed_branch = match errands.run(title_errand).await {
+            let proposed_branch = match errands.run(ErrandPurpose::SessionTitle, title_errand).await
+            {
                 Ok(answer) => match derived_reply(&answer) {
                     Some(DerivedReply { title, branch }) => {
                         if !sessions.replace_derived_title(session_id, &derived_from, title) {
@@ -476,7 +477,7 @@ impl Derivation {
         };
         let answer = self
             .errands
-            .run(errand)
+            .run(ErrandPurpose::TitleProposal, errand)
             .await
             .map_err(|failure| ProposalRefusal::Failed(failure.to_string()))?;
         serde_json::from_value::<DerivedTitleReply>(answer)
@@ -547,7 +548,10 @@ async fn derive_workspace(
     workspace_id: crate::protocol::WorkspaceId,
     errand: ProviderErrand,
 ) {
-    let answer = match errands.run(errand).await {
+    let answer = match errands
+        .run(ErrandPurpose::WorkspaceDescription, errand)
+        .await
+    {
         Ok(answer) => answer,
         Err(failure) => {
             tracing::info!(

@@ -6,8 +6,8 @@ use suru::{
         SkillDescriptor, SkillId, SkillPromptDelivery,
     },
     provider::{
-        ProviderErrand, ProviderError, ProviderFuture, ProviderModelDiscovery, ProviderRuntime,
-        ProviderSessionConnection, ProviderSessionRequest,
+        ErrandAnswer, ProviderErrand, ProviderError, ProviderFuture, ProviderModelDiscovery,
+        ProviderRuntime, ProviderSessionConnection, ProviderSessionRequest,
     },
     server::{self, ServerConfig},
 };
@@ -70,7 +70,7 @@ impl ProviderRuntime for FailingProviderRuntime {
         })
     }
 
-    fn run_errand(&self, _errand: ProviderErrand) -> ProviderFuture<'_, serde_json::Value> {
+    fn run_errand(&self, _errand: ProviderErrand) -> ProviderFuture<'_, ErrandAnswer> {
         Box::pin(async {
             Err(ProviderError::new(
                 "No Provider runtime is configured for this test server.",
