@@ -88,6 +88,17 @@ impl NewErrandRow {
 }
 
 impl ErrandRow {
+    /// The record the row spells, or none, logged, where this Suru reads
+    /// none from it.
+    fn readable(self) -> Option<ErrandRecord> {
+        let id = self.id;
+        self.into_record()
+            .inspect_err(|reason| {
+                tracing::warn!("left out Errand record {id}: {reason}");
+            })
+            .ok()
+    }
+
     /// The record the row spells, or why this Suru reads none from it.
     fn into_record(self) -> Result<ErrandRecord, String> {
         let purpose = spelled(self.purpose, "purpose")?;
@@ -163,7 +174,7 @@ impl StorageRepository {
     /// connection through the index on when each began: every Errand
     /// recorded as beginning within `began`, where given — from its start, up
     /// to but not including its end — earliest first, and when the earliest
-    /// of all of them began.
+    /// of all of them this Suru can read began.
     ///
     /// A row this Suru cannot read is logged and left out rather than failing
     /// the read. The schema version only guards the table's shape: a later
@@ -177,11 +188,7 @@ impl StorageRepository {
         let path = self.database_path.clone();
         on_blocking_task("reading Errand records", move || {
             let mut connection = connect(&path)?;
-            let earliest_began = errands::table
-                .select(diesel::dsl::min(errands::began_at))
-                .first::<Option<i64>>(&mut connection)
-                .map_err(|error| StorageError::Read(error.to_string()))?
-                .map(timestamp);
+            let earliest_began = earliest_readable_began(&mut connection)?;
             let Some(began) = began else {
                 return Ok(ErrandReading {
                     records: Vec::new(),
@@ -214,22 +221,33 @@ pub(super) fn errands_began_within(
         .select(ErrandRow::as_select())
         .load::<ErrandRow>(connection)
         .map_err(|error| StorageError::Read(error.to_string()))?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| {
-            let id = row.id;
-            row.into_record()
-                .inspect_err(|reason| {
-                    tracing::warn!("left out Errand record {id}: {reason}");
-                })
-                .ok()
-        })
-        .collect())
+    Ok(rows.into_iter().filter_map(ErrandRow::readable).collect())
+}
+
+/// When the earliest Errand this Suru can read began, none where none is:
+/// rows are streamed earliest first through the index on when each began
+/// until one reads, so a row left out of every count never sets where All
+/// time starts.
+fn earliest_readable_began(
+    connection: &mut SqliteConnection,
+) -> Result<Option<SessionTimestamp>, StorageError> {
+    let rows = errands::table
+        .order((errands::began_at, errands::id))
+        .select(ErrandRow::as_select())
+        .load_iter::<ErrandRow, diesel::connection::DefaultLoadingMode>(connection)
+        .map_err(|error| StorageError::Read(error.to_string()))?;
+    for row in rows {
+        let row = row.map_err(|error| StorageError::Read(error.to_string()))?;
+        if let Some(record) = row.readable() {
+            return Ok(Some(record.began));
+        }
+    }
+    Ok(None)
 }
 
 /// What [`StorageRepository::errand_reading`] read: the Errands that began
 /// within the span it was asked for, earliest first, and when the earliest
-/// of every Errand recorded began, none where none is.
+/// Errand it can read began, none where none is.
 #[derive(Debug, Default)]
 pub(crate) struct ErrandReading {
     pub(crate) records: Vec<ErrandRecord>,
@@ -340,6 +358,46 @@ mod tests {
                 .earliest_began,
             Some(at(999))
         );
+    }
+
+    /// A row this Suru cannot read is left out of the records and of when
+    /// the earliest began alike, so it never pulls All time's start before
+    /// any Errand counted.
+    #[tokio::test]
+    async fn an_unreadable_errand_row_sets_no_earliest_began() {
+        let data = tempfile::tempdir().unwrap();
+        let repository = StorageRepository::open(data.path()).await.unwrap();
+        let unreadable = |began: u64, outcome: &str| {
+            let mut row = NewErrandRow::of(&record(began, ErrandPurpose::SessionTitle)).unwrap();
+            row.outcome = outcome.to_owned();
+            diesel::insert_into(errands::table)
+                .values(&row)
+                .execute(&mut connect(&repository.database_path).unwrap())
+                .unwrap();
+        };
+        unreadable(500, "outcome-from-a-later-suru");
+        assert_eq!(
+            repository
+                .errand_reading(None)
+                .await
+                .unwrap()
+                .earliest_began,
+            None
+        );
+
+        repository
+            .record_errand(&record(2_000, ErrandPurpose::SessionTitle))
+            .unwrap();
+        unreadable(1_000, "another-outcome");
+        let reading = repository
+            .errand_reading(Some(at(0)..at(u64::MAX)))
+            .await
+            .unwrap();
+        assert_eq!(
+            reading.records,
+            vec![record(2_000, ErrandPurpose::SessionTitle)]
+        );
+        assert_eq!(reading.earliest_began, Some(at(2_000)));
     }
 
     /// The runner hands its records to the storage writer, which lands them
