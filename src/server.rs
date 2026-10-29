@@ -528,7 +528,7 @@ impl ServerTimings {
     }
 
     /// Bounds how long an idle Session keeps a Provider process of its own;
-    /// injectable so tests see it let go of, and the conversation resumed,
+    /// injectable so tests see it stopped, and the conversation resumed,
     /// without waiting out the default.
     pub fn with_provider_idle_shutdown(mut self, idle: Duration) -> Self {
         self.provider_idle_shutdown = idle;

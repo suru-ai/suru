@@ -1765,7 +1765,7 @@ pub trait ProviderRuntime: Send + Sync + 'static {
 
     /// Whether this Provider runs a process of its own for each Session,
     /// rather than one every Session shares. A Session whose Provider does
-    /// has that process let go of once it has waited idle for the Server's
+    /// has that process stopped once it has waited idle for the Server's
     /// `provider_idle_shutdown` with nothing owed on it, and its conversation
     /// resumes from its stored Resume State at its next Turn, so idle
     /// Sessions hold no processes, nor the pipes to them, however many there

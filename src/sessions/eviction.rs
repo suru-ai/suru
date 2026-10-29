@@ -197,17 +197,15 @@ impl SessionStore {
         }
         idle_trees.into_iter().map(|tree| tree[0]).collect()
     }
-}
 
-impl SessionStore {
-    /// Whether the Provider process the actor `owner` owns may be let go of
+    /// Whether the Provider process the actor `owner` owns may be stopped
     /// while it waits for the next Turn: nothing runs or is owed on that
     /// actor — in `owner`, or in any native Subagent riding it — that the
     /// process would act on or answer, or that needs it running to be told.
     /// A reader following the Sessions holds nothing here: what they read
     /// stays as it is, and the conversation resumes from its stored Resume
     /// State at the next Turn, as it does after a restart.
-    pub(crate) fn provider_may_rest(&self, owner: SessionId) -> bool {
+    pub(crate) fn provider_may_stop_idle(&self, owner: SessionId) -> bool {
         let state = self
             .state
             .lock()
@@ -326,7 +324,7 @@ impl SessionStoreState {
     fn holds_work(&self, session_id: SessionId, record: &super::SessionRecord) -> bool {
         let snapshot = &record.snapshot;
         let session = &snapshot.session;
-        // Work runs, or is owed, somewhere in its subtree.
+        // Work runs in it, or is owed there.
         session.working_since.is_some()
             || session.monitoring_since.is_some()
             || session.status != SessionStatus::Idle

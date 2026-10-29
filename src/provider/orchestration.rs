@@ -125,7 +125,7 @@ const COMPACTION_OVERTAKEN_MESSAGE: &str = "Compaction not started: the Agent be
 pub(crate) const PROVIDER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long a Session whose Provider runs a process for each Session waits
-/// idle, with nothing owed on it, before that process is let go of; see
+/// idle, with nothing owed on it, before that process is stopped; see
 /// [`ProviderRuntime::launches_a_process_per_session`].
 pub(crate) const PROVIDER_IDLE_SHUTDOWN: Duration = Duration::from_secs(10 * 60);
 
@@ -2724,9 +2724,9 @@ async fn run_provider_session(
     // request queued here is stale by the time it is read, and asks nothing.
     let mut withdrawn_compactions: HashSet<TurnId> = HashSet::new();
     let provider_id = runtime.provider_id();
-    // A Provider process launched for this Session alone is let go of once
+    // A Provider process launched for this Session alone is stopped once
     // the Session has waited idle long enough; a shared one stays.
-    let rests_when_idle = runtime.launches_a_process_per_session();
+    let stops_when_idle = runtime.launches_a_process_per_session();
     let connector = ProviderConnector {
         runtime: &runtime,
         source_control: &source_control,
@@ -2775,7 +2775,7 @@ async fn run_provider_session(
                     command = commands.recv() => ActorInput::Command(command),
                     // Restarted with every input, so it elapses only once
                     // nothing has reached the actor for that long.
-                    () = tokio::time::sleep(idle_shutdown), if rests_when_idle => ActorInput::Idle,
+                    () = tokio::time::sleep(idle_shutdown), if stops_when_idle => ActorInput::Idle,
                 }
             } else if let Some(prompt_id) = pending_turn_starts
                 .pop_front()
@@ -3040,7 +3040,7 @@ async fn run_provider_session(
                 }
                 // Nothing the actor holds would die with the connection, and
                 // nothing owed on it needs the process running to be told:
-                // the process is let go of, and the next Turn opens a fresh
+                // the process is stopped, and the next Turn opens a fresh
                 // one that resumes the conversation from its stored Resume
                 // State, as after a restart. Anything still owed keeps it for
                 // another wait.
@@ -3050,7 +3050,7 @@ async fn run_provider_session(
                         && !reports_owed
                         && !subagents.owes_continuation()
                         && subagents.watch_outcomes.is_empty()
-                        && sessions.provider_may_rest(session_id)
+                        && sessions.provider_may_stop_idle(session_id)
                         && let Some(idle) = provider.take()
                     {
                         connected_incarnations.lock().unwrap().remove(&session_id);
@@ -8078,12 +8078,12 @@ running 1 test",
         prompt
     }
 
-    /// A Session whose Provider runs a process for it alone lets that
-    /// process go once it has waited idle, and its next Turn starts a fresh
+    /// A Session whose Provider runs a process for it alone has that
+    /// process stopped once it has waited idle, and its next Turn starts a fresh
     /// one; a Watch still standing keeps it, as does a Provider whose process
     /// every Session shares.
     #[tokio::test]
-    async fn an_idle_sessions_own_provider_process_is_let_go_of_and_resumed_at_its_next_turn() {
+    async fn an_idle_sessions_own_provider_process_is_stopped_and_resumed_at_its_next_turn() {
         let idle = Duration::from_millis(20);
         let mut fixture = hand_fixture(true, idle).await;
         let created = create_session(&fixture.sessions, fixture.workspace.path(), "First");
@@ -8123,7 +8123,7 @@ running 1 test",
             }
             .into()))
             .expect("the actor reads its events");
-        waited("the idle process is let go of", || {
+        waited("the idle process is stopped", || {
             first.is_closed().then_some(())
         })
         .await;
@@ -8150,6 +8150,8 @@ running 1 test",
         within("the orchestrator stops", fixture.providers.shutdown()).await;
     }
 
+    /// A Provider process every Session shares stays connected however long
+    /// a Session waits idle, since stopping it frees nothing.
     #[tokio::test]
     async fn a_shared_provider_process_stays_connected_however_long_a_session_waits() {
         let idle = Duration::from_millis(20);
