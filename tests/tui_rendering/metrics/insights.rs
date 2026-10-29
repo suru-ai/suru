@@ -155,6 +155,7 @@ fn worked_delegation() -> DelegationInsights {
         brokered_subagents: role(37.16, false),
         sidekicks: role(24.77, false),
         subsessions: role(4.13, false),
+        errands: CountedCost::default(),
     }
 }
 

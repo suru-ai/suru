@@ -5,13 +5,15 @@ use super::{
     InsightsRefusal, Pairing, RemoteAct, SessionStore,
     restoration_tests::persisted,
     usage_metrics_tests::{
-        CODEX, FABLE, OPUS, PAIRING, SONNET, STUDIO, by_model, metered, read as read_metrics,
-        restore, restore_deferred, running_total, turn_scoped, usd,
+        CODEX, FABLE, OPUS, PAIRING, SONNET, STUDIO, by_model, errands_part, metered,
+        read as read_metrics, restore, restore_deferred, restore_with_errands, running_total,
+        turn_scoped, usd,
     },
 };
 use std::collections::HashMap;
 
 use crate::{
+    errands::{ErrandOutcome, ErrandPurpose, ErrandRecord},
     pricing::{CacheRateLookup, CacheRates, CacheRatesFuture},
     protocol::{
         Activity, ActivityId, ActivityStatus, Approval, ApprovalId, ApprovalInsights,
@@ -21,6 +23,7 @@ use crate::{
         SessionId, SessionListItem, SessionTimestamp, ToolTally, TranscriptItem, Turn,
         TurnDurations, TurnId, TurnInsights, TurnStatus, Usage, UsageMetricsInterval, UsageTotal,
     },
+    provider::ErrandCost,
     sidekick::SidekickWorkspace,
     storage::PersistedSession,
 };
@@ -380,8 +383,42 @@ async fn turns_land_in_the_utc_quarter_hour_they_are_placed_in_earliest_first() 
     writer.shutdown().await.unwrap();
 }
 
+/// The Errands model, which no Session here runs.
+const HAIKU: Option<(&str, &str)> = Some(("claude", "claude-haiku-4-5"));
+
+/// An Errand begun at `began` whose input was `fresh` tokens sent fresh,
+/// `reads` read from cache, and `writes` written to it, where it knew its
+/// Usage, costing what `cost` says, where it knew that.
+fn errand(began: u64, usage: Option<(u64, u64, u64)>, cost: Option<ErrandCost>) -> ErrandRecord {
+    let (provider, model) = HAIKU.unwrap();
+    ErrandRecord {
+        purpose: ErrandPurpose::SessionTitle,
+        provider: ProviderId::new(provider),
+        model: ModelId::new(model),
+        began: SessionTimestamp(began),
+        ended: SessionTimestamp(began + 1),
+        outcome: ErrandOutcome::Answered,
+        usage: usage.map(|(fresh, reads, writes)| Usage {
+            fresh_input_tokens: Some(fresh),
+            cache_read_tokens: Some(reads),
+            cache_write_tokens: Some(writes),
+            output_tokens: Some(1),
+            ..Usage::default()
+        }),
+        cost,
+    }
+}
+
+/// An Errand's Cost of `dollars` as its Provider reported it.
+fn reported(dollars: f64) -> Option<ErrandCost> {
+    Some(ErrandCost::reported(usd(dollars).unwrap()))
+}
+
+/// The heatmap is Turn-only: its quarter-hours carry the range's Session
+/// Cost, and the range's Errands, which the metrics read counts beside the
+/// Sessions, land in none of them.
 #[tokio::test]
-async fn quarter_hour_costs_add_up_to_the_range_s_cost() {
+async fn quarter_hour_costs_add_up_to_the_range_s_session_cost() {
     let directory = tempfile::tempdir().unwrap();
     let at = |place: u64| QUARTER + place * QUARTER_HOUR_MS + 1;
     let mut parent = persisted(directory.path(), None);
@@ -400,7 +437,13 @@ async fn quarter_hour_costs_add_up_to_the_range_s_cost() {
         // Unpriced: its quarter-hour's Cost is partial.
         metered(CODEX, Some(at(3) + 7), None, 1),
     ];
-    let (store, writer) = restore(directory.path(), vec![parent, brokered]).await;
+    // Errands in a quarter-hour holding Turns, and in one holding none.
+    let errands = vec![
+        errand(at(0) + 3, Some((10, 0, 0)), reported(0.04)),
+        errand(at(2), Some((10, 0, 0)), reported(0.02)),
+    ];
+    let (store, writer) =
+        restore_with_errands(directory.path(), vec![parent, brokered], errands).await;
     let (start, end) = (QUARTER, QUARTER + 4 * QUARTER_HOUR_MS);
 
     let report = read(&store, &over(start, end)).await;
@@ -411,20 +454,23 @@ async fn quarter_hour_costs_add_up_to_the_range_s_cost() {
             quarter(0, 1, 1, usd(0.10), false),
             quarter(1, 2, 2, usd(0.30), false),
             quarter(3, 2, 2, usd(0.08), true),
-        ]
+        ],
+        "no Errand is a Turn, or lands its Cost or tokens in a quarter-hour"
     );
     let range = read_metrics(&store, &by_model(&[(start, end)]))
         .await
-        .across_buckets
-        .total;
+        .across_buckets;
+    let errands = errands_part(&range).expect("the range holds Errands").cost;
+    assert_eq!(errands, role(usd(0.06), false));
     let added = report
         .quarter_hours
         .iter()
         .map(|quarter| quarter.cost)
+        .chain([errands])
         .sum::<CountedCost>();
     assert_eq!(
-        added, range.cost,
-        "the quarter-hours add up to the Cost the metrics read gives the range"
+        added, range.total.cost,
+        "the quarter-hours add up to the range's Cost less its Errands'"
     );
     writer.shutdown().await.unwrap();
 }
@@ -507,6 +553,7 @@ async fn delegation_divides_the_range_s_cost_by_the_role_of_the_session_carrying
             brokered_subagents: role(usd(0.08), true),
             sidekicks: role(usd(0.02), false),
             subsessions: role(usd(0.01), false),
+            errands: CountedCost::default(),
         }
     );
     let range = read_metrics(&store, &by_model(&[(START, END)]))
@@ -568,6 +615,62 @@ async fn a_range_whose_turns_carry_no_cost_divides_none() {
         "work nobody priced is partial, with no amount anyone measured"
     );
     writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn delegation_s_errands_are_the_range_s_errand_cost_and_the_rows_add_up_to_its_cost() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut own = persisted(directory.path(), None);
+    own.snapshot.turns = vec![turn_scoped(CODEX, START, 0.50)];
+    let errands = vec![
+        errand(START, Some((10, 0, 0)), reported(0.04)),
+        errand(
+            START + 1,
+            Some((10, 0, 0)),
+            Some(ErrandCost::as_recorded(
+                usd(0.02).unwrap(),
+                crate::protocol::CostBasis::Estimated,
+            )),
+        ),
+        // Before the range, and as it ends: no part of its Cost.
+        errand(START - 1, Some((10, 0, 0)), reported(9.00)),
+        errand(END, Some((10, 0, 0)), reported(9.00)),
+    ];
+    // An Errand that timed out knowing neither: the range's Cost is then
+    // partial, and so are its Errands'.
+    let unmeasured = ErrandRecord {
+        outcome: ErrandOutcome::TimedOut,
+        ..errand(START + 2, None, None)
+    };
+    for (errands, expected) in [
+        (errands.clone(), role(usd(0.06), false)),
+        ([errands, vec![unmeasured]].concat(), role(usd(0.06), true)),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let (store, writer) =
+            restore_with_errands(directory.path(), vec![own.clone()], errands).await;
+
+        let delegation = read(&store, &over(START, END)).await.delegation;
+
+        assert_eq!(
+            delegation,
+            DelegationInsights {
+                own_sessions: role(usd(0.50), false),
+                errands: expected,
+                ..DelegationInsights::default()
+            }
+        );
+        let range = read_metrics(&store, &by_model(&[(START, END)]))
+            .await
+            .across_buckets
+            .total;
+        assert_eq!(
+            delegation.total(),
+            range.cost,
+            "the roles and the Errands add up to the Cost the metrics read gives the range"
+        );
+        writer.shutdown().await.unwrap();
+    }
 }
 
 /// Records `activity` in `session`'s Transcript, as working the Turn it
@@ -1342,5 +1445,57 @@ async fn a_model_lacking_the_cache_write_rate_is_left_out_where_its_turns_wrote_
     let cache = priced_at(&store, &over(START, END), &rates).await.cache;
 
     assert_eq!(cache.saving, saved(None, true));
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_cache_share_and_saving_count_errand_usage_at_the_errand_model_s_rates() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    // 3M read at $0.20 rather than $2.00: $5.40 saved.
+    session.snapshot.turns = vec![cached(CODEX, START, 1_000_000, 3_000_000, 0)];
+    let errands = vec![
+        // 2M read at $0.10 rather than $1.00 saves $1.80; 1M written at
+        // $1.25 costs $0.25 more.
+        errand(START + 1, Some((1_000_000, 2_000_000, 1_000_000)), None),
+        // Knowing no Usage, it adds no input and needs no rates.
+        errand(START + 2, None, None),
+        // Before the range: no part of its input.
+        errand(START - 1, Some((9_000_000, 9_000_000, 0)), None),
+    ];
+    let (store, writer) = restore_with_errands(directory.path(), vec![session], errands).await;
+    let rates = RateTable::default()
+        .pricing(CODEX, 2.00, Some(0.20), Some(2.50))
+        .pricing(HAIKU, 1.00, Some(0.10), Some(1.25));
+
+    let cache = priced_at(&store, &over(START, END), &rates).await.cache;
+
+    assert_eq!(
+        (
+            cache.fresh_input_tokens,
+            cache.cache_read_tokens,
+            cache.cache_write_tokens
+        ),
+        (Some(2_000_000), Some(5_000_000), Some(1_000_000))
+    );
+    // 5M of 8M: 62.50%.
+    assert_eq!(cache.read_share(), Some(6_250));
+    assert_eq!(cache.saving, saved(Some(5.40 + 1.80 - 0.25), false));
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_errand_model_without_rates_is_left_out_of_the_saving_which_is_then_partial() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = persisted(directory.path(), None);
+    session.snapshot.turns = vec![cached(CODEX, START, 0, 1_000_000, 0)];
+    let errands = vec![errand(START + 1, Some((0, 1_000_000, 0)), None)];
+    let (store, writer) = restore_with_errands(directory.path(), vec![session], errands).await;
+    let rates = RateTable::default().pricing(CODEX, 2.00, Some(0.20), Some(2.50));
+
+    let cache = priced_at(&store, &over(START, END), &rates).await.cache;
+
+    assert_eq!(cache.saving, saved(Some(1.80), true));
+    assert_eq!(cache.cache_read_tokens, Some(2_000_000));
     writer.shutdown().await.unwrap();
 }

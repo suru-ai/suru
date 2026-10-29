@@ -11,19 +11,25 @@
 //! asked are Activities, which no Session holds in memory until its history
 //! is read (ADR 0022). Rather than read any in, the read asks storage, in
 //! one pass, for the few fields of each Activity it counts, and keeps those
-//! whose Turn the span holds (ADR 0056).
+//! whose Turn the span holds (ADR 0056). The same pass reads the Errands
+//! that began within the span (ADR 0057), placed by when each began as the
+//! metrics read places them.
 //!
 //! The quarter-hours carry Cost as the metrics read's buckets do: every
 //! Cost Coverage contribution of the counted trees lands where the Turn
-//! carrying it does, so the quarter-hours of a span add up to the Cost the
-//! metrics read gives it. Delegation divides those same contributions by
-//! the role of the Session whose Turn carries each, so its roles add up to
-//! that Cost too.
+//! carrying it does, so the quarter-hours of a span add up to its Session
+//! Cost — the Cost the metrics read gives it, less its Errands'. They, the
+//! Turns, and the Tools are about the user's own work, and an Errand is no
+//! Turn, so it stands in none of them. Delegation divides those same
+//! contributions by the role of the Session whose Turn carries each, and
+//! counts the span's Errands beside the roles, so together they add up to
+//! the span's whole Cost.
 //!
 //! What caching saved is no Cost and lands in none: it is worked out at
-//! every read from the rates each Turn's Provider prices its Model at today,
-//! asked once the lock is let go, and a Model lacking the rate of a part of
-//! the cache its Turns used is left out and the estimate marked partial.
+//! every read from the rates each Turn's or Errand's Provider prices its
+//! Model at today, asked once the lock is let go, and a Model lacking the
+//! rate of a part of the cache its work used is left out and the estimate
+//! marked partial.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -34,7 +40,7 @@ use crate::protocol::{
     UsageMetricsAggregate, WorkspaceId, signed_nano_usd,
 };
 
-use crate::{pricing::CacheRateLookup, sidekick::SidekickWorkspace};
+use crate::{errands::ErrandRecord, pricing::CacheRateLookup, sidekick::SidekickWorkspace};
 
 mod activities;
 
@@ -45,7 +51,8 @@ use super::{
         SessionStore,
         cost_coverage::{CostContribution, tree_contributions},
     },
-    CopiedSession, CountedSession, MeteredForest, SessionTimestamp, TurnPlaces, placed_at,
+    CopiedSession, CountedSession, MeteredForest, SessionTimestamp, TurnPlaces, errand_cost,
+    placed_at,
 };
 
 /// Why an Insights query is refused.
@@ -53,7 +60,8 @@ use super::{
 pub(crate) enum InsightsRefusal {
     /// Its interval ends before it begins.
     OutOfOrder,
-    /// Storage could not be read for the Activities of the interval's Turns.
+    /// Storage could not be read for the Activities of the interval's Turns,
+    /// or for its Errands.
     Storage,
 }
 
@@ -62,9 +70,10 @@ impl SessionStore {
     /// read, as the metrics read is: it moves no Session's revision, writes
     /// nothing, and reads no history in. The Tools, Compactions, and
     /// Approvals of the interval's Turns are read from the Activities
-    /// storage holds, on a blocking task once
-    /// the lock is let go (ADR 0056), and placed in time by the Turns that
-    /// own them, which the copy taken under the lock holds.
+    /// storage holds, beside the Errands that began within the interval, on
+    /// one blocking task once the lock is let go (ADRs 0056 and 0057); the
+    /// Activities are placed in time by the Turns that own them, which the
+    /// copy taken under the lock holds.
     pub(crate) async fn insights(
         &self,
         query: &InsightsQuery,
@@ -111,19 +120,20 @@ impl SessionStore {
         }
         // Only a store restored without storage, as some tests restore one,
         // lacks a repository; its Activities are in memory, and are not
-        // counted.
-        if let Some(repository) = repository
-            && !fold.held_turns.is_empty()
-        {
+        // counted, and it has recorded no Errand to count.
+        if let Some(repository) = repository {
             let held = std::mem::take(&mut fold.held_turns);
-            fold.activities = repository
-                .activity_rows(held, ActivityTally::default())
+            let rows = repository
+                .insights_rows(held, ActivityTally::default(), interval.start..interval.end)
                 .await
                 .map_err(|error| {
-                    tracing::warn!(%error, "reading the Activities Insights counts failed");
+                    tracing::warn!(%error, "reading what Insights count failed");
                     InsightsRefusal::Storage
-                })?
-                .into_tallies();
+                })?;
+            fold.activities = rows.activities.into_tallies();
+            for errand in &rows.errands {
+                fold.add_errand(errand);
+            }
         }
         // Priced once the lock is let go, since a lookup may wait on a
         // fetch of the rate table.
@@ -159,11 +169,29 @@ impl InsightsFold {
         self.turns.add(turn);
         self.quarter_hours.add_turn(session_id, turn, at);
         self.delegation.add_turn(session_id, role, turn);
-        self.cache.add(turn);
+        if let Some(usage) = &turn.usage {
+            let model = turn
+                .agent
+                .as_ref()
+                .map(|agent| (&agent.selection.provider, &agent.selection.model));
+            self.cache.add(usage, model);
+        }
         self.held_turns
             .entry(session_id)
             .or_default()
             .insert(turn.id);
+    }
+
+    /// Adds an Errand that began within the interval: its Cost to
+    /// Delegation's Errands, and its Usage to the cache's figures, priced
+    /// at its Model's rates as a Turn's is. It is no Turn, so it lands in
+    /// no quarter-hour and adds to no Turn, Tool, Compaction, or Approval.
+    fn add_errand(&mut self, errand: &ErrandRecord) {
+        self.delegation.insights.errands.add(errand_cost(errand));
+        if let Some(usage) = &errand.usage {
+            self.cache
+                .add(usage, Some((&errand.provider, &errand.model)));
+        }
     }
 
     /// Adds a Cost contribution of the counted trees, where the interval
@@ -369,15 +397,15 @@ fn durations_of(sorted: &[u64]) -> Option<TurnDurations> {
     })
 }
 
-/// The interval's input, part by part, and how many tokens the Turns of
-/// each Model read from cache and wrote to it, for a saving to be worked
-/// out from that Model's rates once the lock is let go.
+/// The interval's input, part by part, and how many tokens the Turns and
+/// Errands of each Model read from cache and wrote to it, for a saving to be
+/// worked out from that Model's rates once the lock is let go.
 #[derive(Default)]
 struct CacheTally {
     input: UsageMetricsAggregate,
-    /// What the Turns of each Model read from cache and wrote to it. A
-    /// saving is linear in both, so a Model's Turns are priced together as
-    /// they would be one by one.
+    /// What the Turns and Errands of each Model read from cache and wrote to
+    /// it. A saving is linear in both, so a Model's work is priced together
+    /// as it would be piece by piece.
     by_model: HashMap<(ProviderId, ModelId), CacheUse>,
     /// Whether a Turn that read or wrote the cache ran on no Model the
     /// store knows, so no rates can price it.
@@ -392,24 +420,22 @@ struct CacheUse {
 }
 
 impl CacheTally {
-    fn add(&mut self, turn: &Turn) {
-        let Some(usage) = &turn.usage else {
-            return;
-        };
+    /// Adds the Usage of a Turn or an Errand that ran on `model`, none where
+    /// the store knows no Model it ran on.
+    fn add(&mut self, usage: &Usage, model: Option<(&ProviderId, &ModelId)>) {
         self.input.add_usage(usage);
         let reads = usage.cache_read_tokens.unwrap_or(0);
         let writes = usage.cache_write_tokens.unwrap_or(0);
         if reads == 0 && writes == 0 {
             return;
         }
-        let Some(agent) = &turn.agent else {
+        let Some((provider, model)) = model else {
             self.is_unattributed = true;
             return;
         };
-        let selection = &agent.selection;
         let used = self
             .by_model
-            .entry((selection.provider.clone(), selection.model.clone()))
+            .entry((provider.clone(), model.clone()))
             .or_default();
         used.reads = used.reads.saturating_add(reads);
         used.writes = used.writes.saturating_add(writes);

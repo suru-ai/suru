@@ -474,4 +474,32 @@ async fn an_errand_s_usage_and_cost_are_read_over_the_api_under_the_errands_key(
     // The Session's first Turn never began, its Provider never answering
     // its start, so the whole is the Errand's alone: no Session, no Turn.
     assert_eq!(report.buckets[0].total, errands.aggregate);
+
+    // Insights count it as Delegation's Errands, and its input in the
+    // cache's figures, but in no quarter-hour, since it is no Turn.
+    let insights = client
+        .post(format!("{}/v1/usage-metrics/insights", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&InsightsQuery {
+            interval: all_of_time.buckets[0],
+        })
+        .send()
+        .await
+        .expect("send the Insights read");
+    assert!(insights.status().is_success(), "{}", insights.status());
+    let insights = insights.json::<InsightsReport>().await.unwrap();
+    assert_eq!(
+        insights.delegation,
+        DelegationInsights {
+            errands: CountedCost {
+                amount: Some(cost),
+                is_partial: false,
+            },
+            ..DelegationInsights::default()
+        }
+    );
+    assert_eq!(insights.delegation.total(), report.buckets[0].total.cost);
+    assert_eq!(insights.cache.fresh_input_tokens, Some(12));
+    assert_eq!(insights.quarter_hours, Vec::new());
+    server.shutdown().await.unwrap();
 }

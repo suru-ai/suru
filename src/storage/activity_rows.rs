@@ -1,20 +1,31 @@
 //! The Activity rows an Insights read tallies, read straight from storage
 //! without reading any Session's history in (ADR 0056): the one query, and
 //! each row decoded into the few typed fields a tally reads. What a row
-//! counts toward is the Insights read's to say, not storage's.
+//! counts toward is the Insights read's to say, not storage's. The Errands
+//! it counts are read beside them, in the same pass.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
 use diesel::{
     prelude::*,
     sql_types::{BigInt, Nullable, Text},
 };
 
-use crate::protocol::{
-    ActivityStatus, ApprovalOutcome, CompactionTrigger, Decision, SessionId, TurnId,
+use crate::{
+    errands::ErrandRecord,
+    protocol::{
+        ActivityStatus, ApprovalOutcome, CompactionTrigger, Decision, SessionId, SessionTimestamp,
+        TurnId,
+    },
 };
 
-use super::{StorageError, StorageRepository, activities, connect, on_blocking_task};
+use super::{
+    StorageError, StorageRepository, activities, connect, errand_table::errands_began_within,
+    on_blocking_task,
+};
 
 /// How many Sessions one query of [`StorageRepository::activity_rows`]
 /// binds, well within the fewest host parameters any SQLite build allows.
@@ -135,75 +146,99 @@ impl SelectedFields {
 }
 
 impl StorageRepository {
-    /// Streams into `sink` what an Insights tally reads of every Activity
-    /// storage holds of the Turns `turns` names of each Session — its Tools,
-    /// Compactions, and Approvals — read without reading any Session's
-    /// history in (ADR 0056), and answers the sink. Each row gives up only
-    /// its kind, the Turn owning it, and the few fields of its payload a
-    /// tally reads; no payload is deserialized. Storage lags a Session open
-    /// in memory by whatever it has not saved yet, which the read accepts.
+    /// What an Insights read asks of storage, read on one blocking task over
+    /// one connection: the Activity rows of the Turns `turns` names, streamed
+    /// into `sink`, and the Errands recorded as beginning within
+    /// `errands_began`.
+    ///
+    /// Of every Activity storage holds of those Turns of each Session, the
+    /// sink is given what an Insights tally reads — its Tools, Compactions,
+    /// and Approvals — read without reading any Session's history in (ADR
+    /// 0056). Each row gives up only its kind, the Turn owning it, and the
+    /// few fields of its payload a tally reads; no payload is deserialized.
+    /// Storage lags a Session open in memory by whatever it has not saved
+    /// yet, which the read accepts.
     ///
     /// The rows are read a few Sessions at a time, so no query binds more
     /// than [`SESSIONS_PER_ACTIVITY_READ`] of them, and streamed rather than
     /// held: a Session's rows are read whole, whichever of its Turns they
-    /// belong to, and those of a Turn not named left out here.
-    pub(crate) async fn activity_rows<S: ActivityRowSink>(
+    /// belong to, and those of a Turn not named left out here. The Errands
+    /// are read as [`StorageRepository::errand_reading`] reads them (ADR
+    /// 0057).
+    pub(crate) async fn insights_rows<S: ActivityRowSink>(
         &self,
         turns: HashMap<SessionId, HashSet<TurnId>>,
-        mut sink: S,
-    ) -> Result<S, StorageError> {
+        sink: S,
+        errands_began: Range<SessionTimestamp>,
+    ) -> Result<InsightsRows<S>, StorageError> {
         let path = self.database_path.clone();
-        on_blocking_task("reading Activity tallies", move || {
+        on_blocking_task("reading what Insights count", move || {
             let mut connection = connect(&path)?;
-            let turns = turns
-                .into_iter()
-                .map(|(session_id, turns)| {
-                    let turns = turns.iter().map(TurnId::to_string).collect::<HashSet<_>>();
-                    (session_id.to_string(), turns)
-                })
-                .collect::<HashMap<_, _>>();
-            let sessions = turns.keys().collect::<Vec<_>>();
-            for sessions in sessions.chunks(SESSIONS_PER_ACTIVITY_READ) {
-                let rows = activities::table
-                    .filter(activities::session_id.eq_any(sessions))
-                    .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
-                        "json_extract(payload, '$.kind') IN \
-                         ('command', 'file_change', 'tool_call', 'subagent', \
-                          'compaction', 'approval')",
-                    ))
-                    .select((
-                        activities::session_id,
-                        activities::turn_id,
-                        diesel::dsl::sql::<Text>("json_extract(payload, '$.kind')"),
-                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.status')"),
-                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.name')"),
-                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.server')"),
-                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.trigger')"),
-                        diesel::dsl::sql::<Nullable<BigInt>>(
-                            "json_extract(payload, '$.before_tokens')",
-                        ),
-                        diesel::dsl::sql::<Nullable<BigInt>>(
-                            "json_extract(payload, '$.after_tokens')",
-                        ),
-                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.outcome')"),
-                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.decision')"),
-                    ))
-                    .load_iter::<SelectedFields, diesel::connection::DefaultLoadingMode>(
-                        &mut connection,
-                    )
-                    .map_err(|error| StorageError::Read(error.to_string()))?;
-                for fields in rows {
-                    let fields = fields.map_err(|error| StorageError::Read(error.to_string()))?;
-                    let named = turns
-                        .get(&fields.session_id)
-                        .is_some_and(|turns| turns.contains(&fields.turn_id));
-                    if let Some(row) = fields.into_row().filter(|_| named) {
-                        sink.add(row);
-                    }
-                }
-            }
-            Ok(sink)
+            let activities = stream_activity_rows(&mut connection, turns, sink)?;
+            let errands = errands_began_within(&mut connection, errands_began)?;
+            Ok(InsightsRows {
+                activities,
+                errands,
+            })
         })
         .await
     }
+}
+
+/// What [`StorageRepository::insights_rows`] read: the sink the Activity
+/// rows streamed into, and the Errands, earliest first.
+pub(crate) struct InsightsRows<S> {
+    pub(crate) activities: S,
+    pub(crate) errands: Vec<ErrandRecord>,
+}
+
+/// Streams into `sink` the Activity rows of the Turns `turns` names, read
+/// over `connection`, and answers the sink.
+fn stream_activity_rows<S: ActivityRowSink>(
+    connection: &mut SqliteConnection,
+    turns: HashMap<SessionId, HashSet<TurnId>>,
+    mut sink: S,
+) -> Result<S, StorageError> {
+    let turns = turns
+        .into_iter()
+        .map(|(session_id, turns)| {
+            let turns = turns.iter().map(TurnId::to_string).collect::<HashSet<_>>();
+            (session_id.to_string(), turns)
+        })
+        .collect::<HashMap<_, _>>();
+    let sessions = turns.keys().collect::<Vec<_>>();
+    for sessions in sessions.chunks(SESSIONS_PER_ACTIVITY_READ) {
+        let rows = activities::table
+            .filter(activities::session_id.eq_any(sessions))
+            .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                "json_extract(payload, '$.kind') IN \
+                 ('command', 'file_change', 'tool_call', 'subagent', \
+                  'compaction', 'approval')",
+            ))
+            .select((
+                activities::session_id,
+                activities::turn_id,
+                diesel::dsl::sql::<Text>("json_extract(payload, '$.kind')"),
+                diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.status')"),
+                diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.name')"),
+                diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.server')"),
+                diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.trigger')"),
+                diesel::dsl::sql::<Nullable<BigInt>>("json_extract(payload, '$.before_tokens')"),
+                diesel::dsl::sql::<Nullable<BigInt>>("json_extract(payload, '$.after_tokens')"),
+                diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.outcome')"),
+                diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.decision')"),
+            ))
+            .load_iter::<SelectedFields, diesel::connection::DefaultLoadingMode>(connection)
+            .map_err(|error| StorageError::Read(error.to_string()))?;
+        for fields in rows {
+            let fields = fields.map_err(|error| StorageError::Read(error.to_string()))?;
+            let named = turns
+                .get(&fields.session_id)
+                .is_some_and(|turns| turns.contains(&fields.turn_id));
+            if let Some(row) = fields.into_row().filter(|_| named) {
+                sink.add(row);
+            }
+        }
+    }
+    Ok(sink)
 }

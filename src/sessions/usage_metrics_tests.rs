@@ -2024,7 +2024,7 @@ fn counted(dollars: f64, is_partial: bool) -> CountedCost {
 }
 
 /// The Errands' part of `bucket`, where it holds one.
-fn errands_part(bucket: &UsageMetricsBucket) -> Option<UsageMetricsAggregate> {
+pub(super) fn errands_part(bucket: &UsageMetricsBucket) -> Option<UsageMetricsAggregate> {
     bucket
         .by_key
         .iter()

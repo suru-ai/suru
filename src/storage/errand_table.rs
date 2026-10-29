@@ -188,24 +188,7 @@ impl StorageRepository {
                     earliest_began,
                 });
             };
-            let rows = errands::table
-                .filter(errands::began_at.ge(stamp_column(began.start)))
-                .filter(errands::began_at.lt(stamp_column(began.end)))
-                .order((errands::began_at, errands::id))
-                .select(ErrandRow::as_select())
-                .load::<ErrandRow>(&mut connection)
-                .map_err(|error| StorageError::Read(error.to_string()))?;
-            let records = rows
-                .into_iter()
-                .filter_map(|row| {
-                    let id = row.id;
-                    row.into_record()
-                        .inspect_err(|reason| {
-                            tracing::warn!("left out Errand record {id}: {reason}");
-                        })
-                        .ok()
-                })
-                .collect();
+            let records = errands_began_within(&mut connection, began)?;
             Ok(ErrandReading {
                 records,
                 earliest_began,
@@ -213,6 +196,34 @@ impl StorageRepository {
         })
         .await
     }
+}
+
+/// Every Errand recorded as beginning within `began` — from its start, up to
+/// but not including its end — read over `connection` through the index on
+/// when each began, earliest first. A row this Suru cannot read is logged and
+/// left out, as [`StorageRepository::errand_reading`] says why.
+pub(super) fn errands_began_within(
+    connection: &mut SqliteConnection,
+    began: Range<SessionTimestamp>,
+) -> Result<Vec<ErrandRecord>, StorageError> {
+    let rows = errands::table
+        .filter(errands::began_at.ge(stamp_column(began.start)))
+        .filter(errands::began_at.lt(stamp_column(began.end)))
+        .order((errands::began_at, errands::id))
+        .select(ErrandRow::as_select())
+        .load::<ErrandRow>(connection)
+        .map_err(|error| StorageError::Read(error.to_string()))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let id = row.id;
+            row.into_record()
+                .inspect_err(|reason| {
+                    tracing::warn!("left out Errand record {id}: {reason}");
+                })
+                .ok()
+        })
+        .collect())
 }
 
 /// What [`StorageRepository::errand_reading`] read: the Errands that began

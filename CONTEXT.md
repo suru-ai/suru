@@ -180,7 +180,7 @@ What the Sessions living on one Server, and the Errands it ran, consumed over a 
 _Avoid_: Usage stats, analytics, spend, token count
 
 **Insights**:
-How the Sessions living on one Server worked over one span of time, beside how much they consumed: how long their Turns took to Settle and how they ended. It counts the Sessions Usage Metrics counts and places each Turn in time by the same rule, leaving out a Turn with no recorded moment to place it by; a Turn still working has no duration yet. Like Usage Metrics it is read on request and never stored, and the Usage Metrics view shows it on its own tab, over the range its Overview tab shows.
+How the Sessions living on one Server worked over one span of time, beside how much they consumed: how long their Turns took to Settle and how they ended. It counts the Sessions Usage Metrics counts and places each Turn in time by the same rule, leaving out a Turn with no recorded moment to place it by; a Turn still working has no duration yet. The Errands that began in the span count only where Suru's own work belongs: as their own share of the span's Cost beside the roles of the Sessions that did the rest, and in how much input the cache served. Everything about Turns — how long they took, when in the week they were worked, the Tools they used — stays about the user's own work, so the hours of the week add up to the span's Cost less its Errands'. Like Usage Metrics it is read on request and never stored, and the Usage Metrics view shows it on its own tab, over the range its Overview tab shows.
 _Avoid_: Stats, analytics, Usage Metrics (for the figures of how work went)
 
 **Prompt**:

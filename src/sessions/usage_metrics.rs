@@ -675,15 +675,21 @@ fn add_errand_to(aggregate: &mut UsageMetricsAggregate, errand: &ErrandRecord) {
     if let Some(usage) = &errand.usage {
         aggregate.add_usage(usage);
     }
-    aggregate.cost.add(CountedCost {
-        amount: errand.cost.map(ErrandCost::cost),
-        is_partial: errand.usage.is_none() || errand.cost.is_none(),
-    });
+    aggregate.cost.add(errand_cost(errand));
     if let Some(cost) = errand
         .cost
         .filter(|cost| cost.basis() == CostBasis::Estimated)
     {
         add_estimated(aggregate, cost.cost());
+    }
+}
+
+/// What `errand` cost as every figure counts it: whole, or partial where its
+/// Cost or Usage is unknown.
+fn errand_cost(errand: &ErrandRecord) -> CountedCost {
+    CountedCost {
+        amount: errand.cost.map(ErrandCost::cost),
+        is_partial: errand.usage.is_none() || errand.cost.is_none(),
     }
 }
 

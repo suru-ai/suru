@@ -376,20 +376,20 @@ pub struct InsightsReport {
     /// Tools are.
     pub approvals: ApprovalInsights,
     /// The interval's Cost, divided by the role of the Session doing the
-    /// work.
+    /// work, and the Errands' beside them.
     pub delegation: DelegationInsights,
     /// How much of the interval's input its cache served, and what that
     /// saved at today's rates.
     pub cache: CacheInsights,
 }
 
-/// How much of the interval's input the Turns read from cache, and an
-/// estimate of what caching saved them.
+/// How much of the interval's input its Turns and Errands read from cache,
+/// and an estimate of what caching saved them.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheInsights {
-    /// The three parts of the Turns' input, each absent where no Turn
-    /// reported it, as a [`UsageMetricsAggregate`] keeps them.
+    /// The three parts of the Turns' and Errands' input, each absent where
+    /// none of them reported it, as a [`UsageMetricsAggregate`] keeps them.
     pub fresh_input_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
@@ -408,7 +408,7 @@ impl CacheInsights {
 }
 
 /// What caching saved, worked out from the rates the pricing source states
-/// today for each Turn's Model: what its cache reads would have cost more as
+/// today for each Turn's and Errand's Model: what its cache reads would have cost more as
 /// fresh input, less what its cache writes cost more than fresh input did.
 /// A what-if, never a Cost: it is worked out afresh at every read, never
 /// frozen or stored, and adds into no Cost figure (ADR 0016 governs Cost,
@@ -417,19 +417,20 @@ impl CacheInsights {
 #[serde(deny_unknown_fields)]
 pub struct EstimatedSaving {
     /// In billionths of a dollar; negative where writing the cache cost
-    /// more than reading it saved. Absent where no Turn that read or wrote
-    /// the cache has a Model with the rates of the parts it used.
+    /// more than reading it saved. Absent where no Turn or Errand that read
+    /// or wrote the cache has a Model with the rates of the parts it used.
     pub nano_usd: Option<i64>,
-    /// Whether a Turn that read or wrote the cache is left out, its Model
-    /// lacking the rate of a part it used, or its rates pricing no finite
-    /// saving, so it says less than caching did.
+    /// Whether a Turn or Errand that read or wrote the cache is left out,
+    /// its Model lacking the rate of a part it used, or its rates pricing no
+    /// finite saving, so it says less than caching did.
     pub is_partial: bool,
 }
 
 /// The interval's Cost divided by the role of the Session whose Turn carries
 /// each Cost Coverage contribution, overlaps removed as a
-/// [`UsageMetricsAggregate`]'s are, so the roles add up to the interval's
-/// Cost, partial where it is. A Provider that reports a whole tree's Cost
+/// [`UsageMetricsAggregate`]'s are, and the Cost of the Errands that began
+/// within it beside them, so the roles and the Errands add up to the
+/// interval's Cost, partial where it is. A Provider that reports a whole tree's Cost
 /// on its own Turns — Claude's, for the native Subagents it runs — leaves
 /// those Subagents' work inside the Session that reported it.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -446,10 +447,13 @@ pub struct DelegationInsights {
     pub sidekicks: CountedCost,
     /// Sessions a Sidekick began.
     pub subsessions: CountedCost,
+    /// The Errands this Server ran, Suru's own work, which no Session
+    /// does.
+    pub errands: CountedCost,
 }
 
 impl DelegationInsights {
-    /// The Cost every role adds up to: the interval's.
+    /// The Cost every role and the Errands add up to: the interval's.
     pub fn total(&self) -> CountedCost {
         [
             self.own_sessions,
@@ -457,6 +461,7 @@ impl DelegationInsights {
             self.brokered_subagents,
             self.sidekicks,
             self.subsessions,
+            self.errands,
         ]
         .into_iter()
         .sum()
@@ -588,7 +593,8 @@ pub struct QuarterHourTurns {
     pub tokens: Option<u64>,
     /// The Cost their Cost Coverage contributions add up to, overlaps
     /// removed as a [`UsageMetricsAggregate`]'s are, so the quarter-hours of
-    /// an interval add up to its Cost.
+    /// an interval add up to its Session Cost: its Cost less its Errands',
+    /// since an Errand is no Turn and lands in no quarter-hour.
     pub cost: CountedCost,
 }
 
