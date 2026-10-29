@@ -11,7 +11,7 @@ use diesel::{
     OptionalExtension, QueryableByName, SqliteConnection,
     connection::SimpleConnection,
     prelude::*,
-    sql_types::{BigInt, Nullable, Text},
+    sql_types::{BigInt, Text},
 };
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use serde::{Deserialize, Serialize};
@@ -19,16 +19,15 @@ use serde::{Deserialize, Serialize};
 use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
-        ActivityStatus, AgentSelection, ApprovalInsights, ApprovalOutcome, CheckoutAssociation,
-        CompactionInsights, CompactionTrigger, Decision, ExecutionDirectory, FreedShare,
-        InsightsTool, Outlook, PromptId, ProviderId, RepositoryLocation, SessionId,
-        SessionSnapshot, SessionSummary, SessionTimestamp, ToolTally, TranscriptItem, TurnId,
-        UnreadableSessionSummary, Workspace, WorkspaceDescription, WorkspaceId,
+        AgentSelection, CheckoutAssociation, ExecutionDirectory, Outlook, PromptId, ProviderId,
+        RepositoryLocation, SessionId, SessionSnapshot, SessionSummary, SessionTimestamp,
+        TranscriptItem, UnreadableSessionSummary, Workspace, WorkspaceDescription, WorkspaceId,
     },
     provider::{ProviderResumeState, ProviderSubagentId},
     runtime::protect_current_user_file,
 };
 
+mod activity_rows;
 mod attachment_table;
 mod clone_staging_table;
 mod memory_table;
@@ -36,6 +35,7 @@ mod rows;
 mod unsaved;
 mod writer;
 
+pub(crate) use activity_rows::{ActivityRowSink, ActivityTallyRow, Spelled};
 pub(crate) use unsaved::{SessionRows, Unsaved};
 pub(crate) use writer::{
     Deletion, HeldSessions, IDLE_FLUSH_DELAY, SAVE_RETRY_INTERVAL, StorageSink, StorageWriter,
@@ -797,79 +797,6 @@ impl StorageRepository {
                 }
             }
             Ok(spawned)
-        })
-        .await
-    }
-
-    /// What the Activities storage holds of the Turns `turns` names of each
-    /// Session add up to, read without reading any Session's history in
-    /// (ADR 0056): how often they used each Tool and how many of those uses
-    /// failed, their Compactions, and the Approvals they asked. Each row
-    /// gives up only its kind, the Turn owning it, and the few fields of its
-    /// payload a tally reads; no payload is deserialized. Storage lags a
-    /// Session open in memory by whatever it has not saved yet, which the
-    /// read accepts.
-    ///
-    /// The rows are read a few Sessions at a time, so no query binds more
-    /// than [`SESSIONS_PER_ACTIVITY_READ`] of them, and streamed into the
-    /// tally rather than held: a Session's rows are read whole, whichever of
-    /// its Turns they belong to, and those of a Turn not named left out here.
-    pub(crate) async fn activity_tallies(
-        &self,
-        turns: HashMap<SessionId, HashSet<TurnId>>,
-    ) -> Result<ActivityTallies, StorageError> {
-        let path = self.database_path.clone();
-        on_blocking_task("reading Activity tallies", move || {
-            let mut connection = connect(&path)?;
-            let turns = turns
-                .into_iter()
-                .map(|(session_id, turns)| {
-                    let turns = turns.iter().map(TurnId::to_string).collect::<HashSet<_>>();
-                    (session_id.to_string(), turns)
-                })
-                .collect::<HashMap<_, _>>();
-            let sessions = turns.keys().collect::<Vec<_>>();
-            let mut tally = ActivityTally::default();
-            for sessions in sessions.chunks(SESSIONS_PER_ACTIVITY_READ) {
-                let rows = activities::table
-                    .filter(activities::session_id.eq_any(sessions))
-                    .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
-                        "json_extract(payload, '$.kind') IN \
-                         ('command', 'file_change', 'tool_call', 'subagent', \
-                          'compaction', 'approval')",
-                    ))
-                    .select((
-                        activities::session_id,
-                        activities::turn_id,
-                        diesel::dsl::sql::<Text>("json_extract(payload, '$.kind')"),
-                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.status')"),
-                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.name')"),
-                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.server')"),
-                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.trigger')"),
-                        diesel::dsl::sql::<Nullable<BigInt>>(
-                            "json_extract(payload, '$.before_tokens')",
-                        ),
-                        diesel::dsl::sql::<Nullable<BigInt>>(
-                            "json_extract(payload, '$.after_tokens')",
-                        ),
-                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.outcome')"),
-                        diesel::dsl::sql::<Nullable<Text>>("json_extract(payload, '$.decision')"),
-                    ))
-                    .load_iter::<ActivityTallyRow, diesel::connection::DefaultLoadingMode>(
-                        &mut connection,
-                    )
-                    .map_err(|error| StorageError::Read(error.to_string()))?;
-                for row in rows {
-                    let row = row.map_err(|error| StorageError::Read(error.to_string()))?;
-                    if turns
-                        .get(&row.session_id)
-                        .is_some_and(|turns| turns.contains(&row.turn_id))
-                    {
-                        tally.add(row);
-                    }
-                }
-            }
-            Ok(tally.into_tallies())
         })
         .await
     }
@@ -1790,212 +1717,6 @@ fn refuse_newer_schema(connection: &mut SqliteConnection) -> Result<(), StorageE
         });
     }
     Ok(())
-}
-
-/// How many Sessions one query of [`StorageRepository::activity_tallies`]
-/// binds, well within the fewest host parameters any SQLite build allows.
-const SESSIONS_PER_ACTIVITY_READ: usize = 500;
-
-/// What [`StorageRepository::activity_tallies`] reads of an Activity row,
-/// each payload field absent where its kind has none. Read by position, so
-/// the fields stand in the order the query selects them.
-#[derive(Queryable)]
-struct ActivityTallyRow {
-    session_id: String,
-    turn_id: String,
-    kind: String,
-    status: Option<String>,
-    /// A Tool Call's Tool, and the MCP server hosting it.
-    name: Option<String>,
-    server: Option<String>,
-    /// A Compaction's trigger, and its Context Fill before and after.
-    trigger: Option<String>,
-    before_tokens: Option<i64>,
-    after_tokens: Option<i64>,
-    /// An Approval's outcome, and the Decision recorded for it.
-    outcome: Option<String>,
-    decision: Option<String>,
-}
-
-/// What the Activities of a span's Turns add up to, as
-/// [`StorageRepository::activity_tallies`] reads them.
-#[derive(Debug, Default)]
-pub(crate) struct ActivityTallies {
-    /// How often each Tool was used, in no order.
-    pub(crate) tools: Vec<ToolTally>,
-    pub(crate) compactions: CompactionInsights,
-    pub(crate) approvals: ApprovalInsights,
-}
-
-/// The tallies as the rows stream in.
-#[derive(Default)]
-struct ActivityTally {
-    tools: HashMap<InsightsTool, (u64, u64)>,
-    compactions: CompactionInsights,
-    freed: FreedShares,
-    approvals: ApprovalInsights,
-}
-
-/// The freed shares of the Compactions that can say, added up, and how
-/// many there are.
-#[derive(Default)]
-struct FreedShares {
-    shares: f64,
-    compactions: u64,
-}
-
-impl ActivityTally {
-    fn add(&mut self, row: ActivityTallyRow) {
-        match row.kind.as_str() {
-            "compaction" => self.add_compaction(&row),
-            "approval" => self.add_approval(&row),
-            kind => {
-                let Some(tool) = used_tool(kind, row.name, row.server) else {
-                    return;
-                };
-                let (uses, failed) = self.tools.entry(tool).or_default();
-                *uses += 1;
-                *failed += u64::from(
-                    spelled::<ActivityStatus>(row.status.as_deref())
-                        == Some(ActivityStatus::Failed),
-                );
-            }
-        }
-    }
-
-    /// Counts a Compaction by its trigger and status, and where it
-    /// completed knowing both figures with some context before, the share
-    /// of that context it freed. One whose trigger or status this Suru
-    /// cannot read is left out.
-    fn add_compaction(&mut self, row: &ActivityTallyRow) {
-        let (Some(trigger), Some(status)) = (
-            spelled::<CompactionTrigger>(row.trigger.as_deref()),
-            spelled::<ActivityStatus>(row.status.as_deref()),
-        ) else {
-            tracing::warn!(
-                trigger = ?row.trigger,
-                status = ?row.status,
-                "Insights leave out a Compaction they cannot read"
-            );
-            return;
-        };
-        let counts = match trigger {
-            CompactionTrigger::Automatic => &mut self.compactions.automatic,
-            CompactionTrigger::Manual => &mut self.compactions.manual,
-        };
-        let count = match status {
-            ActivityStatus::Active => &mut counts.active,
-            ActivityStatus::Completed => &mut counts.completed,
-            ActivityStatus::Failed => &mut counts.failed,
-            ActivityStatus::Interrupted => &mut counts.interrupted,
-        };
-        *count += 1;
-        if status == ActivityStatus::Completed
-            && let Some((before, after)) = row.before_tokens.zip(row.after_tokens)
-            && before > 0
-        {
-            self.freed.shares += (before - after) as f64 / before as f64;
-            self.freed.compactions += 1;
-        }
-    }
-
-    /// Counts an Approval asked, and how it stands by the Decision
-    /// recorded for it. One whose outcome or Decision this Suru cannot read
-    /// is left out, so every Approval asked stands in one other figure.
-    fn add_approval(&mut self, row: &ActivityTallyRow) {
-        let outcome = spelled::<ApprovalOutcome>(row.outcome.as_deref());
-        // Absent, or a Decision this Suru reads.
-        let decision = match row.decision.as_deref() {
-            None => Some(None),
-            decision => spelled::<Decision>(decision).map(Some),
-        };
-        let (Some(outcome), Some(decision)) = (outcome, decision) else {
-            tracing::warn!(
-                outcome = ?row.outcome,
-                decision = ?row.decision,
-                "Insights leave out an Approval they cannot read"
-            );
-            return;
-        };
-        let approvals = &mut self.approvals;
-        approvals.asked += 1;
-        let count = match (outcome, decision) {
-            (ApprovalOutcome::Decided, Some(Decision::Accept)) => &mut approvals.accepted,
-            (ApprovalOutcome::Decided, Some(Decision::AcceptForSession)) => {
-                &mut approvals.accepted_for_session
-            }
-            (ApprovalOutcome::Decided, Some(Decision::Decline)) => &mut approvals.declined,
-            (ApprovalOutcome::Decided, Some(Decision::DeclineAndInterrupt)) => {
-                &mut approvals.declined_and_interrupted
-            }
-            (
-                ApprovalOutcome::Pending
-                | ApprovalOutcome::Submitting
-                | ApprovalOutcome::SubmissionRejected,
-                _,
-            ) => &mut approvals.waiting,
-            // Settled with no Decision recorded; a Decided one never lacks
-            // its Decision, which the Session's projection refuses.
-            (
-                ApprovalOutcome::Decided
-                | ApprovalOutcome::Withdrawn
-                | ApprovalOutcome::TurnEnded
-                | ApprovalOutcome::Unavailable
-                | ApprovalOutcome::DeliveryUncertain,
-                _,
-            ) => &mut approvals.expired,
-        };
-        *count += 1;
-    }
-
-    fn into_tallies(self) -> ActivityTallies {
-        let FreedShares {
-            shares,
-            compactions,
-        } = self.freed;
-        let freed = (compactions > 0).then(|| FreedShare {
-            compactions,
-            average_millionths: (shares / compactions as f64 * 1_000_000.0).round() as i64,
-        });
-        ActivityTallies {
-            tools: self
-                .tools
-                .into_iter()
-                .map(|(tool, (uses, failed))| ToolTally { tool, uses, failed })
-                .collect(),
-            compactions: CompactionInsights {
-                freed,
-                ..self.compactions
-            },
-            approvals: self.approvals,
-        }
-    }
-}
-
-/// The `T` that `spelling`, read out of a payload, spells as the payload
-/// spells it, so each tally matches every variant the protocol knows and a
-/// variant added there must be placed here; none where it is absent or no
-/// variant this Suru knows.
-fn spelled<T: serde::de::DeserializeOwned>(spelling: Option<&str>) -> Option<T> {
-    use serde::de::{IntoDeserializer, value::StrDeserializer};
-    let spelling: StrDeserializer<'_, serde::de::value::Error> = spelling?.into_deserializer();
-    T::deserialize(spelling).ok()
-}
-
-/// The Tool an Activity of `kind` used, named `name` and hosted by `server`
-/// where it is a Tool Call: none where the row records no use of a Tool, or a Tool
-/// Call's name is missing.
-fn used_tool(kind: &str, name: Option<String>, server: Option<String>) -> Option<InsightsTool> {
-    match kind {
-        "command" => Some(InsightsTool::Command),
-        "file_change" => Some(InsightsTool::FileChange),
-        "subagent" => Some(InsightsTool::Subagent),
-        "tool_call" => Some(InsightsTool::Named {
-            name: name?,
-            server,
-        }),
-        _ => None,
-    }
 }
 
 async fn on_blocking_task<T>(

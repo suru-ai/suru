@@ -34,7 +34,11 @@ use crate::protocol::{
     UsageMetricsAggregate, WorkspaceId, signed_nano_usd,
 };
 
-use crate::{pricing::CacheRateLookup, sidekick::SidekickWorkspace, storage::ActivityTallies};
+use crate::{pricing::CacheRateLookup, sidekick::SidekickWorkspace};
+
+mod activities;
+
+use activities::{ActivityTallies, ActivityTally};
 
 use super::{
     super::{
@@ -112,10 +116,14 @@ impl SessionStore {
             && !fold.held_turns.is_empty()
         {
             let held = std::mem::take(&mut fold.held_turns);
-            fold.activities = repository.activity_tallies(held).await.map_err(|error| {
-                tracing::warn!(%error, "reading the Activities Insights counts failed");
-                InsightsRefusal::Storage
-            })?;
+            fold.activities = repository
+                .activity_rows(held, ActivityTally::default())
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, "reading the Activities Insights counts failed");
+                    InsightsRefusal::Storage
+                })?
+                .into_tallies();
         }
         // Priced once the lock is let go, since a lookup may wait on a
         // fetch of the rate table.
