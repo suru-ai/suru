@@ -1554,6 +1554,20 @@ impl ReportedTurnMetering {
         }
     }
 
+    /// The reading as an Errand's consumption. An Errand's Cost is fixed
+    /// whole or not at all, so one that some contributing report left
+    /// unpriced is absent rather than understated.
+    pub(super) fn into_errand_consumption(self) -> ErrandConsumption {
+        ErrandConsumption {
+            usage: Some(self.usage),
+            cost: self
+                .cost_complete
+                .then_some(self.reported_cost)
+                .flatten()
+                .map(ErrandCost::reported),
+        }
+    }
+
     pub(super) fn subtree_event(&self, reporting_lifetime: &str) -> ProviderEvent {
         ProviderEvent::Usage {
             usage: self.usage.clone(),

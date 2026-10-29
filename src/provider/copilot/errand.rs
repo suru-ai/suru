@@ -17,10 +17,17 @@
 //!
 //! Nothing here creates a Suru Session: no Session store entry, no Transcript, and no Resume State,
 //! so the Copilot Session an Errand ran on can never be listed, opened, or continued.
+//!
+//! What the Errand consumed is that Session's alone, so it is read off the Session's own reports:
+//! every `assistant.usage` it makes while the Errand runs, summed and priced as a Copilot Turn's
+//! are.
 
+use futures_util::{FutureExt, StreamExt};
 use github_copilot_sdk::{
     MessageOptions, SessionConfig, SessionEvent, SessionId as CopilotSessionId,
-    session::Session as NativeSession, session_events::AssistantMessageData,
+    session::Session as NativeSession,
+    session_events::{AssistantMessageData, SessionEventType},
+    subscription::{EventSubscription, Lagged},
 };
 use serde_json::Value;
 
@@ -28,11 +35,14 @@ use super::{
     COPILOT_CLIENT_NAME,
     catalog::tier_id,
     copilot_error,
+    pricing::CopilotPricing,
+    projection::priced_usage,
     session::{lower_selection_options, until_crash},
     transport::CopilotConnection,
 };
 use crate::provider::{
-    ErrandAnswer, ErrandFailed, ProviderErrand, ProviderError, harness::SharedHarnessHandle,
+    ErrandAnswer, ErrandConsumption, ErrandFailed, ProviderErrand, ProviderError,
+    ReportedTurnMetering, harness::SharedHarnessHandle,
 };
 
 /// What a failure running an Errand is reported under: the work Suru asked for rather than the
@@ -42,9 +52,13 @@ const ERRAND_CONTEXT: &str = "Copilot Errand failed";
 /// Runs one Errand on the shared harness process `handle` was granted from, and answers with the
 /// JSON Copilot replied. The reply is not checked against the Errand's schema here — the schema is
 /// a request rather than a guarantee, and whoever asked for the Errand validates it (ADR 0011).
-/// The throwaway Session's usage is not yet gathered, so the answer carries no Usage and no Cost.
+///
+/// The answer carries what the Session reported consuming, priced at `pricing`: the catalog
+/// already in hand, which an Errand never waits to load. A failure after the Session reported any
+/// usage carries it too, since a call that reached the Model spent tokens whatever it replied.
 pub(super) async fn run_copilot_errand(
     handle: SharedHarnessHandle<CopilotConnection>,
+    pricing: CopilotPricing,
     errand: ProviderErrand,
 ) -> Result<ErrandAnswer, ErrandFailed> {
     let config = errand_session_config(&errand)?;
@@ -55,20 +69,103 @@ pub(super) async fn run_copilot_errand(
     )
     .await?;
     let mut session = DiscardedSession::holding(native);
-    let answered = until_crash(
-        &handle,
-        ERRAND_CONTEXT,
-        session
-            .native()
-            .send_and_wait(MessageOptions::new(errand_prompt(&errand))),
-    )
-    .await;
+    let mut metering = ErrandMetering::new(session.native().subscribe(), pricing);
+    let answered = metering
+        .gathering(until_crash(
+            &handle,
+            ERRAND_CONTEXT,
+            session
+                .native()
+                .send_and_wait(MessageOptions::new(errand_prompt(&errand))),
+        ))
+        .await;
+    let consumption = metering.consumption();
     session.discard().await;
-    replied_json(&replied_text(answered?)?)
-        .map(ErrandAnswer::unmeasured)
-        .ok_or_else(|| {
-            copilot_error(format!("{ERRAND_CONTEXT}: Copilot answered with no JSON")).into()
+    let reply = answered.and_then(replied_text).and_then(|text| {
+        replied_json(&text).ok_or_else(|| {
+            copilot_error(format!("{ERRAND_CONTEXT}: Copilot answered with no JSON"))
         })
+    });
+    match reply {
+        Ok(reply) => Ok(ErrandAnswer { reply, consumption }),
+        Err(error) => Err(ErrandFailed::measured(error, consumption)),
+    }
+}
+
+/// What an Errand's Session reported consuming, gathered from its events while the Errand runs.
+///
+/// Every model call the Session makes is the Errand's, so every `assistant.usage` is added in,
+/// whichever agent made it, by the same reading and pricing a Copilot Turn's are. A report that
+/// went unread — one Suru could not decode, or one the subscription fell too far behind to deliver
+/// — leaves the whole consumption unknown, since a sum missing a call is a figure nobody measured.
+struct ErrandMetering {
+    events: EventSubscription,
+    pricing: CopilotPricing,
+    reading: Option<ReportedTurnMetering>,
+    lost: bool,
+    closed: bool,
+}
+
+impl ErrandMetering {
+    fn new(events: EventSubscription, pricing: CopilotPricing) -> Self {
+        Self {
+            events,
+            pricing,
+            reading: None,
+            lost: false,
+            closed: false,
+        }
+    }
+
+    /// Runs `work` to its end, taking in the Session's events as they arrive meanwhile.
+    async fn gathering<T>(&mut self, work: impl Future<Output = T>) -> T {
+        let mut work = std::pin::pin!(work);
+        loop {
+            tokio::select! {
+                biased;
+                done = &mut work => return done,
+                event = self.events.next(), if !self.closed => self.take(event),
+            }
+        }
+    }
+
+    /// What the Session reported consuming, once the events already delivered are taken in. The
+    /// SDK queues every event up to the one that ends a wait before the wait answers, so nothing
+    /// the Errand's call reported is still to come. A Session that reported none leaves it unknown.
+    fn consumption(mut self) -> ErrandConsumption {
+        while !self.closed {
+            match self.events.next().now_or_never() {
+                Some(event) => self.take(event),
+                None => break,
+            }
+        }
+        match self.reading {
+            Some(reading) if !self.lost => reading.into_errand_consumption(),
+            _ => ErrandConsumption::default(),
+        }
+    }
+
+    fn take(&mut self, event: Option<Result<SessionEvent, Lagged>>) {
+        match event {
+            Some(Ok(event)) => self.observe(&event),
+            Some(Err(_)) => self.lost = true,
+            None => self.closed = true,
+        }
+    }
+
+    fn observe(&mut self, event: &SessionEvent) {
+        if event.parsed_type() != SessionEventType::AssistantUsage {
+            return;
+        }
+        let Ok((usage, cost)) = priced_usage(event, &self.pricing) else {
+            self.lost = true;
+            return;
+        };
+        match self.reading.as_mut() {
+            Some(reading) => reading.add(usage, cost),
+            None => self.reading = Some(ReportedTurnMetering::new(usage, cost)),
+        }
+    }
 }
 
 /// The Copilot Session one Errand runs on: the least-capable, least-persistent Session the SDK will

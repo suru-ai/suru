@@ -230,7 +230,12 @@ impl ProviderRuntime for CopilotRuntime {
             // The same shared process every Session and discovery runs on, launched here too if
             // this is the first demand since the server started or since a crash.
             let handle = self.harness.demand().await?;
-            run_copilot_errand(handle, errand).await
+            // Priced at whatever catalog is already in hand: loading one could hold the answer
+            // past the Errand's deadline for the sake of a Cost.
+            let pricing = self
+                .pricing()
+                .unwrap_or_else(|| handle.connection().pricing());
+            run_copilot_errand(handle, pricing, errand).await
         })
     }
 

@@ -22,11 +22,14 @@ use crate::copilot_integration::{
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        AdmitPromptRequest, AgentSelection, CreateSessionRequest, InitialPrompt, ModelId,
-        PromptDelivery, PromptId, ProviderId, SessionCatalogChange, SessionId, SessionListItem,
-        SessionTitleChanged,
+        AdmitPromptRequest, AgentSelection, Cost, CostBasis, CreateSessionRequest, InitialPrompt,
+        ModelId, NativeMeter, PromptDelivery, PromptId, ProviderId, SessionCatalogChange,
+        SessionId, SessionListItem, SessionTitleChanged, Usage,
     },
-    provider::CopilotRuntime,
+    provider::{
+        CopilotRuntime, ErrandAnswer, ErrandConsumption, ErrandFailed, ProviderErrand,
+        ProviderRuntime,
+    },
     server::{self, RunningServer, ServerConfig, ServerTimings},
 };
 use tokio::time::{Duration, timeout};
@@ -570,4 +573,197 @@ async fn an_errand_leaves_a_restart_nothing_of_its_own_to_resume() {
         .shutdown()
         .await
         .expect("shut the replacement server down");
+}
+
+/// A catalog pricing the Model Copilot runs its Errands at, so the Usage an Errand gathers can be
+/// priced the way a Copilot Turn's is, beside a Model it publishes no prices for.
+const PRICED_ERRAND_MODELS: &str = concat!(
+    r#"[{"id":"gpt-5.6-luna","name":"Luna","capabilities":{},"#,
+    r#""supportedReasoningEfforts":["none","low","high"],"defaultReasoningEffort":"high","#,
+    r#""billing":{"tokenPrices":{"batchSize":1000,"inputPrice":2.0,"#,
+    r#""outputPrice":8.0,"cacheReadPrice":0.5,"cacheWritePrice":2.5}}},"#,
+    r#"{"id":"unpriced-fixture","name":"Unpriced Fixture","capabilities":{}}]"#,
+);
+
+/// The reply every answered Errand below settles on.
+const ERRAND_REPLY: &str = r#"        event e1 assistant.message '{"messageId":"e1","content":"{\"title\":\"Explain the Copilot seam\"}"}'
+        event e2 session.idle '{}'
+"#;
+
+/// Two model calls the Errand's Session made, shaped as Copilot's `assistant.usage` reports them:
+/// totals that nest their cache and Reasoning counts, and the premium-request multiplier.
+const TWO_CALLS: &str = r#"        event u1 assistant.usage '{"model":"gpt-5.6-luna","inputTokens":1000,"cacheReadTokens":100,"cacheWriteTokens":50,"outputTokens":200,"reasoningTokens":50,"cost":1,"maxPromptTokens":128000}'
+        event u2 assistant.usage '{"model":"gpt-5.6-luna","inputTokens":500,"cacheReadTokens":50,"cacheWriteTokens":0,"outputTokens":100,"reasoningTokens":0,"cost":0.5}'
+"#;
+
+/// What those two calls consumed, summed into Suru's own disjoint parts.
+fn two_calls_usage() -> Usage {
+    Usage {
+        fresh_input_tokens: Some(1_300),
+        cache_read_tokens: Some(150),
+        cache_write_tokens: Some(50),
+        output_tokens: Some(250),
+        reasoning_tokens: Some(50),
+        native_meter: NativeMeter::from_units(1.5),
+    }
+}
+
+/// What those two calls cost at the catalog's prices: 1,300 fresh tokens at 2 credits, 150 cache
+/// reads at 0.5, 50 cache writes at 2.5, and 300 output tokens, Reasoning included, at 8, per
+/// thousand tokens — 5.2 credits, at a cent each.
+fn two_calls_cost() -> Option<Cost> {
+    Cost::from_usd(0.052)
+}
+
+/// Runs one Errand straight through Copilot's runtime, its Session playing `timeline`. With
+/// `prices_in_hand`, the runtime has listed the catalog first, as a running Server has by the time
+/// it runs an Errand; without, it has never seen a price.
+async fn run_errand(
+    timeline: &str,
+    prices_in_hand: bool,
+) -> (ScriptedCopilot, Result<ErrandAnswer, ErrandFailed>) {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}{}{}{}",
+        connect_arm(),
+        signed_in_arm(),
+        models_arm(PRICED_ERRAND_MODELS),
+        create_session_arm(),
+        detach_session_arm(),
+        delete_session_arm(),
+        send_arm(timeline),
+    ));
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let runtime = CopilotRuntime::new(copilot.executable());
+    if prices_in_hand {
+        runtime.list_models().await.expect("list the catalog");
+    }
+    let selection = runtime
+        .errand_selection()
+        .expect("Copilot declares its Errands' Selection");
+    let ran = runtime
+        .run_errand(ProviderErrand {
+            prompt: "Title this Session".to_owned(),
+            schema: serde_json::json!({"type": "object"}),
+            selection,
+            execution_directory: workspace.path().to_owned(),
+        })
+        .await;
+    runtime.shutdown().await.expect("shut the runtime down");
+    (copilot, ran)
+}
+
+/// The throwaway Session's usage events are the Errand's consumption: every model call it made,
+/// summed and priced from Copilot's own catalog as a Copilot Turn's are — which makes the Cost one
+/// Copilot stated — and the Session is discarded all the same.
+#[tokio::test]
+async fn a_copilot_errand_answers_with_its_sessions_summed_usage_and_cost() {
+    let (copilot, ran) = run_errand(&format!("{TWO_CALLS}{ERRAND_REPLY}"), true).await;
+    let answer = ran.expect("the Errand answers");
+
+    assert_eq!(
+        answer.reply,
+        serde_json::json!({"title": "Explain the Copilot seam"})
+    );
+    assert_eq!(answer.consumption.usage, Some(two_calls_usage()));
+    let cost = answer.consumption.cost.expect("a priced Model has a Cost");
+    assert_eq!(Some(cost.cost()), two_calls_cost());
+    assert_eq!(cost.basis(), CostBasis::Reported);
+    let created = copilot.wait_for_request("session.create").await["params"]["sessionId"]
+        .as_str()
+        .expect("the Errand names the Copilot Session it opens")
+        .to_owned();
+    assert_eq!(
+        discarded_session(&copilot).await,
+        created,
+        "the Session whose usage was gathered is discarded"
+    );
+}
+
+/// A Session that reported no usage has its Errand's consumption unknown rather than zero, and
+/// the Errand still answers. So does one with a usage report Suru could not read, since a sum
+/// missing a call is a figure nobody measured.
+#[tokio::test]
+async fn a_copilot_errand_whose_session_reports_no_readable_usage_answers_unmeasured() {
+    let unreadable = r#"        event u0 assistant.usage '{"inputTokens":"lots"}'
+"#;
+    for timeline in [
+        ERRAND_REPLY.to_owned(),
+        format!("{TWO_CALLS}{unreadable}{ERRAND_REPLY}"),
+    ] {
+        let (_copilot, ran) = run_errand(&timeline, true).await;
+        let answer = ran.expect("the Errand answers");
+
+        assert_eq!(
+            answer.consumption,
+            ErrandConsumption::default(),
+            "{timeline}"
+        );
+    }
+}
+
+/// A Cost is only ever the whole Errand's: one model call at a Model the catalog prices nothing
+/// for leaves the Cost absent rather than understated, while the Usage stands.
+#[tokio::test]
+async fn a_copilot_errand_with_an_unpriced_call_carries_usage_without_a_cost() {
+    let unpriced = r#"        event u3 assistant.usage '{"model":"unpriced-fixture","inputTokens":10,"cacheReadTokens":0,"cacheWriteTokens":0,"outputTokens":5,"reasoningTokens":0}'
+"#;
+    let (_copilot, ran) = run_errand(&format!("{TWO_CALLS}{unpriced}{ERRAND_REPLY}"), true).await;
+    let consumption = ran.expect("the Errand answers").consumption;
+
+    assert_eq!(
+        consumption.usage.and_then(|usage| usage.fresh_input_tokens),
+        Some(1_310)
+    );
+    assert_eq!(consumption.cost, None);
+}
+
+/// An Errand prices from what the runtime already holds rather than asking Copilot for a catalog
+/// it could outlast its deadline waiting on: with no prices in hand, the Usage stands without a
+/// Cost and no catalog is requested.
+#[tokio::test]
+async fn a_copilot_errand_with_no_prices_in_hand_carries_usage_without_asking_for_any() {
+    let (copilot, ran) = run_errand(&format!("{TWO_CALLS}{ERRAND_REPLY}"), false).await;
+    let consumption = ran.expect("the Errand answers").consumption;
+
+    assert_eq!(consumption.usage, Some(two_calls_usage()));
+    assert_eq!(consumption.cost, None);
+    assert!(
+        !copilot
+            .methods()
+            .iter()
+            .any(|method| method == "models.list"),
+        "the Errand asked for no catalog: {:?}",
+        copilot.methods()
+    );
+}
+
+/// A call that reached the Model spent tokens whether or not its reply was usable, so a failed
+/// Errand keeps what its Session reported consuming: one that answered outside its shape, and one
+/// whose Session failed outright.
+#[tokio::test]
+async fn a_failed_copilot_errand_keeps_the_usage_its_session_reported() {
+    let unshaped = r#"        event e1 assistant.message '{"messageId":"e1","content":"Sure! I can help with that."}'
+        event e2 session.idle '{}'
+"#;
+    let errored = r#"        event e3 session.error '{"errorType":"quota","message":"Out of premium requests."}'
+"#;
+    for failing in [unshaped, errored] {
+        let (copilot, ran) = run_errand(&format!("{TWO_CALLS}{failing}"), true).await;
+        let failed = ran.expect_err("the Errand fails");
+
+        assert_eq!(
+            failed.consumption.usage,
+            Some(two_calls_usage()),
+            "{failing}"
+        );
+        assert_eq!(
+            failed
+                .consumption
+                .cost
+                .map(|cost| (cost.cost(), cost.basis())),
+            two_calls_cost().map(|cost| (cost, CostBasis::Reported)),
+            "{failing}"
+        );
+        discarded_session(&copilot).await;
+    }
 }

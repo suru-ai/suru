@@ -1699,6 +1699,17 @@ fn project_usage_event(
     event: &SessionEvent,
     pricing: &CopilotPricing,
 ) -> Result<ProviderEvent, ProviderError> {
+    let (usage, reported_cost) = priced_usage(event, pricing)?;
+    Ok(metered(streams, usage, reported_cost))
+}
+
+/// What one model call's `assistant.usage` reports it consumed, in Suru's disjoint Usage parts,
+/// and its Cost at the catalog `pricing` holds — absent where that prices nothing for the call's
+/// Model. A Turn adds it to the Turn's reading; an Errand to the Errand's.
+pub(super) fn priced_usage(
+    event: &SessionEvent,
+    pricing: &CopilotPricing,
+) -> Result<(Usage, Option<Cost>), ProviderError> {
     let cache_ttl_seconds = reported_cache_ttl(event);
     let reported: AssistantUsageData = decode(event)?;
     let usage = Usage {
@@ -1718,7 +1729,7 @@ fn project_usage_event(
         cache_ttl_seconds,
         &usage,
     );
-    Ok(metered(streams, usage, reported_cost))
+    Ok((usage, reported_cost))
 }
 
 /// Adds one model call's `usage`, costing `reported_cost`, to the reading the conversation's Turn
