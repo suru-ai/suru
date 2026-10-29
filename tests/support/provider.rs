@@ -15,9 +15,9 @@ use suru::protocol::{
     SkillDescriptor, SkillId, SkillPromptDelivery,
 };
 use suru::provider::{
-    AttributedProviderEvent, ErrandAnswer, ErrandFuture, ManualCompaction, ProviderCompactionInput,
-    ProviderDecisionDelivery, ProviderErrand, ProviderError, ProviderEvent,
-    ProviderEventAttribution, ProviderEventStream, ProviderFuture, ProviderInput,
+    AttributedProviderEvent, ErrandAnswer, ErrandConsumption, ErrandFuture, ManualCompaction,
+    ProviderCompactionInput, ProviderDecisionDelivery, ProviderErrand, ProviderError,
+    ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFuture, ProviderInput,
     ProviderInterruption, ProviderModelDiscovery, ProviderPrompt, ProviderRuntime, ProviderSession,
     ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
     ProviderTurnInput, ProviderWatchId, Report, SubagentReport,
@@ -551,8 +551,13 @@ impl ErrandRequest {
     }
 
     pub fn succeed(self, reply: Value) {
+        self.succeed_consuming(reply, ErrandConsumption::default());
+    }
+
+    /// Answers with `reply`, saying giving it consumed `consumption`.
+    pub fn succeed_consuming(self, reply: Value, consumption: ErrandConsumption) {
         self.response
-            .send(Ok(ErrandAnswer::unmeasured(reply)))
+            .send(Ok(ErrandAnswer { reply, consumption }))
             .unwrap_or_else(|_| panic!("Provider Errand response remains connected"));
     }
 

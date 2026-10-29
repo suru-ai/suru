@@ -2,18 +2,28 @@
 //! each read adds up is the Session store's to show; this shows the queries
 //! and the reports cross the wire.
 
-use crate::session_integration::support::{read_session_until, working_turn};
+use crate::session_integration::{
+    provider_support::ControlledProvider,
+    support::{hosted_model, hosted_selection, read_session_until, working_turn},
+};
+use crate::support::PROGRESS_DEADLINE;
 use std::time::Duration;
 use suru::{
     pricing::CacheRates,
     protocol::{
-        CacheInsights, Cost, CostTotal, CountedCost, DelegationInsights, EstimatedSaving,
-        InsightsQuery, InsightsReport, InsightsTool, ModelId, QUARTER_HOUR_MS, RuntimeDescriptor,
+        CacheInsights, Cost, CostTotal, CountedCost, CreateSessionRequest, DelegationInsights,
+        EstimatedSaving, ExecutionDirectory, InitialPrompt, InsightsQuery, InsightsReport,
+        InsightsTool, ModelId, PromptId, ProviderId, QUARTER_HOUR_MS, RuntimeDescriptor,
         SessionError, SessionErrorCode, SessionTimestamp, TURN_DURATION_BINS, ToolTally,
         TurnDurations, TurnInsights, Usage, UsageMetricsAggregate, UsageMetricsBreakdown,
-        UsageMetricsInterval, UsageMetricsKey, UsageMetricsQuery, UsageMetricsReport,
+        UsageMetricsInterval, UsageMetricsKey, UsageMetricsKeyLabel, UsageMetricsQuery,
+        UsageMetricsReport,
     },
-    provider::{MeteredCost, ProviderActivityId, ProviderEvent, ProviderToolCallStatus},
+    provider::{
+        ErrandConsumption, ErrandCost, MeteredCost, ProviderActivityId, ProviderEvent,
+        ProviderToolCallStatus,
+    },
+    server::{self, ServerConfig},
 };
 use tokio::time::timeout;
 
@@ -360,4 +370,108 @@ async fn insights_are_read_over_the_api_and_a_backwards_interval_is_refused() {
     let refused = refused.json::<SessionError>().await.unwrap();
     assert_eq!(refused.code, SessionErrorCode::InvalidUsageMetricsQuery);
     fixture.server.shutdown().await.unwrap();
+}
+
+/// An Errand's Usage and Cost cross the wire under the reserved Errands key,
+/// once the storage writer has landed its record.
+#[tokio::test]
+async fn an_errand_s_usage_and_cost_are_read_over_the_api_under_the_errands_key() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let (runtime, mut provider) = ControlledProvider::with_provider(
+        ProviderId::new("controlled"),
+        vec![hosted_model("controlled", "controlled-default")],
+    );
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state.path(), "usage-metrics-errands").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let descriptor = server.descriptor().clone();
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            session_id: None,
+            preparation_id: None,
+            agent_selection: Some(hosted_selection("controlled", "controlled-default")),
+            execution_directory: ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Count what Suru's own work costs".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds");
+    let cost = Cost::from_usd(0.004).unwrap();
+    timeout(PROGRESS_DEADLINE, provider.next_errand())
+        .await
+        .expect("the Title Errand reaches the Provider")
+        .succeed_consuming(
+            serde_json::json!({ "title": "Errands on the wire", "icon": "md-bug" }),
+            ErrandConsumption {
+                usage: Some(Usage {
+                    fresh_input_tokens: Some(12),
+                    output_tokens: Some(56),
+                    ..Usage::default()
+                }),
+                cost: Some(ErrandCost::reported(cost)),
+            },
+        );
+
+    let all_of_time = by_model(vec![UsageMetricsInterval {
+        start: SessionTimestamp(0),
+        end: SessionTimestamp(i64::MAX as u64),
+    }]);
+    let report = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let response = ask(&client, &descriptor, &all_of_time).await;
+            assert!(response.status().is_success(), "{}", response.status());
+            let report = response.json::<UsageMetricsReport>().await.unwrap();
+            if report
+                .keys
+                .iter()
+                .any(|label| label.key == UsageMetricsKey::Errands)
+            {
+                break report;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the Errand's record lands");
+
+    assert!(report.keys.contains(&UsageMetricsKeyLabel {
+        key: UsageMetricsKey::Errands,
+        label: "Errands".to_owned(),
+    }));
+    let errands = report.buckets[0]
+        .by_key
+        .iter()
+        .find(|keyed| keyed.key == UsageMetricsKey::Errands)
+        .expect("the bucket holds the Errand");
+    assert_eq!(
+        errands.aggregate,
+        UsageMetricsAggregate {
+            fresh_input_tokens: Some(12),
+            output_tokens: Some(56),
+            cost: CountedCost {
+                amount: Some(cost),
+                is_partial: false,
+            },
+            ..UsageMetricsAggregate::default()
+        }
+    );
+    // The Session's first Turn never began, its Provider never answering
+    // its start, so the whole is the Errand's alone: no Session, no Turn.
+    assert_eq!(report.buckets[0].total, errands.aggregate);
 }
