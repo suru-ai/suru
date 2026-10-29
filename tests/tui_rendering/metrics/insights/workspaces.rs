@@ -348,3 +348,70 @@ fn a_workspace_opened_into_a_report_without_it_is_not_shown_alone_by_a_later_one
         "the report the Workspace was opened into had none of it to show alone"
     );
 }
+
+/// `report` with Suru's Errands beside its Workspaces in every bucket,
+/// costing `usd`, as the Server counts them under their reserved key.
+fn with_errands(mut report: UsageMetricsReport, usd: f64) -> UsageMetricsReport {
+    let errands = UsageMetricsAggregate {
+        cost: CountedCost {
+            amount: Cost::from_usd(usd),
+            is_partial: false,
+        },
+        ..UsageMetricsAggregate::default()
+    };
+    for bucket in report
+        .buckets
+        .iter_mut()
+        .chain([&mut report.across_buckets])
+    {
+        bucket.total.cost.add(errands.cost);
+        bucket.by_key.push(KeyedUsageMetrics {
+            key: UsageMetricsKey::Errands,
+            aggregate: errands,
+        });
+    }
+    report.across_buckets_and_untimed.cost.add(errands.cost);
+    report.keys.push(UsageMetricsKeyLabel {
+        key: UsageMetricsKey::Errands,
+        label: "Errands".to_owned(),
+    });
+    report
+}
+
+#[test]
+fn the_panel_lists_errands_as_a_row_and_opening_it_shows_errands_alone_on_overview() {
+    let mut application = on_workspaces(|query| Ok(with_errands(spent(query, &MOCKUP), 50.0)));
+
+    assert_eq!(
+        workspaces_panel(&application).0,
+        vec![
+            "suru $211.40",
+            "relay-infra $96.10",
+            "Errands $50.00",
+            "dotfiles $41.75+",
+            "(5 more) $63.61",
+        ],
+        "ranked by Cost among the Workspaces, as Overview ranks its keys"
+    );
+
+    let opened = invoke(
+        &mut application,
+        SemanticCommandId::MetricsPanelItemOpen {
+            panel: InsightsPanel::Workspaces,
+            item: 2,
+        },
+    );
+
+    let (_, request_id, query) = expect_read(opened);
+    assert_eq!(query.breakdown, UsageMetricsBreakdown::Workspace);
+    answer(
+        &mut application,
+        request_id,
+        Ok(with_errands(spent(&query, &MOCKUP), 50.0)),
+    );
+    assert_eq!(
+        dimmed(&application, ["suru", "relay-infra", "Errands", "dotfiles"]),
+        [Some(true), Some(true), Some(false), Some(true)],
+        "the Errands shown alone"
+    );
+}
