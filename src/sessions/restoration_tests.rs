@@ -5,9 +5,10 @@ use std::{cell::Cell, collections::HashMap, path::Path};
 use super::{
     SessionStore,
     cost_coverage::{CostContribution, CountedAmount, sum_contributions},
+    usage_metrics_tests::{errand, output_usage},
 };
 use crate::{
-    errands::{ErrandLedger, ErrandOutcome, ErrandPurpose, ErrandRecord},
+    errands::{ErrandLedger, ErrandOutcome, ErrandRecord},
     protocol::{
         Activity, ActivityId, ActivityStatus, Cost, CostBasis, CostCoverage, CostDetails,
         CostTotal, ModelAvailability, ModelCatalog, Session, SessionId, SessionRevision,
@@ -1447,35 +1448,17 @@ fn lend_repository(
     lent
 }
 
-/// A Session Title Errand that began at `began`, reporting `usage` tokens of
-/// output where it knew its Usage, and costing `cost` where it knew that.
-fn errand(began: u64, usage: Option<u64>, cost: Option<ErrandCost>) -> ErrandRecord {
-    ErrandRecord {
-        purpose: ErrandPurpose::SessionTitle,
-        provider: crate::protocol::ProviderId::new("claude"),
-        model: crate::protocol::ModelId::new("claude-haiku-4-5"),
-        began: SessionTimestamp(began),
-        ended: SessionTimestamp(began + 1),
-        outcome: ErrandOutcome::Answered,
-        usage: usage.map(|output| Usage {
-            output_tokens: Some(output),
-            ..Default::default()
-        }),
-        cost,
-    }
-}
-
 /// Errands whose Cost is whole: one Reported, one Estimated.
 fn whole_errands() -> Vec<ErrandRecord> {
     vec![
         errand(
             1,
-            Some(40),
+            output_usage(40),
             Some(ErrandCost::reported(Cost::from_nano_usd(4_000_000))),
         ),
         errand(
             50_000,
-            Some(60),
+            output_usage(60),
             Some(ErrandCost::as_recorded(
                 Cost::from_nano_usd(900_000),
                 CostBasis::Estimated,
@@ -1492,7 +1475,7 @@ fn unmeasured_errands() -> Vec<ErrandRecord> {
             outcome: ErrandOutcome::TimedOut,
             ..errand(7, None, None)
         },
-        errand(9, Some(10), None),
+        errand(9, output_usage(10), None),
     ]
 }
 

@@ -1985,10 +1985,10 @@ async fn a_top_session_s_workspace_is_told_apart_whatever_the_breakdown() {
     writer.shutdown().await.unwrap();
 }
 
-/// An Errand begun at `began` that reported `output` tokens, where it knew
-/// its Usage, and cost what `cost` says, where it knew that: under a Model
-/// no Session here ran, so it can stand under no key of theirs.
-fn errand(began: u64, output: Option<u64>, cost: Option<ErrandCost>) -> ErrandRecord {
+/// A Session Title Errand begun at `began` that consumed `usage`, where it
+/// knew its Usage, and cost what `cost` says, where it knew that: under a
+/// Model no Session here ran, so it can stand under no key of theirs.
+pub(super) fn errand(began: u64, usage: Option<Usage>, cost: Option<ErrandCost>) -> ErrandRecord {
     ErrandRecord {
         purpose: ErrandPurpose::SessionTitle,
         provider: ProviderId::new("claude"),
@@ -1996,15 +1996,21 @@ fn errand(began: u64, output: Option<u64>, cost: Option<ErrandCost>) -> ErrandRe
         began: SessionTimestamp(began),
         ended: SessionTimestamp(began + 1),
         outcome: ErrandOutcome::Answered,
-        usage: output.map(|output| Usage {
-            output_tokens: Some(output),
-            ..Default::default()
-        }),
+        usage,
         cost,
     }
 }
 
-fn reported(dollars: f64) -> Option<ErrandCost> {
+/// Usage of `tokens` output tokens and nothing else known.
+pub(super) fn output_usage(tokens: u64) -> Option<Usage> {
+    Some(Usage {
+        output_tokens: Some(tokens),
+        ..Default::default()
+    })
+}
+
+/// An Errand's Cost of `dollars` as its Provider reported it.
+pub(super) fn reported(dollars: f64) -> Option<ErrandCost> {
     Some(ErrandCost::reported(usd(dollars).unwrap()))
 }
 
@@ -2043,13 +2049,13 @@ async fn errands_land_in_the_buckets_they_began_in_under_their_own_key_whatever_
     let session_id = session.snapshot.session.id;
     let errands = vec![
         // Before every bucket.
-        errand(5, Some(1_000), reported(0.01)),
+        errand(5, output_usage(1_000), reported(0.01)),
         // At the first bucket's start, and within it.
-        errand(10, Some(40), reported(0.04)),
-        errand(19, Some(60), estimated(0.002)),
-        errand(25, Some(7), reported(0.03)),
+        errand(10, output_usage(40), reported(0.04)),
+        errand(19, output_usage(60), estimated(0.002)),
+        errand(25, output_usage(7), reported(0.03)),
         // At the last bucket's end, so in none.
-        errand(30, Some(9_000), reported(0.50)),
+        errand(30, output_usage(9_000), reported(0.50)),
     ];
     let (store, writer) = restore_with_errands(directory.path(), vec![session], errands).await;
 
@@ -2164,8 +2170,8 @@ async fn an_errand_of_unknown_usage_or_with_no_cost_marks_every_figure_holding_i
             ..errand(14, None, None)
         },
         // Its Usage known, its Cost not.
-        errand(24, Some(5), None),
-        errand(26, Some(5), reported(0.02)),
+        errand(24, output_usage(5), None),
+        errand(26, output_usage(5), reported(0.02)),
     ];
     let (store, writer) = restore_with_errands(directory.path(), vec![session], errands).await;
 
@@ -2206,8 +2212,8 @@ async fn the_comparison_counts_the_errands_it_holds_and_the_earliest_work_may_be
         vec![turn_scoped(OPUS, 15, 0.10)],
     );
     let errands = vec![
-        errand(3, Some(20), reported(0.05)),
-        errand(16, Some(30), reported(0.01)),
+        errand(3, output_usage(20), reported(0.05)),
+        errand(16, output_usage(30), reported(0.01)),
     ];
     let (store, writer) = restore_with_errands(directory.path(), vec![session], errands).await;
     let compared_with = |start: u64, end: u64| UsageMetricsQuery {

@@ -5,15 +5,15 @@ use super::{
     InsightsRefusal, Pairing, RemoteAct, SessionStore,
     restoration_tests::persisted,
     usage_metrics_tests::{
-        CODEX, FABLE, OPUS, PAIRING, SONNET, STUDIO, by_model, errands_part, metered,
-        read as read_metrics, restore, restore_deferred, restore_with_errands, running_total,
-        turn_scoped, usd,
+        CODEX, FABLE, OPUS, PAIRING, SONNET, STUDIO, by_model, errand, errands_part, metered,
+        read as read_metrics, reported, restore, restore_deferred, restore_with_errands,
+        running_total, turn_scoped, usd,
     },
 };
 use std::collections::HashMap;
 
 use crate::{
-    errands::{ErrandOutcome, ErrandPurpose, ErrandRecord},
+    errands::{ErrandOutcome, ErrandRecord},
     pricing::{CacheRateLookup, CacheRates, CacheRatesFuture},
     protocol::{
         Activity, ActivityId, ActivityStatus, Approval, ApprovalId, ApprovalInsights,
@@ -386,32 +386,16 @@ async fn turns_land_in_the_utc_quarter_hour_they_are_placed_in_earliest_first() 
 /// The Errands model, which no Session here runs.
 const HAIKU: Option<(&str, &str)> = Some(("claude", "claude-haiku-4-5"));
 
-/// An Errand begun at `began` whose input was `fresh` tokens sent fresh,
-/// `reads` read from cache, and `writes` written to it, where it knew its
-/// Usage, costing what `cost` says, where it knew that.
-fn errand(began: u64, usage: Option<(u64, u64, u64)>, cost: Option<ErrandCost>) -> ErrandRecord {
-    let (provider, model) = HAIKU.unwrap();
-    ErrandRecord {
-        purpose: ErrandPurpose::SessionTitle,
-        provider: ProviderId::new(provider),
-        model: ModelId::new(model),
-        began: SessionTimestamp(began),
-        ended: SessionTimestamp(began + 1),
-        outcome: ErrandOutcome::Answered,
-        usage: usage.map(|(fresh, reads, writes)| Usage {
-            fresh_input_tokens: Some(fresh),
-            cache_read_tokens: Some(reads),
-            cache_write_tokens: Some(writes),
-            output_tokens: Some(1),
-            ..Usage::default()
-        }),
-        cost,
-    }
-}
-
-/// An Errand's Cost of `dollars` as its Provider reported it.
-fn reported(dollars: f64) -> Option<ErrandCost> {
-    Some(ErrandCost::reported(usd(dollars).unwrap()))
+/// Usage whose input was `fresh` tokens sent fresh, `reads` read from cache,
+/// and `writes` written to it, beside a token of output.
+fn input(fresh: u64, reads: u64, writes: u64) -> Option<Usage> {
+    Some(Usage {
+        fresh_input_tokens: Some(fresh),
+        cache_read_tokens: Some(reads),
+        cache_write_tokens: Some(writes),
+        output_tokens: Some(1),
+        ..Usage::default()
+    })
 }
 
 /// The heatmap is Turn-only: its quarter-hours carry the range's Session
@@ -439,8 +423,8 @@ async fn quarter_hour_costs_add_up_to_the_range_s_session_cost() {
     ];
     // Errands in a quarter-hour holding Turns, and in one holding none.
     let errands = vec![
-        errand(at(0) + 3, Some((10, 0, 0)), reported(0.04)),
-        errand(at(2), Some((10, 0, 0)), reported(0.02)),
+        errand(at(0) + 3, input(10, 0, 0), reported(0.04)),
+        errand(at(2), input(10, 0, 0), reported(0.02)),
     ];
     let (store, writer) =
         restore_with_errands(directory.path(), vec![parent, brokered], errands).await;
@@ -623,18 +607,18 @@ async fn delegation_s_errands_are_the_range_s_errand_cost_and_the_rows_add_up_to
     let mut own = persisted(directory.path(), None);
     own.snapshot.turns = vec![turn_scoped(CODEX, START, 0.50)];
     let errands = vec![
-        errand(START, Some((10, 0, 0)), reported(0.04)),
+        errand(START, input(10, 0, 0), reported(0.04)),
         errand(
             START + 1,
-            Some((10, 0, 0)),
+            input(10, 0, 0),
             Some(ErrandCost::as_recorded(
                 usd(0.02).unwrap(),
                 crate::protocol::CostBasis::Estimated,
             )),
         ),
         // Before the range, and as it ends: no part of its Cost.
-        errand(START - 1, Some((10, 0, 0)), reported(9.00)),
-        errand(END, Some((10, 0, 0)), reported(9.00)),
+        errand(START - 1, input(10, 0, 0), reported(9.00)),
+        errand(END, input(10, 0, 0), reported(9.00)),
     ];
     // An Errand that timed out knowing neither: the range's Cost is then
     // partial, and so are its Errands'.
@@ -1457,11 +1441,11 @@ async fn the_cache_share_and_saving_count_errand_usage_at_the_errand_model_s_rat
     let errands = vec![
         // 2M read at $0.10 rather than $1.00 saves $1.80; 1M written at
         // $1.25 costs $0.25 more.
-        errand(START + 1, Some((1_000_000, 2_000_000, 1_000_000)), None),
+        errand(START + 1, input(1_000_000, 2_000_000, 1_000_000), None),
         // Knowing no Usage, it adds no input and needs no rates.
         errand(START + 2, None, None),
         // Before the range: no part of its input.
-        errand(START - 1, Some((9_000_000, 9_000_000, 0)), None),
+        errand(START - 1, input(9_000_000, 9_000_000, 0), None),
     ];
     let (store, writer) = restore_with_errands(directory.path(), vec![session], errands).await;
     let rates = RateTable::default()
@@ -1489,7 +1473,7 @@ async fn an_errand_model_without_rates_is_left_out_of_the_saving_which_is_then_p
     let directory = tempfile::tempdir().unwrap();
     let mut session = persisted(directory.path(), None);
     session.snapshot.turns = vec![cached(CODEX, START, 0, 1_000_000, 0)];
-    let errands = vec![errand(START + 1, Some((0, 1_000_000, 0)), None)];
+    let errands = vec![errand(START + 1, input(0, 1_000_000, 0), None)];
     let (store, writer) = restore_with_errands(directory.path(), vec![session], errands).await;
     let rates = RateTable::default().pricing(CODEX, 2.00, Some(0.20), Some(2.50));
 
