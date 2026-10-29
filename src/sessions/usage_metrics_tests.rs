@@ -794,6 +794,77 @@ async fn workspaces_of_one_name_are_told_apart_by_where_they_are() {
     writer.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn a_key_reads_alike_in_every_report_whatever_else_the_report_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let mine = directory.path().join("mine").join("suru");
+    let theirs = directory.path().join("theirs").join("suru");
+    let records = vec![
+        titled(
+            &mine,
+            "Mine",
+            vec![turn_scoped(Some(("copilot", "gpt-5.5")), 11, 0.20)],
+        ),
+        // Before every bucket asked for, yet a Workspace and a Model of the
+        // Server's all the same.
+        titled(
+            &theirs,
+            "Theirs",
+            vec![turn_scoped(Some(("codex", "gpt-5.5")), 5, 0.10)],
+        ),
+    ];
+    let mine_key = UsageMetricsKey::Workspace {
+        workspace: records[0].snapshot.session.workspace.id.clone(),
+    };
+    let (store, writer) = restore(directory.path(), records).await;
+    let paths = WorkspacePaths::default();
+    let copilot = UsageMetricsKey::Model {
+        provider: ProviderId::new("copilot"),
+        model: ModelId::new("gpt-5.5"),
+    };
+
+    for buckets in [&[(10, 20)][..], &[(0, 20)][..]] {
+        for breakdown in [
+            UsageMetricsBreakdown::Model,
+            UsageMetricsBreakdown::Provider,
+            UsageMetricsBreakdown::Workspace,
+        ] {
+            let report = read(
+                &store,
+                &UsageMetricsQuery {
+                    breakdown,
+                    ..top(buckets, 5)
+                },
+            );
+            let mine_session = report
+                .top_sessions
+                .iter()
+                .find(|session| session.title == "Mine")
+                .expect("Mine is a top Session");
+            assert_eq!(
+                (
+                    mine_session.model.as_deref(),
+                    mine_session.workspace.clone()
+                ),
+                (Some("copilot · gpt-5.5"), paths.label(&mine)),
+                "{breakdown:?} over {buckets:?}"
+            );
+            let labelled = labels(&report);
+            if let Some((_, label)) = labelled.iter().find(|(key, _)| *key == copilot) {
+                assert_eq!(*label, "copilot · gpt-5.5", "{buckets:?}");
+            }
+            if breakdown == UsageMetricsBreakdown::Workspace {
+                let label = labelled
+                    .iter()
+                    .find(|(key, _)| *key == mine_key)
+                    .map(|(_, label)| label.to_string());
+                assert_eq!(label, Some(paths.label(&mine)), "{buckets:?}");
+            }
+        }
+    }
+    writer.shutdown().await.unwrap();
+}
+
 /// A Registry entry presenting its Workspace at `path`, or nowhere.
 fn entry(path: Option<&Path>) -> StoredWorkspace {
     StoredWorkspace {

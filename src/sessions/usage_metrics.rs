@@ -700,6 +700,16 @@ fn fold(
             Landing::Outside
         }
     };
+    // Every Model and Workspace the counted Turns ran under, at any moment:
+    // what a label is told apart from, so a key reads alike in every report
+    // the Server gives, whatever else that report names.
+    let mut named = HashSet::<UsageMetricsKey>::new();
+    for turn in &metered.turns {
+        named.extend(turn.model.clone());
+        named.insert(UsageMetricsKey::Workspace {
+            workspace: forest.sessions[&turn.session_id].workspace.clone(),
+        });
+    }
     let mut earliest_turn_at = None::<SessionTimestamp>;
     // What each top-level Session's work across the buckets adds up to.
     let mut owned = HashMap::<SessionId, OwnedCost>::new();
@@ -775,17 +785,9 @@ fn fold(
     keys.sort_by(|left, right| key_order(left).cmp(&key_order(right)));
     keys.dedup();
     let top = top_owners(&owned, query.top_sessions);
-    // The top Sessions' Workspaces and Models are named with the keys, so a
-    // Workspace is told apart from every other the report names alike.
-    let named = top.iter().flat_map(|owner| {
-        let workspace = UsageMetricsKey::Workspace {
-            workspace: forest.sessions[owner].workspace.clone(),
-        };
-        std::iter::once(workspace).chain(owned[owner].main_model().cloned())
-    });
-    let mut named = keys.iter().cloned().chain(named).collect::<Vec<_>>();
+    named.extend(keys.iter().cloned());
+    let mut named = named.into_iter().collect::<Vec<_>>();
     named.sort_by(|left, right| key_order(left).cmp(&key_order(right)));
-    named.dedup();
     let mut labels: HashMap<UsageMetricsKey, String> =
         named.iter().cloned().zip(labels(&named, names)).collect();
     let top_sessions = top

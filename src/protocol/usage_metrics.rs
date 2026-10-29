@@ -86,7 +86,10 @@ pub enum UsageMetricsKey {
 
 /// A breakdown key and the name a reader is shown for it: a Model's name, a
 /// Provider's display name, or a Workspace's name — told apart by where it
-/// is where another Workspace goes by the same name.
+/// is where another Workspace goes by the same name. A Model or Workspace is
+/// told apart from every other the Server's counted Sessions worked under,
+/// at any moment, not only those the report names, so one key reads alike
+/// in every report a Server gives.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageMetricsKeyLabel {
