@@ -646,16 +646,22 @@ pub struct ProviderErrand {
     pub execution_directory: PathBuf,
 }
 
-/// What a Provider answers an Errand with: the reply it gave, and what
-/// giving it consumed where the Provider can tell — its Usage, and its Cost
-/// where it knows one. A Provider that cannot tell answers with neither, which
-/// is never the same as having consumed nothing.
+/// What running an Errand consumed, as far as its Provider can tell: its
+/// Usage, and its Cost where it knows one. A Provider that cannot tell states
+/// neither, which is never the same as having consumed nothing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ErrandConsumption {
+    pub usage: Option<Usage>,
+    pub cost: Option<ErrandCost>,
+}
+
+/// What a Provider answers an Errand with: the reply it gave, and what giving
+/// it consumed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ErrandAnswer {
     /// The JSON the Provider replied, unvalidated against the Errand's schema.
     pub reply: Value,
-    pub usage: Option<Usage>,
-    pub cost: Option<ErrandCost>,
+    pub consumption: ErrandConsumption,
 }
 
 impl ErrandAnswer {
@@ -663,17 +669,89 @@ impl ErrandAnswer {
     pub fn unmeasured(reply: Value) -> Self {
         Self {
             reply,
-            usage: None,
-            cost: None,
+            consumption: ErrandConsumption::default(),
         }
     }
 }
 
-/// An Errand's Cost and who computed it, fixed when the Errand ended.
+/// Why a Provider gave an Errand no answer, and what the attempt consumed
+/// where the Provider can still tell: a call that failed after reaching the
+/// Model may have spent tokens all the same. Any [`ProviderError`] converts
+/// into one that consumed nothing known. The consumption is boxed so a
+/// failure stays small on the path where most carry none.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ErrandFailed {
+    pub error: ProviderError,
+    pub consumption: Box<ErrandConsumption>,
+}
+
+impl ErrandFailed {
+    /// A failure after which the Provider could still say what the attempt
+    /// consumed.
+    pub fn measured(error: ProviderError, consumption: ErrandConsumption) -> Self {
+        Self {
+            error,
+            consumption: Box::new(consumption),
+        }
+    }
+}
+
+impl From<ProviderError> for ErrandFailed {
+    fn from(error: ProviderError) -> Self {
+        Self::measured(error, ErrandConsumption::default())
+    }
+}
+
+impl std::fmt::Display for ErrandFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+/// An Errand's run: its answer, or why there is none.
+pub type ErrandFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ErrandAnswer, ErrandFailed>> + Send + 'a>>;
+
+/// An Errand's Cost and who computed it, fixed when the Errand ended. Like
+/// [`MeteredCost`], it pairs the figure with its Basis by construction, so a
+/// rate-table estimate can never be recorded as a Provider's own figure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ErrandCost {
-    pub cost: Cost,
-    pub basis: CostBasis,
+    cost: Cost,
+    basis: CostBasis,
+}
+
+impl ErrandCost {
+    /// A dollar figure the Provider stated itself.
+    pub const fn reported(cost: Cost) -> Self {
+        Self {
+            cost,
+            basis: CostBasis::Reported,
+        }
+    }
+
+    /// A Cost exactly as it was recorded, Basis and all, for storage reading
+    /// back what an Errand's record already fixed.
+    pub(crate) const fn as_recorded(cost: Cost, basis: CostBasis) -> Self {
+        Self { cost, basis }
+    }
+
+    pub const fn cost(self) -> Cost {
+        self.cost
+    }
+
+    pub const fn basis(self) -> CostBasis {
+        self.basis
+    }
+}
+
+impl From<EstimatedCost> for ErrandCost {
+    fn from(estimated: EstimatedCost) -> Self {
+        Self {
+            cost: estimated.cost(),
+            basis: estimated.basis(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1596,7 +1674,8 @@ pub trait ProviderRuntime: Send + Sync + 'static {
 
     /// Runs one Errand: delivers its Prompt, asks for its shape, and answers
     /// with the JSON the Provider replied, beside the Usage and Cost giving it
-    /// consumed where the Provider can tell (ADR 0057). How that happens is the runtime's
+    /// consumed where the Provider can tell — and, failing, with what the
+    /// attempt consumed where it can tell that (ADR 0057). How that happens is the runtime's
     /// own business — a native one-shot mode where the harness offers one, and
     /// otherwise a Provider-side session it starts and discards (ADR 0011) —
     /// and the caller never learns which path ran.
@@ -1605,7 +1684,7 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     /// in this shape" capability, so a later compaction or summarization Errand
     /// reuses it unchanged. It is not defaulted, so a new Provider has to decide
     /// how it runs Errands rather than silently running none.
-    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, ErrandAnswer>;
+    fn run_errand(&self, errand: ProviderErrand) -> ErrandFuture<'_>;
 
     /// The rates this Provider prices `model` at today, from which Insights
     /// estimates what caching saved; absent where it knows no rate table
@@ -1997,7 +2076,7 @@ mod tests {
     #[cfg(windows)]
     use super::executable_shadowed_by_windows_app_alias;
     use super::{
-        AgentSelection, ErrandAnswer, MAX_REMOTE_ERROR_CHARS, ManualCompaction,
+        AgentSelection, ErrandFuture, MAX_REMOTE_ERROR_CHARS, ManualCompaction,
         ManualCompactionRefusal, ProviderErrand, ProviderFuture, ProviderId,
         ProviderModelDiscovery, ProviderRuntime, ProviderSessionConnection, ProviderSessionRequest,
         built_in_providers, concise_remote_message, resolve_executable, runtimes,
@@ -2128,7 +2207,7 @@ mod tests {
                 unimplemented!("no Session is started")
             }
 
-            fn run_errand(&self, _errand: ProviderErrand) -> ProviderFuture<'_, ErrandAnswer> {
+            fn run_errand(&self, _errand: ProviderErrand) -> ErrandFuture<'_> {
                 unimplemented!("no Errand is run")
             }
 

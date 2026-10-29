@@ -12,14 +12,14 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{sync::watch, time::Duration};
 
 use crate::{
     clock::ServerClock,
     protocol::{ModelId, ProviderId, SessionTimestamp, SettingsSnapshot, Usage},
-    provider::{ErrandCost, ProviderErrand, ProviderRuntime, wait_for_shutdown},
-    storage::StorageError,
+    provider::{ErrandConsumption, ErrandCost, ProviderErrand, ProviderRuntime, wait_for_shutdown},
 };
 
 /// How long an Errand may take before Suru stops waiting. Generous next to any
@@ -59,8 +59,10 @@ impl std::fmt::Display for ErrandFailure {
     }
 }
 
-/// What an Errand was run for, as its record names it.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// What an Errand was run for, as its record names it. Storage spells it as
+/// serde does.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ErrandPurpose {
     /// A Session's Title, derived of Suru's own accord with its Icon and
     /// branch name.
@@ -71,36 +73,18 @@ pub(crate) enum ErrandPurpose {
     WorkspaceDescription,
 }
 
-impl ErrandPurpose {
-    /// How storage spells the purpose.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::SessionTitle => "session_title",
-            Self::TitleProposal => "title_proposal",
-            Self::WorkspaceDescription => "workspace_description",
-        }
-    }
-
-    /// The purpose storage spells `spelled`, none where this Suru reads no
-    /// such spelling.
-    pub(crate) fn spelled(spelled: &str) -> Option<Self> {
-        [
-            Self::SessionTitle,
-            Self::TitleProposal,
-            Self::WorkspaceDescription,
-        ]
-        .into_iter()
-        .find(|purpose| purpose.as_str() == spelled)
-    }
-}
-
-/// How an Errand that reached its Provider ended.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// How an Errand that reached its Provider ended. Storage spells it as serde
+/// does.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ErrandOutcome {
-    /// The Provider answered, whether or not the answer took the shape asked
-    /// for: that is for whoever asked for the Errand to judge.
+    /// The Provider answered with a reply. The runner never checks a reply
+    /// against the Errand's schema — whoever asked for the Errand does — but a
+    /// Provider that can tell its reply fell outside the schema, as Claude's
+    /// CLI can, fails the Errand instead.
     Answered,
-    /// The Provider said it could not answer.
+    /// The Provider said it could not answer, or answered in a shape it
+    /// could tell was not the one asked for.
     Failed,
     /// Suru stopped waiting at the Errand's deadline.
     TimedOut,
@@ -109,36 +93,12 @@ pub(crate) enum ErrandOutcome {
     Abandoned,
 }
 
-impl ErrandOutcome {
-    /// How storage spells the outcome.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Answered => "answered",
-            Self::Failed => "failed",
-            Self::TimedOut => "timed_out",
-            Self::Abandoned => "abandoned",
-        }
-    }
-
-    /// The outcome storage spells `spelled`, none where this Suru reads no
-    /// such spelling.
-    pub(crate) fn spelled(spelled: &str) -> Option<Self> {
-        [
-            Self::Answered,
-            Self::Failed,
-            Self::TimedOut,
-            Self::Abandoned,
-        ]
-        .into_iter()
-        .find(|outcome| outcome.as_str() == spelled)
-    }
-}
-
 /// What Suru keeps of one Errand that reached a Provider beside its answer
 /// (ADR 0057): what it was for, where it ran, when, how it ended, and what it
 /// consumed. Its Usage, and its Cost with the Basis that computed it, are each
 /// absent where unknown — always so for an Errand that timed out or was
-/// abandoned, since Suru stopped listening before the Provider could say.
+/// abandoned, since Suru stopped listening before the Provider could say. A
+/// failed Errand keeps whatever its Provider could still say it consumed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ErrandRecord {
     pub(crate) purpose: ErrandPurpose,
@@ -155,7 +115,17 @@ pub(crate) struct ErrandRecord {
 /// it to be kept, so recording never holds up an Errand's answer, and a record
 /// refused is the runner's to log rather than the answer's to carry.
 pub(crate) trait ErrandLedger: Send + Sync {
-    fn record(&self, record: ErrandRecord) -> Result<(), StorageError>;
+    fn record(&self, record: ErrandRecord) -> Result<(), RecordRefused>;
+}
+
+/// Why a ledger would not take an Errand's record, for the Log.
+#[derive(Debug)]
+pub(crate) struct RecordRefused(pub(crate) String);
+
+impl std::fmt::Display for RecordRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
 #[derive(Clone)]
@@ -234,6 +204,11 @@ impl ErrandRunner {
         {
             return Err(ErrandFailure::ProviderDisabled);
         }
+        // A server already stopping never calls the Provider, so the Errand
+        // never reaches one and leaves no record.
+        if *self.shutdown.borrow() {
+            return Err(ErrandFailure::Abandoned);
+        }
         let reached = Reached {
             ledger: self.ledger.clone(),
             clock: self.clock.clone(),
@@ -248,20 +223,20 @@ impl ErrandRunner {
         tokio::select! {
             biased;
             () = wait_for_shutdown(&mut shutdown) => {
-                reached.ended(ErrandOutcome::Abandoned, None, None);
+                reached.ended(ErrandOutcome::Abandoned, ErrandConsumption::default());
                 Err(ErrandFailure::Abandoned)
             }
             answered = tokio::time::timeout(self.timeout, runtime.run_errand(errand)) => match answered {
                 Ok(Ok(answer)) => {
-                    reached.ended(ErrandOutcome::Answered, answer.usage, answer.cost);
+                    reached.ended(ErrandOutcome::Answered, answer.consumption);
                     Ok(answer.reply)
                 }
-                Ok(Err(error)) => {
-                    reached.ended(ErrandOutcome::Failed, None, None);
-                    Err(ErrandFailure::Provider(error.to_string()))
+                Ok(Err(failed)) => {
+                    reached.ended(ErrandOutcome::Failed, *failed.consumption);
+                    Err(ErrandFailure::Provider(failed.error.to_string()))
                 }
                 Err(_) => {
-                    reached.ended(ErrandOutcome::TimedOut, None, None);
+                    reached.ended(ErrandOutcome::TimedOut, ErrandConsumption::default());
                     Err(ErrandFailure::TimedOut)
                 }
             },
@@ -287,11 +262,11 @@ struct Reached {
 }
 
 impl Reached {
-    fn ended(mut self, outcome: ErrandOutcome, usage: Option<Usage>, cost: Option<ErrandCost>) {
-        self.record(outcome, usage, cost);
+    fn ended(mut self, outcome: ErrandOutcome, consumption: ErrandConsumption) {
+        self.record(outcome, consumption);
     }
 
-    fn record(&mut self, outcome: ErrandOutcome, usage: Option<Usage>, cost: Option<ErrandCost>) {
+    fn record(&mut self, outcome: ErrandOutcome, consumption: ErrandConsumption) {
         let Some(began) = self.unrecorded.take() else {
             return;
         };
@@ -302,8 +277,8 @@ impl Reached {
             began: began.at,
             ended: self.clock.now(),
             outcome,
-            usage,
-            cost,
+            usage: consumption.usage,
+            cost: consumption.cost,
         };
         // The answer is already the caller's whatever becomes of its record.
         if let Err(error) = self.ledger.record(record) {
@@ -314,7 +289,7 @@ impl Reached {
 
 impl Drop for Reached {
     fn drop(&mut self) {
-        self.record(ErrandOutcome::Abandoned, None, None);
+        self.record(ErrandOutcome::Abandoned, ErrandConsumption::default());
     }
 }
 
@@ -328,10 +303,10 @@ mod tests {
     use super::*;
     use crate::{
         clock::ManualClock,
-        protocol::{AgentSelection, Cost, CostBasis},
+        protocol::{AgentSelection, Cost},
         provider::{
-            ErrandAnswer, ProviderError, ProviderFuture, ProviderModelDiscovery,
-            ProviderSessionConnection, ProviderSessionRequest,
+            ErrandAnswer, ErrandFailed, ErrandFuture, ProviderError, ProviderFuture,
+            ProviderModelDiscovery, ProviderSessionConnection, ProviderSessionRequest,
         },
     };
 
@@ -348,7 +323,7 @@ mod tests {
     #[derive(Clone)]
     enum Script {
         Answer(ErrandAnswer),
-        Fail(&'static str),
+        Fail(&'static str, ErrandConsumption),
         /// Answers nothing, so waiting on it ends some other way.
         Silence,
     }
@@ -382,12 +357,17 @@ mod tests {
             unimplemented!("Errand tests never start Sessions")
         }
 
-        fn run_errand(&self, _errand: ProviderErrand) -> ProviderFuture<'_, ErrandAnswer> {
+        fn run_errand(&self, _errand: ProviderErrand) -> ErrandFuture<'_> {
             self.errands.fetch_add(1, Ordering::SeqCst);
             self.hand.advance(ANSWERING_TAKES);
             match self.script.clone() {
                 Script::Answer(answer) => Box::pin(async move { Ok(answer) }),
-                Script::Fail(message) => Box::pin(async move { Err(ProviderError::new(message)) }),
+                Script::Fail(message, consumption) => Box::pin(async move {
+                    Err(ErrandFailed::measured(
+                        ProviderError::new(message),
+                        consumption,
+                    ))
+                }),
                 Script::Silence => Box::pin(std::future::pending()),
             }
         }
@@ -417,11 +397,9 @@ mod tests {
     }
 
     impl ErrandLedger for Ledger {
-        fn record(&self, record: ErrandRecord) -> Result<(), StorageError> {
+        fn record(&self, record: ErrandRecord) -> Result<(), RecordRefused> {
             if self.refuses {
-                return Err(StorageError::WriterTask(
-                    "writer is no longer running".to_owned(),
-                ));
+                return Err(RecordRefused("the writer is no longer running".to_owned()));
             }
             self.records.lock().expect("ledger lock").push(record);
             Ok(())
@@ -486,8 +464,7 @@ mod tests {
     fn answered(usage: Option<Usage>, cost: Option<ErrandCost>) -> Script {
         Script::Answer(ErrandAnswer {
             reply: serde_json::json!({ "title": "Fix the flicker" }),
-            usage,
-            cost,
+            consumption: ErrandConsumption { usage, cost },
         })
     }
 
@@ -503,10 +480,7 @@ mod tests {
     }
 
     fn reported(usd: f64) -> ErrandCost {
-        ErrandCost {
-            cost: Cost::from_usd(usd).expect("a representable Cost"),
-            basis: CostBasis::Reported,
-        }
+        ErrandCost::reported(Cost::from_usd(usd).expect("a representable Cost"))
     }
 
     fn after(began: SessionTimestamp, took: Duration) -> SessionTimestamp {
@@ -560,7 +534,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_errand_is_recorded_failed() {
-        let harness = harness(Script::Fail("the CLI would not start"));
+        let harness = harness(Script::Fail(
+            "the CLI would not start",
+            ErrandConsumption::default(),
+        ));
         let began = harness.clock.now();
 
         let failure = harness
@@ -578,6 +555,32 @@ mod tests {
             (began, after(began, ANSWERING_TAKES))
         );
         assert_eq!((record.usage, record.cost), (None, None));
+    }
+
+    /// A Provider that failed after reaching its Model may still say what the
+    /// attempt consumed, and the record keeps it.
+    #[tokio::test]
+    async fn a_failed_errand_keeps_what_its_provider_says_it_consumed() {
+        let harness = harness(Script::Fail(
+            "the CLI answered outside the schema",
+            ErrandConsumption {
+                usage: Some(usage()),
+                cost: Some(reported(0.002)),
+            },
+        ));
+
+        harness
+            .runner
+            .run(ErrandPurpose::SessionTitle, errand())
+            .await
+            .expect_err("the Provider failed");
+
+        let [record] = harness.ledger.records().try_into().expect("one record");
+        assert_eq!(record.outcome, ErrandOutcome::Failed);
+        assert_eq!(
+            (record.usage, record.cost),
+            (Some(usage()), Some(reported(0.002)))
+        );
     }
 
     /// Suru stopped listening before the Provider could say what the Errand
@@ -623,6 +626,24 @@ mod tests {
         let [record] = harness.ledger.records().try_into().expect("one record");
         assert_eq!(record.outcome, ErrandOutcome::Abandoned);
         assert_eq!((record.usage, record.cost), (None, None));
+    }
+
+    /// A server already stopping never calls the Provider, so the Errand never
+    /// reaches one and nothing is recorded.
+    #[tokio::test]
+    async fn an_errand_asked_for_once_shutdown_began_records_nothing() {
+        let harness = harness(answered(Some(usage()), None));
+        harness.shutdown.send_replace(true);
+
+        assert!(matches!(
+            harness
+                .runner
+                .run(ErrandPurpose::SessionTitle, errand())
+                .await,
+            Err(ErrandFailure::Abandoned)
+        ));
+        assert_eq!(harness.asked.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.ledger.records(), Vec::new());
     }
 
     /// A caller that stops waiting — a Title proposal whose asker went away —

@@ -29,7 +29,7 @@ use crate::{
         ModelOptionValue, ProviderId, ProviderUnavailability,
     },
     provider::{
-        ErrandAnswer, ProviderErrand, ProviderError,
+        ErrandAnswer, ErrandFailed, ProviderErrand, ProviderError,
         harness::{HarnessSpec, run_harness_to_completion},
     },
 };
@@ -91,7 +91,7 @@ pub(super) fn declared_errand_selection() -> AgentSelection {
 pub(super) async fn run(
     executable: OsString,
     errand: ProviderErrand,
-) -> Result<ErrandAnswer, ProviderError> {
+) -> Result<ErrandAnswer, ErrandFailed> {
     let files = ErrandFiles::new(&errand.schema)?;
     let spec = HarnessSpec {
         executable,
@@ -113,9 +113,9 @@ pub(super) async fn run(
             .find(|output| !output.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| format!("Codex exited with {}", finished.status));
-        return Err(codex_error(format!("{ERRAND_FAILED}: {said}")));
+        return Err(codex_error(format!("{ERRAND_FAILED}: {said}")).into());
     }
-    files.answer().map(ErrandAnswer::unmeasured)
+    Ok(files.answer().map(ErrandAnswer::unmeasured)?)
 }
 
 /// The two files one `codex exec` run is pointed at: the schema going in, and

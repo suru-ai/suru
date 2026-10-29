@@ -30,7 +30,7 @@ use crate::{
         AgentSelection, ClaudePermissionMode, EffectiveSettings, ModelId, ProviderId, SkillCatalog,
     },
     provider::{
-        ErrandAnswer, ManualCompaction, ProviderErrand, ProviderError, ProviderFuture,
+        ErrandFuture, ManualCompaction, ProviderErrand, ProviderError, ProviderFuture,
         ProviderModelDiscovery, ProviderRuntime, ProviderSessionConnection, ProviderSessionRequest,
         harness::ProcessRegistry, resolve_executable,
     },
@@ -284,7 +284,7 @@ impl ProviderRuntime for ClaudeRuntime {
     // availability probe of its own: an Errand is best-effort, its Selection
     // was already resolved against a catalog a probe stands behind, and a CLI
     // that has become unusable since says so in the result it prints.
-    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, ErrandAnswer> {
+    fn run_errand(&self, errand: ProviderErrand) -> ErrandFuture<'_> {
         let executable = self.executable.clone();
         Box::pin(async move { run_claude_errand(executable, errand).await })
     }

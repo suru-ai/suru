@@ -25,9 +25,9 @@ use std::ffi::OsString;
 
 use super::{claude_error, claude_error_context, projection::result_usage, wire::ResultMessage};
 use crate::{
-    protocol::{Cost, CostBasis, ProviderUnavailability},
+    protocol::{Cost, ProviderUnavailability},
     provider::{
-        ErrandAnswer, ErrandCost, ProviderErrand, ProviderError,
+        ErrandAnswer, ErrandConsumption, ErrandCost, ErrandFailed, ProviderErrand, ProviderError,
         harness::{HarnessSpec, run_harness_to_completion},
     },
 };
@@ -59,11 +59,12 @@ const CLAUDE_PRINT_MODE_ARGS: [&str; 9] = [
 /// Runs one Errand as a single print-mode invocation and answers with the JSON the CLI shaped to
 /// the Errand's schema, beside the Usage and Cost its result states. The reply is handed back
 /// unvalidated: the schema constrains the CLI rather than binding it, so whoever asked for the
-/// Errand still checks the shape it came back in.
+/// Errand still checks the shape it came back in. A failure the CLI printed a result for carries
+/// what that result states the run consumed.
 pub(super) async fn run_claude_errand(
     executable: OsString,
     errand: ProviderErrand,
-) -> Result<ErrandAnswer, ProviderError> {
+) -> Result<ErrandAnswer, ErrandFailed> {
     let spec = HarnessSpec {
         executable,
         args: arguments(&errand)?,
@@ -93,7 +94,8 @@ pub(super) async fn run_claude_errand(
         )
     } else {
         format!("{ERRAND_FAILED}: {said}")
-    }))
+    })
+    .into())
 }
 
 /// What the CLI is invoked with to run `errand`: the flags that put it in print mode and keep the
@@ -117,40 +119,40 @@ fn arguments(errand: &ProviderErrand) -> Result<Vec<OsString>, ProviderError> {
 /// caller asked for one shape, and the prose the CLI would otherwise fall back to is not it.
 ///
 /// The result's `usage` is the Errand's Usage, and its `total_cost_usd` a Cost Claude reported:
-/// print mode persists no conversation, so the running total it keeps is this run's alone.
-fn errand_answer(printed: &str) -> Result<ErrandAnswer, ProviderError> {
+/// print mode persists no conversation, so the running total it keeps is this run's alone. A
+/// result is printed for a failure as for an answer, so a failure carries both as well.
+fn errand_answer(printed: &str) -> Result<ErrandAnswer, ErrandFailed> {
     let printed = printed.trim();
     if printed.is_empty() {
-        return Err(claude_error(
-            "the Claude Code CLI printed no answer to an Errand",
-        ));
+        return Err(claude_error("the Claude Code CLI printed no answer to an Errand").into());
     }
     let result: ResultMessage = serde_json::from_str(printed).map_err(|error| {
         claude_error(format!(
             "the Claude Code CLI printed an invalid Errand result: {error}"
         ))
     })?;
-    if result.is_error || result.subtype != "success" {
-        // Already bounded and collapsed by the result itself, so it is not passed through
-        // `claude_error` a second time.
-        return Err(ProviderError::new(super::result_failure_message(
-            "Errand", &result,
-        )));
-    }
-    let reply = result.structured_output.ok_or_else(|| {
-        claude_error("the Claude Code CLI answered an Errand outside the schema it was given")
-    })?;
-    Ok(ErrandAnswer {
-        reply,
+    let consumption = ErrandConsumption {
         usage: result.usage.as_ref().map(result_usage),
         cost: result
             .total_cost_usd
             .and_then(Cost::from_usd)
-            .map(|cost| ErrandCost {
-                cost,
-                basis: CostBasis::Reported,
-            }),
-    })
+            .map(ErrandCost::reported),
+    };
+    if result.is_error || result.subtype != "success" {
+        // Already bounded and collapsed by the result itself, so it is not passed through
+        // `claude_error` a second time.
+        return Err(ErrandFailed::measured(
+            ProviderError::new(super::result_failure_message("Errand", &result)),
+            consumption,
+        ));
+    }
+    match result.structured_output {
+        Some(reply) => Ok(ErrandAnswer { reply, consumption }),
+        None => Err(ErrandFailed::measured(
+            claude_error("the Claude Code CLI answered an Errand outside the schema it was given"),
+            consumption,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -253,24 +255,66 @@ mod tests {
         .to_string();
         let answer = errand_answer(&printed).expect("a schema-shaped answer is an answer");
         assert_eq!(answer.reply, json!({ "title": "Fix the flicker" }));
-        assert_eq!(
-            answer.usage,
-            Some(Usage {
+        assert_eq!(answer.consumption, stated_consumption());
+    }
+
+    /// The `usage` and `total_cost_usd` every result below states, and what they read as.
+    fn stated(mut result: serde_json::Value) -> String {
+        result["total_cost_usd"] = json!(0.0041235);
+        result["usage"] = json!({
+            "input_tokens": 12,
+            "cache_creation_input_tokens": 1830,
+            "cache_read_input_tokens": 14211,
+            "output_tokens": 96,
+            "output_tokens_details": { "thinking_tokens": 40 },
+        });
+        result.to_string()
+    }
+
+    fn stated_consumption() -> ErrandConsumption {
+        ErrandConsumption {
+            usage: Some(Usage {
                 fresh_input_tokens: Some(12),
                 cache_read_tokens: Some(14211),
                 cache_write_tokens: Some(1830),
                 output_tokens: Some(56),
                 reasoning_tokens: Some(40),
                 native_meter: None,
-            })
+            }),
+            cost: Some(ErrandCost::reported(
+                Cost::from_usd(0.0041235).expect("a representable Cost"),
+            )),
+        }
+    }
+
+    /// An errored result spent what it states all the same, so the failure carries it.
+    #[test]
+    fn an_errored_result_carries_the_usage_and_cost_it_states() {
+        let printed = stated(json!({
+            "type": "result",
+            "subtype": "error_max_turns",
+            "is_error": true,
+            "errors": ["Reached maximum number of turns (1)"],
+        }));
+        let failed = errand_answer(&printed).expect_err("an errored result is a failed Errand");
+        assert_eq!(*failed.consumption, stated_consumption());
+    }
+
+    /// An answer outside the schema is no answer, but the tokens behind it were spent.
+    #[test]
+    fn an_answer_outside_the_schema_carries_the_usage_and_cost_it_states() {
+        let printed = stated(json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "Here is a title for you!",
+        }));
+        let failed = errand_answer(&printed).expect_err("prose is not the shape Suru asked for");
+        assert!(
+            failed.to_string().contains("outside the schema"),
+            "{failed}"
         );
-        assert_eq!(
-            answer.cost,
-            Some(ErrandCost {
-                cost: Cost::from_usd(0.0041235).expect("a representable Cost"),
-                basis: CostBasis::Reported,
-            })
-        );
+        assert_eq!(*failed.consumption, stated_consumption());
     }
 
     /// A CLI whose result states neither leaves both unknown rather than zero.
@@ -284,8 +328,7 @@ mod tests {
         })
         .to_string();
         let answer = errand_answer(&printed).expect("a schema-shaped answer is an answer");
-        assert_eq!(answer.usage, None);
-        assert_eq!(answer.cost, None);
+        assert_eq!(answer.consumption, ErrandConsumption::default());
     }
 
     #[test]

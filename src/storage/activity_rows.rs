@@ -35,7 +35,7 @@ impl<T: serde::de::DeserializeOwned> Spelled<T> {
     /// The `T` that `spelling`, read out of a payload, spells as the
     /// payload spells it, so a tally matches every variant the protocol
     /// knows and a variant added there is read here too.
-    fn of(spelling: Option<String>) -> Self {
+    pub(super) fn of(spelling: Option<String>) -> Self {
         use serde::de::{IntoDeserializer, value::StrDeserializer};
         let Some(spelling) = spelling else {
             return Self::Absent;

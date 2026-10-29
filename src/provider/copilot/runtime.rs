@@ -25,7 +25,7 @@ use crate::{
         SkillCatalog,
     },
     provider::{
-        ErrandAnswer, ManualCompaction, ProviderErrand, ProviderFuture, ProviderModelDiscovery,
+        ErrandFuture, ManualCompaction, ProviderErrand, ProviderFuture, ProviderModelDiscovery,
         ProviderRuntime, ProviderSessionConnection, ProviderSessionRequest,
         harness::{HarnessSpec, SharedHarness},
         resolve_executable,
@@ -225,7 +225,7 @@ impl ProviderRuntime for CopilotRuntime {
             settings.provider.copilot.permissions;
     }
 
-    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, ErrandAnswer> {
+    fn run_errand(&self, errand: ProviderErrand) -> ErrandFuture<'_> {
         Box::pin(async move {
             // The same shared process every Session and discovery runs on, launched here too if
             // this is the first demand since the server started or since a crash.

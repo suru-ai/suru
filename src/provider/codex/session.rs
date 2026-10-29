@@ -45,7 +45,7 @@ use crate::{
         SkillCatalog,
     },
     provider::{
-        ErrandAnswer, ManualCompaction, ProviderCompactionInput, ProviderDecisionDelivery,
+        ErrandFuture, ManualCompaction, ProviderCompactionInput, ProviderDecisionDelivery,
         ProviderErrand, ProviderError, ProviderFuture, ProviderInput, ProviderInterruption,
         ProviderModelDiscovery, ProviderResumeState, ProviderRuntime, ProviderSession,
         ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
@@ -271,7 +271,7 @@ impl ProviderRuntime for CodexRuntime {
     /// Codex fulfils an Errand through `codex exec`, its own one-shot mode:
     /// a separate, short-lived process from the app-server every Session is
     /// driven over, which persists nothing and is never resumed.
-    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, ErrandAnswer> {
+    fn run_errand(&self, errand: ProviderErrand) -> ErrandFuture<'_> {
         let executable = self.executable.clone();
         Box::pin(async move { super::errand::run(executable, errand).await })
     }

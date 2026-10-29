@@ -6,7 +6,7 @@ use suru::{
         SkillDescriptor, SkillId, SkillPromptDelivery,
     },
     provider::{
-        ErrandAnswer, ProviderErrand, ProviderError, ProviderFuture, ProviderModelDiscovery,
+        ErrandFuture, ProviderErrand, ProviderError, ProviderFuture, ProviderModelDiscovery,
         ProviderRuntime, ProviderSessionConnection, ProviderSessionRequest,
     },
     server::{self, ServerConfig},
@@ -70,11 +70,12 @@ impl ProviderRuntime for FailingProviderRuntime {
         })
     }
 
-    fn run_errand(&self, _errand: ProviderErrand) -> ProviderFuture<'_, ErrandAnswer> {
+    fn run_errand(&self, _errand: ProviderErrand) -> ErrandFuture<'_> {
         Box::pin(async {
-            Err(ProviderError::new(
-                "No Provider runtime is configured for this test server.",
-            ))
+            Err(
+                ProviderError::new("No Provider runtime is configured for this test server.")
+                    .into(),
+            )
         })
     }
 

@@ -15,7 +15,7 @@ use suru::protocol::{
     SkillDescriptor, SkillId, SkillPromptDelivery,
 };
 use suru::provider::{
-    AttributedProviderEvent, ErrandAnswer, ManualCompaction, ProviderCompactionInput,
+    AttributedProviderEvent, ErrandAnswer, ErrandFuture, ManualCompaction, ProviderCompactionInput,
     ProviderDecisionDelivery, ProviderErrand, ProviderError, ProviderEvent,
     ProviderEventAttribution, ProviderEventStream, ProviderFuture, ProviderInput,
     ProviderInterruption, ProviderModelDiscovery, ProviderPrompt, ProviderRuntime, ProviderSession,
@@ -1259,14 +1259,16 @@ impl ProviderRuntime for ControlledProviderRuntime {
             .clone()
     }
 
-    fn run_errand(&self, errand: ProviderErrand) -> ProviderFuture<'_, ErrandAnswer> {
+    fn run_errand(&self, errand: ProviderErrand) -> ErrandFuture<'_> {
         if *self
             .session_shaped_errands
             .lock()
             .expect("controlled Provider Errand mode lock is not poisoned")
         {
             let starts = self.errand_starts.clone();
-            return Box::pin(async move { run_errand_through_a_session(starts, errand).await });
+            return Box::pin(
+                async move { Ok(run_errand_through_a_session(starts, errand).await?) },
+            );
         }
         let errands = self.errands.clone();
         Box::pin(async move {
@@ -1277,9 +1279,9 @@ impl ProviderRuntime for ControlledProviderRuntime {
                     response: response_tx,
                 })
                 .map_err(|_| ProviderError::new("test Provider controller disconnected"))?;
-            response_rx
+            Ok(response_rx
                 .await
-                .map_err(|_| ProviderError::new("test Provider Errand was abandoned"))?
+                .map_err(|_| ProviderError::new("test Provider Errand was abandoned"))??)
         })
     }
 

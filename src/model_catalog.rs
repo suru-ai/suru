@@ -802,7 +802,7 @@ mod tests {
         fn run_errand(
             &self,
             _errand: crate::provider::ProviderErrand,
-        ) -> ProviderFuture<'_, crate::provider::ErrandAnswer> {
+        ) -> crate::provider::ErrandFuture<'_> {
             unimplemented!("catalog tests never run Errands")
         }
 

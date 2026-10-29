@@ -36,7 +36,7 @@ use std::{
 };
 
 use crate::{
-    errands::{ErrandLedger, ErrandRecord},
+    errands::{ErrandLedger, ErrandRecord, RecordRefused},
     model_catalog::RememberedProviderCatalog,
     protocol::{
         AgentSelection, SessionChange, SessionId, SessionStatus, SessionTimestamp, SessionUpdate,
@@ -1074,10 +1074,10 @@ pub(crate) fn is_turn_boundary(update: &SessionUpdate) -> bool {
 /// The storage writer keeps the Errand records the runner takes, landing each
 /// on its own thread so the runner never waits on SQLite.
 impl ErrandLedger for StorageSink {
-    fn record(&self, record: ErrandRecord) -> Result<(), StorageError> {
+    fn record(&self, record: ErrandRecord) -> Result<(), RecordRefused> {
         self.commands
             .send(WriterCommand::RecordErrand(Box::new(record)))
-            .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))
+            .map_err(|_| RecordRefused("the storage writer is no longer running".to_owned()))
     }
 }
 

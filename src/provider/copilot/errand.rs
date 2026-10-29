@@ -31,7 +31,9 @@ use super::{
     session::{lower_selection_options, until_crash},
     transport::CopilotConnection,
 };
-use crate::provider::{ErrandAnswer, ProviderErrand, ProviderError, harness::SharedHarnessHandle};
+use crate::provider::{
+    ErrandAnswer, ErrandFailed, ProviderErrand, ProviderError, harness::SharedHarnessHandle,
+};
 
 /// What a failure running an Errand is reported under: the work Suru asked for rather than the
 /// phase of it that went wrong.
@@ -44,7 +46,7 @@ const ERRAND_CONTEXT: &str = "Copilot Errand failed";
 pub(super) async fn run_copilot_errand(
     handle: SharedHarnessHandle<CopilotConnection>,
     errand: ProviderErrand,
-) -> Result<ErrandAnswer, ProviderError> {
+) -> Result<ErrandAnswer, ErrandFailed> {
     let config = errand_session_config(&errand)?;
     let native = until_crash(
         &handle,
@@ -64,7 +66,9 @@ pub(super) async fn run_copilot_errand(
     session.discard().await;
     replied_json(&replied_text(answered?)?)
         .map(ErrandAnswer::unmeasured)
-        .ok_or_else(|| copilot_error(format!("{ERRAND_CONTEXT}: Copilot answered with no JSON")))
+        .ok_or_else(|| {
+            copilot_error(format!("{ERRAND_CONTEXT}: Copilot answered with no JSON")).into()
+        })
 }
 
 /// The Copilot Session one Errand runs on: the least-capable, least-persistent Session the SDK will

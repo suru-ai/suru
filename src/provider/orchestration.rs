@@ -7808,11 +7808,8 @@ running 1 test",
             })
         }
 
-        fn run_errand(
-            &self,
-            _errand: ProviderErrand,
-        ) -> ProviderFuture<'_, crate::provider::ErrandAnswer> {
-            Box::pin(async { Err(ProviderError::new("no Errand is run")) })
+        fn run_errand(&self, _errand: ProviderErrand) -> crate::provider::ErrandFuture<'_> {
+            Box::pin(async { Err(ProviderError::new("no Errand is run").into()) })
         }
 
         fn errand_selection(&self) -> Option<AgentSelection> {

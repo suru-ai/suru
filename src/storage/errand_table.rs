@@ -8,10 +8,12 @@ use std::ops::Range;
 
 use diesel::prelude::*;
 
-use super::{StorageError, StorageRepository, connect, on_blocking_task, stamp_column};
+use serde::{Serialize, de::DeserializeOwned};
+
+use super::{Spelled, StorageError, StorageRepository, connect, on_blocking_task, stamp_column};
 use crate::{
-    errands::{ErrandOutcome, ErrandPurpose, ErrandRecord},
-    protocol::{Cost, CostBasis, ModelId, ProviderId, SessionTimestamp, Usage},
+    errands::ErrandRecord,
+    protocol::{Cost, ModelId, ProviderId, SessionTimestamp, Usage},
     provider::ErrandCost,
 };
 
@@ -34,15 +36,15 @@ diesel::table! {
 #[derive(Insertable)]
 #[diesel(table_name = errands)]
 struct NewErrandRow {
-    purpose: &'static str,
+    purpose: String,
     provider: String,
     model: String,
     began_at: i64,
     ended_at: i64,
-    outcome: &'static str,
+    outcome: String,
     usage: Option<String>,
     cost_nano_usd: Option<i64>,
-    cost_basis: Option<&'static str>,
+    cost_basis: Option<String>,
 }
 
 /// One Errand's row as read, in the order the table declares its columns.
@@ -70,17 +72,17 @@ impl NewErrandRow {
             .transpose()
             .map_err(|error| StorageError::WriteErrand(error.to_string()))?;
         Ok(Self {
-            purpose: record.purpose.as_str(),
+            purpose: spelling(record.purpose)?,
             provider: record.provider.as_str().to_owned(),
             model: record.model.as_str().to_owned(),
             began_at: stamp_column(record.began),
             ended_at: stamp_column(record.ended),
-            outcome: record.outcome.as_str(),
+            outcome: spelling(record.outcome)?,
             usage,
             cost_nano_usd: record
                 .cost
-                .map(|cost| i64::try_from(cost.cost.nano_usd()).unwrap_or(i64::MAX)),
-            cost_basis: record.cost.map(|cost| basis_column(cost.basis)),
+                .map(|cost| i64::try_from(cost.cost().nano_usd()).unwrap_or(i64::MAX)),
+            cost_basis: record.cost.map(|cost| spelling(cost.basis())).transpose()?,
         })
     }
 }
@@ -88,23 +90,20 @@ impl NewErrandRow {
 impl ErrandRow {
     /// The record the row spells, or why this Suru reads none from it.
     fn into_record(self) -> Result<ErrandRecord, String> {
-        let purpose = ErrandPurpose::spelled(&self.purpose)
-            .ok_or_else(|| format!("no purpose is spelled `{}`", self.purpose))?;
-        let outcome = ErrandOutcome::spelled(&self.outcome)
-            .ok_or_else(|| format!("no outcome is spelled `{}`", self.outcome))?;
+        let purpose = spelled(self.purpose, "purpose")?;
+        let outcome = spelled(self.outcome, "outcome")?;
         let usage = self
             .usage
             .map(|usage| serde_json::from_str::<Usage>(&usage))
             .transpose()
             .map_err(|error| format!("its Usage does not decode: {error}"))?;
         let cost = match (self.cost_nano_usd, self.cost_basis) {
-            (Some(nano_usd), Some(basis)) => Some(ErrandCost {
-                cost: Cost::from_nano_usd(
+            (Some(nano_usd), Some(basis)) => Some(ErrandCost::as_recorded(
+                Cost::from_nano_usd(
                     u64::try_from(nano_usd).map_err(|_| "its Cost is negative".to_owned())?,
                 ),
-                basis: basis_spelled(&basis)
-                    .ok_or_else(|| format!("no Cost Basis is spelled `{basis}`"))?,
-            }),
+                spelled(basis, "Cost Basis")?,
+            )),
             (None, None) => None,
             _ => return Err("its Cost and Cost Basis disagree on being known".to_owned()),
         };
@@ -125,17 +124,26 @@ fn timestamp(column: i64) -> SessionTimestamp {
     SessionTimestamp(u64::try_from(column).unwrap_or(0))
 }
 
-const fn basis_column(basis: CostBasis) -> &'static str {
-    match basis {
-        CostBasis::Reported => "reported",
-        CostBasis::Estimated => "estimated",
+/// How a column spells `value`: as serde spells it, so the purpose, outcome,
+/// and Cost Basis are spelled the one way their types already say.
+fn spelling(value: impl Serialize) -> Result<String, StorageError> {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(spelling)) => Ok(spelling),
+        Ok(other) => Err(StorageError::WriteErrand(format!(
+            "`{other}` spells no column"
+        ))),
+        Err(error) => Err(StorageError::WriteErrand(error.to_string())),
     }
 }
 
-fn basis_spelled(spelled: &str) -> Option<CostBasis> {
-    [CostBasis::Reported, CostBasis::Estimated]
-        .into_iter()
-        .find(|basis| basis_column(*basis) == spelled)
+/// The `T` a column spells as serde spells it, or why it spells none; `what`
+/// names the column for the Log.
+fn spelled<T: DeserializeOwned>(column: String, what: &str) -> Result<T, String> {
+    match Spelled::of(Some(column)) {
+        Spelled::Known(value) => Ok(value),
+        Spelled::Unknown(column) => Err(format!("no {what} is spelled `{column}`")),
+        Spelled::Absent => Err(format!("it has no {what}")),
+    }
 }
 
 impl StorageRepository {
@@ -153,9 +161,13 @@ impl StorageRepository {
 
     /// Every Errand recorded as beginning within `began` — from its start,
     /// up to but not including its end — earliest first, read on a blocking
-    /// task through the index on when each began. A row this Suru cannot
-    /// read, such as one a later Suru wrote with a purpose this one does not
-    /// know, is logged and left out rather than failing the read.
+    /// task through the index on when each began.
+    ///
+    /// A row this Suru cannot read is logged and left out rather than failing
+    /// the read. The schema version only guards the table's shape: a later
+    /// Suru that adds a purpose or outcome writes it without a migration, so
+    /// after a downgrade this Suru can meet a spelling it does not know, and a
+    /// figure missing one Errand is better than no figures at all.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "Usage Metrics reads Errand records from #585 on")
@@ -193,7 +205,11 @@ impl StorageRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::StorageWriter;
+    use crate::{
+        errands::{ErrandOutcome, ErrandPurpose},
+        protocol::CostBasis,
+        storage::StorageWriter,
+    };
 
     fn at(millis: u64) -> SessionTimestamp {
         SessionTimestamp(millis)
@@ -215,10 +231,7 @@ mod tests {
                 reasoning_tokens: Some(40),
                 native_meter: None,
             }),
-            cost: Some(ErrandCost {
-                cost: Cost::from_nano_usd(4_123_500),
-                basis: CostBasis::Reported,
-            }),
+            cost: Some(ErrandCost::reported(Cost::from_nano_usd(4_123_500))),
         }
     }
 
@@ -234,12 +247,21 @@ mod tests {
             cost: None,
             ..record(2_000, ErrandPurpose::TitleProposal)
         };
+        let estimated = ErrandRecord {
+            outcome: ErrandOutcome::Failed,
+            cost: Some(ErrandCost::as_recorded(
+                Cost::from_nano_usd(900),
+                CostBasis::Estimated,
+            )),
+            ..record(1_500, ErrandPurpose::WorkspaceDescription)
+        };
         {
             let repository = StorageRepository::open(data.path()).await.unwrap();
             for written in [
                 record(3_000, ErrandPurpose::WorkspaceDescription),
                 record(999, ErrandPurpose::SessionTitle),
                 unmeasured.clone(),
+                estimated.clone(),
                 record(1_000, ErrandPurpose::SessionTitle),
             ] {
                 repository.record_errand(&written).unwrap();
@@ -252,7 +274,11 @@ mod tests {
                 .errand_records(at(1_000)..at(3_000))
                 .await
                 .unwrap(),
-            vec![record(1_000, ErrandPurpose::SessionTitle), unmeasured]
+            vec![
+                record(1_000, ErrandPurpose::SessionTitle),
+                estimated,
+                unmeasured
+            ]
         );
         assert_eq!(
             repository
