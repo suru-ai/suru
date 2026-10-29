@@ -18,12 +18,16 @@ use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    protocol::{Cost, CountedCost, QuarterHourTurns},
+    protocol::{CountedCost, QuarterHourTurns},
     theme::Theme,
 };
 
 use super::{
-    super::{super::slots::truncate_to_width, calendar::MetricsRange, chart::MetricsMeasure},
+    super::{
+        super::slots::truncate_to_width,
+        calendar::MetricsRange,
+        chart::{Figure, MetricsMeasure},
+    },
     InsightsPanel, InsightsView,
     turns::counted,
 };
@@ -237,11 +241,10 @@ fn named_cell(heatmap: &Heatmap, day: usize, hour: usize) -> String {
     }
     parts.push(counted(cell.turns));
     if let Some(tokens) = cell.tokens {
-        parts.push(MetricsMeasure::Tokens.total(tokens, false));
+        parts.push(MetricsMeasure::Tokens.total(Figure::measured(tokens)));
     }
     if cell.cost.counts_work() {
-        let cost = cell.cost.amount.map_or(0, Cost::nano_usd);
-        parts.push(MetricsMeasure::Cost.total(cost, cell.cost.is_partial));
+        parts.push(MetricsMeasure::Cost.total(Figure::from(cell.cost)));
     }
     parts.join(" · ")
 }
@@ -275,7 +278,7 @@ fn local_hour(quarter: &QuarterHourTurns, zone: &TimeZone) -> Option<(usize, usi
 mod tests {
     use jiff::{civil::DateTime, civil::date, tz::TimeZone};
 
-    use super::{Heatmap, HourCell};
+    use super::{Heatmap, HourCell, named_cell};
     use crate::protocol::{Cost, CountedCost, QUARTER_HOUR_MS, QuarterHourTurns, SessionTimestamp};
 
     const MONDAY: usize = 0;
@@ -471,5 +474,26 @@ mod tests {
             }
         );
         assert_eq!(heatmap.busiest(), 3);
+    }
+
+    #[test]
+    fn a_cell_whose_work_counts_no_amount_reads_unpriced_never_a_zero() {
+        let utc = TimeZone::UTC;
+        let unpriced = QuarterHourTurns {
+            start: quarter(date(2026, 10, 26).at(9, 0, 0, 0), 0, 0).start,
+            turns: 2,
+            tokens: None,
+            cost: CountedCost {
+                amount: None,
+                is_partial: true,
+            },
+        };
+
+        let heatmap = Heatmap::fold(&[unpriced], &utc);
+
+        assert_eq!(
+            named_cell(&heatmap, MONDAY, 9),
+            "Mon 09:00–10:00 · 2 Turns · unpriced"
+        );
     }
 }

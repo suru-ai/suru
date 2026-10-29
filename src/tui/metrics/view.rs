@@ -30,7 +30,7 @@ use super::{
     BREAKDOWNS, BarStrip, FocusedRow, LEGEND_SERIES, MetricsContent, MetricsReadRefusal,
     MetricsTab, MetricsView, OfferedBreakdown,
     calendar::{MetricsRange, RangeBuckets},
-    chart::{self, MetricsMeasure, Series},
+    chart::{self, Figure, MetricsMeasure, Series},
     headline::{self, HEADLINE_ROWS},
     mix::{self, MIX_ROWS},
 };
@@ -667,9 +667,8 @@ fn render_tabs<const N: usize>(
 /// that bucket's in their place, so the legend is the bar's tooltip.
 struct Legend {
     heading: String,
-    /// Each series' figure, and whether it says less than was consumed, in
-    /// the series' order.
-    figures: Vec<(u64, bool)>,
+    /// Each series' figure, in the series' order.
+    figures: Vec<Figure>,
     /// The whole each figure's share is of.
     whole: u64,
     /// Whether the figures count more than the whole, as Sessions under
@@ -688,20 +687,17 @@ impl Legend {
     /// Turns.
     fn new(
         name: String,
-        figures: Vec<(u64, bool)>,
+        figures: Vec<Figure>,
         measure: MetricsMeasure,
         whole: &UsageMetricsAggregate,
         counts: bool,
     ) -> Self {
         let total = measure.value(whole);
-        let mut heading = format!(
-            "{name} · {}",
-            measure.total(total, measure.is_partial(whole))
-        );
+        let mut heading = format!("{name} · {}", measure.total(measure.figure_of(whole)));
         if counts {
             if measure != MetricsMeasure::Sessions {
                 heading.push_str(" · ");
-                heading.push_str(&MetricsMeasure::Sessions.total(whole.sessions, false));
+                heading.push_str(&MetricsMeasure::Sessions.total(Figure::measured(whole.sessions)));
             }
             heading.push_str(" · ");
             heading.push_str(&chart::counted(whole.turns, "Turn", "Turns"));
@@ -722,10 +718,7 @@ impl Legend {
         range: MetricsRange,
         whole: &UsageMetricsAggregate,
     ) -> Self {
-        let figures = series
-            .iter()
-            .map(|series| (series.total, series.is_partial))
-            .collect();
+        let figures = series.iter().map(|series| series.total).collect();
         Self::new(range.title().to_owned(), figures, measure, whole, false)
     }
 
@@ -743,12 +736,7 @@ impl Legend {
         let whole = &report.buckets.get(index)?.total;
         let figures = series
             .iter()
-            .map(|series| {
-                (
-                    series.values.get(index).copied().unwrap_or(0),
-                    series.partials.get(index).copied().unwrap_or(false),
-                )
-            })
+            .map(|series| series.figures.get(index).copied().unwrap_or_default())
             .collect();
         let name = chart::bucket_heading(bucket, buckets.unit);
         Some(Self::new(name, figures, measure, whole, true))
@@ -794,7 +782,7 @@ fn render_legend(
     let values: Vec<String> = legend
         .figures
         .iter()
-        .map(|(figure, is_partial)| measure.figure(*figure, *is_partial))
+        .map(|figure| measure.stated(*figure))
         .collect();
     let value_width = values.iter().map(|value| value.width()).max().unwrap_or(0);
     // Series stand in the same order whatever the measure, so the largest
@@ -802,7 +790,7 @@ fn render_legend(
     let largest = legend
         .figures
         .iter()
-        .map(|(figure, _)| *figure)
+        .map(|figure| figure.value)
         .max()
         .unwrap_or(0)
         .max(1);
@@ -811,9 +799,10 @@ fn render_legend(
     let bar_room = usize::from(area.width)
         .saturating_sub(fixed)
         .min(usize::from(LEGEND_BAR));
-    for (row, ((series, value), (figure, _))) in
+    for (row, ((series, value), figure)) in
         series.iter().zip(&values).zip(&legend.figures).enumerate()
     {
+        let figure = &figure.value;
         let Some(y) = u16::try_from(row + 1)
             .ok()
             .map(|row| area.y + row)
@@ -894,11 +883,10 @@ impl Flowed {
             .iter()
             .map(|series| {
                 series
-                    .values
+                    .figures
                     .iter()
-                    .zip(&series.partials)
-                    .map(|(value, partial)| measure.figure(*value, *partial).width())
-                    .chain([measure.figure(series.total, series.is_partial).width()])
+                    .chain([&series.total])
+                    .map(|figure| measure.stated(*figure).width())
                     .max()
                     .unwrap_or(0)
             })
@@ -969,7 +957,7 @@ fn render_flowed_legend(
     );
     let focused = view.focused_row();
     let room = usize::from(area.width);
-    for (place, (((series, (x, line)), (label_width, value_width)), (figure, is_partial))) in series
+    for (place, (((series, (x, line)), (label_width, value_width)), figure)) in series
         .iter()
         .zip(&flowed.places)
         .zip(flowed.label_widths.iter().zip(&flowed.value_widths))
@@ -1003,7 +991,7 @@ fn render_flowed_legend(
         let padding = " ".repeat(label_width.saturating_sub(label.width()));
         let text = format!(
             "{label}{padding} {value:>value_width$}",
-            value = measure.figure(*figure, *is_partial),
+            value = measure.stated(*figure),
         );
         let left = room.saturating_sub(usize::from(*x) + 2);
         let text = truncate_to_width(&text, left);
@@ -1032,10 +1020,10 @@ fn overlap_note(breakdown: UsageMetricsBreakdown) -> String {
 /// Whether `figures` count more than `whole` does, as a measure that does
 /// not add up can: a Session that worked under several keys counts once
 /// under each and once in the whole.
-fn overcounts(figures: &[(u64, bool)], measure: MetricsMeasure, whole: u64) -> bool {
+fn overcounts(figures: &[Figure], measure: MetricsMeasure, whole: u64) -> bool {
     let counted = figures
         .iter()
-        .map(|(figure, _)| *figure)
+        .map(|figure| figure.value)
         .fold(0, u64::saturating_add);
     !measure.adds_up() && counted > whole
 }

@@ -1460,7 +1460,7 @@ fn cost_is_shown_first_in_dollars_with_a_plus_after_every_partial_figure() {
     for (label, figures) in [
         ("Claude Opus 5.5", ["$90.00 ", "75%"]),
         ("GPT-5.5 Codex", ["$30.00 ", "25%"]),
-        ("copilot · GPT-5.5", ["$0.00+", "0%"]),
+        ("copilot · GPT-5.5", ["unpriced", "0%"]),
     ] {
         let line = row(&rows, label);
         for figure in figures {
@@ -1500,7 +1500,7 @@ fn work_with_no_known_cost_is_not_shown_as_no_usage() {
 
     let rows = screen(&application);
     assert!(!rows.join("\n").contains("No Usage"), "{rows:#?}");
-    row(&rows, "Last 30 days · $0.00+");
+    row(&rows, "Last 30 days · unpriced");
 }
 
 #[test]
@@ -2320,7 +2320,7 @@ fn a_selected_bar_reads_its_own_figures_in_the_legend() {
     press(&mut application, 'c');
     assert_eq!(
         legend_heading(&application),
-        "Tue 13 Oct · $0.00 · 3 Sessions · 30 Turns"
+        "Tue 13 Oct · — · 3 Sessions · 30 Turns"
     );
 
     // Sessions count the bucket's distinct total, which the Models overcount.
@@ -2368,7 +2368,7 @@ fn a_selected_bar_s_cost_is_partial_where_its_own_work_is() {
     for (label, figures) in [
         ("Claude Opus 5.5", ["$5.00 ", "71%"]),
         ("GPT-5.5 Codex", ["$2.00 ", "29%"]),
-        ("copilot · GPT-5.5", ["$0.00+", "0%"]),
+        ("copilot · GPT-5.5", ["unpriced", "0%"]),
     ] {
         let line = row(&rows, label);
         for figure in figures {
@@ -3969,9 +3969,11 @@ fn at_eighty_columns_today_thirty_days_and_a_year_show_every_control_and_the_leg
             "{controls:?}"
         );
 
-        // The legend's series flow along one line beneath its heading.
+        // The legend's series flow along the lines beneath its heading, each
+        // whole: an unpriced figure is wider than a priced one, so the last
+        // flows onto a line of its own.
         let at = rendered_row(&rows, heading);
-        let line = &rows[at + 1];
+        let line = &format!("{}{}", rows[at + 1], rows[at + 2]);
         assert!(
             in_order(
                 line,
@@ -3981,7 +3983,7 @@ fn at_eighty_columns_today_thirty_days_and_a_year_show_every_control_and_the_leg
                     "█ GPT-5.5 Codex",
                     "$",
                     "█ copilot · GPT-5.5",
-                    "$0.00+"
+                    "unpriced"
                 ]
             ),
             "{range_key}: {line:?}"

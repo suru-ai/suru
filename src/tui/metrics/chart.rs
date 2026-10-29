@@ -11,8 +11,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     protocol::{
-        Cost, UsageMetricsAggregate, UsageMetricsBucket, UsageMetricsKey, UsageMetricsKeyLabel,
-        UsageMetricsReport,
+        Cost, CountedCost, UsageMetricsAggregate, UsageMetricsBucket, UsageMetricsKey,
+        UsageMetricsKeyLabel, UsageMetricsReport,
     },
     theme::Theme,
 };
@@ -61,6 +61,16 @@ impl MetricsMeasure {
             .expect("every measure is listed")
     }
 
+    /// `aggregate`'s figure in the measure, as a surface states it.
+    pub(crate) fn figure_of(self, aggregate: &UsageMetricsAggregate) -> Figure {
+        match self {
+            Self::Cost => Figure::from(aggregate.cost),
+            Self::Tokens | Self::Sessions => Figure::measured(self.value(aggregate)),
+        }
+    }
+
+    /// `aggregate`'s figure in the measure as the chart plots it: none
+    /// where nothing was measured.
     pub(crate) fn value(self, aggregate: &UsageMetricsAggregate) -> u64 {
         match self {
             Self::Cost => aggregate.cost.amount.map_or(0, Cost::nano_usd),
@@ -111,12 +121,65 @@ impl MetricsMeasure {
         if is_partial { figure + "+" } else { figure }
     }
 
-    /// A range's whole, named in the measure's unit.
-    pub(crate) fn total(self, value: u64, is_partial: bool) -> String {
+    /// A figure as every surface of both tabs states it: its value, `+`
+    /// where it is partial; or, where it measured nothing, whether that is
+    /// for want of a price or of any work — never a zero nobody measured.
+    /// The chart plots such a figure at no height all the same.
+    pub(crate) fn stated(self, figure: Figure) -> String {
+        match (figure.is_measured, figure.is_partial) {
+            (true, is_partial) => self.figure(figure.value, is_partial),
+            (false, true) => "unpriced".to_owned(),
+            (false, false) => "—".to_owned(),
+        }
+    }
+
+    /// A range's whole, named in the measure's unit, stated as
+    /// [`Self::stated`] states a figure.
+    pub(crate) fn total(self, figure: Figure) -> String {
         match self {
-            Self::Cost => self.figure(value, is_partial),
-            Self::Tokens => format!("{} tokens", self.figure(value, is_partial)),
-            Self::Sessions => counted(value, "Session", "Sessions"),
+            Self::Cost => self.stated(figure),
+            Self::Tokens => format!("{} tokens", self.stated(figure)),
+            Self::Sessions => counted(figure.value, "Session", "Sessions"),
+        }
+    }
+}
+
+/// A figure of a measure: its value, which the chart plots, whether
+/// anything was measured at all — only a Cost with no known amount was
+/// not — and whether it says less than was consumed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Figure {
+    pub(crate) value: u64,
+    pub(crate) is_measured: bool,
+    pub(crate) is_partial: bool,
+}
+
+impl Figure {
+    /// A whole figure that was measured, as every count is.
+    pub(crate) fn measured(value: u64) -> Self {
+        Self {
+            value,
+            is_measured: true,
+            is_partial: false,
+        }
+    }
+
+    /// This figure and `other` stated as one.
+    pub(crate) fn add(self, other: Self) -> Self {
+        Self {
+            value: self.value.saturating_add(other.value),
+            is_measured: self.is_measured || other.is_measured,
+            is_partial: self.is_partial || other.is_partial,
+        }
+    }
+}
+
+impl From<CountedCost> for Figure {
+    fn from(cost: CountedCost) -> Self {
+        Self {
+            value: cost.amount.map_or(0, Cost::nano_usd),
+            is_measured: cost.amount.is_some(),
+            is_partial: cost.is_partial,
         }
     }
 }
@@ -147,16 +210,10 @@ pub(crate) struct Series {
     pub(crate) label: String,
     pub(crate) color: Color,
     /// The series' figure in each bucket, in the order of the buckets.
-    pub(crate) values: Vec<u64>,
-    /// Whether each of those figures says less than the key's Turns in that
-    /// bucket consumed.
-    pub(crate) partials: Vec<bool>,
+    pub(crate) figures: Vec<Figure>,
     /// The series' figure over the buckets taken together, which for a
-    /// measure that does not add up is not its values added.
-    pub(crate) total: u64,
-    /// Whether the total says less than the key's Turns consumed, as a
-    /// partial Cost does.
-    pub(crate) is_partial: bool,
+    /// measure that does not add up is not its figures added.
+    pub(crate) total: Figure,
 }
 
 /// The most keys a chart stacks as series of their own; the rest fold into
@@ -195,24 +252,14 @@ pub(crate) fn series(
     kept_apart: Option<&UsageMetricsKey>,
 ) -> Vec<Series> {
     let (ranked, folded) = ranked(report, kept_apart);
-    let values = |keys: &[RankedKey<'_>]| {
+    let figures = |keys: &[RankedKey<'_>]| {
         report
             .buckets
             .iter()
             .map(|bucket| {
                 keys.iter()
-                    .map(|(label, _)| measure.value(&part(bucket, &label.key)))
-                    .fold(0, u64::saturating_add)
-            })
-            .collect()
-    };
-    let partials = |keys: &[RankedKey<'_>]| {
-        report
-            .buckets
-            .iter()
-            .map(|bucket| {
-                keys.iter()
-                    .any(|(label, _)| measure.is_partial(&part(bucket, &label.key)))
+                    .map(|(label, _)| measure.figure_of(&part(bucket, &label.key)))
+                    .fold(Figure::default(), Figure::add)
             })
             .collect()
     };
@@ -224,10 +271,8 @@ pub(crate) fn series(
             id: SeriesId::Key(keyed.0.key.clone()),
             label: keyed.0.label.clone(),
             color: palette[place % palette.len()],
-            values: values(std::slice::from_ref(keyed)),
-            partials: partials(std::slice::from_ref(keyed)),
-            total: measure.value(&keyed.1),
-            is_partial: measure.is_partial(&keyed.1),
+            figures: figures(std::slice::from_ref(keyed)),
+            total: measure.figure_of(&keyed.1),
         })
         .collect();
     if !folded.is_empty() {
@@ -235,13 +280,11 @@ pub(crate) fn series(
             id: SeriesId::Other,
             label: OTHER.to_owned(),
             color: other_color(theme),
-            values: values(&folded),
-            partials: partials(&folded),
+            figures: figures(&folded),
             total: folded
                 .iter()
-                .map(|(_, whole)| measure.value(whole))
-                .fold(0, u64::saturating_add),
-            is_partial: folded.iter().any(|(_, whole)| measure.is_partial(whole)),
+                .map(|(_, whole)| measure.figure_of(whole))
+                .fold(Figure::default(), Figure::add),
         });
     }
     series
@@ -580,7 +623,12 @@ impl ChartLayout {
             return None;
         }
         let max = (0..buckets.len())
-            .map(|index| series.iter().map(|series| series.values[index]).sum())
+            .map(|index| {
+                series
+                    .iter()
+                    .map(|series| series.figures[index].value)
+                    .sum()
+            })
             .max()
             .unwrap_or(0u64);
         // A tick every other row at most, so the axis never reads as a
@@ -721,7 +769,7 @@ pub(crate) fn render_chart(
         let mut boundaries = Vec::with_capacity(series.len());
         let mut running: u128 = 0;
         for series in series {
-            running += u128::from(series.values[index]);
+            running += u128::from(series.figures[index].value);
             let ends = (running * eighths + u128::from(axis.top) / 2) / u128::from(axis.top);
             boundaries.push((u32::try_from(ends).unwrap_or(u32::MAX), series.color));
         }

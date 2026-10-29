@@ -13,7 +13,7 @@ use super::{
         usage::{compact_cost, compact_count},
     },
     calendar::MetricsRange,
-    chart::{MetricsMeasure, counted},
+    chart::{Figure, MetricsMeasure, counted},
 };
 
 /// The rows the headline takes: its figures, their comparisons, and what
@@ -226,17 +226,17 @@ fn columns(whole: &UsageMetricsAggregate, before: Option<&UsageMetricsAggregate>
 
     let mut columns = vec![
         Column {
-            figure: MetricsMeasure::Cost.total(cost(whole), whole.cost.is_partial),
+            figure: MetricsMeasure::Cost.total(MetricsMeasure::Cost.figure_of(whole)),
             compared: change(cost),
             detail: estimated,
         },
         Column {
-            figure: MetricsMeasure::Tokens.total(tokens(whole), false),
+            figure: MetricsMeasure::Tokens.total(Figure::measured(tokens(whole))),
             compared: change(tokens),
             detail: None,
         },
         Column {
-            figure: MetricsMeasure::Sessions.total(whole.sessions, false),
+            figure: MetricsMeasure::Sessions.total(Figure::measured(whole.sessions)),
             compared: change(sessions),
             detail: subagents,
         },

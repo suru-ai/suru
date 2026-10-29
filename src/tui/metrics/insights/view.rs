@@ -28,7 +28,11 @@ use unicode_width::UnicodeWidthStr;
 use crate::{protocol::CountedCost, theme::Theme};
 
 use super::{
-    super::{MetricsReadRefusal, calendar::MetricsRange, chart::MetricsMeasure},
+    super::{
+        MetricsReadRefusal,
+        calendar::MetricsRange,
+        chart::{Figure, MetricsMeasure},
+    },
     Column, InsightsContent, InsightsPanel, InsightsView, KeptReport, Place, approvals, cache,
     compactions, delegation, heatmap, tools, turns, workspaces,
 };
@@ -428,15 +432,10 @@ pub(super) fn bar(part: u64, whole: u64, width: usize) -> String {
     bar
 }
 
-/// A Cost as a panel states it: its amount, `+` where it is partial; or,
-/// where it counts no amount, whether that is for want of work or of a
-/// price, never a zero nobody measured.
+/// A Cost as a panel states it, on the terms every figure of either tab
+/// is stated: see [`MetricsMeasure::stated`].
 pub(super) fn stated_cost(cost: CountedCost) -> String {
-    match (cost.amount, cost.is_partial) {
-        (Some(cost), is_partial) => MetricsMeasure::Cost.figure(cost.nano_usd(), is_partial),
-        (None, true) => "unpriced".to_owned(),
-        (None, false) => "—".to_owned(),
-    }
+    MetricsMeasure::Cost.stated(Figure::from(cost))
 }
 
 #[cfg(test)]
