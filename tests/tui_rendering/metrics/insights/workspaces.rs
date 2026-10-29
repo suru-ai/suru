@@ -86,7 +86,7 @@ pub(super) fn spent(query: &UsageMetricsQuery, spent: &[(&str, f64, bool)]) -> U
         untimed: UsageMetricsBucket::default(),
         across_buckets_and_untimed: total,
         comparison: None,
-        earliest_turn_at: query.buckets.first().map(|bucket| bucket.start),
+        earliest_at: query.buckets.first().map(|bucket| bucket.start),
         keys: spent
             .iter()
             .map(|(label, _, _)| UsageMetricsKeyLabel {

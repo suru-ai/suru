@@ -178,9 +178,9 @@ pub(super) struct MetricsView {
     alone: Option<SeriesId>,
     /// The row of one of the view's lists the keyboard acts on.
     focused: Option<ListRow>,
-    /// When the earliest timed Turn was, as the last report since opening
-    /// said, from which All time begins.
-    earliest: EarliestTurn,
+    /// When the earliest work was placed — a timed Turn, or an Errand —
+    /// as the last report since opening said, from which All time begins.
+    earliest: EarliestWork,
     /// Where the last frame drew what a pointer can act on.
     targets: Cell<Targets>,
     /// The Insights tab's reports and focus.
@@ -222,25 +222,26 @@ pub(super) enum FocusMove {
 /// What a read the view awaits asked for.
 #[derive(Clone, Debug)]
 enum Asked {
-    /// No buckets at all, only when the earliest timed Turn was, which All
-    /// time must learn before it can cut its own.
-    EarliestTurn,
+    /// No buckets at all, only when the earliest work was placed, which
+    /// All time must learn before it can cut its own.
+    EarliestWork,
     /// The range's buckets, as the calendar cut them.
     Range(RangeBuckets),
 }
 
-/// What the view knows of the earliest timed Turn on the Server.
+/// What the view knows of the earliest work the Server places in time: a
+/// timed Turn, or an Errand.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum EarliestTurn {
+enum EarliestWork {
     /// No report since the view opened has said.
     #[default]
     Unknown,
-    /// A report said no Turn is timed.
+    /// A report said no work is placed in time.
     Untimed,
     At(SessionTimestamp),
 }
 
-impl From<Option<SessionTimestamp>> for EarliestTurn {
+impl From<Option<SessionTimestamp>> for EarliestWork {
     fn from(earliest: Option<SessionTimestamp>) -> Self {
         earliest.map_or(Self::Untimed, Self::At)
     }
@@ -366,7 +367,7 @@ impl MetricsView {
         self.kept_apart = None;
         self.alone = None;
         self.focused = None;
-        self.earliest = EarliestTurn::Unknown;
+        self.earliest = EarliestWork::Unknown;
     }
 
     /// Lets go of every figure, and every read awaited, that is not of the
@@ -384,7 +385,7 @@ impl MetricsView {
             .any(|origin| origin != outlook);
         if elsewhere {
             self.forget_figures();
-            self.earliest = EarliestTurn::Unknown;
+            self.earliest = EarliestWork::Unknown;
         }
         self.insights.keep_only(outlook);
     }
@@ -720,9 +721,9 @@ impl MetricsView {
     /// already shown stays until the answer replaces it. A moment the
     /// calendar cannot place is refused in the view instead.
     ///
-    /// All time begins with the earliest timed Turn's month, so before any
+    /// All time begins with the earliest timed work's month, so before any
     /// report has said when that was, it asks for no buckets at all: a read
-    /// that answers with nothing but the earliest Turn, from which
+    /// that answers with nothing but the earliest work, from which
     /// [`Self::receive`] has the view read again.
     pub(super) fn ask(
         &mut self,
@@ -731,11 +732,11 @@ impl MetricsView {
         zone: &TimeZone,
     ) -> Option<(Uuid, UsageMetricsQuery)> {
         let earliest = match self.earliest {
-            EarliestTurn::Unknown if self.range == MetricsRange::AllTime => {
-                return Some(self.await_answer(origin, Asked::EarliestTurn, Vec::new(), None));
+            EarliestWork::Unknown if self.range == MetricsRange::AllTime => {
+                return Some(self.await_answer(origin, Asked::EarliestWork, Vec::new(), None));
             }
-            EarliestTurn::At(earliest) => Some(earliest),
-            EarliestTurn::Unknown | EarliestTurn::Untimed => None,
+            EarliestWork::At(earliest) => Some(earliest),
+            EarliestWork::Unknown | EarliestWork::Untimed => None,
         };
         let Some(buckets) = calendar::resolve(self.range, now, zone, earliest) else {
             self.refuse(MetricsReadRefusal::Failed(
@@ -773,7 +774,7 @@ impl MetricsView {
 
     /// Takes the Server's answer, unless the view has since closed or asked
     /// again, and says whether the view must read again: after All time has
-    /// learned when the earliest Turn was, or of a Turn earlier than the
+    /// learned when the earliest work was, or of work earlier than the
     /// buckets it asked for begin.
     pub(super) fn receive(
         &mut self,
@@ -795,16 +796,16 @@ impl MetricsView {
                 return Receipt::Settled;
             }
         };
-        let earliest = EarliestTurn::from(report.earliest_turn_at);
-        // Asked again only for an earliest Turn the cut did not begin from,
+        let earliest = EarliestWork::from(report.earliest_at);
+        // Asked again only for earliest work the cut did not begin from,
         // so a read whose buckets cannot reach back that far is asked once.
         let learned = self.earliest != earliest;
         self.earliest = earliest;
         let buckets = match asked {
-            Asked::EarliestTurn => return Receipt::ReadAgain,
+            Asked::EarliestWork => return Receipt::ReadAgain,
             Asked::Range(buckets) => buckets,
         };
-        let uncovered = report.earliest_turn_at.is_some_and(|earliest| {
+        let uncovered = report.earliest_at.is_some_and(|earliest| {
             buckets
                 .buckets
                 .first()

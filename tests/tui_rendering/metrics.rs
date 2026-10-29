@@ -157,7 +157,7 @@ fn report(query: &UsageMetricsQuery) -> UsageMetricsReport {
         untimed: UsageMetricsBucket::default(),
         across_buckets_and_untimed: UsageMetricsAggregate::default(),
         comparison: None,
-        earliest_turn_at: query.buckets.first().map(|bucket| bucket.start),
+        earliest_at: query.buckets.first().map(|bucket| bucket.start),
         // Listed smallest first, so the chart's order is its own.
         keys: vec![
             UsageMetricsKeyLabel {
@@ -514,7 +514,7 @@ fn a_range_without_usage_says_so() {
             untimed: UsageMetricsBucket::default(),
             across_buckets_and_untimed: UsageMetricsAggregate::default(),
             comparison: None,
-            earliest_turn_at: None,
+            earliest_at: None,
             keys: Vec::new(),
             across_buckets: UsageMetricsBucket::default(),
         }),
@@ -911,7 +911,7 @@ fn empty_report(
         untimed: UsageMetricsBucket::default(),
         across_buckets_and_untimed: UsageMetricsAggregate::default(),
         comparison: None,
-        earliest_turn_at: earliest,
+        earliest_at: earliest,
         keys: Vec::new(),
         across_buckets: UsageMetricsBucket::default(),
     }
@@ -1982,7 +1982,7 @@ fn many_workspaces(query: &UsageMetricsQuery, keys: u64) -> UsageMetricsReport {
         untimed: UsageMetricsBucket::default(),
         across_buckets_and_untimed: UsageMetricsAggregate::default(),
         comparison: None,
-        earliest_turn_at: query.buckets.first().map(|bucket| bucket.start),
+        earliest_at: query.buckets.first().map(|bucket| bucket.start),
         // By identity, which says nothing of their size.
         keys: (0..keys)
             .rev()

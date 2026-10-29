@@ -2,7 +2,7 @@
 //! the reader's own local boundaries, and the interval each is compared
 //! with. The Server knows nothing of calendars or time zones, so the reader
 //! resolves them here, a pure function of the range, the moment now, the
-//! zone, and — for All time — the earliest timed Turn, and asks for the
+//! zone, and — for All time — the earliest timed work, and asks for the
 //! intervals.
 
 use jiff::{
@@ -25,7 +25,7 @@ pub enum MetricsRange {
     ThirtyDays,
     /// This calendar month and the 11 before it, a bucket each.
     Year,
-    /// Every calendar month since the earliest timed Turn's, gathered into
+    /// Every calendar month since the earliest timed work's, gathered into
     /// quarters past [`ALL_TIME_MONTHS`] months and into years past
     /// [`ALL_TIME_QUARTERS`] quarters' worth of them.
     AllTime,
@@ -83,7 +83,7 @@ impl MetricsRange {
 
     /// How long the range is in the reader's calendar, ending with the
     /// present: so many local days or calendar months. All time has no
-    /// length of its own; it runs from the earliest timed Turn.
+    /// length of its own; it runs from the earliest timed work.
     pub(crate) fn length(self) -> Option<RangeLength> {
         match self {
             Self::Today => Some(RangeLength::Days(1)),
@@ -234,7 +234,7 @@ pub(crate) fn span(
 }
 
 /// The buckets `range` divides into at `now` in `zone`. All time begins
-/// with the month of `earliest`, the earliest timed Turn, and is this month
+/// with the month of `earliest`, the earliest timed work, and is this month
 /// alone where no Turn is timed; no other range consults it. `None` where
 /// `now` lies beyond what the calendar can place.
 ///
@@ -471,7 +471,7 @@ mod tests {
     }
 
     /// The buckets `range` divides into at `now` in the zone named, for a
-    /// range that does not consult the earliest Turn.
+    /// range that does not consult the earliest work.
     fn cut(range: MetricsRange, now: SessionTimestamp, zone_name: &str) -> Vec<CalendarBucket> {
         resolve(range, now, &zone(zone_name), None)
             .expect("a moment the calendar places")
@@ -691,7 +691,7 @@ mod tests {
         assert!(contiguous(&cut.buckets));
 
         // A quarter begins on the first of its first month, wherever in it
-        // the earliest Turn fell.
+        // the earliest work fell.
         let cut = all_time_since(date(2014, 11, 15).at(0, 0, 0, 0), now);
         assert_eq!(cut.unit, BucketUnit::Quarter, "twelve years exactly");
         assert_eq!(cut.buckets.len(), 49);

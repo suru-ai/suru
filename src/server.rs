@@ -3731,9 +3731,11 @@ async fn context_breakdown(
     }
 }
 
-/// Usage Metrics of every Session living on this Server. The query rides
-/// the body, since its buckets are too many for a query string; the read
-/// changes nothing and reads no history in, so it passes no hydration.
+/// Usage Metrics of every Session living on this Server, and of the
+/// Errands it ran. The query rides the body, since its buckets are too many
+/// for a query string; the read changes nothing and reads no history in, so
+/// it passes no hydration. The Errands it counts are read from storage, and
+/// a failure to read them is the Server's.
 async fn read_usage_metrics(State(state): State<AppState>, request: Request) -> Response {
     let query =
         match decode_session_command::<UsageMetricsQuery>(&state, request, "Usage Metrics read")
@@ -3742,32 +3744,33 @@ async fn read_usage_metrics(State(state): State<AppState>, request: Request) -> 
             Ok(query) => query,
             Err(response) => return response,
         };
-    match state.sessions.usage_metrics(
-        &query,
-        &state.model_catalog.current(),
-        &state.workspace_paths,
-    ) {
-        Ok(report) => Json(report).into_response(),
-        Err(refusal) => session_error_response(
-            StatusCode::BAD_REQUEST,
-            SessionErrorCode::InvalidUsageMetricsQuery,
-            match refusal {
-                UsageMetricsRefusal::TooManyBuckets => format!(
-                    "A Usage Metrics query asks for at most {MAX_USAGE_METRICS_BUCKETS} buckets"
-                ),
-                UsageMetricsRefusal::OutOfOrder => {
-                    "A Usage Metrics query's buckets run out of order".to_owned()
-                }
-                UsageMetricsRefusal::Overlapping => {
-                    "A Usage Metrics query's buckets overlap".to_owned()
-                }
-                UsageMetricsRefusal::TooManyTopSessions => format!(
-                    "A Usage Metrics query asks for at most {MAX_USAGE_METRICS_TOP_SESSIONS} top \
-                     Sessions"
-                ),
-            },
+    let catalog = state.model_catalog.current();
+    let refusal = match state
+        .sessions
+        .usage_metrics(&query, &catalog, &state.workspace_paths)
+        .await
+    {
+        Ok(report) => return Json(report).into_response(),
+        Err(refusal) => refusal,
+    };
+    let message = match refusal {
+        UsageMetricsRefusal::TooManyBuckets => {
+            format!("A Usage Metrics query asks for at most {MAX_USAGE_METRICS_BUCKETS} buckets")
+        }
+        UsageMetricsRefusal::OutOfOrder => {
+            "A Usage Metrics query's buckets run out of order".to_owned()
+        }
+        UsageMetricsRefusal::Overlapping => "A Usage Metrics query's buckets overlap".to_owned(),
+        UsageMetricsRefusal::TooManyTopSessions => format!(
+            "A Usage Metrics query asks for at most {MAX_USAGE_METRICS_TOP_SESSIONS} top Sessions"
         ),
-    }
+        UsageMetricsRefusal::Storage => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    session_error_response(
+        StatusCode::BAD_REQUEST,
+        SessionErrorCode::InvalidUsageMetricsQuery,
+        message,
+    )
 }
 
 /// Insights of every Session living on this Server, on the same terms as

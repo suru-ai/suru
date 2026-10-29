@@ -1,5 +1,5 @@
-//! Usage Metrics: what the Sessions living on one Server consumed over a span
-//! of time, divided into time buckets the reader chooses and broken down by
+//! Usage Metrics: what the Sessions living on one Server, and the Errands it
+//! ran, consumed over a span of time, divided into time buckets the reader chooses and broken down by
 //! a key. The Server knows nothing of calendars or time zones: a reader asks
 //! for the buckets as intervals of Session timestamps, cut where its own
 //! calendar falls, and is answered with the figures each one holds. A report
@@ -82,6 +82,11 @@ pub enum UsageMetricsKey {
     /// Turns whose Agent is not known, which no Model or Provider key can
     /// hold. Every Session has a Workspace, so that breakdown has none.
     Unknown,
+    /// Suru's own Errands, under every breakdown whatever Model, Provider,
+    /// or Workspace each ran under: an Errand belongs to no Session, so it
+    /// is counted apart from the work of every Session. It holds Usage and
+    /// Cost alone, never a Session, Subagent, or Turn.
+    Errands,
 }
 
 /// A breakdown key and the name a reader is shown for it: a Model's name, a
@@ -119,10 +124,10 @@ pub struct UsageMetricsReport {
     /// The figures of the query's comparison interval taken together, where
     /// it asked for one.
     pub comparison: Option<UsageMetricsAggregate>,
-    /// The moment the earliest timed Turn on the Server is placed at, from
-    /// which a reader asking for all of time can begin its buckets; absent
-    /// where no Turn is timed.
-    pub earliest_turn_at: Option<SessionTimestamp>,
+    /// The earliest moment the Server places work at — a timed Turn, or
+    /// when an Errand began — from which a reader asking for all of time
+    /// can begin its buckets; absent where it has placed none.
+    pub earliest_at: Option<SessionTimestamp>,
     /// Every key a bucket breaks its figures down by, each with its label.
     pub keys: Vec<UsageMetricsKeyLabel>,
     /// The top-level Sessions whose work cost the most across the buckets,
@@ -156,7 +161,8 @@ pub struct UsageMetricsSession {
 }
 
 /// The figures of one bucket: its whole, and its part under each key a Turn
-/// in the bucket ran under, whether or not that Turn recorded any Usage.
+/// in the bucket ran under, whether or not that Turn recorded any Usage, and
+/// under [`UsageMetricsKey::Errands`] where an Errand began in it.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageMetricsBucket {
@@ -172,11 +178,12 @@ pub struct KeyedUsageMetrics {
     pub aggregate: UsageMetricsAggregate,
 }
 
-/// What a set of Turns consumed together: the five parts of their Usage,
-/// each absent where no Turn among them reported it, as a Session's total
-/// keeps it, what their Cost Coverage contributions add up to, how many
-/// Sessions they are the work of, and how many Turns they are and how those
-/// ended.
+/// What a set of Turns, and any Errands beside them, consumed together: the
+/// five parts of their Usage, each absent where none among them reported
+/// it, as a Session's total keeps it, what their Cost Coverage
+/// contributions and Errand Costs add up to, how many Sessions they are the
+/// work of, and how many Turns they are and how those ended. An Errand adds
+/// to the Usage and Cost alone: it is neither a Session nor a Turn.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageMetricsAggregate {
@@ -187,7 +194,8 @@ pub struct UsageMetricsAggregate {
     pub reasoning_tokens: Option<u64>,
     /// The Cost the Turns contribute once every overlap is removed (ADR
     /// 0054), a running total's increments placed on the Turns that carried
-    /// them.
+    /// them, and each Errand's Cost besides. An Errand whose Usage or Cost
+    /// is unknown marks it partial: an Errand's Cost is whole or absent.
     pub cost: CountedCost,
     /// The part of `cost`'s amount Suru estimated rather than the Provider
     /// reported; absent where no contribution was Estimated.

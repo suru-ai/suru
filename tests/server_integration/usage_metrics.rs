@@ -46,7 +46,7 @@ async fn usage_metrics_are_read_from_the_server_the_outlook_names() {
             vec![UsageMetricsBucket::default()],
             "{way}: one bucket, as asked, holding nothing"
         );
-        assert_eq!(report.earliest_turn_at, None, "{way}");
+        assert_eq!(report.earliest_at, None, "{way}");
         assert_eq!(
             report.top_sessions,
             Vec::new(),

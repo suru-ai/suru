@@ -121,7 +121,7 @@ async fn usage_metrics_are_read_over_the_api_and_a_bad_query_is_refused() {
             .collect::<Vec<_>>(),
         vec![&report.buckets[1].by_key[0].key]
     );
-    assert_eq!(report.earliest_turn_at, Some(started_at));
+    assert_eq!(report.earliest_at, Some(started_at));
     assert_eq!(
         report.comparison,
         Some(measured),

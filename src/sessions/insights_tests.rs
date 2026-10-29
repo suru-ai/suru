@@ -414,6 +414,7 @@ async fn quarter_hour_costs_add_up_to_the_range_s_cost() {
         ]
     );
     let range = read_metrics(&store, &by_model(&[(start, end)]))
+        .await
         .across_buckets
         .total;
     let added = report
@@ -509,6 +510,7 @@ async fn delegation_divides_the_range_s_cost_by_the_role_of_the_session_carrying
         }
     );
     let range = read_metrics(&store, &by_model(&[(START, END)]))
+        .await
         .across_buckets
         .total;
     assert_eq!(
@@ -1295,6 +1297,7 @@ async fn the_saving_enters_no_cost_figure_of_the_insights_or_metrics_reports() {
     );
     assert_eq!(priced.delegation.total(), role(usd(0.50), false));
     let range = read_metrics(&store, &by_model(&[(START, END)]))
+        .await
         .across_buckets
         .total;
     assert_eq!(

@@ -7,6 +7,7 @@ use super::{
     cost_coverage::{CostContribution, CountedAmount, sum_contributions},
 };
 use crate::{
+    errands::{ErrandLedger, ErrandOutcome, ErrandPurpose, ErrandRecord},
     protocol::{
         Activity, ActivityId, ActivityStatus, Cost, CostBasis, CostCoverage, CostDetails,
         CostTotal, ModelAvailability, ModelCatalog, Session, SessionId, SessionRevision,
@@ -14,7 +15,10 @@ use crate::{
         TranscriptItem, Turn, TurnId, TurnStatus, Usage, UsageMetricsAggregate,
         UsageMetricsBreakdown, UsageMetricsInterval, UsageMetricsQuery, UsageTotal, Workspace,
     },
-    storage::{PersistedSession, RestoredSessions, StorageRepository, StorageWriter},
+    provider::ErrandCost,
+    storage::{
+        DeferredSessions, PersistedSession, RestoredSessions, StorageRepository, StorageWriter,
+    },
 };
 
 thread_local! {
@@ -178,7 +182,7 @@ async fn an_untimed_descendant_aggregate_is_suppressed_but_an_untimed_turn_cost_
     assert_eq!(untimed_total.cost, Cost::from_usd(0.10));
     assert!(untimed_total.cost_is_partial);
 
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
 }
 
@@ -249,7 +253,7 @@ async fn restored_usage_folds_descendants_without_spending_revisions_or_writes()
         assert_eq!(summary.session.working_since, snapshot.working_since());
         assert_eq!(summary.updated_at, SessionTimestamp(2));
     }
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
     assert!(
         repository
@@ -374,7 +378,7 @@ async fn a_subagent_turn_left_open_by_a_stop_settles_as_failed_at_the_next_start
 
     // The repair is durable: the next process reads it back rather than
     // deciding it again.
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
     let reloaded_child = repository
         .session(child_id)
@@ -446,7 +450,7 @@ async fn a_root_turn_left_open_by_a_stop_settles_as_failed_at_the_next_start() {
     assert_eq!(summary.session.status, SessionStatus::Idle);
     assert_eq!(summary.session.working_since, None);
 
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
     let reloaded = repository
         .session(root_id)
@@ -497,7 +501,7 @@ async fn a_subagent_already_settled_is_left_exactly_as_it_was() {
         (ActivityStatus::Active, None),
         "a row the last process left open over a settled Turn is not this repair's to close"
     );
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
     assert!(
         repository
@@ -565,7 +569,7 @@ async fn a_resume_row_a_sibling_holds_settles_with_the_turn_left_open_by_a_stop(
         (ActivityStatus::Completed, Some(8)),
         "the spawn's row keeps what its own stretch settled with"
     );
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
 }
 
@@ -617,7 +621,7 @@ async fn restore_tree(wide: bool) {
         Some(1)
     );
     assert_eq!(store.list(None).len(), 1);
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
 }
 
@@ -690,7 +694,7 @@ async fn restoring_many_disjoint_reporting_lifetimes_uses_indexed_coverage() {
         .expect("reported totals");
     assert_eq!(total.cost, Cost::from_usd(2.56));
     assert!(!total.cost_is_partial);
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
 }
 
@@ -788,7 +792,7 @@ async fn restored_balanced_tree_matches_the_durable_interval_union() {
         assert_eq!(snapshot.working_since(), since, "Working for {id}");
         assert_eq!(snapshot.total_usage(), usage, "Usage for {id}");
     }
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
 }
 
@@ -828,13 +832,16 @@ async fn malformed_relationships_do_not_promote_children_into_listed_roots() {
     store.reconcile_approval_postures(&crate::protocol::EffectiveSettings::default());
     assert_eq!(store.list(None).len(), 1);
     assert!(store.subscribe(root_id).is_some());
-    let all_time = all_time_metrics(&store, UsageMetricsBreakdown::Model).buckets[0].total;
+    let all_time = all_time_metrics(&store, UsageMetricsBreakdown::Model)
+        .await
+        .buckets[0]
+        .total;
     assert_eq!(
         (all_time.cost.amount, all_time.output_tokens),
         (Cost::from_usd(0.01), Some(1)),
         "only the listed root's Turn counts"
     );
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
 }
 
@@ -920,7 +927,7 @@ async fn restoring_independent_roots_does_linear_relationship_work() {
         work <= 128 * 8,
         "128 roots required {work} restoration operations"
     );
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
 }
 
@@ -1020,7 +1027,7 @@ async fn a_whole_tree_report_covers_a_native_child_but_never_a_brokered_one() {
                 own: known(0.05, false),
             }
         );
-        assert_contributions_add_up(&store);
+        assert_contributions_add_up(&store).await;
         writer.shutdown().await.unwrap();
     }
 }
@@ -1091,7 +1098,7 @@ async fn a_sidekicks_tree_cost_carries_its_subsessions_whole_trees() {
         );
     }
 
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     // A Subsession deleted takes its Cost out of its Sidekick's tree Cost.
     store.delete(subsession_id).unwrap();
     store.delete(unpriced_id).unwrap();
@@ -1103,7 +1110,7 @@ async fn a_sidekicks_tree_cost_carries_its_subsessions_whole_trees() {
         },
         "a deleted Subsession's Cost leaves its Sidekick's tree Cost"
     );
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
 }
 
@@ -1192,7 +1199,7 @@ async fn a_brokered_subagent_covers_its_own_native_descendants_and_counts_its_br
         (Cost::from_usd(0.22), known(0.10, false)),
         "a listing reads the same two figures an open Session does"
     );
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
 }
 
@@ -1246,7 +1253,7 @@ async fn own_cost_counts_each_reporting_lifetime_once_and_every_turn_scoped_cost
             },
             "{case}"
         );
-        assert_contributions_add_up(&store);
+        assert_contributions_add_up(&store).await;
         writer.shutdown().await.unwrap();
     }
 }
@@ -1289,7 +1296,7 @@ const BREAKDOWNS: [UsageMetricsBreakdown; 3] = [
 
 /// Usage Metrics over one bucket holding all of time, broken down by
 /// `breakdown`.
-fn all_time_metrics(
+async fn all_time_metrics(
     store: &SessionStore,
     breakdown: UsageMetricsBreakdown,
 ) -> crate::protocol::UsageMetricsReport {
@@ -1310,6 +1317,7 @@ fn all_time_metrics(
             },
             &crate::protocol::WorkspacePaths::default(),
         )
+        .await
         .expect("an all-time query is answered")
 }
 
@@ -1355,14 +1363,14 @@ async fn reading_usage_metrics_over_a_wide_forest_walks_each_tree_once() {
 
     for breakdown in BREAKDOWNS {
         WORK.set(0);
-        all_time_metrics(&store, breakdown);
+        all_time_metrics(&store, breakdown).await;
         let work = WORK.get();
         assert!(
             work <= sessions * 8,
             "{sessions} Sessions required {work} operations to read by {breakdown:?}"
         );
     }
-    let report = all_time_metrics(&store, UsageMetricsBreakdown::Model);
+    let report = all_time_metrics(&store, UsageMetricsBreakdown::Model).await;
     assert_eq!(
         report.buckets[0].total.cost.amount,
         Cost::from_usd(128.0 * 0.12 + 0.65),
@@ -1376,28 +1384,124 @@ async fn reading_usage_metrics_over_a_wide_forest_walks_each_tree_once() {
         "the roots, the Sidekick and its Subsessions top-level, and the \
          Subagents apart, each once"
     );
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
 }
 
-/// The Usage Metrics invariant (ADR 0054): over a bucket holding all of time
-/// and the untimed figures beside it, the Server's Cost is its root
-/// Sessions' tree Costs added, each Session counted once — a Sidekick's
-/// Subsessions beneath it, not again as roots of their own — and partial
-/// exactly where one of those trees holds work no counted amount accounts
-/// for, a tree whose Cost is wholly unknown included. The keys of every
-/// breakdown divide that Cost without adding to it.
-fn assert_all_time_metrics_add_up_to_root_tree_costs(store: &SessionStore) {
-    for breakdown in BREAKDOWNS {
-        assert_all_time_metrics_by_add_up_to_root_tree_costs(store, breakdown);
+/// The Usage Metrics invariant (ADR 0054, restated by ADR 0057): over a
+/// bucket holding all of time and the untimed figures beside it, the
+/// Server's Cost is its root Sessions' tree Costs added, each Session
+/// counted once — a Sidekick's Subsessions beneath it, not again as roots of
+/// their own — and every Errand's Cost besides; partial exactly where one of
+/// those trees holds work no counted amount accounts for, a tree whose Cost
+/// is wholly unknown included, or an Errand's Usage or Cost is unknown. The
+/// keys of every breakdown divide that Cost without adding to it.
+///
+/// It holds with no Errand recorded, then with Errands of a whole Cost,
+/// Reported and Estimated, then with one whose Usage and Cost are unknown
+/// and one whose Usage is known but whose Cost is not. A store restored
+/// without storage is lent a repository of its own to record them in.
+async fn assert_all_time_metrics_add_up_to_root_tree_costs(store: &SessionStore) {
+    let directory = tempfile::tempdir().unwrap();
+    let repository = StorageRepository::open(directory.path()).await.unwrap();
+    let lent = lend_repository(store, Some(repository.clone()));
+    let mut recorded = Vec::new();
+    for round in [Vec::new(), whole_errands(), unmeasured_errands()] {
+        let (writer, sink) = StorageWriter::spawn(repository.clone());
+        for errand in &round {
+            ErrandLedger::record(&sink, errand.clone()).unwrap();
+        }
+        writer.shutdown().await.unwrap();
+        recorded.extend(round);
+        for breakdown in BREAKDOWNS {
+            assert_all_time_metrics_by_add_up_to_root_tree_costs(store, breakdown, &recorded).await;
+        }
+    }
+    lend_repository(store, lent);
+}
+
+/// Gives `store` `repository` to read from, or none, handing back the one it
+/// read from before. A store restored without storage is given an empty set
+/// of deferred Sessions with it, which defers no Session.
+fn lend_repository(
+    store: &SessionStore,
+    repository: Option<StorageRepository>,
+) -> Option<StorageRepository> {
+    let mut state = store.state.lock().unwrap();
+    let held = state.deferred.take();
+    let (lent, rest) = match held {
+        Some(deferred) => (Some(deferred.repository.clone()), Some(deferred)),
+        None => (None, None),
+    };
+    state.deferred = match (repository, rest) {
+        (Some(repository), Some(rest)) => Some(DeferredSessions { repository, ..rest }),
+        (Some(repository), None) => Some(DeferredSessions {
+            repository,
+            summaries: Default::default(),
+            parents: Default::default(),
+            child_ids: Default::default(),
+        }),
+        // Only none was held before any was lent.
+        (None, _) => None,
+    };
+    lent
+}
+
+/// An Errand of `purpose`'s that began at `began`, with whatever Usage and
+/// Cost it knows.
+fn errand(began: u64, usage: Option<u64>, cost: Option<ErrandCost>) -> ErrandRecord {
+    ErrandRecord {
+        purpose: ErrandPurpose::SessionTitle,
+        provider: crate::protocol::ProviderId::new("claude"),
+        model: crate::protocol::ModelId::new("claude-haiku-4-5"),
+        began: SessionTimestamp(began),
+        ended: SessionTimestamp(began + 1),
+        outcome: ErrandOutcome::Answered,
+        usage: usage.map(|output| Usage {
+            output_tokens: Some(output),
+            ..Default::default()
+        }),
+        cost,
     }
 }
 
-fn assert_all_time_metrics_by_add_up_to_root_tree_costs(
+/// Errands whose Cost is whole: one Reported, one Estimated.
+fn whole_errands() -> Vec<ErrandRecord> {
+    vec![
+        errand(
+            1,
+            Some(40),
+            Some(ErrandCost::reported(Cost::from_nano_usd(4_000_000))),
+        ),
+        errand(
+            50_000,
+            Some(60),
+            Some(ErrandCost::as_recorded(
+                Cost::from_nano_usd(900_000),
+                CostBasis::Estimated,
+            )),
+        ),
+    ]
+}
+
+/// Errands whose Cost is not whole: one that timed out knowing neither its
+/// Usage nor its Cost, and one that knows its Usage alone.
+fn unmeasured_errands() -> Vec<ErrandRecord> {
+    vec![
+        ErrandRecord {
+            outcome: ErrandOutcome::TimedOut,
+            ..errand(7, None, None)
+        },
+        errand(9, Some(10), None),
+    ]
+}
+
+async fn assert_all_time_metrics_by_add_up_to_root_tree_costs(
     store: &SessionStore,
     breakdown: UsageMetricsBreakdown,
+    errands: &[ErrandRecord],
 ) {
-    let report = all_time_metrics(store, breakdown);
+    let report = all_time_metrics(store, breakdown).await;
     let added = |aggregates: &[UsageMetricsAggregate]| {
         (
             aggregates
@@ -1449,9 +1553,26 @@ fn assert_all_time_metrics_by_add_up_to_root_tree_costs(
                 .any(|contribution| contribution.is_partial)
         }),
     );
+    let errand_costs = (
+        errands
+            .iter()
+            .filter_map(|errand| errand.cost)
+            .map(ErrandCost::cost)
+            .reduce(Cost::saturating_add),
+        errands
+            .iter()
+            .any(|errand| errand.usage.is_none() || errand.cost.is_none()),
+    );
+    let expected = (
+        match (tree_costs.0, errand_costs.0) {
+            (Some(trees), Some(errands)) => Some(trees.saturating_add(errands)),
+            (trees, errands) => trees.or(errands),
+        },
+        tree_costs.1 || errand_costs.1,
+    );
     assert_eq!(
-        all_time, tree_costs,
-        "all of time costs what the root Sessions' trees do"
+        all_time, expected,
+        "all of time costs what the root Sessions' trees and every Errand do"
     );
     assert_eq!(
         by_key, all_time,
@@ -1464,8 +1585,8 @@ fn assert_all_time_metrics_by_add_up_to_root_tree_costs(
 /// the own Cost its own contributions add up to. The live roll-up reads both
 /// as those sums, so this holds the startup fold to the same reading of Cost
 /// Coverage; `costs` holds it there for any Session a test names.
-fn assert_contributions_add_up(store: &SessionStore) {
-    assert_all_time_metrics_add_up_to_root_tree_costs(store);
+async fn assert_contributions_add_up(store: &SessionStore) {
+    assert_all_time_metrics_add_up_to_root_tree_costs(store).await;
     let state = store.state.lock().unwrap();
     let mut walk = state
         .sessions
@@ -1565,7 +1686,7 @@ async fn running_total_reports_contribute_their_increments_and_turn_scoped_costs
             },
             "{case}"
         );
-        assert_contributions_add_up(&store);
+        assert_contributions_add_up(&store).await;
         writer.shutdown().await.unwrap();
     }
 }
@@ -1602,7 +1723,7 @@ async fn a_covered_native_subagent_contributes_nothing_and_a_brokered_one_its_ow
                 "the child's own Cost counts its own Turn either way",
             );
         }
-        assert_contributions_add_up(&store);
+        assert_contributions_add_up(&store).await;
         writer.shutdown().await.unwrap();
     }
 }
@@ -1627,7 +1748,7 @@ async fn a_contribution_carries_its_cost_basis() {
         &[counted(id, &reported, 0.02, false), estimated_counted],
         "each Turn's Basis rides with its amount",
     );
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
 }
 
@@ -1657,7 +1778,7 @@ async fn reading_contributions_moves_no_revision_and_changes_no_turn() {
         assert_eq!(before.revision, after.revision);
         assert_eq!(before.turns, after.turns);
     }
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
 }
 
@@ -1698,7 +1819,7 @@ async fn a_prior_record_from_an_earlier_lifetime_contributes_beside_the_current_
             own: known(0.13, false),
         }
     );
-    assert_contributions_add_up(&store);
+    assert_contributions_add_up(&store).await;
     writer.shutdown().await.unwrap();
 }
 
@@ -1739,7 +1860,7 @@ async fn a_complete_running_total_settles_an_earlier_partial_report_in_its_lifet
             },
             "{case}"
         );
-        assert_contributions_add_up(&store);
+        assert_contributions_add_up(&store).await;
         writer.shutdown().await.unwrap();
     }
 }

@@ -8,6 +8,7 @@ use crate::protocol::{
     CostTotal, CountedCost, MAX_USAGE_METRICS_TOP_SESSIONS, SessionId, UsageMetricsSession,
 };
 use crate::{
+    errands::{ErrandLedger, ErrandOutcome, ErrandPurpose, ErrandRecord},
     protocol::{
         AgentId, AgentIdentity, AgentSelection, Author, Cost, CostBasis, CostCoverage, CostDetails,
         KeyedUsageMetrics, MAX_USAGE_METRICS_BUCKETS, ModelAvailability, ModelCatalog,
@@ -17,6 +18,7 @@ use crate::{
         UsageMetricsKeyLabel, UsageMetricsQuery, UsageMetricsReport, UsageTotal, WorkspaceId,
         WorkspacePaths,
     },
+    provider::ErrandCost,
     sidekick::SidekickWorkspace,
     storage::{
         PersistedSession, RestoredSessions, StorageRepository, StorageWriter, StoredWorkspace,
@@ -177,10 +179,22 @@ pub(super) async fn restore_deferred(
     directory: &std::path::Path,
     records: Vec<crate::storage::PersistedSession>,
 ) -> (SessionStore, StorageWriter) {
+    restore_with_errands(directory, records, Vec::new()).await
+}
+
+/// [`restore_deferred`], storage holding `errands`' records besides.
+pub(super) async fn restore_with_errands(
+    directory: &std::path::Path,
+    records: Vec<crate::storage::PersistedSession>,
+    errands: Vec<ErrandRecord>,
+) -> (SessionStore, StorageWriter) {
     let repository = StorageRepository::open(directory).await.unwrap();
     let (writer, sink) = StorageWriter::spawn(repository.clone());
     for record in records {
         sink.created(record, Vec::new());
+    }
+    for errand in errands {
+        ErrandLedger::record(&sink, errand).expect("the writer is running");
     }
     writer.shutdown().await.unwrap();
     let restored = repository.load_sessions().await.unwrap();
@@ -189,7 +203,7 @@ pub(super) async fn restore_deferred(
     (store, writer)
 }
 
-pub(super) fn read(store: &SessionStore, query: &UsageMetricsQuery) -> UsageMetricsReport {
+pub(super) async fn read(store: &SessionStore, query: &UsageMetricsQuery) -> UsageMetricsReport {
     store
         .usage_metrics(
             query,
@@ -198,6 +212,7 @@ pub(super) fn read(store: &SessionStore, query: &UsageMetricsQuery) -> UsageMetr
             },
             &WorkspacePaths::default(),
         )
+        .await
         .expect("a well-formed query is answered")
 }
 
@@ -218,7 +233,7 @@ async fn a_turn_lands_in_the_bucket_of_its_start_falling_back_to_its_settle_then
     ];
     let (store, writer) = restore(directory.path(), vec![session]).await;
 
-    let report = read(&store, &by_model(&[(10, 20), (20, 30)]));
+    let report = read(&store, &by_model(&[(10, 20), (20, 30)])).await;
 
     assert_eq!(report.buckets, vec![only(fable(), 1), only(fable(), 10)]);
     assert_eq!(report.untimed, only(fable(), 100));
@@ -232,23 +247,27 @@ async fn a_query_with_too_many_buckets_or_buckets_out_of_order_or_overlapping_is
     let catalog = ModelCatalog {
         providers: Vec::new(),
     };
-    let refusal = |buckets: Vec<(u64, u64)>| {
+    let refusal = async |buckets: Vec<(u64, u64)>| {
         store
             .usage_metrics(&by_model(&buckets), &catalog, &WorkspacePaths::default())
+            .await
             .expect_err("the query is refused")
     };
 
     let too_many = (0..=MAX_USAGE_METRICS_BUCKETS as u64)
         .map(|hour| (hour * 10, hour * 10 + 10))
         .collect();
-    assert_eq!(refusal(too_many), UsageMetricsRefusal::TooManyBuckets);
+    assert_eq!(refusal(too_many).await, UsageMetricsRefusal::TooManyBuckets);
     assert_eq!(
-        refusal(vec![(20, 30), (10, 20)]),
+        refusal(vec![(20, 30), (10, 20)]).await,
         UsageMetricsRefusal::OutOfOrder
     );
-    assert_eq!(refusal(vec![(20, 10)]), UsageMetricsRefusal::OutOfOrder);
     assert_eq!(
-        refusal(vec![(10, 25), (20, 30)]),
+        refusal(vec![(20, 10)]).await,
+        UsageMetricsRefusal::OutOfOrder
+    );
+    assert_eq!(
+        refusal(vec![(10, 25), (20, 30)]).await,
         UsageMetricsRefusal::Overlapping
     );
     // As many buckets as a query may ask for, each beginning where the one
@@ -256,7 +275,10 @@ async fn a_query_with_too_many_buckets_or_buckets_out_of_order_or_overlapping_is
     let most = (0..MAX_USAGE_METRICS_BUCKETS as u64)
         .map(|hour| (hour * 10, hour * 10 + 10))
         .collect::<Vec<_>>();
-    assert_eq!(read(&store, &by_model(&most)).buckets.len(), most.len());
+    assert_eq!(
+        read(&store, &by_model(&most)).await.buckets.len(),
+        most.len()
+    );
     writer.shutdown().await.unwrap();
 }
 
@@ -304,7 +326,7 @@ async fn a_part_no_turn_reported_stays_absent_and_failed_interrupted_and_active_
     ];
     let (store, writer) = restore(directory.path(), vec![session]).await;
 
-    let report = read(&store, &by_model(&[(10, 20)]));
+    let report = read(&store, &by_model(&[(10, 20)])).await;
 
     let expected = UsageMetricsAggregate {
         fresh_input_tokens: Some(100),
@@ -372,6 +394,7 @@ async fn a_model_under_two_providers_is_two_keys_and_a_turn_of_no_known_agent_is
 
     let report = store
         .usage_metrics(&by_model(&[(10, 20)]), &catalog, &WorkspacePaths::default())
+        .await
         .unwrap();
 
     let model = |provider: &str| UsageMetricsKey::Model {
@@ -487,6 +510,7 @@ async fn models_that_would_read_alike_are_told_apart_in_the_keys_and_the_top_ses
 
     let report = store
         .usage_metrics(&top(&[(10, 20)], 5), &catalog, &WorkspacePaths::default())
+        .await
         .unwrap();
 
     let model = |provider: &str, model: &str| UsageMetricsKey::Model {
@@ -566,6 +590,7 @@ async fn one_name_under_two_providers_is_told_apart_whichever_provider_s_name_it
 
     let report = store
         .usage_metrics(&by_model(&[(10, 20)]), &catalog, &WorkspacePaths::default())
+        .await
         .unwrap();
 
     let model = |provider: &str, model: &str| UsageMetricsKey::Model {
@@ -623,7 +648,8 @@ async fn a_top_session_s_model_is_told_apart_from_one_the_keys_do_not_name() {
             breakdown: UsageMetricsBreakdown::Workspace,
             ..top(&[(10, 20)], 5)
         },
-    );
+    )
+    .await;
 
     assert_eq!(
         report
@@ -695,6 +721,7 @@ async fn the_provider_breakdown_groups_every_model_under_its_provider_by_its_dis
             &catalog,
             &WorkspacePaths::default(),
         )
+        .await
         .unwrap();
 
     assert_eq!(
@@ -744,7 +771,7 @@ async fn the_workspace_breakdown_counts_each_turn_under_its_own_session_s_worksp
     let (atlas_key, borealis_key) = (workspace(&root), workspace(&other));
     let (store, writer) = restore(directory.path(), vec![root, subagent, other]).await;
 
-    let report = read(&store, &by(UsageMetricsBreakdown::Workspace, &[(10, 20)]));
+    let report = read(&store, &by(UsageMetricsBreakdown::Workspace, &[(10, 20)])).await;
 
     let mut named = labels(&report);
     named.sort_by(|left, right| left.1.cmp(right.1));
@@ -782,7 +809,7 @@ async fn workspaces_of_one_name_are_told_apart_by_where_they_are() {
     }
     let (store, writer) = restore(directory.path(), records).await;
 
-    let report = read(&store, &by(UsageMetricsBreakdown::Workspace, &[(10, 20)]));
+    let report = read(&store, &by(UsageMetricsBreakdown::Workspace, &[(10, 20)])).await;
 
     let paths = WorkspacePaths::default();
     let mut named = labels(&report)
@@ -835,7 +862,8 @@ async fn a_key_reads_alike_in_every_report_whatever_else_the_report_names() {
                     breakdown,
                     ..top(buckets, 5)
                 },
-            );
+            )
+            .await;
             let mine_session = report
                 .top_sessions
                 .iter()
@@ -895,7 +923,7 @@ async fn a_workspace_is_named_as_its_registry_entry_presents_it_or_else_as_its_s
     let (store, writer) =
         restore_with_registry(directory.path(), vec![presented, pathless], registry).await;
 
-    let report = read(&store, &by(UsageMetricsBreakdown::Workspace, &[(10, 20)]));
+    let report = read(&store, &by(UsageMetricsBreakdown::Workspace, &[(10, 20)])).await;
 
     let mut named = labels(&report);
     named.sort_by(|left, right| left.1.cmp(right.1));
@@ -927,7 +955,7 @@ async fn two_workspaces_presented_at_one_path_are_still_told_apart() {
     }
     let (store, writer) = restore_with_registry(directory.path(), records, registry).await;
 
-    let report = read(&store, &by(UsageMetricsBreakdown::Workspace, &[(10, 20)]));
+    let report = read(&store, &by(UsageMetricsBreakdown::Workspace, &[(10, 20)])).await;
 
     let label = |index: usize| report.keys[index].label.as_str();
     assert_ne!(label(0), label(1));
@@ -1004,7 +1032,7 @@ async fn subagent_and_subsession_turns_count_and_a_remotes_sessions_do_not() {
         "the Sidekick's tree lists the Remote's Session"
     );
 
-    let report = read(&store, &by_model(&[(10, 20)]));
+    let report = read(&store, &by_model(&[(10, 20)])).await;
 
     assert_eq!(
         report.buckets,
@@ -1031,9 +1059,9 @@ async fn the_earliest_timed_turn_is_reported_whichever_bucket_holds_it() {
 
     // Asked for no buckets at all, as a reader learning where all of time
     // begins does.
-    let report = read(&store, &by_model(&[]));
+    let report = read(&store, &by_model(&[])).await;
 
-    assert_eq!(report.earliest_turn_at, Some(SessionTimestamp(30)));
+    assert_eq!(report.earliest_at, Some(SessionTimestamp(30)));
     assert!(report.buckets.is_empty());
     assert_eq!(report.untimed, only(fable(), 1));
     writer.shutdown().await.unwrap();
@@ -1064,7 +1092,7 @@ async fn reading_never_hydrates_a_deferred_session_and_moves_no_revision() {
     };
     let before = revisions(&store);
 
-    let report = read(&store, &by_model(&[(10, 20)]));
+    let report = read(&store, &by_model(&[(10, 20)])).await;
 
     assert_eq!(report.buckets, vec![worked_by(only(fable(), 11), 1, 1)]);
     assert_eq!(deferred(&store), [true, true], "no history was read in");
@@ -1186,7 +1214,7 @@ async fn a_turn_scoped_cost_lands_in_its_turn_s_bucket_with_its_estimated_portio
     ];
     let (store, writer) = restore(directory.path(), vec![session]).await;
 
-    let report = read(&store, &by_model(&[(10, 20), (20, 30)]));
+    let report = read(&store, &by_model(&[(10, 20), (20, 30)])).await;
 
     assert_eq!(
         cost(&report.buckets[0].total),
@@ -1223,7 +1251,7 @@ async fn a_running_total_s_increments_land_in_the_buckets_of_the_turns_carrying_
     let id = session.snapshot.session.id;
     let (store, writer) = restore(directory.path(), vec![session]).await;
 
-    let report = read(&store, &by_model(&[(10, 20), (20, 30), (30, 40), (40, 50)]));
+    let report = read(&store, &by_model(&[(10, 20), (20, 30), (30, 40), (40, 50)])).await;
 
     assert_eq!(
         report
@@ -1263,7 +1291,7 @@ async fn a_whole_tree_report_counts_under_the_model_carrying_it_and_a_brokered_s
     brokered.snapshot.turns = vec![turn_scoped(CODEX, 14, 0.08)];
     let (store, writer) = restore(directory.path(), vec![parent, native, brokered]).await;
 
-    let report = read(&store, &by_model(&[(0, 100)]));
+    let report = read(&store, &by_model(&[(0, 100)])).await;
 
     let bucket = &report.buckets[0];
     assert_eq!(cost(&keyed(bucket, &key(OPUS))), (usd(0.30), false, None));
@@ -1302,7 +1330,7 @@ async fn a_sidekick_s_subsessions_are_counted_once() {
     subagent.snapshot.turns = vec![turn_scoped(CODEX, 13, 0.02)];
     let (store, writer) = restore(directory.path(), vec![sidekick, subsession, subagent]).await;
 
-    let report = read(&store, &by_model(&[(10, 20)]));
+    let report = read(&store, &by_model(&[(10, 20)])).await;
 
     assert_eq!(
         cost(&report.buckets[0].total),
@@ -1328,7 +1356,7 @@ async fn an_unpriced_turn_marks_its_bucket_its_key_and_the_untimed_figures_parti
     ];
     let (store, writer) = restore(directory.path(), vec![session]).await;
 
-    let report = read(&store, &by_model(&[(10, 20), (20, 30)]));
+    let report = read(&store, &by_model(&[(10, 20), (20, 30)])).await;
 
     assert_eq!(cost(&report.buckets[0].total), (usd(0.10), false, None));
     assert_eq!(
@@ -1367,7 +1395,7 @@ async fn a_session_that_worked_under_two_models_counts_once_under_each_and_once_
     }];
     let (store, writer) = restore(directory.path(), vec![both, opus_only]).await;
 
-    let report = read(&store, &by_model(&[(10, 20)]));
+    let report = read(&store, &by_model(&[(10, 20)])).await;
 
     let bucket = &report.buckets[0];
     assert_eq!(sessions(&keyed(bucket, &key(OPUS))), (2, 0));
@@ -1401,7 +1429,7 @@ async fn subagent_sessions_are_counted_apart_from_top_level_sessions() {
     let (store, writer) =
         restore(directory.path(), vec![root, native, nested, brokered, idle]).await;
 
-    let report = read(&store, &by_model(&[(10, 20), (20, 30)]));
+    let report = read(&store, &by_model(&[(10, 20), (20, 30)])).await;
 
     let bucket = &report.buckets[0];
     assert_eq!(sessions(&bucket.total), (1, 3));
@@ -1440,7 +1468,7 @@ async fn a_session_counts_in_every_bucket_it_worked_in_and_once_across_them_all(
     before.snapshot.turns = vec![metered(OPUS, Some(1), None, 1)];
     let (store, writer) = restore(directory.path(), vec![daily, subagent, once, before]).await;
 
-    let report = read(&store, &by_model(&[(10, 20), (20, 30), (30, 40)]));
+    let report = read(&store, &by_model(&[(10, 20), (20, 30), (30, 40)])).await;
 
     assert_eq!(
         report
@@ -1484,7 +1512,7 @@ async fn the_range_holds_the_cost_its_buckets_add_up_to() {
     ];
     let (store, writer) = restore(directory.path(), vec![session]).await;
 
-    let report = read(&store, &by_model(&[(10, 20), (20, 30)]));
+    let report = read(&store, &by_model(&[(10, 20), (20, 30)])).await;
 
     assert_eq!(cost(&report.across_buckets.total), (usd(0.25), true, None));
     assert_eq!(
@@ -1526,7 +1554,8 @@ async fn the_comparison_interval_holds_what_its_turns_consumed_apart_from_the_bu
             comparison: Some(interval(2, 10)),
             ..by_model(&[(10, 20)])
         },
-    );
+    )
+    .await;
 
     assert_eq!(
         report.comparison,
@@ -1548,7 +1577,7 @@ async fn the_comparison_interval_holds_what_its_turns_consumed_apart_from_the_bu
         "the buckets hold none of the comparison's Turns"
     );
     assert_eq!(
-        read(&store, &by_model(&[(10, 20)])).comparison,
+        read(&store, &by_model(&[(10, 20)])).await.comparison,
         None,
         "a query asking for no comparison is answered with none"
     );
@@ -1566,7 +1595,7 @@ async fn a_comparison_interval_may_overlap_the_buckets_but_not_end_before_it_beg
         ..by_model(&[(10, 20)])
     };
 
-    let overlapping = read(&store, &with_comparison(12, 18));
+    let overlapping = read(&store, &with_comparison(12, 18)).await;
     assert_eq!(
         overlapping
             .comparison
@@ -1583,6 +1612,7 @@ async fn a_comparison_interval_may_overlap_the_buckets_but_not_end_before_it_beg
                 },
                 &WorkspacePaths::default(),
             )
+            .await
             .expect_err("the query is refused"),
         UsageMetricsRefusal::OutOfOrder
     );
@@ -1609,7 +1639,7 @@ async fn the_buckets_and_the_untimed_turns_together_count_each_session_once() {
     untimed.snapshot.turns = vec![metered(CODEX, None, None, 10_000)];
     let (store, writer) = restore(directory.path(), vec![both, subagent, untimed]).await;
 
-    let report = read(&store, &by_model(&[(10, 20)]));
+    let report = read(&store, &by_model(&[(10, 20)])).await;
 
     assert_eq!(sessions(&report.across_buckets.total), (1, 0));
     assert_eq!(sessions(&report.untimed.total), (2, 1));
@@ -1680,7 +1710,7 @@ async fn the_top_sessions_are_ordered_by_their_cost_in_range_not_their_lifetime_
     let (lifelong_id, recent_id) = (lifelong.snapshot.session.id, recent.snapshot.session.id);
     let (store, writer) = restore(directory.path(), vec![lifelong, recent]).await;
 
-    let report = read(&store, &top(&[(10, 20)], 5));
+    let report = read(&store, &top(&[(10, 20)], 5)).await;
 
     assert_eq!(
         ranked(&report),
@@ -1710,7 +1740,7 @@ async fn the_top_sessions_are_ordered_by_their_cost_in_range_not_their_lifetime_
         }
     );
     assert_eq!(
-        read(&store, &by_model(&[(10, 20)])).top_sessions,
+        read(&store, &by_model(&[(10, 20)])).await.top_sessions,
         Vec::new(),
         "a query asking for none is answered with none"
     );
@@ -1733,16 +1763,17 @@ async fn as_many_top_sessions_are_named_as_were_asked_for_and_too_many_is_refuse
         .collect();
     let (store, writer) = restore(directory.path(), sessions).await;
 
-    let titles = |limit| {
+    let titles = async |limit| {
         read(&store, &top(&[(10, 20)], limit))
+            .await
             .top_sessions
             .into_iter()
             .map(|session| session.title)
             .collect::<Vec<_>>()
     };
-    assert_eq!(titles(3), ["0.4", "0.3", "0.2"]);
-    assert_eq!(titles(1), ["0.4"]);
-    assert_eq!(titles(10), ["0.4", "0.3", "0.2", "0.1", "0.05"]);
+    assert_eq!(titles(3).await, ["0.4", "0.3", "0.2"]);
+    assert_eq!(titles(1).await, ["0.4"]);
+    assert_eq!(titles(10).await, ["0.4", "0.3", "0.2", "0.1", "0.05"]);
     assert_eq!(
         store
             .usage_metrics(
@@ -1752,6 +1783,7 @@ async fn as_many_top_sessions_are_named_as_were_asked_for_and_too_many_is_refuse
                 },
                 &WorkspacePaths::default(),
             )
+            .await
             .unwrap_err(),
         UsageMetricsRefusal::TooManyTopSessions
     );
@@ -1777,11 +1809,11 @@ async fn a_partly_priced_session_is_flagged_and_one_of_no_known_cost_is_not_list
     let partly_id = partly.snapshot.session.id;
     let (store, writer) = restore(directory.path(), vec![partly, unpriced]).await;
 
-    let report = read(&store, &top(&[(10, 20)], 5));
+    let report = read(&store, &top(&[(10, 20)], 5)).await;
 
     assert_eq!(ranked(&report), vec![(partly_id, usd(0.10), true)]);
     assert_eq!(
-        read(&store, &top(&[(12, 20)], 5)).top_sessions,
+        read(&store, &top(&[(12, 20)], 5)).await.top_sessions,
         Vec::new(),
         "where none of the range's work has a known Cost, no Session is named"
     );
@@ -1825,7 +1857,7 @@ async fn a_subagent_s_cost_counts_toward_its_top_level_session_and_a_subsession_
     )
     .await;
 
-    let report = read(&store, &top(&[(10, 20)], 5));
+    let report = read(&store, &top(&[(10, 20)], 5)).await;
 
     assert_eq!(
         ranked(&report),
@@ -1865,7 +1897,7 @@ async fn a_top_session_s_model_is_the_one_its_work_cost_most_under_else_used_mos
     );
     let (store, writer) = restore(directory.path(), vec![free]).await;
 
-    let report = read(&store, &top(&[(10, 20)], 5));
+    let report = read(&store, &top(&[(10, 20)], 5)).await;
 
     assert_eq!(
         report.top_sessions.len(),
@@ -1900,6 +1932,7 @@ async fn top_sessions_that_cost_alike_stand_in_the_order_of_their_identities() {
 
     for limit in [4, 2] {
         let named: Vec<SessionId> = read(&store, &top(&[(10, 20)], limit))
+            .await
             .top_sessions
             .iter()
             .map(|session| session.session_id)
@@ -1927,7 +1960,8 @@ async fn a_top_session_s_workspace_is_told_apart_whatever_the_breakdown() {
             breakdown: UsageMetricsBreakdown::Provider,
             ..top(&[(10, 20)], 5)
         },
-    );
+    )
+    .await;
 
     assert_eq!(
         report
@@ -1947,6 +1981,266 @@ async fn a_top_session_s_workspace_is_told_apart_whatever_the_breakdown() {
             .iter()
             .all(|label| matches!(label.key, UsageMetricsKey::Provider { .. })),
         "naming the Sessions' Workspaces adds no Workspace key"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+/// An Errand begun at `began` that reported `output` tokens, where it knew
+/// its Usage, and cost what `cost` says, where it knew that: under a Model
+/// no Session here ran, so it can stand under no key of theirs.
+fn errand(began: u64, output: Option<u64>, cost: Option<ErrandCost>) -> ErrandRecord {
+    ErrandRecord {
+        purpose: ErrandPurpose::SessionTitle,
+        provider: ProviderId::new("claude"),
+        model: ModelId::new("claude-haiku-4-5"),
+        began: SessionTimestamp(began),
+        ended: SessionTimestamp(began + 1),
+        outcome: ErrandOutcome::Answered,
+        usage: output.map(|output| Usage {
+            output_tokens: Some(output),
+            ..Default::default()
+        }),
+        cost,
+    }
+}
+
+fn reported(dollars: f64) -> Option<ErrandCost> {
+    Some(ErrandCost::reported(usd(dollars).unwrap()))
+}
+
+fn estimated(dollars: f64) -> Option<ErrandCost> {
+    Some(ErrandCost::as_recorded(
+        usd(dollars).unwrap(),
+        CostBasis::Estimated,
+    ))
+}
+
+/// A Cost of `dollars`, partial where `is_partial`.
+fn counted(dollars: f64, is_partial: bool) -> CountedCost {
+    CountedCost {
+        amount: usd(dollars),
+        is_partial,
+    }
+}
+
+/// The Errands' part of `bucket`, where it holds one.
+fn errands_part(bucket: &UsageMetricsBucket) -> Option<UsageMetricsAggregate> {
+    bucket
+        .by_key
+        .iter()
+        .find(|keyed| keyed.key == UsageMetricsKey::Errands)
+        .map(|keyed| keyed.aggregate)
+}
+
+#[tokio::test]
+async fn errands_land_in_the_buckets_they_began_in_under_their_own_key_whatever_the_breakdown() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = titled(
+        directory.path(),
+        "Worked",
+        vec![turn_scoped(OPUS, 12, 0.10), turn_scoped(OPUS, 22, 0.20)],
+    );
+    let session_id = session.snapshot.session.id;
+    let errands = vec![
+        // Before every bucket.
+        errand(5, Some(1_000), reported(0.01)),
+        // At the first bucket's start, and within it.
+        errand(10, Some(40), reported(0.04)),
+        errand(19, Some(60), estimated(0.002)),
+        errand(25, Some(7), reported(0.03)),
+        // At the last bucket's end, so in none.
+        errand(30, Some(9_000), reported(0.50)),
+    ];
+    let (store, writer) = restore_with_errands(directory.path(), vec![session], errands).await;
+
+    for breakdown in [
+        UsageMetricsBreakdown::Model,
+        UsageMetricsBreakdown::Provider,
+        UsageMetricsBreakdown::Workspace,
+    ] {
+        let query = UsageMetricsQuery {
+            top_sessions: 5,
+            ..by(breakdown, &[(10, 20), (20, 30)])
+        };
+        let report = read(&store, &query).await;
+
+        let errands = |output: u64, cost: f64, estimated: Option<f64>| UsageMetricsAggregate {
+            output_tokens: Some(output),
+            cost: counted(cost, false),
+            estimated_cost: estimated.and_then(usd),
+            ..Default::default()
+        };
+        assert_eq!(
+            errands_part(&report.buckets[0]),
+            Some(errands(100, 0.042, Some(0.002))),
+            "by {breakdown:?}"
+        );
+        assert_eq!(
+            errands_part(&report.buckets[1]),
+            Some(errands(7, 0.03, None)),
+            "by {breakdown:?}"
+        );
+        assert_eq!(
+            errands_part(&report.across_buckets),
+            Some(errands(107, 0.072, Some(0.002))),
+            "by {breakdown:?}"
+        );
+        assert_eq!(errands_part(&report.untimed), None, "by {breakdown:?}");
+        assert_eq!(
+            report.keys.last(),
+            Some(&UsageMetricsKeyLabel {
+                key: UsageMetricsKey::Errands,
+                label: "Errands".to_owned(),
+            }),
+            "by {breakdown:?}"
+        );
+
+        // The whole adds the Errands' Usage and Cost, and never counts them
+        // as Sessions or Turns.
+        let whole = |aggregate: &UsageMetricsAggregate| {
+            (
+                aggregate.output_tokens,
+                aggregate.cost,
+                aggregate.estimated_cost,
+                aggregate.sessions,
+                aggregate.subagent_sessions,
+                aggregate.turns,
+            )
+        };
+        assert_eq!(
+            whole(&report.buckets[0].total),
+            (Some(101), counted(0.142, false), usd(0.002), 1, 0, 1),
+            "by {breakdown:?}"
+        );
+        assert_eq!(
+            whole(&report.across_buckets.total),
+            (Some(109), counted(0.372, false), usd(0.002), 1, 0, 2),
+            "by {breakdown:?}"
+        );
+        assert_eq!(
+            whole(&report.across_buckets_and_untimed),
+            whole(&report.across_buckets.total),
+            "by {breakdown:?}"
+        );
+        // The Session's own keys hold its work alone.
+        let others: UsageMetricsAggregate = report.buckets[0]
+            .by_key
+            .iter()
+            .filter(|keyed| keyed.key != UsageMetricsKey::Errands)
+            .map(|keyed| keyed.aggregate)
+            .fold(UsageMetricsAggregate::default(), |mut sum, part| {
+                sum.cost.add(part.cost);
+                sum.turns += part.turns;
+                sum
+            });
+        assert_eq!(
+            (others.cost, others.turns),
+            (counted(0.10, false), 1),
+            "by {breakdown:?}"
+        );
+        // The top Sessions are the user's alone.
+        assert_eq!(
+            ranked(&report),
+            vec![(session_id, usd(0.30), false)],
+            "by {breakdown:?}"
+        );
+    }
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_errand_of_unknown_usage_or_with_no_cost_marks_every_figure_holding_it_partial() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = titled(
+        directory.path(),
+        "Worked",
+        vec![turn_scoped(OPUS, 12, 0.10)],
+    );
+    let session_id = session.snapshot.session.id;
+    let errands = vec![
+        // Timed out: Suru stopped listening before the Provider could say.
+        ErrandRecord {
+            outcome: ErrandOutcome::TimedOut,
+            ..errand(14, None, None)
+        },
+        // Its Usage known, its Cost not.
+        errand(24, Some(5), None),
+        errand(26, Some(5), reported(0.02)),
+    ];
+    let (store, writer) = restore_with_errands(directory.path(), vec![session], errands).await;
+
+    let report = read(&store, &top(&[(10, 20), (20, 30)], 5)).await;
+
+    assert_eq!(
+        errands_part(&report.buckets[0]),
+        Some(UsageMetricsAggregate {
+            cost: CountedCost {
+                amount: None,
+                is_partial: true,
+            },
+            ..Default::default()
+        }),
+        "an Errand nobody measured is work all the same, never a zero"
+    );
+    assert_eq!(report.buckets[0].total.cost, counted(0.10, true));
+    assert_eq!(
+        errands_part(&report.buckets[1]).map(|part| (part.output_tokens, part.cost)),
+        Some((Some(10), counted(0.02, true)))
+    );
+    assert_eq!(report.across_buckets.total.cost, counted(0.12, true));
+    assert_eq!(report.across_buckets_and_untimed.cost, counted(0.12, true));
+    assert_eq!(
+        ranked(&report),
+        vec![(session_id, usd(0.10), false)],
+        "no Errand marks a Session's Cost partial"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_comparison_counts_the_errands_it_holds_and_the_earliest_work_may_be_an_errand() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = titled(
+        directory.path(),
+        "Worked",
+        vec![turn_scoped(OPUS, 15, 0.10)],
+    );
+    let errands = vec![
+        errand(3, Some(20), reported(0.05)),
+        errand(16, Some(30), reported(0.01)),
+    ];
+    let (store, writer) = restore_with_errands(directory.path(), vec![session], errands).await;
+    let compared_with = |start: u64, end: u64| UsageMetricsQuery {
+        comparison: Some(interval(start, end)),
+        ..by_model(&[(10, 20)])
+    };
+
+    let before = read(&store, &compared_with(0, 10)).await;
+    assert_eq!(
+        before.comparison,
+        Some(UsageMetricsAggregate {
+            output_tokens: Some(20),
+            cost: counted(0.05, false),
+            ..Default::default()
+        }),
+        "a period of Errands alone counts no Session and no Turn"
+    );
+    let overlapping = read(&store, &compared_with(0, 20)).await;
+    assert_eq!(
+        overlapping.comparison.map(|aggregate| (
+            aggregate.output_tokens,
+            aggregate.cost,
+            aggregate.sessions,
+            aggregate.turns
+        )),
+        Some((Some(51), counted(0.16, false), 1, 1))
+    );
+
+    // All of time begins with the Errand that began before any Turn.
+    assert_eq!(before.earliest_at, Some(SessionTimestamp(3)));
+    assert_eq!(
+        read(&store, &by_model(&[])).await.earliest_at,
+        Some(SessionTimestamp(3))
     );
     writer.shutdown().await.unwrap();
 }

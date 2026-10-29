@@ -168,10 +168,6 @@ impl StorageRepository {
     /// Suru that adds a purpose or outcome writes it without a migration, so
     /// after a downgrade this Suru can meet a spelling it does not know, and a
     /// figure missing one Errand is better than no figures at all.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Usage Metrics reads Errand records from #585 on")
-    )]
     pub(crate) async fn errand_records(
         &self,
         began: Range<SessionTimestamp>,
@@ -197,6 +193,23 @@ impl StorageRepository {
                         .ok()
                 })
                 .collect())
+        })
+        .await
+    }
+
+    /// When the earliest Errand recorded began, read on a blocking task
+    /// through the index on when each began; none where none is recorded.
+    pub(crate) async fn earliest_errand_began(
+        &self,
+    ) -> Result<Option<SessionTimestamp>, StorageError> {
+        let path = self.database_path.clone();
+        on_blocking_task("reading when the earliest Errand began", move || {
+            let mut connection = connect(&path)?;
+            let earliest = errands::table
+                .select(diesel::dsl::min(errands::began_at))
+                .first::<Option<i64>>(&mut connection)
+                .map_err(|error| StorageError::Read(error.to_string()))?;
+            Ok(earliest.map(timestamp))
         })
         .await
     }
@@ -237,7 +250,8 @@ mod tests {
 
     /// Records outlive the repository that wrote them, and are read back
     /// whole by when they began: the interval's start counts, its end does
-    /// not, and those either side are left out.
+    /// not, and those either side are left out. The earliest of them says
+    /// when it began.
     #[tokio::test]
     async fn errand_records_are_read_back_by_when_they_began() {
         let data = tempfile::tempdir().unwrap();
@@ -257,6 +271,7 @@ mod tests {
         };
         {
             let repository = StorageRepository::open(data.path()).await.unwrap();
+            assert_eq!(repository.earliest_errand_began().await.unwrap(), None);
             for written in [
                 record(3_000, ErrandPurpose::WorkspaceDescription),
                 record(999, ErrandPurpose::SessionTitle),
@@ -286,6 +301,10 @@ mod tests {
                 .await
                 .unwrap(),
             Vec::new()
+        );
+        assert_eq!(
+            repository.earliest_errand_began().await.unwrap(),
+            Some(at(999))
         );
     }
 
