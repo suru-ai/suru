@@ -1,9 +1,9 @@
 //! Usage Metrics: what the Sessions living on one Server, and the Errands it
 //! ran, consumed over a span of time, divided into time buckets the reader
-//! chooses and broken down by a key. The Server knows nothing of calendars or time zones: a reader asks
-//! for the buckets as intervals of Session timestamps, cut where its own
-//! calendar falls, and is answered with the figures each one holds. A report
-//! is read on request and never stored.
+//! chooses and broken down by a key. The Server knows nothing of calendars
+//! or time zones: a reader asks for the buckets as intervals of Session
+//! timestamps, cut where its own calendar falls, and is answered with the
+//! figures each one holds. A report is read on request and never stored.
 
 use serde::{Deserialize, Serialize};
 
@@ -408,8 +408,9 @@ impl CacheInsights {
 }
 
 /// What caching saved, worked out from the rates the pricing source states
-/// today for each Turn's and Errand's Model: what its cache reads would have cost more as
-/// fresh input, less what its cache writes cost more than fresh input did.
+/// today for each Turn's and Errand's Model: what its cache reads would have
+/// cost more as fresh input, less what its cache writes cost more than fresh
+/// input did.
 /// A what-if, never a Cost: it is worked out afresh at every read, never
 /// frozen or stored, and adds into no Cost figure (ADR 0016 governs Cost,
 /// not this).
@@ -426,13 +427,14 @@ pub struct EstimatedSaving {
     pub is_partial: bool,
 }
 
-/// The interval's Cost divided by the role of the Session whose Turn carries
-/// each Cost Coverage contribution, overlaps removed as a
-/// [`UsageMetricsAggregate`]'s are, and the Cost of the Errands that began
-/// within it beside them, so the roles and the Errands add up to the
-/// interval's Cost, partial where it is. A Provider that reports a whole tree's Cost
-/// on its own Turns — Claude's, for the native Subagents it runs — leaves
-/// those Subagents' work inside the Session that reported it.
+/// The interval's Cost divided between the Sessions' roles and Suru's own
+/// Errands: each Cost Coverage contribution by the role of the Session whose
+/// Turn carries it, overlaps removed as a [`UsageMetricsAggregate`]'s are,
+/// and beside them the Cost of the Errands that began within the interval,
+/// so the roles and the Errands add up to its Cost, partial where it is. A
+/// Provider that reports a whole tree's Cost on its own Turns — Claude's,
+/// for the native Subagents it runs — leaves those Subagents' work inside
+/// the Session that reported it.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegationInsights {
@@ -593,8 +595,8 @@ pub struct QuarterHourTurns {
     pub tokens: Option<u64>,
     /// The Cost their Cost Coverage contributions add up to, overlaps
     /// removed as a [`UsageMetricsAggregate`]'s are, so the quarter-hours of
-    /// an interval add up to its Session Cost: its Cost less its Errands',
-    /// since an Errand is no Turn and lands in no quarter-hour.
+    /// an interval add up to the interval's Cost less its Errands', since an
+    /// Errand is no Turn and lands in no quarter-hour.
     pub cost: CountedCost,
 }
 

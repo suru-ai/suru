@@ -4,8 +4,8 @@
 //! can select to read its Turns, tokens, and Cost.
 //!
 //! The panel is about the user's own work, so it holds Turns alone: Suru's
-//! Errands are no Turns, and the cells' Costs add up to the range's Session
-//! Cost — its Cost less the Errands' that Delegation states beside it.
+//! Errands are no Turns, and the cells' Costs add up to the range's Cost
+//! less its Errands', which Delegation states beside its roles.
 //!
 //! A cell takes one of five looks: a dot where it holds no Turn, otherwise
 //! one of four shades, each its own glyph, so they read apart on a Theme of

@@ -17,8 +17,8 @@
 //!
 //! The quarter-hours carry Cost as the metrics read's buckets do: every
 //! Cost Coverage contribution of the counted trees lands where the Turn
-//! carrying it does, so the quarter-hours of a span add up to its Session
-//! Cost — the Cost the metrics read gives it, less its Errands'. They, the
+//! carrying it does, so the quarter-hours of a span add up to the span's
+//! Cost less its Errands', as the metrics read gives both. They, the
 //! Turns, and the Tools are about the user's own work, and an Errand is no
 //! Turn, so it stands in none of them. Delegation divides those same
 //! contributions by the role of the Session whose Turn carries each, and
@@ -124,7 +124,7 @@ impl SessionStore {
         if let Some(repository) = repository {
             let held = std::mem::take(&mut fold.held_turns);
             let rows = repository
-                .insights_rows(held, ActivityTally::default(), interval.start..interval.end)
+                .insights_reading(held, ActivityTally::default(), interval.start..interval.end)
                 .await
                 .map_err(|error| {
                     tracing::warn!(%error, "reading what Insights count failed");
@@ -412,7 +412,7 @@ struct CacheTally {
     is_unattributed: bool,
 }
 
-/// How many tokens some Turns read from cache and wrote to it.
+/// How many tokens some Turns and Errands read from cache and wrote to it.
 #[derive(Clone, Copy, Default)]
 struct CacheUse {
     reads: u64,

@@ -201,7 +201,8 @@ impl StorageRepository {
 /// Every Errand recorded as beginning within `began` — from its start, up to
 /// but not including its end — read over `connection` through the index on
 /// when each began, earliest first. A row this Suru cannot read is logged and
-/// left out, as [`StorageRepository::errand_reading`] says why.
+/// left out rather than failing the read; [`StorageRepository::errand_reading`]
+/// says why.
 pub(super) fn errands_began_within(
     connection: &mut SqliteConnection,
     began: Range<SessionTimestamp>,

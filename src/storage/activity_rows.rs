@@ -27,7 +27,7 @@ use super::{
     on_blocking_task,
 };
 
-/// How many Sessions one query of [`StorageRepository::activity_rows`]
+/// How many Sessions one query of [`StorageRepository::insights_reading`]
 /// binds, well within the fewest host parameters any SQLite build allows.
 const SESSIONS_PER_ACTIVITY_READ: usize = 500;
 
@@ -94,7 +94,7 @@ pub(crate) enum ActivityTallyRow {
     },
 }
 
-/// Where [`StorageRepository::activity_rows`] streams the rows it reads.
+/// Where [`StorageRepository::insights_reading`] streams the rows it reads.
 pub(crate) trait ActivityRowSink: Send + 'static {
     fn add(&mut self, row: ActivityTallyRow);
 }
@@ -165,18 +165,18 @@ impl StorageRepository {
     /// belong to, and those of a Turn not named left out here. The Errands
     /// are read as [`StorageRepository::errand_reading`] reads them (ADR
     /// 0057).
-    pub(crate) async fn insights_rows<S: ActivityRowSink>(
+    pub(crate) async fn insights_reading<S: ActivityRowSink>(
         &self,
         turns: HashMap<SessionId, HashSet<TurnId>>,
         sink: S,
         errands_began: Range<SessionTimestamp>,
-    ) -> Result<InsightsRows<S>, StorageError> {
+    ) -> Result<InsightsReading<S>, StorageError> {
         let path = self.database_path.clone();
         on_blocking_task("reading what Insights count", move || {
             let mut connection = connect(&path)?;
             let activities = stream_activity_rows(&mut connection, turns, sink)?;
             let errands = errands_began_within(&mut connection, errands_began)?;
-            Ok(InsightsRows {
+            Ok(InsightsReading {
                 activities,
                 errands,
             })
@@ -185,9 +185,9 @@ impl StorageRepository {
     }
 }
 
-/// What [`StorageRepository::insights_rows`] read: the sink the Activity
+/// What [`StorageRepository::insights_reading`] read: the sink the Activity
 /// rows streamed into, and the Errands, earliest first.
-pub(crate) struct InsightsRows<S> {
+pub(crate) struct InsightsReading<S> {
     pub(crate) activities: S,
     pub(crate) errands: Vec<ErrandRecord>,
 }
