@@ -245,6 +245,14 @@ pub(crate) const OTHER: &str = "Other";
 /// A key `kept_apart` that would fold into Other stands as a series of its
 /// own in the last place kept, the key that stood there folding in its
 /// stead, so that it can be shown alone.
+///
+/// Errands — Suru's own work, under its reserved key — are always kept
+/// apart so: they never fold into Other, taking their place among the keys
+/// kept by Cost like any other. They take the Theme's colour reserved for
+/// them, which no key takes, and the keys take the palette's colours in
+/// their places among themselves, so no colour moves as the Errands rise or
+/// fall among them. They are no Session, so under Sessions their figures
+/// say nothing was measured.
 pub(crate) fn series(
     report: &UsageMetricsReport,
     measure: MetricsMeasure,
@@ -258,21 +266,30 @@ pub(crate) fn series(
             .iter()
             .map(|bucket| {
                 keys.iter()
-                    .map(|(label, _)| measure.figure_of(&part(bucket, &label.key)))
+                    .map(|(label, _)| figure_of(measure, &label.key, &part(bucket, &label.key)))
                     .fold(Figure::default(), Figure::add)
             })
             .collect()
     };
     let palette = palette(theme);
+    let mut places = 0..;
     let mut series: Vec<Series> = ranked
         .iter()
-        .enumerate()
-        .map(|(place, keyed)| Series {
-            id: SeriesId::Key(keyed.0.key.clone()),
-            label: keyed.0.label.clone(),
-            color: palette[place % palette.len()],
-            figures: figures(std::slice::from_ref(keyed)),
-            total: measure.figure_of(&keyed.1),
+        .map(|keyed| {
+            let key = &keyed.0.key;
+            let color = if *key == UsageMetricsKey::Errands {
+                errands_color(theme)
+            } else {
+                let place = places.next().expect("places never run out");
+                palette[place % palette.len()]
+            };
+            Series {
+                id: SeriesId::Key(key.clone()),
+                label: keyed.0.label.clone(),
+                color,
+                figures: figures(std::slice::from_ref(keyed)),
+                total: figure_of(measure, key, &keyed.1),
+            }
         })
         .collect();
     if !folded.is_empty() {
@@ -288,6 +305,21 @@ pub(crate) fn series(
         });
     }
     series
+}
+
+/// `key`'s figure in `measure` of `aggregate`, its part of some whole:
+/// nothing measured where Errands are counted as Sessions, which they never
+/// are.
+fn figure_of(
+    measure: MetricsMeasure,
+    key: &UsageMetricsKey,
+    aggregate: &UsageMetricsAggregate,
+) -> Figure {
+    if *key == UsageMetricsKey::Errands && measure == MetricsMeasure::Sessions {
+        Figure::default()
+    } else {
+        measure.figure_of(aggregate)
+    }
 }
 
 /// Which series [`series`] makes of `report`, in the same order, without
@@ -309,27 +341,30 @@ pub(crate) type RankedKey<'a> = (&'a UsageMetricsKeyLabel, UsageMetricsAggregate
 
 /// `report`'s keys in the order [`series`] stacks them, split into the
 /// largest few it keeps and the rest it folds into Other, with the key
-/// `kept_apart` among those kept.
+/// `kept_apart` and the Errands among those kept.
 fn ranked<'a>(
     report: &'a UsageMetricsReport,
     kept_apart: Option<&UsageMetricsKey>,
 ) -> (Vec<RankedKey<'a>>, Vec<RankedKey<'a>>) {
     let mut ranked = ranked_keys(report);
-    let mut folded = if ranked.len() > KEYED_SERIES {
+    let folded = if ranked.len() > KEYED_SERIES {
         ranked.split_off(KEYED_SERIES)
     } else {
         Vec::new()
     };
-    if let Some(at) =
-        kept_apart.and_then(|key| folded.iter().position(|(label, _)| label.key == *key))
-    {
-        let apart = folded.remove(at);
-        // Keys fold only past a full set kept, so there is one to displace,
-        // and it is larger than every key folded.
-        if let Some(displaced) = ranked.pop() {
-            folded.insert(0, displaced);
+    let is_apart =
+        |key: &UsageMetricsKey| *key == UsageMetricsKey::Errands || Some(key) == kept_apart;
+    let (apart, mut folded): (Vec<_>, Vec<_>) = folded
+        .into_iter()
+        .partition(|(label, _)| is_apart(&label.key));
+    // Each key kept apart, the larger first, displaces the smallest key kept
+    // that is not: keys fold only past a full set kept, so there is one to
+    // displace, and it is larger than every key folded, so it heads them.
+    for key in apart {
+        if let Some(at) = ranked.iter().rposition(|(label, _)| !is_apart(&label.key)) {
+            folded.insert(0, ranked.remove(at));
         }
-        ranked.push(apart);
+        ranked.push(key);
     }
     (ranked, folded)
 }
@@ -381,13 +416,15 @@ pub(crate) fn holds_nothing(report: &UsageMetricsReport) -> bool {
 
 /// The colours series take in turn: the Theme's accent, then the bright
 /// ANSI hues it names, each once, and none the canvas is painted with nor
-/// [`other_color`], so no key reads as the canvas or as Other — as
-/// many as [`KEYED_SERIES`] where the Theme's hues are all distinct. A Theme
-/// naming fewer distinct hues has them taken in turn again.
+/// [`other_color`] nor [`errands_color`], so no key reads as the canvas, as
+/// Other, or as the Errands — as many as [`KEYED_SERIES`] where the Theme's
+/// hues are all distinct. A Theme naming fewer distinct hues has them taken
+/// in turn again.
 fn palette(theme: &Theme) -> Vec<Color> {
     let bright = theme.ansi.bright;
     let canvas = theme.surface.base.bg;
     let other = other_color(theme);
+    let errands = errands_color(theme);
     let mut palette: Vec<Color> = Vec::new();
     for color in [
         theme.accent.primary.fg,
@@ -404,6 +441,7 @@ fn palette(theme: &Theme) -> Vec<Color> {
         if color != Color::Reset
             && Some(color) != canvas
             && color != other
+            && color != errands
             && !palette.contains(&color)
         {
             palette.push(color);
@@ -426,6 +464,25 @@ fn other_color(theme: &Theme) -> Color {
         .or(theme.border.subdued.fg)
         .filter(|color| *color != Color::Reset)
         .unwrap_or(Color::Gray)
+}
+
+/// The colour reserved for the Errands series: the Theme's bright magenta,
+/// or failing that its magenta or bright white — the first that is neither
+/// the canvas's, the accent the first key takes, nor [`other_color`] — which
+/// [`palette`] then leaves out, so the Errands keep one colour wherever they
+/// rank and read as no key.
+fn errands_color(theme: &Theme) -> Color {
+    let ansi = theme.ansi;
+    let other = other_color(theme);
+    [ansi.bright.magenta, ansi.normal.magenta, ansi.bright.white]
+        .into_iter()
+        .find(|color| {
+            *color != Color::Reset
+                && Some(*color) != theme.surface.base.bg
+                && Some(*color) != theme.accent.primary.fg
+                && *color != other
+        })
+        .unwrap_or(Color::Magenta)
 }
 
 /// A y-axis: its top, and the step between its ticks.
@@ -846,6 +903,20 @@ mod tests {
         assert!(!palette.contains(&theme.ansi.bright.blue), "{palette:?}");
         assert!(!palette.contains(&theme.ansi.bright.green), "{palette:?}");
         assert!(!palette.is_empty());
+    }
+
+    #[test]
+    fn the_errands_colour_is_no_key_s_nor_other_s_nor_the_accent_s() {
+        for accent in [Color::Cyan, Theme::system().ansi.bright.magenta] {
+            let mut theme = Theme::system();
+            theme.accent.primary = Style::default().fg(accent);
+
+            let errands = errands_color(&theme);
+
+            assert!(!palette(&theme).contains(&errands), "{errands:?}");
+            assert_ne!(errands, other_color(&theme));
+            assert_ne!(Some(errands), theme.accent.primary.fg);
+        }
     }
 
     #[test]

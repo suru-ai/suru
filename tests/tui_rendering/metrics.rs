@@ -28,6 +28,7 @@ use suru::{
 };
 use uuid::Uuid;
 
+mod errands;
 mod insights;
 
 const WIDTH: u16 = 120;
