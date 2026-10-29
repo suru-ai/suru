@@ -181,6 +181,9 @@ async fn main() -> Result<()> {
             }
             let log_guard = logging::init(&config, logging::Role::Server)
                 .context("initialize server logging")?;
+            // Before anything is spawned: every Provider process and Git
+            // command holds descriptors of the Server's.
+            suru::open_files::raise_limit();
             let signals = server::ShutdownSignals::listen()?;
             let mut timings = server::ServerTimings::default();
             if let Some(interval_ms) = state_dir_check_interval_ms {
